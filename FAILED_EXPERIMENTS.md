@@ -1637,3 +1637,92 @@ reference.
 Escape overhead on enwik8: only 0.52% of bytes are >= 155, confirming
 the substitution range is safe for text. Binary data would have much
 higher escape rates.
+
+---
+
+## Hand-written x86-64 ASM for Fast decoder hot loop (2026-05-04)
+
+**Context**: VTune uarch-exploration showed `processModeImpl` at 0.22 CPI
+with the raw-literal fast inner loop as the hottest code. LLVM's noinline
+codegen produced a 33-instruction loop with two apparent wastes: a
+duplicate `test r13b, r13b` (once for cmovns, once for setns) and a
+`mov r11, r13` register copy from LLVM reusing r11 for both dst and
+match_addr.
+
+**Experiment 1 — Full loop replacement (28 instructions)**:
+Replaced the entire Zig while loop with a hand-written inline asm loop.
+Key optimizations vs LLVM: single `test` feeding both `cmovns` and `js`
+(cmov doesn't clobber flags), branch-based off16 advance (2 instructions
+vs LLVM's 4-instruction branchless setns path), `dst` stays in one
+register throughout (no register copy).
+
+Result: **6,399 MB/s** vs LLVM's **6,575 MB/s** — **3% slower** despite
+5 fewer instructions. Round-trip correct.
+
+**Experiment 2 — Loop body replacement only**:
+Kept the Zig while loop structure but replaced the `cmd >= 24` token body
+with inline asm (same 21 instructions of inner work). This proved the
+code path was executing (100 NOPs inside slowed it 9%).
+
+Result: **6,378 MB/s** — still 3% slower than LLVM.
+
+**Why fewer instructions was slower**: LLVM's 33-instruction loop has
+better instruction scheduling for Ice Lake's out-of-order engine. The
+"wasted" instructions (duplicate test, register copy, branchless setns
+path) allow the OOO engine to overlap more work:
+
+- The duplicate `test al, al` feeds `setns` which is on a separate
+  dependency chain from the `cmovns`. The OOO engine executes them in
+  parallel on different ports.
+- The `mov r12, rax` register copy lets LLVM use rax as a temporary
+  for the match address computation, freeing r12 to receive the new
+  dst value on a separate dependency chain.
+- The branchless `xor + setns + lea` off16 advance avoids a branch
+  that would serialize the pipeline 20% of the time.
+
+**Lesson**: Instruction count is not execution time. On modern OOO CPUs,
+"redundant" instructions that create independent dependency chains can
+be faster than "efficient" code with fewer instructions but longer serial
+chains. Trust LLVM's scheduler for hot loops — it optimizes for uop
+throughput and dependency depth, not instruction count.
+
+The noinline keyword alone gave +1.4% by isolating register allocation.
+The hand-written ASM was unnecessary.
+
+---
+
+## `inline for` over struct array for recent-offset checks (2026-05-05)
+
+**Context**: Codebase cleanup item. Three identical blocks in
+`high_matcher.zig` checking `recents.offs[4]`, `[5]`, `[6]` with
+hardcoded `best_offs` values of 0, -1, -2. Proposed replacement:
+
+```zig
+const recent_sentinels = [_]struct { idx: usize, offs_code: i32 }{
+    .{ .idx = 4, .offs_code = 0 },
+    .{ .idx = 5, .offs_code = -1 },
+    .{ .idx = 6, .offs_code = -2 },
+};
+inline for (recent_sentinels) |r| {
+    const ml = match_eval.getMatchLengthQuick(src, recents.offs[r.idx], ...);
+    if (ml > best_ml) { best_ml = ml; best_offs = r.offs_code; }
+}
+```
+
+**Result**: L6 compress **-17%** (45.0 → 37.7 MB/s), L6 decompress
+**-9%** (12,215 → 11,082 MB/s). Confirmed by A/B stash testing.
+
+**Why**: Although `inline for` with comptime-known values should unroll
+to identical code, the struct field access pattern generates different
+LLVM IR than three hardcoded constants. LLVM's optimizer treats the
+struct indirection differently — the `r.offs_code` access through a
+comptime struct generates extra intermediate SSA values that shift
+register allocation in the surrounding function, degrading the High
+codec's hot path.
+
+**Lesson**: `inline for` over a struct array is NOT equivalent to manual
+unrolling in Zig when the loop body calls functions or affects register
+pressure. The Zig compiler's comptime evaluation produces different IR
+shapes than hand-written repetition, and LLVM's optimizer doesn't always
+canonicalize them to the same output. For performance-critical code,
+prefer explicit repetition over `inline for` with struct dispatch.
