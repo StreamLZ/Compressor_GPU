@@ -1691,6 +1691,51 @@ The hand-written ASM was unnecessary.
 
 ---
 
+## Dropping/changing `inline` on hot-path token functions (2026-05-05)
+
+**Context**: The `noinline` win on `processModeImpl` (+1.4%) suggested
+that forced inlining might be hurting other hot-path functions too.
+Tested removing or flipping `inline` on per-token functions.
+
+**Experiment 1 — `processOneToken` (High decoder, L9-L11): drop `inline`**
+
+This function is the entire L9-L11 token execution body (~100 lines),
+called from two loop bodies (prefetch-safe main + no-prefetch tail).
+Removing `inline` lets LLVM decide.
+
+Result: L9 t1 decompress **1,008 MB/s** (baseline **1,019**) — **-1%**.
+LLVM chose to inline it anyway (the function is hot enough), so
+removing the annotation had minimal effect.
+
+**Experiment 2 — `processOneToken`: add `noinline`**
+
+Force LLVM to NOT inline, creating a function call per token.
+
+Result: L9 t1 decompress **869 MB/s** — **-15% regression**.
+
+**Why**: `processOneToken` is called per token (~millions of times per
+chunk). The function call overhead (push/pop callee-saved registers,
+argument passing, return) adds ~5-10 cycles per call. At ~100 cycles
+per token baseline, that's a 5-10% overhead. Combined with losing
+cross-call optimization (the caller's loop variables can't be kept in
+registers across the call boundary), the total cost is 15%.
+
+This is the opposite of `processModeImpl`, which is called once per
+64KB sub-chunk (~150 times per enwik8). There, the call overhead is
+amortized over ~thousands of tokens, and the register isolation benefit
+(cleaner allocation in the caller) outweighs the cost.
+
+**Rule of thumb**: `noinline` helps functions called O(chunks) that
+share a file with complex callers. It hurts functions called O(tokens)
+where call overhead dominates.
+
+**Experiment 3 — `writeOffset` (Fast encoder): drop `inline`**
+
+Result: Compress speed neutral (367.5 vs 369 MB/s). No effect on the
+encode hot path — LLVM inlines it regardless of the annotation.
+
+---
+
 ## `inline for` over struct array for recent-offset checks (2026-05-05)
 
 **Context**: Codebase cleanup item. Three identical blocks in
