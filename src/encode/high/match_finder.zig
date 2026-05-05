@@ -1,6 +1,4 @@
-//! Hash-based match finder for the High optimal parser. Port of
-//! `MatchFinder.FindMatchesHashBased` from
-//! src/StreamLZ/Compression/MatchFinding/MatchFinder.cs.
+//! Hash-based match finder for the High optimal parser.
 //! Used by: High codec (L6-L11)
 //!
 //! Uses `MatchHasher16Dual` (16-entry dual-hash bucket) to probe
@@ -14,7 +12,7 @@
 //!   * Each bucket holds 16 entries; every entry is tested via a
 //!     scalar tag+position filter. Uses SSE2 vectorized probes
 //!     for this, but the scalar code path produces identical
-//!     results and is simpler to port without intrinsic rewrites.
+//!     results and is simpler without intrinsic rewrites.
 //!   * When a match's length is >= 77 bytes, the finder inserts
 //!     synthetic sub-matches at stride-4 positions within the long
 //!     match and skips the main loop past the end — this is the

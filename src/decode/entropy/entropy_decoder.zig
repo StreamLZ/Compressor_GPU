@@ -584,7 +584,7 @@ fn decodeMultiArrayInternal(
         const numbits_f: u5 = @intCast(interval_lenlog2[@intCast(ii + 0)]);
         const numbits_b: u5 = @intCast(interval_lenlog2[@intCast(ii + 1)]);
 
-        // Rotate-left with sentinel bit set (| 1). Port of BitOperations.RotateLeft.
+        // Rotate-left with sentinel bit set (| 1).
         bits_f = std.math.rotl(u32, bits_f | 1, @as(usize, numbits_f));
         bitpos_f += @as(i32, numbits_f) - 8 * ((bitpos_f + 7) >> 3);
 

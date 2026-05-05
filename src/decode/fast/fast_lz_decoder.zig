@@ -360,9 +360,16 @@ pub fn readLzTable(
 
 const LiteralMode = enum { raw, delta };
 
+fn copyN(dst: [*]u8, src: [*]const u8, n: usize) void {
+    for (0..n) |i| dst[i] = src[i];
+}
+
 /// Hot-loop Fast LZ token processor. `mode` is a comptime parameter so each
 /// variant generates specialized code without branching on `isDelta` inside.
-fn processModeImpl(
+/// `safe` = true replaces all overcopy (copy64/copy16) with exact-length
+/// copies — slower but guarantees no writes past the token boundary.
+noinline fn processModeImpl(
+    comptime safe: bool,
     comptime mode: LiteralMode,
     dst_in: [*]u8,
     dst_size: usize,
@@ -398,39 +405,45 @@ fn processModeImpl(
     // Short tokens (cmd >= 24) produce at most 7 + 15 = 22 bytes.
     // Process tokens without any dst bounds checks while safely far
     // from the end. Non-short tokens (cmd <= 2) break to the safe path.
-    while (@intFromPtr(cmd_stream) < @intFromPtr(cmd_stream_end) and
-        @intFromPtr(dst) < @intFromPtr(dst_safe_end))
-    {
-        const cmd: u32 = cmd_stream[0];
-        cmd_stream += 1;
+    // Skipped entirely in safe mode (all work done by the safe tail).
+    if (!safe) {
+        while (@intFromPtr(cmd_stream) < @intFromPtr(cmd_stream_end) and
+            @intFromPtr(dst) < @intFromPtr(dst_safe_end))
+        {
+            const cmd: u32 = cmd_stream[0];
+            cmd_stream += 1;
 
-        if (cmd >= 24) {
-            @branchHint(.likely);
-            const new_dist: i64 = off16_stream[0];
-            const literal_length: usize = cmd & 7;
-            const use_new_dist: bool = (cmd & 0x80) == 0;
+            if (cmd >= 24) {
+                @branchHint(.likely);
+                const literal_length: usize = cmd & 7;
+                const match_length: usize = (cmd >> 3) & 0xF;
+                const next_dst = dst + literal_length + match_length;
 
-            if (is_delta) {
-                const delta_src: [*]const u8 = ptr_math.offsetPtr([*]const u8, dst, @as(isize, @intCast(recent_offs)));
-                copy.copy64Add(dst, lit_stream, delta_src);
+                const new_dist: i64 = off16_stream[0];
+                const use_new_dist: bool = (cmd & 0x80) == 0;
+
+                if (is_delta) {
+                    const delta_src: [*]const u8 = ptr_math.offsetPtr([*]const u8, dst, @as(isize, @intCast(recent_offs)));
+                    copy.copy64Add(dst, lit_stream, delta_src);
+                } else {
+                    copy.copy64(dst, lit_stream);
+                }
+                dst += literal_length;
+                lit_stream += literal_length;
+
+                const candidate_offs: i64 = -new_dist;
+                recent_offs = if (use_new_dist) candidate_offs else recent_offs;
+                off16_stream = @ptrFromInt(@intFromPtr(off16_stream) + (@as(usize, @intFromBool(use_new_dist)) * 2));
+
+                const match_ptr: [*]const u8 = ptr_math.offsetPtr([*]const u8, dst, @as(isize, @intCast(recent_offs)));
+                copy.copy64(dst, match_ptr);
+                copy.copy64(dst + 8, match_ptr + 8);
+                dst = next_dst;
             } else {
-                copy.copy64(dst, lit_stream);
+                // Non-short token: back up and fall through to safe loop
+                cmd_stream -= 1;
+                break;
             }
-            dst += literal_length;
-            lit_stream += literal_length;
-
-            const candidate_offs: i64 = -new_dist;
-            recent_offs = if (use_new_dist) candidate_offs else recent_offs;
-            off16_stream = @ptrFromInt(@intFromPtr(off16_stream) + (@as(usize, @intFromBool(use_new_dist)) * 2));
-
-            const match_ptr: [*]const u8 = ptr_math.offsetPtr([*]const u8, dst, @as(isize, @intCast(recent_offs)));
-            copy.copy64(dst, match_ptr);
-            copy.copy64(dst + 8, match_ptr + 8);
-            dst += (cmd >> 3) & 0xF;
-        } else {
-            // Non-short token: back up and fall through to safe loop
-            cmd_stream -= 1;
-            break;
         }
     }
 
@@ -448,9 +461,13 @@ fn processModeImpl(
 
             if (is_delta) {
                 const delta_src: [*]const u8 = ptr_math.offsetPtr([*]const u8, dst, @as(isize, @intCast(recent_offs)));
-                copy.copy64Add(dst, lit_stream, delta_src);
+                if (safe) {
+                    for (0..literal_length) |i| dst[i] = lit_stream[i] +% delta_src[i];
+                } else {
+                    copy.copy64Add(dst, lit_stream, delta_src);
+                }
             } else {
-                copy.copy64(dst, lit_stream);
+                if (safe) copyN(dst, lit_stream, literal_length) else copy.copy64(dst, lit_stream);
             }
             dst += literal_length;
             lit_stream += literal_length;
@@ -462,9 +479,14 @@ fn processModeImpl(
             const match_addr_usize: usize = @intFromPtr(dst) +% @as(usize, @bitCast(@as(isize, @intCast(recent_offs))));
             if (match_addr_usize < @intFromPtr(dst_start)) return error.MatchOutOfBounds;
             const match_ptr: [*]const u8 = @ptrFromInt(match_addr_usize);
-            copy.copy64(dst, match_ptr);
-            copy.copy64(dst + 8, match_ptr + 8);
-            dst += (cmd >> 3) & 0xF;
+            const match_length: usize = (cmd >> 3) & 0xF;
+            if (safe) {
+                copyN(dst, match_ptr, match_length);
+            } else {
+                copy.copy64(dst, match_ptr);
+                copy.copy64(dst + 8, match_ptr + 8);
+            }
+            dst += match_length;
         } else if (cmd > 2) {
             const length: usize = cmd + 5;
             if (@intFromPtr(off32_stream) == @intFromPtr(off32_stream_end)) {
@@ -483,8 +505,12 @@ fn processModeImpl(
                 @branchHint(.cold);
                 return error.OutputTruncated;
             }
-            copy.copy16(dst, match_ptr);
-            copy.copy16(dst + 16, match_ptr + 16);
+            if (safe) {
+                copyN(dst, match_ptr, length);
+            } else {
+                copy.copy16(dst, match_ptr);
+                copy.copy16(dst + 16, match_ptr + 16);
+            }
             dst += length;
         } else if (cmd == 0) {
             @branchHint(.cold);
@@ -509,21 +535,36 @@ fn processModeImpl(
             }
 
             var remaining: isize = @intCast(length);
-            if (is_delta) {
-                while (remaining > 0) {
+            if (safe) {
+                if (is_delta) {
                     const off_usize: usize = @bitCast(@as(isize, @intCast(recent_offs)));
-                    const delta_src: [*]const u8 = @ptrFromInt(@intFromPtr(dst) +% off_usize);
-                    copy.copy16Add(dst, lit_stream, delta_src);
-                    dst += 16;
-                    lit_stream += 16;
-                    remaining -= 16;
+                    for (0..length) |i| {
+                        const d: [*]const u8 = @ptrFromInt(@intFromPtr(dst + i) +% off_usize);
+                        dst[i] = lit_stream[i] +% d[0];
+                    }
+                } else {
+                    copyN(dst, lit_stream, length);
                 }
+                dst += length;
+                lit_stream += length;
+                remaining = 0;
             } else {
-                while (remaining > 0) {
-                    copy.copy16(dst, lit_stream);
-                    dst += 16;
-                    lit_stream += 16;
-                    remaining -= 16;
+                if (is_delta) {
+                    while (remaining > 0) {
+                        const off_usize: usize = @bitCast(@as(isize, @intCast(recent_offs)));
+                        const delta_src: [*]const u8 = @ptrFromInt(@intFromPtr(dst) +% off_usize);
+                        copy.copy16Add(dst, lit_stream, delta_src);
+                        dst += 16;
+                        lit_stream += 16;
+                        remaining -= 16;
+                    }
+                } else {
+                    while (remaining > 0) {
+                        copy.copy16(dst, lit_stream);
+                        dst += 16;
+                        lit_stream += 16;
+                        remaining -= 16;
+                    }
                 }
             }
             dst = ptr_math.offsetPtr([*]u8, dst, remaining);
@@ -560,15 +601,19 @@ fn processModeImpl(
                 return error.OutputTruncated;
             }
 
-            var m = match_ptr;
-            var d = dst;
-            var remaining: isize = @intCast(length);
-            while (remaining > 0) {
-                copy.copy64(d, m);
-                copy.copy64(d + 8, m + 8);
-                d += 16;
-                m += 16;
-                remaining -= 16;
+            if (safe) {
+                copyN(dst, match_ptr, length);
+            } else {
+                var m = match_ptr;
+                var d = dst;
+                var remaining: isize = @intCast(length);
+                while (remaining > 0) {
+                    copy.copy64(d, m);
+                    copy.copy64(d + 8, m + 8);
+                    d += 16;
+                    m += 16;
+                    remaining -= 16;
+                }
             }
             dst += length;
         } else {
@@ -602,14 +647,18 @@ fn processModeImpl(
                 return error.OutputTruncated;
             }
 
-            var m = match_ptr;
-            var d = dst;
-            var remaining: isize = @intCast(length);
-            while (remaining > 0) {
-                copy.copy16(d, m);
-                d += 16;
-                m += 16;
-                remaining -= 16;
+            if (safe) {
+                copyN(dst, match_ptr, length);
+            } else {
+                var m = match_ptr;
+                var d = dst;
+                var remaining: isize = @intCast(length);
+                while (remaining > 0) {
+                    copy.copy16(d, m);
+                    d += 16;
+                    m += 16;
+                    remaining -= 16;
+                }
             }
             dst += length;
         }
@@ -619,12 +668,14 @@ fn processModeImpl(
     var length: isize = @as(isize, @intCast(@intFromPtr(dst_end))) - @as(isize, @intCast(@intFromPtr(dst)));
     if (is_delta) {
         const off_usize: usize = @bitCast(@as(isize, @intCast(recent_offs)));
-        while (length >= 8) {
-            const delta_src: [*]const u8 = @ptrFromInt(@intFromPtr(dst) +% off_usize);
-            copy.copy64Add(dst, lit_stream, delta_src);
-            dst += 8;
-            lit_stream += 8;
-            length -= 8;
+        if (!safe) {
+            while (length >= 8) {
+                const delta_src: [*]const u8 = @ptrFromInt(@intFromPtr(dst) +% off_usize);
+                copy.copy64Add(dst, lit_stream, delta_src);
+                dst += 8;
+                lit_stream += 8;
+                length -= 8;
+            }
         }
         while (length > 0) : (length -= 1) {
             const delta_byte_ptr: [*]const u8 = @ptrFromInt(@intFromPtr(dst) +% off_usize);
@@ -633,11 +684,13 @@ fn processModeImpl(
             dst += 1;
         }
     } else {
-        while (length >= 8) {
-            copy.copy64(dst, lit_stream);
-            dst += 8;
-            lit_stream += 8;
-            length -= 8;
+        if (!safe) {
+            while (length >= 8) {
+                copy.copy64(dst, lit_stream);
+                dst += 8;
+                lit_stream += 8;
+                length -= 8;
+            }
         }
         while (length > 0) : (length -= 1) {
             dst[0] = lit_stream[0];
@@ -693,9 +746,63 @@ pub fn processLzRuns(
         lz.src_end = src_end;
 
         src_cur = if (mode == 0)
-            try processModeImpl(.delta, dst, dst_size_cur, dst_end_total, dst_start, lz, &saved_dist, s_off)
+            try processModeImpl(false, .delta, dst, dst_size_cur, dst_end_total, dst_start, lz, &saved_dist, s_off)
         else
-            try processModeImpl(.raw, dst, dst_size_cur, dst_end_total, dst_start, lz, &saved_dist, s_off);
+            try processModeImpl(false, .raw, dst, dst_size_cur, dst_end_total, dst_start, lz, &saved_dist, s_off);
+
+        dst += dst_size_cur;
+        dst_size -= dst_size_cur;
+        if (dst_size == 0) break;
+    }
+
+    if (src_cur) |sc| {
+        if (@intFromPtr(sc) != @intFromPtr(src_end)) return error.CommandStreamMismatch;
+    }
+}
+
+fn processLzRunsSafe(
+    mode: u32,
+    src_ptr: [*]const u8,
+    src_end: [*]const u8,
+    dst_in: [*]u8,
+    dst_size_in: usize,
+    base_offset: u64,
+    dst_end_total: [*]u8,
+    lz: *FastLzTable,
+) DecodeError!void {
+    _ = src_ptr;
+    if (dst_size_in == 0 or mode > 1) return error.BadMode;
+
+    const dst_start: [*]const u8 = @ptrFromInt(@intFromPtr(dst_in) - base_offset);
+    var saved_dist: i32 = -@as(i32, @intCast(constants.initial_recent_offset));
+    var src_cur: ?[*]const u8 = null;
+
+    var dst = dst_in;
+    var dst_size = dst_size_in;
+
+    var iteration: u32 = 0;
+    while (iteration != 2) : (iteration += 1) {
+        var dst_size_cur: usize = dst_size;
+        if (dst_size_cur > 0x10000) dst_size_cur = 0x10000;
+
+        if (iteration == 0) {
+            lz.off32_start = lz.off32_backing1;
+            lz.off32_end = lz.off32_backing1 + lz.off32_count1;
+            lz.cmd_end = lz.cmd_start + lz.cmd_stream2_offset;
+        } else {
+            lz.off32_start = lz.off32_backing2;
+            lz.off32_end = lz.off32_backing2 + lz.off32_count2;
+            lz.cmd_end = lz.cmd_start + lz.cmd_stream2_offset_end;
+            lz.cmd_start += lz.cmd_stream2_offset;
+        }
+
+        const s_off: usize = if (base_offset == 0 and iteration == 0) 8 else 0;
+        lz.src_end = src_end;
+
+        src_cur = if (mode == 0)
+            try processModeImpl(true, .delta, dst, dst_size_cur, dst_end_total, dst_start, lz, &saved_dist, s_off)
+        else
+            try processModeImpl(true, .raw, dst, dst_size_cur, dst_end_total, dst_start, lz, &saved_dist, s_off);
 
         dst += dst_size_cur;
         dst_size -= dst_size_cur;
@@ -771,6 +878,88 @@ pub fn decodeChunk(
                     lz_ptr,
                 );
                 try processLzRuns(
+                    mode,
+                    src,
+                    src + src_used,
+                    dst,
+                    dst_count,
+                    @intCast(@intFromPtr(dst) - @intFromPtr(dst_start)),
+                    dst_end,
+                    lz_ptr,
+                );
+            } else if (src_used > dst_count or mode != 0) {
+                return error.InvalidChunkHeader;
+            } else {
+                @memcpy(dst[0..dst_count], src[0..dst_count]);
+            }
+        }
+
+        src += src_used;
+        dst += dst_count;
+    }
+
+    return @intFromPtr(src) - @intFromPtr(src_in);
+}
+
+/// Safe variant of `decodeChunk` — uses exact-length copies (no overcopy)
+/// at the cost of speed. Used for re-decoding chunks that failed XOR fold
+/// integrity checks after parallel decode.
+pub fn decodeChunkSafe(
+    dst_in: [*]u8,
+    dst_end: [*]u8,
+    dst_start: [*]const u8,
+    src_in: [*]const u8,
+    src_end: [*]const u8,
+    scratch: [*]u8,
+    scratch_end: [*]u8,
+) DecodeError!usize {
+    var src = src_in;
+    var dst = dst_in;
+
+    while (@intFromPtr(dst_end) - @intFromPtr(dst) != 0) {
+        var dst_count: usize = @intFromPtr(dst_end) - @intFromPtr(dst);
+        if (dst_count > constants.sub_chunk_size) dst_count = constants.sub_chunk_size;
+        if (@intFromPtr(src_end) - @intFromPtr(src) < 4) return error.SourceTruncated;
+
+        const chunkhdr: u32 = (@as(u32, src[0]) << 16) | (@as(u32, src[1]) << 8) | @as(u32, src[2]);
+        var src_used: usize = undefined;
+
+        if ((chunkhdr & constants.chunk_header_compressed_flag) == 0) {
+            const src_left: usize = @intFromPtr(src_end) - @intFromPtr(src);
+            const res = try entropy.highDecodeBytes(dst, dst_count, src[0..src_left], false, scratch, scratch_end);
+            if (res.decoded_size != dst_count) return error.OutputTruncated;
+            if (@intFromPtr(res.out_ptr) != @intFromPtr(dst)) {
+                @memcpy(dst[0..dst_count], res.out_ptr[0..dst_count]);
+            }
+            src_used = res.bytes_consumed;
+        } else {
+            src += 3;
+            src_used = chunkhdr & 0x7FFFF;
+            const mode: u32 = (chunkhdr >> constants.sub_chunk_type_shift) & 0xF;
+
+            if (@intFromPtr(src_end) - @intFromPtr(src) < src_used) return error.SourceTruncated;
+
+            if (src_used < dst_count) {
+                var temp_usage: usize = 2 * dst_count + 32;
+                if (temp_usage > constants.chunk_size) temp_usage = constants.chunk_size;
+                const fast_lz_table_size: usize = @sizeOf(FastLzTable);
+                const lz_ptr: *FastLzTable = @ptrCast(@alignCast(scratch));
+                const inner_scratch: [*]u8 = scratch + fast_lz_table_size;
+                const inner_scratch_end: [*]u8 = scratch + temp_usage;
+
+                var dst_slot: [*]u8 = dst;
+                try readLzTable(
+                    mode,
+                    src,
+                    src + src_used,
+                    &dst_slot,
+                    @intCast(dst_count),
+                    @intCast(@intFromPtr(dst) - @intFromPtr(dst_start)),
+                    inner_scratch,
+                    inner_scratch_end,
+                    lz_ptr,
+                );
+                try processLzRunsSafe(
                     mode,
                     src,
                     src + src_used,

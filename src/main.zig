@@ -10,7 +10,7 @@ test {
     _ = @import("format/frame_format.zig");
     _ = @import("format/streamlz_constants.zig");
     _ = @import("format/block_header.zig");
-    _ = @import("io/BitReader.zig");
+    _ = @import("io/bit_reader.zig");
     _ = @import("io/bit_writer.zig");
     _ = @import("io/copy_helpers.zig");
     _ = @import("io/ptr_math.zig");
@@ -23,7 +23,7 @@ test {
     _ = @import("decode/entropy/tans_decoder.zig");
     _ = @import("decode/decompress_parallel.zig");
     _ = @import("decode/fixture_tests.zig");
-    _ = @import("encode/entropy/ByteHistogram.zig");
+    _ = @import("encode/entropy/byte_histogram.zig");
     _ = @import("encode/fast/fast_constants.zig");
     _ = @import("encode/entropy/tans_encoder.zig");
     _ = @import("encode/offset_encoder.zig");
@@ -33,7 +33,7 @@ test {
     _ = @import("encode/text_detector.zig");
     _ = @import("encode/cost_coefficients.zig");
     _ = @import("encode/fast/fast_cost_model.zig");
-    _ = @import("encode/fast/FastStreamWriter.zig");
+    _ = @import("encode/fast/fast_stream_writer.zig");
     _ = @import("encode/fast/fast_token_writer.zig");
     _ = @import("encode/fast/fast_lz_parser.zig");
     _ = @import("encode/match_eval.zig");

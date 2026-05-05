@@ -12,7 +12,7 @@
 //!            pre-computes `ManagedMatchLenStorage` (step 26 + 27)
 //!
 //! This file currently contains the type-level wiring + the
-//! `SetupEncoder` helper. The actual parsers land in subsequent
+//! encoder setup helper. The actual parsers land in subsequent
 //! parity steps:
 //!   - step 29 (F2): `fastCompress` (greedy + lazy)
 //!   - step 30 (F4): `assembleCompressedOutput` (token assembly)
@@ -51,7 +51,7 @@ pub const HasherType = enum {
     none,
 };
 
-/// Level-table entry for `SetupEncoder`'s internal
+/// Level-table entry for the encoder setup's internal
 /// lookup. Indexed by `level + 3`, so index 0
 /// is level -3 and index 7 is level 4. Levels ≥ 5 use a different
 /// hasher path (Optimal creates its own).

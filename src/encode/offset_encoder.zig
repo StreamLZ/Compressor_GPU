@@ -11,10 +11,10 @@
 //!      / `encodeNewOffsets` — the full LZ offset encoding pipeline the
 //!      High codec uses. Fast doesn't exercise this path (it emits raw
 //!      off16 / off32 directly in `fast_lz_encoder.assembleEntropyOutput`)
-//!      so these are Zig-port infrastructure for future High parity.
+//!      so these are infrastructure for future High parity.
 
 const std = @import("std");
-const hist_mod = @import("entropy/ByteHistogram.zig");
+const hist_mod = @import("entropy/byte_histogram.zig");
 const entropy_enc = @import("entropy/entropy_encoder.zig");
 const cost_coeffs = @import("cost_coefficients.zig");
 const bw_mod = @import("../io/bit_writer.zig");
@@ -25,18 +25,18 @@ const BitWriter64Forward = bw_mod.BitWriter64Forward;
 const BitWriter64Backward = bw_mod.BitWriter64Backward;
 const ptr_math = @import("../io/ptr_math.zig");
 
-/// `dst[i] = src[i] - src[i + neg_offset]` for `len` bytes. `neg_offset`
+/// `dst[i] = src[i] - src[i + match_offset]` for `len` bytes. `match_offset`
 /// is negative when the match source is before `src`. The function may
 /// read one 16-byte vector past the end of `src` (the caller must ensure
 /// at least 16 bytes of readable memory after `src + len`).
-pub fn subtractBytesUnsafe(dst: [*]u8, src: [*]const u8, len: usize, neg_offset: isize) void {
+pub fn subtractBytesUnsafe(dst: [*]u8, src: [*]const u8, len: usize, match_offset: isize) void {
     const V16 = @Vector(16, u8);
     var d = dst;
     var s = src;
     var remaining = len;
     while (remaining > 16) : (remaining -= 16) {
         const a: V16 = s[0..16].*;
-        const back_ptr: [*]const u8 = ptr_math.offsetPtr([*]const u8, s, neg_offset);
+        const back_ptr: [*]const u8 = ptr_math.offsetPtr([*]const u8, s, match_offset);
         const b: V16 = back_ptr[0..16].*;
         const out: V16 = a -% b;
         d[0..16].* = out;
@@ -47,7 +47,7 @@ pub fn subtractBytesUnsafe(dst: [*]u8, src: [*]const u8, len: usize, neg_offset:
     // OK — caller guarantees 16 bytes of slack).
     if (remaining > 0) {
         const a: V16 = s[0..16].*;
-        const back_ptr: [*]const u8 = ptr_math.offsetPtr([*]const u8, s, neg_offset);
+        const back_ptr: [*]const u8 = ptr_math.offsetPtr([*]const u8, s, match_offset);
         const b: V16 = back_ptr[0..16].*;
         const out: V16 = a -% b;
         @memcpy(d[0..remaining], (@as([*]const u8, @ptrCast(&out)))[0..remaining]);
@@ -55,14 +55,14 @@ pub fn subtractBytesUnsafe(dst: [*]u8, src: [*]const u8, len: usize, neg_offset:
 }
 
 /// Exact-length variant. Does not read past `src + len`.
-pub inline fn subtractBytes(dst: [*]u8, src: [*]const u8, len: usize, neg_offset: isize) void {
+pub inline fn subtractBytes(dst: [*]u8, src: [*]const u8, len: usize, match_offset: isize) void {
     const V16 = @Vector(16, u8);
     var d = dst;
     var s = src;
     var remaining = len;
     while (remaining >= 16) : (remaining -= 16) {
         const a: V16 = s[0..16].*;
-        const back_ptr: [*]const u8 = ptr_math.offsetPtr([*]const u8, s, neg_offset);
+        const back_ptr: [*]const u8 = ptr_math.offsetPtr([*]const u8, s, match_offset);
         const b: V16 = back_ptr[0..16].*;
         const out: V16 = a -% b;
         d[0..16].* = out;
@@ -71,7 +71,7 @@ pub inline fn subtractBytes(dst: [*]u8, src: [*]const u8, len: usize, neg_offset
     }
     var i: usize = 0;
     while (i < remaining) : (i += 1) {
-        const back_ptr: [*]const u8 = ptr_math.offsetPtr([*]const u8, s, neg_offset);
+        const back_ptr: [*]const u8 = ptr_math.offsetPtr([*]const u8, s, match_offset);
         d[i] = s[i] -% back_ptr[i];
     }
 }
@@ -615,7 +615,7 @@ test "subtractBytes matches scalar computation" {
     var dst: [32]u8 = @splat(0);
     const src_offset: usize = 20;
     const src_cursor: [*]const u8 = src_buf[src_offset..].ptr;
-    // neg_offset = -8: subtract src[i-8] from src[i]
+    // match_offset = -8: subtract src[i-8] from src[i]
     subtractBytes(&dst, src_cursor, 16, -8);
 
     var expected: [16]u8 = undefined;
@@ -723,7 +723,7 @@ test "writeLzOffsetBits legacy path: direct BitWriter roundtrip" {
     // pair (BitWriter64Forward + BitReader.readDistance) works for the
     // legacy offset formula. Passes when the bit-level encode/decode
     // pair is correct.
-    const bit_reader_mod = @import("../io/BitReader.zig");
+    const bit_reader_mod = @import("../io/bit_reader.zig");
 
     const offset: u32 = 200;
     const bsr: u32 = std.math.log2_int(u32, offset + lz_constants.offset_bias_constant);
@@ -746,7 +746,7 @@ test "writeLzOffsetBits legacy path: direct BitWriter roundtrip" {
 }
 
 test "writeLzOffsetBits legacy path: full function roundtrip" {
-    const bit_reader_mod = @import("../io/BitReader.zig");
+    const bit_reader_mod = @import("../io/bit_reader.zig");
 
     const offset: u32 = 200;
     const bsr: u32 = std.math.log2_int(u32, offset + lz_constants.offset_bias_constant);
@@ -786,7 +786,7 @@ test "writeLzOffsetBits legacy path: two near offsets (fwd + bwd)" {
     // Two offsets trigger the alternating forward/backward write path.
     // Index 0 goes to forward, index 1 goes to backward. flag_ignore_u32_length
     // is still true so there's no count header competing for bits_b.
-    const bit_reader_mod = @import("../io/BitReader.zig");
+    const bit_reader_mod = @import("../io/bit_reader.zig");
 
     const off0: u32 = 200;
     const off1: u32 = 310;
@@ -824,7 +824,7 @@ test "writeLzOffsetBits legacy path: one offset with length-count header" {
     // Add the backward length-count header (flag_ignore_u32_length = false,
     // u32_len_count = 0). This writes a single-bit `1` marker to bits_b
     // before the offset loop runs. Decoder reads the header first.
-    const bit_reader_mod = @import("../io/BitReader.zig");
+    const bit_reader_mod = @import("../io/bit_reader.zig");
 
     const offset: u32 = 200;
     const u8_desc: u8 = buildNearU8Desc(offset);
@@ -880,7 +880,7 @@ test "writeLzOffsetBits legacy path: 10 near offsets + count header" {
     // Scale up to 10 offsets — alternating forward/backward — while
     // still including the backward count header. This is the shape the
     // High codec emits for a realistic sub-chunk.
-    const bit_reader_mod = @import("../io/BitReader.zig");
+    const bit_reader_mod = @import("../io/bit_reader.zig");
 
     const raw_offsets: [10]u32 = .{ 200, 310, 450, 600, 800, 1100, 1500, 2000, 2800, 4000 };
     var u8_offs: [10]u8 = undefined;
@@ -944,7 +944,7 @@ test "writeLzOffsetBits legacy path: 4 offsets + 2 u32_len overflows" {
     // L9/L11 roundtrip desyncs in practice. The decoder reads lengths
     // via `readLengthBackward` (index 1) and `readLength` (index 0)
     // alternating, after the offset stream has been consumed.
-    const bit_reader_mod = @import("../io/BitReader.zig");
+    const bit_reader_mod = @import("../io/bit_reader.zig");
 
     const raw_offsets: [4]u32 = .{ 200, 310, 450, 600 };
     var u8_offs: [4]u8 = undefined;
@@ -1028,7 +1028,7 @@ test "writeLzOffsetBits legacy path: 50 offsets + 20 u32_len overflows" {
     // writeLzOffsetBits' multi-write composition — it's upstream (in
     // assembleCompressedOutput's stream ordering) or downstream (in the
     // decoder's read position after literal/cmd/offs/len streams).
-    const bit_reader_mod = @import("../io/BitReader.zig");
+    const bit_reader_mod = @import("../io/bit_reader.zig");
 
     var raw_offsets: [50]u32 = undefined;
     var u8_offs: [50]u8 = undefined;

@@ -20,7 +20,7 @@ pub const BitReaderState = struct {
 };
 
 /// Secondary byte-aligned reader used by Golomb-Rice decoding.
-pub const BitReader2 = struct {
+pub const GolombRiceBitReader = struct {
     p: [*]const u8,
     p_end: [*]const u8,
     bit_pos: u32,
@@ -173,7 +173,7 @@ pub fn bitReaderReadFluff(br: *BitReaderState, num_symbols: u32) u32 {
 // ────────────────────────────────────────────────────────────
 
 /// Decodes Golomb-Rice run lengths from a bit stream.
-pub fn decodeGolombRiceLengths(dst_buf: [*]u8, size: usize, br: *BitReader2) DecodeError!void {
+pub fn decodeGolombRiceLengths(dst_buf: [*]u8, size: usize, br: *GolombRiceBitReader) DecodeError!void {
     var p = br.p;
     const p_end = br.p_end;
     var dst = dst_buf;
@@ -227,7 +227,7 @@ pub fn decodeGolombRiceLengths(dst_buf: [*]u8, size: usize, br: *BitReader2) Dec
 /// Decodes additional Golomb-Rice precision bits (1, 2, or 3) and merges them
 /// into the length array. Uses SIMD-style bit unpacking (u64 bit manipulation
 /// tricks).
-pub fn decodeGolombRiceBits(dst_buf: [*]u8, size: usize, bitcount: u32, br: *BitReader2) DecodeError!void {
+pub fn decodeGolombRiceBits(dst_buf: [*]u8, size: usize, bitcount: u32, br: *GolombRiceBitReader) DecodeError!void {
     if (bitcount == 0) return;
 
     const dst_end = dst_buf + size;

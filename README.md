@@ -55,106 +55,86 @@ before running tests.
 ## Benchmarks
 
 Intel Core Ultra 9 285K (Arrow Lake-S), Windows 11, Zig 0.16 / LLVM 21,
-`-Doptimize=ReleaseFast`. Best of 3 runs.
+`-Doptimize=ReleaseFast`. Best of 30 decompress runs.
 
-### vs zstd and LZ4 (single-threaded, enwik8)
+### vs zstd and LZ4 (single-threaded, enwik8 100 MB)
 
 Single-threaded comparison. All compressors use full-stream mode (no block splitting).
 
 | Compressor | Ratio | Compress | Decompress |
 |-----------|-------|----------|------------|
-| LZ4       | 57.3% |     705 MB/s |  4,804 MB/s |
-| LZ4 HC 9  | 42.2% |    52.0 MB/s |  4,742 MB/s |
-| zstd 1    | 40.7% |     521 MB/s |  1,795 MB/s |
-| zstd 3    | 35.4% |     311 MB/s |  1,439 MB/s |
-| zstd 9    | 31.1% |    78.5 MB/s |  1,526 MB/s |
-| zstd 19   | 26.9% |     2.5 MB/s |  1,519 MB/s |
-| **SLZ L1**  | 54.9% |     404 MB/s |  **6,619 MB/s** |
-| **SLZ L3**  | 53.4% |    71.6 MB/s |  **3,992 MB/s** |
-| **SLZ L5**  | 43.4% |    39.4 MB/s |  **4,054 MB/s** |
-| **SLZ L6**  | 27.4% |     3.1 MB/s |  1,053 MB/s |
-| **SLZ L8**  | 25.5% |     0.9 MB/s |  1,054 MB/s |
-| **SLZ L9**  | 27.4% |     3.2 MB/s |  1,007 MB/s |
-| **SLZ L11** | 25.5% |     0.2 MB/s |    997 MB/s |
+| LZ4       | 57.7% |     689 MB/s |  5,022 MB/s |
+| LZ4 HC 9  | 42.2% |    48.0 MB/s |  4,835 MB/s |
+| zstd 1    | 40.9% |     466 MB/s |  1,796 MB/s |
+| zstd 3    | 35.9% |     310 MB/s |  1,464 MB/s |
+| zstd 9    | 31.8% |    80.1 MB/s |  1,547 MB/s |
+| zstd 19   | 28.3% |     2.8 MB/s |  1,498 MB/s |
+| **SLZ L1**  | 55.3% |     370 MB/s |  **6,769 MB/s** |
+| **SLZ L3**  | 53.6% |    73.1 MB/s |  **4,568 MB/s** |
+| **SLZ L5**  | 43.0% |    39.2 MB/s |  **4,505 MB/s** |
+| **SLZ L6**  | 28.6% |     3.3 MB/s |  1,072 MB/s |
+| **SLZ L8**  | 27.2% |     1.0 MB/s |  1,066 MB/s |
+| **SLZ L9**  | 28.6% |     3.4 MB/s |  1,026 MB/s |
+| **SLZ L11** | 27.2% |     0.3 MB/s |  1,020 MB/s |
 
-At the fast tier: SLZ L1 decompresses **3.7x faster** than zstd 1
-(6.6 vs 1.8 GB/s) and **1.4x faster** than LZ4 (6.6 vs 4.8 GB/s).
-SLZ L5 matches LZ4 HC 9's ratio (43.4% vs 42.2%) while decoding
-nearly as fast (4.1 vs 4.7 GB/s). At the best-ratio tier:
-SLZ L11 achieves 25.5% vs zstd 19's 26.9%.
+At the fast tier: SLZ L1 decompresses **3.8x faster** than zstd 1
+(6.8 vs 1.8 GB/s) and **1.3x faster** than LZ4 (6.8 vs 5.0 GB/s).
+SLZ L5 matches LZ4 HC 9's ratio (43.0% vs 42.2%) while decoding
+nearly as fast (4.5 vs 4.8 GB/s). At the best-ratio tier:
+SLZ L11 achieves 27.2% vs zstd 19's 28.3%.
 
 ### vs zstd and LZ4 (single-threaded, silesia 203 MB)
 
 | Compressor | Ratio | Compress | Decompress |
 |-----------|-------|----------|------------|
-| LZ4       | 47.4% |     961 MB/s |  5,102 MB/s |
-| LZ4 HC 9  | 36.6% |    55.2 MB/s |  5,102 MB/s |
-| zstd 1    | 34.4% |     699 MB/s |  2,010 MB/s |
-| zstd 3    | 31.1% |     428 MB/s |  1,765 MB/s |
-| zstd 9    | 27.8% |     109 MB/s |  1,892 MB/s |
-| zstd 19   | 24.8% |     3.9 MB/s |  1,737 MB/s |
-| **SLZ L1**  | 45.6% |     597 MB/s |  **6,902 MB/s** |
-| **SLZ L3**  | 45.5% |    83.9 MB/s |  **3,134 MB/s** |
-| **SLZ L5**  | 37.6% |    49.7 MB/s |  **4,420 MB/s** |
-| **SLZ L6**  | 24.9% |     4.6 MB/s |  1,304 MB/s |
-| **SLZ L8**  | 24.1% |     1.2 MB/s |  1,311 MB/s |
-| **SLZ L9**  | 24.9% |     4.8 MB/s |  1,257 MB/s |
-| **SLZ L11** | 24.1% |     0.3 MB/s |  1,234 MB/s |
+| LZ4       | 47.5% |     920 MB/s |  5,417 MB/s |
+| LZ4 HC 9  | 36.6% |    55.4 MB/s |  5,486 MB/s |
+| zstd 1    | 34.7% |     599 MB/s |  2,038 MB/s |
+| zstd 3    | 31.4% |     427 MB/s |  1,787 MB/s |
+| zstd 9    | 27.9% |     109 MB/s |  1,936 MB/s |
+| zstd 19   | 24.8% |     4.2 MB/s |  1,785 MB/s |
+| **SLZ L1**  | 45.8% |     515 MB/s |  **7,367 MB/s** |
+| **SLZ L3**  | 45.6% |    82.1 MB/s |  **3,443 MB/s** |
+| **SLZ L5**  | 37.6% |    49.3 MB/s |  **4,713 MB/s** |
+| **SLZ L6**  | 24.9% |     4.6 MB/s |  1,367 MB/s |
+| **SLZ L8**  | 24.3% |     1.2 MB/s |  1,418 MB/s |
+| **SLZ L9**  | 24.9% |     4.8 MB/s |  1,329 MB/s |
+| **SLZ L11** | 24.3% |     0.3 MB/s |  1,366 MB/s |
 
-### All levels (24 cores, enwik8)
+### All levels (24 cores, enwik8 100 MB)
 
-Full-speed numbers with all 24 cores. `streamlz -ba -r 3 --no-dict`.
+Full-speed numbers with all 24 cores. `streamlz -ba -r 30`.
 
 | Level | Compressed | Ratio | Compress | Decompress |
 |-------|------------|-------|----------|------------|
-| L1  | 58,635,288 | 58.6% | 4,515 MB/s | 31,550 MB/s |
-| L2  | 56,883,810 | 56.9% |    86 MB/s | 33,483 MB/s |
-| L3  | 56,523,932 | 56.5% |    82 MB/s | 30,431 MB/s |
-| L4  | 53,964,914 | 54.0% |    82 MB/s | 31,316 MB/s |
-| L5  | 43,377,247 | 43.4% |    40 MB/s | 10,084 MB/s |
-| L6  | 31,376,255 | 31.4% |    69 MB/s | 15,210 MB/s |
-| L7  | 31,299,037 | 31.3% |    51 MB/s | 15,193 MB/s |
-| L8  | 30,997,739 | 31.0% |    35 MB/s | 15,236 MB/s |
-| L9  | 27,430,880 | 27.4% |   7.6 MB/s |  2,051 MB/s |
-| L10 | 27,280,109 | 27.3% |   7.3 MB/s |  2,057 MB/s |
-| L11 | 25,550,460 | 25.6% |   1.3 MB/s |  2,019 MB/s |
+| L1  | 55,317,964 | 55.3% | 2,977 MB/s | 41,140 MB/s |
+| L2  | 54,389,843 | 54.4% |    82 MB/s | 27,788 MB/s |
+| L3  | 53,554,821 | 53.6% |    75 MB/s | 16,772 MB/s |
+| L4  | 50,884,428 | 50.9% |    65 MB/s |  9,795 MB/s |
+| L5  | 42,974,607 | 43.0% |    40 MB/s | 16,070 MB/s |
+| L6  | 30,024,917 | 30.0% |    44 MB/s | 12,253 MB/s |
+| L7  | 29,925,233 | 29.9% |    33 MB/s | 12,267 MB/s |
+| L8  | 29,602,506 | 29.6% |    19 MB/s | 12,582 MB/s |
+| L9  | 28,625,632 | 28.6% |   7.9 MB/s |  3,269 MB/s |
+| L10 | 28,489,882 | 28.5% |   7.6 MB/s |  3,673 MB/s |
+| L11 | 27,175,320 | 27.2% |   1.5 MB/s |  3,416 MB/s |
 
 L1 compress is parallel (SC, per-chunk workers); L2-L5 compress serial;
 L6-L11 compress parallel (High codec). All decompress is parallel:
 L1 SC group-parallel, L2-L5 sidecar parallel, L6-L8 SC group-parallel
 (adaptive group size), L9-L11 two-phase parallel.
 
-### All levels (24 cores, enwik9 — 1 GB)
+### All levels (24 cores, silesia 203 MB)
 
 | Level | Compressed | Ratio | Compress | Decompress |
 |-------|------------|-------|----------|------------|
-| L1  | 522,968,434 | 52.3% | 5,610 MB/s | 31,122 MB/s |
-| L2  | 507,756,352 | 50.8% |    82 MB/s | 30,608 MB/s |
-| L3  | 504,805,210 | 50.5% |    79 MB/s | 31,068 MB/s |
-| L4  | 483,591,236 | 48.4% |    81 MB/s | 31,167 MB/s |
-| L5  | 392,752,692 | 39.3% |    39 MB/s | 10,977 MB/s |
-| L6  | 277,816,941 | 27.8% |    83 MB/s | 17,932 MB/s |
-| L7  | 275,526,412 | 27.6% |    48 MB/s | 18,351 MB/s |
-| L8  | 272,710,834 | 27.3% |    33 MB/s | 19,025 MB/s |
-| L9  | 240,990,881 | 24.1% |   7.8 MB/s |  3,435 MB/s |
-| L10 | 237,327,055 | 23.7% |   7.4 MB/s |  3,524 MB/s |
-| L11 | 205,685,427 | 20.6% |   0.9 MB/s |  2,493 MB/s |
-
-### All levels (24 cores, silesia — 203 MB)
-
-| Level | Compressed | Ratio | Compress | Decompress |
-|-------|------------|-------|----------|------------|
-| L1  | 100,278,034 | 47.1% | 5,937 MB/s | 33,982 MB/s |
-| L2  |  98,521,402 | 46.3% |   110 MB/s | 33,011 MB/s |
-| L3  |  98,112,746 | 46.1% |   103 MB/s | 32,981 MB/s |
-| L4  |  94,748,347 | 44.5% |   102 MB/s | 34,128 MB/s |
-| L5  |  79,927,683 | 37.6% |    50 MB/s | 10,717 MB/s |
-| L6  |  56,843,696 | 26.7% |    89 MB/s | 18,923 MB/s |
-| L7  |  56,669,194 | 26.6% |    42 MB/s | 18,817 MB/s |
-| L8  |  55,938,668 | 26.3% |    26 MB/s | 19,747 MB/s |
-| L9  |  52,915,951 | 24.9% |    12 MB/s |  2,480 MB/s |
-| L10 |  52,678,794 | 24.8% |    11 MB/s |  2,831 MB/s |
-| L11 |  51,331,020 | 24.1% |   3.1 MB/s |  3,259 MB/s |
+| L1  |  97,488,921 | 45.8% | 3,435 MB/s | 35,412 MB/s |
+| L3  |  97,082,439 | 45.6% |    82 MB/s |  6,567 MB/s |
+| L5  |  79,945,494 | 37.6% |    49 MB/s | 11,850 MB/s |
+| L6  |  53,858,094 | 25.3% |    41 MB/s | 14,587 MB/s |
+| L8  |  52,831,020 | 24.8% |    13 MB/s | 13,555 MB/s |
+| L9  |  53,010,373 | 24.9% |    11 MB/s |  2,925 MB/s |
+| L11 |  51,638,057 | 24.3% |   3.5 MB/s |  3,258 MB/s |
 
 ---
 

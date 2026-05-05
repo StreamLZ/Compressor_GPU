@@ -1,4 +1,6 @@
 //! Centralized magic numbers for the StreamLZ codec family.
+//!
+//! Terminology: "sc" / "SC" = "self-contained" throughout this module.
 
 // ────────────────────────────────────────────────────────────
 //  Chunk and buffer sizing

@@ -166,8 +166,8 @@ pub fn findMatchesBT4(
 ///
 /// Uses two pointer variables (`leftNodePtr`, `rightNodePtr`)
 /// that each point to either `left[k]` or `right[k]` for some node k,
-/// tracking "where we would write the next descended child". This port
-/// models the same state with (index, which_array) pairs.
+/// tracking "where we would write the next descended child". This
+/// implementation models the same state with (index, which_array) pairs.
 fn bt4SearchAndInsert(
     src: []const u8,
     pos: u32,
@@ -198,9 +198,12 @@ fn bt4SearchAndInsert(
     // The two bools use the SAME semantics as `writeRef`'s `in_left`
     // parameter: `true` → slot is in `left[*_ref]`, `false` → slot is in
     // `right[*_ref]`. This lets both refs share the same writeRef call
-    // signature without per-side inversion (an earlier port version used
+    // signature without per-side inversion (an earlier version used
     // inverted bools for the right side and silently clobbered its own
     // child pointer during termination).
+    //
+    // Invariant: each bool tracks WHICH array (left/right) the dangling slot lives in,
+    // so writeRef can patch the correct parent pointer when the descent terminates.
     var left_ref: usize = pos;
     var right_ref: usize = pos;
     var left_ref_in_left: bool = true;
@@ -209,22 +212,22 @@ fn bt4SearchAndInsert(
     left[left_ref] = 0;
     right[right_ref] = 0;
 
-    var match_len_left: u32 = 0;
-    var match_len_right: u32 = 0;
+    var ml_left: u32 = 0;
+    var ml_right: u32 = 0;
     var num_found: u32 = 0;
     var best_len: u32 = 3;
 
     var depth: u32 = 0;
     while (depth < max_depth and cur_match >= 0) : (depth += 1) {
         const cur: u32 = @intCast(cur_match);
-        const common_len: u32 = @min(match_len_left, match_len_right);
+        const common_len: u32 = @min(ml_left, ml_right);
         const max_len_a: u32 = src_safe - pos;
         const max_len_b: u32 = src_safe - cur;
         const max_len: u32 = @min(max_len_a, max_len_b);
         if (max_len <= common_len) break;
 
         // Extend from `common_len`. 8-byte XOR + TZCNT tail.
-        var match_len: u32 = common_len;
+        var ml: u32 = common_len;
         var remain: u32 = max_len - common_len;
         var pa: usize = @as(usize, pos) + common_len;
         var pb: usize = @as(usize, cur) + common_len;
@@ -234,29 +237,29 @@ fn bt4SearchAndInsert(
             const b: u64 = std.mem.readInt(u64, src[pb..][0..8], .little);
             const diff: u64 = a ^ b;
             if (diff != 0) {
-                match_len += @intCast(@ctz(diff) >> 3);
+                ml += @intCast(@ctz(diff) >> 3);
                 done_extend = true;
                 break;
             }
             pa += 8;
             pb += 8;
-            match_len += 8;
+            ml += 8;
             remain -= 8;
         }
         if (!done_extend) {
             while (remain > 0 and src[pa] == src[pb]) {
                 pa += 1;
                 pb += 1;
-                match_len += 1;
+                ml += 1;
                 remain -= 1;
             }
         }
 
-        if (match_len > best_len) {
-            best_len = match_len;
+        if (ml > best_len) {
+            best_len = ml;
             if (matches.len > 0) {
                 if (num_found < max_matches) {
-                    matches[num_found].set(@intCast(match_len), @intCast(pos - cur));
+                    matches[num_found].set(@intCast(ml), @intCast(pos - cur));
                     num_found += 1;
                 } else if (num_found > 0) {
                     // Replace shortest (linear scan; max_matches is small).
@@ -265,13 +268,13 @@ fn bt4SearchAndInsert(
                     while (k < num_found) : (k += 1) {
                         if (matches[k].length < matches[worst_idx].length) worst_idx = k;
                     }
-                    if (@as(i32, @intCast(match_len)) > matches[worst_idx].length) {
-                        matches[worst_idx].set(@intCast(match_len), @intCast(pos - cur));
+                    if (@as(i32, @intCast(ml)) > matches[worst_idx].length) {
+                        matches[worst_idx].set(@intCast(ml), @intCast(pos - cur));
                     }
                 }
             }
 
-            if (match_len >= max_len) {
+            if (ml >= max_len) {
                 // Suffix exhausted: splice cur's children into our refs.
                 writeRef(left, right, left_ref, left_ref_in_left, left[cur]);
                 writeRef(left, right, right_ref, right_ref_in_left, right[cur]);
@@ -280,19 +283,19 @@ fn bt4SearchAndInsert(
         }
 
         // Decide direction by the first mismatched byte.
-        const go_left: bool = src[@as(usize, pos) + match_len] < src[@as(usize, cur) + match_len];
+        const go_left: bool = src[@as(usize, pos) + ml] < src[@as(usize, cur) + ml];
         if (go_left) {
             // cur becomes our right-side subtree root; descend into cur.left.
             writeRef(left, right, right_ref, right_ref_in_left, cur + 1);
             right_ref = cur;
             right_ref_in_left = true; // right_ref now lives in left[cur]
-            match_len_right = match_len;
+            ml_right = ml;
             cur_match = @as(i64, left[cur]) - 1;
         } else {
             writeRef(left, right, left_ref, left_ref_in_left, cur + 1);
             left_ref = cur;
             left_ref_in_left = false; // left_ref now lives in right[cur]
-            match_len_left = match_len;
+            ml_left = ml;
             cur_match = @as(i64, right[cur]) - 1;
         }
     }

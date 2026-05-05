@@ -1,6 +1,8 @@
 //! High codec frame builder — produces SLZ1-framed blocks for High
 //! levels L6-L11.
 //!
+//! Terminology: "sc" / "SC" = "self-contained" throughout this module.
+//!
 //! Extracted from `streamlz_encoder.zig` to isolate the High-codec
 //! frame construction (serial paths) from the top-level dispatch,
 //! the Fast-codec path, and the parallel dispatch.  Public entry
@@ -52,8 +54,7 @@ pub fn mapHighLevel(user_level: u8) HighMapping {
     };
 }
 
-/// High-codec framed compressor --
-/// `CompressBlocksSerial` / `CompressOneBlock` / `CompressChunk`.
+/// Adaptive SC group size from input length.
 /// Initial scope: serial, no SC prefix table emission (treats L6-L8
 /// as non-SC for now). Full SC parity layers on in a follow-up.
 pub fn computeAdaptiveGroupSize(src_len: usize) u8 {
@@ -111,8 +112,8 @@ pub fn compressFramedHigh(
     const ctx: high_encoder.HighEncoderContext = .{
         .allocator = allocator,
         .compression_level = mapping.codec_level,
-        // SetupEncoder:
-        //   SpeedTradeoff = SpaceSpeedTradeoffBytes * Factor1 * Factor2
+        // High codec speed tradeoff:
+        //   speed_tradeoff = space_speed_tradeoff_bytes * factor1 * factor2
         // The Fast codec uses a different formula (scale * entropy_factor)
         // which would produce a speed_tradeoff ~5.6x too high here and
         // silently corrupt every cost-model comparison.
@@ -538,8 +539,7 @@ pub fn compressOneFrameBlockWindowed(
     pos_ptr.* = pos;
 }
 
-/// Appends the SC per-chunk first-8-bytes prefix table. Matches
-/// `StreamLzCompressor.AppendSelfContainedPrefixTable`. `src` should be
+/// Appends the SC per-chunk first-8-bytes prefix table. `src` should be
 /// empty (zero-length slice) in non-SC paths to no-op.
 pub fn emitScPrefixTable(src: []const u8, dst: []u8, pos_ptr: *usize) CompressError!void {
     if (src.len == 0) return;

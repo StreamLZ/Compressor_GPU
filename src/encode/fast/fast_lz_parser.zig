@@ -1,5 +1,4 @@
-//! Greedy Fast LZ parser. Direct port of `FastParser.RunGreedyParser` in
-//! src/StreamLZ/Compression/Fast/FastParser.cs.
+//! Greedy Fast LZ parser.
 //! Used by: Fast codec (L1-L5)
 //!
 //! Hot-loop design:
@@ -19,7 +18,7 @@ const std = @import("std");
 const fast_constants = @import("fast_constants.zig");
 const FastMatchHasher = @import("fast_match_hasher.zig").FastMatchHasher;
 const match_hasher = @import("../match_hasher.zig");
-const writer_mod = @import("FastStreamWriter.zig");
+const writer_mod = @import("fast_stream_writer.zig");
 const token_writer = @import("fast_token_writer.zig");
 const ptr_math = @import("../../io/ptr_math.zig");
 
@@ -131,14 +130,14 @@ pub fn runGreedyParser(
         if (bytes_at_cursor == candidate_word) {
             const offset_candidate: u32 = cur_pos_t -% stored_pos_t;
             if (offset_candidate >= 8 and offset_candidate <= cur_pos_in_window) {
-                const match_len_raw: usize = @intFromPtr(
+                const ml_raw: usize = @intFromPtr(
                     token_writer.extendMatchForward(source_cursor + 4, safe_source_end, -@as(isize, @intCast(offset_candidate))),
                 ) - @intFromPtr(source_cursor);
                 const log2_idx: u5 = @intCast(@clz(offset_candidate));
-                if (match_len_raw >= min_match_length_table[log2_idx]) {
+                if (ml_raw >= min_match_length_table[log2_idx]) {
                     offset_or_recent = offset_candidate;
                     current_offset = -@as(isize, @intCast(offset_candidate));
-                    match_end = source_cursor + match_len_raw;
+                    match_end = source_cursor + ml_raw;
                     emitMatch(T, level, w, token_writer, hash_table, hash_mult, hash_shift, window_base, &source_cursor, &literal_start, &recent_offset, match_end, offset_or_recent, current_offset);
                     if (@intFromPtr(source_cursor) + 5 >= @intFromPtr(safe_source_end)) break :outer;
                     continue :outer;
@@ -192,8 +191,7 @@ pub fn runGreedyParser(
 //  Lazy-parser helpers
 // ────────────────────────────────────────────────────────────
 
-/// Count matching bytes 8-then-4 wide, starting at `p`. Port of
-/// `MatchEvaluation.CountMatchingBytes`. Returns how many bytes past `p`
+/// Count matching bytes 8-then-4 wide, starting at `p`. Returns how many bytes past `p`
 /// continue to match the source at `p - offset`. `offset` is positive.
 inline fn countMatchingBytes(p: [*]const u8, p_end: [*]const u8, offset: usize) usize {
     var cur = p;
@@ -231,7 +229,6 @@ inline fn countMatchingBytes(p: [*]const u8, p_end: [*]const u8, offset: usize) 
 }
 
 /// Is `(match_length, match_offset)` better than `(best_length, best_offset)`?
-/// Straight port of `Matcher.IsMatchBetter`.
 inline fn isMatchBetter(match_length: i32, match_offset: i32, best_length: i32, best_offset: i32) bool {
     if (match_length == best_length) return match_offset < best_offset;
     if ((match_offset <= 0xffff) == (best_offset <= 0xffff)) return match_length > best_length;
@@ -313,7 +310,7 @@ inline fn isLazyMatchBetter(cand: LengthAndOffset, current: LengthAndOffset, ste
 }
 
 /// Hash-based match finder used by the lazy parser. `comptime num_hash` is
-/// the bucket width (2 for L3). Direct port of `Matcher.FindMatchWithHasher`.
+/// the bucket width (2 for L3).
 ///
 /// `next_cursor_ptr` is where the caller wants the hasher to prefetch next —
 /// usually `source_cursor + 1` so the next parser iteration finds the hash
@@ -327,7 +324,7 @@ pub fn findMatchWithHasher(
     hasher: *match_hasher.MatchHasher(num_hash),
     next_cursor_ptr: [*]const u8,
     dictionary_size: u32,
-    minimum_match_length_in: u32,
+    initial_min_match_length: u32,
     min_match_length_table: *const [32]u32,
 ) LengthAndOffset {
     const hp = hasher.getHashPos(source_cursor);
@@ -340,13 +337,13 @@ pub fn findMatchWithHasher(
     const xor_value: u32 = recent_word ^ bytes_at_source;
     if (xor_value == 0) {
         const ext_end = token_writer.extendMatchForward(source_cursor + 4, safe_source_end, recent_offset);
-        const match_len: usize = 4 + (@intFromPtr(ext_end) - @intFromPtr(source_cursor + 4));
+        const ml: usize = 4 + (@intFromPtr(ext_end) - @intFromPtr(source_cursor + 4));
         hasher.insert(hp);
-        return .{ .length = @intCast(match_len), .offset = 0 };
+        return .{ .length = @intCast(ml), .offset = 0 };
     }
     var recent_match_length: i32 = @intCast(@as(u32, @ctz(xor_value)) >> 3);
 
-    var minimum_match_length: i32 = @intCast(minimum_match_length_in);
+    var minimum_match_length: i32 = @intCast(initial_min_match_length);
     if (@intFromPtr(source_cursor) - @intFromPtr(literal_start) >= 64) {
         if (recent_match_length < 3) recent_match_length = 0;
         minimum_match_length += 1;
@@ -417,9 +414,8 @@ pub fn findMatchWithHasher(
     return .{ .length = best_match_length, .offset = best_offset };
 }
 
-/// Lazy parser driving a `MatchHasher(num_hash)` — port of
-/// `FastParser.RunLazyParser`. Emits directly to the supplied writer; on
-/// return, trailing literals have been copied.
+/// Lazy parser driving a `MatchHasher(num_hash)`. Emits directly to the
+/// supplied writer; on return, trailing literals have been copied.
 ///
 /// `engine_level` selects the lazy depth:
 ///   * <= 1 → lazy-1 only (user level 3)
@@ -554,7 +550,6 @@ pub fn runLazyParser(
 
 /// Hash-based match finder that walks the firstHash chain, optionally
 /// dereferences the longHash secondary table, and falls back to offset 8.
-/// Port of `Matcher.FindMatchWithChainHasher`.
 pub fn findMatchWithChainHasher(
     source_cursor: [*]const u8,
     safe_source_end: [*]const u8,
@@ -563,7 +558,7 @@ pub fn findMatchWithChainHasher(
     hasher: *match_hasher.MatchHasher2,
     next_cursor_ptr: [*]const u8,
     dictionary_size: u32,
-    minimum_match_length_in: u32,
+    initial_min_match_length: u32,
     min_match_length_table: *const [32]u32,
 ) LengthAndOffset {
     const hp = hasher.getHashPos(source_cursor);
@@ -576,13 +571,13 @@ pub fn findMatchWithChainHasher(
     const xor_value: u32 = recent_word ^ bytes_at_source;
     if (xor_value == 0) {
         const ext_end = token_writer.extendMatchForward(source_cursor + 4, safe_source_end, recent_offset);
-        const match_len: usize = 4 + (@intFromPtr(ext_end) - @intFromPtr(source_cursor + 4));
+        const ml: usize = 4 + (@intFromPtr(ext_end) - @intFromPtr(source_cursor + 4));
         hasher.insert(hp);
-        return .{ .length = @intCast(match_len), .offset = 0 };
+        return .{ .length = @intCast(ml), .offset = 0 };
     }
     var recent_match_length: i32 = @intCast(@as(u32, @ctz(xor_value)) >> 3);
 
-    var minimum_match_length: i32 = @intCast(minimum_match_length_in);
+    var minimum_match_length: i32 = @intCast(initial_min_match_length);
     if (@intFromPtr(source_cursor) - @intFromPtr(literal_start) >= 64) {
         if (recent_match_length < 3) recent_match_length = 0;
         minimum_match_length += 1;
@@ -725,9 +720,8 @@ pub fn findMatchWithChainHasher(
     return .{ .length = best_match_length, .offset = best_offset };
 }
 
-/// Lazy parser driving a `MatchHasher2` chain hasher — port of
-/// `FastParser.RunLazyParserChainHasher`. Handles both lazy-1 and lazy-2
-/// evaluation based on `engine_level` (>3 enables lazy-2).
+/// Lazy parser driving a `MatchHasher2` chain hasher. Handles both lazy-1
+/// and lazy-2 evaluation based on `engine_level` (>3 enables lazy-2).
 pub fn runLazyParserChain(
     comptime engine_level: i32,
     w: *FastStreamWriter,

@@ -1,6 +1,5 @@
 //! FastStreamWriter — the parallel-stream output buffer used by the Fast
-//! parser during a single sub-chunk encode. Port of `FastStreamWriter` in
-//! src/StreamLZ/Compression/Fast/Encoder.cs.
+//! parser during a single sub-chunk encode.
 //! Used by: Fast codec (L1-L5)
 //!
 //! The parser emits six streams in parallel:

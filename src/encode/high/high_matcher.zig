@@ -56,18 +56,17 @@ pub fn getBestMatch(
     recents: *const HighRecentOffs,
     src: [*]const u8,
     src_end: [*]const u8,
-    min_match_len_in: i32,
+    initial_min_match_len: i32,
     literals_since_last_match: i32,
     window_base: [*]const u8,
     max_match_offset: i32,
 ) LengthAndOffset {
-    var min_match_len = min_match_len_in;
+    var min_match_len = initial_min_match_len;
     const m32: u32 = std.mem.readInt(u32, src[0..4], .little);
 
     var best_ml: i32 = 0;
     var best_offs: i32 = 0;
 
-    // Recent offsets (slots 4, 5, 6 in the 8-entry HighRecentOffs ring).
     {
         const ml_raw = match_eval.getMatchLengthQuick(src, recents.offs[4], src_end, m32);
         const ml: i32 = @intCast(ml_raw);

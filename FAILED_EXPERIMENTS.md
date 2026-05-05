@@ -1437,3 +1437,203 @@ barely benefits from referencing positions 64+ MB back.
 
 **Disposition**: Not adopted. Would need to be a per-level config
 option. May revisit if L11 speed becomes a priority.
+
+---
+
+## XOR-mask branchless repeat-offset selection (Lizard/LZ5 style) (2026-05-01)
+
+**Context**: Lizard/LZ5 uses a branchless XOR-and-mask pattern for
+repeat-offset selection instead of CMOV. The current Fast decoder hot
+loop uses Zig's `if (use_new_dist) candidate else recent` which compiles
+to a CMOV. Hypothesis: the XOR approach avoids CMOV's false data
+dependency on both source operands, breaking the serial dependency chain.
+
+**Change**: Replaced CMOV-style offset selection in both the fast inner
+loop and safe tail loop:
+
+```zig
+// Before (CMOV):
+recent_offs = if (use_new_dist) candidate_offs else recent_offs;
+
+// After (XOR-mask):
+const dist_mask: i64 = -@as(i64, @intFromBool(use_new_dist));
+recent_offs ^= (recent_offs ^ candidate_offs) & dist_mask;
+```
+
+When `use_new_dist` is true, mask = -1 (all bits set), so
+`recent_offs ^ (recent_offs ^ candidate_offs) = candidate_offs`.
+When false, mask = 0, so `recent_offs ^= 0` = no change.
+
+**Results** (enwik8 100 MB, L1, t1, 30 runs):
+
+| Variant | Decompress median |
+|---------|-------------------|
+| Baseline (CMOV) | **836.2 MB/s** |
+| XOR-mask | 819.8 MB/s |
+| **Delta** | **-2.0%** |
+
+**Why it failed**: On modern Intel (Arrow Lake, Ice Lake), CMOV is a
+single-cycle single-µop instruction. The XOR-mask pattern requires 3
+ALU operations (XOR, AND, XOR) even though each is single-cycle. The
+serial dependency depth is the same (each iteration's `recent_offs`
+still depends on the previous), so the extra µops just add frontend
+pressure without breaking any dependency chain. The "false dependency"
+issue that motivated this trick on older architectures (pre-Broadwell)
+was fixed in Intel's microarchitecture years ago — modern CMOV reads
+the condition flags and only the selected operand.
+
+**Disposition**: Not adopted. CMOV is optimal for this pattern on any
+CPU from Broadwell onwards. The Lizard XOR trick was designed for
+architectures where CMOV had higher latency or stalled on both inputs.
+
+---
+
+## Adaptive L1 SC group sizing (2026-04-30)
+
+**Context**: L6-L8 use adaptive SC (self-contained) group sizing based
+on input characteristics. L1 uses a fixed group_size=4 (4 sub-chunks
+per SC group = ~256 KB). Hypothesis: adapting the group size for L1
+based on file size or match distribution could improve parallel decode
+scaling, especially on bandwidth-limited systems.
+
+**Implementation**: Added adaptive group sizing logic to the L1 encoder
+in `fast_framed.zig`, selecting group_size based on input size and
+compression characteristics (larger groups for larger files, smaller
+groups for better parallelism on small files).
+
+**Results**: Benchmarked on both Arrow Lake desktop and Ice Lake laptop
+(Surface Book 3, i7-1065G7). No measurable benefit on either machine
+across L1 t1-t8 scaling tests on enwik8 100 MB.
+
+**Why it didn't help**: The fixed group_size=4 already provides good
+parallel granularity. Each 256 KB group is small enough for fine-grained
+work distribution across cores, and large enough to amortize the SC
+boundary overhead (8-byte initial copy, sidecar closure). The
+bottleneck for L1 parallel scaling is DRAM bandwidth (confirmed by
+VTune: 86.7% DRAM Bandwidth Bound at 10+ threads on Arrow Lake),
+not work distribution granularity. Changing group sizes doesn't move
+more data through the memory bus.
+
+On the Ice Lake laptop (16 GB LPDDR4x, ~34 GB/s peak), L1 decompress
+scales 3.1x from t1→t8 and plateaus — purely bandwidth-limited.
+Group sizing can't help when the ceiling is memory throughput.
+
+**Disposition**: Reverted on both machines. Fixed group_size=4 is
+correct for L1.
+
+---
+
+## N-gram forward scatter / substitution for High codec decode speed (2026-05-01)
+
+**Context**: VTune showed L9-L11 decompress bottlenecked on match copy
+cache misses — large-offset matches hit cold L3/DRAM. The idea: if
+common 4-grams like " the" appear hundreds of thousands of times,
+pre-writing them to the output buffer (or eliminating them from the
+token stream) could save the decoder from doing expensive random
+backward-reference loads.
+
+Greedy non-overlapping 4-gram analysis on enwik8 100 MB confirmed a
+strong pareto distribution: top 10 patterns cover 11.4% of output,
+top 100 cover 28.5%.
+
+### Three approaches tested, all failed
+
+**Approach 1: Zero-substitution pre-filter (replace 4-grams with 0x00)**
+
+Replace each occurrence of the top 5 4-grams with `0x00000000` in the
+input, then compress. The zeros are equally matchable — hypothesis was
+that uniform zeros would compress tighter.
+
+Results (enwik8 100 MB, L9, all threads):
+
+| Variant | Compressed | Ratio | Decompress |
+|---------|-----------|-------|------------|
+| Original | 28,624,068 | 28.62% | 526 MB/s |
+| Zero-sub top 5 | 28,704,697 | 28.70% | 523 MB/s |
+
+Ratio 0.1pp **worse**, decompress unchanged. The zeros fragment natural
+long matches ("in the morning" becomes "in \x00\x00\x00\x00morning" —
+two tokens instead of one). The LZ compressor was already encoding
+" the" as cheap match tokens; replacing with zeros doesn't eliminate
+any tokens, just changes what gets matched.
+
+**Approach 2: Byte-stripping with position sidecar (remove 4-grams entirely)**
+
+Actually remove the 4-gram bytes from the input (shrinking it), store
+pattern → position-list in a sidecar, decompress shorter data, then
+expand by inserting patterns at recorded positions via a merge pass.
+
+Results (enwik8 100 MB, L9, top 10 patterns, all threads):
+
+| Metric | Original | Stripped + sidecar |
+|--------|----------|-------------------|
+| Compressed + sidecar | 28,624,068 | 32,005,754 |
+| Ratio | 28.62% | **32.01%** |
+
+**15% worse.** Removing 8.5% of input only shrunk the compressed output
+by 981 KB, but the sidecar storing 2.1M position entries cost 4.4 MB
+(delta-varint). Even after entropy-coding the sidecar with zstd-19,
+it was still 2.8 MB — 3x more than the compression savings.
+
+The fundamental problem: LZ already handles repeated 4-grams efficiently
+as cheap match tokens. The position metadata to reconstruct them costs
+far more than what the LZ compressor saves from processing fewer bytes.
+
+**Approach 3: Single-byte substitution (BPE-style, best approach)**
+
+Replace each top-N 4-gram with a single byte in the range 156-255 (100
+substitution codes). Byte 155 is an escape for natural high-byte values.
+Each substitution saves 3 bytes (4 → 1). The "sidecar" is just a 40-400
+byte mapping table.
+
+Results (enwik8 100 MB, L9 and L11):
+
+| Variant | L9 ratio | L9 decomp (best) | L11 ratio | L11 decomp (best) |
+|---------|----------|------------------|-----------|-------------------|
+| Original | 28.62% | 172.4 ms | 27.17% | 165.3 ms |
+| Sub-10 | **28.48%** | 172.7 ms | 27.20% | 168.5 ms |
+| Sub-100 | 28.81% | 166.3 ms | 27.65% | 164.7 ms |
+
+Ratio: L9 sub-10 improves by 0.14pp. But L11 sub-10 is 0.03pp worse —
+the BT4 optimal parser loses more from substitution bytes disrupting
+match contexts. Sub-100 hurts ratio at both levels because 100 different
+high-byte codes increase entropy.
+
+**Decompress speed is virtually identical across all variants.** The
+decoder takes ~165-173ms regardless of whether the output is 82 MB or
+100 MB. The bottleneck is token processing (resolve + execute), not
+raw output bytes. Substitution doesn't reduce the token count — the
+compressor matches the substitution bytes just like it matched the
+original 4-grams, producing roughly the same number of tokens.
+
+Compress speed improved 10-21% (fewer bytes to parse), but this is
+the wrong side of the tradeoff — users of L9-L11 care about decode
+speed, not encode speed.
+
+### Why all approaches fail
+
+The core insight: **the LZ compressor already handles repeated 4-grams
+optimally.** Each occurrence of " the" is encoded as a small match token
+(a few bytes). Pre-processing to remove, replace, or substitute these
+patterns doesn't reduce the number of tokens the decoder must process —
+it just changes what those tokens reference.
+
+The High codec decode bottleneck is the **token resolve/execute pipeline**
+(carousel walk, offset/length decode, match copy), not the volume of
+output bytes or the content of match sources. Any preprocessing that
+doesn't reduce the token count won't help decode speed.
+
+To actually reduce token count, you'd need to change the LZ format
+itself — e.g., a new token type meaning "emit this dictionary entry"
+that's cheaper to decode than a match token. That's a format-level
+change, not a preprocessor.
+
+**Disposition**: All three approaches abandoned. The n-gram analysis
+itself is solid (strong pareto, 28.5% coverage from 100 patterns), but
+there's no way to exploit it that beats what the LZ compressor already
+does. The 4-gram frequency data is preserved in `ngram.md` for future
+reference.
+
+Escape overhead on enwik8: only 0.52% of bytes are >= 155, confirming
+the substitution range is safe for text. Binary data would have much
+higher escape rates.

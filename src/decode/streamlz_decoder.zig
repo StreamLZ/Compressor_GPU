@@ -1,5 +1,7 @@
 //! Top-level StreamLZ framed decompressor.
 //!
+//! Terminology: "sc" / "SC" = "self-contained" throughout this module.
+//!
 //! Handles the framed decompress loop and inner block dispatcher.
 //!
 //! Current coverage:
@@ -18,6 +20,12 @@ const parallel = @import("decompress_parallel.zig");
 /// Extra bytes the decoder is allowed to write past `dst_len`.
 pub const safe_space = constants.safe_space;
 
+/// Maximum content size the decoder will accept from a frame header.
+/// Protects against malicious headers claiming absurd sizes (e.g. 281 TB)
+/// that would cause OOM before any real decompression begins. Callers
+/// needing larger outputs should stream in chunks.
+pub const max_content_size: u64 = 4 * 1024 * 1024 * 1024; // 4 GB
+
 pub const DecompressError = error{
     BadFrame,
     Truncated,
@@ -30,6 +38,7 @@ pub const DecompressError = error{
     ChecksumMismatch,
     ChunkSizeMismatch,
     UnknownDictionary,
+    ContentSizeTooLarge,
 } || fast.DecodeError || high.DecodeError || std.mem.Allocator.Error || std.Thread.CpuCountError;
 
 /// Streams `src` (an SLZ1-framed buffer) into `dst`, returning the number
@@ -175,6 +184,7 @@ fn decompressOneFrame(
     const hdr = frame.parseHeader(src) catch return error.BadFrame;
 
     if (hdr.content_size) |cs| {
+        if (cs > max_content_size) return error.ContentSizeTooLarge;
         const needed: usize = @intCast(cs + safe_space);
         // Extra space for dictionary prefix (matches are resolved
         // relative to dict + output, then the prefix is stripped).
@@ -958,7 +968,7 @@ test "decompressStream enforces max_decompressed_size cap" {
 }
 
 test "encoder sets RestartDecoder flag on first internal block header" {
-    // Port parity check for A9: the encoder writes `keyframe` = true for
+    // Parity check for A9: the encoder writes `keyframe` = true for
     // the first 256 KB block inside a frame, which sets bit 6 of the
     // 2-byte internal block header (`restart_decoder` on the decoder side).
     // Consumers don't act on it but the flag IS written; confirm Zig

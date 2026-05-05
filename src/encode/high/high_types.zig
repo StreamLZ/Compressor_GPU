@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const lz_constants = @import("../../format/streamlz_constants.zig");
-const hist_mod = @import("../entropy/ByteHistogram.zig");
+const hist_mod = @import("../entropy/byte_histogram.zig");
 
 const ByteHistogram = hist_mod.ByteHistogram;
 
@@ -72,7 +72,7 @@ pub const HighStreamWriter = struct {
 pub const Token = struct {
     recent_offset0: i32,
     lit_len: i32,
-    match_len: i32,
+    match_length: i32,
     offset: i32,
 };
 
@@ -96,7 +96,7 @@ pub const State = struct {
     recent_offs0: i32 = 0,
     recent_offs1: i32 = 0,
     recent_offs2: i32 = 0,
-    match_len: i32 = 0,
+    match_length: i32 = 0,
     lit_len: i32 = 0,
     /// Packed recent-match-after-literals descriptor. 0 = none.
     /// Low byte = literal count (1 or 2), upper bytes = match length (value >> 8).
@@ -109,7 +109,7 @@ pub const State = struct {
         self.recent_offs0 = @intCast(lz_constants.initial_recent_offset);
         self.recent_offs1 = @intCast(lz_constants.initial_recent_offset);
         self.recent_offs2 = @intCast(lz_constants.initial_recent_offset);
-        self.match_len = 0;
+        self.match_length = 0;
         self.lit_len = 0;
         self.prev_state = 0;
         self.quick_recent_match_len_lit_len = 0;
@@ -143,7 +143,7 @@ pub const CostModel = struct {
     offs_encode_type: i32,
     offs_cost: [256]u32,
     offs_lo_cost: [256]u32,
-    match_len_cost: [256]u32,
+    match_length_cost: [256]u32,
 
     // Decode-cost penalties (in 32nds of a bit, 0 = disabled).
     decode_cost_per_token: i32,
@@ -156,7 +156,7 @@ pub const Stats = struct {
     lit_raw: ByteHistogram = .{},
     lit_sub: ByteHistogram = .{},
     token_histo: ByteHistogram = .{},
-    match_len_histo: ByteHistogram = .{},
+    match_length_histo: ByteHistogram = .{},
     offs_encode_type: i32 = 0,
     offs_histo: ByteHistogram = .{},
     offs_lo_histo: ByteHistogram = .{},

@@ -23,7 +23,7 @@ const brl = @import("bit_reader_lite.zig");
 // Re-export shared types so existing callers (entropy_decoder.zig) that
 // reference `huffman.BitReaderState` etc. continue to compile unchanged.
 pub const BitReaderState = brl.BitReaderState;
-pub const BitReader2 = brl.BitReader2;
+pub const GolombRiceBitReader = brl.GolombRiceBitReader;
 pub const HuffRange = brl.HuffRange;
 pub const DecodeError = brl.DecodeError;
 pub const k_rice_code_bits2_value = brl.k_rice_code_bits2_value;
@@ -104,7 +104,7 @@ pub fn huffReadCodeLengthsNew(
 
     var code_len: [512 + 16]u8 = undefined;
 
-    var br2: BitReader2 = .{
+    var br2: GolombRiceBitReader = .{
         .p = undefined,
         .p_end = br.p_end,
         .bit_pos = @bitCast(@as(i32, @truncate((br.bit_pos - 24) & 7))),

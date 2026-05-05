@@ -1,7 +1,5 @@
 //! MatchHasher — bucket-based Fibonacci-hash match finder used by the lazy
-//! parsers. Port of `MatchHasherBase` + `MatchHasher{1,2x,4,4Dual,16Dual}`
-//! in src/StreamLZ/Compression/MatchFinding/MatchHasher.cs.
-//! Used by: Fast and High codecs
+//! parsers (Fast and High codecs).
 //!
 //! Each table entry stores `(tag<<25) | (pos & 0x01FFFFFF)` — 7 high tag bits
 //! for collision rejection and 25 low position bits. Positions are tracked
@@ -258,7 +256,7 @@ pub fn MatchHasher(comptime num_hash: u32, comptime dual_hash: bool) type {
         }
 
         /// Insert entries covering the interior of a freshly emitted match at
-        /// exponentially spaced positions. Ported from `MatchHasherBase.InsertRange`.
+        /// exponentially spaced positions.
         pub fn insertRange(self: *Self, match_start: [*]const u8, len: usize) void {
             const offset: i64 = @intCast(@intFromPtr(match_start) - @intFromPtr(self.src_base));
             if (self.src_cur_offset < offset + @as(i64, @intCast(len))) {
@@ -388,8 +386,7 @@ pub const MatchHasher2HashPos = struct {
 
 /// Chain-walking match hasher with a first-hash head table, a modulo-64K
 /// next-hash ring for the chain, and a direct-mapped long-hash table with a
-/// 6-bit tag. Port of `MatchHasher2` in
-/// src/StreamLZ/Compression/MatchFinding/MatchHasher.cs.
+/// 6-bit tag.
 pub const MatchHasher2 = struct {
     /// Hash-A multiplier — distinct from Fibonacci to decorrelate the two hashes.
     const mult_a: u64 = 0xB7A5646300000000;

@@ -1,6 +1,4 @@
-//! Fast LZ token emitter. Port of the `WriteOffset` / `WriteComplexOffset`
-//! / `WriteLengthValue` / `WriteOffset32` helpers in
-//! src/StreamLZ/Compression/Fast/Encoder.cs.
+//! Fast LZ token emitter.
 //! Used by: Fast codec (L1-L5)
 //!
 //! Hot-loop design:
@@ -16,7 +14,7 @@
 
 const std = @import("std");
 const constants = @import("fast_constants.zig");
-const writer_mod = @import("FastStreamWriter.zig");
+const writer_mod = @import("fast_stream_writer.zig");
 const copy = @import("../../io/copy_helpers.zig");
 const ptr_math = @import("../../io/ptr_math.zig");
 const offset_encoder = @import("../offset_encoder.zig");
@@ -27,8 +25,7 @@ const FastStreamWriter = writer_mod.FastStreamWriter;
 //  Low-level helpers
 // ────────────────────────────────────────────────────────────
 
-/// Extend a match forward by comparing 4 bytes at a time. Port of
-///
+/// Extend a match forward by comparing 4 bytes at a time.
 pub inline fn extendMatchForward(
     source: [*]const u8,
     source_end: [*]const u8,
@@ -131,17 +128,16 @@ pub inline fn writeOffset32(w: *FastStreamWriter, offset: u32) void {
 /// Handles long literal runs (≥ 8 bytes), long matches, and large offsets.
 pub fn writeComplexOffset(
     w: *FastStreamWriter,
-    match_length_in: u32,
-    literal_run_length_in: u32,
+    initial_match_length: u32,
+    initial_literal_run_length: u32,
     offset: u32,
     recent_offset: isize,
     literal_start: [*]const u8,
 ) void {
-    var match_length = match_length_in;
-    var literal_run_length = literal_run_length_in;
+    var match_length = initial_match_length;
+    var literal_run_length = initial_literal_run_length;
 
-    // Copy literals into the stream. We read past the end (up to 4 bytes)
-    // but the parser guarantees the scratch buffer has room.
+    // Reads up to 4 bytes past the literal span; the parser's scratch buffer has room.
     const old_literal = w.literal_cursor;
     w.literal_cursor = old_literal + literal_run_length;
     if (literal_run_length > 0) {
@@ -240,9 +236,9 @@ pub fn writeComplexOffset(
     }
 
     if (effective_offset > 0xFFFF) {
-        // Offset adjustment: `+ (sourcePointer + block2StartOffset - literalEnd)`.
-        // For the serial port we compute it from writer state.
-        const literal_end_pos: usize = @intFromPtr(literal_start) + literal_run_length_in;
+        // Offset adjustment: `+ (source_ptr + block2_start_offset - literal_end)`.
+        // Computed from writer state.
+        const literal_end_pos: usize = @intFromPtr(literal_start) + initial_literal_run_length;
         const src_base_plus_block2: usize = @intFromPtr(w.source_ptr) + w.block2_start_offset;
         const adjusted: u32 = effective_offset +% @as(u32, @truncate(src_base_plus_block2 -% literal_end_pos));
         writeOffset32(w, adjusted);
@@ -297,8 +293,7 @@ pub inline fn writeOffset(
 
 /// Lazy-parser entry point: scans literal runs in the [8, 63] range for
 /// 1-byte recent-offset matches, splitting the run into multiple length-1
-/// recent-offset tokens when the slot accounting allows. Port of
-///
+/// recent-offset tokens when the slot accounting allows.
 ///
 /// Caller invariant: used after the lazy parser
 /// (chain hasher and 2x hasher) emits a match. For literal runs outside
@@ -321,13 +316,13 @@ pub fn writeOffsetWithLiteral1(
 fn writeOffsetWithLiteral1Inner(
     w: *FastStreamWriter,
     match_length: u32,
-    literal_run_length_in: u32,
+    initial_literal_run_length: u32,
     offset: u32,
     recent_offset: isize,
     literal_start_in: [*]const u8,
 ) void {
     var literal_start = literal_start_in;
-    var literal_run_length = literal_run_length_in;
+    var literal_run_length = initial_literal_run_length;
 
     var found: [33]u32 = undefined;
     var found_count: u32 = 0;

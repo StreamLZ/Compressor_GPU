@@ -83,11 +83,13 @@ pub const LiteralByte = struct {
 pub const ParsedSidecar = struct {
     match_ops: []MatchOp,
     literal_bytes: []LiteralByte,
+    chunk_xor_folds: []u64,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ParsedSidecar) void {
         self.allocator.free(self.match_ops);
         self.allocator.free(self.literal_bytes);
+        if (self.chunk_xor_folds.len > 0) self.allocator.free(self.chunk_xor_folds);
     }
 };
 
@@ -166,6 +168,27 @@ inline fn readVarintFast(src: []const u8) ParseError!VarintRead {
 }
 
 // ────────────────────────────────────────────────────────────
+//  XOR fold helper
+// ────────────────────────────────────────────────────────────
+
+pub fn xorFoldChunk(data: []const u8) u64 {
+    var fold: u64 = 0;
+    var i: usize = 0;
+    while (i + 8 <= data.len) : (i += 8) {
+        fold ^= std.mem.readInt(u64, data[i..][0..8], .little);
+    }
+    if (i < data.len) {
+        var tail: u64 = 0;
+        var j: usize = 0;
+        while (i + j < data.len) : (j += 1) {
+            tail |= @as(u64, data[i + j]) << @as(u6, @intCast(j * 8));
+        }
+        fold ^= tail;
+    }
+    return fold;
+}
+
+// ────────────────────────────────────────────────────────────
 //  Size computation
 // ────────────────────────────────────────────────────────────
 
@@ -179,6 +202,7 @@ inline fn readVarintFast(src: []const u8) ParseError!VarintRead {
 pub fn serializedBodySize(
     match_ops: []const MatchOp,
     literal_bytes: []const LiteralByte,
+    chunk_xor_folds: []const u64,
 ) usize {
     var total: usize = payload_header_size;
 
@@ -223,6 +247,12 @@ pub fn serializedBodySize(
         i += run_len;
     }
 
+    // XOR folds section (optional trailing extension).
+    if (chunk_xor_folds.len > 0) {
+        total += varintSize(@intCast(chunk_xor_folds.len));
+        total += chunk_xor_folds.len * 8;
+    }
+
     return total;
 }
 
@@ -256,8 +286,9 @@ pub fn writeBlockBody(
     dst: []u8,
     match_ops: []const MatchOp,
     literal_bytes: []const LiteralByte,
+    chunk_xor_folds: []const u64,
 ) WriteError!usize {
-    const needed = serializedBodySize(match_ops, literal_bytes);
+    const needed = serializedBodySize(match_ops, literal_bytes, chunk_xor_folds);
     if (dst.len < needed) return error.DestinationTooSmall;
 
     var pos: usize = 0;
@@ -314,6 +345,16 @@ pub fn writeBlockBody(
         pos += run_len;
         prev_run_end = run_start + run_len;
         i += run_len;
+    }
+
+    // XOR folds section (optional trailing extension).
+    if (chunk_xor_folds.len > 0) {
+        pos += try writeVarint(dst[pos..], @intCast(chunk_xor_folds.len));
+        for (chunk_xor_folds) |fold| {
+            if (pos + 8 > dst.len) return error.DestinationTooSmall;
+            std.mem.writeInt(u64, dst[pos..][0..8], fold, .little);
+            pos += 8;
+        }
     }
 
     return pos;
@@ -414,9 +455,28 @@ pub fn parseBlockBody(src: []const u8, allocator: std.mem.Allocator) ParseError!
         prev_run_end = run_start + run_len;
     }
 
+    // XOR folds (optional trailing extension — present when the
+    // encoder stored per-chunk integrity folds after the literal
+    // runs section).
+    var chunk_xor_folds: []u64 = &[_]u64{};
+    if (pos < src.len) {
+        const nf = try readVarintFast(src[pos..]);
+        pos += nf.consumed;
+        const num_folds: usize = @intCast(nf.value);
+        if (num_folds > 0) {
+            if (pos + num_folds * 8 > src.len) return error.Truncated;
+            chunk_xor_folds = try allocator.alloc(u64, num_folds);
+            for (chunk_xor_folds, 0..) |*f, fi| {
+                f.* = std.mem.readInt(u64, src[pos + fi * 8 ..][0..8], .little);
+            }
+            pos += num_folds * 8;
+        }
+    }
+
     return .{
         .match_ops = match_ops,
         .literal_bytes = literal_bytes,
+        .chunk_xor_folds = chunk_xor_folds,
         .allocator = allocator,
     };
 }
@@ -463,13 +523,13 @@ test "serializedBodySize == writeBlockBody's return value" {
         .{ .position = 42, .byte_value = 0x55 }, // isolated
     };
     var buf: [256]u8 = undefined;
-    const n = try writeBlockBody(&buf, &match_ops, &literal_bytes);
-    try testing.expectEqual(serializedBodySize(&match_ops, &literal_bytes), n);
+    const n = try writeBlockBody(&buf, &match_ops, &literal_bytes, &[_]u64{});
+    try testing.expectEqual(serializedBodySize(&match_ops, &literal_bytes, &[_]u64{}), n);
 }
 
 test "writeBlockBody / parseBlockBody round trip — empty sidecar" {
     var buf: [16]u8 = undefined;
-    const n = try writeBlockBody(&buf, &[_]MatchOp{}, &[_]LiteralByte{});
+    const n = try writeBlockBody(&buf, &[_]MatchOp{}, &[_]LiteralByte{}, &[_]u64{});
     // 8 byte header + two 1-byte varints (zero counts) = 10 bytes.
     try testing.expectEqual(@as(usize, 10), n);
     var parsed = try parseBlockBody(buf[0..n], testing.allocator);
@@ -494,7 +554,7 @@ test "writeBlockBody / parseBlockBody round trip — mixed payload" {
     };
 
     var buf: [512]u8 = undefined;
-    const n = try writeBlockBody(&buf, &match_ops, &literal_bytes);
+    const n = try writeBlockBody(&buf, &match_ops, &literal_bytes, &[_]u64{});
 
     var parsed = try parseBlockBody(buf[0..n], testing.allocator);
     defer parsed.deinit();
@@ -557,8 +617,47 @@ test "delta + varint compresses monotonic match ops" {
         };
     }
     const raw_size: usize = 100 * 20 + 16; // old v1 format cost
-    const v2_size = serializedBodySize(&match_ops, &[_]LiteralByte{});
+    const v2_size = serializedBodySize(&match_ops, &[_]LiteralByte{}, &[_]u64{});
     // v2 should be dramatically smaller: 100 × (~2 + 2 + 1) = ~500 bytes
     // vs 2016 for raw. Anything under half the raw size is a pass.
     try testing.expect(v2_size < raw_size / 2);
+}
+
+test "xorFoldChunk basic" {
+    const data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 0xFF, 0, 0, 0, 0, 0, 0, 0 };
+    const fold = xorFoldChunk(&data);
+    const w0 = std.mem.readInt(u64, data[0..8], .little);
+    const w1 = std.mem.readInt(u64, data[8..16], .little);
+    try testing.expectEqual(w0 ^ w1, fold);
+}
+
+test "xorFoldChunk tail bytes" {
+    const data = [_]u8{ 0xAA, 0xBB, 0xCC };
+    const fold = xorFoldChunk(&data);
+    const expected: u64 = 0xAA | (@as(u64, 0xBB) << 8) | (@as(u64, 0xCC) << 16);
+    try testing.expectEqual(expected, fold);
+}
+
+test "writeBlockBody / parseBlockBody round trip — with XOR folds" {
+    const match_ops = [_]MatchOp{
+        .{ .target_start = 100, .src_start = 50, .length = 8 },
+    };
+    const literal_bytes = [_]LiteralByte{
+        .{ .position = 10, .byte_value = 0xAA },
+    };
+    const folds = [_]u64{ 0xDEADBEEF_CAFEBABE, 0x1234567890ABCDEF, 0 };
+
+    var buf: [512]u8 = undefined;
+    const n = try writeBlockBody(&buf, &match_ops, &literal_bytes, &folds);
+    try testing.expectEqual(serializedBodySize(&match_ops, &literal_bytes, &folds), n);
+
+    var parsed = try parseBlockBody(buf[0..n], testing.allocator);
+    defer parsed.deinit();
+
+    try testing.expectEqual(@as(usize, 1), parsed.match_ops.len);
+    try testing.expectEqual(@as(usize, 1), parsed.literal_bytes.len);
+    try testing.expectEqual(@as(usize, 3), parsed.chunk_xor_folds.len);
+    try testing.expectEqual(@as(u64, 0xDEADBEEF_CAFEBABE), parsed.chunk_xor_folds[0]);
+    try testing.expectEqual(@as(u64, 0x1234567890ABCDEF), parsed.chunk_xor_folds[1]);
+    try testing.expectEqual(@as(u64, 0), parsed.chunk_xor_folds[2]);
 }

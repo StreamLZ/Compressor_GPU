@@ -128,11 +128,11 @@ pub inline fn literalRunSlotCount(value: u32) u32 {
 }
 
 // ────────────────────────────────────────────────────────────
-//  Adaptive hash-bit sizing (EntropyEncoder.GetHashBits port)
+//  Adaptive hash-bit sizing
 // ────────────────────────────────────────────────────────────
 
-/// Computes hash table bits from source length and level. The Fast
-/// compressor's `SetupEncoder` calls this function:
+/// Computes hash table bits from source length and level. Called by
+/// `resolveParams` during encoder setup:
 ///
 ///   if (copts.HashBits > 0) return copts.HashBits;
 ///   bits = Log2((uint)max(srcLen, 1)) + 1;

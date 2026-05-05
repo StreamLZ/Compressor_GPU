@@ -18,7 +18,7 @@ const fast_constants = @import("fast/fast_constants.zig");
 const entropy_enc = @import("entropy/entropy_encoder.zig");
 const tans_enc = @import("entropy/tans_encoder.zig");
 
-const ByteHistogram = @import("entropy/ByteHistogram.zig").ByteHistogram;
+const ByteHistogram = @import("entropy/byte_histogram.zig").ByteHistogram;
 
 pub const ForwardLzResult = struct {
     total_size: usize,

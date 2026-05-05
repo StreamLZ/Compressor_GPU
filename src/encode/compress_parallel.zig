@@ -6,6 +6,8 @@
 //! entry points:
 //!   - `compressBlocksParallel`     — non-SC parallel over 256 KB blocks
 //!   - `compressInternalParallelSc` — SC parallel over SC chunk groups
+//!
+//! Terminology: "sc" / "SC" = "self-contained" throughout this module.
 
 const std = @import("std");
 const lz_constants = @import("../format/streamlz_constants.zig");
@@ -41,7 +43,7 @@ const compressBound = encoder.compressBound;
 // directly on all targets, so we leave this at default — this is
 // only a fairness/latency property, not a correctness one.
 
-const PcShared = struct {
+const CompressShared = struct {
     src: []const u8,
     /// Base context (shared, read-only). Each worker builds a local
     /// copy with its own arena-backed allocator (step 14 LzTemp
@@ -68,7 +70,7 @@ const PcShared = struct {
     num_blocks: usize,
 };
 
-fn pcWorkerFn(shared: *PcShared) void {
+fn compressWorker(shared: *CompressShared) void {
     // Per-worker `LzTemp` equivalent: an arena allocator rooted at
     // `backing_allocator`. Reset between blocks with
     // `.retain_capacity` so the second+ block's allocations are
@@ -183,7 +185,7 @@ pub fn compressBlocksParallel(
     defer allocator.free(written);
     @memset(written, 0);
 
-    var shared: PcShared = .{
+    var shared: CompressShared = .{
         .src = src,
         .base_ctx = ctx,
         .backing_allocator = allocator,
@@ -202,12 +204,12 @@ pub fn compressBlocksParallel(
     // Cap worker count at num_blocks — no point spawning more.
     const worker_count: usize = @min(@as(usize, num_threads), num_blocks);
     if (worker_count == 1) {
-        pcWorkerFn(&shared);
+        compressWorker(&shared);
     } else {
         var group: std.Io.Group = .init;
         for (0..worker_count) |_| {
-            group.concurrent(io, pcWorkerFn, .{&shared}) catch |err| switch (err) {
-                error.ConcurrencyUnavailable => pcWorkerFn(&shared),
+            group.concurrent(io, compressWorker, .{&shared}) catch |err| switch (err) {
+                error.ConcurrencyUnavailable => compressWorker(&shared),
             };
         }
         group.await(io) catch {};
@@ -251,7 +253,7 @@ pub fn compressBlocksParallel(
 // (within the group). Output is assembled chunk-by-chunk into
 // per-chunk tmp buffers then concatenated.
 
-const ScShared = struct {
+const ScCompressShared = struct {
     src: []const u8,
     base_ctx: *const high_encoder.HighEncoderContext,
     backing_allocator: std.mem.Allocator,
@@ -270,7 +272,7 @@ const ScShared = struct {
     group_size: usize,
 };
 
-fn scWorkerFn(shared: *ScShared) void {
+fn scCompressWorker(shared: *ScCompressShared) void {
     var arena = std.heap.ArenaAllocator.init(shared.backing_allocator);
     defer arena.deinit();
 
@@ -315,20 +317,20 @@ fn scWorkerFn(shared: *ScShared) void {
         const last_chunk = @min(first_chunk + group_size, shared.num_chunks);
         const chunks_in_group = last_chunk - first_chunk;
 
-        const dpl = shared.dict_prefix_len;
+        const dict_prefix_len = shared.dict_prefix_len;
         const group_src_off = first_chunk * lz_constants.chunk_size;
-        const group_content_len = @min(chunks_in_group * lz_constants.chunk_size, shared.src.len - dpl - group_src_off);
+        const group_content_len = @min(chunks_in_group * lz_constants.chunk_size, shared.src.len - dict_prefix_len - group_src_off);
 
-        const finder_preload: usize = dpl;
+        const finder_preload: usize = dict_prefix_len;
         var dict_group_buf: ?[]u8 = null;
-        const group_src: []const u8 = if (dpl > 0) blk: {
-            const buf = shared.backing_allocator.alloc(u8, dpl + group_content_len) catch {
+        const group_src: []const u8 = if (dict_prefix_len > 0) blk: {
+            const buf = shared.backing_allocator.alloc(u8, dict_prefix_len + group_content_len) catch {
                 _ = shared.error_flag.store(1, .monotonic);
                 _ = shared.captured_err.cmpxchgStrong(0, @intFromError(error.OutOfMemory), .monotonic, .monotonic);
                 return;
             };
-            @memcpy(buf[0..dpl], shared.src[0..dpl]);
-            @memcpy(buf[dpl..], shared.src[dpl + group_src_off ..][0..group_content_len]);
+            @memcpy(buf[0..dict_prefix_len], shared.src[0..dict_prefix_len]);
+            @memcpy(buf[dict_prefix_len..], shared.src[dict_prefix_len + group_src_off ..][0..group_content_len]);
             dict_group_buf = buf;
             break :blk buf;
         } else shared.src[group_src_off .. group_src_off + group_content_len];
@@ -368,7 +370,7 @@ fn scWorkerFn(shared: *ScShared) void {
         // Content-only slice for the block compressor. Contiguous with
         // the dictionary prefix in memory so pointer arithmetic reaches
         // dictionary bytes via negative offsets from the content start.
-        const group_content = group_src[dpl..];
+        const group_content = group_src[dict_prefix_len..];
 
         var ci: usize = 0;
         while (ci < chunks_in_group) : (ci += 1) {
@@ -435,7 +437,7 @@ pub fn compressInternalParallelSc(
     defer allocator.free(written);
     @memset(written, 0);
 
-    var shared: ScShared = .{
+    var shared: ScCompressShared = .{
         .src = src,
         .base_ctx = ctx,
         .backing_allocator = allocator,
@@ -454,12 +456,12 @@ pub fn compressInternalParallelSc(
 
     const worker_count: usize = @min(@as(usize, num_threads), num_groups);
     if (worker_count == 1) {
-        scWorkerFn(&shared);
+        scCompressWorker(&shared);
     } else {
         var group: std.Io.Group = .init;
         for (0..worker_count) |_| {
-            group.concurrent(io, scWorkerFn, .{&shared}) catch |err| switch (err) {
-                error.ConcurrencyUnavailable => scWorkerFn(&shared),
+            group.concurrent(io, scCompressWorker, .{&shared}) catch |err| switch (err) {
+                error.ConcurrencyUnavailable => scCompressWorker(&shared),
             };
         }
         group.await(io) catch {};

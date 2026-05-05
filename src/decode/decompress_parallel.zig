@@ -1,5 +1,7 @@
 //! Parallel decompression helpers.
 //!
+//! Terminology: "sc" / "SC" = "self-contained" throughout this module.
+//!
 //! Three parallel strategies, dispatched by the caller based on the
 //! compression level stored in the frame header:
 //!
@@ -294,6 +296,84 @@ fn decodeOneChunk(
     switch (block_hdr.decoder_type) {
         .fast, .turbo => {
             const n = try fast.decodeChunk(
+                dst_ptr,
+                dst_end_ptr,
+                dst.ptr,
+                src_slice_start,
+                src_slice_end,
+                scratch_ptr,
+                scratch_end_ptr,
+            );
+            if (n != comp_size) return error.ChunkSizeMismatch;
+        },
+        .high => {
+            const n = try high.decodeChunkSc(
+                dst_ptr,
+                dst_end_ptr,
+                dst[group_dst_start_off..].ptr,
+                dst.ptr,
+                src_slice_start,
+                src_slice_end,
+                scratch_ptr,
+                scratch_end_ptr,
+            );
+            if (n != comp_size) return error.ChunkSizeMismatch;
+        },
+        else => return error.InvalidInternalHeader,
+    }
+}
+
+/// Safe variant of `decodeOneChunk` — uses exact-length copies (no
+/// overcopy past token boundaries). Used for re-decoding chunks that
+/// failed XOR fold integrity checks after parallel decode.
+fn decodeOneChunkSafe(
+    src: []const u8,
+    dst: []u8,
+    dst_off: usize,
+    dst_size: usize,
+    group_dst_start_off: usize,
+    scratch: []u8,
+) DecodeError!void {
+    if (src.len < block_header.BlockHeader.size) return error.Truncated;
+    const block_hdr = block_header.parseBlockHeader(src) catch return error.InvalidInternalHeader;
+    var src_pos: usize = block_header.BlockHeader.size;
+
+    if (block_hdr.uncompressed) {
+        if (src_pos + dst_size > src.len) return error.Truncated;
+        if (dst_off + dst_size > dst.len) return error.OutputTooSmall;
+        @memcpy(dst[dst_off..][0..dst_size], src[src_pos..][0..dst_size]);
+        return;
+    }
+
+    const ch = block_header.parseChunkHeader(src[src_pos..], block_hdr.use_checksums) catch return error.BadChunkHeader;
+    src_pos += ch.bytes_consumed;
+
+    if (ch.is_memset) {
+        if (dst_off + dst_size > dst.len) return error.OutputTooSmall;
+        @memset(dst[dst_off..][0..dst_size], ch.memset_fill);
+        return;
+    }
+
+    const comp_size: usize = ch.compressed_size;
+    if (src_pos + comp_size > src.len) return error.Truncated;
+    if (comp_size > dst_size) return error.BadChunkHeader;
+
+    if (comp_size == dst_size) {
+        if (dst_off + dst_size > dst.len) return error.OutputTooSmall;
+        @memcpy(dst[dst_off..][0..dst_size], src[src_pos..][0..dst_size]);
+        return;
+    }
+
+    const src_slice_start: [*]const u8 = src[src_pos..].ptr;
+    const src_slice_end: [*]const u8 = src_slice_start + comp_size;
+    const dst_ptr: [*]u8 = dst[dst_off..].ptr;
+    const dst_end_ptr: [*]u8 = dst_ptr + dst_size;
+    const scratch_ptr: [*]u8 = scratch.ptr;
+    const scratch_end_ptr: [*]u8 = scratch.ptr + scratch.len;
+
+    switch (block_hdr.decoder_type) {
+        .fast, .turbo => {
+            const n = try fast.decodeChunkSafe(
                 dst_ptr,
                 dst_end_ptr,
                 dst.ptr,
@@ -840,6 +920,7 @@ const FastL14Shared = struct {
     /// output start). Workers apply only the subset that falls within
     /// their chunk range, eliminating the serial applySidecar bottleneck.
     sidecar_literals: []const pdm.LiteralByte,
+    chunk_xor_folds: []const u64,
 };
 
 /// Decode a contiguous slice of chunks [start, end) within a Fast L1-L4
@@ -913,6 +994,7 @@ fn fastL14WorkerFn(shared: *FastL14Shared, scratch: []u8, start: usize, end: usi
     if (guard_len > 0) {
         @memcpy(shared.dst[guard_pos..][0..guard_len], guard[0..guard_len]);
     }
+
 }
 
 /// Apply the phase-1 sidecar literal bytes to `dst[dst_off..][0..region_len]`.
@@ -1067,13 +1149,64 @@ pub fn decompressFastL14Parallel(
         .error_flag = std.atomic.Value(u32).init(0),
         .captured_err = std.atomic.Value(u16).init(0),
         .sidecar_literals = sidecar.literal_bytes,
+        .chunk_xor_folds = sidecar.chunk_xor_folds,
     };
 
     // Sidecar literals applied inside each worker (distributed across cores).
     dispatchWorkers(io, &shared, scratches, worker_count, aligned_slice);
     if (shared.error_flag.load(.monotonic) != 0) return reportWorkerError(&shared);
 
+    // Parallel XOR fold verification. All decode workers have joined,
+    // so no concurrent writes — safe to read the output. Each verifier
+    // checks its slice and re-decodes failures with exact copies.
+    if (sidecar.chunk_xor_folds.len > 0 and worker_count > 1) {
+        shared.error_flag = std.atomic.Value(u32).init(0);
+        shared.captured_err = std.atomic.Value(u16).init(0);
+        if (worker_count == 1) {
+            xorFoldVerifyFn(&shared, scratches[0], 0, num_chunks);
+        } else {
+            var vgroup: std.Io.Group = .init;
+            for (0..worker_count) |wi| {
+                const s = wi * aligned_slice;
+                const e = @min(s + aligned_slice, num_chunks);
+                vgroup.concurrent(io, xorFoldVerifyFn, .{ &shared, scratches[wi], s, e }) catch |err| switch (err) {
+                    error.ConcurrencyUnavailable => xorFoldVerifyFn(&shared, scratches[wi], s, e),
+                };
+            }
+            vgroup.await(io) catch {};
+        }
+        if (shared.error_flag.load(.monotonic) != 0) return reportWorkerError(&shared);
+    }
+
     dst_off_inout.* += decompressed_size;
+}
+
+/// Post-join XOR fold verifier. Runs AFTER all decode workers have
+/// joined, so no concurrent writes. Checks each chunk in [start, end)
+/// against the stored XOR fold and re-decodes failures with safe copy.
+fn xorFoldVerifyFn(shared: *FastL14Shared, scratch: []u8, start: usize, end: usize) void {
+    var ci: usize = start;
+    while (ci < end) : (ci += 1) {
+        if (ci >= shared.chunk_xor_folds.len) break;
+        if (shared.error_flag.load(.monotonic) != 0) return;
+        const q = shared.chunks[ci];
+        const chunk_data = shared.dst[shared.dst_start_off + q.dst_offset ..][0..q.dst_size];
+        if (pdm.xorFoldChunk(chunk_data) != shared.chunk_xor_folds[ci]) {
+            decodeOneChunkSafe(
+                shared.block_src[q.src_offset .. q.src_offset + q.src_size],
+                shared.dst,
+                shared.dst_start_off + q.dst_offset,
+                q.dst_size,
+                shared.dst_start_off,
+                scratch,
+            ) catch |err| {
+                const code: u16 = @intFromError(err);
+                _ = shared.captured_err.cmpxchgStrong(0, code, .monotonic, .monotonic);
+                _ = shared.error_flag.store(1, .monotonic);
+                return;
+            };
+        }
+    }
 }
 
 fn dispatchWorkers(
@@ -1144,6 +1277,52 @@ fn parallelRoundtrip(source: []const u8, level: u8) !void {
     );
     try testing.expectEqual(source.len, written_par);
     try testing.expectEqualSlices(u8, source, decoded_par[0..written_par]);
+}
+
+// ── L2-L5 sidecar parallel tests (exercises XOR fold verify + safe retry) ──
+
+test "decompressFramedParallel: L2 sidecar 384 KB (2 chunks, XOR fold path)" {
+    const allocator = testing.allocator;
+    const src = try allocator.alloc(u8, 384 * 1024);
+    defer allocator.free(src);
+    const p = "The quick brown fox jumps over a lazy dog. ";
+    for (src, 0..) |*b, i| b.* = p[i % p.len];
+    try parallelRoundtrip(src, 2);
+}
+
+test "decompressFramedParallel: L3 sidecar 768 KB (3 chunks, cross-chunk matches)" {
+    const allocator = testing.allocator;
+    const src = try allocator.alloc(u8, 768 * 1024);
+    defer allocator.free(src);
+    const p = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnop";
+    for (src, 0..) |*b, i| b.* = p[i % p.len];
+    try parallelRoundtrip(src, 3);
+}
+
+test "decompressFramedParallel: L4 sidecar 384 KB (2 chunks, highest race frequency)" {
+    const allocator = testing.allocator;
+    const src = try allocator.alloc(u8, 384 * 1024);
+    defer allocator.free(src);
+    const p = "The quick brown fox jumps over a lazy dog. ";
+    for (src, 0..) |*b, i| b.* = p[i % p.len];
+    try parallelRoundtrip(src, 4);
+}
+
+test "decompressFramedParallel: L5 sidecar 512 KB (lazy chain parser)" {
+    const allocator = testing.allocator;
+    const src = try allocator.alloc(u8, 512 * 1024);
+    defer allocator.free(src);
+    for (src, 0..) |*b, i| b.* = @intCast('A' + (i % 26));
+    try parallelRoundtrip(src, 5);
+}
+
+test "decompressFramedParallel: L4 sidecar 768 KB (3 chunks, cross-chunk XOR fold)" {
+    const allocator = testing.allocator;
+    const src = try allocator.alloc(u8, 768 * 1024);
+    defer allocator.free(src);
+    const p = "The quick brown fox jumps over a lazy dog. ";
+    for (src, 0..) |*b, i| b.* = p[i % p.len];
+    try parallelRoundtrip(src, 4);
 }
 
 test "decompressFramedParallel: L6 SC 384 KB (multi-chunk, exercises parallel path)" {

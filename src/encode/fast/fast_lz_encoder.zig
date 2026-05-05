@@ -21,11 +21,11 @@ const std = @import("std");
 const fast_constants = @import("fast_constants.zig");
 const FastMatchHasher = @import("fast_match_hasher.zig").FastMatchHasher;
 const match_hasher = @import("../match_hasher.zig");
-const writer_mod = @import("FastStreamWriter.zig");
+const writer_mod = @import("fast_stream_writer.zig");
 const parser = @import("fast_lz_parser.zig");
 const token_writer = @import("fast_token_writer.zig");
 const entropy_enc = @import("../entropy/entropy_encoder.zig");
-const byte_hist = @import("../entropy/ByteHistogram.zig");
+const byte_hist = @import("../entropy/byte_histogram.zig");
 const cost_model = @import("fast_cost_model.zig");
 
 const MatchHasher2 = match_hasher.MatchHasher2;
@@ -326,8 +326,7 @@ pub fn encodeSubChunkRaw(
 // ────────────────────────────────────────────────────────────
 
 /// Encode a single Fast sub-chunk in entropy mode (delta-literal + token
-/// entropy coding via tANS/memcpy, optional off16 entropy split). Port
-/// of the entropy-mode branches.
+/// entropy coding via tANS/memcpy, optional off16 entropy split).
 ///
 /// The caller runs the parser with `use_delta_literals = true` so BOTH
 /// literal streams are available; this function picks the cheaper one
@@ -718,7 +717,7 @@ fn assembleEntropyOutput(
 }
 
 /// Encode a sub-chunk in entropy mode using the L5 lazy parser with the
-/// `MatchHasher2` chain-walking hasher. Port of `FastParser.CompressLazyChainHasher`.
+/// `MatchHasher2` chain-walking hasher.
 pub fn encodeSubChunkEntropyChain(
     comptime engine_level: i32,
     allocator: std.mem.Allocator,

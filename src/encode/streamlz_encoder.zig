@@ -1,5 +1,7 @@
 //! Top-level StreamLZ framed compressor — public API surface.
 //!
+//! Terminology: "sc" / "SC" = "self-contained" throughout this module.
+//!
 //! This module is the single import target for callers that need
 //! `compressFramed` or `compressBound`.  Internally it delegates to:
 //!
@@ -130,11 +132,11 @@ pub const ResolvedParams = struct {
     /// Passed to `FastMatchHasher.init` as the hash `k` parameter. Applies
     /// the text-detector bump here (6 for text, 4 otherwise). This affects
     /// the Fibonacci hash multiplier, NOT the parser's acceptance threshold.
-    hasher_min_match_length: u32,
+    hasher_k: u32,
     /// Passed to the parser's `buildMinimumMatchLengthTable` and is the
-    /// acceptance threshold for match lengths. `FastParser.CompressGreedy`
-    /// reads this from `opts.MinMatchLength` (default 0 → floor 4), so the
-    /// text bump DOES NOT apply.
+    /// acceptance threshold for match lengths. The greedy parser reads this
+    /// from `opts.min_match_length` (default 0 → floor 4), so the text
+    /// bump DOES NOT apply.
     parser_min_match_length: u32,
     dict_size: u32,
 };
@@ -143,10 +145,9 @@ pub fn resolveParams(src: []const u8, opts: Options) ResolvedParams {
     const mapped = fast_constants.mapLevel(opts.level);
     const eng = mapped.engine_level;
 
-    // SetupEncoder computes a LOCAL minimumMatchLength that
-    // starts at 4 and is bumped to 6 for text inputs. That local is passed to
-    // `CreateFastHasher<T>.AllocateHash(hashBits, minimumMatchLength)` to pick
-    // the Fibonacci hash multiplier (k=6 shifts differently than k=4).
+    // Compute a LOCAL hasher_k that starts at 4 and is bumped to 6 for
+    // text inputs. This is passed to `FastMatchHasher.init` to pick the
+    // Fibonacci hash multiplier (k=6 shifts differently than k=4).
     var hasher_k: u32 = if (opts.min_match_length >= 4) opts.min_match_length else 4;
     if (opts.min_match_length == 0 and src.len > 0x4000 and eng >= -2 and eng <= 3) {
         if (text_detector.isProbablyText(src)) {
@@ -154,13 +155,14 @@ pub fn resolveParams(src: []const u8, opts: Options) ResolvedParams {
         }
     }
 
-    // FastParser.CompressGreedy computes `minimumMatchLength`
-    // FRESHLY from `Math.Max(opts.MinMatchLength, 4)` and passes THIS value
-    // to `BuildMinimumMatchLengthTable`. The text-detector bump is NOT
+    // The greedy parser computes its own minimum match length as
+    // `@max(opts.min_match_length, 4)` and passes THAT to
+    // `buildMinimumMatchLengthTable`. The text-detector bump is NOT
     // applied to the parser's acceptance threshold, only to the hasher's
     // hash-multiplier. So the parser accepts 4-byte matches at low offsets
     // even on text input, which the hasher's higher k hints it was built for.
     const parser_min_ml: u32 = if (opts.min_match_length >= 4) opts.min_match_length else 4;
+    // Result: text mode hashes for 6-byte matches but still accepts 4-byte matches at low offsets.
 
     const bits = fast_constants.getHashBits(
         src.len,
@@ -178,7 +180,7 @@ pub fn resolveParams(src: []const u8, opts: Options) ResolvedParams {
         .engine_level = eng,
         .use_entropy = mapped.use_entropy_coding,
         .hash_bits = bits,
-        .hasher_min_match_length = hasher_k,
+        .hasher_k = hasher_k,
         .parser_min_match_length = parser_min_ml,
         .dict_size = dict,
     };

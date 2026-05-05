@@ -1,5 +1,7 @@
 //! SLZ frame format (v2).
 //!
+//! Terminology: "sc" / "SC" = "self-contained" throughout this module.
+//!
 //! Wire layout (little-endian) — StreamLZ v2:
 //!   [4] magic = 0x534C5A31 ('SLZ1' byte order S,L,Z,1)
 //!   [1] version = 2                         ← bumped from 1; breaking change

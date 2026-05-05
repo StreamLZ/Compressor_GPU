@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const lz_constants = @import("../../format/streamlz_constants.zig");
-const hist_mod = @import("../entropy/ByteHistogram.zig");
+const hist_mod = @import("../entropy/byte_histogram.zig");
 const entropy_enc = @import("../entropy/entropy_encoder.zig");
 const offset_enc = @import("../offset_encoder.zig");
 const cost_coeffs = @import("../cost_coefficients.zig");
@@ -177,8 +177,8 @@ fn writeMatchLength(writer: *HighStreamWriter, match_length: i32) i32 {
 }
 
 /// Long-literal path: copies `len` literal bytes + delta bytes.
-fn writeLiteralsLong(writer: *HighStreamWriter, src: [*]const u8, len: usize, do_subtract: bool) void {
-    if (do_subtract) {
+fn writeLiteralsLong(writer: *HighStreamWriter, src: [*]const u8, len: usize, use_delta_literals: bool) void {
+    if (use_delta_literals) {
         // delta[i] = src[i] - src[i - recent0] (dst uses negative offset).
         const neg: isize = -@as(isize, writer.recent0);
         offset_enc.subtractBytesUnsafe(writer.delta_literals, src, len, neg);
@@ -211,11 +211,11 @@ fn writeLiteralsLong(writer: *HighStreamWriter, src: [*]const u8, len: usize, do
 
 /// Writes a literal run and returns the 2-bit `litLen` token field
 /// (bits 1:0 of the command byte).
-inline fn writeLiterals(writer: *HighStreamWriter, src: [*]const u8, len: usize, do_subtract: bool) i32 {
+inline fn writeLiterals(writer: *HighStreamWriter, src: [*]const u8, len: usize, use_delta_literals: bool) i32 {
     if (len == 0) return 0;
 
     if (len > 8) {
-        writeLiteralsLong(writer, src, len, do_subtract);
+        writeLiteralsLong(writer, src, len, use_delta_literals);
         return 3;
     }
 
@@ -233,7 +233,7 @@ inline fn writeLiterals(writer: *HighStreamWriter, src: [*]const u8, len: usize,
     std.mem.writeInt(u64, ll[0..8], w, .little);
     writer.literals = ll + len;
 
-    if (do_subtract) {
+    if (use_delta_literals) {
         const sl: [*]u8 = writer.delta_literals;
         const neg: isize = -@as(isize, writer.recent0);
         var i: usize = 0;
@@ -287,13 +287,13 @@ pub fn addToken(
     recent: *HighRecentOffs,
     lit_start: [*]const u8,
     lit_len: usize,
-    match_len: i32,
+    match_length: i32,
     offs_or_recent: i32,
     do_recent: bool,
-    do_subtract: bool,
+    use_delta_literals: bool,
 ) void {
-    var token: i32 = writeLiterals(writer, lit_start, lit_len, do_subtract);
-    token += writeMatchLength(writer, match_len);
+    var token: i32 = writeLiterals(writer, lit_start, lit_len, use_delta_literals);
+    token += writeMatchLength(writer, match_length);
 
     if (offs_or_recent > 0) {
         token += 3 << 6;
@@ -327,13 +327,13 @@ pub fn addFinalLiterals(
     writer: *HighStreamWriter,
     src: [*]const u8,
     src_end: [*]const u8,
-    do_subtract: bool,
+    use_delta_literals: bool,
 ) void {
     const len: usize = @intFromPtr(src_end) - @intFromPtr(src);
     if (len == 0) return;
     @memcpy(writer.literals[0..len], src[0..len]);
     writer.literals += len;
-    if (do_subtract) {
+    if (use_delta_literals) {
         const neg: isize = -@as(isize, writer.recent0);
         offset_enc.subtractBytes(writer.delta_literals, src, len, neg);
         writer.delta_literals += len;
@@ -565,7 +565,7 @@ pub fn assembleCompressedOutput(
         const dst_remaining: usize = @intFromPtr(dst_end) - @intFromPtr(dst);
         const dst_slice: []u8 = dst[0..dst_remaining];
         const src_slice: []const u8 = writer.literal_run_lengths_start[0..lrl8_len];
-        const histo_out: ?*ByteHistogram = if (stats) |s| &s.match_len_histo else null;
+        const histo_out: ?*ByteHistogram = if (stats) |s| &s.match_length_histo else null;
         const lrl8_n = entropy_enc.encodeArrayU8(
             ctx.allocator,
             dst_slice,
@@ -635,7 +635,7 @@ pub fn assembleCompressedOutput(
 // ────────────────────────────────────────────────────────────
 
 /// Encodes a pre-parsed token array into `dst`. Walks the tokens in
-/// order, calls `addToken` for each (with do_recent = do_subtract =
+/// order, calls `addToken` for each (with do_recent = use_delta_literals =
 /// true), then `addFinalLiterals`, then `assembleCompressedOutput`.
 ///
 /// The optimal
@@ -673,12 +673,12 @@ pub fn encodeTokenArray(
             &recent,
             cur_src,
             @intCast(tok.lit_len),
-            tok.match_len,
+            tok.match_length,
             tok.offset,
             true, // do_recent
-            true, // do_subtract
+            true, // use_delta_literals
         );
-        cur_src += @as(usize, @intCast(tok.lit_len)) + @as(usize, @intCast(tok.match_len));
+        cur_src += @as(usize, @intCast(tok.lit_len)) + @as(usize, @intCast(tok.match_length));
     }
     addFinalLiterals(&writer, cur_src, src_end, true);
 

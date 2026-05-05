@@ -95,7 +95,7 @@ pub fn decodeTable(
 
         var rice: [512 + 16]u8 = undefined;
 
-        var br2: brl.BitReader2 = .{
+        var br2: brl.GolombRiceBitReader = .{
             .p = undefined,
             .p_end = br.p_end,
             .bit_pos = @intCast(@as(u32, @bitCast(@as(i32, @truncate((br.bit_pos - 24) & 7))))),
@@ -133,7 +133,7 @@ pub fn decodeTable(
         var cur_rice_ptr: [*]const u8 = &rice;
         const cur_rice_end: [*]const u8 = rice[total_rice_values..].ptr;
         var average: i32 = 6;
-        var somesum: i32 = 0;
+        var weight_sum: i32 = 0;
 
         var safe_a: [256]u8 = undefined;
         var safe_b: [256]u32 = undefined;
@@ -181,14 +181,14 @@ pub fn decodeTable(
                     safe_b[b_count] = (@as(u32, @intCast(symbol)) << 16) | @as(u32, @intCast(v));
                     b_count += 1;
                 }
-                somesum += v;
-                if (somesum > @as(i32, @intCast(l_val))) return error.BadTableFormat;
+                weight_sum += v;
+                if (weight_sum > @as(i32, @intCast(l_val))) return error.BadTableFormat;
                 symbol += 1;
                 num -= 1;
                 if (num == 0) break;
             }
         }
-        if (somesum != @as(i32, @intCast(l_val))) return error.BadTableFormat;
+        if (weight_sum != @as(i32, @intCast(l_val))) return error.BadTableFormat;
 
         tans_data.a_used = a_count;
         tans_data.b_used = b_count;

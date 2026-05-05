@@ -4,6 +4,7 @@
 //! cases. Default values come from an Intel Arrow Lake-S (Ultra 9 285K)
 //! sweep. They do NOT affect the wire format or the
 //! decompressor — only encoder decisions.
+//! To retune: benchmark per-operation decode nanoseconds on target hardware, then update the constants below to match.
 //!
 //! We only expose the subset of coefficients the Fast encoder actually
 //! consults: memset cost, speed-tradeoff factors, and the per-stream
@@ -89,9 +90,8 @@ pub const cost_to_bits_factor: f32 = 0.130525;
 // ── Multi-array base cost factor ─────────────────────────────────────
 pub const multi_array_base_cost_factor: f32 = 54.234;
 
-/// Scaling applied to `CompressOptions.SpaceSpeedTradeoffBytes` in
-/// `Fast.Compressor.SetupEncoder` — `1 / 256` so the default `256` yields
-/// a multiplicative factor of 1.
+/// Scaling applied to `space_speed_tradeoff_bytes` — `1 / 256` so the
+/// default `256` yields a multiplicative factor of 1.
 pub const speed_tradeoff_scale: f32 = 1.0 / 256.0;
 
 /// Additional multiplier applied to the speed tradeoff in Fast RAW modes
@@ -106,8 +106,7 @@ pub const entropy_speed_factor: f32 = 0.050000001;
 /// toward better compression ratio at the cost of decode speed.
 pub const default_space_speed_tradeoff_bytes: i32 = 256;
 
-/// Computes the `coder.SpeedTradeoff` scalar the way
-/// `Fast.Compressor.SetupEncoder` does.
+/// Computes the speed-tradeoff scalar for the Fast codec.
 pub fn speedTradeoffFor(space_speed_tradeoff_bytes: i32, use_literal_entropy_coding: bool) f32 {
     const factor = if (use_literal_entropy_coding) entropy_speed_factor else raw_speed_factor;
     return @as(f32, @floatFromInt(space_speed_tradeoff_bytes)) * speed_tradeoff_scale * factor;

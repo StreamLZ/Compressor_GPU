@@ -1123,36 +1123,35 @@ fn buildPpocSidecarInner(
     // 16 chunks = 4 MB per slice, supporting up to ~24 workers on
     // a 100 MB file while keeping the sidecar small (~1 MB for L5).
     const slice_align: u64 = 16;
-    const dpl: u64 = dict_prefix_len;
     for (tokens.items) |t| {
         if (t.src_start < 0 or t.length == 0) continue;
         const chunk_start_signed: i64 = @intCast(t.chunk_start);
         if (t.src_start >= chunk_start_signed) continue;
         const src_u: u64 = @intCast(t.src_start);
         // Dictionary positions are always pre-filled by the decoder.
-        if (src_u + t.length <= dpl) continue;
+        if (src_u + t.length <= dict_prefix_len) continue;
         // Chunk/slice indices relative to content start (after dict prefix).
-        const tgt_rel: u64 = if (t.target_start >= dpl) t.target_start - dpl else 0;
+        const tgt_rel: u64 = if (t.target_start >= dict_prefix_len) t.target_start - dict_prefix_len else 0;
         const tgt_chunk: u64 = tgt_rel / cs;
         const tgt_slice: u64 = tgt_chunk / slice_align;
-        const src_rel: u64 = if (src_u >= dpl) src_u - dpl else 0;
+        const src_rel: u64 = if (src_u >= dict_prefix_len) src_u - dict_prefix_len else 0;
         const src_first_slice: u64 = (src_rel / cs) / slice_align;
         const src_last_u: u64 = @min(src_u + t.length, total_decomp);
-        const src_last_rel: u64 = if (src_last_u > dpl) src_last_u - dpl else 0;
+        const src_last_rel: u64 = if (src_last_u > dict_prefix_len) src_last_u - dict_prefix_len else 0;
         const src_last_slice: u64 = if (src_last_rel > 0) ((src_last_rel - 1) / cs) / slice_align else src_first_slice;
         if (src_first_slice == tgt_slice and src_last_slice == tgt_slice) continue;
-        const src_lo: u64 = @max(src_u, dpl);
+        const src_lo: u64 = @max(src_u, dict_prefix_len);
         const src_hi: u64 = @min(src_u + t.length, total_decomp);
         var p: u64 = src_lo;
         while (p < src_hi) : (p += 1) {
-            const p_rel: u64 = if (p >= dpl) p - dpl else 0;
+            const p_rel: u64 = if (p >= dict_prefix_len) p - dict_prefix_len else 0;
             const p_slice: u64 = (p_rel / cs) / slice_align;
             if (p_slice == tgt_slice) continue;
             if (lit_seen[@intCast(p)] != 0) continue;
             lit_seen[@intCast(p)] = 1;
             // Sidecar positions are frame-output-relative (subtract dict prefix).
             try sidecar.literal_bytes.append(allocator, .{
-                .position = p - dpl,
+                .position = p - dict_prefix_len,
                 .byte_value = dst_ref[@intCast(p)],
             });
         }
@@ -1854,9 +1853,9 @@ fn level0HighSubChunk(
     var offs_stream: [*]align(1) const i32 = lz.offs_stream;
 
     const init_recent: i32 = -@as(i32, @intCast(constants.initial_recent_offset));
-    var ro3: i32 = init_recent;
-    var ro4: i32 = init_recent;
-    var ro5: i32 = init_recent;
+    var recent0: i32 = init_recent;
+    var recent1: i32 = init_recent;
+    var recent2: i32 = init_recent;
     var last_offset: i32 = init_recent;
 
     while (@intFromPtr(cmd_stream) < @intFromPtr(cmd_stream_end)) {
@@ -1874,15 +1873,15 @@ fn level0HighSubChunk(
 
         const new_off: i32 = offs_stream[0];
 
-        var picked: i32 = ro3;
-        if (offset_index >= 1) picked = ro4;
-        if (offset_index >= 2) picked = ro5;
+        var picked: i32 = recent0;
+        if (offset_index >= 1) picked = recent1;
+        if (offset_index >= 2) picked = recent2;
         if (offset_index >= 3) picked = new_off;
-        const next_ro4: i32 = if (offset_index == 0) ro4 else ro3;
-        const next_ro5: i32 = if (offset_index < 2) ro5 else ro4;
-        ro3 = picked;
-        ro4 = next_ro4;
-        ro5 = next_ro5;
+        const next_recent1: i32 = if (offset_index == 0) recent1 else recent0;
+        const next_recent2: i32 = if (offset_index < 2) recent2 else recent1;
+        recent0 = picked;
+        recent1 = next_recent1;
+        recent2 = next_recent2;
 
         if (offset_index == 3) offs_stream += 1;
 
@@ -2685,9 +2684,9 @@ fn analyzeHighSubChunk(
 
     // 3-entry recent-offset LIFO (mirrors processLzRunsType0).
     const init_recent: i32 = -@as(i32, @intCast(constants.initial_recent_offset));
-    var ro3: i32 = init_recent;
-    var ro4: i32 = init_recent;
-    var ro5: i32 = init_recent;
+    var recent0: i32 = init_recent;
+    var recent1: i32 = init_recent;
+    var recent2: i32 = init_recent;
     var last_offset: i32 = init_recent;
 
     while (@intFromPtr(cmd_stream) < @intFromPtr(cmd_stream_end)) {
@@ -2708,15 +2707,15 @@ fn analyzeHighSubChunk(
         const new_off: i32 = offs_stream[0];
 
         // CMOV select picked offset.
-        var picked: i32 = ro3;
-        if (offset_index >= 1) picked = ro4;
-        if (offset_index >= 2) picked = ro5;
+        var picked: i32 = recent0;
+        if (offset_index >= 1) picked = recent1;
+        if (offset_index >= 2) picked = recent2;
         if (offset_index >= 3) picked = new_off;
-        const next_ro4: i32 = if (offset_index == 0) ro4 else ro3;
-        const next_ro5: i32 = if (offset_index < 2) ro5 else ro4;
-        ro3 = picked;
-        ro4 = next_ro4;
-        ro5 = next_ro5;
+        const next_recent1: i32 = if (offset_index == 0) recent1 else recent0;
+        const next_recent2: i32 = if (offset_index < 2) recent2 else recent1;
+        recent0 = picked;
+        recent1 = next_recent1;
+        recent2 = next_recent2;
 
         if (offset_index == 3) offs_stream += 1;
 

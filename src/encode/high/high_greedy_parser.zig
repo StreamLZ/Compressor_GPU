@@ -2,6 +2,8 @@
 //! finder emitting tokens via `high_encoder.addToken`.
 //! Used by: High codec (L6-L11)
 //!
+//! Terminology: "sc" / "SC" = "self-contained" throughout this module.
+//!
 //! The parser is comptime-generic over the hasher type — each High
 //! level instantiates a specialized copy for its `MatchHasher*` so
 //! the hot loop is branch-free over `num_hash` and `dual_hash`. The
@@ -301,7 +303,7 @@ pub fn compressFast(
             m.length,
             m.offset,
             true, // do_recent
-            true, // do_subtract
+            true, // use_delta_literals
         );
 
         // Insert the match interior into the hash table.

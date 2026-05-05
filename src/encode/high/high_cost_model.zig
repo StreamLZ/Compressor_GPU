@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const lz_constants = @import("../../format/streamlz_constants.zig");
-const hist_mod = @import("../entropy/ByteHistogram.zig");
+const hist_mod = @import("../entropy/byte_histogram.zig");
 const high_types = @import("high_types.zig");
 const offset_encoder = @import("../offset_encoder.zig");
 
@@ -28,7 +28,7 @@ pub fn rescaleStats(s: *Stats) void {
     rescaleOne(&s.offs_histo);
     if (s.offs_encode_type > 1) rescaleOne(&s.offs_lo_histo);
     rescaleOne(&s.token_histo);
-    rescaleOne(&s.match_len_histo);
+    rescaleOne(&s.match_length_histo);
 }
 
 /// `h := ((h + t) >> 5) + 1`.
@@ -49,7 +49,7 @@ pub fn rescaleAddStats(s: *Stats, t: *const Stats, chunk_type_same: bool) void {
         rescaleOne(&s.lit_sub);
     }
     rescaleAddOne(&s.token_histo, &t.token_histo);
-    rescaleAddOne(&s.match_len_histo, &t.match_len_histo);
+    rescaleAddOne(&s.match_length_histo, &t.match_length_histo);
     if (s.offs_encode_type == t.offs_encode_type) {
         rescaleAddOne(&s.offs_histo, &t.offs_histo);
         if (s.offs_encode_type > 1) rescaleAddOne(&s.offs_lo_histo, &t.offs_lo_histo);
@@ -63,26 +63,26 @@ pub fn rescaleAddStats(s: *Stats, t: *const Stats, chunk_type_same: bool) void {
 }
 
 /// Type-0 offset histogram update: split low/high threshold encoding.
-fn updateOffsType0(histo: *ByteHistogram, offset: u32, increment: u32) void {
+fn updateOffsThresholdSplit(histo: *ByteHistogram, offset: u32, increment: u32) void {
     if (offset >= lz_constants.high_offset_threshold) {
         const low_limit: u32 = @intCast(lz_constants.low_offset_encoding_limit);
         const log_part: u32 = std.math.log2_int(u32, offset - low_limit);
         const high_marker: u32 = @intCast(lz_constants.high_offset_marker);
-        const tv: u32 = log_part | high_marker;
-        histo.count[tv] += increment;
+        const histo_bin: u32 = log_part | high_marker;
+        histo.count[histo_bin] += increment;
     } else {
         const bias: u32 = @intCast(lz_constants.offset_bias_constant);
         const top_bits: u32 = std.math.log2_int(u32, offset + bias) - 9;
-        const tv: u32 = ((offset - 8) & 0xF) + 16 * top_bits;
-        histo.count[tv] += increment;
+        const histo_bin: u32 = ((offset - 8) & 0xF) + 16 * top_bits;
+        histo.count[histo_bin] += increment;
     }
 }
 
 /// Type-1 offset histogram update: log-bucketed encoding.
-fn updateOffsType1(histo: *ByteHistogram, offset: u32, increment: u32) void {
+fn updateOffsLogBucket(histo: *ByteHistogram, offset: u32, increment: u32) void {
     const shifted: u32 = offset + 8;
-    const tv: u32 = std.math.log2_int(u32, shifted) - 3;
-    const u: u32 = 8 * tv | ((shifted >> @intCast(tv)) ^ 8);
+    const histo_bin: u32 = std.math.log2_int(u32, shifted) - 3;
+    const u: u32 = 8 * histo_bin | ((shifted >> @intCast(histo_bin)) ^ 8);
     histo.count[u] += increment;
 }
 
@@ -98,9 +98,9 @@ fn updateOffsTypeSplit(
     const offset_high: u32 = offset / divisor;
     const offset_low: u32 = offset % divisor;
     const shifted_h: u32 = offset_high + 8;
-    const tv: u32 = std.math.log2_int(u32, shifted_h) - 3;
-    const u: u32 = 8 * tv | ((shifted_h >> @intCast(tv)) ^ 8);
-    histo.count[u] += increment;
+    const log_bucket: u32 = std.math.log2_int(u32, shifted_h) - 3;
+    const histo_bin: u32 = 8 * log_bucket | ((shifted_h >> @intCast(log_bucket)) ^ 8);
+    histo.count[histo_bin] += increment;
     lo_histo.count[offset_low] += increment;
 }
 
@@ -135,17 +135,17 @@ pub fn updateStats(
             h.lit_sub.count[delta] += increment;
         }
 
-        pos += litlen + @as(usize, @intCast(t.match_len));
+        pos += litlen + @as(usize, @intCast(t.match_length));
 
         var length_field: i32 = @intCast(litlen);
         if (litlen >= 3) {
             const bucket: usize = @min(litlen - 3, @as(usize, 255));
-            h.match_len_histo.count[bucket] += increment;
+            h.match_length_histo.count[bucket] += increment;
             length_field = 3;
         }
 
-        // Guard: match_len must be >= 2. Token stream assumes this.
-        if (t.match_len < 2) continue;
+        // Guard: match_length must be >= 2. Token stream assumes this.
+        if (t.match_length < 2) continue;
 
         const offset_i32: i32 = t.offset;
         var recent_field: i32 = undefined;
@@ -155,16 +155,16 @@ pub fn updateStats(
             recent_field = 3;
             const offset: u32 = @intCast(offset_i32);
             switch (h.offs_encode_type) {
-                0 => updateOffsType0(&h.offs_histo, offset, increment),
-                1 => updateOffsType1(&h.offs_histo, offset, increment),
+                0 => updateOffsThresholdSplit(&h.offs_histo, offset, increment),
+                1 => updateOffsLogBucket(&h.offs_histo, offset, increment),
                 else => updateOffsTypeSplit(&h.offs_histo, &h.offs_lo_histo, offset, h.offs_encode_type, increment),
             }
         }
 
-        var matchlen_field: i32 = t.match_len - 2;
-        if (t.match_len - 17 >= 0) {
-            const bucket: usize = @min(@as(usize, @intCast(t.match_len - 17)), @as(usize, 255));
-            h.match_len_histo.count[bucket] += increment;
+        var matchlen_field: i32 = t.match_length - 2;
+        if (t.match_length - 17 >= 0) {
+            const bucket: usize = @min(@as(usize, @intCast(t.match_length - 17)), @as(usize, 255));
+            h.match_length_histo.count[bucket] += increment;
             matchlen_field = 15;
         }
 
@@ -185,7 +185,7 @@ pub fn makeCostModel(h: *const Stats, cost_model: *CostModel) void {
     }
 
     offset_encoder.convertHistoToCost(&h.token_histo, &cost_model.token_cost, 18, 255);
-    offset_encoder.convertHistoToCost(&h.match_len_histo, &cost_model.match_len_cost, 12, 255);
+    offset_encoder.convertHistoToCost(&h.match_length_histo, &cost_model.match_length_cost, 12, 255);
 
     if (cost_model.chunk_type == 1) {
         offset_encoder.convertHistoToCost(&h.lit_raw, &cost_model.lit_cost, 0, 255);
@@ -200,9 +200,9 @@ pub inline fn bitsForLiteralLength(cost_model: *const CostModel, cur_litlen: i32
     if (cur_litlen - 3 >= 255) {
         const arg: u32 = @intCast(((cur_litlen - 3 - 255) >> 6) + 1);
         const v: u32 = std.math.log2_int(u32, @max(arg, 1));
-        return cost_model.match_len_cost[255] + 32 * (2 * v + 7);
+        return cost_model.match_length_cost[255] + 32 * (2 * v + 7);
     }
-    return cost_model.match_len_cost[@intCast(cur_litlen - 3)];
+    return cost_model.match_length_cost[@intCast(cur_litlen - 3)];
 }
 
 /// Cost in 32nds-of-a-bit for a single literal byte.
@@ -263,7 +263,7 @@ pub inline fn bitsForLiterals(
 }
 
 /// Computes the cost (in 32nds of a bit) of emitting a token with the
-/// given `(match_len, cmd_offset, recent_field, length_field)`.
+/// given `(match_length, cmd_offset, recent_field, length_field)`.
 pub fn bitsForToken(
     cost_model: *const CostModel,
     cur_match_len: i32,
@@ -277,9 +277,9 @@ pub fn bitsForToken(
         if (cur_match_len - 17 >= 255) {
             const arg: u32 = @intCast(((cur_match_len - 17 - 255) >> 6) + 1);
             const bit_scan: i32 = @intCast(std.math.log2_int(u32, @max(arg, 1)));
-            bits_for_match_len = @as(i32, @intCast(cost_model.match_len_cost[255])) + 32 * (2 * bit_scan + 7);
+            bits_for_match_len = @as(i32, @intCast(cost_model.match_length_cost[255])) + 32 * (2 * bit_scan + 7);
         } else {
-            bits_for_match_len = @intCast(cost_model.match_len_cost[@intCast(cur_match_len - 17)]);
+            bits_for_match_len = @intCast(cost_model.match_length_cost[@intCast(cur_match_len - 17)]);
         }
         const idx: usize = @intCast((15 << 2) + (recent_field << 6) + length_field);
         cost = @as(i32, @intCast(cost_model.token_cost[idx])) + bits_for_match_len;
@@ -369,7 +369,7 @@ test "rescaleStats covers every stream" {
     s.lit_raw.count[0] = 100;
     s.lit_sub.count[0] = 100;
     s.token_histo.count[0] = 100;
-    s.match_len_histo.count[0] = 100;
+    s.match_length_histo.count[0] = 100;
     s.offs_histo.count[0] = 100;
     s.offs_lo_histo.count[0] = 100;
     s.offs_encode_type = 2;
@@ -377,7 +377,7 @@ test "rescaleStats covers every stream" {
     try testing.expectEqual(@as(u32, 7), s.lit_raw.count[0]); // (100 >> 4) + 1 = 7
     try testing.expectEqual(@as(u32, 7), s.lit_sub.count[0]);
     try testing.expectEqual(@as(u32, 7), s.token_histo.count[0]);
-    try testing.expectEqual(@as(u32, 7), s.match_len_histo.count[0]);
+    try testing.expectEqual(@as(u32, 7), s.match_length_histo.count[0]);
     try testing.expectEqual(@as(u32, 7), s.offs_histo.count[0]);
     try testing.expectEqual(@as(u32, 7), s.offs_lo_histo.count[0]);
 }
@@ -388,10 +388,10 @@ test "bitsForLiteralLength: litlen < 3 returns 0" {
     try testing.expectEqual(@as(u32, 0), bitsForLiteralLength(&cm, 2));
 }
 
-test "bitsForLiteralLength: litlen in [3, 257] reads from match_len_cost" {
+test "bitsForLiteralLength: litlen in [3, 257] reads from match_length_cost" {
     var cm: CostModel = std.mem.zeroes(CostModel);
-    cm.match_len_cost[0] = 100;
-    cm.match_len_cost[5] = 200;
+    cm.match_length_cost[0] = 100;
+    cm.match_length_cost[5] = 200;
     try testing.expectEqual(@as(u32, 100), bitsForLiteralLength(&cm, 3)); // index 0
     try testing.expectEqual(@as(u32, 200), bitsForLiteralLength(&cm, 8)); // index 5
 }

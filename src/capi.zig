@@ -49,6 +49,10 @@ export fn slz_content_size(src: [*]const u8, src_len: usize) u64 {
     return hdr.content_size orelse 0;
 }
 
+export fn slz_max_content_size() u64 {
+    return decoder.max_content_size;
+}
+
 export fn slz_version_string() [*:0]const u8 {
     return "2.0.0";
 }

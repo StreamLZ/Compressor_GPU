@@ -1,6 +1,5 @@
 //! FastMatchHasher — single-entry Fibonacci-hash table used by the greedy
-//! Fast LZ parser. Port of `FastMatchHasher<T>` in
-//! src/StreamLZ/Compression/MatchFinding/MatchHasher.cs.
+//! Fast LZ parser.
 //! Used by: Fast codec (L1-L5)
 //!
 //! Hot-loop design:
@@ -19,7 +18,7 @@
 //! Cache notes:
 //!   * For u32 entries at 17 bits, table = 512 KB → spills to L2. For 14 bits
 //!     (u16 entries, level -2) it's 32 KB → fits in L1. Keep the bit count at
-//!     or below the per-level maximum from `Fast.Compressor.SetupEncoder`.
+//!     or below the per-level maximum from `resolveParams`.
 
 const std = @import("std");
 const constants = @import("fast_constants.zig");
@@ -63,8 +62,8 @@ pub fn FastMatchHasher(comptime T: type) type {
         ///   if (k in [5, 8]):  hashMult = FibonacciHashMultiplier << (8 * (8 - k))
         ///   else (k = 0 or 4): hashMult = 0x9E3779B100000000UL
         ///
-        /// This is intentionally DIFFERENT from `MatchHasherBase.AllocateHash`
-        /// which uses `FibonacciHashMultiplier << (8 * (8 - k))` for all k.
+        /// This is intentionally DIFFERENT from `MatchHasher.init` which uses
+        /// `fibonacci_hash_multiplier << (8 * (8 - k))` for all k.
         pub fn init(allocator: std.mem.Allocator, params: HasherParams) !Self {
             if (params.hash_bits < 8 or params.hash_bits > 24) return error.HashBitsOutOfRange;
             const k: u32 = if (params.min_match_length == 0) 4 else params.min_match_length;

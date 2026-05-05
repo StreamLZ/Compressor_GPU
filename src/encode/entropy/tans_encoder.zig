@@ -29,7 +29,7 @@
 //!     in the 10-round cycle tells us which state to use).
 
 const std = @import("std");
-const hist_mod = @import("ByteHistogram.zig");
+const hist_mod = @import("byte_histogram.zig");
 const bw_mod = @import("../../io/bit_writer.zig");
 const cost_coeffs = @import("../cost_coefficients.zig");
 
@@ -191,39 +191,39 @@ fn heapPop(heap: []HeapEntry) void {
 //  Normalize histogram counts to sum to L = 2^log_table_bits
 // ────────────────────────────────────────────────────────────
 
-/// Fills `weights[0..weights_size]` with normalized counts (summing to `L`).
-/// `histo_sum` is the count total over `weights_size` symbols. Returns the
+/// Fills `weights[0..num_symbols]` with normalized counts (summing to `L`).
+/// `histo_sum` is the count total over `num_symbols` symbols. Returns the
 /// number of used symbols (weights > 0).
 pub fn tansNormalizeCounts(
     weights: []u32,
-    L: u32,
+    table_size: u32,
     histo: *const ByteHistogram,
     histo_sum: u32,
-    weights_size: usize,
+    num_symbols: usize,
 ) u32 {
     var syms_used: u32 = 0;
-    const multiplier: f64 = @as(f64, @floatFromInt(L)) / @as(f64, @floatFromInt(histo_sum));
+    const multiplier: f64 = @as(f64, @floatFromInt(table_size)) / @as(f64, @floatFromInt(histo_sum));
     var weight_sum: u32 = 0;
-    for (0..weights_size) |i| {
-        const h: u32 = histo.count[i];
-        var u: u32 = 0;
-        if (h != 0) {
-            u = doubleToUintRoundPow2(@as(f64, @floatFromInt(h)) * multiplier);
-            weight_sum += u;
+    for (0..num_symbols) |i| {
+        const sym_count: u32 = histo.count[i];
+        var normalized_weight: u32 = 0;
+        if (sym_count != 0) {
+            normalized_weight = doubleToUintRoundPow2(@as(f64, @floatFromInt(sym_count)) * multiplier);
+            weight_sum += normalized_weight;
             syms_used += 1;
         }
-        weights[i] = u;
+        weights[i] = normalized_weight;
     }
-    for (weights_size..weights.len) |i| weights[i] = 0;
-    if (weight_sum == L) return syms_used;
+    for (num_symbols..weights.len) |i| weights[i] = 0;
+    if (weight_sum == table_size) return syms_used;
 
     var heap_buf: [256]HeapEntry = undefined;
     var heap_len: usize = 0;
-    const diff_i64: i64 = @as(i64, L) - @as(i64, weight_sum);
+    const diff_i64: i64 = @as(i64, table_size) - @as(i64, weight_sum);
 
     if (diff_i64 < 0) {
         // Need to decrement weights that are > 1.
-        for (0..weights_size) |i| {
+        for (0..num_symbols) |i| {
             if (weights[i] > 1) {
                 heap_buf[heap_len] = .{
                     .index = @intCast(i),
@@ -235,7 +235,7 @@ pub fn tansNormalizeCounts(
         }
     } else {
         // Need to increment weights that are > 0.
-        for (0..weights_size) |i| {
+        for (0..num_symbols) |i| {
             if (histo.count[i] != 0) {
                 heap_buf[heap_len] = .{
                     .index = @intCast(i),
@@ -297,16 +297,16 @@ pub fn tansInitTable(
     te: *[256]TansEncEntry,
     te_data: []u16,
     weights: []const u32,
-    weights_size: usize,
+    num_symbols: usize,
     log_table_bits: u32,
 ) void {
-    std.debug.assert(weights_size <= 256);
+    std.debug.assert(num_symbols <= 256);
     const L: u32 = @as(u32, 1) << @intCast(log_table_bits);
     std.debug.assert(te_data.len >= L);
 
     // Count weight-1 symbols.
     var ones: u32 = 0;
-    for (0..weights_size) |i| {
+    for (0..num_symbols) |i| {
         if (weights[i] == 1) ones += 1;
     }
 
@@ -325,7 +325,7 @@ pub fn tansInitTable(
 
     var weights_sum: i32 = 0;
 
-    for (0..weights_size) |i| {
+    for (0..num_symbols) |i| {
         const w: u32 = weights[i];
         if (w == 0) {
             te[i].base_offset = 0;
@@ -347,9 +347,9 @@ pub fn tansInitTable(
             ones_ptr += 1;
         } else {
             const w_minus_1: u32 = w - 1;
-            const nb_high: u32 = 31 - @clz(w_minus_1) + 1;
-            te[i].num_bits = @intCast(log_table_bits - nb_high);
-            te[i].thres = @intCast((2 * w) << @intCast(log_table_bits - nb_high));
+            const num_bits_high: u32 = 31 - @clz(w_minus_1) + 1;
+            te[i].num_bits = @intCast(log_table_bits - num_bits_high);
+            te[i].thres = @intCast((2 * w) << @intCast(log_table_bits - num_bits_high));
             te[i].base_offset = @as(i32, @intCast(weights_sum)) - @as(i32, @intCast(w));
 
             var j: usize = 0;
@@ -391,6 +391,28 @@ inline fn nextState(te_data: []const u16, entry: *const TansEncEntry, state: u32
     return .{ new_state, nb };
 }
 
+/// Helper: dry-run 5 symbols through the state machine, accumulating
+/// the total bits emitted. Mirrors `encodeSymbolGroup` but only counts
+/// bits instead of writing them.
+inline fn countSymbolGroup(
+    te: *const [256]TansEncEntry,
+    te_data: []const u16,
+    src: []const u8,
+    read_idx: *usize,
+    states: *[5]u32,
+) u32 {
+    var bits: u32 = 0;
+    inline for (.{ 4, 3, 2, 1, 0 }) |idx| {
+        const sym = src[read_idx.*];
+        if (read_idx.* > 0) read_idx.* -= 1;
+        const entry = &te[sym];
+        const ns_nb = nextState(te_data, entry, states[idx]);
+        bits += ns_nb[1];
+        states[idx] = ns_nb[0];
+    }
+    return bits;
+}
+
 /// Computes the exact number of forward and backward bits the 5-state
 /// encoder will emit for `src` (not counting the initial-state payloads).
 /// The encoder's main loop processes 10 symbols per iteration (5 forward,
@@ -407,11 +429,13 @@ pub fn tansGetEncodedBitCount(
 
     // Initial states = last 5 source bytes (with the L-bit set).
     const src_end_idx: usize = src.len - 5;
-    var state0: u32 = @as(u32, src[src_end_idx + 0]) | L;
-    var state1: u32 = @as(u32, src[src_end_idx + 1]) | L;
-    var state2: u32 = @as(u32, src[src_end_idx + 2]) | L;
-    var state3: u32 = @as(u32, src[src_end_idx + 3]) | L;
-    var state4: u32 = @as(u32, src[src_end_idx + 4]) | L;
+    var states = [5]u32{
+        @as(u32, src[src_end_idx + 0]) | L,
+        @as(u32, src[src_end_idx + 1]) | L,
+        @as(u32, src[src_end_idx + 2]) | L,
+        @as(u32, src[src_end_idx + 3]) | L,
+        @as(u32, src[src_end_idx + 4]) | L,
+    };
 
     var forward_bits: u32 = 0;
     var backward_bits: u32 = 0;
@@ -433,76 +457,17 @@ pub fn tansGetEncodedBitCount(
         if (read_idx > 0) read_idx -= 1;
         const entry = &te[sym];
         const si: usize = ri % 5;
-        var sv: u32 = undefined;
-        switch (si) {
-            0 => sv = state4,
-            1 => sv = state3,
-            2 => sv = state2,
-            3 => sv = state1,
-            else => sv = state0,
-        }
+        const sv = states[4 - si];
         const ns_nb = nextState(te_data, entry, sv);
         if (ri < 5) forward_bits += ns_nb[1] else backward_bits += ns_nb[1];
-        switch (si) {
-            0 => state4 = ns_nb[0],
-            1 => state3 = ns_nb[0],
-            2 => state2 = ns_nb[0],
-            3 => state1 = ns_nb[0],
-            else => state0 = ns_nb[0],
-        }
+        states[4 - si] = ns_nb[0];
     }
 
     // Body: `rounds` iterations of the full 10-symbol cycle.
     var r: usize = 0;
     while (r < rounds) : (r += 1) {
-        inline for (.{ 4, 3, 2, 1, 0 }) |idx| {
-            const sym = src[read_idx];
-            if (read_idx > 0) read_idx -= 1;
-            var sv: u32 = undefined;
-            switch (idx) {
-                0 => sv = state0,
-                1 => sv = state1,
-                2 => sv = state2,
-                3 => sv = state3,
-                4 => sv = state4,
-                else => unreachable,
-            }
-            const entry = &te[sym];
-            const ns_nb = nextState(te_data, entry, sv);
-            forward_bits += ns_nb[1];
-            switch (idx) {
-                0 => state0 = ns_nb[0],
-                1 => state1 = ns_nb[0],
-                2 => state2 = ns_nb[0],
-                3 => state3 = ns_nb[0],
-                4 => state4 = ns_nb[0],
-                else => unreachable,
-            }
-        }
-        inline for (.{ 4, 3, 2, 1, 0 }) |idx| {
-            const sym = src[read_idx];
-            if (read_idx > 0) read_idx -= 1;
-            var sv: u32 = undefined;
-            switch (idx) {
-                0 => sv = state0,
-                1 => sv = state1,
-                2 => sv = state2,
-                3 => sv = state3,
-                4 => sv = state4,
-                else => unreachable,
-            }
-            const entry = &te[sym];
-            const ns_nb = nextState(te_data, entry, sv);
-            backward_bits += ns_nb[1];
-            switch (idx) {
-                0 => state0 = ns_nb[0],
-                1 => state1 = ns_nb[0],
-                2 => state2 = ns_nb[0],
-                3 => state3 = ns_nb[0],
-                4 => state4 = ns_nb[0],
-                else => unreachable,
-            }
-        }
+        forward_bits += countSymbolGroup(te, te_data, src, &read_idx, &states);
+        backward_bits += countSymbolGroup(te, te_data, src, &read_idx, &states);
     }
 
     return .{
@@ -516,6 +481,29 @@ pub fn tansGetEncodedBitCount(
 // ────────────────────────────────────────────────────────────
 //  Encode hot loop (5-state interleaved)
 // ────────────────────────────────────────────────────────────
+
+/// Encode 5 symbols (one half of the 10-symbol cycle) into `writer`.
+/// Used by `tansEncodeBytes` for both the forward and backward passes.
+inline fn encodeSymbolGroup(
+    writer: anytype,
+    te: *const [256]TansEncEntry,
+    te_data: []const u16,
+    src: []const u8,
+    read_idx_plus1: *usize,
+    states: *[5]u32,
+) void {
+    inline for (.{ 4, 3, 2, 1, 0 }) |idx| {
+        const sym = src[read_idx_plus1.*];
+        if (read_idx_plus1.* > 0) read_idx_plus1.* -= 1;
+        const sv = states[idx];
+        const entry = &te[sym];
+        const ns_nb = nextState(te_data, entry, sv);
+        const nb_u5: u5 = @intCast(ns_nb[1]);
+        const mask: u32 = if (ns_nb[1] >= 32) 0xFFFF_FFFF else ((@as(u32, 1) << nb_u5) - 1);
+        writer.writeNoFlush(sv & mask, nb_u5);
+        states[idx] = ns_nb[0];
+    }
+}
 
 /// Encodes `src` using the 5-state interleaved encoder. Writes forward
 /// bit stream to `dst[0..]` growing up and backward bit stream to
@@ -549,11 +537,13 @@ pub fn tansEncodeBytes(
 
     const L: u32 = @as(u32, 1) << @intCast(log_table_bits);
     const src_end_idx: usize = src.len - 5;
-    var state0: u32 = @as(u32, src[src_end_idx + 0]) | L;
-    var state1: u32 = @as(u32, src[src_end_idx + 1]) | L;
-    var state2: u32 = @as(u32, src[src_end_idx + 2]) | L;
-    var state3: u32 = @as(u32, src[src_end_idx + 3]) | L;
-    var state4: u32 = @as(u32, src[src_end_idx + 4]) | L;
+    var states = [5]u32{
+        @as(u32, src[src_end_idx + 0]) | L,
+        @as(u32, src[src_end_idx + 1]) | L,
+        @as(u32, src[src_end_idx + 2]) | L,
+        @as(u32, src[src_end_idx + 3]) | L,
+        @as(u32, src[src_end_idx + 4]) | L,
+    };
 
     const body_len: usize = src_end_idx;
     const rounds: usize = body_len / 10;
@@ -563,32 +553,21 @@ pub fn tansEncodeBytes(
     if (read_idx_plus1 > 0) read_idx_plus1 -= 1;
 
     // Process remainder symbols first.
+    // The remainder maps into the 10-symbol cycle [4,3,2,1,0,4,3,2,1,0]
+    // where positions 0-4 write forward and positions 5-9 write backward.
     var ri: usize = 10 - remainder;
     while (ri < 10) : (ri += 1) {
         const sym: u8 = src[read_idx_plus1];
         if (read_idx_plus1 > 0) read_idx_plus1 -= 1;
         const entry = &te[sym];
         const si: usize = ri % 5;
-        var sv: u32 = undefined;
-        switch (si) {
-            0 => sv = state4,
-            1 => sv = state3,
-            2 => sv = state2,
-            3 => sv = state1,
-            else => sv = state0,
-        }
+        const sv = states[4 - si];
         const ns_nb = nextState(te_data, entry, sv);
         const nb_u5: u5 = @intCast(ns_nb[1]);
         const mask: u32 = if (ns_nb[1] >= 32) 0xFFFF_FFFF else ((@as(u32, 1) << nb_u5) - 1);
         const bits: u32 = sv & mask;
         if (ri < 5) forward.writeNoFlush(bits, nb_u5) else backward.writeNoFlush(bits, nb_u5);
-        switch (si) {
-            0 => state4 = ns_nb[0],
-            1 => state3 = ns_nb[0],
-            2 => state2 = ns_nb[0],
-            3 => state1 = ns_nb[0],
-            else => state0 = ns_nb[0],
-        }
+        states[4 - si] = ns_nb[0];
     }
     if (remainder > 0) {
         backward.flush();
@@ -597,71 +576,19 @@ pub fn tansEncodeBytes(
 
     var r: usize = 0;
     while (r < rounds) : (r += 1) {
-        // Forward 5: state4, state3, state2, state1, state0
-        inline for (.{ 4, 3, 2, 1, 0 }) |idx| {
-            const sym = src[read_idx_plus1];
-            if (read_idx_plus1 > 0) read_idx_plus1 -= 1;
-            var sv: u32 = undefined;
-            switch (idx) {
-                0 => sv = state0,
-                1 => sv = state1,
-                2 => sv = state2,
-                3 => sv = state3,
-                4 => sv = state4,
-                else => unreachable,
-            }
-            const entry = &te[sym];
-            const ns_nb = nextState(te_data, entry, sv);
-            const nb_u5: u5 = @intCast(ns_nb[1]);
-            const mask: u32 = if (ns_nb[1] >= 32) 0xFFFF_FFFF else ((@as(u32, 1) << nb_u5) - 1);
-            forward.writeNoFlush(sv & mask, nb_u5);
-            switch (idx) {
-                0 => state0 = ns_nb[0],
-                1 => state1 = ns_nb[0],
-                2 => state2 = ns_nb[0],
-                3 => state3 = ns_nb[0],
-                4 => state4 = ns_nb[0],
-                else => unreachable,
-            }
-        }
-        // Backward 5: state4, state3, state2, state1, state0
-        inline for (.{ 4, 3, 2, 1, 0 }) |idx| {
-            const sym = src[read_idx_plus1];
-            if (read_idx_plus1 > 0) read_idx_plus1 -= 1;
-            var sv: u32 = undefined;
-            switch (idx) {
-                0 => sv = state0,
-                1 => sv = state1,
-                2 => sv = state2,
-                3 => sv = state3,
-                4 => sv = state4,
-                else => unreachable,
-            }
-            const entry = &te[sym];
-            const ns_nb = nextState(te_data, entry, sv);
-            const nb_u5: u5 = @intCast(ns_nb[1]);
-            const mask: u32 = if (ns_nb[1] >= 32) 0xFFFF_FFFF else ((@as(u32, 1) << nb_u5) - 1);
-            backward.writeNoFlush(sv & mask, nb_u5);
-            switch (idx) {
-                0 => state0 = ns_nb[0],
-                1 => state1 = ns_nb[0],
-                2 => state2 = ns_nb[0],
-                3 => state3 = ns_nb[0],
-                4 => state4 = ns_nb[0],
-                else => unreachable,
-            }
-        }
+        encodeSymbolGroup(&forward, te, te_data, src, &read_idx_plus1, &states);
+        encodeSymbolGroup(&backward, te, te_data, src, &read_idx_plus1, &states);
         backward.flush();
         forward.flush();
     }
     // Write final states.
     const mask_L: u32 = L - 1;
     const ltb_u5: u5 = @intCast(log_table_bits);
-    backward.writeNoFlush(state4 & mask_L, ltb_u5);
-    backward.writeNoFlush(state2 & mask_L, ltb_u5);
-    backward.writeNoFlush(state0 & mask_L, ltb_u5);
-    forward.writeNoFlush(state3 & mask_L, ltb_u5);
-    forward.writeNoFlush(state1 & mask_L, ltb_u5);
+    backward.writeNoFlush(states[4] & mask_L, ltb_u5);
+    backward.writeNoFlush(states[2] & mask_L, ltb_u5);
+    backward.writeNoFlush(states[0] & mask_L, ltb_u5);
+    forward.writeNoFlush(states[3] & mask_L, ltb_u5);
+    forward.writeNoFlush(states[1] & mask_L, ltb_u5);
     backward.flush();
     forward.flush();
 
@@ -977,9 +904,9 @@ pub fn encodeArrayU8Tans(
     const log_table_bits: u32 = @intCast(clamped);
 
     // Determine used range of the histogram.
-    var weights_size: usize = 256;
-    while (weights_size > 0 and histo.count[weights_size - 1] == 0) weights_size -= 1;
-    if (weights_size == 0) return error.TooFewSymbols;
+    var num_symbols: usize = 256;
+    while (num_symbols > 0 and histo.count[num_symbols - 1] == 0) num_symbols -= 1;
+    if (num_symbols == 0) return error.TooFewSymbols;
 
     var weights: [256]u32 = @splat(0);
     const used_symbols = tansNormalizeCounts(
@@ -987,7 +914,7 @@ pub fn encodeArrayU8Tans(
         @as(u32, 1) << @intCast(log_table_bits),
         histo,
         @intCast(src.len - 5),
-        weights_size,
+        num_symbols,
     );
     if (used_symbols <= 1) return error.TooFewSymbols;
 
@@ -1022,7 +949,7 @@ pub fn encodeArrayU8Tans(
     var table_buf: [512]u8 = @splat(0);
     var bw = BitWriter64Forward.initBounded(&table_buf, table_buf.len);
     bw.writeNoFlush(log_table_bits - 8, 3);
-    tansEncodeTable(&bw, log_table_bits, &weights, weights_size, used_symbols);
+    tansEncodeTable(&bw, log_table_bits, &weights, num_symbols, used_symbols);
     bw.flush();
     const table_final_ptr = bw.getFinalPtr();
     const table_bytes: usize = @intFromPtr(table_final_ptr) - @intFromPtr(&table_buf[0]);
@@ -1030,7 +957,7 @@ pub fn encodeArrayU8Tans(
     // Build encoding table.
     var te: [256]TansEncEntry = undefined;
     var te_data: [2048]u16 = undefined;
-    tansInitTable(&te, &te_data, &weights, weights_size, log_table_bits);
+    tansInitTable(&te, &te_data, &weights, num_symbols, log_table_bits);
 
     // Compute exact bit counts.
     const counts = tansGetEncodedBitCount(&te, &te_data, src, log_table_bits);

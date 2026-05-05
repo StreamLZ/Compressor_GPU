@@ -1,6 +1,8 @@
 //! Fast codec frame builder — produces a single SLZ1-framed block
 //! for Fast levels L1-L5.
 //!
+//! Terminology: "sc" / "SC" = "self-contained" throughout this module.
+//!
 //! Extracted from `streamlz_encoder.zig` to isolate the Fast-codec
 //! frame construction from the top-level dispatch and the High-codec
 //! path.  `compressFramedOne` is the sole public entry point.
@@ -39,13 +41,13 @@ const areAllBytesEqual = block_header.areAllBytesEqual;
 
 const l1_sc_group_size: usize = 1; // per-chunk independence (256 KB)
 
-const FastScShared = struct {
+const FastScContext = struct {
     src: []const u8,
     effective_src: []const u8,
     level: u8,
     sc_flag_bits: u8,
     greedy_hash_bits: u6,
-    hasher_min_match_length: u32,
+    hasher_k: u32,
     parser_config: fast_enc.ParserConfig,
     check_plain_huffman: bool,
     entropy_options: entropy_enc.EntropyOptions,
@@ -59,10 +61,10 @@ const FastScShared = struct {
     num_groups: usize,
 };
 
-fn fastScWorkerFn(shared: *FastScShared) void {
+fn fastScWorker(shared: *FastScContext) void {
     var hasher = FastMatchHasher(u32).init(std.heap.c_allocator, .{
         .hash_bits = shared.greedy_hash_bits,
-        .min_match_length = shared.hasher_min_match_length,
+        .min_match_length = shared.hasher_k,
     }) catch {
         _ = shared.error_flag.store(1, .monotonic);
         return;
@@ -241,13 +243,13 @@ fn compressFastChunksParallel(
 
     const num_groups = (num_chunks + l1_sc_group_size - 1) / l1_sc_group_size;
 
-    var shared: FastScShared = .{
+    var shared: FastScContext = .{
         .src = src,
         .effective_src = effective_src,
         .level = opts.level,
         .sc_flag_bits = sc_flag_bits,
         .greedy_hash_bits = greedy_hash_bits,
-        .hasher_min_match_length = resolved.hasher_min_match_length,
+        .hasher_k = resolved.hasher_k,
         .parser_config = parser_config,
         .check_plain_huffman = false,
         .entropy_options = entropyOptionsForLevel(opts.level),
@@ -263,12 +265,12 @@ fn compressFastChunksParallel(
 
     const worker_count = @min(@as(usize, num_threads), num_groups);
     if (worker_count <= 1) {
-        fastScWorkerFn(&shared);
+        fastScWorker(&shared);
     } else {
         var group: std.Io.Group = .init;
         for (0..worker_count) |_| {
-            group.concurrent(io, fastScWorkerFn, .{&shared}) catch |err| switch (err) {
-                error.ConcurrencyUnavailable => fastScWorkerFn(&shared),
+            group.concurrent(io, fastScWorker, .{&shared}) catch |err| switch (err) {
+                error.ConcurrencyUnavailable => fastScWorker(&shared),
             };
         }
         group.await(io) catch {};
@@ -344,6 +346,7 @@ pub fn compressFramedOne(
         .sc_group_size = sc_grp,
         .content_size = if (opts.include_content_size) @as(u64, @intCast(src.len)) else null,
         .dictionary_id = opts.dictionary_id,
+        .content_checksum = false,
     });
     pos += hdr_len;
 
@@ -397,7 +400,7 @@ pub fn compressFramedOne(
             // Fast 2 (engine -1), Fast 3 (engine 1), Fast 5 (engine 2).
             greedy_hasher_u32 = FastMatchHasher(u32).init(allocator, .{
                 .hash_bits = greedy_hash_bits,
-                .min_match_length = resolved.hasher_min_match_length,
+                .min_match_length = resolved.hasher_k,
             }) catch |err| return if (err == error.HashBitsOutOfRange) error.BadLevel else @errorCast(err);
         },
     }
@@ -407,16 +410,15 @@ pub fn compressFramedOne(
         resolved.use_entropy,
     );
     const parser_config: fast_enc.ParserConfig = .{
-        // Parser mmlt uses the UN-bumped value (reads opts.MinMatchLength
-        // in FastParser.CompressGreedy regardless of the text bump).
+        // Parser mmlt uses the UN-bumped value (reads opts.min_match_length
+        // regardless of the text bump).
         .minimum_match_length = resolved.parser_min_match_length,
         .dictionary_size = resolved.dict_size,
         .speed_tradeoff = speed_tradeoff,
     };
 
-    // Reset all hashers ONCE at the top of compressFramed
-    // `SetupEncoder` → `CreateFastHasher<T>.AllocateHash` which clears the
-    // table once per CompressBlock_Fast call and then never re-clears.
+    // Reset all hashers ONCE at the top of compressFramed. The hash table
+    // is cleared once per frame and then never re-cleared.
     //
     // The greedy parser uses the hash table with positions stored in
     // WHOLE-INPUT coordinates (measured from src.ptr). Stale entries from
@@ -501,14 +503,13 @@ pub fn compressFramedOne(
         return pos;
     }
 
-    // CompressBlocksSerial -> CompressOneBlock -> CompressChunk.
-    // Structure:
+    // Block/chunk/sub-chunk structure:
     //   per 256 KB block:
     //     if all-equal → 2-byte block hdr + 5-byte memset chunk hdr, done
     //     else: 2-byte block hdr + 4-byte chunk hdr placeholder + sub-chunks
     //            per sub-chunk:
     //              < 32 → 3-byte raw sub-chunk hdr + memcpy
-    //              all-equal → EncodeArrayU8 memcpy (no compressed flag)
+    //              all-equal → raw memcpy (no compressed flag)
     //              else → LZ; compare lzCost vs memsetCost vs plainHuffCost
     //            if totalCost > blockMemsetCost → rewind, emit uncompressed block
     //            else backfill chunk hdr
@@ -569,7 +570,7 @@ pub fn compressFramedOne(
         // ── Iterate sub-chunks ─────────────────────────────────────────
         // Per sub-chunk:
         //   * < 32 bytes → raw-flag sub-chunk header + raw bytes
-        //   * all-equal → EncodeArrayU8 (memcpy, no compressed flag)
+        //   * all-equal → raw memcpy (no compressed flag)
         //   * else → LZ encode + cost-based 3-way decision
         var total_cost: f32 = 0;
         var sub_off: usize = 0;
@@ -586,17 +587,15 @@ pub fn compressFramedOne(
 
             if (round_bytes >= 32) {
                 if (areAllBytesEqual(sub_src)) {
-                    // Plain memcpy via
-                    // EncodeArrayU8. For Fast (tANS disabled) this falls
-                    // through to a 3-byte BE memcpy header + raw bytes,
-                    // which has the compressed flag CLEAR (size ≤ 18 bits).
+                    // Plain memcpy: 3-byte BE header + raw bytes, with the
+                    // compressed flag CLEAR (size ≤ 18 bits).
                     if (pos + round_bytes + 3 > dst.len) return error.DestinationTooSmall;
                     dst[pos + 0] = @intCast((round_bytes >> 16) & 0xFF);
                     dst[pos + 1] = @intCast((round_bytes >> 8) & 0xFF);
                     dst[pos + 2] = @intCast(round_bytes & 0xFF);
                     @memcpy(dst[pos + 3 ..][0..round_bytes], sub_src);
                     pos += round_bytes + 3;
-                    // EncodeArrayU8 memcpy cost = count + 3.
+                    // Raw memcpy cost = count + 3.
                     total_cost += @floatFromInt(round_bytes + 3);
                     sub_off += round_bytes;
                     continue;
@@ -621,16 +620,16 @@ pub fn compressFramedOne(
 
                 // ── Plain-Huffman trial encode (CheckPlainHuffman path) ──
                 //
-                // For Fast with no tANS/Huffman, EncodeArrayU8 falls back to
-                // memcpy which always returns count+3 bytes (i.e., never
-                // beats raw), so plain_huff_cost is always invalidated.
+                // For Fast with no tANS/Huffman, the raw array path falls
+                // back to memcpy which always returns count+3 bytes (i.e.,
+                // never beats raw), so plain_huff_cost is always invalidated.
                 // We still emit the same decision arm to stay byte-parity
                 // in case the order of operations matters.
                 var plain_huff_cost: f32 = std.math.inf(f32);
                 if (check_plain_huffman) {
                     plain_huff_cost = @min(sub_memset_cost, lz_cost);
-                    // EncodeArrayU8 memcpy returns count + 3. Check matches
-                    // plainHuffN < 0 || plainHuffN >= roundBytes.
+                    // Raw memcpy returns count + 3. If plain_huff_n >=
+                    // round_bytes, it can't beat raw, so invalidate.
                     const plain_huff_n: usize = round_bytes + 3;
                     if (plain_huff_n >= round_bytes) {
                         plain_huff_cost = std.math.inf(f32);
@@ -735,10 +734,8 @@ pub fn compressFramedOne(
 
     // SC mode: append a prefix table of (num_chunks - 1) * 8 bytes at the
     // end of the frame block payload. Each entry holds the first 8 bytes of
-    // chunks 1..N-1 (the 0-fill + memcpy trick matches the format
-    // `StreamLzCompressor.AppendSelfContainedPrefixTable` lines 407-426).
-    // The parallel decompressor uses these to restore the corrupted first
-    // 8 bytes of each per-worker-decoded chunk.
+    // chunks 1..N-1. The parallel decompressor uses these to restore the
+    // corrupted first 8 bytes of each per-worker-decoded chunk.
     if (self_contained and can_compress) {
         var i: usize = 1;
         while (i < num_chunks) : (i += 1) {
@@ -853,7 +850,19 @@ pub fn compressFramedOne(
                     }
                 }.lessThan);
 
-                const body_size = pdm.serializedBodySize(tmp_match_ops, tmp_literal_bytes);
+                // Per-chunk XOR folds for parallel decode integrity verification.
+                const chunk_xor_folds = allocator.alloc(u64, num_chunks) catch null;
+                defer if (chunk_xor_folds) |folds| allocator.free(folds);
+                const xor_folds_slice: []const u64 = if (chunk_xor_folds) |folds| blk: {
+                    for (folds, 0..) |*f, ci| {
+                        const cs = ci * lz_constants.chunk_size;
+                        const ce = @min(cs + lz_constants.chunk_size, src.len);
+                        f.* = pdm.xorFoldChunk(src[cs..ce]);
+                    }
+                    break :blk folds;
+                } else &[_]u64{};
+
+                const body_size = pdm.serializedBodySize(tmp_match_ops, tmp_literal_bytes, xor_folds_slice);
                 // Outer block header (8 bytes) + body.
                 if (pos + 8 + body_size > dst.len) {
                     // Out of output budget — skip the sidecar rather
@@ -874,6 +883,7 @@ pub fn compressFramedOne(
                         dst[pos..],
                         tmp_match_ops,
                         tmp_literal_bytes,
+                        xor_folds_slice,
                     );
                     pos += body_written;
 

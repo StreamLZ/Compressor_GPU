@@ -3,6 +3,8 @@
 //! tokens that minimizes total bit cost.
 //! Used by: High codec (L6-L11)
 //!
+//! Terminology: "sc" / "SC" = "self-contained" throughout this module.
+//!
 //! The parser operates in three phases per chunk:
 //!
 //!   1. Collect statistics — a greedy pass over the match table to
@@ -18,8 +20,8 @@
 //!
 //! The parser is NOT byte-exact validated yet — the full High codec
 //! end-to-end round-trip validation lives in the wiring step (D9 /
-//! step 34). This port ensures the code compiles and runs on its
-//! own; fixture-based byte-exact checks come next.
+//! step 34). This ensures the code compiles and runs on its own;
+//! fixture-based byte-exact checks come next.
 
 const std = @import("std");
 const lz_constants = @import("../../format/streamlz_constants.zig");
@@ -29,7 +31,7 @@ const high_types = @import("high_types.zig");
 const high_matcher = @import("high_matcher.zig");
 const high_cost_model = @import("high_cost_model.zig");
 const high_encoder = @import("high_encoder.zig");
-const hist_mod = @import("../entropy/ByteHistogram.zig");
+const hist_mod = @import("../entropy/byte_histogram.zig");
 
 const LengthAndOffset = mls_mod.LengthAndOffset;
 const ManagedMatchLenStorage = mls_mod.ManagedMatchLenStorage;
@@ -75,7 +77,7 @@ inline fn updateState(
 
     st.best_bit_count = bits;
     st.lit_len = literal_run_length;
-    st.match_len = match_length;
+    st.match_length = match_length;
 
     const r0 = states[prev_state].recent_offs0;
     const r1 = states[prev_state].recent_offs1;
@@ -147,9 +149,9 @@ fn updateStatesZ(
 }
 
 /// Greedy-pass statistics collector. Walks the match table with the
-/// same lazy-eval logic as `High.FastParser.CompressFast` and emits
-/// tokens to a writer; the resulting `Stats` block seeds the optimal
-/// parser's initial cost model.
+/// same lazy-eval logic as `fastCompress` and emits tokens to a writer;
+/// the resulting `Stats` block seeds the optimal parser's initial cost
+/// model.
 fn collectStatistics(
     ctx: *const HighEncoderContext,
     stats: *Stats,
@@ -307,16 +309,16 @@ fn backwardExtract(
                 tokens_begin[num_tokens] = .{
                     .recent_offset0 = state_cur.recent_offs0,
                     .offset = 0,
-                    .match_len = @intCast(extra_ml),
+                    .match_length = @intCast(extra_ml),
                     .lit_len = @intCast(extra_lit),
                 };
                 num_tokens += 1;
             }
         }
         const lit_len_sub: usize = @intCast(state_cur.lit_len);
-        const match_len_sub: usize = @intCast(state_cur.match_len);
-        if (out_offs < lit_len_sub + match_len_sub) break;
-        out_offs -= lit_len_sub + match_len_sub;
+        const ml_sub: usize = @intCast(state_cur.match_length);
+        if (out_offs < lit_len_sub + ml_sub) break;
+        out_offs -= lit_len_sub + ml_sub;
         const prev_idx: usize = @intCast(state_cur.prev_state);
         const state_prev = &states[prev_idx];
         const recent0: i32 = state_cur.recent_offs0;
@@ -326,7 +328,7 @@ fn backwardExtract(
             tokens_begin[num_tokens] = .{
                 .recent_offset0 = state_prev.recent_offs0,
                 .lit_len = state_cur.lit_len,
-                .match_len = state_cur.match_len,
+                .match_length = state_cur.match_length,
                 .offset = off_field,
             };
             num_tokens += 1;
@@ -475,6 +477,7 @@ fn optimalOnePass(
             const u32_at_cur: u32 = std.mem.readInt(u32, src_cur[0..4], .little);
 
             if (state_width == 1) {
+                // Incremental literal costing: accumulate per-byte costs since prev_offset to avoid O(n^2) re-summation.
                 if (pos != prev_offset) {
                     const extra_bits: i32 = @intCast(high_cost_model.bitsForLiteral(
                         source,
@@ -1142,9 +1145,9 @@ pub fn optimal(
 
     // ── Cross-block stats carry ──
     // If the caller plumbed a `HighCrossBlockState`, read the previous
-    // block's stats as a seed for `rescaleAddStats`. C# stores these in
-    // `lzcoder.SymbolStatisticsScratch` + `lzcoder.LastChunkType`; without
-    // plumbing this, multi-block streams diverge byte-exact parity.
+    // block's stats as a seed for `rescaleAddStats`. These are stored in
+    // `cross_block_state`; without plumbing this, multi-block streams
+    // diverge byte-exact parity.
     var prev_stats: ?Stats = null;
     var last_chunk_type: i32 = -1;
     if (ctx.cross_block) |cb| {
@@ -1263,7 +1266,7 @@ test "updateState: improves only when bits < current" {
     try testing.expect(improved2);
     try testing.expectEqual(@as(i32, 100), states[1].best_bit_count);
     try testing.expectEqual(@as(i32, 2), states[1].lit_len);
-    try testing.expectEqual(@as(i32, 5), states[1].match_len);
+    try testing.expectEqual(@as(i32, 5), states[1].match_length);
 }
 
 test "optimal: short input returns null" {

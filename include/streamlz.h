@@ -73,8 +73,20 @@ size_t slz_compress_bound(size_t src_len);
 /*
  * Read the content size from an SLZ1 frame header.
  * Returns 0 if the header is invalid or content size is not present.
+ *
+ * IMPORTANT: The value is read directly from the frame header and may
+ * be attacker-controlled. Always compare against slz_max_content_size()
+ * before allocating, or rely on slz_decompress() which enforces the cap
+ * internally (returns 0 if the header claims more than 4 GB).
  */
 uint64_t slz_content_size(const void *src, size_t src_len);
+
+/*
+ * Returns the maximum content size the decoder will accept (4 GB).
+ * Frames claiming a larger uncompressed size are rejected by
+ * slz_decompress() with a 0 return.
+ */
+uint64_t slz_max_content_size(void);
 
 /*
  * Returns the library version string (e.g. "2.0.0").

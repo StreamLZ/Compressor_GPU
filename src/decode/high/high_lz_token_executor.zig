@@ -1,12 +1,11 @@
 //! High decoder phase-2: LZ run processor for Type 0 (delta literals)
-//! and Type 1 (raw literals). Port of
-//! src/StreamLZ/Decompression/High/LzDecoder.ProcessLzRuns.cs.
+//! and Type 1 (raw literals).
 //!
 //! Type 0 is single-pass: walks cmd/offs/len/lit streams inline.
 //! Type 1 is two-pass: resolve tokens (carousel + lengths) into a flat
-//! array, then execute with match-source prefetching. For the first
-//! port I keep both paths simple and correct; the SIMD AVX2 tail
-//! optimizations and binary-search dstSafeEnd split land in phase 7.
+//! array, then execute with match-source prefetching. Both paths are
+//! simple and correct; SIMD AVX2 tail optimizations and binary-search
+//! dstSafeEnd split land in phase 7.
 //!
 //! Note: correctness of small-offset match propagation depends on
 //! `io.copy_helpers.wildCopy16` doing load-store-load-store (not both
@@ -96,7 +95,7 @@ pub fn processLzRunsType1PreResolved(
     var dst_after: [*]u8 = dst_run_start;
     if (token_count > 0) {
         const last = tokens[token_count - 1];
-        dst_after = dst_run_start + @as(usize, @intCast(last.dst_pos + last.lit_len + last.match_len));
+        dst_after = dst_run_start + @as(usize, @intCast(last.dst_pos + last.lit_len + last.match_length));
     }
 
     // Trailing literals.
@@ -192,7 +191,7 @@ fn processLzRunsType0(
         };
 
         const lit_len_i: usize = @intCast(literal_length);
-        const match_len_i: usize = @intCast(actual_match_len);
+        const ml_i: usize = @intCast(actual_match_len);
         const off_i: i32 = picked;
         const lit_off_i: i32 = lit_delta_offset;
 
@@ -204,9 +203,9 @@ fn processLzRunsType0(
             @prefetch(@as([*]const u8, @ptrFromInt(pre_addr)), .{ .rw = .read, .locality = 3, .cache = .data });
         }
 
-        if (@intFromPtr(dst + lit_len_i + match_len_i) >= @intFromPtr(dst_safe_end)) {
+        if (@intFromPtr(dst + lit_len_i + ml_i) >= @intFromPtr(dst_safe_end)) {
             @branchHint(.cold);
-            if (@intFromPtr(dst + lit_len_i + match_len_i) > @intFromPtr(dst_end)) return error.OutputTruncated;
+            if (@intFromPtr(dst + lit_len_i + ml_i) > @intFromPtr(dst_end)) return error.OutputTruncated;
 
             copyLiteralAddExact(dst, lit_stream, lit_off_i, lit_len_i);
             dst += lit_len_i;
@@ -215,8 +214,8 @@ fn processLzRunsType0(
             const match_addr: usize = @intFromPtr(dst) +% @as(usize, @bitCast(@as(isize, off_i)));
             if (match_addr < @intFromPtr(dst_start)) return error.OutputTruncated;
             const match_ptr: [*]const u8 = @ptrFromInt(match_addr);
-            copyMatchExact(dst, match_ptr, match_len_i);
-            dst += match_len_i;
+            copyMatchExact(dst, match_ptr, ml_i);
+            dst += ml_i;
         } else {
             // Fast path — wide copies.
             const match_src_post_lit: usize = @intFromPtr(dst + lit_len_i) +% @as(usize, @bitCast(@as(isize, off_i)));
@@ -257,10 +256,10 @@ fn processLzRunsType0(
             const match_ptr: [*]const u8 = @ptrFromInt(match_addr);
             copy.copy64(dst, match_ptr);
             copy.copy64(dst + 8, match_ptr + 8);
-            if (match_length == 15 and match_len_i > 16) {
-                copy.wildCopy16(dst + 16, match_ptr + 16, dst + match_len_i);
+            if (match_length == 15 and ml_i > 16) {
+                copy.wildCopy16(dst + 16, match_ptr + 16, dst + ml_i);
             }
-            dst += match_len_i;
+            dst += ml_i;
         }
     }
 
@@ -331,7 +330,7 @@ pub const LzToken = struct {
     dst_pos: i32,
     offset: i32,
     lit_len: i32,
-    match_len: i32,
+    match_length: i32,
 };
 
 pub fn resolveTokens(
@@ -347,9 +346,9 @@ pub fn resolveTokens(
     var offs_stream: [*]align(1) const i32 = lz.offs_stream;
 
     // 3-entry recent-offset LIFO held in registers (CMOV chain below).
-    var ro3: i32 = -@as(i32, @intCast(constants.initial_recent_offset));
-    var ro4: i32 = ro3;
-    var ro5: i32 = ro3;
+    var recent0: i32 = -@as(i32, @intCast(constants.initial_recent_offset));
+    var recent1: i32 = recent0;
+    var recent2: i32 = recent0;
 
     var dst_pos: i32 = 0;
     var token_index: u32 = 0;
@@ -374,11 +373,11 @@ pub fn resolveTokens(
         }
 
         const new_off: i32 = offs_stream[0];
-        const ro_arr = [4]i32{ ro3, ro4, ro5, new_off };
+        const ro_arr = [4]i32{ recent0, recent1, recent2, new_off };
         const picked: i32 = ro_arr[offset_index];
-        ro5 = if (offset_index < 2) ro5 else ro4;
-        ro4 = if (offset_index == 0) ro4 else ro3;
-        ro3 = picked;
+        recent2 = if (offset_index < 2) recent2 else recent1;
+        recent1 = if (offset_index == 0) recent1 else recent0;
+        recent0 = picked;
 
         // Branchless offs_stream advance: (oi + 1) & 4 is 0 for oi in
         // {0,1,2} and 4 (= sizeof(i32)) for oi == 3. Saves the branch
@@ -400,7 +399,7 @@ pub fn resolveTokens(
             .dst_pos = dst_pos,
             .offset = picked,
             .lit_len = @intCast(literal_length),
-            .match_len = actual_match_len,
+            .match_length = actual_match_len,
         };
         token_index += 1;
 
@@ -465,7 +464,7 @@ fn processLzRunsType1(
 
         if (resolved > 0) {
             const last = tokens[resolved - 1];
-            const advance: usize = @intCast(last.dst_pos + last.lit_len + last.match_len);
+            const advance: usize = @intCast(last.dst_pos + last.lit_len + last.match_length);
             dst += advance;
         }
     }
@@ -505,7 +504,7 @@ const FwdDiag = struct {
         hash: u64 = 0,
         total_bytes: u64 = 0,
         occurrences: u32 = 0,
-        match_len: u32 = 0,
+        match_length: u32 = 0,
     };
 
     const max_buckets = 1 << 20; // 1M buckets
@@ -518,16 +517,16 @@ const FwdDiag = struct {
         chunks_seen += 1;
         for (0..count) |i| {
             const t = tokens[i];
-            const match_len: usize = @intCast(t.match_len);
-            if (match_len < 2) continue;
+            const ml: usize = @intCast(t.match_length);
+            if (ml < 2) continue;
 
-            total_match_bytes += match_len;
+            total_match_bytes += ml;
             total_tokens += 1;
 
             const match_start: [*]const u8 = dst_base + @as(usize, @intCast(t.dst_pos)) + @as(usize, @intCast(t.lit_len));
 
-            var h: u64 = @as(u64, match_len) *% 0x9E3779B97F4A7C15;
-            const hash_bytes = @min(match_len, 16);
+            var h: u64 = @as(u64, ml) *% 0x9E3779B97F4A7C15;
+            const hash_bytes = @min(ml, 16);
             for (0..hash_bytes) |b| {
                 h ^= @as(u64, match_start[b]) *% (@as(u64, 0x100000001B3) +% @as(u64, b) * 7);
             }
@@ -541,14 +540,14 @@ const FwdDiag = struct {
                 if (buckets[probe].occurrences == 0) {
                     buckets[probe] = .{
                         .hash = h,
-                        .total_bytes = match_len,
+                        .total_bytes = ml,
                         .occurrences = 1,
-                        .match_len = @intCast(match_len),
+                        .match_length = @intCast(ml),
                     };
                     break;
                 }
-                if (buckets[probe].hash == h and buckets[probe].match_len == match_len) {
-                    buckets[probe].total_bytes += match_len;
+                if (buckets[probe].hash == h and buckets[probe].match_length == ml) {
+                    buckets[probe].total_bytes += ml;
                     buckets[probe].occurrences += 1;
                     break;
                 }
@@ -709,11 +708,11 @@ inline fn processOneToken(
 ) DecodeError!void {
     var lit_stream = lit_stream_inout.*;
     const lit_len: usize = @intCast(t.lit_len);
-    const match_len: usize = @intCast(t.match_len);
+    const ml: usize = @intCast(t.match_length);
     const offset: i32 = t.offset;
 
     const dst_token_start: [*]u8 = dst_base + @as(usize, @intCast(t.dst_pos));
-    const dst_after_all: [*]u8 = dst_token_start + lit_len + match_len;
+    const dst_after_all: [*]u8 = dst_token_start + lit_len + ml;
 
     if (@intFromPtr(dst_after_all) > @intFromPtr(dst_safe_end)) {
         @branchHint(.cold);
@@ -731,7 +730,7 @@ inline fn processOneToken(
             return error.OutputTruncated;
         }
         var s: [*]const u8 = @ptrFromInt(match_addr_slow);
-        var mrem = match_len;
+        var mrem = ml;
         while (mrem > 0) : (mrem -= 1) {
             d[0] = s[0];
             d += 1;
@@ -765,8 +764,8 @@ inline fn processOneToken(
     const match_ptr: [*]const u8 = @ptrFromInt(match_addr);
     copy.copy64(d, match_ptr);
     copy.copy64(d + 8, match_ptr + 8);
-    if (match_len > 16) {
-        copy.wildCopy16(d + 16, match_ptr + 16, d + match_len);
+    if (ml > 16) {
+        copy.wildCopy16(d + 16, match_ptr + 16, d + ml);
     }
     lit_stream_inout.* = lit_stream;
 }
