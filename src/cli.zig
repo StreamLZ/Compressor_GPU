@@ -762,18 +762,14 @@ fn runBenchCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer,
     const comp_opts: encoder.Options = .{ .level = level, .dictionary = dict_data_b, .dictionary_id = dict_id_b, .num_threads = args.threads };
     var comp_size: usize = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts);
 
-    // Compress benchmark.
-    const comp_times = try allocator.alloc(u64, runs);
-    defer allocator.free(comp_times);
-    var r: u32 = 0;
-    while (r < runs) : (r += 1) {
+    // Compress (single timed run — -r only affects decompress).
+    {
         const timer_start = std.Io.Clock.awake.now(io);
-        const n = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts);
-        comp_times[r] = @as(u64, @intCast(timer_start.untilNow(io, .awake).toNanoseconds()));
-        comp_size = n;
-        const run_ms = @as(f64, @floatFromInt(comp_times[r])) / 1_000_000.0;
-        const run_mbps = mb * 1000.0 / run_ms;
-        try w.print("  Compress run {d}: {d:.0}ms ({d:.1} MB/s)\n", .{ r + 1, run_ms, run_mbps });
+        comp_size = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts);
+        const ns = @as(u64, @intCast(timer_start.untilNow(io, .awake).toNanoseconds()));
+        const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+        const mbps = mb * 1000.0 / ms;
+        try w.print("  Compress: {d:.0}ms ({d:.1} MB/s)\n", .{ ms, mbps });
     }
     try w.print("Level {d}: {d} -> {d} bytes ({d:.1}%)\n\n", .{
         level,
@@ -781,11 +777,6 @@ fn runBenchCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer,
         comp_size,
         @as(f64, @floatFromInt(comp_size)) / @as(f64, @floatFromInt(src.len)) * 100.0,
     });
-
-    const comp_median_ns = median(comp_times);
-    const comp_median_ms = @as(f64, @floatFromInt(comp_median_ns)) / 1_000_000.0;
-    const comp_median_mbps = mb * 1000.0 / comp_median_ms;
-    try w.print("  Compress median: {d:.0}ms ({d:.1} MB/s)\n\n", .{ comp_median_ms, comp_median_mbps });
 
     // Persistent decompress context.
     var dec_ctx = decoder.DecompressContext.initThreadedWithIo(allocator, io, args.threads);
@@ -801,7 +792,7 @@ fn runBenchCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer,
     // Decompress benchmark.
     const dec_times = try allocator.alloc(u64, runs);
     defer allocator.free(dec_times);
-    r = 0;
+    var r: u32 = 0;
     while (r < runs) : (r += 1) {
         const timer_start = std.Io.Clock.awake.now(io);
         _ = try dec_ctx.decompress(compressed[0..comp_size], decompressed);
