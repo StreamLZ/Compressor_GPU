@@ -27,13 +27,7 @@ const Failure = struct {
 test "encoder roundtrip: every .raw encodes + decodes byte-exact (L1/L2)" {
     const allocator = testing.allocator;
 
-    const root_z = std.c.getenv("STREAMLZ_FIXTURES_DIR") orelse {
-        std.debug.print(
-            "\n  [encode_fixture_tests] STREAMLZ_FIXTURES_DIR not set — skipping.\n",
-            .{},
-        );
-        return;
-    };
+    const root_z = std.c.getenv("STREAMLZ_FIXTURES_DIR") orelse return;
     const root: []const u8 = std.mem.span(root_z);
 
     const raw_dir_path = try std.fmt.allocPrint(allocator, "{s}/raw", .{root});

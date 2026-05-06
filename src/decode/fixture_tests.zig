@@ -68,14 +68,7 @@ fn rawNameFromSlz(allocator: std.mem.Allocator, slz_name: []const u8) ![]u8 {
 test "fixture corpus roundtrip: every .slz decodes to its matching .raw" {
     const allocator = testing.allocator;
 
-    const root_z = std.c.getenv("STREAMLZ_FIXTURES_DIR") orelse {
-        std.debug.print(
-            "\n  [fixture_tests] STREAMLZ_FIXTURES_DIR not set — skipping.\n" ++
-                "  Run scripts/gen_fixtures.sh and set STREAMLZ_FIXTURES_DIR=./fixtures\n",
-            .{},
-        );
-        return;
-    };
+    const root_z = std.c.getenv("STREAMLZ_FIXTURES_DIR") orelse return;
     const root: []const u8 = std.mem.span(root_z);
 
     const slz_dir_path = try std.fmt.allocPrint(allocator, "{s}/slz", .{root});
