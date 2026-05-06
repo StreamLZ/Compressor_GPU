@@ -61,6 +61,15 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // Parallel test runner: `zig build ptest` runs tests across multiple threads.
+    const parallel_tests = b.addTest(.{
+        .root_module = root_module,
+        .test_runner = .{ .path = b.path("src/test_runner_parallel.zig"), .mode = .simple },
+    });
+    const run_parallel_tests = b.addRunArtifact(parallel_tests);
+    const ptest_step = b.step("ptest", "Run unit tests in parallel");
+    ptest_step.dependOn(&run_parallel_tests.step);
+
     // ---- ReleaseSafe build step ----
     // Enables runtime safety checks (bounds, overflow) at moderate
     // performance cost. Useful for CI and testing against untrusted data.
