@@ -39,8 +39,6 @@ const areAllBytesEqual = block_header.areAllBytesEqual;
 //  Parallel SC Fast compress (L1)
 // ────────────────────────────────────────────────────────────
 
-const l1_sc_group_size: usize = 1; // per-chunk independence (256 KB)
-
 const FastScContext = struct {
     src: []const u8,
     effective_src: []const u8,
@@ -59,36 +57,53 @@ const FastScContext = struct {
     captured_err: std.atomic.Value(u16),
     num_chunks: usize,
     num_groups: usize,
+    sc_group_size: usize,
 };
 
 fn fastScWorker(shared: *FastScContext) void {
-    var hasher = FastMatchHasher(u32).init(std.heap.c_allocator, .{
-        .hash_bits = shared.greedy_hash_bits,
-        .min_match_length = shared.hasher_k,
-    }) catch {
-        _ = shared.error_flag.store(1, .monotonic);
-        return;
-    };
-    defer hasher.deinit();
+    var greedy_hasher: ?FastMatchHasher(u32) = null;
+    var chain_hasher_local: ?MatchHasher2 = null;
+    defer if (greedy_hasher) |*h| h.deinit();
+    defer if (chain_hasher_local) |*h| h.deinit();
+
+    if (shared.level == 5) {
+        chain_hasher_local = MatchHasher2.init(std.heap.c_allocator, shared.greedy_hash_bits) catch {
+            _ = shared.error_flag.store(1, .monotonic);
+            return;
+        };
+    } else {
+        greedy_hasher = FastMatchHasher(u32).init(std.heap.c_allocator, .{
+            .hash_bits = shared.greedy_hash_bits,
+            .min_match_length = shared.hasher_k,
+        }) catch {
+            _ = shared.error_flag.store(1, .monotonic);
+            return;
+        };
+    }
 
     while (true) {
         const group_idx = shared.next_group.fetchAdd(1, .monotonic);
         if (group_idx >= shared.num_groups) return;
         if (shared.error_flag.load(.monotonic) != 0) return;
 
-        const first_chunk = group_idx * l1_sc_group_size;
-        const last_chunk = @min(first_chunk + l1_sc_group_size, shared.num_chunks);
+        const first_chunk = group_idx * shared.sc_group_size;
+        const last_chunk = @min(first_chunk + shared.sc_group_size, shared.num_chunks);
 
         // Reset hasher once per group — persists across chunks within the
-        // group so the parser can find matches across the full 4 MB window.
-        hasher.reset();
-        if (shared.dict_len > 0) {
-            hasher.preloadDictionary(shared.effective_src.ptr, shared.dict_len);
-        }
-
-        // Window base spans the entire group so cross-chunk matches work.
+        // group so the parser can find matches across the group window.
         const group_start_off = shared.dict_len + first_chunk * lz_constants.chunk_size;
         const window_base_ptr: [*]const u8 = shared.effective_src.ptr + group_start_off;
+
+        if (greedy_hasher) |*h| {
+            h.reset();
+            if (shared.dict_len > 0) h.preloadDictionary(shared.effective_src.ptr, shared.dict_len);
+        }
+        if (chain_hasher_local) |*h| {
+            h.reset();
+            h.setSrcBase(window_base_ptr);
+            h.setBaseWithoutPreload(0);
+            if (shared.dict_len > 0) h.preloadDictionary(shared.effective_src.ptr, shared.dict_len);
+        }
 
         var ci: usize = first_chunk;
         while (ci < last_chunk) : (ci += 1) {
@@ -149,9 +164,23 @@ fn fastScWorker(shared: *FastScContext) void {
                 const sub_payload_start = wpos;
                 const start_pos = src_off + sub_off;
 
-                const result = fast_enc.encodeSubChunkRaw(-2, u32, std.heap.c_allocator, &hasher, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.parser_config) catch {
-                    _ = shared.error_flag.store(1, .monotonic);
-                    return;
+                const result = switch (shared.level) {
+                    5 => fast_enc.encodeSubChunkEntropyChain(4, std.heap.c_allocator, &chain_hasher_local.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.entropy_options, shared.parser_config) catch {
+                        _ = shared.error_flag.store(1, .monotonic);
+                        return;
+                    },
+                    3 => fast_enc.encodeSubChunkEntropy(1, std.heap.c_allocator, &greedy_hasher.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.entropy_options, shared.parser_config) catch {
+                        _ = shared.error_flag.store(1, .monotonic);
+                        return;
+                    },
+                    4 => fast_enc.encodeSubChunkEntropy(2, std.heap.c_allocator, &greedy_hasher.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.entropy_options, shared.parser_config) catch {
+                        _ = shared.error_flag.store(1, .monotonic);
+                        return;
+                    },
+                    else => fast_enc.encodeSubChunkRaw(-2, u32, std.heap.c_allocator, &greedy_hasher.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.parser_config) catch {
+                        _ = shared.error_flag.store(1, .monotonic);
+                        return;
+                    },
                 };
 
                 const lz_cost: f32 = result.cost + 3.0;
@@ -221,6 +250,7 @@ fn compressFastChunksParallel(
     resolved: encoder.ResolvedParams,
     parser_config: fast_enc.ParserConfig,
     num_threads: u32,
+    sc_group_size: usize,
 ) CompressError!usize {
     const dict_len = if (opts.dictionary) |d| d.len else 0;
     const num_chunks = (src.len + lz_constants.chunk_size - 1) / lz_constants.chunk_size;
@@ -241,7 +271,7 @@ fn compressFastChunksParallel(
     defer allocator.free(written);
     @memset(written, 0);
 
-    const num_groups = (num_chunks + l1_sc_group_size - 1) / l1_sc_group_size;
+    const num_groups = (num_chunks + sc_group_size - 1) / sc_group_size;
 
     var shared: FastScContext = .{
         .src = src,
@@ -261,6 +291,7 @@ fn compressFastChunksParallel(
         .captured_err = std.atomic.Value(u16).init(0),
         .num_chunks = num_chunks,
         .num_groups = num_groups,
+        .sc_group_size = sc_group_size,
     };
 
     const worker_count = @min(@as(usize, num_threads), num_groups);
@@ -338,7 +369,7 @@ pub fn compressFramedOne(
         else => unreachable,
     };
     var pos: usize = 0;
-    const sc_grp: u8 = lz_constants.default_sc_group_size;
+    const sc_grp: u8 = if (opts.level >= 2) high_framed.computeAdaptiveGroupSize(src.len) else lz_constants.default_sc_group_size;
     const hdr_len = try frame.writeHeader(dst, .{
         .codec = .fast,
         .level = codec_level,
@@ -373,9 +404,9 @@ pub fn compressFramedOne(
     const engine_level_cap: u6 = switch (resolved.engine_level) {
         -3 => 13,
         -2 => 17,
-        -1 => 16,
-        0, 1 => 17,
-        2 => 19,
+        -1 => 18,
+        0, 1 => 19,
+        2 => 20,
         else => resolved.hash_bits,
     };
     const greedy_hash_bits: u6 = @min(resolved.hash_bits, engine_level_cap);
@@ -467,13 +498,14 @@ pub fn compressFramedOne(
 
     const can_compress = src.len > fast_constants.min_source_length;
 
-    const self_contained: bool = opts.self_contained or opts.two_phase or (opts.level == 1);
+    const self_contained: bool = opts.self_contained or opts.two_phase or (opts.level >= 1 and opts.level <= 5);
     const sc_flag_bit: u8 = if (self_contained) 0x10 else 0;
     const two_phase_flag_bit: u8 = if (opts.two_phase) 0x20 else 0;
 
     const num_chunks: usize = if (can_compress) (src.len + lz_constants.chunk_size - 1) / lz_constants.chunk_size else 0;
     const effective_threads: u32 = if (opts.num_threads == 0) @intCast(@max(1, std.Thread.getCpuCount() catch 1)) else opts.num_threads;
     if (self_contained and can_compress and effective_threads > 1 and num_chunks > 1) {
+        const parallel_sc_grp: usize = if (opts.level == 1) 1 else sc_grp;
         const parallel_payload_size = try compressFastChunksParallel(
             allocator,
             io,
@@ -486,6 +518,7 @@ pub fn compressFramedOne(
             resolved,
             parser_config,
             effective_threads,
+            parallel_sc_grp,
         );
 
         frame.writeBlockHeader(dst[frame_block_hdr_pos..], .{
@@ -516,24 +549,24 @@ pub fn compressFramedOne(
     const check_plain_huffman: bool = resolved.use_entropy and resolved.engine_level >= 4;
 
     var src_off: usize = dict_len;
+    var chunk_in_group: usize = 0;
+    var group_start_off: usize = dict_len;
     while (can_compress and src_off < effective_src.len) {
         const block_src_len: usize = @min(effective_src.len - src_off, lz_constants.chunk_size);
         const block_src: []const u8 = effective_src[src_off..][0..block_src_len];
 
-        // SC mode: the backward-extend bound + hasher visibility must be
-        // block-local so no LZ back-reference reaches across 256 KB chunks.
-        // Reset the hasher at every block boundary, set window_base to the
-        // current block's start. Non-SC keeps the whole-input window (phase 10j).
-        if (self_contained) {
-            if (greedy_hasher_u32) |*h| h.reset();
+        // SC mode: reset hasher at group boundaries (every sc_grp chunks).
+        // Within a group, the hasher persists so cross-chunk matches work.
+        if (self_contained and chunk_in_group == 0) {
             if (greedy_hasher_u32) |*h| h.reset();
             if (chain_hasher) |*h| {
                 h.reset();
-                h.setSrcBase(block_src.ptr);
+                h.setSrcBase(effective_src[src_off..].ptr);
                 h.setBaseWithoutPreload(0);
             }
+            group_start_off = src_off;
         }
-        const window_base_ptr: [*]const u8 = if (self_contained) block_src.ptr else effective_src.ptr;
+        const window_base_ptr: [*]const u8 = if (self_contained) effective_src[group_start_off..].ptr else effective_src.ptr;
 
         const block_start: usize = pos;
         // For SC mode, EVERY block is a keyframe (independently decodable).
@@ -730,6 +763,8 @@ pub fn compressFramedOne(
         }
 
         src_off += block_src_len;
+        chunk_in_group += 1;
+        if (chunk_in_group >= sc_grp) chunk_in_group = 0;
     }
 
     // SC mode: append a prefix table of (num_chunks - 1) * 8 bytes at the
