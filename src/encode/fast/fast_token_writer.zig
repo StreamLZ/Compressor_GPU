@@ -330,6 +330,17 @@ fn writeOffsetWithLiteral1Inner(
     var i: u32 = 1;
     const V16 = @Vector(16, u8);
     const V16Bool = @Vector(16, bool);
+    // SAFETY (SIMD overread): The 16-byte loads below may read up to 15 bytes
+    // past the end of the literal run.  This is safe because:
+    //   1. literal_run_length is capped to [8, 63] by the caller guard
+    //      `(literal_run_length -% 8) > 55`.
+    //   2. The literal run ends at the match start (`source_cursor`), and
+    //      the parser guarantees >= 16 bytes of valid source data remain
+    //      past `source_cursor` (enforced by the `safe_source_end - 16`
+    //      loop guard in `runGreedyParser`).
+    //   3. `b_ptr` (the recent-offset back-reference) points into already-
+    //      parsed source data, so 16-byte reads stay within the source
+    //      buffer.
     while (i < literal_run_length) {
         const a_ptr = literal_start + i;
         const b_ptr: [*]const u8 = ptr_math.offsetPtr([*]const u8, a_ptr, recent_offset);

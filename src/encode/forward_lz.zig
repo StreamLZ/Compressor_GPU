@@ -77,8 +77,8 @@ pub fn analyzeForwardLz(
         hash_table[hi] = cur;
 
         const offset: u16 = cur -% stored;
-        if (offset >= 8) {
-            const src_pos = pos -% offset;
+        if (offset >= 8 and @as(usize, offset) <= pos) {
+            const src_pos = pos - @as(usize, offset);
             var mlen: usize = 0;
             const limit = @min(@as(usize, 256), src.len - pos, src.len - src_pos);
             while (mlen < limit and src[src_pos + mlen] == src[pos + mlen]) {

@@ -74,6 +74,7 @@ pub fn train(
 
     // Build the dictionary by selecting best segments.
     const dict = try allocator.alloc(u8, params.dict_size);
+    errdefer allocator.free(dict);
     var dict_pos: usize = params.dict_size;
 
     const epoch_size = params.dict_size / params.epochs;
@@ -146,11 +147,13 @@ pub fn train(
         }
     }
 
-    // If dictionary wasn't fully filled, shift content to start.
+    // If dictionary wasn't fully filled, shift content to start and
+    // shrink the allocation.  On realloc failure the errdefer above
+    // frees the original allocation and we propagate the error.
     if (dict_pos > 0) {
         const used = params.dict_size - dict_pos;
         std.mem.copyForwards(u8, dict[0..used], dict[dict_pos..][0..used]);
-        const result = allocator.realloc(dict, used) catch dict;
+        const result = try allocator.realloc(dict, used);
         return .{ .dict = result[0..used], .allocator = allocator };
     }
 

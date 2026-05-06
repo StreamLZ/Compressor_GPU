@@ -63,12 +63,14 @@ pub const ManagedMatchLenStorage = struct {
     pub fn reset(self: *ManagedMatchLenStorage, entries: usize, avg_bytes: f32) !void {
         const needed_bytes: usize = @intFromFloat(@as(f32, @floatFromInt(entries)) * avg_bytes);
         if (self.byte_buffer.len < needed_bytes) {
+            const new_buf = try self.allocator.alloc(u8, needed_bytes);
             self.allocator.free(self.byte_buffer);
-            self.byte_buffer = try self.allocator.alloc(u8, needed_bytes);
+            self.byte_buffer = new_buf;
         }
         if (self.offset2_pos.len < entries) {
+            const new_pos = try self.allocator.alloc(i64, entries);
             self.allocator.free(self.offset2_pos);
-            self.offset2_pos = try self.allocator.alloc(i64, entries);
+            self.offset2_pos = new_pos;
         }
         @memset(self.offset2_pos[0..entries], 0);
         self.byte_buffer_use = 1;

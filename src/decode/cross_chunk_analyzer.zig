@@ -1483,7 +1483,7 @@ fn parseOnlyFastChunkPayload(
                 lz_ptr.cmd_end = lz_ptr.cmd_start + lz_ptr.cmd_stream2_offset_end;
                 lz_ptr.cmd_start += lz_ptr.cmd_stream2_offset;
             }
-            const s_off: usize = if (iteration == 0) 8 else 0;
+            const s_off: usize = if (running_dst_off + dst_off_in_chunk == 0 and iteration == 0) 8 else 0;
             parseOnlyFastSubChunk(lz_ptr, dst_size_cur, &saved_dist, s_off, out_byte_count);
             dst_size_left -= dst_size_cur;
             if (dst_size_left == 0) break;
@@ -1989,8 +1989,8 @@ fn level0FastChunkPayload(
                 lz_ptr.cmd_end = lz_ptr.cmd_start + lz_ptr.cmd_stream2_offset_end;
                 lz_ptr.cmd_start += lz_ptr.cmd_stream2_offset;
             }
-            const s_off: usize = if (iteration == 0) 8 else 0;
             const sub_chunk_file_pos: u64 = running_dst_off + dst_off_in_chunk + (dst_count - dst_size_left);
+            const s_off: usize = if (sub_chunk_file_pos == 0 and iteration == 0) 8 else 0;
             if (mode == 0) {
                 level0FastSubChunk(.delta, lz_ptr, dst_size_cur, &saved_dist, s_off, sub_chunk_file_pos, bitmap, bitmap_byte_capacity, stats);
             } else {
@@ -2617,7 +2617,6 @@ fn analyzeFastChunkPayload(
                 lz_ptr.cmd_start += lz_ptr.cmd_stream2_offset;
             }
 
-            const s_off: usize = if (iteration == 0) 8 else 0;
             var stats: SubChunkStats = .{
                 .total_bytes = @intCast(dst_size_cur),
                 .clean_bytes = 0,
@@ -2627,6 +2626,7 @@ fn analyzeFastChunkPayload(
             };
 
             const sub_chunk_file_pos: u64 = running_dst_off + dst_off_in_chunk + (dst_count - dst_size_left);
+            const s_off: usize = if (sub_chunk_file_pos == 0 and iteration == 0) 8 else 0;
             if (mode == 0) {
                 analyzeOneSubChunk(.delta, lz_ptr, dst_size_cur, &saved_dist, s_off, taint, &stats, sub_chunk_file_pos, byte_round, file_stats);
             } else {

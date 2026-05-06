@@ -150,6 +150,10 @@ pub fn setupEncoder(
         hasher_type = entry.hasher_type;
     }
 
+    // entropy_options is u32 here but HighEncoderContext.entropy_options
+    // is a packed struct(u8). Guard against silent truncation.
+    std.debug.assert(entropy_options <= std.math.maxInt(u8));
+
     return .{
         .level = level,
         .codec_id = @intFromEnum(CodecId.high),

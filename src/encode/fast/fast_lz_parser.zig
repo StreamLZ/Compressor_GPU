@@ -317,11 +317,12 @@ inline fn isLazyMatchBetter(cand: LengthAndOffset, current: LengthAndOffset, ste
 /// bucket hot in L1.
 pub fn findMatchWithHasher(
     comptime num_hash: u32,
+    comptime dual_hash: bool,
     source_cursor: [*]const u8,
     safe_source_end: [*]const u8,
     literal_start: [*]const u8,
     recent_offset: isize,
-    hasher: *match_hasher.MatchHasher(num_hash),
+    hasher: *match_hasher.MatchHasher(num_hash, dual_hash),
     next_cursor_ptr: [*]const u8,
     dictionary_size: u32,
     initial_min_match_length: u32,
@@ -423,8 +424,9 @@ pub fn findMatchWithHasher(
 pub fn runLazyParser(
     comptime engine_level: i32,
     comptime num_hash: u32,
+    comptime dual_hash: bool,
     w: *FastStreamWriter,
-    hasher: *match_hasher.MatchHasher(num_hash),
+    hasher: *match_hasher.MatchHasher(num_hash, dual_hash),
     source_cursor_in: [*]const u8,
     safe_source_end: [*]const u8,
     source_end: [*]const u8,
@@ -444,6 +446,7 @@ pub fn runLazyParser(
         while (@intFromPtr(source_cursor) + 1 < guard_addr) {
             var match = findMatchWithHasher(
                 num_hash,
+                dual_hash,
                 source_cursor,
                 safe_source_end,
                 literal_start,
@@ -463,6 +466,7 @@ pub fn runLazyParser(
             while (@intFromPtr(source_cursor) + 1 < guard_addr) {
                 const lazy1 = findMatchWithHasher(
                     num_hash,
+                    dual_hash,
                     source_cursor + 1,
                     safe_source_end,
                     literal_start,
@@ -481,6 +485,7 @@ pub fn runLazyParser(
                     if (@intFromPtr(source_cursor) + 2 > guard_addr or match.length == 2) break;
                     const lazy2 = findMatchWithHasher(
                         num_hash,
+                        dual_hash,
                         source_cursor + 2,
                         safe_source_end,
                         literal_start,

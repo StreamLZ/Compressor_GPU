@@ -71,6 +71,7 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .link_libc = true,
     });
+    safe_module.addOptions("build_options", bench_option);
     const safe_exe = b.addExecutable(.{
         .name = "streamlz-safe",
         .root_module = safe_module,

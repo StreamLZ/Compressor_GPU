@@ -459,6 +459,7 @@ pub fn parseBlockBody(src: []const u8, allocator: std.mem.Allocator) ParseError!
     // encoder stored per-chunk integrity folds after the literal
     // runs section).
     var chunk_xor_folds: []u64 = &[_]u64{};
+    errdefer if (chunk_xor_folds.len > 0) allocator.free(chunk_xor_folds);
     if (pos < src.len) {
         const nf = try readVarintFast(src[pos..]);
         pos += nf.consumed;

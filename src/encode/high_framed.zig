@@ -207,26 +207,16 @@ pub fn compressFramedHigh(
         );
     } else if (can_parallel_blocks) {
         // Parallel non-SC High: build one global MLS, dictionary preload.
-        const dict_p = opts.dictionary orelse &[_]u8{};
-        const dict_len_p = dict_p.len;
-        var combined_p: ?[]u8 = null;
-        const effective_src_p: []const u8 = if (dict_len_p > 0) blk: {
-            const buf = allocator.alloc(u8, dict_len_p + src.len) catch return error.OutOfMemory;
-            @memcpy(buf[0..dict_len_p], dict_p);
-            @memcpy(buf[dict_len_p..], src);
-            combined_p = buf;
-            break :blk buf;
-        } else src;
-        defer if (combined_p) |buf| allocator.free(buf);
+        // Reuse the dictionary buffer already built for the global path.
 
         var global_mls = try mls_mod.ManagedMatchLenStorage.init(allocator, src.len + 1, 8.0);
         defer global_mls.deinit();
-        global_mls.window_base_offset = @intCast(dict_len_p);
-        global_mls.round_start_pos = @intCast(dict_len_p);
+        global_mls.window_base_offset = @intCast(dict_len_g);
+        global_mls.round_start_pos = @intCast(dict_len_g);
         if (mapping.use_bt4) {
-            try match_finder_bt4.findMatchesBT4(allocator, effective_src_p, &global_mls, 4, dict_len_p, 128);
+            try match_finder_bt4.findMatchesBT4(allocator, effective_src_g, &global_mls, 4, dict_len_g, 128);
         } else {
-            match_finder.findMatchesHashBased(allocator, effective_src_p, &global_mls, 4, dict_len_p) catch |err| return if (err == error.HashBitsOutOfRange) error.BadLevel else @errorCast(err);
+            match_finder.findMatchesHashBased(allocator, effective_src_g, &global_mls, 4, dict_len_g) catch |err| return if (err == error.HashBitsOutOfRange) error.BadLevel else @errorCast(err);
         }
         const frame_block_hdr_pos: usize = pos;
         pos += 8;
@@ -234,14 +224,14 @@ pub fn compressFramedHigh(
         const written = try compress_parallel.compressBlocksParallel(
             allocator,
             io,
-            effective_src_p,
+            effective_src_g,
             dst[pos..],
             &ctx,
             &global_mls,
             sc_flag_bit,
             self_contained,
             resolved_threads,
-            dict_len_p,
+            dict_len_g,
         );
         pos += written;
         try finalizeSingleFrameBlock(

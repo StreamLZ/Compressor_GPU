@@ -231,6 +231,10 @@ pub inline fn bitsForLiteral(
     }
     const byte_cur: u8 = src[pos];
     const back: usize = if (recent >= 0) @intCast(recent) else @intCast(-@as(i64, recent));
+    if (pos < back) {
+        // No valid delta reference — use raw literal as delta.
+        return cost_model.lit_cost[byte_cur];
+    }
     const byte_prev: u8 = @as([*]const u8, @ptrFromInt(@intFromPtr(src + pos) - back))[0];
     const delta: u8 = byte_cur -% byte_prev;
     return cost_model.lit_cost[delta];
@@ -254,12 +258,17 @@ pub inline fn bitsForLiterals(
     }
     var sum: u32 = 0;
     var i: usize = 0;
+    const back_l: usize = if (recent >= 0) @intCast(recent) else @intCast(-@as(i64, recent));
     while (i < num) : (i += 1) {
         const byte_cur: u8 = src[pos + i];
-        const back_l: usize = if (recent >= 0) @intCast(recent) else @intCast(-@as(i64, recent));
-        const byte_prev: u8 = @as([*]const u8, @ptrFromInt(@intFromPtr(src + pos + i) - back_l))[0];
-        const delta: u8 = byte_cur -% byte_prev;
-        sum += cost_model.lit_cost[delta];
+        if (pos + i < back_l) {
+            // No valid delta reference — use raw literal as delta.
+            sum += cost_model.lit_cost[byte_cur];
+        } else {
+            const byte_prev: u8 = @as([*]const u8, @ptrFromInt(@intFromPtr(src + pos + i) - back_l))[0];
+            const delta: u8 = byte_cur -% byte_prev;
+            sum += cost_model.lit_cost[delta];
+        }
     }
     return sum;
 }
