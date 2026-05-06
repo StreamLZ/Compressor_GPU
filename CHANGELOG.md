@@ -9,9 +9,9 @@ Zig 0.15.2 with byte-exact wire-format compatibility.
 
 - **All 11 compression levels** (Fast L1-L5, High L6-L11) with compress
   and decompress at full parity with v1.
-- **Parallel decompress** at all levels: SC group-parallel for L1,
-  sidecar-based for L2-L5, SC group-parallel for L6-L8 (adaptive
-  group size), two-phase parallel for L9-L11.
+- **Parallel decompress** at all levels: SC group-parallel for L1-L5
+  (adaptive group size), SC group-parallel for L6-L8 (adaptive group
+  size), two-phase parallel for L9-L11.
 - **Dictionary support**: 7 built-in dictionaries (JSON, HTML, CSS, JS,
   XML, text, general) with auto-detection by file extension. Custom
   dictionary training via FASTCOVER algorithm. Zero-copy decompress
@@ -27,8 +27,7 @@ Zig 0.15.2 with byte-exact wire-format compatibility.
 ### Performance (Arrow Lake-S, 24 cores, enwik8 100 MB, best of 3)
 
 - L1 parallel decompress: 34 GB/s
-- L2-L4 parallel decompress: 6.5-20 GB/s
-- L5 parallel decompress: 11 GB/s
+- L2-L5 SC group-parallel decompress: 37-39 GB/s
 - L6-L8 SC group-parallel decompress: 11-12 GB/s
 - L9-L11 two-phase parallel decompress: 1.4-2.3 GB/s
 - L1 parallel compress: 4.2 GB/s
@@ -51,7 +50,7 @@ Zig 0.15.2 with byte-exact wire-format compatibility.
 - Conditional far-offset prefetch for L3-L5
 - SIMD hash probe + dual-bucket prefetch for L9-L11 encoder
 - Parallel resolveTokens for L9-L11 (+17-24% decompress)
-- v2 sidecar frame format for L2-L5 parallel decode
+- SC group-parallel for L2-L5 (supersedes v2 sidecar frame format)
 - L1 SC per-chunk independence (no sidecar needed)
 
 ### Build

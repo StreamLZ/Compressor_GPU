@@ -1,9 +1,44 @@
 # StreamLZ Zig Benchmarks
 
 Intel Ultra 9 285K (Arrow Lake-S), 24 cores, Windows 11.
-Zig 0.15.2 `ReleaseFast -Dcpu=native`.
+
+## L2-L5 SC parallel decode (2026-05-05)
+
+Zig 0.16.0 `ReleaseFast -mcpu=x86_64_v3`. L2-L5 switched from sidecar
+parallel decode to SC group-parallel with adaptive group sizing. Hash bit
+caps fixed: L2=18, L3=19, L4=20. L5 parallel compress with chain hasher.
+
+### enwik8 100 MB, 24 threads, r30
+
+| Level | Ratio | Compress MB/s | Decompress MB/s |
+|-------|------:|-----:|-------:|
+| L1  | 55.3% | 2,798 | 36,954 |
+| L2  | 53.5% | 2,047 | 38,943 |
+| L3  | 52.2% | 1,533 | 37,049 |
+| L4  | 49.4% | 1,036 | 37,209 |
+| L5  | 42.0% |   755 | 38,233 |
+| L6  | 30.0% |  38.9 | 11,946 |
+| L8  | 29.6% |  17.0 | 12,383 |
+
+### silesia 203 MB, 24 threads, r30
+
+| Level | Ratio | Compress MB/s | Decompress MB/s |
+|-------|------:|-----:|-------:|
+| L1  | 45.8% | 3,841 | 35,856 |
+| L3  | 43.2% | 2,096 | 33,147 |
+| L5  | 35.8% |   920 | 35,834 |
+| L6  | 25.3% |  45.3 | 14,087 |
+| L8  | 24.8% |  13.6 | 14,192 |
+
+All Fast levels (L1-L5) compress and decompress in parallel via SC
+groups. Decompress speed is memory-bandwidth-bound at 35-39 GB/s
+across all Fast levels.
+
+---
 
 ## After audit cleanup (2026-04-18)
+
+Zig 0.15.2 `ReleaseFast -Dcpu=native`.
 
 Post-audit numbers on enwik8 (100 MB). `benchc -l N -r 5`. Parallel
 decompress (default thread count). Compress + decompress + round-trip.

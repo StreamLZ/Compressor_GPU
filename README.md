@@ -107,11 +107,11 @@ Full-speed numbers with all 24 cores. `streamlz -ba -r 30`.
 
 | Level | Compressed | Ratio | Compress | Decompress |
 |-------|------------|-------|----------|------------|
-| L1  | 55,317,964 | 55.3% | 2,977 MB/s | 41,140 MB/s |
-| L2  | 54,389,843 | 54.4% |    82 MB/s | 27,788 MB/s |
-| L3  | 53,554,821 | 53.6% |    75 MB/s | 16,772 MB/s |
-| L4  | 50,884,428 | 50.9% |    65 MB/s |  9,795 MB/s |
-| L5  | 42,974,607 | 43.0% |    40 MB/s | 16,070 MB/s |
+| L1  | 55,317,964 | 55.3% | 2,798 MB/s | 36,954 MB/s |
+| L2  | 53,454,868 | 53.5% | 2,047 MB/s | 38,943 MB/s |
+| L3  | 52,248,526 | 52.2% | 1,533 MB/s | 37,049 MB/s |
+| L4  | 49,407,767 | 49.4% | 1,036 MB/s | 37,209 MB/s |
+| L5  | 42,013,817 | 42.0% |   755 MB/s | 38,233 MB/s |
 | L6  | 30,024,917 | 30.0% |    44 MB/s | 12,253 MB/s |
 | L7  | 29,925,233 | 29.9% |    33 MB/s | 12,267 MB/s |
 | L8  | 29,602,506 | 29.6% |    19 MB/s | 12,582 MB/s |
@@ -119,18 +119,18 @@ Full-speed numbers with all 24 cores. `streamlz -ba -r 30`.
 | L10 | 28,489,882 | 28.5% |   7.6 MB/s |  3,673 MB/s |
 | L11 | 27,175,320 | 27.2% |   1.5 MB/s |  3,416 MB/s |
 
-L1 compress is parallel (SC, per-chunk workers); L2-L5 compress serial;
+L1-L5 compress is parallel (SC, per-chunk/per-group workers);
 L6-L11 compress parallel (High codec). All decompress is parallel:
-L1 SC group-parallel, L2-L5 sidecar parallel, L6-L8 SC group-parallel
+L1-L5 SC group-parallel (adaptive group size), L6-L8 SC group-parallel
 (adaptive group size), L9-L11 two-phase parallel.
 
 ### All levels (24 cores, silesia 203 MB)
 
 | Level | Compressed | Ratio | Compress | Decompress |
 |-------|------------|-------|----------|------------|
-| L1  |  97,488,921 | 45.8% | 3,435 MB/s | 35,412 MB/s |
-| L3  |  97,082,439 | 45.6% |    82 MB/s |  6,567 MB/s |
-| L5  |  79,945,494 | 37.6% |    49 MB/s | 11,850 MB/s |
+| L1  |  97,488,921 | 45.8% | 3,841 MB/s | 35,856 MB/s |
+| L3  |  91,834,394 | 43.2% | 2,096 MB/s | 33,147 MB/s |
+| L5  |  76,285,339 | 35.8% |   920 MB/s | 35,834 MB/s |
 | L6  |  53,858,094 | 25.3% |    41 MB/s | 14,587 MB/s |
 | L8  |  52,831,020 | 24.8% |    13 MB/s | 13,555 MB/s |
 | L9  |  53,010,373 | 24.9% |    11 MB/s |  2,925 MB/s |

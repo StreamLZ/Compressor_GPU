@@ -27,7 +27,7 @@ The design is similar in spirit to LZ4 frames and Zstandard frames: a magic numb
 ├──────────────────────────┤
 │    ...                    │
 ├──────────────────────────┤
-│    Sidecar Block          │  (optional, Fast L1-L5 only)
+│    Sidecar Block          │  (optional, legacy; not emitted by current encoder)
 ├──────────────────────────┤
 │    End Mark               │  4 bytes (0x00000000)
 ├──────────────────────────┤
@@ -65,7 +65,7 @@ Offset  Size  Field
 | 1   | ContentChecksum              | 4-byte XXH32 checksum after the end mark           |
 | 2   | BlockChecksums               | 4-byte XXH32 checksum after each block payload     |
 | 3   | DictionaryIdPresent          | 4-byte dictionary ID follows content size (if any) |
-| 4   | ParallelDecodeMetadataPresent | Frame contains a sidecar block for parallel Fast decode |
+| 4   | ParallelDecodeMetadataPresent | Frame contains a sidecar block for parallel Fast decode. **Legacy:** current encoder (v2.0+) does not set this flag; L2-L5 now use SC group-parallel decode instead. Decoders must still handle it for backward compatibility with older frames. |
 | 5-7 | Reserved                     | Must be 0                                          |
 
 ### Codec ID (byte at offset 6)
@@ -188,7 +188,7 @@ When set, chunks are grouped (default: 4 chunks per group, stored in the frame h
 
 Each 256 KB chunk in the Fast codec is divided into two **sub-chunks** of up to 128 KB each. Each sub-chunk has its own independent set of six encoded streams. The first sub-chunk covers bytes [0, 131072) of the chunk output; the second covers [131072, 262144).
 
-Sub-chunk boundaries are significant for the sidecar: the cross-chunk dependency analysis operates at chunk granularity, and the parallel decode worker assignment operates at slice boundaries that are multiples of 16 chunks (4 MB).
+Sub-chunk boundaries are significant for the legacy sidecar path: the cross-chunk dependency analysis operates at chunk granularity, and the parallel decode worker assignment operates at slice boundaries that are multiples of 16 chunks (4 MB). The current encoder uses SC group-parallel mode for all Fast levels, so sidecar-based slicing is only relevant when decoding older frames.
 
 ---
 
@@ -230,10 +230,15 @@ If the `UseChecksums` flag is set in the internal block header, 3 bytes of check
 
 ## Sidecar Block (Parallel-Decode Metadata)
 
-The sidecar block enables parallel Fast decode for L2-L5. It is an
-optional block marked with bit 30 (`ParallelDecodeMetadata`) in the
-block header's compressed_size field. Sidecar blocks have
-`decompressed_size == 0` and produce no output.
+> **Legacy wire format.** The current encoder (v2.0+) uses SC
+> (self-contained) group-parallel mode for L1-L5 and no longer emits
+> sidecar blocks. This section documents the sidecar wire format so
+> that decoders can still read older .slz frames that contain sidecars.
+
+The sidecar block enables parallel Fast decode for frames that were
+encoded without SC mode. It is an optional block marked with bit 30
+(`ParallelDecodeMetadata`) in the block header's compressed_size field.
+Sidecar blocks have `decompressed_size == 0` and produce no output.
 
 The sidecar carries the pre-computed cross-chunk dependency data that
 the parallel decoder needs to execute before spawning per-slice worker
@@ -242,12 +247,14 @@ boundaries.
 
 ### When present
 
-The sidecar is emitted when the frame header's flag bit 4
-(`ParallelDecodeMetadataPresent`) is set. This occurs only for non-SC
-Fast codec (L2-L5) frames. L1 uses SC group-parallel decode instead
-(no sidecar). High codec (L6-L11) frames never carry a
-sidecar — L6-L8 use SC group-parallel decode, and L9-L11 use two-phase
-parallel decode, neither of which requires a sidecar.
+The sidecar is present when the frame header's flag bit 4
+(`ParallelDecodeMetadataPresent`) is set. In older encoders this
+occurred for non-SC Fast codec (L2-L5) frames. The current encoder
+(v2.0+) no longer sets this flag — all Fast levels now use SC
+group-parallel decode instead. L1 has always used SC mode.
+High codec (L6-L11) frames never carry a sidecar — L6-L8 use SC
+group-parallel decode, and L9-L11 use two-phase parallel decode,
+neither of which requires a sidecar.
 
 ### Sidecar block body wire format
 
@@ -291,13 +298,13 @@ The decoder writes these directly to dst at the indicated positions.
 
 Delta encoding makes positions 1-2 varint bytes each instead of 8 raw bytes. Match offsets are stored as `target - src` (small positive integers). Literal bytes are grouped into maximal consecutive runs to amortize the per-byte position overhead.
 
-Typical sidecar sizes:
+Typical sidecar sizes (legacy frames only; the current encoder does not emit sidecars):
 - L1-L4 enwik8 (100 MB): ~150 KB (~0.15% of input)
 - L5 enwik8 (100 MB): ~1.2 MB (~1.2% of input)
 
 L5 sidecars are larger because the lazy parser produces longer-distance matches with deeper transitive cross-chunk dependency chains.
 
-### Decoder behavior
+### Decoder behavior (legacy sidecar path)
 
 1. Parse the sidecar block body.
 2. Execute all `literal_bytes` as scattered writes to dst (serial).
@@ -430,8 +437,8 @@ The packed byte (0xF0..0xFF) is followed by `extraBits` raw bits encoding the re
 | Huffman LUT bits   | 11          | 2048-entry decode table            |
 | Initial copy bytes | 8           | Verbatim bytes at chunk start      |
 | SC group size      | 4 (default) | Chunks per group in self-contained mode; adaptive 4-255 |
-| Sidecar magic      | 0x43534450  | "PDSC" in little-endian            |
-| Sidecar version    | 2           | Current sidecar format version     |
+| Sidecar magic      | 0x43534450  | "PDSC" in little-endian (legacy)   |
+| Sidecar version    | 2           | Sidecar format version (legacy)    |
 
 ---
 
@@ -442,8 +449,8 @@ The packed byte (0xF0..0xFF) is followed by `extraBits` raw bits encoding the re
 | Levels | Codec | Strategy | Mechanism |
 |--------|-------|----------|-----------|
 | L1     | Fast  | SC group-parallel | Encoder emits self-contained chunks (1 chunk per group). Decoded via `decompressCoreParallel`. No sidecar needed. |
-| L2-L4  | Fast  | Sidecar parallel | Small sidecar (~0.15% overhead) carries cross-chunk match ops + literal leaves. Workers decode contiguous slices independently. |
-| L5     | Fast  | Sidecar parallel | Larger sidecar (~1.2% overhead) with cross-chunk source bytes at transitive depth >= 1. Workers constrained to 16-chunk slice boundaries. |
+| L2-L4  | Fast  | SC group-parallel | Encoder emits self-contained groups (adaptive sizing, ~16 groups per file). Each group decoded independently, no sidecar needed. Legacy frames may contain a sidecar instead; decoders must handle both paths. |
+| L5     | Fast  | SC group-parallel | Same as L2-L4. Legacy frames may contain a larger sidecar (~1.2% overhead); decoders must handle both paths. |
 | L6-L8  | High  | SC group-parallel | Encoder constrains chunks to self-contained groups (adaptive size, ~16 groups per file). Each group decoded independently, no sidecar needed. |
 | L9-L11 | High  | Two-phase parallel | Phase 1: parallel entropy decode + token resolution. Phase 2: serial token execution. No sidecar (64 MB dictionary window makes cross-slice deps ubiquitous). |
 
@@ -452,6 +459,6 @@ The packed byte (0xF0..0xFF) is followed by `extraBits` raw bits encoding the re
 | Levels | Codec | Threading |
 |--------|-------|-----------|
 | L1     | Fast  | Parallel (per-chunk workers, SC mode) |
-| L2-L5  | Fast  | Serial |
+| L2-L5  | Fast  | Parallel (SC, per-group workers, adaptive group sizing) |
 | L6-L8  | High  | Parallel (per-group workers, SC mode) |
 | L9-L11 | High  | Parallel (per-block workers, sliding window) |
