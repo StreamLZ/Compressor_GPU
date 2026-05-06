@@ -1,6 +1,6 @@
 # StreamLZ Native
 
-Zig 0.15.2 implementation of [StreamLZ](https://github.com/StreamLZ/StreamLZ), a fast LZ77-family
+Zig 0.16 implementation of [StreamLZ](https://github.com/StreamLZ/StreamLZ), a fast LZ77-family
 compressor/decompressor. Covers all 11 compression levels (Fast L1-L5,
 High L6-L11) with byte-exact wire-format compatibility with the C#
 reference. Primary goal: **fast decompression** on consumer x86-64.
@@ -37,7 +37,7 @@ disables auto-detection.
 ```
 zig build -Doptimize=ReleaseFast                # release binary
 zig build -Doptimize=ReleaseFast -Dstrip=false  # release + symbols (VTune)
-zig build test --summary all                    # 282 unit tests
+zig build test --summary all                    # 329 unit tests
 zig build safe                                  # ReleaseSafe build
 zig build fuzz                                  # fuzz harness
 ```
@@ -176,16 +176,16 @@ is complete.
 build.zig              build script
 src/                   all Zig source
 scripts/               fixture generation + fuzz harness
-CodeWiki.md            source tree map, invariants, glossary
+CODEWIKI.md            source tree map, invariants, glossary
 BENCHMARKS.md          historical benchmark numbers
 CHANGELOG.md           release history
 FORMAT.md              SLZ1 wire format specification
-FailedExperiments.md   optimization dead-ends (valuable context)
+FAILED_EXPERIMENTS.md  optimization dead-ends (valuable context)
 SECURITY.md            security policy + fuzz testing
 ```
 
 For the full source tree map, key invariants, and glossary, see
-[CodeWiki.md](CodeWiki.md).
+[CODEWIKI.md](CODEWIKI.md).
 
 ---
 

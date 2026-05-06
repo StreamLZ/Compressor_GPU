@@ -3,7 +3,7 @@
 ## [2.0.0] — 2026-04-29
 
 Initial native (Zig) release. Full port of the C# StreamLZ library to
-Zig 0.15.2 with byte-exact wire-format compatibility.
+Zig 0.16 with byte-exact wire-format compatibility.
 
 ### Highlights
 
@@ -30,7 +30,7 @@ Zig 0.15.2 with byte-exact wire-format compatibility.
 - L2-L5 SC group-parallel decompress: 37-39 GB/s
 - L6-L8 SC group-parallel decompress: 11-12 GB/s
 - L9-L11 two-phase parallel decompress: 1.4-2.3 GB/s
-- L1 parallel compress: 4.2 GB/s
+- L1-L5 parallel compress (SC, per-group workers): 2.8 GB/s (L1), 2.0 GB/s (L2), 1.5 GB/s (L3), 1.0 GB/s (L4), 755 MB/s (L5)
 - L9 compress: 7.9 MB/s (SIMD hash probe + dual-bucket prefetch)
 
 ### Key optimizations over v1
@@ -50,8 +50,10 @@ Zig 0.15.2 with byte-exact wire-format compatibility.
 - Conditional far-offset prefetch for L3-L5
 - SIMD hash probe + dual-bucket prefetch for L9-L11 encoder
 - Parallel resolveTokens for L9-L11 (+17-24% decompress)
-- SC group-parallel for L2-L5 (supersedes v2 sidecar frame format)
+- SC group-parallel compress and decompress for L2-L5 (supersedes v2 sidecar frame format)
 - L1 SC per-chunk independence (no sidecar needed)
+- C-ABI exports via `capi.zig` (`slz_compress`, `slz_decompress`, error codes) for FFI consumers
+- 4 GB `content_size` cap in frame header to prevent OOM DoS from malicious inputs
 
 ### Build
 
