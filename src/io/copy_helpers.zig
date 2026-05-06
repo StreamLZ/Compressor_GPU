@@ -178,7 +178,7 @@ pub inline fn copyMatch16Pshufb(dst: [*]u8, match_ptr: [*]const u8, distance: us
         storeV16(dst, shuffled);
     } else {
         // Scalar fallback: apply the shuffle mask byte-by-byte.
-        var result: V16 = undefined;
+        var result: V16 = @splat(0);
         inline for (0..16) |lane| {
             result[lane] = v[mask[lane]];
         }
