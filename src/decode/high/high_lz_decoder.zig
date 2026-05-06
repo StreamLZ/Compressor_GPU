@@ -434,7 +434,7 @@ pub fn phase1ProcessChunk(
         const sub_scratch_end: [*]u8 = sub_scratch + per_sub_scratch;
 
         const chunkhdr: u32 = (@as(u32, src[0]) << 16) | (@as(u32, src[1]) << 8) | @as(u32, src[2]);
-        var src_used: usize = undefined;
+        var src_used: usize = 0;
 
         if ((chunkhdr & constants.chunk_header_compressed_flag) == 0) {
             // Entropy-only sub-chunk — decode directly to output. Phase 2
@@ -605,7 +605,7 @@ fn decodeChunkInner(
 
         // 3-byte big-endian sub-chunk header.
         const chunkhdr: u32 = (@as(u32, src[0]) << 16) | (@as(u32, src[1]) << 8) | @as(u32, src[2]);
-        var src_used: usize = undefined;
+        var src_used: usize = 0;
 
         if ((chunkhdr & constants.chunk_header_compressed_flag) == 0) {
             // Stored as entropy without LZ.

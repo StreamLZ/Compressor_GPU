@@ -282,9 +282,9 @@ pub fn bitsForToken(
     recent_field: i32,
     length_field: i32,
 ) i32 {
-    var cost: i32 = undefined;
+    var cost: i32 = 0;
     if (cur_match_len - 17 >= 0) {
-        var bits_for_match_len: i32 = undefined;
+        var bits_for_match_len: i32 = 0;
         if (cur_match_len - 17 >= 255) {
             const arg: u32 = @intCast(((cur_match_len - 17 - 255) >> 6) + 1);
             const bit_scan: i32 = @intCast(std.math.log2_int(u32, @max(arg, 1)));
