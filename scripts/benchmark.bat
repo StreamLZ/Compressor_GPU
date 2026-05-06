@@ -1,14 +1,15 @@
 @echo off
 REM StreamLZ benchmark script — downloads enwik8 if needed, runs -bc at t0, t1, t16.
 
-set SLZ=%~dp0streamlz.exe
-set ENWIK8=%~dp0enwik8
+set "SLZ=%~dp0streamlz.exe"
+set "ENWIK8=%~dp0enwik8"
+set "ZIPFILE=%~dp0enwik8.zip"
 
 if not exist "%ENWIK8%" (
     echo Downloading enwik8 ^(34 MB^)...
-    curl -L -o "%~dp0enwik8.zip" https://mattmahoney.net/dc/enwik8.zip
-    tar -xf "%~dp0enwik8.zip" -C "%~dp0"
-    del "%~dp0enwik8.zip"
+    curl -L -o "%ZIPFILE%" https://mattmahoney.net/dc/enwik8.zip
+    powershell -Command "Expand-Archive -Path '%ZIPFILE%' -DestinationPath '%~dp0' -Force"
+    del "%ZIPFILE%"
 )
 
 echo.
