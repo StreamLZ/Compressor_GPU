@@ -1172,7 +1172,7 @@ fn benchmarkCodec(
 fn runBenchCompare(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: Args, fast_only: bool) !void {
     const in_path = requireInput(args, w);
     const runs = args.runs orelse 3;
-    const threads: c_int = if (args.threads > 0) @intCast(args.threads) else 8;
+    const threads: c_int = if (args.threads > 0) @intCast(args.threads) else @intCast(std.Thread.getCpuCount() catch 8);
 
     if (runs == 0) die(w, "error: runs must be >= 1\n");
 
