@@ -73,15 +73,14 @@ pub fn totalAvailableMemoryBytes() u64 {
         };
         if (win32.GlobalMemoryStatusEx(&ms) == .FALSE) return 0;
         return ms.ullTotalPhys;
-    } else if (os == .linux or os == .android) {
-        var info: std.posix.system.sysinfo = undefined;
-        if (std.posix.system.sysinfo(&info) != 0) return 0;
+    } else if (os == .linux) {
+        var info: std.os.linux.Sysinfo = undefined;
+        if (std.os.linux.sysinfo(&info) != 0) return 0;
         return @as(u64, info.totalram) * @as(u64, info.mem_unit);
     } else if (os == .macos or os == .ios) {
         var mem: u64 = 0;
         var size: usize = @sizeOf(u64);
-        const mib = [2]c_int{ std.posix.CTL.HW, std.posix.system.HW.MEMSIZE };
-        const rc = std.posix.system.sysctl(&mib, mib.len, std.mem.asBytes(&mem), &size, null, 0);
+        const rc = std.posix.system.sysctlbyname("hw.memsize", @ptrCast(&mem), &size, null, 0);
         if (rc != 0) return 0;
         return mem;
     } else {

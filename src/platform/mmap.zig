@@ -64,7 +64,7 @@ pub const MappedFile = struct {
             _ = win32.UnmapViewOfFile(@ptrCast(self.ptr));
             if (self.map_handle) |h| _ = win32.CloseHandle(h);
         } else {
-            const aligned: [*]align(std.mem.page_size) u8 = @alignCast(self.ptr);
+            const aligned: [*]align(std.heap.page_size_min) u8 = @alignCast(self.ptr);
             std.posix.munmap(aligned[0..self.len]);
         }
     }
@@ -84,7 +84,7 @@ pub fn mapFileRead(file: std.Io.File, size: usize) ?MappedFile {
             .map_handle = map_h,
         };
     } else {
-        const result = std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .SHARED }, file.handle, 0);
+        const result = std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
         const ptr = result catch return null;
         return .{
             .ptr = @ptrCast(ptr),
@@ -110,7 +110,7 @@ pub fn mapFileReadWrite(file: std.Io.File, size: usize) ?MappedFile {
             .map_handle = map_h,
         };
     } else {
-        const result = std.posix.mmap(null, size, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED }, file.handle, 0);
+        const result = std.posix.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, file.handle, 0);
         const ptr = result catch return null;
         return .{
             .ptr = @ptrCast(ptr),

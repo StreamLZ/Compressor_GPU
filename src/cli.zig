@@ -860,8 +860,8 @@ fn getMemInfo() MemInfo {
         }
     } else if (os == .linux or os == .macos or os == .ios) {
         var usage: std.c.rusage = undefined;
-        if (std.c.getrusage(.SELF, &usage) == 0) {
-            const peak_kb: u64 = @intCast(@max(@as(i64, 0), usage.ru_maxrss));
+        if (std.c.getrusage(0, &usage) == 0) { // 0 == RUSAGE_SELF
+            const peak_kb: u64 = @intCast(@max(@as(isize, 0), usage.maxrss));
             const divisor: f64 = if (os == .macos or os == .ios) (1024.0 * 1024.0) else 1024.0;
             return .{
                 .peak_rss_mb = @as(f64, @floatFromInt(peak_kb)) / divisor,
