@@ -23,6 +23,18 @@ extern "C" {
 #endif
 
 /*
+ * Error codes. Returned as negative values from slz_compress/slz_decompress.
+ * Success returns a non-negative byte count.
+ */
+#define SLZ_ERROR_DST_TOO_SMALL  (-1)  /* Output buffer too small */
+#define SLZ_ERROR_CORRUPT        (-2)  /* Input is corrupted or invalid */
+#define SLZ_ERROR_OOM            (-3)  /* Out of memory */
+#define SLZ_ERROR_BAD_LEVEL      (-4)  /* Invalid compression level */
+#define SLZ_ERROR_UNKNOWN        (-5)  /* Unclassified internal error */
+
+#define SLZ_IS_ERROR(ret) ((ret) < 0)
+
+/*
  * Compress `src_len` bytes from `src` into `dst`.
  *
  * `level` selects the compression level (1-11, clamped if out of range):
@@ -43,26 +55,26 @@ extern "C" {
  *
  *   * Approximate, enwik8 100 MB, 24 threads, Arrow Lake-S.
  *
- * Returns the number of compressed bytes written to `dst`,
- * or 0 on failure (dst too small, allocation error).
+ * Returns the number of compressed bytes written to `dst` (>= 0),
+ * or a negative SLZ_ERROR_* code on failure.
  *
  * `dst` must be at least `slz_compress_bound(src_len)` bytes.
  */
-size_t slz_compress(const void *src, size_t src_len,
-                    void *dst, size_t dst_len,
-                    int level);
+int slz_compress(const void *src, size_t src_len,
+                 void *dst, size_t dst_len,
+                 int level);
 
 /*
  * Decompress an SLZ1 frame from `src` into `dst`.
  *
- * Returns the number of decompressed bytes written to `dst`,
- * or 0 on failure (corrupt input, dst too small).
+ * Returns the number of decompressed bytes written to `dst` (>= 0),
+ * or a negative SLZ_ERROR_* code on failure.
  *
  * `dst` must be at least `slz_content_size(src, src_len)` bytes
  * plus 64 bytes of safe-space padding.
  */
-size_t slz_decompress(const void *src, size_t src_len,
-                      void *dst, size_t dst_len);
+int slz_decompress(const void *src, size_t src_len,
+                   void *dst, size_t dst_len);
 
 /*
  * Returns the maximum compressed size for a given input length.

@@ -5,31 +5,58 @@ const frame = @import("format/frame_format.zig");
 
 const allocator = std.heap.c_allocator;
 
-/// Compress `src` into `dst` at the given level (1-11); returns bytes written or 0 on failure.
+/// C-ABI error codes. Negative values indicate specific errors.
+pub const SLZ_ERROR_DST_TOO_SMALL: c_int = -1;
+pub const SLZ_ERROR_CORRUPT: c_int = -2;
+pub const SLZ_ERROR_OOM: c_int = -3;
+pub const SLZ_ERROR_BAD_LEVEL: c_int = -4;
+pub const SLZ_ERROR_UNKNOWN: c_int = -5;
+
+fn mapCompressError(err: encoder.CompressError) c_int {
+    return switch (err) {
+        error.DestinationTooSmall => SLZ_ERROR_DST_TOO_SMALL,
+        error.OutOfMemory => SLZ_ERROR_OOM,
+        error.BadLevel => SLZ_ERROR_BAD_LEVEL,
+        else => SLZ_ERROR_UNKNOWN,
+    };
+}
+
+fn mapDecompressError(err: decoder.DecompressError) c_int {
+    return switch (err) {
+        error.OutputTooSmall => SLZ_ERROR_DST_TOO_SMALL,
+        error.OutOfMemory => SLZ_ERROR_OOM,
+        else => SLZ_ERROR_CORRUPT,
+    };
+}
+
+/// Compress `src` into `dst` at the given level (1-11).
+/// Returns bytes written (>= 0) on success, or a negative SLZ_ERROR_* code on failure.
 export fn slz_compress(
     src: [*]const u8,
     src_len: usize,
     dst: [*]u8,
     dst_len: usize,
     level: c_int,
-) usize {
+) c_int {
     if (src_len == 0 or dst_len == 0) return 0;
+    if (level < 1 or level > 11) return SLZ_ERROR_BAD_LEVEL;
     const result = encoder.compressFramed(
         allocator,
         src[0..src_len],
         dst[0..dst_len],
-        .{ .level = @intCast(std.math.clamp(level, 1, 11)) },
-    ) catch return 0;
-    return result;
+        .{ .level = @intCast(level) },
+    ) catch |err| return mapCompressError(err);
+    return @intCast(result);
 }
 
-/// Decompress an SLZ1 frame from `src` into `dst`; returns bytes written or 0 on failure.
+/// Decompress an SLZ1 frame from `src` into `dst`.
+/// Returns bytes written (>= 0) on success, or a negative SLZ_ERROR_* code on failure.
 export fn slz_decompress(
     src: [*]const u8,
     src_len: usize,
     dst: [*]u8,
     dst_len: usize,
-) usize {
+) c_int {
     if (src_len == 0 or dst_len == 0) return 0;
     const result = decoder.decompressFramedParallelThreaded(
         allocator,
@@ -37,8 +64,8 @@ export fn slz_decompress(
         src[0..src_len],
         dst[0..dst_len],
         0,
-    ) catch return 0;
-    return result.written;
+    ) catch |err| return mapDecompressError(err);
+    return @intCast(result.written);
 }
 
 /// Return the worst-case compressed size for a given source length.

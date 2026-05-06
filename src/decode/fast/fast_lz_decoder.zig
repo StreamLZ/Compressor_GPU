@@ -474,6 +474,7 @@ noinline fn processModeImpl(
 
             const candidate_offs: i64 = -new_dist;
             recent_offs = if (use_new_dist) candidate_offs else recent_offs;
+            if (recent_offs == 0) return error.MatchOutOfBounds;
             off16_stream = @ptrFromInt(@intFromPtr(off16_stream) + (@as(usize, @intFromBool(use_new_dist)) * 2));
 
             const match_addr_usize: usize = @intFromPtr(dst) +% @as(usize, @bitCast(@as(isize, @intCast(recent_offs))));
