@@ -49,6 +49,7 @@ test {
     _ = @import("encode/high/high_compressor.zig");
     _ = @import("encode/fast/fast_lz_encoder.zig");
     _ = @import("encode/forward_lz.zig");
+    _ = @import("platform/cache_detect.zig");
     _ = @import("encode/streamlz_encoder.zig");
     _ = @import("encode/fast_framed.zig");
     _ = @import("encode/high_framed.zig");
