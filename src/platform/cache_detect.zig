@@ -166,6 +166,110 @@ fn detectLinuxSysfs() CacheSizes {
 }
 
 // ────────────────────────────────────────────────────────────
+//  CPU brand string (x86 CPUID 0x80000002-04)
+// ────────────────────────────────────────────────────────────
+
+pub fn cpuBrandString() [48]u8 {
+    var buf: [48]u8 = .{0} ** 48;
+    if (comptime builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86) {
+        const max_ext = cpuid(0x80000000, 0).eax;
+        if (max_ext >= 0x80000004) {
+            inline for (.{ 0x80000002, 0x80000003, 0x80000004 }, 0..) |leaf, i| {
+                const r = cpuid(leaf, 0);
+                const off = i * 16;
+                @memcpy(buf[off..][0..4], @as(*const [4]u8, @ptrCast(&r.eax)));
+                @memcpy(buf[off + 4 ..][0..4], @as(*const [4]u8, @ptrCast(&r.ebx)));
+                @memcpy(buf[off + 8 ..][0..4], @as(*const [4]u8, @ptrCast(&r.ecx)));
+                @memcpy(buf[off + 12 ..][0..4], @as(*const [4]u8, @ptrCast(&r.edx)));
+            }
+        }
+    }
+    return buf;
+}
+
+pub fn cpuBrandSlice(buf: *const [48]u8) []const u8 {
+    // Skip leading spaces.
+    var start: usize = 0;
+    while (start < buf.len and buf[start] == ' ') start += 1;
+    const end = std.mem.indexOfScalar(u8, buf[start..], 0) orelse (buf.len - start);
+    return buf[start..][0..end];
+}
+
+// ────────────────────────────────────────────────────────────
+//  System info summary
+// ────────────────────────────────────────────────────────────
+
+const memory_query = @import("memory_query.zig");
+
+pub const RamBandwidth = struct { read_gbps: f64, write_gbps: f64 };
+
+pub fn measureRamBandwidth(io: std.Io) RamBandwidth {
+    const size: usize = 64 * 1024 * 1024;
+    const buf = std.heap.c_allocator.alloc(u8, size) catch return .{ .read_gbps = 0, .write_gbps = 0 };
+    defer std.heap.c_allocator.free(buf);
+    @memset(buf, 0xAA);
+
+    // Write bandwidth — use volatile u64 stores to prevent optimization.
+    var best_write_ns: u64 = std.math.maxInt(u64);
+    for (0..3) |_| {
+        const start = std.Io.Clock.awake.now(io);
+        {
+            const ptr: [*]volatile u64 = @ptrCast(@alignCast(buf.ptr));
+            const count = size / 8;
+            var j: usize = 0;
+            while (j < count) : (j += 1) {
+                ptr[j] = 0x5555555555555555;
+            }
+        }
+        const ns: u64 = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (ns < best_write_ns) best_write_ns = ns;
+    }
+
+    // Read bandwidth (volatile sum to prevent optimization)
+    var best_read_ns: u64 = std.math.maxInt(u64);
+    for (0..3) |_| {
+        var sum: u64 = 0;
+        const start = std.Io.Clock.awake.now(io);
+        var i: usize = 0;
+        while (i < size) : (i += 64) {
+            sum +%= buf[i];
+        }
+        std.mem.doNotOptimizeAway(sum);
+        const ns: u64 = @intCast(start.untilNow(io, .awake).toNanoseconds());
+        if (ns < best_read_ns) best_read_ns = ns;
+    }
+
+    const sz = @as(f64, @floatFromInt(size));
+    const gb = 1024.0 * 1024.0 * 1024.0;
+    return .{
+        .read_gbps = if (best_read_ns > 0) sz / (@as(f64, @floatFromInt(best_read_ns)) / 1e9) / gb else 0,
+        .write_gbps = if (best_write_ns > 0) sz / (@as(f64, @floatFromInt(best_write_ns)) / 1e9) / gb else 0,
+    };
+}
+
+pub fn printSystemInfo(w: anytype, io: std.Io) void {
+    const brand_buf = cpuBrandString();
+    const brand = cpuBrandSlice(&brand_buf);
+    const cache = detect();
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const ram_bytes = memory_query.totalAvailableMemoryBytes();
+    const ram_gb = @as(f64, @floatFromInt(ram_bytes)) / (1024.0 * 1024.0 * 1024.0);
+    const bw = measureRamBandwidth(io);
+
+    w.print("System: {s}\n", .{if (brand.len > 0) brand else "unknown CPU"}) catch {};
+    w.print("  Cores: {d}, RAM: {d:.1} GB (read {d:.1} / write {d:.1} GB/s)\n", .{ cpu_count, ram_gb, bw.read_gbps, bw.write_gbps }) catch {};
+    w.print("  Cache: L1d={d}K  L2={d}K  L3={d}M\n", .{
+        cache.l1d / 1024,
+        cache.l2 / 1024,
+        cache.l3 / (1024 * 1024),
+    }) catch {};
+    w.print("  OS: {s}, Arch: {s}\n\n", .{
+        @tagName(builtin.os.tag),
+        @tagName(builtin.cpu.arch),
+    }) catch {};
+}
+
+// ────────────────────────────────────────────────────────────
 //  Tests
 // ────────────────────────────────────────────────────────────
 

@@ -19,6 +19,7 @@ const lz4 = if (enable_bench) @import("compare/lz4.zig") else struct {};
 const forward_lz = @import("encode/forward_lz.zig");
 
 const mmap_helpers = @import("platform/mmap.zig");
+const cache_detect = @import("platform/cache_detect.zig");
 
 const Mode = enum {
     compress,
@@ -963,6 +964,7 @@ fn runBenchAll(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
     defer allocator.free(src);
 
     const mb: f64 = @as(f64, @floatFromInt(src.len)) / (1024.0 * 1024.0);
+    cache_detect.printSystemInfo(w, io);
     try w.print("streamlz bench-all: {s} ({d} bytes, {d} threads, {d} decompress runs)\n", .{ in_path, src.len, num_threads, runs });
 
     const bound = encoder.compressBound(src.len);
@@ -1178,6 +1180,7 @@ fn runBenchCompare(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, 
     defer allocator.free(src);
 
     const mb: f64 = @as(f64, @floatFromInt(src.len)) / (1024.0 * 1024.0);
+    cache_detect.printSystemInfo(w, io);
     try w.print("comparison benchmark: {s} ({d} bytes, {d:.2} MB)\n", .{ in_path, src.len, mb });
     try w.print("threads: {d}, runs: {d}\n\n", .{ threads, runs });
     try w.flush();
