@@ -881,11 +881,13 @@ test "encodeSubChunkRaw roundtrip: repeating 2 KB pattern" {
 }
 
 test "encodeSubChunkRaw roundtrip: 4 KB binary-ish input" {
+    // Use a repeating binary pattern with some variation so the compressor
+    // finds matches instead of bailing.
     var source: [4096]u8 = undefined;
-    var state: u32 = 0x1234_5678;
-    for (&source) |*b| {
-        state = state *% 1103515245 +% 12345;
-        b.* = @intCast((state >> 16) & 0xFF);
+    const seed_block = "BinaryPatternXY"; // 16 bytes
+    for (&source, 0..) |*b, i| {
+        // Repeating seed with a small per-position variation every 256 bytes
+        b.* = seed_block[i % seed_block.len] +% @as(u8, @intCast((i / 256) & 0x0F));
     }
 
     var hasher = try FastMatchHasher(u32).init(testing.allocator, .{ .hash_bits = 14, .min_match_length = 4 });
@@ -898,7 +900,7 @@ test "encodeSubChunkRaw roundtrip: 4 KB binary-ish input" {
         .dictionary_size = 0x40000000,
         .speed_tradeoff = 0.14,
     });
-    if (res.bail) return; // Random data usually bails — acceptable.
+    try testing.expect(!res.bail); // Pattern is compressible — should not bail.
 
     var decoded: [source.len + 64]u8 = @splat(0);
     try wrapAndDecode(dst[0..res.bytes_written], decoded[0..], source.len);

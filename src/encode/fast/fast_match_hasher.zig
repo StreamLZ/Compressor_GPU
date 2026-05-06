@@ -138,6 +138,18 @@ test "FastMatchHasher(u16) 13-bit table" {
     try testing.expectEqual(@as(u6, 51), h.hash_shift);
 }
 
+// ── 4e: Error-path tests for FastMatchHasher init ──────────────
+
+test "FastMatchHasher init: hash_bits < 8 returns error.HashBitsOutOfRange" {
+    const result = FastMatchHasher(u32).init(testing.allocator, .{ .hash_bits = 7, .min_match_length = 4 });
+    try testing.expectError(error.HashBitsOutOfRange, result);
+}
+
+test "FastMatchHasher init: hash_bits > 24 returns error.HashBitsOutOfRange" {
+    const result = FastMatchHasher(u32).init(testing.allocator, .{ .hash_bits = 25, .min_match_length = 4 });
+    try testing.expectError(error.HashBitsOutOfRange, result);
+}
+
 test "FastMatchHasher hashes to valid index" {
     var h = try FastMatchHasher(u32).init(testing.allocator, .{ .hash_bits = 16, .min_match_length = 4 });
     defer h.deinit();

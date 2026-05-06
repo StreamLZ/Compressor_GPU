@@ -1167,13 +1167,23 @@ fn tansRoundtripChunk(allocator: std.mem.Allocator, src: []const u8) !void {
     try testing.expectEqualSlices(u8, src, decoded[0..src.len]);
 }
 
+/// Build a path to a test data file. Checks STREAMLZ_TEST_DATA env var first,
+/// then falls back to the hardcoded default base directory.
+fn testDataPath(allocator: std.mem.Allocator, filename: []const u8) ![]const u8 {
+    const default_base = "c:/Users/james.JAMESWORK2025/Repos/StreamLZ/assets";
+    const base: []const u8 = if (std.c.getenv("STREAMLZ_TEST_DATA")) |env_z|
+        std.mem.span(env_z)
+    else
+        default_base;
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, filename });
+}
+
 test "tANS roundtrip: enwik8 first 64 KB" {
     const io = std.testing.io;
     const allocator = testing.allocator;
-    const file = std.Io.Dir.cwd().openFile(io,
-        "c:/Users/james.JAMESWORK2025/Repos/StreamLZ/assets/enwik8.txt",
-        .{},
-    ) catch return;
+    const path = try testDataPath(allocator, "enwik8.txt");
+    defer allocator.free(path);
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return;
     defer file.close(io);
 
     const src = try allocator.alloc(u8, 64 * 1024);
@@ -1187,10 +1197,9 @@ test "tANS roundtrip: enwik8 first 64 KB" {
 test "tANS roundtrip: enwik8 offset 1 MB, 128 KB chunk" {
     const io = std.testing.io;
     const allocator = testing.allocator;
-    const file = std.Io.Dir.cwd().openFile(io,
-        "c:/Users/james.JAMESWORK2025/Repos/StreamLZ/assets/enwik8.txt",
-        .{},
-    ) catch return;
+    const path = try testDataPath(allocator, "enwik8.txt");
+    defer allocator.free(path);
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return;
     defer file.close(io);
 
     const src = try allocator.alloc(u8, 128 * 1024);
@@ -1204,10 +1213,9 @@ test "tANS roundtrip: enwik8 offset 1 MB, 128 KB chunk" {
 test "tANS roundtrip: silesia first 64 KB (binary-ish)" {
     const io = std.testing.io;
     const allocator = testing.allocator;
-    const file = std.Io.Dir.cwd().openFile(io,
-        "c:/Users/james.JAMESWORK2025/Repos/StreamLZ/assets/silesia_all.tar",
-        .{},
-    ) catch return;
+    const path = try testDataPath(allocator, "silesia_all.tar");
+    defer allocator.free(path);
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return;
     defer file.close(io);
 
     const src = try allocator.alloc(u8, 64 * 1024);
@@ -1221,10 +1229,9 @@ test "tANS roundtrip: silesia first 64 KB (binary-ish)" {
 test "tANS roundtrip: silesia 128 KB at offset 2 MB" {
     const io = std.testing.io;
     const allocator = testing.allocator;
-    const file = std.Io.Dir.cwd().openFile(io,
-        "c:/Users/james.JAMESWORK2025/Repos/StreamLZ/assets/silesia_all.tar",
-        .{},
-    ) catch return;
+    const path = try testDataPath(allocator, "silesia_all.tar");
+    defer allocator.free(path);
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return;
     defer file.close(io);
 
     const src = try allocator.alloc(u8, 128 * 1024);

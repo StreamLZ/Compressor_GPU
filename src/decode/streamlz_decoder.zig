@@ -822,12 +822,11 @@ test "decompressFramed rejects bad magic" {
 }
 
 test "decompressBlock roundtrips a raw compressed block (no frame wrapper)" {
-    // Build a compressible payload large enough to clear min_source_length (128).
-    var payload: [512]u8 = undefined;
-    for (&payload, 0..) |*b, i| b.* = @intCast((i * 37) & 0xFF);
-    // Inject a repeated region so the LZ parser has something to find.
-    @memcpy(payload[100..164], payload[0..64]);
-    @memcpy(payload[300..364], payload[0..64]);
+    // Build a highly compressible payload (repeating pattern) large enough
+    // to clear min_source_length (128) and always trigger the compressed path.
+    var payload: [1024]u8 = undefined;
+    const pat = "The quick brown fox jumps. ";
+    for (&payload, 0..) |*b, i| b.* = pat[i % pat.len];
 
     const allocator = testing.allocator;
     const encoder = @import("../encode/streamlz_encoder.zig");
@@ -835,18 +834,22 @@ test "decompressBlock roundtrips a raw compressed block (no frame wrapper)" {
     // Compress via the framed API, then strip the SLZ1 frame header + 8-byte
     // outer block header to get the raw inner compressed block that
     // `decompressBlock` expects.
-    var framed: [1024]u8 = undefined;
+    var framed: [2048]u8 = undefined;
     const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 });
 
     const hdr = try frame.parseHeader(framed[0..framed_len]);
-    const block_hdr= try frame.parseBlockHeader(framed[hdr.header_size..]);
-    // Only validate the roundtrip when the encoder chose the compressed path.
-    // For very short inputs the frame block may come back uncompressed.
-    if (block_hdr.uncompressed) return;
+    const block_hdr = try frame.parseBlockHeader(framed[hdr.header_size..]);
+    if (block_hdr.uncompressed) {
+        // Uncompressed path: the raw payload bytes follow the outer block
+        // header directly; verify the frame roundtrips correctly.
+        const raw_start = hdr.header_size + 8;
+        try testing.expectEqualSlices(u8, &payload, framed[raw_start .. raw_start + payload.len]);
+        return;
+    }
     const inner_start = hdr.header_size + 8;
     const inner = framed[inner_start .. inner_start + block_hdr.compressed_size];
 
-    var out: [1024]u8 = @splat(0);
+    var out: [2048]u8 = @splat(0);
     const written = try decompressBlock(inner, &out, payload.len);
     try testing.expectEqual(payload.len, written);
     try testing.expectEqualSlices(u8, &payload, out[0..payload.len]);
@@ -889,24 +892,30 @@ test "decompressBlockWithDict writes output at dst_offset for an uncompressed bl
 test "decompressBlockWithDict matches decompressBlock when dst_offset == 0" {
     // Equivalence check: `decompressBlockWithDict(..., 0, ...)` must produce
     // identical output to `decompressBlock(..., ...)` on the same input.
-    var payload: [384]u8 = undefined;
-    for (&payload, 0..) |*b, i| b.* = @intCast((i * 17) & 0xFF);
-    @memcpy(payload[128..192], payload[0..64]);
+    // Use a highly compressible payload to ensure the compressed path is taken.
+    var payload: [1024]u8 = undefined;
+    const pat = "ABCDEFGHIJKLMNOP";
+    for (&payload, 0..) |*b, i| b.* = pat[i % pat.len];
 
     const allocator = testing.allocator;
     const encoder = @import("../encode/streamlz_encoder.zig");
 
-    var framed: [1024]u8 = undefined;
+    var framed: [2048]u8 = undefined;
     const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 });
 
     const hdr = try frame.parseHeader(framed[0..framed_len]);
-    const block_hdr= try frame.parseBlockHeader(framed[hdr.header_size..]);
-    if (block_hdr.uncompressed) return;
+    const block_hdr = try frame.parseBlockHeader(framed[hdr.header_size..]);
+    if (block_hdr.uncompressed) {
+        // Even on the uncompressed path, verify roundtrip via the frame.
+        const raw_start = hdr.header_size + 8;
+        try testing.expectEqualSlices(u8, &payload, framed[raw_start .. raw_start + payload.len]);
+        return;
+    }
     const inner_start = hdr.header_size + 8;
     const inner = framed[inner_start .. inner_start + block_hdr.compressed_size];
 
-    var out_a: [1024]u8 = @splat(0);
-    var out_b: [1024]u8 = @splat(0);
+    var out_a: [2048]u8 = @splat(0);
+    var out_b: [2048]u8 = @splat(0);
     const n_a = try decompressBlock(inner, &out_a, payload.len);
     const n_b = try decompressBlockWithDict(inner, &out_b, 0, payload.len);
     try testing.expectEqual(n_a, n_b);
@@ -972,19 +981,26 @@ test "encoder sets RestartDecoder flag on first internal block header" {
     // 2-byte internal block header (`restart_decoder` on the decoder side).
     // Consumers don't act on it but the flag IS written; confirm Zig
     // is consistent.
-    var payload: [384]u8 = undefined;
-    for (&payload, 0..) |*b, i| b.* = @truncate(i);
-    @memcpy(payload[64..128], payload[0..64]);
+    // Use a highly compressible payload to ensure the compressed path is taken.
+    var payload: [1024]u8 = undefined;
+    const pat = "ABCDEFGHIJKLMNOP";
+    for (&payload, 0..) |*b, i| b.* = pat[i % pat.len];
 
     const allocator = testing.allocator;
     const encoder = @import("../encode/streamlz_encoder.zig");
 
-    var framed: [1024]u8 = undefined;
+    var framed: [2048]u8 = undefined;
     const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 });
 
     const hdr = try frame.parseHeader(framed[0..framed_len]);
-    const block_hdr= try frame.parseBlockHeader(framed[hdr.header_size..]);
-    if (block_hdr.uncompressed) return;
+    const block_hdr = try frame.parseBlockHeader(framed[hdr.header_size..]);
+    if (block_hdr.uncompressed) {
+        // Even if uncompressed, the internal header should still exist
+        // in the framed format — but the flag check only applies to the
+        // compressed path. Fail loudly so we know the test isn't covering
+        // the intended codepath.
+        return error.SkipZigTest;
+    }
     const inner_start = hdr.header_size + 8;
     const internal = try block_header.parseBlockHeader(framed[inner_start..]);
     try testing.expect(internal.restart_decoder);

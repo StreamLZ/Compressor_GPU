@@ -273,3 +273,42 @@ test "getLazyScore: longer match with smaller offset wins" {
     // a wins: 4*(10-8) - 4 - (log2(100)+3 - log2(1000)+3) = 8-4-(-3) = 7
     try testing.expect(getLazyScore(a, b) > 0);
 }
+
+// ── 4d: match_eval gaps ────────────────────────────────────────
+
+test "countMatchingBytes: zero-length (p == p_end) returns 0" {
+    const src = "ABCDEFGHABCDEFGH";
+    // Pass p == p_end so available length is 0.
+    const len = countMatchingBytes(src[8..].ptr, src[8..].ptr, 8);
+    try testing.expectEqual(@as(usize, 0), len);
+}
+
+test "getMatchLengthQuick: returns 0 when first bytes differ" {
+    // "abcdefgh" then "XYZWefgh" -- first u16 differs so result is 0.
+    const src = "abcdefghXYZWefgh";
+    const len = getMatchLengthQuick(
+        src[8..].ptr,
+        8,
+        src[src.len..].ptr,
+        std.mem.readInt(u32, src[8..12], .little),
+    );
+    try testing.expectEqual(@as(usize, 0), len);
+}
+
+test "getLazyScore: equal lengths, a < b offset favours a" {
+    const a: CompareLengthAndOffset = .{ .length = 8, .offset = 50 };
+    const b: CompareLengthAndOffset = .{ .length = 8, .offset = 200 };
+    // 4*(8-8) - 4 - (log2(50)+3 - log2(200)+3)
+    // = 0 - 4 - (5+3 - 7-3) = -4 - (-2) = -2
+    // a has smaller offset so bits_a < bits_b, giving a bonus, but
+    // equal length means -4 penalty from the literal skip.
+    // Either way, verify the relationship is deterministic.
+    const score = getLazyScore(a, b);
+    // With equal length, the -4 penalty is offset only by the bit-cost
+    // difference. a.offset < b.offset so bits_a < bits_b => (bits_a - bits_b) < 0
+    // => score = 0 - 4 - (negative) > -4.
+    try testing.expect(score > -4);
+    // But score should still be negative because the -4 literal-skip
+    // penalty dominates.
+    try testing.expect(score < 0);
+}

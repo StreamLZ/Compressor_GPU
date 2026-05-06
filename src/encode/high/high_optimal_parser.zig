@@ -1286,3 +1286,61 @@ test "optimal: short input returns null" {
     const result = try optimal(&ctx, .{}, null, &src, @intCast(src.len), &dst_buf, dst_buf[dst_buf.len..].ptr, 0, &chunk_type, &cost, null);
     try testing.expectEqual(@as(?usize, null), result);
 }
+
+// ── 4g: DP engine with real compressible data ──────────────────
+
+test "optimal: 8 KB highly-repetitive data exercises DP engine" {
+    // Use a very short repeating pattern so the greedy statistics pass
+    // finds enough matches to compress below input size, allowing the
+    // DP engine to proceed past the bail-out check.
+    const src_len = 8192;
+    var src: [src_len]u8 = undefined;
+    const pattern = "ABCD";
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) src[i] = pattern[i % pattern.len];
+
+    const ctx: HighEncoderContext = .{
+        .allocator = testing.allocator,
+        .compression_level = 5,
+        .speed_tradeoff = 0.05,
+        .entropy_options = .{},
+        .encode_flags = 0,
+    };
+    const dst_size = src_len * 2;
+    const dst_buf = try testing.allocator.alloc(u8, dst_size);
+    defer testing.allocator.free(dst_buf);
+    var chunk_type: i32 = -1;
+    var cost: f32 = 0;
+
+    // Pre-populate the match table with realistic match entries so
+    // the greedy statistics collector and the DP forward pass have
+    // candidates to evaluate. Each position gets a match of length 4
+    // at offset 4 (the 4-byte period of our "ABCD" pattern).
+    const mt_len: usize = 4 * src_len;
+    const match_table = try testing.allocator.alloc(LengthAndOffset, mt_len);
+    defer testing.allocator.free(match_table);
+    @memset(match_table, .{ .length = 0, .offset = 0 });
+    // Fill slot 0 of every 4-slot group (positions >= 8) with a real match.
+    var pos: usize = 8;
+    while (pos < src_len - 16) : (pos += 1) {
+        match_table[4 * pos] = .{ .length = 4, .offset = 4 };
+    }
+
+    const result = try optimal(
+        &ctx,
+        .{},
+        null,
+        &src,
+        @intCast(src.len),
+        dst_buf.ptr,
+        dst_buf[dst_buf.len..].ptr,
+        0,
+        &chunk_type,
+        &cost,
+        match_table,
+    );
+    // With pre-filled matches the DP engine should produce output.
+    try testing.expect(result != null);
+    try testing.expect(result.? > 0);
+    try testing.expect(result.? < src.len);
+}

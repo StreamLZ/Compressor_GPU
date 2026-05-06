@@ -618,6 +618,53 @@ test "edge: all zeros, 128 KB (single sub-chunk exact)" {
     try roundtripAllLevels(&src);
 }
 
+// ── 4a: Edge-case roundtrips for L6, L9, L11 ───────────────────
+
+test "edge L6: empty input" {
+    const src: []const u8 = &[_]u8{};
+    try roundtrip(src, 6);
+}
+
+test "edge L9: empty input" {
+    const src: []const u8 = &[_]u8{};
+    try roundtrip(src, 9);
+}
+
+test "edge L11: empty input" {
+    const src: []const u8 = &[_]u8{};
+    try roundtrip(src, 11);
+}
+
+test "edge L6: single byte" {
+    const src = [_]u8{'Z'};
+    try roundtrip(&src, 6);
+}
+
+test "edge L9: single byte" {
+    const src = [_]u8{'Z'};
+    try roundtrip(&src, 9);
+}
+
+test "edge L11: single byte" {
+    const src = [_]u8{'Z'};
+    try roundtrip(&src, 11);
+}
+
+test "edge L6: 256 KB all-equal bytes (memset path)" {
+    const src: [256 * 1024]u8 = @splat(0xAA);
+    try roundtrip(&src, 6);
+}
+
+test "edge L9: 256 KB all-equal bytes (memset path)" {
+    const src: [256 * 1024]u8 = @splat(0xAA);
+    try roundtrip(&src, 9);
+}
+
+test "edge L11: 256 KB all-equal bytes (memset path)" {
+    const src: [256 * 1024]u8 = @splat(0xAA);
+    try roundtrip(&src, 11);
+}
+
 test "edge: all same byte (0xFF), 2 MB" {
     const src: [2 * 1024 * 1024]u8 = @splat(0xFF);
     try roundtripAllLevels(&src);
@@ -977,4 +1024,34 @@ test "decompressFramed: multi-piece concatenation across L6 + L9 codecs" {
     const written = try decoder.decompressFramed(tmp[0..total], decoded);
     try testing.expectEqual(src.len, written);
     try testing.expectEqualSlices(u8, &src, decoded[0..written]);
+}
+
+// ── 4b: Error-path tests for encoder ────────────────────────────
+
+test "compressFramed: level=0 returns error.BadLevel" {
+    var dst: [1024]u8 = undefined;
+    const src = "hello";
+    const result = compressFramed(testing.allocator, src, &dst, .{ .level = 0 });
+    try testing.expectError(error.BadLevel, result);
+}
+
+test "compressFramed: level=12 returns error.BadLevel" {
+    var dst: [1024]u8 = undefined;
+    const src = "hello";
+    const result = compressFramed(testing.allocator, src, &dst, .{ .level = 12 });
+    try testing.expectError(error.BadLevel, result);
+}
+
+test "compressFramed: hash_bits=7 returns error.BadLevel" {
+    var dst: [1024]u8 = undefined;
+    const src = "hello";
+    const result = compressFramed(testing.allocator, src, &dst, .{ .level = 1, .hash_bits = 7 });
+    try testing.expectError(error.BadLevel, result);
+}
+
+test "compressFramed: dst too small returns error.DestinationTooSmall" {
+    var dst: [4]u8 = undefined;
+    const src = "hello world, this needs more than 4 bytes of output space";
+    const result = compressFramed(testing.allocator, src, &dst, .{ .level = 1 });
+    try testing.expectError(error.DestinationTooSmall, result);
 }

@@ -737,6 +737,18 @@ test "MatchHasher16Dual insertAtIndex ring-shifts 16 entries" {
     for (1..16) |i| try testing.expectEqual(@as(u32, @intCast(i)), h.hash_table[i]);
 }
 
+// ── 4e: Error-path tests for MatchHasher init ──────────────────
+
+test "MatchHasher2x init: hash_bits < 8 returns error.HashBitsOutOfRange" {
+    const result = MatchHasher2x.init(testing.allocator, 7, 4);
+    try testing.expectError(error.HashBitsOutOfRange, result);
+}
+
+test "MatchHasher2x init: hash_bits > 24 returns error.HashBitsOutOfRange" {
+    const result = MatchHasher2x.init(testing.allocator, 25, 4);
+    try testing.expectError(error.HashBitsOutOfRange, result);
+}
+
 test "adaptivePreloadLoop visits cur_offset in step progression" {
     // Preallocate a generous buffer and fill from the inserter; exceed
     // the default ArrayList capacity by pre-sizing.

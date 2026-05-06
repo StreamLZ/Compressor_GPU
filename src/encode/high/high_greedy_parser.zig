@@ -414,3 +414,45 @@ test "compressFast: 1 KB repeating input produces compressed output" {
     try testing.expect(n > 0);
     try testing.expect(n < src.len);
 }
+
+// ── 4f: Lazy evaluation path (num_lazy = 1) ────────────────────
+
+test "compressFast: 1 KB with num_lazy=1 exercises lazy path" {
+    var src: [1024]u8 = undefined;
+    const pattern = "The quick brown fox jumps over a lazy dog. ";
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) src[i] = pattern[i % pattern.len];
+
+    const MatchHasher1 = hasher_mod.MatchHasher1;
+    var hasher = try MatchHasher1.init(testing.allocator, 16, 4);
+    defer hasher.deinit();
+
+    const ctx: HighEncoderContext = .{
+        .allocator = testing.allocator,
+        .compression_level = 3,
+        .speed_tradeoff = 0.05,
+        .entropy_options = .{},
+        .encode_flags = 0,
+        .sub_or_copy_mask = 0,
+    };
+
+    var dst_buf: [2048]u8 = undefined;
+    var cost: f32 = 0;
+    var chunk_type: i32 = -1;
+    const n = try compressFast(
+        MatchHasher1,
+        &ctx,
+        &hasher,
+        &src,
+        @intCast(src.len),
+        &dst_buf,
+        dst_buf[dst_buf.len..].ptr,
+        0,
+        1, // num_lazy = 1 to exercise lazy evaluation
+        .{},
+        &cost,
+        &chunk_type,
+    );
+    try testing.expect(n > 0);
+    try testing.expect(n < src.len);
+}

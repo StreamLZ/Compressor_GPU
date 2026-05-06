@@ -960,3 +960,53 @@ test "u32 hash positions: parser roundtrips with u32 hasher" {
     // Repeating pattern: parser should find matches.
     try testing.expect(w.tokenCount() > 0);
 }
+
+test "parser roundtrip: compress via encoder, decompress, compare" {
+    // End-to-end roundtrip through the greedy parser: encode a compressible
+    // payload with encodeSubChunkRaw (which calls runGreedyParser), then
+    // decode and verify the output matches the original source.
+    const encoder = @import("fast_lz_encoder.zig");
+    const decoder = @import("../../decode/fast/fast_lz_decoder.zig");
+    const lz_constants = @import("../../format/streamlz_constants.zig");
+
+    const pat = "ABCDEFGH" ** 128; // 1024 bytes, highly repeating
+    var src: [1024]u8 = undefined;
+    @memcpy(&src, pat);
+
+    var hasher = try FastMatchHasher(u32).init(testing.allocator, .{ .hash_bits = 12, .min_match_length = 4 });
+    defer hasher.deinit();
+
+    var dst: [src.len + 512]u8 = undefined;
+    hasher.reset();
+    const res = try encoder.encodeSubChunkRaw(1, u32, testing.allocator, &hasher, &src, src[0..].ptr, &dst, 0, .{
+        .minimum_match_length = 4,
+        .dictionary_size = 0x40000000,
+        .speed_tradeoff = 0.14,
+    });
+    try testing.expect(!res.bail);
+    try testing.expect(res.bytes_written < src.len); // actually compressed
+
+    // Wrap the raw encoded sub-chunk in the 3-byte outer header and decode.
+    var wrapped: [4096]u8 = undefined;
+    const hdr_val: u32 = @as(u32, @intCast(res.bytes_written)) |
+        (@as(u32, 1) << lz_constants.sub_chunk_type_shift) |
+        lz_constants.chunk_header_compressed_flag;
+    wrapped[0] = @intCast((hdr_val >> 16) & 0xFF);
+    wrapped[1] = @intCast((hdr_val >> 8) & 0xFF);
+    wrapped[2] = @intCast(hdr_val & 0xFF);
+    @memcpy(wrapped[3 .. 3 + res.bytes_written], dst[0..res.bytes_written]);
+
+    var decoded: [src.len + 64]u8 = @splat(0);
+    var scratch: [lz_constants.scratch_size]u8 = undefined;
+    _ = try decoder.decodeChunk(
+        decoded[0..].ptr,
+        decoded[0..].ptr + src.len,
+        decoded[0..].ptr,
+        wrapped[0..].ptr,
+        wrapped[0..].ptr + 3 + res.bytes_written,
+        scratch[0..].ptr,
+        scratch[0..].ptr + scratch.len,
+    );
+
+    try testing.expectEqualSlices(u8, &src, decoded[0..src.len]);
+}
