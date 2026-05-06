@@ -208,6 +208,7 @@ pub const BitReader = struct {
         const lz: u32 = @clz(self.bits);
         std.debug.assert(lz < 24);
         const lz_u5: u5 = @intCast(lz);
+        std.debug.assert(@as(u32, lz_u5) + @as(u32, forced) < 32);
         const right_shift: u5 = @intCast(31 - lz_u5 - @as(u32, forced));
         const part_a: u32 = self.bits >> right_shift;
         const part_b: u32 = (lz - 1) << forced;

@@ -193,9 +193,11 @@ pub const WriteHeaderOptions = struct {
     dictionary_id: ?u32 = null,
 };
 
+pub const WriteError = error{ BadLevel, BadBlockSize, BadScGroupSize };
+
 /// Writes a frame header to `dst` and returns the number of bytes written.
 /// Caller must ensure `dst.len >= max_header_size`.
-pub fn writeHeader(dst: []u8, opts: WriteHeaderOptions) !usize {
+pub fn writeHeader(dst: []u8, opts: WriteHeaderOptions) WriteError!usize {
     if (opts.level < 1 or opts.level > 9) return error.BadLevel;
     if (opts.block_size < min_block_size or opts.block_size > max_block_size) return error.BadBlockSize;
     if (!std.math.isPowerOfTwo(opts.block_size)) return error.BadBlockSize;

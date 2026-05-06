@@ -94,7 +94,6 @@ pub fn mapLevel(user_level: u8) InternalLevel {
 // ────────────────────────────────────────────────────────────
 
 /// Builds the minimum-match-length table indexed by `31 - log2(offset)`.
-/// Builds the minimum match length table.
 ///
 ///   indexes  0..9   offsets > 4 MB   → 32 bytes (effectively disabled)
 ///   indexes 10..11  offsets 1-4 MB   → 2*long_offset_threshold - 6

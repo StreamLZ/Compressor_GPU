@@ -115,7 +115,7 @@ pub fn encodeSubChunkRaw(
     const literal_data_ptr: [*]u8 = dst_cursor + 3;
 
     var w = try FastStreamWriter.init(allocator, source.ptr, source.len, literal_data_ptr, false);
-    defer w.deinit(allocator);
+    defer w.deinit();
 
     var mmlt: [32]u32 = undefined;
     fast_constants.buildMinimumMatchLengthTable(&mmlt, config.minimum_match_length, 14);
@@ -361,7 +361,7 @@ pub fn encodeSubChunkEntropy(
     // Entropy mode: both literal streams live in scratch, so the caller
     // doesn't touch the literal data until assembly.
     var w = try FastStreamWriter.init(allocator, source.ptr, source.len, null, true);
-    defer w.deinit(allocator);
+    defer w.deinit();
 
     var mmlt: [32]u32 = undefined;
     // `long_offset_threshold = 10` for entropy mode (vs 14 for raw).
@@ -746,7 +746,7 @@ pub fn encodeSubChunkEntropyChain(
     }
 
     var w = try FastStreamWriter.init(allocator, source.ptr, source.len, null, true);
-    defer w.deinit(allocator);
+    defer w.deinit();
 
     var mmlt: [32]u32 = undefined;
     fast_constants.buildMinimumMatchLengthTable(&mmlt, config.minimum_match_length, 10);

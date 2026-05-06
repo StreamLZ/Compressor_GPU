@@ -72,6 +72,8 @@ pub const FastStreamWriter = struct {
     // ── Backing storage ─────────────────────────────────────────────────
     /// Base of the scratch allocation. Free this via `allocator.free(scratch)`.
     scratch: []u8,
+    /// Allocator used for the scratch buffer; stored so `deinit` is self-contained.
+    allocator: std.mem.Allocator,
 
     /// Allocate and carve up the scratch buffer.
     ///
@@ -157,11 +159,12 @@ pub const FastStreamWriter = struct {
             .complex_token_count = 0,
             .off32_count = 0,
             .scratch = scratch,
+            .allocator = allocator,
         };
     }
 
-    pub fn deinit(self: *FastStreamWriter, allocator: std.mem.Allocator) void {
-        allocator.free(self.scratch);
+    pub fn deinit(self: *FastStreamWriter) void {
+        self.allocator.free(self.scratch);
         self.* = undefined;
     }
 
@@ -199,7 +202,7 @@ const testing = std.testing;
 test "FastStreamWriter.init allocates and sets cursors at start" {
     const src: [100]u8 = @splat('A');
     var w = try FastStreamWriter.init(testing.allocator, &src, src.len, null, false);
-    defer w.deinit(testing.allocator);
+    defer w.deinit();
 
     try testing.expectEqual(@as(usize, 0), w.literalCount());
     try testing.expectEqual(@as(usize, 0), w.tokenCount());
@@ -212,7 +215,7 @@ test "FastStreamWriter.init allocates and sets cursors at start" {
 test "FastStreamWriter block1/block2 split at 64 KB" {
     const src: [150 * 1024]u8 = @splat('A');
     var w = try FastStreamWriter.init(testing.allocator, &src, src.len, null, false);
-    defer w.deinit(testing.allocator);
+    defer w.deinit();
     try testing.expectEqual(@as(u32, 65536), w.block1_size);
     try testing.expectEqual(@as(u32, 150 * 1024 - 65536), w.block2_size);
 }
@@ -221,7 +224,7 @@ test "FastStreamWriter raw mode accepts external literal dst" {
     const src: [100]u8 = @splat('A');
     var dst: [200]u8 = undefined;
     var w = try FastStreamWriter.init(testing.allocator, &src, src.len, dst[0..].ptr, false);
-    defer w.deinit(testing.allocator);
+    defer w.deinit();
     try testing.expectEqual(@as(usize, 0), w.literalCount());
     try testing.expectEqual(@intFromPtr(&dst[0]), @intFromPtr(w.literal_start));
 }

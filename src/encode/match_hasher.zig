@@ -66,7 +66,7 @@ pub fn MatchHasher(comptime num_hash: u32, comptime dual_hash: bool) type {
 
         /// Pinned raw base pointer to the source window. The caller sets this
         /// before each sub-chunk so position-from-pointer math stays branchless.
-        src_base: [*]const u8 = undefined,
+        src_base: [*]const u8 = @ptrFromInt(std.math.maxInt(usize)),
 
         /// Src base offset (relative to the window base). For non-streaming
         /// single-block compress this stays 0.
@@ -147,6 +147,7 @@ pub fn MatchHasher(comptime num_hash: u32, comptime dual_hash: bool) type {
         /// Compute the hash for the 8 bytes at `p` and cache the index + tag.
         /// When `dual_hash = true`, also computes a secondary bucket index.
         pub inline fn setHashPos(self: *Self, p: [*]const u8) void {
+            std.debug.assert(@intFromPtr(self.src_base) != std.math.maxInt(usize));
             const offset: i64 = @intCast(@intFromPtr(p) - @intFromPtr(self.src_base));
             self.src_cur_offset = offset;
             const at_src: u64 = std.mem.readInt(u64, p[0..8], .little);
@@ -191,6 +192,7 @@ pub fn MatchHasher(comptime num_hash: u32, comptime dual_hash: bool) type {
 
         /// Capture the current state as an immutable snapshot.
         pub inline fn getHashPos(self: *const Self, p: [*]const u8) HasherHashPos {
+            std.debug.assert(@intFromPtr(self.src_base) != std.math.maxInt(usize));
             const pos: u32 = @intCast(@as(i64, @intCast(@intFromPtr(p) - @intFromPtr(self.src_base))) - self.src_base_offset);
             return .{
                 .ptr1_index = self.hash_entry_ptr_index,
@@ -403,7 +405,7 @@ pub const MatchHasher2 = struct {
     first_hash_bits: u6,
     long_hash_bits: u6,
 
-    src_base: [*]const u8 = undefined,
+    src_base: [*]const u8 = @ptrFromInt(std.math.maxInt(usize)),
     src_base_offset: i64 = 0,
     src_cur_offset: i64 = 0,
 
@@ -466,6 +468,7 @@ pub const MatchHasher2 = struct {
 
     /// Compute the two raw hash values for the 8 bytes at `p`.
     pub inline fn getHashPos(self: *const MatchHasher2, p: [*]const u8) MatchHasher2HashPos {
+        std.debug.assert(@intFromPtr(self.src_base) != std.math.maxInt(usize));
         const offset: i64 = @intCast(@intFromPtr(p) - @intFromPtr(self.src_base));
         const at_src: u64 = std.mem.readInt(u64, p[0..8], .little);
         const product_a: u64 = mult_a *% at_src;
@@ -500,6 +503,7 @@ pub const MatchHasher2 = struct {
 
     /// In this hasher family `setHashPos` only updates the cursor — no hashing.
     pub inline fn setHashPos(self: *MatchHasher2, p: [*]const u8) void {
+        std.debug.assert(@intFromPtr(self.src_base) != std.math.maxInt(usize));
         self.src_cur_offset = @intCast(@intFromPtr(p) - @intFromPtr(self.src_base));
     }
 

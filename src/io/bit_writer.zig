@@ -46,6 +46,7 @@ pub const BitWriter64Forward = struct {
 
     pub inline fn write(self: *BitWriter64Forward, bits: u32, n: u6) void {
         self.total_bits += n;
+        std.debug.assert(n <= self.pos);
         self.pos -= n;
         self.bits = (self.bits << n) | bits;
         self.flush();
@@ -53,6 +54,7 @@ pub const BitWriter64Forward = struct {
 
     pub inline fn writeNoFlush(self: *BitWriter64Forward, bits: u32, n: u6) void {
         self.total_bits += n;
+        std.debug.assert(n <= self.pos);
         self.pos -= n;
         self.bits = (self.bits << n) | bits;
     }
@@ -93,6 +95,7 @@ pub const BitWriter64Backward = struct {
 
     pub inline fn write(self: *BitWriter64Backward, bits: u32, n: u6) void {
         self.total_bits += n;
+        std.debug.assert(n <= self.pos);
         self.pos -= n;
         self.bits = (self.bits << n) | bits;
         self.flush();
@@ -100,6 +103,7 @@ pub const BitWriter64Backward = struct {
 
     pub inline fn writeNoFlush(self: *BitWriter64Backward, bits: u32, n: u6) void {
         self.total_bits += n;
+        std.debug.assert(n <= self.pos);
         self.pos -= n;
         self.bits = (self.bits << n) | bits;
     }

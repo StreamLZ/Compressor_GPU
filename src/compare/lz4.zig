@@ -1,3 +1,5 @@
+//! LZ4/LZ4HC C library bindings for benchmark comparison.
+
 const std = @import("std");
 const c = @cImport({
     @cInclude("lz4.h");

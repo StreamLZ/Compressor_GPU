@@ -149,6 +149,12 @@ pub fn isMatchBetter(match_length: u32, offset: u32, best_match_length: u32, bes
 /// function serves both the Fast and High parsers without forcing a
 /// shared struct type.
 pub fn getLazyScore(a: anytype, b: anytype) i32 {
+    comptime {
+        if (!@hasField(@TypeOf(a), "length") or !@hasField(@TypeOf(a), "offset"))
+            @compileError("getLazyScore: first argument must have .length and .offset fields");
+        if (!@hasField(@TypeOf(b), "length") or !@hasField(@TypeOf(b), "offset"))
+            @compileError("getLazyScore: second argument must have .length and .offset fields");
+    }
     const bits_a: i32 = if (a.offset > 0)
         @as(i32, @intCast(std.math.log2_int(u32, @intCast(a.offset)))) + 3
     else

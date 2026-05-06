@@ -77,8 +77,6 @@ pub fn runGreedyParser(
     // Parser-local recent offset (signed negative distance).
     var recent_offset: isize = recent_offset_inout.*;
 
-    _ = comptime if (level <= -3) 3 else if (level <= 1) 4 else 5;
-
     var source_cursor: [*]const u8 = source_cursor_in;
     var literal_start: [*]const u8 = source_cursor_in;
 
@@ -859,7 +857,7 @@ test "runGreedyParser runs over a short source without crashing" {
     defer hasher.deinit();
 
     var w = try FastStreamWriter.init(testing.allocator, &src, src.len, null, false);
-    defer w.deinit(testing.allocator);
+    defer w.deinit();
 
     var mmlt: [32]u32 = undefined;
     fast_constants.buildMinimumMatchLengthTable(&mmlt, 4, 14);
@@ -893,7 +891,7 @@ test "on-the-fly skip: no skip_accumulator state needed" {
 
     const allocator = testing.allocator;
     var w = try FastStreamWriter.init(allocator, src[0..].ptr, src.len, null, false);
-    defer w.deinit(allocator);
+    defer w.deinit();
 
     var hasher = FastMatchHasher(u32).init(allocator, .{
         .hash_bits = 10,
@@ -932,7 +930,7 @@ test "u32 hash positions: parser roundtrips with u32 hasher" {
 
     const allocator = testing.allocator;
     var w = try FastStreamWriter.init(allocator, src[0..].ptr, src.len, null, false);
-    defer w.deinit(allocator);
+    defer w.deinit();
 
     var hasher = FastMatchHasher(u32).init(allocator, .{
         .hash_bits = 12,

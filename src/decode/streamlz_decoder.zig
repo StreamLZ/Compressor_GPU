@@ -183,25 +183,24 @@ fn decompressOneFrame(
 
     const hdr = frame.parseHeader(src) catch return error.BadFrame;
 
+    const dict_mod = @import("../dict/dictionary.zig");
+
     if (hdr.content_size) |cs| {
         if (cs > max_content_size) return error.ContentSizeTooLarge;
         const needed: usize = @intCast(cs + safe_space);
         // Extra space for dictionary prefix (matches are resolved
         // relative to dict + output, then the prefix is stripped).
-        const dict_registry = @import("../dict/dictionary.zig");
         const dict_overhead: usize = if (hdr.dictionary_id) |did|
-            if (dict_registry.findById(did)) |d| d.data.len + safe_space else 0
+            if (dict_mod.findById(did)) |d| d.data.len + safe_space else 0
         else
             0;
         if (dst.len < needed + dict_overhead) return error.OutputTooSmall;
     }
 
     var pos: usize = hdr.header_size;
-
-    const dict_mod2 = @import("../dict/dictionary.zig");
     var dict_prefix_len: usize = 0;
     if (hdr.dictionary_id) |dict_id| {
-        const d = dict_mod2.findById(dict_id) orelse return error.UnknownDictionary;
+        const d = dict_mod.findById(dict_id) orelse return error.UnknownDictionary;
         const needed = d.data.len + (if (hdr.content_size) |cs| @as(usize, @intCast(cs)) else 0) + safe_space;
         if (needed > dst.len) return error.OutputTooSmall;
         @memcpy(dst[0..d.data.len], d.data);

@@ -47,7 +47,6 @@ const FastScContext = struct {
     greedy_hash_bits: u6,
     hasher_k: u32,
     parser_config: fast_enc.ParserConfig,
-    check_plain_huffman: bool,
     entropy_options: entropy_enc.EntropyOptions,
     dict_len: usize,
     tmp_bufs: []const []u8,
@@ -284,7 +283,6 @@ fn compressFastChunksParallel(
         .greedy_hash_bits = greedy_hash_bits,
         .hasher_k = resolved.hasher_k,
         .parser_config = parser_config,
-        .check_plain_huffman = false,
         .entropy_options = entropyOptionsForLevel(opts.level),
         .dict_len = dict_len,
         .tmp_bufs = tmp_bufs,
@@ -544,11 +542,9 @@ pub fn compressFramedOne(
     //            per sub-chunk:
     //              < 32 → 3-byte raw sub-chunk hdr + memcpy
     //              all-equal → raw memcpy (no compressed flag)
-    //              else → LZ; compare lzCost vs memsetCost vs plainHuffCost
+    //              else → LZ; compare lzCost vs memsetCost
     //            if totalCost > blockMemsetCost → rewind, emit uncompressed block
     //            else backfill chunk hdr
-    const check_plain_huffman: bool = resolved.use_entropy and resolved.engine_level >= 4;
-
     var src_off: usize = dict_len;
     var chunk_in_group: usize = 0;
     var group_start_off: usize = dict_len;
@@ -652,27 +648,8 @@ pub fn compressFramedOne(
                 };
                 const lz_cost: f32 = result.cost + 3.0; // +3 for sub-chunk header
 
-                // ── Plain-Huffman trial encode (CheckPlainHuffman path) ──
-                //
-                // For Fast with no tANS/Huffman, the raw array path falls
-                // back to memcpy which always returns count+3 bytes (i.e.,
-                // never beats raw), so plain_huff_cost is always invalidated.
-                // We still emit the same decision arm to stay byte-parity
-                // in case the order of operations matters.
-                var plain_huff_cost: f32 = std.math.inf(f32);
-                if (check_plain_huffman) {
-                    plain_huff_cost = @min(sub_memset_cost, lz_cost);
-                    // Raw memcpy returns count + 3. If plain_huff_n >=
-                    // round_bytes, it can't beat raw, so invalidate.
-                    const plain_huff_n: usize = round_bytes + 3;
-                    if (plain_huff_n >= round_bytes) {
-                        plain_huff_cost = std.math.inf(f32);
-                    }
-                }
-
                 const lz_wins = !result.bail and
                     lz_cost < sub_memset_cost and
-                    lz_cost <= plain_huff_cost and
                     result.bytes_written > 0 and
                     result.bytes_written < round_bytes;
 
@@ -686,7 +663,7 @@ pub fn compressFramedOne(
                     dst[sub_hdr_pos + 2] = @intCast(hdr & 0xFF);
                     pos = sub_payload_start + result.bytes_written;
                     total_cost += lz_cost;
-                } else if (sub_memset_cost <= plain_huff_cost) {
+                } else {
                     // Memset (uncompressed) path: 3-byte header with
                     // compressed flag set, size = round_bytes, then raw
                     // bytes verbatim. Rewind the LZ-written payload.
@@ -699,18 +676,6 @@ pub fn compressFramedOne(
                     @memcpy(dst[pos + 3 ..][0..round_bytes], sub_src);
                     pos += 3 + round_bytes;
                     total_cost += sub_memset_cost;
-                } else {
-                    // Plain-huffman won. Without a real Huffman encoder this
-                    // path is unreachable (plain_huff_cost is always ∞) but
-                    //
-                    pos = sub_hdr_pos;
-                    if (pos + round_bytes + 3 > dst.len) return error.DestinationTooSmall;
-                    dst[pos + 0] = @intCast((round_bytes >> 16) & 0xFF);
-                    dst[pos + 1] = @intCast((round_bytes >> 8) & 0xFF);
-                    dst[pos + 2] = @intCast(round_bytes & 0xFF);
-                    @memcpy(dst[pos + 3 ..][0..round_bytes], sub_src);
-                    pos += round_bytes + 3;
-                    total_cost += plain_huff_cost;
                 }
             } else {
                 // round_bytes < 32: too small to compress.

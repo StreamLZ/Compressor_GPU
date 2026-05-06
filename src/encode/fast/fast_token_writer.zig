@@ -409,7 +409,7 @@ const testing = std.testing;
 test "writeLengthValue single-byte path" {
     const buf: [16]u8 = @splat(0);
     var w = try FastStreamWriter.init(testing.allocator, &buf, 16, null, false);
-    defer w.deinit(testing.allocator);
+    defer w.deinit();
 
     writeLengthValue(&w, 0);
     writeLengthValue(&w, 100);
@@ -424,7 +424,7 @@ test "writeLengthValue single-byte path" {
 test "writeLengthValue extended 3-byte path" {
     const buf: [16]u8 = @splat(0);
     var w = try FastStreamWriter.init(testing.allocator, &buf, 16, null, false);
-    defer w.deinit(testing.allocator);
+    defer w.deinit();
 
     // value = 252: low2 = 0, tag = -4 = 0xFC; remainder = (252 - 252) >> 2 = 0
     writeLengthValue(&w, 252);
@@ -444,7 +444,7 @@ test "writeOffset fast path emits one token byte and one u16" {
     buf[1] = 'B';
     buf[2] = 'C';
     var w = try FastStreamWriter.init(testing.allocator, &buf, 32, null, false);
-    defer w.deinit(testing.allocator);
+    defer w.deinit();
 
     // lit=3, match=5, offset=0x1234
     writeOffset(&w, 5, 3, 0x1234, -8, &buf);
@@ -459,7 +459,7 @@ test "writeOffset fast path emits one token byte and one u16" {
 test "writeOffset fast path offset==0 sets high bit and no off16 store" {
     const buf: [32]u8 = @splat('x');
     var w = try FastStreamWriter.init(testing.allocator, &buf, 32, null, false);
-    defer w.deinit(testing.allocator);
+    defer w.deinit();
 
     writeOffset(&w, 10, 2, 0, -8, &buf);
     try testing.expectEqual(@as(usize, 0), w.off16Count());
@@ -469,7 +469,7 @@ test "writeOffset fast path offset==0 sets high bit and no off16 store" {
 test "writeOffset32 small-offset path writes 3 bytes" {
     const buf: [8]u8 = @splat(0);
     var w = try FastStreamWriter.init(testing.allocator, &buf, 8, null, false);
-    defer w.deinit(testing.allocator);
+    defer w.deinit();
 
     writeOffset32(&w, 0x123456);
     try testing.expectEqual(@as(usize, 3), w.off32ByteCount());

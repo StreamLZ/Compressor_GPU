@@ -32,7 +32,7 @@ pub const TrainResult = struct {
 };
 
 fn hashDmer(src: [*]const u8, d: usize, f: u5) usize {
-    _ = d;
+    std.debug.assert(d >= 8);
     const v = std.mem.readInt(u64, src[0..8], .little);
     const h = v *% 0x9E3779B97F4A7C15;
     const shift: u6 = @intCast(@as(u7, 64) - @as(u7, f));
@@ -160,4 +160,3 @@ pub fn train(
     return .{ .dict = dict, .allocator = allocator };
 }
 
-pub const NoSamples = error{NoSamples};
