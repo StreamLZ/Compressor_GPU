@@ -64,7 +64,7 @@ pub fn FastMatchHasher(comptime T: type) type {
         ///
         /// This is intentionally DIFFERENT from `MatchHasher.init` which uses
         /// `fibonacci_hash_multiplier << (8 * (8 - k))` for all k.
-        pub fn init(allocator: std.mem.Allocator, params: HasherParams) !Self {
+        pub fn init(allocator: std.mem.Allocator, params: HasherParams) (error{HashBitsOutOfRange} || std.mem.Allocator.Error)!Self {
             if (params.hash_bits < 8 or params.hash_bits > 24) return error.HashBitsOutOfRange;
             const k: u32 = if (params.min_match_length == 0) 4 else params.min_match_length;
             const size: usize = @as(usize, 1) << params.hash_bits;

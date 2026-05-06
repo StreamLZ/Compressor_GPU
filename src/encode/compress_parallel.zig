@@ -150,6 +150,7 @@ fn compressWorker(shared: *CompressShared) void {
     }
 }
 
+/// Dispatch parallel compression of 256 KB blocks for the High codec (non-SC path).
 pub fn compressBlocksParallel(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -212,6 +213,8 @@ pub fn compressBlocksParallel(
                 error.ConcurrencyUnavailable => compressWorker(&shared),
             };
         }
+        // Worker errors are captured via atomic error_flag/captured_err;
+        // group.await errors are redundant and safely discarded.
         group.await(io) catch {};
     }
 
@@ -403,6 +406,7 @@ fn scCompressWorker(shared: *ScCompressShared) void {
     }
 }
 
+/// Dispatch parallel self-contained compression across SC chunk groups.
 pub fn compressInternalParallelSc(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -464,6 +468,8 @@ pub fn compressInternalParallelSc(
                 error.ConcurrencyUnavailable => scCompressWorker(&shared),
             };
         }
+        // Worker errors are captured via atomic error_flag/captured_err;
+        // group.await errors are redundant and safely discarded.
         group.await(io) catch {};
     }
 

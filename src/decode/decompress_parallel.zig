@@ -122,8 +122,8 @@ pub fn preScanBlock(
         const block_hdr= block_header.parseBlockHeader(block_src[src_pos..]) catch return error.InvalidInternalHeader;
         src_pos += block_header.BlockHeader.size;
 
-        const is_high = block_hdr.decoder_type == .high or block_hdr.decoder_type == .fast;
-        const chunk_cap: usize = if (is_high) constants.chunk_size else 0x4000;
+        const is_large_chunk = block_hdr.decoder_type == .high or block_hdr.decoder_type == .fast;
+        const chunk_cap: usize = if (is_large_chunk) constants.chunk_size else 0x4000;
         const dst_bytes: usize = @min(chunk_cap, dst_rem);
 
         if (block_hdr.uncompressed) {
@@ -519,6 +519,8 @@ pub fn decompressCoreParallel(
                 error.ConcurrencyUnavailable => workerFn(&shared, scratches[wi]),
             };
         }
+        // Worker errors are captured via atomic error_flag/captured_err;
+        // group.await errors are redundant and safely discarded.
         group.await(io) catch {};
     }
 
@@ -815,6 +817,8 @@ pub fn decompressCoreTwoPhase(
                     error.ConcurrencyUnavailable => tpWorkerFn(&shared),
                 };
             }
+            // Worker errors are captured via atomic error_flag/captured_err;
+            // group.await errors are redundant and safely discarded.
             group.await(io) catch {};
         }
 
@@ -1173,6 +1177,8 @@ pub fn decompressFastL14Parallel(
                     error.ConcurrencyUnavailable => xorFoldVerifyFn(&shared, scratches[wi], s, e),
                 };
             }
+            // Worker errors are captured via atomic error_flag/captured_err;
+            // group.await errors are redundant and safely discarded.
             vgroup.await(io) catch {};
         }
         if (shared.error_flag.load(.acquire) != 0) return reportWorkerError(&shared);
@@ -1228,6 +1234,8 @@ fn dispatchWorkers(
                 error.ConcurrencyUnavailable => fastL14WorkerFn(shared, scratches[wi], s, e),
             };
         }
+        // Worker errors are captured via atomic error_flag/captured_err;
+        // group.await errors are redundant and safely discarded.
         group.await(io) catch {};
     }
 }

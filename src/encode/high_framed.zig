@@ -40,6 +40,7 @@ pub const HighMapping = struct {
     use_bt4: bool,
 };
 
+/// Map a user-facing level (6-11) to High codec parameters.
 pub fn mapHighLevel(user_level: u8) HighMapping {
     //
     // codec_level >= 9 enables the BT4 match finder.
@@ -64,6 +65,7 @@ pub fn computeAdaptiveGroupSize(src_len: usize) u8 {
     return @intCast(@min(ideal, 255));
 }
 
+/// Top-level framed compression entry point for the High codec (L6-L11).
 pub fn compressFramedHigh(
     allocator: std.mem.Allocator,
     io: std.Io,

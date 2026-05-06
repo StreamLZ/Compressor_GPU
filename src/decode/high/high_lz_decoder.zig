@@ -15,6 +15,9 @@ const copy = @import("../../io/copy_helpers.zig");
 const BitReader = @import("../../io/bit_reader.zig").BitReader;
 const entropy = @import("../entropy/entropy_decoder.zig");
 const runs = @import("high_lz_token_executor.zig");
+// Uses c_allocator directly (not the caller's allocator) because parallel
+// workers need thread-safe allocation. Invisible to test allocator leak
+// detection — verified manually.
 const fallback_allocator = std.heap.c_allocator;
 
 pub const DecodeError = error{

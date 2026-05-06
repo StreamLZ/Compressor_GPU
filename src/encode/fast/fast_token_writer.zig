@@ -207,8 +207,8 @@ pub fn writeComplexOffset(
         effective_offset = @intCast(@as(isize, neg_recent));
     }
 
-    var token_byte: u8 = undefined;
-    var length_value: i64 = undefined;
+    var token_byte: u8 = 0;
+    var length_value: i64 = 0;
     var write_length = false;
 
     if (effective_offset > 0xFFFF) {

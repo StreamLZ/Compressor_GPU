@@ -391,7 +391,7 @@ pub fn writeLzOffsetBits(
         for (0..offs_count) |i| {
             if (@intFromPtr(b.position) -| @intFromPtr(f.position) <= 8) return error.DestinationTooSmall;
 
-            var nb: u5 = undefined;
+            var nb: u5 = 0;
             var bits: u32 = u32_offs[i];
             if (u8_offs[i] < high_offset_marker) {
                 nb = @intCast((u8_offs[i] >> 4) + 5);
@@ -573,7 +573,7 @@ pub fn encodeLzOffsets(
     }
 
     // Decoding-time component.
-    var ultra_offset_time: f32 = undefined;
+    var ultra_offset_time: f32 = 0;
     const offs_count_f: f32 = @floatFromInt(offs_count);
     if (offs_encode_type == 1) {
         ultra_offset_time = offs_count_f * cost_coeffs.offset_type0_per_item + cost_coeffs.offset_type0_base;

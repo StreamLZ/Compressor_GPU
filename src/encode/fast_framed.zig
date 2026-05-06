@@ -66,6 +66,9 @@ fn fastScWorker(shared: *FastScContext) void {
     defer if (greedy_hasher) |*h| h.deinit();
     defer if (chain_hasher_local) |*h| h.deinit();
 
+    // Uses c_allocator directly (not the caller's allocator) because parallel
+    // workers need thread-safe allocation. Invisible to test allocator leak
+    // detection — verified manually.
     if (shared.level == 5) {
         chain_hasher_local = MatchHasher2.init(std.heap.c_allocator, shared.greedy_hash_bits) catch {
             _ = shared.error_flag.store(1, .release);
@@ -304,6 +307,8 @@ fn compressFastChunksParallel(
                 error.ConcurrencyUnavailable => fastScWorker(&shared),
             };
         }
+        // Worker errors are captured via atomic error_flag/captured_err;
+        // group.await errors are redundant and safely discarded.
         group.await(io) catch {};
     }
 

@@ -10,6 +10,7 @@
 
 const std = @import("std");
 
+/// Metadata for a built-in or custom compression dictionary.
 pub const DictInfo = struct {
     id: u32,
     name: []const u8,
@@ -26,6 +27,7 @@ pub const id_css: u32 = 5;
 pub const id_js: u32 = 6;
 pub const id_general: u32 = 7;
 
+/// Table of compiled-in dictionaries keyed by content type.
 pub const builtin_dicts: []const DictInfo = &.{
     .{
         .id = id_json,
@@ -71,6 +73,7 @@ pub const builtin_dicts: []const DictInfo = &.{
     },
 };
 
+/// Look up a built-in dictionary by short name (e.g. "json", "html").
 pub fn findByName(name: []const u8) ?*const DictInfo {
     for (builtin_dicts) |*d| {
         if (std.mem.eql(u8, d.name, name)) return d;
@@ -78,6 +81,7 @@ pub fn findByName(name: []const u8) ?*const DictInfo {
     return null;
 }
 
+/// Look up a built-in dictionary by its well-known numeric ID.
 pub fn findById(id: u32) ?*const DictInfo {
     for (builtin_dicts) |*d| {
         if (d.id == id) return d;
@@ -85,6 +89,7 @@ pub fn findById(id: u32) ?*const DictInfo {
     return null;
 }
 
+/// Select a built-in dictionary by file extension; falls back to "general".
 pub fn findByExtension(path: []const u8) ?*const DictInfo {
     const ext = std.fs.path.extension(path);
     if (ext.len == 0) return findByName("general");

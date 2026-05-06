@@ -43,6 +43,7 @@ pub const memory_budget_pct = memory_query.memory_budget_pct;
 pub const totalAvailableMemoryBytes = memory_query.totalAvailableMemoryBytes;
 pub const calculateMaxThreads = memory_query.calculateMaxThreads;
 
+/// Error set for all compression entry points.
 pub const CompressError = error{
     BadLevel,
     BadBlockSize,
@@ -141,6 +142,7 @@ pub const ResolvedParams = struct {
     dict_size: u32,
 };
 
+/// Resolve user-facing options into internal engine parameters for the given input.
 pub fn resolveParams(src: []const u8, opts: Options) ResolvedParams {
     const mapped = fast_constants.mapLevel(opts.level);
     const eng = mapped.engine_level;
@@ -274,6 +276,7 @@ pub fn compressFramed(
     return compressFramedWithIo(allocator, std.Io.failing, src, dst, opts);
 }
 
+/// Compress `src` into an SLZ1 frame using an explicit I/O interface for thread spawning.
 pub fn compressFramedWithIo(
     allocator: std.mem.Allocator,
     io: std.Io,

@@ -839,7 +839,7 @@ pub fn decodeChunk(
 
         // 3-byte big-endian sub-chunk header: [23] comp flag | [22:19] mode | [18:0] size
         const chunkhdr: u32 = (@as(u32, src[0]) << 16) | (@as(u32, src[1]) << 8) | @as(u32, src[2]);
-        var src_used: usize = undefined;
+        var src_used: usize = 0;
 
         if ((chunkhdr & constants.chunk_header_compressed_flag) == 0) {
             // Stored without LZ: entropy-only decode straight into dst.
@@ -924,7 +924,7 @@ pub fn decodeChunkSafe(
         if (@intFromPtr(src_end) - @intFromPtr(src) < 4) return error.SourceTruncated;
 
         const chunkhdr: u32 = (@as(u32, src[0]) << 16) | (@as(u32, src[1]) << 8) | @as(u32, src[2]);
-        var src_used: usize = undefined;
+        var src_used: usize = 0;
 
         if ((chunkhdr & constants.chunk_header_compressed_flag) == 0) {
             const src_left: usize = @intFromPtr(src_end) - @intFromPtr(src);

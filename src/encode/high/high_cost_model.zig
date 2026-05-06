@@ -150,7 +150,7 @@ pub fn updateStats(
         if (t.match_length < 2) continue;
 
         const offset_i32: i32 = t.offset;
-        var recent_field: i32 = undefined;
+        var recent_field: i32 = 0;
         if (t.offset <= 0) {
             recent_field = -t.offset;
         } else {
@@ -303,7 +303,7 @@ const offset_distance_penalty_mult: u32 = 16;
 
 /// Computes the cost of emitting an offset (in 32nds of a bit).
 pub fn bitsForOffset(cost_model: *const CostModel, offset: u32) u32 {
-    var cost: u32 = undefined;
+    var cost: u32 = 0;
     if (cost_model.offs_encode_type == 0) {
         if (offset >= lz_constants.high_offset_threshold) {
             const low_limit: u32 = @intCast(lz_constants.low_offset_encoding_limit);

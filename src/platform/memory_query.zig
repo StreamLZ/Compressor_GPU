@@ -4,7 +4,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 
+/// Estimated memory consumption per compression worker thread (40 MB).
 pub const per_thread_memory_estimate: u64 = 40 * 1024 * 1024;
+/// Percentage of total physical RAM used as the thread-budget ceiling.
 pub const memory_budget_pct: u64 = 60;
 
 const win32 = if (is_windows) struct {
@@ -54,6 +56,7 @@ const win32 = if (is_windows) struct {
     extern "kernel32" fn GetCurrentThread() callconv(.winapi) std.os.windows.HANDLE;
 } else struct {};
 
+/// Query total physical RAM from the OS; returns 0 on unsupported platforms.
 pub fn totalAvailableMemoryBytes() u64 {
     const os = builtin.os.tag;
     if (os == .windows) {
@@ -86,6 +89,7 @@ pub fn totalAvailableMemoryBytes() u64 {
     }
 }
 
+/// Compute the maximum worker thread count given source size and available RAM.
 pub fn calculateMaxThreads(src_len: usize) u32 {
     const cpu: u32 = @intCast(std.Thread.getCpuCount() catch 1);
     const total_memory: u64 = totalAvailableMemoryBytes();
@@ -102,6 +106,7 @@ pub fn calculateMaxThreads(src_len: usize) u32 {
     return @max(@as(u32, 1), max_by_memory_u32);
 }
 
+/// CPU topology snapshot: P-core / E-core counts and IDs for hybrid processors.
 pub const CoreInfo = struct {
     p_core_count: u32,
     e_core_count: u32,
@@ -111,6 +116,7 @@ pub const CoreInfo = struct {
     is_hybrid: bool,
 };
 
+/// Detect P-core and E-core topology on the current system (Windows hybrid-aware).
 pub fn detectCores() CoreInfo {
     if (!is_windows) {
         const cpu: u32 = @intCast(std.Thread.getCpuCount() catch 1);
@@ -163,6 +169,7 @@ pub fn detectCores() CoreInfo {
     return result;
 }
 
+/// Pin the calling thread to the given CPU-set IDs (Windows only; no-op elsewhere).
 pub fn pinCurrentThreadToCpuSet(ids: []const u32) void {
     if (!is_windows or ids.len == 0) return;
     _ = win32.SetThreadSelectedCpuSets(

@@ -592,9 +592,9 @@ fn optimalOnePass(
 
             var lazy: i32 = 0;
             while (lazy <= max_literal_run_trials) : (lazy += 1) {
-                var literal_run_length: i32 = undefined;
-                var total_bits: i32 = undefined;
-                var prev_state: usize = undefined;
+                var literal_run_length: i32 = 0;
+                var total_bits: i32 = 0;
+                var prev_state: usize = 0;
 
                 if (state_width == 1) {
                     literal_run_length = if (lazy == max_literal_run_trials and lits_since_prev > max_literal_run_trials)

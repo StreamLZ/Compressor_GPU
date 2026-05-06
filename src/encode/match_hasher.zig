@@ -84,7 +84,7 @@ pub fn MatchHasher(comptime num_hash: u32, comptime dual_hash: bool) type {
 
         allocator: std.mem.Allocator,
 
-        pub fn init(allocator: std.mem.Allocator, hash_bits: u6, min_match_length: u32) !Self {
+        pub fn init(allocator: std.mem.Allocator, hash_bits: u6, min_match_length: u32) (error{HashBitsOutOfRange} || std.mem.Allocator.Error)!Self {
             if (hash_bits < 8 or hash_bits > 24) return error.HashBitsOutOfRange;
             const size: usize = @as(usize, 1) << hash_bits;
             // 64-byte-aligned allocation so every 16-entry bucket
@@ -409,7 +409,7 @@ pub const MatchHasher2 = struct {
 
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, bits: u6) !MatchHasher2 {
+    pub fn init(allocator: std.mem.Allocator, bits: u6) std.mem.Allocator.Error!MatchHasher2 {
         const a_bits: u6 = @min(bits, 19);
         const b_bits: u6 = @min(bits, 19);
         const c_bits: u6 = 16;

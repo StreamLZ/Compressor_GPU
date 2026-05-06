@@ -39,19 +39,26 @@ const win32 = if (is_windows) struct {
     const FILE_MAP_WRITE: DWORD = 0x02;
 } else struct {};
 
+/// A memory-mapped view of a file (read-only or read-write).
 pub const MappedFile = struct {
+    /// Base pointer to the mapped region.
     ptr: [*]u8,
+    /// Length of the mapped region in bytes.
     len: usize,
+    /// OS mapping handle (Windows only; void on POSIX).
     map_handle: if (is_windows) ?std.os.windows.HANDLE else void,
 
+    /// Return the mapped region as a const byte slice.
     pub fn sliceConst(self: MappedFile) []const u8 {
         return self.ptr[0..self.len];
     }
 
+    /// Return the mapped region as a mutable byte slice.
     pub fn slice(self: MappedFile) []u8 {
         return self.ptr[0..self.len];
     }
 
+    /// Release the memory mapping and close the OS handle.
     pub fn unmap(self: *MappedFile) void {
         if (is_windows) {
             _ = win32.UnmapViewOfFile(@ptrCast(self.ptr));
@@ -63,6 +70,7 @@ pub const MappedFile = struct {
     }
 };
 
+/// Map an open file as read-only; returns null on failure.
 pub fn mapFileRead(file: std.Io.File, size: usize) ?MappedFile {
     if (is_windows) {
         const map_h = win32.CreateFileMappingW(file.handle, null, win32.PAGE_READONLY, 0, 0, null) orelse return null;
@@ -86,6 +94,7 @@ pub fn mapFileRead(file: std.Io.File, size: usize) ?MappedFile {
     }
 }
 
+/// Map an open file as read-write; returns null on failure.
 pub fn mapFileReadWrite(file: std.Io.File, size: usize) ?MappedFile {
     if (is_windows) {
         const size_hi: win32.DWORD = @intCast(size >> 32);

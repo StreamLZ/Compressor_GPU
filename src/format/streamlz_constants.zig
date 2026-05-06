@@ -46,6 +46,7 @@ pub const chunk_header_compressed_flag: u32 = 0x800000;
 pub const scratch_size: usize = 0x6C000; // 442,368
 pub const entropy_scratch_size: usize = 0xD000; // 53,248
 
+/// Return the scratch buffer size needed for entropy coding a block of `dst_count` bytes.
 pub fn calculateScratchSize(dst_count: usize) usize {
     const needed = 3 * dst_count + 32 + entropy_scratch_size;
     return if (needed < scratch_size) needed else scratch_size;

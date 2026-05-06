@@ -5,7 +5,7 @@ const decoder = @import("decode/streamlz_decoder.zig");
 const encoder = @import("encode/streamlz_encoder.zig");
 const dict_mod = @import("dict/dictionary.zig");
 
-const version_string = "0.0.0-phase3a";
+const version_string = "2.0.0";
 
 // ─── Argument parsing ────────────────────────────────────────────────
 
