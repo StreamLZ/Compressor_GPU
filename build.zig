@@ -56,18 +56,15 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the streamlz CLI");
     run_step.dependOn(&run_cmd.step);
 
-    const unit_tests = b.addTest(.{ .root_module = root_module });
-    const run_unit_tests = b.addRunArtifact(unit_tests);
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
-
-    // Parallel test runner: `zig build ptest` runs tests across multiple threads.
+    // Both `zig build test` and `zig build ptest` use the parallel test runner.
     const parallel_tests = b.addTest(.{
         .root_module = root_module,
         .test_runner = .{ .path = b.path("src/test_runner_parallel.zig"), .mode = .simple },
     });
     const run_parallel_tests = b.addRunArtifact(parallel_tests);
-    const ptest_step = b.step("ptest", "Run unit tests in parallel");
+    const test_step = b.step("test", "Run unit tests (parallel)");
+    test_step.dependOn(&run_parallel_tests.step);
+    const ptest_step = b.step("ptest", "Run unit tests (parallel, alias for test)");
     ptest_step.dependOn(&run_parallel_tests.step);
 
     // ---- ReleaseSafe build step ----
