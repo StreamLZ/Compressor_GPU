@@ -483,11 +483,10 @@ pub fn decompressCoreParallel(
     // all decode work and return success with an uninitialized dst.
     std.debug.assert(worker_count > 0);
 
-    // Per-worker scratch. Sized to scratch_size * 2 (matching the
-    // two-phase path) so the token array overflow into the heap
-    // fallback is rare for L6-L8 SC. With 24 workers × 884 KB ≈ 21 MB
-    // total → fits in the 36 MB L3 (the 1.9 MB-per-worker experiment
-    // overflowed L3 at 46 MB; see FailedExperiments.md).
+    // Per-worker scratch. Sized to scratch_size * 2 so the token
+    // array overflow into the heap fallback is rare for L6-L8 SC.
+    // Rule of thumb: worker_count * per_worker_size should fit in
+    // shared L3 cache. See FAILED_EXPERIMENTS.md for details.
     const sc_scratch_bytes: usize = constants.scratch_size * 2;
     const scratches = try allocator.alloc([]u8, worker_count);
     defer {
@@ -1098,7 +1097,7 @@ pub fn decompressFastL14Parallel(
             cpu_count_raw = std.fmt.parseInt(usize, std.mem.span(val), 10) catch cpu_count_raw;
         }
     }
-    const max_workers: usize = @min(24, @min(num_chunks, cpu_count_raw));
+    const max_workers: usize = @min(num_chunks, cpu_count_raw);
     // Slice size is rounded up to a multiple of 16 chunks so that
     // sidecar boundaries (emitted by the encoder at 16-chunk intervals)
     // always fall on slice edges, never mid-slice. This prevents two
