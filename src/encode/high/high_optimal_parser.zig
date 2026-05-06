@@ -1039,6 +1039,7 @@ pub fn optimal(
     const state_count: usize = state_width * (src_len_usize + 1);
     const states = try ctx.allocator.alloc(State, state_count);
     defer ctx.allocator.free(states);
+    @memset(states, std.mem.zeroes(State));
 
     var lit_indexes_buf: ?[]i32 = null;
     defer if (lit_indexes_buf) |b| ctx.allocator.free(b);

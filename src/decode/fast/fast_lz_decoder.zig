@@ -495,6 +495,7 @@ noinline fn processModeImpl(
             }
             const far: u32 = off32_stream[0];
             off32_stream += 1;
+            if (far > @intFromPtr(dst) - @intFromPtr(dst_start)) return error.MatchOutOfBounds;
             const match_ptr: [*]const u8 = dst_begin - far;
             if (far > 65536) {
                 @branchHint(.cold);
@@ -636,6 +637,7 @@ noinline fn processModeImpl(
             }
             const far: u32 = off32_stream[0];
             off32_stream += 1;
+            if (far > @intFromPtr(dst) - @intFromPtr(dst_start)) return error.MatchOutOfBounds;
             const match_ptr: [*]const u8 = dst_begin - far;
             if (far > 65536) {
                 @branchHint(.cold);

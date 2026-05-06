@@ -66,8 +66,10 @@ pub fn findMatchesBT4(
     const tree_size: usize = src_size + 1;
     const left = try allocator.alloc(u32, tree_size);
     defer allocator.free(left);
+    @memset(left, 0);
     const right = try allocator.alloc(u32, tree_size);
     defer allocator.free(right);
+    @memset(right, 0);
 
     const src_size_safe: usize = src_size - 8;
     var match_buf: [match_buf_cap]LengthAndOffset = @splat(.{ .length = 0, .offset = 0 });

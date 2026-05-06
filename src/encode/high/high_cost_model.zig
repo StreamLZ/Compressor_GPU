@@ -120,19 +120,21 @@ pub fn updateStats(
         const recent: usize = @intCast(t.recent_offset0);
 
         // Per-literal histogram updates (raw + sub).
-        // When `pos + j < recent` the subtraction wraps below the source
-        // buffer. We use wrapping subtraction so Zig doesn't panic on
-        // usize underflow — the resulting delta byte goes into the
-        // histogram regardless.
         var j: usize = 0;
         while (j < litlen) : (j += 1) {
             const b: u8 = src[pos + j];
             h.lit_raw.count[b] += increment;
-            const back_addr: usize = @intFromPtr(src + pos + j) -% recent;
-            const back_ptr: [*]const u8 = @ptrFromInt(back_addr);
-            const prev_byte: u8 = back_ptr[0];
-            const delta: u8 = b -% prev_byte;
-            h.lit_sub.count[delta] += increment;
+            if (pos + j >= recent) {
+                // Delta reference is within the source buffer.
+                const back_addr: usize = @intFromPtr(src + pos + j) - recent;
+                const back_ptr: [*]const u8 = @ptrFromInt(back_addr);
+                const prev_byte: u8 = back_ptr[0];
+                const delta: u8 = b -% prev_byte;
+                h.lit_sub.count[delta] += increment;
+            } else {
+                // No valid delta reference — use raw literal as delta.
+                h.lit_sub.count[b] += increment;
+            }
         }
 
         pos += litlen + @as(usize, @intCast(t.match_length));

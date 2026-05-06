@@ -195,7 +195,7 @@ fn workerFn(shared: *Shared, scratch: []u8) void {
     while (true) {
         const group_idx = shared.next_group.fetchAdd(1, .monotonic);
         if (group_idx >= num_groups) return;
-        if (shared.error_flag.load(.monotonic) != 0) return;
+        if (shared.error_flag.load(.acquire) != 0) return;
 
         const first_chunk = group_idx * shared.group_size;
         const last_chunk: usize = @min(first_chunk + shared.group_size, shared.chunks.len);
@@ -211,8 +211,8 @@ fn workerFn(shared: *Shared, scratch: []u8) void {
         ) catch |err| {
             const code: u16 = @intFromError(err);
             // Only the first error sticks.
-            _ = shared.captured_err.cmpxchgStrong(0, code, .monotonic, .monotonic);
-            _ = shared.error_flag.store(1, .monotonic);
+            _ = shared.captured_err.cmpxchgStrong(0, code, .release, .monotonic);
+            _ = shared.error_flag.store(1, .release);
             return;
         };
     }
@@ -522,8 +522,8 @@ pub fn decompressCoreParallel(
         group.await(io) catch {};
     }
 
-    if (shared.error_flag.load(.monotonic) != 0) {
-        const code = shared.captured_err.load(.monotonic);
+    if (shared.error_flag.load(.acquire) != 0) {
+        const code = shared.captured_err.load(.acquire);
         if (code != 0) {
             // Re-raise the first error captured by any worker. The
             // runtime error table gives every error a stable u16 code
@@ -601,7 +601,7 @@ fn tpWorkerFn(shared: *TpShared) void {
     while (true) {
         const local_idx = shared.next_chunk.fetchAdd(1, .monotonic);
         if (local_idx >= shared.batch_count) return;
-        if (shared.error_flag.load(.monotonic) != 0) return;
+        if (shared.error_flag.load(.acquire) != 0) return;
 
         const chunk_idx = shared.batch_start + local_idx;
         const q = shared.chunks[chunk_idx];
@@ -616,8 +616,8 @@ fn tpWorkerFn(shared: *TpShared) void {
             &shared.phase1_results[local_idx],
         ) catch |err| {
             const code: u16 = @intFromError(err);
-            _ = shared.captured_err.cmpxchgStrong(0, code, .monotonic, .monotonic);
-            _ = shared.error_flag.store(1, .monotonic);
+            _ = shared.captured_err.cmpxchgStrong(0, code, .release, .monotonic);
+            _ = shared.error_flag.store(1, .release);
             return;
         };
     }
@@ -818,8 +818,8 @@ pub fn decompressCoreTwoPhase(
             group.await(io) catch {};
         }
 
-        if (shared.error_flag.load(.monotonic) != 0) {
-            const code = shared.captured_err.load(.monotonic);
+        if (shared.error_flag.load(.acquire) != 0) {
+            const code = shared.captured_err.load(.acquire);
             if (code != 0) {
                 const any_err: anyerror = @errorFromInt(code);
                 const narrow: DecodeError = @errorCast(any_err);
@@ -960,7 +960,7 @@ fn fastL14WorkerFn(shared: *FastL14Shared, scratch: []u8, start: usize, end: usi
 
     var chunk_idx: usize = start;
     while (chunk_idx < end) : (chunk_idx += 1) {
-        if (shared.error_flag.load(.monotonic) != 0) return;
+        if (shared.error_flag.load(.acquire) != 0) return;
         const q = shared.chunks[chunk_idx];
         decodeOneChunk(
             shared.block_src[q.src_offset .. q.src_offset + q.src_size],
@@ -971,8 +971,8 @@ fn fastL14WorkerFn(shared: *FastL14Shared, scratch: []u8, start: usize, end: usi
             scratch,
         ) catch |err| {
             const code: u16 = @intFromError(err);
-            _ = shared.captured_err.cmpxchgStrong(0, code, .monotonic, .monotonic);
-            _ = shared.error_flag.store(1, .monotonic);
+            _ = shared.captured_err.cmpxchgStrong(0, code, .release, .monotonic);
+            _ = shared.error_flag.store(1, .release);
             return;
         };
 
@@ -1154,7 +1154,7 @@ pub fn decompressFastL14Parallel(
 
     // Sidecar literals applied inside each worker (distributed across cores).
     dispatchWorkers(io, &shared, scratches, worker_count, aligned_slice);
-    if (shared.error_flag.load(.monotonic) != 0) return reportWorkerError(&shared);
+    if (shared.error_flag.load(.acquire) != 0) return reportWorkerError(&shared);
 
     // Parallel XOR fold verification. All decode workers have joined,
     // so no concurrent writes — safe to read the output. Each verifier
@@ -1175,7 +1175,7 @@ pub fn decompressFastL14Parallel(
             }
             vgroup.await(io) catch {};
         }
-        if (shared.error_flag.load(.monotonic) != 0) return reportWorkerError(&shared);
+        if (shared.error_flag.load(.acquire) != 0) return reportWorkerError(&shared);
     }
 
     dst_off_inout.* += decompressed_size;
@@ -1188,7 +1188,7 @@ fn xorFoldVerifyFn(shared: *FastL14Shared, scratch: []u8, start: usize, end: usi
     var ci: usize = start;
     while (ci < end) : (ci += 1) {
         if (ci >= shared.chunk_xor_folds.len) break;
-        if (shared.error_flag.load(.monotonic) != 0) return;
+        if (shared.error_flag.load(.acquire) != 0) return;
         const q = shared.chunks[ci];
         const chunk_data = shared.dst[shared.dst_start_off + q.dst_offset ..][0..q.dst_size];
         if (pdm.xorFoldChunk(chunk_data) != shared.chunk_xor_folds[ci]) {
@@ -1201,8 +1201,8 @@ fn xorFoldVerifyFn(shared: *FastL14Shared, scratch: []u8, start: usize, end: usi
                 scratch,
             ) catch |err| {
                 const code: u16 = @intFromError(err);
-                _ = shared.captured_err.cmpxchgStrong(0, code, .monotonic, .monotonic);
-                _ = shared.error_flag.store(1, .monotonic);
+                _ = shared.captured_err.cmpxchgStrong(0, code, .release, .monotonic);
+                _ = shared.error_flag.store(1, .release);
                 return;
             };
         }
@@ -1233,7 +1233,7 @@ fn dispatchWorkers(
 }
 
 fn reportWorkerError(shared: *const FastL14Shared) DecodeError {
-    const code = shared.captured_err.load(.monotonic);
+    const code = shared.captured_err.load(.acquire);
     if (code != 0) {
         const any_err: anyerror = @errorFromInt(code);
         return @errorCast(any_err);

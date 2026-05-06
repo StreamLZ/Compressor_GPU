@@ -69,7 +69,7 @@ pub fn analyzeForwardLz(
     @memset(covered, 0);
 
     var pos: usize = 0;
-    while (pos + 4 < src.len) {
+    while (pos + 8 <= src.len) {
         const word: u64 = std.mem.readInt(u64, src[pos..][0..8], .little);
         const hi: usize = @intCast((word *% hash_mult) >> hash_shift);
         const stored: u16 = hash_table[hi];

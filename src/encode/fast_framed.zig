@@ -68,7 +68,7 @@ fn fastScWorker(shared: *FastScContext) void {
 
     if (shared.level == 5) {
         chain_hasher_local = MatchHasher2.init(std.heap.c_allocator, shared.greedy_hash_bits) catch {
-            _ = shared.error_flag.store(1, .monotonic);
+            _ = shared.error_flag.store(1, .release);
             return;
         };
     } else {
@@ -76,7 +76,7 @@ fn fastScWorker(shared: *FastScContext) void {
             .hash_bits = shared.greedy_hash_bits,
             .min_match_length = shared.hasher_k,
         }) catch {
-            _ = shared.error_flag.store(1, .monotonic);
+            _ = shared.error_flag.store(1, .release);
             return;
         };
     }
@@ -84,7 +84,7 @@ fn fastScWorker(shared: *FastScContext) void {
     while (true) {
         const group_idx = shared.next_group.fetchAdd(1, .monotonic);
         if (group_idx >= shared.num_groups) return;
-        if (shared.error_flag.load(.monotonic) != 0) return;
+        if (shared.error_flag.load(.acquire) != 0) return;
 
         const first_chunk = group_idx * shared.sc_group_size;
         const last_chunk = @min(first_chunk + shared.sc_group_size, shared.num_chunks);
@@ -166,19 +166,19 @@ fn fastScWorker(shared: *FastScContext) void {
 
                 const result = switch (shared.level) {
                     5 => fast_enc.encodeSubChunkEntropyChain(4, std.heap.c_allocator, &chain_hasher_local.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.entropy_options, shared.parser_config) catch {
-                        _ = shared.error_flag.store(1, .monotonic);
+                        _ = shared.error_flag.store(1, .release);
                         return;
                     },
                     3 => fast_enc.encodeSubChunkEntropy(1, std.heap.c_allocator, &greedy_hasher.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.entropy_options, shared.parser_config) catch {
-                        _ = shared.error_flag.store(1, .monotonic);
+                        _ = shared.error_flag.store(1, .release);
                         return;
                     },
                     4 => fast_enc.encodeSubChunkEntropy(2, std.heap.c_allocator, &greedy_hasher.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.entropy_options, shared.parser_config) catch {
-                        _ = shared.error_flag.store(1, .monotonic);
+                        _ = shared.error_flag.store(1, .release);
                         return;
                     },
                     else => fast_enc.encodeSubChunkRaw(-2, u32, std.heap.c_allocator, &greedy_hasher.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.parser_config) catch {
-                        _ = shared.error_flag.store(1, .monotonic);
+                        _ = shared.error_flag.store(1, .release);
                         return;
                     },
                 };
@@ -307,7 +307,7 @@ fn compressFastChunksParallel(
         group.await(io) catch {};
     }
 
-    if (shared.error_flag.load(.monotonic) != 0) {
+    if (shared.error_flag.load(.acquire) != 0) {
         return error.DestinationTooSmall;
     }
 
@@ -456,7 +456,6 @@ pub fn compressFramedOne(
     // sub-chunk N−1 read during sub-chunk N give huge offsets that fail
     // the `offset <= cursor - source_block_base` bound check.
     if (greedy_hasher_u32) |*h| h.reset();
-    if (greedy_hasher_u32) |*h| h.reset();
     if (chain_hasher) |*h| {
         h.reset();
         h.setSrcBase(effective_src.ptr);
@@ -466,9 +465,6 @@ pub fn compressFramedOne(
     // Pre-fill hashers with dictionary positions so the first chunk
     // can find matches against dictionary content.
     if (dict_len > 0) {
-        if (greedy_hasher_u32) |*h| {
-            h.preloadDictionary(effective_src.ptr, dict_len);
-        }
         if (greedy_hasher_u32) |*h| {
             h.preloadDictionary(effective_src.ptr, dict_len);
         }

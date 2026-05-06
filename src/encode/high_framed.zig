@@ -694,7 +694,10 @@ pub fn compressOneHighBlock(
                 &chunk_type,
                 &lz_cost,
                 match_table_buf,
-            ) catch null;
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            };
 
             if (n_opt) |n| {
                 const total_lz_cost = lz_cost + 3.0;

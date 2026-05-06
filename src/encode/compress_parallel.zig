@@ -99,8 +99,8 @@ fn compressWorker(shared: *CompressShared) void {
     // Pre-allocate match table once per worker thread (L5+ only).
     const worker_mt_buf: ?[]mls_mod.LengthAndOffset = if (shared.base_ctx.compression_level >= 5)
         (shared.backing_allocator.alloc(mls_mod.LengthAndOffset, 4 * high_compressor.sub_chunk_size) catch {
-            _ = shared.captured_err.cmpxchgStrong(0, @intFromError(error.OutOfMemory), .monotonic, .monotonic);
-            _ = shared.error_flag.store(1, .monotonic);
+            _ = shared.captured_err.cmpxchgStrong(0, @intFromError(error.OutOfMemory), .release, .monotonic);
+            _ = shared.error_flag.store(1, .release);
             return;
         })
     else
@@ -110,7 +110,7 @@ fn compressWorker(shared: *CompressShared) void {
     while (true) {
         const block_idx = shared.next_block.fetchAdd(1, .monotonic);
         if (block_idx >= shared.num_blocks) return;
-        if (shared.error_flag.load(.monotonic) != 0) return;
+        if (shared.error_flag.load(.acquire) != 0) return;
 
         // Fresh cross-block state per block → output is deterministic
         // regardless of which thread wins which block via the atomic
@@ -139,8 +139,8 @@ fn compressWorker(shared: *CompressShared) void {
             shared.written[block_idx] = n;
         } else |err| {
             const code: u16 = @intFromError(err);
-            _ = shared.captured_err.cmpxchgStrong(0, code, .monotonic, .monotonic);
-            _ = shared.error_flag.store(1, .monotonic);
+            _ = shared.captured_err.cmpxchgStrong(0, code, .release, .monotonic);
+            _ = shared.error_flag.store(1, .release);
             return;
         }
 
@@ -215,8 +215,8 @@ pub fn compressBlocksParallel(
         group.await(io) catch {};
     }
 
-    if (shared.error_flag.load(.monotonic) != 0) {
-        const code = shared.captured_err.load(.monotonic);
+    if (shared.error_flag.load(.acquire) != 0) {
+        const code = shared.captured_err.load(.acquire);
         if (code != 0) {
             const any_err: anyerror = @errorFromInt(code);
             const narrow: CompressError = @errorCast(any_err);
@@ -295,8 +295,8 @@ fn scCompressWorker(shared: *ScCompressShared) void {
     // Pre-allocate match table once per SC worker thread (L5+ only).
     const sc_mt_buf: ?[]mls_mod.LengthAndOffset = if (shared.base_ctx.compression_level >= 5)
         (shared.backing_allocator.alloc(mls_mod.LengthAndOffset, 4 * high_compressor.sub_chunk_size) catch {
-            _ = shared.captured_err.cmpxchgStrong(0, @intFromError(error.OutOfMemory), .monotonic, .monotonic);
-            _ = shared.error_flag.store(1, .monotonic);
+            _ = shared.captured_err.cmpxchgStrong(0, @intFromError(error.OutOfMemory), .release, .monotonic);
+            _ = shared.error_flag.store(1, .release);
             return;
         })
     else
@@ -308,7 +308,7 @@ fn scCompressWorker(shared: *ScCompressShared) void {
     while (true) {
         const g = shared.next_group.fetchAdd(1, .monotonic);
         if (g >= shared.num_groups) return;
-        if (shared.error_flag.load(.monotonic) != 0) return;
+        if (shared.error_flag.load(.acquire) != 0) return;
 
         // Fresh cross-block state per group → deterministic output.
         worker_cross_block = .{};
@@ -325,8 +325,8 @@ fn scCompressWorker(shared: *ScCompressShared) void {
         var dict_group_buf: ?[]u8 = null;
         const group_src: []const u8 = if (dict_prefix_len > 0) blk: {
             const buf = shared.backing_allocator.alloc(u8, dict_prefix_len + group_content_len) catch {
-                _ = shared.error_flag.store(1, .monotonic);
-                _ = shared.captured_err.cmpxchgStrong(0, @intFromError(error.OutOfMemory), .monotonic, .monotonic);
+                _ = shared.captured_err.cmpxchgStrong(0, @intFromError(error.OutOfMemory), .release, .monotonic);
+                _ = shared.error_flag.store(1, .release);
                 return;
             };
             @memcpy(buf[0..dict_prefix_len], shared.src[0..dict_prefix_len]);
@@ -339,8 +339,8 @@ fn scCompressWorker(shared: *ScCompressShared) void {
         _ = arena.reset(.retain_capacity);
 
         var mls = mls_mod.ManagedMatchLenStorage.init(arena.allocator(), group_content_len + 1, 8.0) catch {
-            _ = shared.error_flag.store(1, .monotonic);
-            _ = shared.captured_err.cmpxchgStrong(0, @intFromError(error.OutOfMemory), .monotonic, .monotonic);
+            _ = shared.captured_err.cmpxchgStrong(0, @intFromError(error.OutOfMemory), .release, .monotonic);
+            _ = shared.error_flag.store(1, .release);
             return;
         };
         mls.window_base_offset = 0;
@@ -350,20 +350,20 @@ fn scCompressWorker(shared: *ScCompressShared) void {
             if (shared.mapping.use_bt4) {
                 match_finder_bt4.findMatchesBT4(arena.allocator(), group_src, &mls, 4, finder_preload, 96) catch |err| {
                     const code: u16 = @intFromError(err);
-                    _ = shared.captured_err.cmpxchgStrong(0, code, .monotonic, .monotonic);
+                    _ = shared.captured_err.cmpxchgStrong(0, code, .release, .monotonic);
                     break :blk false;
                 };
             } else {
                 match_finder.findMatchesHashBased(arena.allocator(), group_src, &mls, 4, finder_preload) catch |err| {
                     const code: u16 = @intFromError(err);
-                    _ = shared.captured_err.cmpxchgStrong(0, code, .monotonic, .monotonic);
+                    _ = shared.captured_err.cmpxchgStrong(0, code, .release, .monotonic);
                     break :blk false;
                 };
             }
             break :blk true;
         };
         if (!mf_ok) {
-            _ = shared.error_flag.store(1, .monotonic);
+            _ = shared.error_flag.store(1, .release);
             return;
         }
 
@@ -395,8 +395,8 @@ fn scCompressWorker(shared: *ScCompressShared) void {
                 shared.written[chunk_idx] = n;
             } else |err| {
                 const code: u16 = @intFromError(err);
-                _ = shared.captured_err.cmpxchgStrong(0, code, .monotonic, .monotonic);
-                _ = shared.error_flag.store(1, .monotonic);
+                _ = shared.captured_err.cmpxchgStrong(0, code, .release, .monotonic);
+                _ = shared.error_flag.store(1, .release);
                 return;
             }
         }
@@ -467,8 +467,8 @@ pub fn compressInternalParallelSc(
         group.await(io) catch {};
     }
 
-    if (shared.error_flag.load(.monotonic) != 0) {
-        const code = shared.captured_err.load(.monotonic);
+    if (shared.error_flag.load(.acquire) != 0) {
+        const code = shared.captured_err.load(.acquire);
         if (code != 0) {
             const any_err: anyerror = @errorFromInt(code);
             const narrow: CompressError = @errorCast(any_err);

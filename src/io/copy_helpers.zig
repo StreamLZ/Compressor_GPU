@@ -20,6 +20,7 @@
 //!   * `copy64Add` adds 8 byte lanes in one vector add.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// 16-byte unsigned vector (SSE2 lane width).
 pub const V16 = @Vector(16, u8);
@@ -167,12 +168,22 @@ pub inline fn copyMatch16Pshufb(dst: [*]u8, match_ptr: [*]const u8, distance: us
     const idx: u4 = @intCast(idx_wide);
     const mask: V16 = match_copy_pshufb_masks[idx];
     const v: V16 = loadV16(match_ptr);
-    const shuffled: V16 = asm ("pshufb %[mask], %[v]"
-        : [ret] "=x" (-> V16),
-        : [v] "0" (v),
-          [mask] "x" (mask),
-    );
-    storeV16(dst, shuffled);
+
+    if (comptime builtin.cpu.arch == .x86_64) {
+        const shuffled: V16 = asm ("pshufb %[mask], %[v]"
+            : [ret] "=x" (-> V16),
+            : [v] "0" (v),
+              [mask] "x" (mask),
+        );
+        storeV16(dst, shuffled);
+    } else {
+        // Scalar fallback: apply the shuffle mask byte-by-byte.
+        var result: V16 = undefined;
+        inline for (0..16) |lane| {
+            result[lane] = v[mask[lane]];
+        }
+        storeV16(dst, result);
+    }
 }
 
 /// Fills `count` bytes starting at `dst` with `byte`.
