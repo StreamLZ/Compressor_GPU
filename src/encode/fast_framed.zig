@@ -372,7 +372,12 @@ pub fn compressFramedOne(
         else => unreachable,
     };
     var pos: usize = 0;
-    const sc_grp: u8 = if (opts.level >= 2) high_framed.computeAdaptiveGroupSize(src.len) else lz_constants.default_sc_group_size;
+    const sc_grp: u8 = switch (opts.level) {
+        1 => lz_constants.default_sc_group_size,
+        2, 3, 4 => @min(high_framed.computeAdaptiveGroupSize(src.len), 16),
+        5 => high_framed.computeAdaptiveGroupSize(src.len),
+        else => lz_constants.default_sc_group_size,
+    };
     const hdr_len = try frame.writeHeader(dst, .{
         .codec = .fast,
         .level = codec_level,
@@ -504,7 +509,7 @@ pub fn compressFramedOne(
     const num_chunks: usize = if (can_compress) (src.len + lz_constants.chunk_size - 1) / lz_constants.chunk_size else 0;
     const effective_threads: u32 = if (opts.num_threads == 0) @intCast(@max(1, std.Thread.getCpuCount() catch 1)) else opts.num_threads;
     if (self_contained and can_compress and effective_threads > 1 and num_chunks > 1) {
-        const parallel_sc_grp: usize = if (opts.level == 1) 1 else sc_grp;
+        const parallel_sc_grp: usize = sc_grp;
         const parallel_payload_size = try compressFastChunksParallel(
             allocator,
             io,
