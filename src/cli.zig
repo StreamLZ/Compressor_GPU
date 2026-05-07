@@ -15,6 +15,7 @@ const build_options = @import("build_options");
 const enable_bench = build_options.enable_bench;
 const zstd = if (enable_bench) @import("compare/zstd.zig") else struct {};
 const lz4 = if (enable_bench) @import("compare/lz4.zig") else struct {};
+const lzt = if (enable_bench) @import("compare/lzturbo.zig") else struct {};
 
 const forward_lz = @import("encode/forward_lz.zig");
 
@@ -1117,6 +1118,8 @@ const BenchCompareRow = struct {
 const BenchDecomp = union(enum) {
     lz4_st: struct { dst: []u8, comp: []const u8, orig_size: usize },
     lz4_mt: struct { io: std.Io, src: []const u8, dst: []u8, mt: *const lz4.MtResult, threads: usize },
+    lzt_st: struct { dst: []u8, comp: []const u8, orig_size: usize },
+    lzt_mt: struct { io: std.Io, src: []const u8, dst: []u8, mt: *const lzt.MtResult, threads: usize },
     zstd_st: struct { dst: []u8, comp: []const u8 },
     zstd_mt: struct { io: std.Io, src: []const u8, dst: []u8, mt: *const zstd.MtResult, threads: usize },
     slz: struct { ctx: *decoder.DecompressContext, comp: []const u8, dst: []u8 },
@@ -1125,6 +1128,8 @@ const BenchDecomp = union(enum) {
         switch (self) {
             .lz4_st => |s| _ = try lz4.decompress(s.dst, s.comp, s.orig_size),
             .lz4_mt => |s| try lz4.decompressMt(s.io, s.src, s.dst, s.mt, s.threads),
+            .lzt_st => |s| _ = try lzt.decompress(s.dst, s.comp, s.orig_size),
+            .lzt_mt => |s| try lzt.decompressMt(s.io, s.src, s.dst, s.mt, s.threads),
             .zstd_st => |s| _ = try zstd.decompress(s.dst, s.comp),
             .zstd_mt => |s| try zstd.decompressBlocksMt(s.io, s.src, s.dst, s.mt, s.threads),
             .slz => |s| _ = try s.ctx.decompress(s.comp, s.dst),
@@ -1191,8 +1196,9 @@ fn runBenchCompare(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, 
     // Shared buffers — allocate to the max bound across all compressors.
     const zstd_bound = zstd.compressBound(src.len);
     const lz4_bound = lz4.compressBound(src.len);
+    const lzt_bound = lzt.compressBound(src.len);
     const slz_bound = encoder.compressBound(src.len);
-    const max_bound = @max(zstd_bound, @max(lz4_bound, slz_bound));
+    const max_bound = @max(zstd_bound, @max(lz4_bound, @max(lzt_bound, slz_bound)));
     const compressed = try allocator.alloc(u8, max_bound);
     defer allocator.free(compressed);
     const decompressed = try allocator.alloc(u8, src.len + decoder.safe_space);
@@ -1265,6 +1271,41 @@ fn runBenchCompare(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, 
                 defer mr.deinit();
                 try benchmarkCodec(label, mr.total_compressed, comp_ns,
                     .{ .lz4_mt = .{ .io = io, .src = src, .dst = decompressed[0..src.len], .mt = mr, .threads = @intCast(threads) } },
+                    src.len, mb, runs, io, w, &results, &result_count);
+            } else {
+                try w.writeAll(" FAILED\n");
+            }
+        }
+        try w.flush();
+    }
+
+    flushMemory();
+
+    // ── LZTurbo 10 ──
+    {
+        const is_single = threads == 1;
+        const lzt_label: []const u8 = if (is_single) "LZTurbo 10" else "LZTurbo 10 MT";
+        try w.print("  {s} ...", .{lzt_label});
+        try w.flush();
+        if (is_single) {
+            const comp_timer = std.Io.Clock.awake.now(io);
+            const comp_size = lzt.compress(compressed, src) catch 0;
+            const comp_ns = @as(u64, @intCast(comp_timer.untilNow(io, .awake).toNanoseconds()));
+            if (comp_size > 0) {
+                try benchmarkCodec(lzt_label, comp_size, comp_ns,
+                    .{ .lzt_st = .{ .dst = decompressed[0..src.len], .comp = compressed[0..comp_size], .orig_size = src.len } },
+                    src.len, mb, runs, io, w, &results, &result_count);
+            } else {
+                try w.writeAll(" FAILED\n");
+            }
+        } else {
+            const comp_timer = std.Io.Clock.awake.now(io);
+            var mt_result: ?lzt.MtResult = lzt.compressMt(allocator, io, src, @intCast(threads)) catch null;
+            const comp_ns = @as(u64, @intCast(comp_timer.untilNow(io, .awake).toNanoseconds()));
+            if (mt_result) |*mr| {
+                defer mr.deinit();
+                try benchmarkCodec(lzt_label, mr.total_compressed, comp_ns,
+                    .{ .lzt_mt = .{ .io = io, .src = src, .dst = decompressed[0..src.len], .mt = mr, .threads = @intCast(threads) } },
                     src.len, mb, runs, io, w, &results, &result_count);
             } else {
                 try w.writeAll(" FAILED\n");
@@ -1375,6 +1416,7 @@ fn runBenchCompare(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, 
     } else {
         try w.print("\nThreading ({d} threads, 4 MB independent blocks):\n", .{threads});
         try w.writeAll("  LZ4:      compress MT, decompress MT\n");
+        try w.writeAll("  LZTurbo:  compress MT, decompress MT\n");
         try w.writeAll("  zstd:     compress MT, decompress MT\n");
         try w.writeAll("  StreamLZ: compress MT (L1, L6+), decompress MT (all levels)\n");
     }
