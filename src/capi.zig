@@ -38,7 +38,7 @@ export fn slz_compress(
     dst_len: usize,
     level: c_int,
 ) c_int {
-    if (src_len == 0 or dst_len == 0) return 0;
+    if (dst_len == 0) return SLZ_ERROR_DST_TOO_SMALL;
     if (level < 1 or level > 11) return SLZ_ERROR_BAD_LEVEL;
     const result = encoder.compressFramed(
         allocator,
@@ -58,7 +58,8 @@ export fn slz_decompress(
     dst: [*]u8,
     dst_len: usize,
 ) c_int {
-    if (src_len == 0 or dst_len == 0) return 0;
+    if (src_len == 0) return 0;
+    if (dst_len == 0) return SLZ_ERROR_DST_TOO_SMALL;
     const result = decoder.decompressFramedParallelThreaded(
         allocator,
         null,
@@ -66,6 +67,9 @@ export fn slz_decompress(
         dst[0..dst_len],
         0,
     ) catch |err| return mapDecompressError(err);
+    if (result.offset > 0) {
+        std.mem.copyForwards(u8, dst[0..result.written], dst[result.offset..][0..result.written]);
+    }
     if (result.written > std.math.maxInt(c_int)) return SLZ_ERROR_UNKNOWN;
     return @intCast(result.written);
 }

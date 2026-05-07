@@ -163,10 +163,9 @@ fn processLzRunsType0(
         const offset_index: u32 = command_byte >> 6;
         const match_length: u32 = (command_byte >> 2) & 0xF;
 
-        // Branchless long-literal decode.
-        const speculative_long: u32 = @bitCast(len_stream[0]);
         if (literal_length == 3) {
-            literal_length = speculative_long;
+            if (@intFromPtr(len_stream) >= @intFromPtr(len_stream_end)) return error.StreamMismatch;
+            literal_length = @bitCast(len_stream[0]);
             len_stream += 1;
         }
 
@@ -186,6 +185,7 @@ fn processLzRunsType0(
 
         const actual_match_len: u32 = blk: {
             if (match_length != 15) break :blk match_length + 2;
+            if (@intFromPtr(len_stream) >= @intFromPtr(len_stream_end)) return error.StreamMismatch;
             const extra: u32 = @bitCast(len_stream[0]);
             len_stream += 1;
             break :blk 14 + extra;

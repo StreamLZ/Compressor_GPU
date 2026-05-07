@@ -182,6 +182,11 @@ fn fastScWorker(shared: *FastScContext) void {
                         _ = shared.error_flag.store(1, .release);
                         return;
                     },
+                    2 => fast_enc.encodeSubChunkRaw(-1, u32, std.heap.c_allocator, &greedy_hasher.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.parser_config) catch |err| {
+                        _ = shared.captured_err.cmpxchgStrong(0, @intFromError(err), .release, .monotonic);
+                        _ = shared.error_flag.store(1, .release);
+                        return;
+                    },
                     else => fast_enc.encodeSubChunkRaw(-2, u32, std.heap.c_allocator, &greedy_hasher.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.parser_config) catch |err| {
                         _ = shared.captured_err.cmpxchgStrong(0, @intFromError(err), .release, .monotonic);
                         _ = shared.error_flag.store(1, .release);

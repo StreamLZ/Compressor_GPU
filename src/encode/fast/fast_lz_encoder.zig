@@ -706,8 +706,8 @@ fn assembleEntropyOutput(
     //                      off16 payload + off32 section + length stream.
     // extra_bytes = bytes_after_tokens - off16 payload.
     const dest_after_tokens: usize = initial_bytes + 3 + literal_count + 3 + token_count;
-    const bytes_after_tokens: usize = total - dest_after_tokens;
-    const extra_bytes: f32 = @floatFromInt(bytes_after_tokens - offset16_bytes_written);
+    const bytes_after_tokens: usize = total -| dest_after_tokens;
+    const extra_bytes: f32 = @floatFromInt(bytes_after_tokens -| offset16_bytes_written);
     const initial_bytes_f: f32 = @floatFromInt(initial_bytes);
     const cost: f32 = off32_time + token_cost + literal_cost +
         decoding_time_entropy * config.speed_tradeoff +

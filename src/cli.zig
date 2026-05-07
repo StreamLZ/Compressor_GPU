@@ -339,8 +339,8 @@ fn requireInput(args: Args, w: *std.Io.Writer) []const u8 {
     };
 }
 
-/// Median of a slice of nanosecond durations.
-fn median(times: []const u64) u64 {
+/// Median of a slice of nanosecond durations (falls back to mean for n > 256).
+fn medianOrMean(times: []const u64) u64 {
     var buf: [256]u64 = undefined;
     const n = times.len;
     if (n == 0) return 0;
@@ -802,7 +802,7 @@ fn runBenchCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer,
         const run_mbps = mb * 1000.0 / run_ms;
         try w.print("  Decompress run {d}: {d:.0}ms ({d:.1} MB/s)\n", .{ r + 1, run_ms, run_mbps });
     }
-    const dec_median_ns = median(dec_times);
+    const dec_median_ns = medianOrMean(dec_times);
     const dec_median_ms = @as(f64, @floatFromInt(dec_median_ns)) / 1_000_000.0;
     const dec_median_mbps = mb * 1000.0 / dec_median_ms;
     try w.print("  Decompress median: {d:.0}ms ({d:.1} MB/s)\n\n", .{ dec_median_ms, dec_median_mbps });

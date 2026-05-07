@@ -412,7 +412,8 @@ noinline fn processModeImpl(
     // Skipped entirely in safe mode (all work done by the safe tail).
     if (!safe) {
         while (@intFromPtr(cmd_stream) < @intFromPtr(cmd_stream_end) and
-            @intFromPtr(dst) < @intFromPtr(dst_safe_end))
+            @intFromPtr(dst) < @intFromPtr(dst_safe_end) and
+            @intFromPtr(off16_stream) < @intFromPtr(off16_stream_end))
         {
             const cmd: u32 = cmd_stream[0];
             cmd_stream += 1;
