@@ -1771,3 +1771,43 @@ pressure. The Zig compiler's comptime evaluation produces different IR
 shapes than hand-written repetition, and LLVM's optimizer doesn't always
 canonicalize them to the same output. For performance-critical code,
 prefer explicit repetition over `inline for` with struct dispatch.
+
+---
+
+## lz4ultra-style token reduction (2026-05-07)
+
+Inspired by [lz4ultra](https://github.com/emmanuel-marty/lz4ultra), which
+speeds up LZ4 decompression by reducing token count via two encoder-side
+optimizations. We tried both on StreamLZ's Fast codec (L1-L5).
+
+### Match length cap at nibble boundary
+
+**Idea**: Cap match lengths at 15 (the Fast token nibble max) when the
+original length is 16-30. Avoids the extended-length decode branch in
+the decompressor at the cost of a few extra literal bytes.
+
+**Result**: Ratio worsened by 0.4pp across L1-L4, and decompress speed
+*dropped* 7-9%. The cap creates more tokens (the leftover bytes become
+new matches/literals in subsequent iterations), increasing total token
+count. The branch-elimination savings were smaller than the extra-token
+cost. lz4ultra avoids this problem because its optimal parser globally
+rearranges matches around the cap; our greedy/lazy parser truncates
+blindly.
+
+### Minimum match length bump (4 → 5)
+
+**Idea**: Reject 4-byte matches with new offsets. A 4-byte match saves
+only 1 byte over literals (4 bytes saved − 3 bytes token overhead) but
+adds one full iteration of the serial pointer chase (~11-13 cycles).
+
+**Result**: L1 ratio unchanged (greedy parser rarely finds 4-byte
+matches at L1's hash resolution). L5 ratio worsened by 1.2pp (43.1% vs
+41.9%) — the chain hasher finds many useful 4-byte matches. Decompress
+speed unchanged (within noise). The ratio loss far outweighs any
+theoretical decode speedup.
+
+**Lesson**: These optimizations require a full optimal parser that can
+globally evaluate token cost vs decode overhead. With a greedy/lazy
+parser, local truncation decisions create worse output. StreamLZ's L6+
+High codec already uses an optimal parser, and the Fast codec's token
+decisions are already well-tuned for the greedy/lazy tradeoff.
