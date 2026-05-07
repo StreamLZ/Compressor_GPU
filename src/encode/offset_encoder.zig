@@ -159,15 +159,14 @@ inline fn bitsUp(bits: u32) f32 {
 /// the given `offs_encode_type` divisor (1 = no-modulo / legacy).
 pub fn getCostModularOffsets(
     offs_encode_type: u32,
-    u32_offs: [*]const u32,
-    offs_count: usize,
+    u32_offs: []const u32,
     speed_tradeoff: f32,
 ) f32 {
     var low_histo: [128]u32 = @splat(0);
     var high_histo: ByteHistogram = .{};
 
     var bits_for_data: u32 = 0;
-    for (0..offs_count) |i| {
+    for (0..u32_offs.len) |i| {
         const offset: u32 = u32_offs[i];
         const ohi: u32 = offset / offs_encode_type;
         const olo: u32 = offset % offs_encode_type;
@@ -186,9 +185,9 @@ pub fn getCostModularOffsets(
     var cost: f32 = bitsUp(getHistoCostApprox(&high_histo.count, @intCast(high_histo_sum))) + bitsUp(bits_for_data);
 
     if (offs_encode_type > 1) {
-        const offs_count_f: f32 = @floatFromInt(offs_count);
+        const offs_count_f: f32 = @floatFromInt(u32_offs.len);
         cost += (offs_count_f * cost_coeffs.offset_modular_per_item + cost_coeffs.offset_modular_base) * speed_tradeoff;
-        cost += bitsUp(getHistoCostApprox(&low_histo, @intCast(offs_count)));
+        cost += bitsUp(getHistoCostApprox(&low_histo, @intCast(u32_offs.len)));
         cost += (cost_coeffs.single_huffman_base +
             offs_count_f * cost_coeffs.single_huffman_per_item +
             128 * cost_coeffs.single_huffman_per_symbol) * speed_tradeoff;
@@ -204,8 +203,7 @@ pub fn getCostModularOffsets(
 /// Tracks the four most common small offsets and tries each one as the
 /// modulo divisor. Returns the best-scoring divisor (1 = no modulo).
 pub fn getBestOffsetEncodingFast(
-    u32_offs: [*]const u32,
-    offs_count: usize,
+    u32_offs: []const u32,
     speed_tradeoff: f32,
 ) u32 {
     // Initialize array with i in low byte so the sort-descending tiebreak
@@ -214,7 +212,7 @@ pub fn getBestOffsetEncodingFast(
     for (0..129) |i| arr[i] = @intCast(i);
 
     // Bump count for each offset that fits in [0..128].
-    for (0..offs_count) |i| {
+    for (0..u32_offs.len) |i| {
         if (u32_offs[i] <= 128) {
             arr[@intCast(u32_offs[i])] += 256;
         }
@@ -227,13 +225,13 @@ pub fn getBestOffsetEncodingFast(
         }
     }.lessThan);
 
-    var best_cost: f32 = getCostModularOffsets(1, u32_offs, offs_count, speed_tradeoff);
+    var best_cost: f32 = getCostModularOffsets(1, u32_offs, speed_tradeoff);
     var best: u32 = 1;
 
     for (0..4) |i| {
         const offs_encode_type: u32 = arr[i] & 0xFF;
         if (offs_encode_type > 1) {
-            const cost: f32 = getCostModularOffsets(offs_encode_type, u32_offs, offs_count, speed_tradeoff);
+            const cost: f32 = getCostModularOffsets(offs_encode_type, u32_offs, speed_tradeoff);
             if (cost < best_cost) {
                 best = offs_encode_type;
                 best_cost = cost;
@@ -246,17 +244,16 @@ pub fn getBestOffsetEncodingFast(
 
 /// Exhaustively tries every divisor in 1..128 and picks the cheapest.
 pub fn getBestOffsetEncodingSlow(
-    u32_offs: [*]const u32,
-    offs_count: usize,
+    u32_offs: []const u32,
     speed_tradeoff: f32,
 ) u32 {
-    if (offs_count < 32) return 1;
+    if (u32_offs.len < 32) return 1;
 
     var best: u32 = 0;
     var best_cost: f32 = std.math.inf(f32);
     var offs_encode_type: u32 = 1;
     while (offs_encode_type <= 128) : (offs_encode_type += 1) {
-        const cost: f32 = getCostModularOffsets(offs_encode_type, u32_offs, offs_count, speed_tradeoff);
+        const cost: f32 = getCostModularOffsets(offs_encode_type, u32_offs, speed_tradeoff);
         if (cost < best_cost) {
             best = offs_encode_type;
             best_cost = cost;
@@ -291,8 +288,7 @@ const low_offset_encoding_limit: u32 = lz_constants.low_offset_encoding_limit;
 /// and encodes the hi-part as a variable-length byte. Writes `u8_offs_hi`
 /// and (when divisor > 1) `u8_offs_lo`; returns per-type bit-count totals.
 pub fn encodeNewOffsets(
-    u32_offs: [*]const u32,
-    offs_count: usize,
+    u32_offs: []const u32,
     u8_offs_hi: [*]u8,
     u8_offs_lo: [*]u8,
     offs_encode_type: u32,
@@ -302,7 +298,7 @@ pub fn encodeNewOffsets(
     var bits_type1: i32 = 0;
 
     if (offs_encode_type == 1) {
-        for (0..offs_count) |i| {
+        for (0..u32_offs.len) |i| {
             bits_type0 += if (u8_offs[i] >= high_offset_marker)
                 @as(i32, u8_offs[i]) - @as(i32, @intCast(high_offset_cost_adjust))
             else
@@ -315,7 +311,7 @@ pub fn encodeNewOffsets(
             bits_type1 += @as(i32, extra_bit_count);
         }
     } else {
-        for (0..offs_count) |i| {
+        for (0..u32_offs.len) |i| {
             bits_type0 += if (u8_offs[i] >= high_offset_marker)
                 @as(i32, u8_offs[i]) - @as(i32, @intCast(high_offset_cost_adjust))
             else
@@ -479,8 +475,7 @@ pub fn encodeLzOffsets(
     allocator: std.mem.Allocator,
     dst: []u8,
     u8_offs: []u8,
-    u32_offs: [*]const u32,
-    offs_count: usize,
+    u32_offs: []const u32,
     opts: entropy_enc.EntropyOptions,
     speed_tradeoff: f32,
     min_match_len: u32,
@@ -489,6 +484,7 @@ pub fn encodeLzOffsets(
     histo_out: ?*ByteHistogram,
     histo_lo_out: ?*ByteHistogram,
 ) (entropy_enc.EncodeError || error{NotBeneficial})!EncodeLzOffsetsResult {
+    const offs_count = u32_offs.len;
     std.debug.assert(u8_offs.len >= offs_count);
 
     var n: usize = std.math.maxInt(usize);
@@ -522,9 +518,9 @@ pub fn encodeLzOffsets(
 
     offs_encode_type = 1;
     if (level >= 8) {
-        offs_encode_type = getBestOffsetEncodingSlow(u32_offs, offs_count, speed_tradeoff);
+        offs_encode_type = getBestOffsetEncodingSlow(u32_offs, speed_tradeoff);
     } else if (level >= 4) {
-        offs_encode_type = getBestOffsetEncodingFast(u32_offs, offs_count, speed_tradeoff);
+        offs_encode_type = getBestOffsetEncodingFast(u32_offs, speed_tradeoff);
     }
 
     const u8_offs_hi: [*]u8 = temp.ptr;
@@ -532,7 +528,7 @@ pub fn encodeLzOffsets(
     const tmp_dst_start: [*]u8 = temp.ptr + offs_count * 2;
     const tmp_dst_end: [*]u8 = temp.ptr + temp_size;
 
-    const split = encodeNewOffsets(u32_offs, offs_count, u8_offs_hi, u8_offs_lo, offs_encode_type, u8_offs.ptr);
+    const split = encodeNewOffsets(u32_offs, u8_offs_hi, u8_offs_lo, offs_encode_type, u8_offs.ptr);
 
     // Write the divisor byte, then the compressed hi stream and (if needed)
     // the compressed lo stream into the trial buffer.
@@ -665,8 +661,8 @@ test "getCostModularOffsets divisor 1 vs divisor 16" {
     // bits per low, so it should be cheaper than divisor 1 which needs
     // the full log2(16+8)-3 = 1 extra bit per item.
     var offs: [8]u32 = @splat(16);
-    const cost_1 = getCostModularOffsets(1, &offs, 8, 0.05);
-    const cost_16 = getCostModularOffsets(16, &offs, 8, 0.05);
+    const cost_1 = getCostModularOffsets(1, &offs, 0.05);
+    const cost_16 = getCostModularOffsets(16, &offs, 0.05);
     // Both are finite and positive.
     try testing.expect(cost_1 > 0);
     try testing.expect(cost_16 > 0);
@@ -677,13 +673,13 @@ test "getBestOffsetEncodingFast picks best divisor among top-4" {
     // if the modulo overhead outweighs the savings for this tiny sample).
     var offs: [64]u32 = undefined;
     for (&offs, 0..) |*o, i| o.* = @intCast((i % 32) * 2 + 2);
-    const best = getBestOffsetEncodingFast(&offs, offs.len, 0.05);
+    const best = getBestOffsetEncodingFast(&offs, 0.05);
     try testing.expect(best >= 1 and best <= 128);
 }
 
 test "getBestOffsetEncodingSlow short input returns 1" {
     var offs: [16]u32 = @splat(10);
-    try testing.expectEqual(@as(u32, 1), getBestOffsetEncodingSlow(&offs, offs.len, 0.05));
+    try testing.expectEqual(@as(u32, 1), getBestOffsetEncodingSlow(&offs, 0.05));
 }
 
 test "encodeNewOffsets splits offset=16 into hi=0, lo=16 when divisor=1" {
@@ -691,7 +687,7 @@ test "encodeNewOffsets splits offset=16 into hi=0, lo=16 when divisor=1" {
     var u8_offs: [1]u8 = .{0};
     var hi: [1]u8 = undefined;
     var lo: [1]u8 = undefined;
-    const res = encodeNewOffsets(&u32_offs, 1, &hi, &lo, 1, &u8_offs);
+    const res = encodeNewOffsets(&u32_offs, &hi, &lo, 1, &u8_offs);
     // Divisor 1: hi = (16+8)>>extra_bit_count with extra_bit_count = log2(24)-3 = 1.
     //   hi value: 8*1 | ((24>>1) ^ 8) = 8 | (12 ^ 8) = 8 | 4 = 12
     try testing.expectEqual(@as(u8, 12), hi[0]);

@@ -46,6 +46,7 @@ export fn slz_compress(
         dst[0..dst_len],
         .{ .level = @intCast(level) },
     ) catch |err| return mapCompressError(err);
+    if (result > std.math.maxInt(c_int)) return SLZ_ERROR_UNKNOWN;
     return @intCast(result);
 }
 
@@ -65,6 +66,7 @@ export fn slz_decompress(
         dst[0..dst_len],
         0,
     ) catch |err| return mapDecompressError(err);
+    if (result.written > std.math.maxInt(c_int)) return SLZ_ERROR_UNKNOWN;
     return @intCast(result.written);
 }
 

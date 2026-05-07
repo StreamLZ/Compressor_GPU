@@ -96,6 +96,7 @@ pub fn decodeFarOffsetsUnaligned(
         var i: u32 = 0;
         while (i != output_size) : (i += 1) {
             if (@intFromPtr(src_end) - @intFromPtr(src_cur) < 3) return error.SourceTruncated;
+            // 3-byte little-endian offset
             const off: u32 = @as(u32, src_cur[0]) |
                 (@as(u32, src_cur[1]) << 8) |
                 (@as(u32, src_cur[2]) << 16);
@@ -110,6 +111,7 @@ pub fn decodeFarOffsetsUnaligned(
     var i: u32 = 0;
     while (i != output_size) : (i += 1) {
         if (@intFromPtr(src_end) - @intFromPtr(src_cur) < 3) return error.SourceTruncated;
+        // 3-byte little-endian offset
         var off: u32 = @as(u32, src_cur[0]) |
             (@as(u32, src_cur[1]) << 8) |
             (@as(u32, src_cur[2]) << 16);
@@ -141,6 +143,7 @@ pub fn decodeFarOffsets(
         var i: u32 = 0;
         while (i != output_size) : (i += 1) {
             if (@intFromPtr(src_end) - @intFromPtr(src_cur) < 3) return error.SourceTruncated;
+            // 3-byte little-endian offset
             const off: u32 = @as(u32, src_cur[0]) |
                 (@as(u32, src_cur[1]) << 8) |
                 (@as(u32, src_cur[2]) << 16);
@@ -154,6 +157,7 @@ pub fn decodeFarOffsets(
     var i: u32 = 0;
     while (i != output_size) : (i += 1) {
         if (@intFromPtr(src_end) - @intFromPtr(src_cur) < 3) return error.SourceTruncated;
+        // 3-byte little-endian offset
         var off: u32 = @as(u32, src_cur[0]) |
             (@as(u32, src_cur[1]) << 8) |
             (@as(u32, src_cur[2]) << 16);

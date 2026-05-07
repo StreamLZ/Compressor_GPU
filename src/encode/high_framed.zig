@@ -698,9 +698,7 @@ pub fn compressOneHighBlock(
                     const hdr: u32 = @as(u32, @intCast(n)) |
                         (@as(u32, @intCast(chunk_type)) << lz_constants.sub_chunk_type_shift) |
                         lz_constants.chunk_header_compressed_flag;
-                    dst_block[sub_hdr_pos + 0] = @intCast((hdr >> 16) & 0xFF);
-                    dst_block[sub_hdr_pos + 1] = @intCast((hdr >> 8) & 0xFF);
-                    dst_block[sub_hdr_pos + 2] = @intCast(hdr & 0xFF);
+                    block_header.writeBE24(dst_block[sub_hdr_pos..].ptr, hdr);
                     local_pos = sub_payload_start + n;
                     total_cost += total_lz_cost;
                     lz_chose = true;
@@ -716,9 +714,7 @@ pub fn compressOneHighBlock(
         if (!lz_chose) {
             if (local_pos + 3 + round_bytes > dst_block.len) return error.DestinationTooSmall;
             const hdr: u32 = @as(u32, @intCast(round_bytes)) | lz_constants.chunk_header_compressed_flag;
-            dst_block[local_pos + 0] = @intCast((hdr >> 16) & 0xFF);
-            dst_block[local_pos + 1] = @intCast((hdr >> 8) & 0xFF);
-            dst_block[local_pos + 2] = @intCast(round_bytes & 0xFF);
+            block_header.writeBE24(dst_block[local_pos..].ptr, hdr);
             @memcpy(dst_block[local_pos + 3 ..][0..round_bytes], sub_src);
             local_pos += 3 + round_bytes;
             total_cost += sub_memset_cost;

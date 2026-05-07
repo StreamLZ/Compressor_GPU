@@ -62,7 +62,7 @@ fn mtCompressWorker(shared: *MtShared) void {
     while (true) {
         const idx = shared.next_block.fetchAdd(1, .monotonic);
         if (idx >= shared.num_blocks) return;
-        if (shared.error_flag.load(.monotonic) != 0) return;
+        if (shared.error_flag.load(.acquire) != 0) return;
 
         const src_off = idx * block_size;
         const blk_len = @min(shared.src.len - src_off, block_size);
@@ -85,7 +85,7 @@ fn mtCompressWorker(shared: *MtShared) void {
             );
 
         if (ret <= 0) {
-            shared.error_flag.store(1, .monotonic);
+            shared.error_flag.store(1, .release);
             return;
         }
         shared.comp_sizes[idx] = @intCast(ret);
@@ -106,7 +106,7 @@ fn mtDecompressWorker(shared: *MtDecompShared) void {
     while (true) {
         const idx = shared.next_block.fetchAdd(1, .monotonic);
         if (idx >= shared.num_blocks) return;
-        if (shared.error_flag.load(.monotonic) != 0) return;
+        if (shared.error_flag.load(.acquire) != 0) return;
 
         const dst_off = idx * block_size;
         const blk_len = @min(shared.src.len - dst_off, block_size);
@@ -118,7 +118,7 @@ fn mtDecompressWorker(shared: *MtDecompShared) void {
             @intCast(blk_len),
         );
         if (ret < 0) {
-            shared.error_flag.store(1, .monotonic);
+            shared.error_flag.store(1, .release);
             return;
         }
     }
@@ -182,7 +182,7 @@ pub fn compressMt(allocator: std.mem.Allocator, src: []const u8, num_threads: us
         for (threads) |t| t.join();
     }
 
-    if (shared.error_flag.load(.monotonic) != 0) return error.Lz4CompressError;
+    if (shared.error_flag.load(.acquire) != 0) return error.Lz4CompressError;
 
     var total: usize = 0;
     for (comp_sizes[0..num_blocks]) |s| total += s;
@@ -223,5 +223,5 @@ pub fn decompressMt(allocator: std.mem.Allocator, src: []const u8, dst: []u8, re
         for (threads) |t| t.join();
     }
 
-    if (shared.error_flag.load(.monotonic) != 0) return error.Lz4DecompressError;
+    if (shared.error_flag.load(.acquire) != 0) return error.Lz4DecompressError;
 }

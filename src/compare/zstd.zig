@@ -51,7 +51,7 @@ fn mtCompressWorker(shared: *MtShared) void {
     while (true) {
         const idx = shared.next_block.fetchAdd(1, .monotonic);
         if (idx >= shared.num_blocks) return;
-        if (shared.error_flag.load(.monotonic) != 0) return;
+        if (shared.error_flag.load(.acquire) != 0) return;
 
         const src_off = idx * block_size;
         const blk_len = @min(shared.src.len - src_off, block_size);
@@ -64,7 +64,7 @@ fn mtCompressWorker(shared: *MtShared) void {
             shared.level,
         );
         if (c.ZSTD_isError(ret) != 0) {
-            shared.error_flag.store(1, .monotonic);
+            shared.error_flag.store(1, .release);
             return;
         }
         shared.comp_sizes[idx] = ret;
@@ -85,7 +85,7 @@ fn mtDecompressWorker(shared: *MtDecompShared) void {
     while (true) {
         const idx = shared.next_block.fetchAdd(1, .monotonic);
         if (idx >= shared.num_blocks) return;
-        if (shared.error_flag.load(.monotonic) != 0) return;
+        if (shared.error_flag.load(.acquire) != 0) return;
 
         const dst_off = idx * block_size;
         const blk_len = @min(shared.src.len - dst_off, block_size);
@@ -97,7 +97,7 @@ fn mtDecompressWorker(shared: *MtDecompShared) void {
             shared.comp_sizes[idx],
         );
         if (c.ZSTD_isError(ret) != 0) {
-            shared.error_flag.store(1, .monotonic);
+            shared.error_flag.store(1, .release);
             return;
         }
     }
@@ -161,7 +161,7 @@ pub fn compressBlocksMt(allocator: std.mem.Allocator, src: []const u8, num_threa
         for (threads) |t| t.join();
     }
 
-    if (shared.error_flag.load(.monotonic) != 0) return error.ZstdCompressError;
+    if (shared.error_flag.load(.acquire) != 0) return error.ZstdCompressError;
 
     var total: usize = 0;
     for (comp_sizes[0..num_blocks]) |s| total += s;
@@ -202,5 +202,5 @@ pub fn decompressBlocksMt(allocator: std.mem.Allocator, src: []const u8, dst: []
         for (threads) |t| t.join();
     }
 
-    if (shared.error_flag.load(.monotonic) != 0) return error.ZstdDecompressError;
+    if (shared.error_flag.load(.acquire) != 0) return error.ZstdDecompressError;
 }

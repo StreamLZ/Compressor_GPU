@@ -61,7 +61,9 @@ pub const MappedFile = struct {
     /// Release the memory mapping and close the OS handle.
     pub fn unmap(self: *MappedFile) void {
         if (is_windows) {
+            // Return value ignored: unmap failure is non-recoverable for read-only mappings.
             _ = win32.UnmapViewOfFile(@ptrCast(self.ptr));
+            // Return value ignored: unmap failure is non-recoverable for read-only mappings.
             if (self.map_handle) |h| _ = win32.CloseHandle(h);
         } else {
             const aligned: [*]align(std.heap.page_size_min) u8 = @alignCast(self.ptr);

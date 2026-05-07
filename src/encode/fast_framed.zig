@@ -70,6 +70,7 @@ fn fastScWorker(shared: *FastScContext) void {
     // detection — verified manually.
     if (shared.level == 5) {
         chain_hasher_local = MatchHasher2.init(std.heap.c_allocator, shared.greedy_hash_bits) catch {
+            _ = shared.captured_err.cmpxchgStrong(0, @intFromError(error.OutOfMemory), .release, .monotonic);
             _ = shared.error_flag.store(1, .release);
             return;
         };
@@ -78,6 +79,7 @@ fn fastScWorker(shared: *FastScContext) void {
             .hash_bits = shared.greedy_hash_bits,
             .min_match_length = shared.hasher_k,
         }) catch {
+            _ = shared.captured_err.cmpxchgStrong(0, @intFromError(error.OutOfMemory), .release, .monotonic);
             _ = shared.error_flag.store(1, .release);
             return;
         };
@@ -151,9 +153,7 @@ fn fastScWorker(shared: *FastScContext) void {
 
             if (round_bytes >= 32) {
                 if (areAllBytesEqual(sub_src)) {
-                    out[wpos + 0] = @intCast((round_bytes >> 16) & 0xFF);
-                    out[wpos + 1] = @intCast((round_bytes >> 8) & 0xFF);
-                    out[wpos + 2] = @intCast(round_bytes & 0xFF);
+                    block_header.writeBE24(out[wpos..].ptr, @intCast(round_bytes));
                     @memcpy(out[wpos + 3 ..][0..round_bytes], sub_src);
                     wpos += round_bytes + 3;
                     total_cost += @floatFromInt(round_bytes + 3);
@@ -167,19 +167,23 @@ fn fastScWorker(shared: *FastScContext) void {
                 const start_pos = src_off + sub_off;
 
                 const result = switch (shared.level) {
-                    5 => fast_enc.encodeSubChunkEntropyChain(4, std.heap.c_allocator, &chain_hasher_local.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.entropy_options, shared.parser_config) catch {
+                    5 => fast_enc.encodeSubChunkEntropyChain(4, std.heap.c_allocator, &chain_hasher_local.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.entropy_options, shared.parser_config) catch |err| {
+                        _ = shared.captured_err.cmpxchgStrong(0, @intFromError(err), .release, .monotonic);
                         _ = shared.error_flag.store(1, .release);
                         return;
                     },
-                    3 => fast_enc.encodeSubChunkEntropy(1, std.heap.c_allocator, &greedy_hasher.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.entropy_options, shared.parser_config) catch {
+                    3 => fast_enc.encodeSubChunkEntropy(1, std.heap.c_allocator, &greedy_hasher.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.entropy_options, shared.parser_config) catch |err| {
+                        _ = shared.captured_err.cmpxchgStrong(0, @intFromError(err), .release, .monotonic);
                         _ = shared.error_flag.store(1, .release);
                         return;
                     },
-                    4 => fast_enc.encodeSubChunkEntropy(2, std.heap.c_allocator, &greedy_hasher.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.entropy_options, shared.parser_config) catch {
+                    4 => fast_enc.encodeSubChunkEntropy(2, std.heap.c_allocator, &greedy_hasher.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.entropy_options, shared.parser_config) catch |err| {
+                        _ = shared.captured_err.cmpxchgStrong(0, @intFromError(err), .release, .monotonic);
                         _ = shared.error_flag.store(1, .release);
                         return;
                     },
-                    else => fast_enc.encodeSubChunkRaw(-2, u32, std.heap.c_allocator, &greedy_hasher.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.parser_config) catch {
+                    else => fast_enc.encodeSubChunkRaw(-2, u32, std.heap.c_allocator, &greedy_hasher.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.parser_config) catch |err| {
+                        _ = shared.captured_err.cmpxchgStrong(0, @intFromError(err), .release, .monotonic);
                         _ = shared.error_flag.store(1, .release);
                         return;
                     },
@@ -192,26 +196,20 @@ fn fastScWorker(shared: *FastScContext) void {
                     const hdr: u32 = @as(u32, @intCast(result.bytes_written)) |
                         (@as(u32, @intFromEnum(result.chunk_type)) << lz_constants.sub_chunk_type_shift) |
                         lz_constants.chunk_header_compressed_flag;
-                    out[sub_hdr_pos + 0] = @intCast((hdr >> 16) & 0xFF);
-                    out[sub_hdr_pos + 1] = @intCast((hdr >> 8) & 0xFF);
-                    out[sub_hdr_pos + 2] = @intCast(hdr & 0xFF);
+                    block_header.writeBE24(out[sub_hdr_pos..].ptr, hdr);
                     wpos = sub_payload_start + result.bytes_written;
                     total_cost += lz_cost;
                 } else {
                     wpos = sub_hdr_pos;
                     const hdr: u32 = @as(u32, @intCast(round_bytes)) | lz_constants.chunk_header_compressed_flag;
-                    out[wpos + 0] = @intCast((hdr >> 16) & 0xFF);
-                    out[wpos + 1] = @intCast((hdr >> 8) & 0xFF);
-                    out[wpos + 2] = @intCast(hdr & 0xFF);
+                    block_header.writeBE24(out[wpos..].ptr, hdr);
                     @memcpy(out[wpos + 3 ..][0..round_bytes], sub_src);
                     wpos += 3 + round_bytes;
                     total_cost += sub_memset_cost;
                 }
             } else {
                 const hdr: u32 = @as(u32, @intCast(round_bytes)) | lz_constants.chunk_header_compressed_flag;
-                out[wpos + 0] = @intCast((hdr >> 16) & 0xFF);
-                out[wpos + 1] = @intCast((hdr >> 8) & 0xFF);
-                out[wpos + 2] = @intCast(hdr & 0xFF);
+                block_header.writeBE24(out[wpos..].ptr, hdr);
                 @memcpy(out[wpos + 3 ..][0..round_bytes], sub_src);
                 wpos += 3 + round_bytes;
                 total_cost += sub_memset_cost;
@@ -311,6 +309,12 @@ fn compressFastChunksParallel(
     }
 
     if (shared.error_flag.load(.acquire) != 0) {
+        const code = shared.captured_err.load(.acquire);
+        if (code != 0) {
+            const any_err: anyerror = @errorFromInt(code);
+            const narrow: CompressError = @errorCast(any_err);
+            return narrow;
+        }
         return error.DestinationTooSmall;
     }
 
@@ -625,9 +629,7 @@ pub fn compressFramedOne(
                     // Plain memcpy: 3-byte BE header + raw bytes, with the
                     // compressed flag CLEAR (size ≤ 18 bits).
                     if (pos + round_bytes + 3 > dst.len) return error.DestinationTooSmall;
-                    dst[pos + 0] = @intCast((round_bytes >> 16) & 0xFF);
-                    dst[pos + 1] = @intCast((round_bytes >> 8) & 0xFF);
-                    dst[pos + 2] = @intCast(round_bytes & 0xFF);
+                    block_header.writeBE24(dst[pos..].ptr, @intCast(round_bytes));
                     @memcpy(dst[pos + 3 ..][0..round_bytes], sub_src);
                     pos += round_bytes + 3;
                     // Raw memcpy cost = count + 3.
@@ -663,9 +665,7 @@ pub fn compressFramedOne(
                     const hdr: u32 = @as(u32, @intCast(result.bytes_written)) |
                         (@as(u32, @intFromEnum(result.chunk_type)) << lz_constants.sub_chunk_type_shift) |
                         lz_constants.chunk_header_compressed_flag;
-                    dst[sub_hdr_pos + 0] = @intCast((hdr >> 16) & 0xFF);
-                    dst[sub_hdr_pos + 1] = @intCast((hdr >> 8) & 0xFF);
-                    dst[sub_hdr_pos + 2] = @intCast(hdr & 0xFF);
+                    block_header.writeBE24(dst[sub_hdr_pos..].ptr, hdr);
                     pos = sub_payload_start + result.bytes_written;
                     total_cost += lz_cost;
                 } else {
@@ -675,9 +675,7 @@ pub fn compressFramedOne(
                     pos = sub_hdr_pos;
                     if (pos + 3 + round_bytes > dst.len) return error.DestinationTooSmall;
                     const hdr: u32 = @as(u32, @intCast(round_bytes)) | lz_constants.chunk_header_compressed_flag;
-                    dst[pos + 0] = @intCast((hdr >> 16) & 0xFF);
-                    dst[pos + 1] = @intCast((hdr >> 8) & 0xFF);
-                    dst[pos + 2] = @intCast(hdr & 0xFF);
+                    block_header.writeBE24(dst[pos..].ptr, hdr);
                     @memcpy(dst[pos + 3 ..][0..round_bytes], sub_src);
                     pos += 3 + round_bytes;
                     total_cost += sub_memset_cost;
@@ -686,9 +684,7 @@ pub fn compressFramedOne(
                 // round_bytes < 32: too small to compress.
                 if (pos + 3 + round_bytes > dst.len) return error.DestinationTooSmall;
                 const hdr: u32 = @as(u32, @intCast(round_bytes)) | lz_constants.chunk_header_compressed_flag;
-                dst[pos + 0] = @intCast((hdr >> 16) & 0xFF);
-                dst[pos + 1] = @intCast((hdr >> 8) & 0xFF);
-                dst[pos + 2] = @intCast(hdr & 0xFF);
+                block_header.writeBE24(dst[pos..].ptr, hdr);
                 @memcpy(dst[pos + 3 ..][0..round_bytes], sub_src);
                 pos += 3 + round_bytes;
                 total_cost += sub_memset_cost;

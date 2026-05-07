@@ -831,6 +831,18 @@ pub fn decompressCoreTwoPhase(
             return error.BadChunkHeader;
         }
 
+        // Ensure fallback_tokens are freed even if phase 3 errors out.
+        defer for (phase1_results[0..batch_count]) |*r| {
+            if (r.sub0.fallback_tokens) |f| {
+                std.heap.c_allocator.free(f);
+                r.sub0.fallback_tokens = null;
+            }
+            if (r.sub1.fallback_tokens) |f| {
+                std.heap.c_allocator.free(f);
+                r.sub1.fallback_tokens = null;
+            }
+        };
+
         // Phase 3: serial ProcessLzRuns for this batch.
         for (0..batch_count) |j| {
             const r = &phase1_results[j];

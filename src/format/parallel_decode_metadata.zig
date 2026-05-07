@@ -147,9 +147,11 @@ fn readVarint(src: []const u8) ParseError!VarintRead {
         if (pos >= src.len) return error.Truncated;
         const b = src[pos];
         pos += 1;
+        // At shift 63, only bit 0 is valid (bit 63 of the u64). Reject
+        // any byte that sets bits 1-6, which would overflow a u64.
+        if (shift >= 63 and (b & 0x7E) != 0) return error.VarintTooLong;
         v |= @as(u64, b & 0x7f) << shift;
         if ((b & 0x80) == 0) break;
-        if (shift >= 63) return error.VarintTooLong;
         shift += 7;
     }
     return .{ .value = v, .consumed = pos };
@@ -385,6 +387,12 @@ pub fn parseBlockBody(src: []const u8, allocator: std.mem.Allocator) ParseError!
     const nr = try readVarintFast(src[pos..]);
     pos += nr.consumed;
     const num_literal_runs: usize = @intCast(nr.value);
+
+    // Validate counts against remaining input size before allocating.
+    // A match op needs at least 3 varint bytes (delta_target + offset + length).
+    if (num_match_ops > (src.len - pos) / 3) return error.Truncated;
+    // A literal run needs at least 2 varint bytes (delta_position + run_length).
+    if (num_literal_runs > (src.len - pos) / 2) return error.Truncated;
 
     const match_ops = try allocator.alloc(MatchOp, num_match_ops);
     errdefer allocator.free(match_ops);

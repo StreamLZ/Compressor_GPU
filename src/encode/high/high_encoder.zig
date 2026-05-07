@@ -541,8 +541,7 @@ pub fn assembleCompressedOutput(
             ctx.allocator,
             dst_slice,
             u8_offs_slice,
-            writer.far_offsets_start,
-            num_off,
+            writer.far_offsets_start[0..num_off],
             ctx.entropy_options,
             ctx.speed_tradeoff,
             8, // min_match_len == 8: takes the fast path at line 567
