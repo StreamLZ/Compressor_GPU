@@ -1055,3 +1055,12 @@ test "compressFramed: dst too small returns error.DestinationTooSmall" {
     const result = compressFramed(testing.allocator, src, &dst, .{ .level = 1 });
     try testing.expectError(error.DestinationTooSmall, result);
 }
+
+test "compressFramed handles OOM cleanly" {
+    // Use a FailingAllocator that fails after 0 allocations (immediate OOM).
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const src = "The quick brown fox jumps over the lazy dog. " ** 100;
+    var dst: [compressBound(src.len)]u8 = undefined;
+    const result = compressFramed(failing.allocator(), src, &dst, .{ .level = 1 });
+    try testing.expectError(error.OutOfMemory, result);
+}

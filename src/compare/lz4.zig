@@ -138,7 +138,7 @@ pub const MtResult = struct {
     }
 };
 
-pub fn compressMt(allocator: std.mem.Allocator, src: []const u8, num_threads: usize, hc_level: ?c_int) !MtResult {
+pub fn compressMt(allocator: std.mem.Allocator, io: std.Io, src: []const u8, num_threads: usize, hc_level: ?c_int) !MtResult {
     const num_blocks = (src.len + block_size - 1) / block_size;
 
     const comp_bufs = try allocator.alloc([]u8, num_blocks);
@@ -170,16 +170,13 @@ pub fn compressMt(allocator: std.mem.Allocator, src: []const u8, num_threads: us
     if (worker_count <= 1) {
         mtCompressWorker(&shared);
     } else {
-        const threads = try allocator.alloc(std.Thread, worker_count);
-        defer allocator.free(threads);
-        var spawned: usize = 0;
-        while (spawned < worker_count) : (spawned += 1) {
-            threads[spawned] = std.Thread.spawn(.{}, mtCompressWorker, .{&shared}) catch {
-                for (threads[0..spawned]) |t| t.join();
-                return error.Lz4CompressError;
+        var group: std.Io.Group = .init;
+        for (0..worker_count) |_| {
+            group.concurrent(io, mtCompressWorker, .{&shared}) catch |err| switch (err) {
+                error.ConcurrencyUnavailable => mtCompressWorker(&shared),
             };
         }
-        for (threads) |t| t.join();
+        group.await(io) catch {};
     }
 
     if (shared.error_flag.load(.acquire) != 0) return error.Lz4CompressError;
@@ -196,7 +193,7 @@ pub fn compressMt(allocator: std.mem.Allocator, src: []const u8, num_threads: us
     };
 }
 
-pub fn decompressMt(allocator: std.mem.Allocator, src: []const u8, dst: []u8, result: *const MtResult, num_threads: usize) !void {
+pub fn decompressMt(io: std.Io, src: []const u8, dst: []u8, result: *const MtResult, num_threads: usize) !void {
     var shared: MtDecompShared = .{
         .src = src,
         .comp_bufs = result.comp_bufs,
@@ -211,16 +208,13 @@ pub fn decompressMt(allocator: std.mem.Allocator, src: []const u8, dst: []u8, re
     if (worker_count <= 1) {
         mtDecompressWorker(&shared);
     } else {
-        const threads = try allocator.alloc(std.Thread, worker_count);
-        defer allocator.free(threads);
-        var spawned: usize = 0;
-        while (spawned < worker_count) : (spawned += 1) {
-            threads[spawned] = std.Thread.spawn(.{}, mtDecompressWorker, .{&shared}) catch {
-                for (threads[0..spawned]) |t| t.join();
-                return error.Lz4DecompressError;
+        var group: std.Io.Group = .init;
+        for (0..worker_count) |_| {
+            group.concurrent(io, mtDecompressWorker, .{&shared}) catch |err| switch (err) {
+                error.ConcurrencyUnavailable => mtDecompressWorker(&shared),
             };
         }
-        for (threads) |t| t.join();
+        group.await(io) catch {};
     }
 
     if (shared.error_flag.load(.acquire) != 0) return error.Lz4DecompressError;

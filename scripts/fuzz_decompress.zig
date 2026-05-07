@@ -11,20 +11,16 @@ const slz = @import("streamlz");
 /// ReleaseSafe catches via bounds/overflow checks.
 ///
 /// Works with AFL (@@), honggfuzz, or manual corpus files.
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args_it = try init.minimal.args.iterateAllocator(allocator);
+    defer args_it.deinit();
+    _ = args_it.next(); // skip argv[0]
+    const path = args_it.next() orelse return;
 
-    if (args.len < 2) return;
-
-    const file = std.fs.cwd().openFile(args[1], .{}) catch return;
-    defer file.close();
-
-    const input = file.readToEndAlloc(allocator, 1 << 24) catch return;
+    const input = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, @enumFromInt(1 << 24)) catch return;
     defer allocator.free(input);
 
     var dst: [1 << 24]u8 = undefined;

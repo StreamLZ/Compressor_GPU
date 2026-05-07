@@ -410,7 +410,7 @@ fn runCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
 
         switch (args.engine) {
             .zstd_engine => {
-                var result = zstd.compressBlocksMt(allocator, src, threads, @intCast(level)) catch |err| {
+                var result = zstd.compressBlocksMt(allocator, io, src, threads, @intCast(level)) catch |err| {
                     try w.print("error: zstd compression failed: {s}\n", .{@errorName(err)});
                     try w.flush();
                     std.process.exit(1);
@@ -426,7 +426,7 @@ fn runCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
             },
             .lz4_engine => {
                 const hc_level: ?c_int = if (level > 1) @intCast(level) else null;
-                var result = lz4.compressMt(allocator, src, threads, hc_level) catch |err| {
+                var result = lz4.compressMt(allocator, io, src, threads, hc_level) catch |err| {
                     try w.print("error: lz4 compression failed: {s}\n", .{@errorName(err)});
                     try w.flush();
                     std.process.exit(1);
@@ -570,14 +570,14 @@ fn runDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, ar
 
         switch (args.engine) {
             .zstd_engine => {
-                var result = zstd.compressBlocksMt(allocator, src, threads, level) catch |err| {
+                var result = zstd.compressBlocksMt(allocator, io, src, threads, level) catch |err| {
                     try w.print("error: zstd compress failed: {s}\n", .{@errorName(err)});
                     std.process.exit(1);
                 };
                 defer result.deinit();
                 const dec_buf = try allocator.alloc(u8, src.len);
                 defer allocator.free(dec_buf);
-                zstd.decompressBlocksMt(allocator, src, dec_buf, &result, threads) catch |err| {
+                zstd.decompressBlocksMt(io, src, dec_buf, &result, threads) catch |err| {
                     try w.print("error: zstd decompress failed: {s}\n", .{@errorName(err)});
                     std.process.exit(1);
                 };
@@ -585,14 +585,14 @@ fn runDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, ar
             },
             .lz4_engine => {
                 const hc_level: ?c_int = if (level > 1) level else null;
-                var result = lz4.compressMt(allocator, src, threads, hc_level) catch |err| {
+                var result = lz4.compressMt(allocator, io, src, threads, hc_level) catch |err| {
                     try w.print("error: lz4 compress failed: {s}\n", .{@errorName(err)});
                     std.process.exit(1);
                 };
                 defer result.deinit();
                 const dec_buf = try allocator.alloc(u8, src.len);
                 defer allocator.free(dec_buf);
-                lz4.decompressMt(allocator, src, dec_buf, &result, threads) catch |err| {
+                lz4.decompressMt(io, src, dec_buf, &result, threads) catch |err| {
                     try w.print("error: lz4 decompress failed: {s}\n", .{@errorName(err)});
                     std.process.exit(1);
                 };
@@ -1116,17 +1116,17 @@ const BenchCompareRow = struct {
 /// a single `run()` method so the timed best-of-N loop can be shared.
 const BenchDecomp = union(enum) {
     lz4_st: struct { dst: []u8, comp: []const u8, orig_size: usize },
-    lz4_mt: struct { alloc: std.mem.Allocator, src: []const u8, dst: []u8, mt: *const lz4.MtResult, threads: usize },
+    lz4_mt: struct { io: std.Io, src: []const u8, dst: []u8, mt: *const lz4.MtResult, threads: usize },
     zstd_st: struct { dst: []u8, comp: []const u8 },
-    zstd_mt: struct { alloc: std.mem.Allocator, src: []const u8, dst: []u8, mt: *const zstd.MtResult, threads: usize },
+    zstd_mt: struct { io: std.Io, src: []const u8, dst: []u8, mt: *const zstd.MtResult, threads: usize },
     slz: struct { ctx: *decoder.DecompressContext, comp: []const u8, dst: []u8 },
 
     fn run(self: BenchDecomp) !void {
         switch (self) {
             .lz4_st => |s| _ = try lz4.decompress(s.dst, s.comp, s.orig_size),
-            .lz4_mt => |s| try lz4.decompressMt(s.alloc, s.src, s.dst, s.mt, s.threads),
+            .lz4_mt => |s| try lz4.decompressMt(s.io, s.src, s.dst, s.mt, s.threads),
             .zstd_st => |s| _ = try zstd.decompress(s.dst, s.comp),
-            .zstd_mt => |s| try zstd.decompressBlocksMt(s.alloc, s.src, s.dst, s.mt, s.threads),
+            .zstd_mt => |s| try zstd.decompressBlocksMt(s.io, s.src, s.dst, s.mt, s.threads),
             .slz => |s| _ = try s.ctx.decompress(s.comp, s.dst),
         }
     }
@@ -1217,12 +1217,12 @@ fn runBenchCompare(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, 
             }
         } else {
             const comp_timer = std.Io.Clock.awake.now(io);
-            var mt_result: ?lz4.MtResult = lz4.compressMt(allocator, src, @intCast(threads), null) catch null;
+            var mt_result: ?lz4.MtResult = lz4.compressMt(allocator, io, src, @intCast(threads), null) catch null;
             const comp_ns = @as(u64, @intCast(comp_timer.untilNow(io, .awake).toNanoseconds()));
             if (mt_result) |*mr| {
                 defer mr.deinit();
                 try benchmarkCodec(lz4_label, mr.total_compressed, comp_ns,
-                    .{ .lz4_mt = .{ .alloc = allocator, .src = src, .dst = decompressed[0..src.len], .mt = mr, .threads = @intCast(threads) } },
+                    .{ .lz4_mt = .{ .io = io, .src = src, .dst = decompressed[0..src.len], .mt = mr, .threads = @intCast(threads) } },
                     src.len, mb, runs, io, w, &results, &result_count);
             } else {
                 try w.writeAll(" FAILED\n");
@@ -1259,12 +1259,12 @@ fn runBenchCompare(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, 
             }
         } else {
             const comp_timer = std.Io.Clock.awake.now(io);
-            var mt_result: ?lz4.MtResult = lz4.compressMt(allocator, src, @intCast(threads), hc_level) catch null;
+            var mt_result: ?lz4.MtResult = lz4.compressMt(allocator, io, src, @intCast(threads), hc_level) catch null;
             const comp_ns = @as(u64, @intCast(comp_timer.untilNow(io, .awake).toNanoseconds()));
             if (mt_result) |*mr| {
                 defer mr.deinit();
                 try benchmarkCodec(label, mr.total_compressed, comp_ns,
-                    .{ .lz4_mt = .{ .alloc = allocator, .src = src, .dst = decompressed[0..src.len], .mt = mr, .threads = @intCast(threads) } },
+                    .{ .lz4_mt = .{ .io = io, .src = src, .dst = decompressed[0..src.len], .mt = mr, .threads = @intCast(threads) } },
                     src.len, mb, runs, io, w, &results, &result_count);
             } else {
                 try w.writeAll(" FAILED\n");
@@ -1301,12 +1301,12 @@ fn runBenchCompare(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, 
             }
         } else {
             const comp_timer = std.Io.Clock.awake.now(io);
-            var mt_result: ?zstd.MtResult = zstd.compressBlocksMt(allocator, src, @intCast(threads), zstd_level) catch null;
+            var mt_result: ?zstd.MtResult = zstd.compressBlocksMt(allocator, io, src, @intCast(threads), zstd_level) catch null;
             const comp_ns = @as(u64, @intCast(comp_timer.untilNow(io, .awake).toNanoseconds()));
             if (mt_result) |*mr| {
                 defer mr.deinit();
                 try benchmarkCodec(label, mr.total_compressed, comp_ns,
-                    .{ .zstd_mt = .{ .alloc = allocator, .src = src, .dst = decompressed[0..src.len], .mt = mr, .threads = @intCast(threads) } },
+                    .{ .zstd_mt = .{ .io = io, .src = src, .dst = decompressed[0..src.len], .mt = mr, .threads = @intCast(threads) } },
                     src.len, mb, runs, io, w, &results, &result_count);
             } else {
                 try w.writeAll(" FAILED\n");
@@ -1489,7 +1489,7 @@ fn runForwardAnalyze(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer
     const bound = encoder.compressBound(src.len);
     const comp_buf = try allocator.alloc(u8, bound);
     defer allocator.free(comp_buf);
-    const slz_size = encoder.compressFramed(allocator, src, comp_buf, .{ .level = 1 }) catch 0;
+    const slz_size = encoder.compressFramedWithIo(allocator, io, src, comp_buf, .{ .level = 1 }) catch 0;
     if (slz_size > 0) {
         const slz_ratio = @as(f64, @floatFromInt(slz_size)) / @as(f64, @floatFromInt(src.len)) * 100.0;
         try w.print("\nStreamLZ L1: {d:>12} bytes ({d:.1}%)\n", .{ slz_size, slz_ratio });
@@ -1586,11 +1586,13 @@ fn runTrain(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: A
         const comp_buf = allocator.alloc(u8, bound) catch continue;
         defer allocator.free(comp_buf);
 
+        // Serial intentional: small sample, parallel overhead not worth it.
         const no_dict_size = encoder.compressFramed(allocator, sample, comp_buf, .{
             .level = 3,
         }) catch continue;
         total_no_dict += no_dict_size;
 
+        // Serial intentional: small sample, parallel overhead not worth it.
         const with_dict_size = encoder.compressFramed(allocator, sample, comp_buf, .{
             .level = 3,
             .dictionary = result.dict,

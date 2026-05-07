@@ -730,7 +730,7 @@ pub fn analyzeFilePartition(
     // Pass 2a: bucket the tokens + count the cheap proxy (low-earliest).
     // Also identify seeds: tokens whose src_start < their own
     // sub_chunk_start (the match reaches before its sub-chunk's start).
-    var seed_queue: std.ArrayList(u32) = .{};
+    var seed_queue: std.ArrayList(u32) = .empty;
     defer seed_queue.deinit(allocator);
     const in_closure = try allocator.alloc(u8, tokens.items.len);
     defer allocator.free(in_closure);
@@ -854,36 +854,28 @@ pub fn analyzeFilePartition(
             bytes_moved_warmup += length;
         }
 
-        // Timed runs: take the best of 20 iterations. This version iterates
-        // the FULL tokens list (all 7-16M entries) and branches on
-        // in_closure[idx]. O(N_total).
-        var best_ns: u64 = std.math.maxInt(u64);
+        // Execute the full-list benchmark pass once to measure bytes_moved.
+        // Timing intentionally omitted: this diagnostic path does not have
+        // access to std.Io, and std.time.Timer was removed in Zig 0.16.
         var bytes_moved: u64 = 0;
-        var iter: u32 = 0;
-        while (iter < 20) : (iter += 1) {
-            bytes_moved = 0;
-            var phase1_timer = try std.time.Timer.start();
-            for (tokens.items, 0..) |t, idx| {
-                if (in_closure[idx] == 0) continue;
-                const length: usize = t.length;
-                if (length == 0) continue;
-                if (t.src_start < 0) continue;
-                const src_u: u64 = @intCast(t.src_start);
-                const tgt_u: u64 = t.target_start;
-                if (src_u + length > total_decomp) continue;
-                if (tgt_u + length > total_decomp) continue;
-                const src_begin: usize = @intCast(src_u);
-                const tgt_begin: usize = @intCast(tgt_u);
-                var i: usize = 0;
-                while (i < length) : (i += 1) {
-                    dst_scratch[tgt_begin + i] = dst_scratch[src_begin + i];
-                }
-                bytes_moved += length;
+        for (tokens.items, 0..) |t, idx| {
+            if (in_closure[idx] == 0) continue;
+            const length: usize = t.length;
+            if (length == 0) continue;
+            if (t.src_start < 0) continue;
+            const src_u: u64 = @intCast(t.src_start);
+            const tgt_u: u64 = t.target_start;
+            if (src_u + length > total_decomp) continue;
+            if (tgt_u + length > total_decomp) continue;
+            const src_begin: usize = @intCast(src_u);
+            const tgt_begin: usize = @intCast(tgt_u);
+            var i: usize = 0;
+            while (i < length) : (i += 1) {
+                dst_scratch[tgt_begin + i] = dst_scratch[src_begin + i];
             }
-            const elapsed = phase1_timer.read();
-            if (elapsed < best_ns) best_ns = elapsed;
+            bytes_moved += length;
         }
-        stats.phase1_execute_only_ns = best_ns;
+        stats.phase1_execute_only_ns = 0; // timing omitted (no Io available)
         stats.phase1_execute_bytes = bytes_moved;
 
         // Compact version: build a dedicated list of closure tokens, then
@@ -892,7 +884,7 @@ pub fn analyzeFilePartition(
         // you'd pay in a real decoder where the encoder emits the closure
         // as a separate compact stream rather than as a bit flag on a full
         // token list.
-        var closure_compact: std.ArrayList(TokenInfo) = .{};
+        var closure_compact: std.ArrayList(TokenInfo) = .empty;
         defer closure_compact.deinit(allocator);
         for (tokens.items, 0..) |t, idx| {
             if (in_closure[idx] != 0) {
@@ -900,29 +892,23 @@ pub fn analyzeFilePartition(
             }
         }
 
-        var best_compact_ns: u64 = std.math.maxInt(u64);
-        iter = 0;
-        while (iter < 20) : (iter += 1) {
-            var phase1_timer = try std.time.Timer.start();
-            for (closure_compact.items) |t| {
-                const length: usize = t.length;
-                if (length == 0) continue;
-                if (t.src_start < 0) continue;
-                const src_u: u64 = @intCast(t.src_start);
-                const tgt_u: u64 = t.target_start;
-                if (src_u + length > total_decomp) continue;
-                if (tgt_u + length > total_decomp) continue;
-                const src_begin: usize = @intCast(src_u);
-                const tgt_begin: usize = @intCast(tgt_u);
-                var i: usize = 0;
-                while (i < length) : (i += 1) {
-                    dst_scratch[tgt_begin + i] = dst_scratch[src_begin + i];
-                }
+        // Compact-list benchmark pass (timing omitted, same reason as above).
+        for (closure_compact.items) |t| {
+            const length: usize = t.length;
+            if (length == 0) continue;
+            if (t.src_start < 0) continue;
+            const src_u: u64 = @intCast(t.src_start);
+            const tgt_u: u64 = t.target_start;
+            if (src_u + length > total_decomp) continue;
+            if (tgt_u + length > total_decomp) continue;
+            const src_begin: usize = @intCast(src_u);
+            const tgt_begin: usize = @intCast(tgt_u);
+            var i: usize = 0;
+            while (i < length) : (i += 1) {
+                dst_scratch[tgt_begin + i] = dst_scratch[src_begin + i];
             }
-            const elapsed = phase1_timer.read();
-            if (elapsed < best_compact_ns) best_compact_ns = elapsed;
         }
-        stats.phase1_execute_compact_ns = best_compact_ns;
+        stats.phase1_execute_compact_ns = 0; // timing omitted (no Io available)
     }
 
     return stats;
