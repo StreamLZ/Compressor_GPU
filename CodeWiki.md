@@ -189,6 +189,34 @@ decode it would speed up. Kept for offline diagnostic work.
 
 ---
 
+## Per-token serial dependency and L1 load latency
+
+Every LZ decompressor has a serial pointer chase through the compressed
+stream: read token → decode lengths → copy literals → advance src
+pointer → read next token. The critical path per token is:
+
+```
+load [src]  →  decode (ALU)  →  compute new src  →  load [src]
+   4-5 cyc       2-3 cyc           1 cyc             4-5 cyc
+```
+
+On Skylake (4-cycle L1 load): ~11 cycles/token.
+On Arrow Lake (5-cycle L1 load): ~13 cycles/token.
+That 18% per-clock penalty is architectural — no code change can fix it.
+
+Verified empirically: the LZTurbo binary's exact instruction sequence
+(extracted via VTune, reassembled as a .s file) runs at 3,756 MB/s on
+Arrow Lake vs the author's published 3,970 MB/s on Skylake — matching
+the predicted ratio after adjusting for clock speed and load latency.
+
+StreamLZ's Fast decoder has the same serial dependency through
+`cmd_stream`. The architectural response is SC group-parallel decode:
+each thread runs its own independent pointer chase, so aggregate
+throughput is memory-bandwidth-bound (~40 GB/s at 24 threads), not
+latency-bound. This is the primary reason L1-L5 use SC encoding.
+
+---
+
 ## Glossary
 
 | Term | Meaning |
