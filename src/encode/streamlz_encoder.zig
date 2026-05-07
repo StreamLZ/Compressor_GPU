@@ -360,6 +360,20 @@ pub fn compressFramedWithIo(
 const testing = std.testing;
 const decoder = @import("../decode/streamlz_decoder.zig");
 
+fn comptimeRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    @setEvalBranchQuota(s.len * n * 4);
+    return comptime blk: {
+        var buf: [s.len * n]u8 = @splat(0);
+        for (0..n) |i| {
+            for (s, 0..) |c, j| {
+                buf[i * s.len + j] = c;
+            }
+        }
+        const final = buf;
+        break :blk &final;
+    };
+}
+
 fn roundtrip(source: []const u8, level: u8) !void {
     const allocator = testing.allocator;
     const bound = compressBound(source.len);
@@ -1059,7 +1073,7 @@ test "compressFramed: dst too small returns error.DestinationTooSmall" {
 test "compressFramed handles OOM cleanly" {
     // Use a FailingAllocator that fails after 0 allocations (immediate OOM).
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    const src = "The quick brown fox jumps over the lazy dog. " ** 100;
+    const src = comptimeRepeat("The quick brown fox jumps over the lazy dog. ", 100);
     var dst: [compressBound(src.len)]u8 = undefined;
     const result = compressFramed(failing.allocator(), src, &dst, .{ .level = 1 });
     try testing.expectError(error.OutOfMemory, result);

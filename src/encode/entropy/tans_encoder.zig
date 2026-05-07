@@ -312,7 +312,7 @@ pub fn tansInitTable(
 
     const slots_left: u32 = L - ones;
     const sa: u32 = slots_left >> 2;
-    var pointers: [4]u32 = .{0} ** 4;
+    var pointers: [4]u32 = @splat(0);
     var sb: u32 = sa + (if ((slots_left & 3) > 0) @as(u32, 1) else 0);
     pointers[1] = sb;
     sb += sa + (if ((slots_left & 3) > 1) @as(u32, 1) else 0);

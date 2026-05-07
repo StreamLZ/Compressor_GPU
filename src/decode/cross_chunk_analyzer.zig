@@ -3104,7 +3104,7 @@ pub fn analyzeFile(allocator: std.mem.Allocator, src: []const u8) !FileStats {
         .total_bytes = 0,
         .total_clean = 0,
         .total_match_tokens = 0,
-        .round_histogram = [_]u64{0} ** 65536,
+        .round_histogram = @splat(0),
     };
     errdefer stats.deinit(allocator);
 

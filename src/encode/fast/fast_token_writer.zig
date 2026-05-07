@@ -438,7 +438,7 @@ test "writeLengthValue extended 3-byte path" {
 }
 
 test "writeOffset fast path emits one token byte and one u16" {
-    var buf: [32]u8 = .{0} ** 32;
+    var buf: [32]u8 = @splat(0);
     // Set up source with some literal bytes at the start.
     buf[0] = 'A';
     buf[1] = 'B';

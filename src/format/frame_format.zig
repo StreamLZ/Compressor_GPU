@@ -303,7 +303,7 @@ const testing = std.testing;
 
 test "parseHeader rejects non-SLZ1 magic" {
     // min_header_size bytes of garbage with the wrong magic up front.
-    const bogus = [_]u8{ 'N', 'O', 'P', 'E' } ++ [_]u8{0} ** (min_header_size - 4);
+    const bogus = [_]u8{ 'N', 'O', 'P', 'E' } ++ @as([min_header_size - 4]u8, @splat(0));
     try testing.expectError(error.BadMagic, parseHeader(&bogus));
 }
 

@@ -42,7 +42,7 @@ pub fn main() void {
 
     std.debug.print("Running {d} tests on {d} threads...\n", .{ test_fns.len, worker_count });
 
-    var threads: [16]?std.Thread = .{null} ** 16;
+    var threads: [16]?std.Thread = @splat(null);
     for (0..worker_count) |wi| {
         threads[wi] = std.Thread.spawn(.{}, workerFn, .{}) catch null;
     }

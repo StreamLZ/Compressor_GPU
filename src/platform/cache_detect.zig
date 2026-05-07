@@ -170,7 +170,7 @@ fn detectLinuxSysfs() CacheSizes {
 // ────────────────────────────────────────────────────────────
 
 pub fn cpuBrandString() [48]u8 {
-    var buf: [48]u8 = .{0} ** 48;
+    var buf: [48]u8 = @splat(0);
     if (comptime builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86) {
         const max_ext = cpuid(0x80000000, 0).eax;
         if (max_ext >= 0x80000004) {

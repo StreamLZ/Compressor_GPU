@@ -109,8 +109,8 @@ pub fn calculateMaxThreads(src_len: usize) u32 {
 pub const CoreInfo = struct {
     p_core_count: u32,
     e_core_count: u32,
-    p_core_ids: [64]u32 = .{0} ** 64,
-    e_core_ids: [64]u32 = .{0} ** 64,
+    p_core_ids: [64]u32 = @splat(0),
+    e_core_ids: [64]u32 = @splat(0),
     total_cores: u32,
     is_hybrid: bool,
 };

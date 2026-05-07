@@ -848,6 +848,20 @@ pub fn runLazyParserChain(
 
 const testing = std.testing;
 
+fn comptimeRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    @setEvalBranchQuota(s.len * n * 4);
+    return comptime blk: {
+        var buf: [s.len * n]u8 = @splat(0);
+        for (0..n) |i| {
+            for (s, 0..) |c, j| {
+                buf[i * s.len + j] = c;
+            }
+        }
+        const final = buf;
+        break :blk &final;
+    };
+}
+
 test "runGreedyParser runs over a short source without crashing" {
     // Pattern with a clear repetition: "abcdefghabcdefghabcdefgh..."
     var src: [256]u8 = undefined;
@@ -924,7 +938,7 @@ test "on-the-fly skip: no skip_accumulator state needed" {
 
 test "u32 hash positions: parser roundtrips with u32 hasher" {
     // Verify the parser works with u32 hash positions (not u16).
-    const pattern = "ABCDEFGH" ** 64; // 512 bytes, repeating
+    const pattern = comptimeRepeat("ABCDEFGH", 64);
     var src: [512]u8 = undefined;
     @memcpy(&src, pattern);
 
@@ -969,7 +983,7 @@ test "parser roundtrip: compress via encoder, decompress, compare" {
     const decoder = @import("../../decode/fast/fast_lz_decoder.zig");
     const lz_constants = @import("../../format/streamlz_constants.zig");
 
-    const pat = "ABCDEFGH" ** 128; // 1024 bytes, highly repeating
+    const pat = comptimeRepeat("ABCDEFGH", 128);
     var src: [1024]u8 = undefined;
     @memcpy(&src, pat);
 

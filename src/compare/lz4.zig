@@ -1,10 +1,13 @@
 //! LZ4/LZ4HC C library bindings for benchmark comparison.
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("lz4.h");
-    @cInclude("lz4hc.h");
-});
+
+const c = struct {
+    extern fn LZ4_compress_default(src: [*c]const u8, dst: [*c]u8, srcSize: c_int, dstCapacity: c_int) c_int;
+    extern fn LZ4_compress_HC(src: [*c]const u8, dst: [*c]u8, srcSize: c_int, dstCapacity: c_int, compressionLevel: c_int) c_int;
+    extern fn LZ4_decompress_safe(src: [*c]const u8, dst: [*c]u8, compressedSize: c_int, dstCapacity: c_int) c_int;
+    extern fn LZ4_compressBound(inputSize: c_int) c_int;
+};
 
 pub const block_size: usize = 4 * 1024 * 1024; // 4 MB, same as LZ4 CLI default
 

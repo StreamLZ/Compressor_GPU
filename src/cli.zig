@@ -1185,7 +1185,7 @@ fn runBenchCompare(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, 
     try w.print("threads: {d}, runs: {d}\n\n", .{ threads, runs });
     try w.flush();
 
-    var results: [16]BenchCompareRow = [_]BenchCompareRow{.{}} ** 16;
+    var results: [16]BenchCompareRow = @splat(.{});
     var result_count: usize = 0;
 
     // Shared buffers — allocate to the max bound across all compressors.

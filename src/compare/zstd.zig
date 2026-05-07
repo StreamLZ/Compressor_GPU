@@ -1,9 +1,20 @@
 //! Zstd C library bindings for benchmark comparison.
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("zstd.h");
-});
+
+const ZSTD_CCtx = opaque {};
+const c = struct {
+    extern fn ZSTD_compress(dst: [*c]u8, dstCapacity: usize, src: [*c]const u8, srcSize: usize, compressionLevel: c_int) usize;
+    extern fn ZSTD_decompress(dst: [*c]u8, dstCapacity: usize, src: [*c]const u8, compressedSize: usize) usize;
+    extern fn ZSTD_compressBound(srcSize: usize) usize;
+    extern fn ZSTD_isError(code: usize) c_uint;
+    extern fn ZSTD_createCCtx() ?*ZSTD_CCtx;
+    extern fn ZSTD_freeCCtx(cctx: *ZSTD_CCtx) usize;
+    extern fn ZSTD_CCtx_setParameter(cctx: *ZSTD_CCtx, param: c_int, value: c_int) usize;
+    extern fn ZSTD_compress2(cctx: *ZSTD_CCtx, dst: [*c]u8, dstCapacity: usize, src: [*c]const u8, srcSize: usize) usize;
+    const ZSTD_c_compressionLevel: c_int = 100;
+    const ZSTD_c_nbWorkers: c_int = 400;
+};
 
 pub const block_size: usize = 4 * 1024 * 1024; // 4 MB independent blocks
 
