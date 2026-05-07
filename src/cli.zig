@@ -1411,8 +1411,9 @@ fn runBenchCompare(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, 
         });
     }
 
+    try w.writeAll("\nVersions: LZ4 1.10.0, zstd 1.5.7, LZTurbo 1.2 (Zig reimpl)\n");
     if (threads == 1) {
-        try w.writeAll("\nSingle-threaded: all compressors use full-stream mode (no block splitting).\n");
+        try w.writeAll("Single-threaded: all compressors use full-stream mode (no block splitting).\n");
     } else {
         try w.print("\nThreading ({d} threads, 4 MB independent blocks):\n", .{threads});
         try w.writeAll("  LZ4:      compress MT, decompress MT\n");
