@@ -7,12 +7,14 @@ Internal reference for contributors. For user-facing docs see [README.md](README
 ## Source layout
 
 ```
-build.zig                         Zig 0.15.2 build script
+build.zig                         Zig 0.16 build script
 build.zig.zon
 src/
   main.zig                        CLI dispatcher
   cli.zig                         CLI argument parser + command handlers
   streamlz.zig                    public library API (re-exports)
+  capi.zig                        C-ABI exports (slz_compress, slz_decompress, error codes)
+  test_runner_parallel.zig        Parallel test runner for zig build test/ptest
   dict/
     dictionary.zig                dictionary registry + auto-detect
     trainer.zig                   FASTCOVER dictionary trainer
@@ -21,9 +23,9 @@ src/
     streamlz_constants.zig        centralized constants
     frame_format.zig              SLZ1 frame + block headers
     block_header.zig              internal 2-byte + 4-byte chunk headers
-    parallel_decode_metadata.zig  sidecar wire format
+    parallel_decode_metadata.zig  sidecar wire format (legacy)
   io/
-    BitReader.zig                 MSB-first bit reader
+    bit_reader.zig                MSB-first bit reader
     bit_writer.zig                4 bit-writer variants (with debug bounds)
     copy_helpers.zig              SIMD copy helpers + alignment
     ptr_math.zig                  signed-offset pointer arithmetic
@@ -32,8 +34,8 @@ src/
     mmap.zig                      cross-platform mmap helpers (read/read-write)
   decode/
     streamlz_decoder.zig          framed decompress + DecompressContext
-    decompress_parallel.zig       parallel dispatch (SC + two-phase + sidecar)
-    cross_chunk_analyzer.zig      sidecar builder + DAG analyzer
+    decompress_parallel.zig       parallel dispatch (SC + two-phase)
+    cross_chunk_analyzer.zig      cross-chunk dependency analyzer (legacy sidecar builder)
     fixture_tests.zig             test-only: fixture roundtrips
     fast/
       fast_lz_decoder.zig         L1-L5 codec hot loop
@@ -46,10 +48,11 @@ src/
       tans_decoder.zig            tANS 5-state decode
       bit_reader_lite.zig         shared Golomb-Rice infrastructure
   encode/
-    streamlz_encoder.zig          public compress API (~667 lines)
+    streamlz_encoder.zig          public compress API
     fast_framed.zig               Fast codec frame builder
     high_framed.zig               High codec frame builder
     compress_parallel.zig         parallel compress dispatch
+    forward_lz.zig                Forward-LZ experimental module
     cost_coefficients.zig         empirical timing coefficients
     match_eval.zig                shared match evaluation helpers
     match_hasher.zig              MatchHasher family (bucket-based)
@@ -59,7 +62,7 @@ src/
     fast/
       fast_lz_encoder.zig         sub-chunk encoders (raw/entropy)
       fast_lz_parser.zig          greedy + lazy chain parser
-      FastStreamWriter.zig        6-stream output buffer
+      fast_stream_writer.zig      6-stream output buffer
       fast_match_hasher.zig       single-entry Fibonacci hash
       fast_token_writer.zig       Fast cmd encoding helpers
       fast_constants.zig          level mapping + min-match table
@@ -78,7 +81,7 @@ src/
     entropy/
       entropy_encoder.zig         encodeArrayU8 + tANS + memcpy
       tans_encoder.zig            tANS encoder
-      ByteHistogram.zig           byte frequency histogram
+      byte_histogram.zig          byte frequency histogram
 ```
 
 The decode side has zero dependencies on the encode side; either can be vendored
@@ -104,8 +107,7 @@ independently.
 | Levels | Strategy | How it works |
 |--------|----------|--------------|
 | L1 | SC group-parallel | Encoder compresses each 256KB chunk independently (no cross-chunk refs). Decoded via `decompressCoreParallel` using frame header's `sc_group_size`. No sidecar. |
-| L2-L4 | Sidecar (small) | Per-block BFS closure sidecar (~150 KB/100 MB). Workers decode contiguous slices independently. |
-| L5 | Sidecar (large) | Per-block sidecar (~1.2 MB/100 MB) with cross-chunk source bytes at depth ≥ 1. |
+| L2-L5 | SC group-parallel | Encoder constrains chunks to self-contained groups with adaptive group sizing. Each group decoded independently. |
 | L6-L8 | SC group-parallel | Encoder constrains chunks to self-contained groups (adaptive size, ~16 groups per file). Each group decoded independently. |
 | L9-L11 | Two-phase | Phase 1: parallel entropy decode + resolveTokens. Phase 2: serial token execution. |
 
@@ -114,7 +116,7 @@ independently.
 | Levels | Threading | How it works |
 |--------|-----------|--------------|
 | L1 | Parallel | Per-chunk workers with independent hashers (SC mode). |
-| L2-L5 | Serial | Single-threaded greedy/lazy parser. |
+| L2-L5 | Parallel | Per-group workers with independent hashers (SC mode, adaptive group sizing). |
 | L6-L8 | Parallel | Per-group workers with independent match finders (SC mode). |
 | L9-L11 | Parallel | Per-block workers sharing pre-computed MLS. |
 
@@ -196,9 +198,9 @@ decode it would speed up. Kept for offline diagnostic work.
 | tANS | Tabled Asymmetric Numeral System — entropy coder used for literal streams. |
 | BT4 | Binary Tree 4-way — match finder used by the High codec's optimal parser. |
 | SC | Self-Contained — block format flag; each block decodes independently. |
-| Sidecar | Optional parallel-decode metadata block (cross-chunk dependency map). |
+| Sidecar | (Legacy) Optional parallel-decode metadata block (cross-chunk dependency map). No longer emitted by current encoder. |
 | Chunk | 256 KB decompression unit. Sub-chunk = 128 KB half. |
 | Cross-chunk | A match whose source bytes are in a different chunk than its target. |
 | Cleanness | Whether a byte's dependency chain stays within one chunk (no cross-chunk refs). |
-| PPOC | Parallel Producer/Consumer — sidecar builder. |
+| PPOC | (Legacy) Parallel Producer/Consumer — sidecar builder. No longer emitted by current encoder. |
 | MLS | Managed Match Length Storage — variable-length match table for the High codec. |

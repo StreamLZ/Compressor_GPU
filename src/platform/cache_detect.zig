@@ -204,39 +204,55 @@ const memory_query = @import("memory_query.zig");
 pub const RamBandwidth = struct { read_gbps: f64, write_gbps: f64 };
 
 pub fn measureRamBandwidth(io: std.Io) RamBandwidth {
-    const size: usize = 64 * 1024 * 1024;
+    const size: usize = 128 * 1024 * 1024;
     const buf = std.heap.c_allocator.alloc(u8, size) catch return .{ .read_gbps = 0, .write_gbps = 0 };
     defer std.heap.c_allocator.free(buf);
     @memset(buf, 0xAA);
 
-    // Write bandwidth — use volatile u64 stores to prevent optimization.
+    // Both read and write: full sequential 8-byte access over the buffer.
+    // Warm the buffer into cache first, then measure.
+    const words = size / 8;
+    const ptr: [*]volatile u64 = @ptrCast(@alignCast(buf.ptr));
+
+    // Write bandwidth
     var best_write_ns: u64 = std.math.maxInt(u64);
-    for (0..3) |_| {
+    for (0..5) |p| {
+        const val: u64 = 0x5555555555555555 +% p;
         const start = std.Io.Clock.awake.now(io);
-        {
-            const ptr: [*]volatile u64 = @ptrCast(@alignCast(buf.ptr));
-            const count = size / 8;
-            var j: usize = 0;
-            while (j < count) : (j += 1) {
-                ptr[j] = 0x5555555555555555;
-            }
+        var wi: usize = 0;
+        while (wi < words) : (wi += 8) {
+            ptr[wi] = val;
+            ptr[wi + 1] = val;
+            ptr[wi + 2] = val;
+            ptr[wi + 3] = val;
+            ptr[wi + 4] = val;
+            ptr[wi + 5] = val;
+            ptr[wi + 6] = val;
+            ptr[wi + 7] = val;
         }
         const ns: u64 = @intCast(start.untilNow(io, .awake).toNanoseconds());
-        if (ns < best_write_ns) best_write_ns = ns;
+        if (ns > 0 and ns < best_write_ns) best_write_ns = ns;
     }
 
-    // Read bandwidth (volatile sum to prevent optimization)
+    // Read bandwidth
     var best_read_ns: u64 = std.math.maxInt(u64);
-    for (0..3) |_| {
+    for (0..5) |_| {
         var sum: u64 = 0;
         const start = std.Io.Clock.awake.now(io);
-        var i: usize = 0;
-        while (i < size) : (i += 64) {
-            sum +%= buf[i];
+        var ri: usize = 0;
+        while (ri < words) : (ri += 8) {
+            sum +%= ptr[ri];
+            sum +%= ptr[ri + 1];
+            sum +%= ptr[ri + 2];
+            sum +%= ptr[ri + 3];
+            sum +%= ptr[ri + 4];
+            sum +%= ptr[ri + 5];
+            sum +%= ptr[ri + 6];
+            sum +%= ptr[ri + 7];
         }
         std.mem.doNotOptimizeAway(sum);
         const ns: u64 = @intCast(start.untilNow(io, .awake).toNanoseconds());
-        if (ns < best_read_ns) best_read_ns = ns;
+        if (ns > 0 and ns < best_read_ns) best_read_ns = ns;
     }
 
     const sz = @as(f64, @floatFromInt(size));
