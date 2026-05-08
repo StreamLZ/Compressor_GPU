@@ -266,7 +266,6 @@ __device__ void decodeSubChunkBatched(
     const uint32_t BATCH_SZ = 32 * TOKENS_PER_LANE;
     __shared__ TokenWork batch[32 * TOKENS_PER_LANE];
     __shared__ uint32_t batch_n;
-    __shared__ uint8_t match_safe[32 * TOKENS_PER_LANE];
 
     for (;;) {
     while (cmd_pos < block_cmd_end) {
@@ -360,58 +359,10 @@ __device__ void decodeSubChunkBatched(
         }
         __syncwarp();
 
-        // ── Pass 3: Flag matches that only rely on literals (lane 0, serial) ──
-        // A match is "lit-safe" if its entire source region was written by
-        // literals (or is pre-existing output). Match source = [ms, ms+ml).
-        // The batch's literal-written region is [batch_start, batch_end) with
-        // gaps where matches go. Simple check: source entirely before the
-        // batch's first MATCH destination, or before the batch start.
-        if (lane == 0) {
-            uint32_t batch_start_pos = batch[0].dst_pos;
-            for (uint32_t t = 0; t < n_tokens; t++) {
-                uint32_t ml = batch[t].match_len;
-                if (ml == 0) { match_safe[t] = 1; continue; }
-                int32_t off = batch[t].offset;
-                uint32_t match_dst_pos = batch[t].dst_pos + batch[t].lit_len;
-                uint32_t ms = (uint32_t)((int32_t)match_dst_pos + off);
-                int32_t abs_off = -off;
-                // Safe if: source entirely before batch output, OR
-                // non-overlapping and source in literal-only region
-                if (ms + ml <= batch_start_pos) {
-                    match_safe[t] = 1;
-                } else if (abs_off >= (int32_t)ml) {
-                    // Non-overlapping. Check if source region only contains
-                    // literals (every byte in [ms, ms+ml) was written by a
-                    // literal, not a match). Approximate: source before this
-                    // token's dst_pos means it could include prior match output.
-                    // Conservative: safe only if source is pre-batch.
-                    match_safe[t] = 0;
-                } else {
-                    match_safe[t] = 0;
-                }
-            }
-        }
-        __syncwarp();
-
-        // ── Pass 4: Resolve lit-safe matches (massively parallel) ──
-        for (uint32_t g = 0; g < TOKENS_PER_LANE; g++) {
-            uint32_t idx = lane + g * 32;
-            if (idx >= n_tokens) continue;
-            if (!match_safe[idx] || batch[idx].match_len == 0) continue;
-            uint32_t ml = batch[idx].match_len;
-            int32_t off = batch[idx].offset;
-            uint32_t match_dst_pos = batch[idx].dst_pos + batch[idx].lit_len;
-            uint32_t ms = (uint32_t)((int32_t)match_dst_pos + off);
-            for (uint32_t i = 0; i < ml; i++)
-                if (match_dst_pos + i < dst_end_abs)
-                    dst[match_dst_pos + i] = dst[ms + i];
-        }
-        __syncwarp();
-
-        // ── Pass 5: Resolve remaining matches (serial, cooperative warp) ──
+        // ── Pass 3: Resolve all matches (serial order, cooperative warp copy) ──
         for (uint32_t t = 0; t < n_tokens; t++) {
-            if (match_safe[t] || batch[t].match_len == 0) continue;
             uint32_t ml = batch[t].match_len;
+            if (ml == 0) continue;
             int32_t off = batch[t].offset;
             uint32_t match_dst_pos = batch[t].dst_pos + batch[t].lit_len;
             uint32_t ms = (uint32_t)((int32_t)match_dst_pos + off);
