@@ -35,6 +35,7 @@ __device__ uint32_t readLength(const uint8_t* &len_stream, const uint8_t* len_en
 }
 
 // Core sub-chunk decode: used by both serial and batch kernels.
+// mode: 0 = delta literals, 1 = raw literals
 __device__ void decodeSubChunk(
     const uint8_t* __restrict__ cmd, uint32_t cmd_size,
     const uint8_t* __restrict__ lit, uint32_t lit_size,
@@ -45,7 +46,8 @@ __device__ void decodeSubChunk(
     uint8_t* __restrict__ dst, uint32_t dst_size,
     uint32_t initial_copy,
     uint32_t cmd_stream2_offset,
-    uint32_t dst_offset
+    uint32_t dst_offset,
+    uint32_t mode
 ) {
     const int lane = threadIdx.x & 31;
     uint32_t cmd_pos = 0, lit_pos = 0, off16_pos = 0, off32_pos = 0;
@@ -123,9 +125,18 @@ __device__ void decodeSubChunk(
         off32_pos   = __shfl_sync(0xFFFFFFFF, off32_pos, 0);
 
         if (local_lit > 0) {
-            for (uint32_t i = lane; i < local_lit; i += 32)
-                if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size)
-                    dst[dst_pos + i] = lit[lit_pos + i];
+            if (mode == 0) {
+                // Delta literals: dst[i] = lit[i] + dst[match_src + i]
+                for (uint32_t i = lane; i < local_lit; i += 32)
+                    if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size) {
+                        uint32_t ms = (uint32_t)((int32_t)(dst_pos + i) + recent_offset);
+                        dst[dst_pos + i] = lit[lit_pos + i] + dst[ms];
+                    }
+            } else {
+                for (uint32_t i = lane; i < local_lit; i += 32)
+                    if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size)
+                        dst[dst_pos + i] = lit[lit_pos + i];
+            }
             __syncwarp();
             dst_pos += local_lit;
             lit_pos += local_lit;
@@ -166,9 +177,17 @@ __device__ void decodeSubChunk(
         uint32_t block_end = block_dst_start + 0x10000;
         if (block_end > dst_end_abs) block_end = dst_end_abs;
         uint32_t block_trailing = (block_end > dst_pos) ? (block_end - dst_pos) : 0;
-        for (uint32_t i = lane; i < block_trailing; i += 32)
-            if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size)
-                dst[dst_pos + i] = lit[lit_pos + i];
+        if (mode == 0) {
+            for (uint32_t i = lane; i < block_trailing; i += 32)
+                if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size) {
+                    uint32_t ms = (uint32_t)((int32_t)(dst_pos + i) + recent_offset);
+                    dst[dst_pos + i] = lit[lit_pos + i] + dst[ms];
+                }
+        } else {
+            for (uint32_t i = lane; i < block_trailing; i += 32)
+                if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size)
+                    dst[dst_pos + i] = lit[lit_pos + i];
+        }
         __syncwarp();
         dst_pos += block_trailing;
         lit_pos += block_trailing;
@@ -187,9 +206,17 @@ __device__ void decodeSubChunk(
     dst_pos = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
     lit_pos = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
     uint32_t trailing = (lit_size > lit_pos) ? (lit_size - lit_pos) : 0;
-    for (uint32_t i = lane; i < trailing; i += 32)
-        if (dst_pos + i < dst_end_abs)
-            dst[dst_pos + i] = lit[lit_pos + i];
+    if (mode == 0) {
+        for (uint32_t i = lane; i < trailing; i += 32)
+            if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size) {
+                uint32_t ms = (uint32_t)((int32_t)(dst_pos + i) + recent_offset);
+                dst[dst_pos + i] = lit[lit_pos + i] + dst[ms];
+            }
+    } else {
+        for (uint32_t i = lane; i < trailing; i += 32)
+            if (dst_pos + i < dst_end_abs)
+                dst[dst_pos + i] = lit[lit_pos + i];
+    }
 }
 
 // --- Serial kernel (legacy, wraps decodeSubChunk) ---
@@ -210,7 +237,7 @@ extern "C" __global__ void slzDecompressL1Kernel(
     decodeSubChunk(cmd, cmd_size, lit, lit_size,
         off16_raw, off16_count, off32_raw1, off32_count1,
         off32_raw2, off32_count2, len_data, len_avail,
-        dst, dst_size, initial_copy, cmd_stream2_offset, dst_offset);
+        dst, dst_size, initial_copy, cmd_stream2_offset, dst_offset, 1);
 }
 
 // --- Batch kernel: 1 block per SC group, all groups simultaneously ---
@@ -244,7 +271,7 @@ extern "C" __global__ void slzBatchDecompressL1Kernel(
             off32_all + d.off32_2_offset, d.off32_count2,
             len_all + d.len_offset,    d.len_avail,
             dst, d.dst_size, d.initial_copy, d.cmd_stream2_offset,
-            d.dst_offset
+            d.dst_offset, 1
         );
         __syncwarp();
     }
@@ -286,7 +313,8 @@ __device__ void parseAndDecodeSubChunk(
     uint32_t sc_decomp_size,
     uint8_t* dst,
     uint32_t dst_offset,
-    uint32_t base_offset
+    uint32_t base_offset,
+    uint32_t mode
 ) {
     const int lane = threadIdx.x & 31;
     const uint8_t* src = sc_src;
@@ -425,7 +453,7 @@ __device__ void parseAndDecodeSubChunk(
         off32_exp2, off32_count2,
         len_stream, len_avail,
         dst, sc_decomp_size, initial_copy, cmd_stream2_offset,
-        dst_offset
+        dst_offset, mode
     );
 }
 
@@ -486,6 +514,7 @@ extern "C" __global__ void slzFullDecompressL1Kernel(
             }
 
             uint32_t sc_comp_size = chunkhdr & 0x7FFFF;
+            uint32_t sc_mode = (chunkhdr >> 19) & 0xF;
             const uint8_t* sc_payload = chunk_src + 3;
 
             if (sc_comp_size < sc_size) {
@@ -493,7 +522,7 @@ extern "C" __global__ void slzFullDecompressL1Kernel(
 
                 parseAndDecodeSubChunk(
                     sc_payload, sc_comp_size, sc_size,
-                    dst, sc_dst_off, base_offset_val
+                    dst, sc_dst_off, base_offset_val, sc_mode
                 );
             } else {
                 // Uncompressed sub-chunk: copy
