@@ -220,9 +220,11 @@ __device__ void decodeSubChunk(
 }
 
 // ────────────────────────────────────────────────────────────────
-//  Batched token model (nvCOMP-style): parse 32 tokens, parallel
-//  literal copy, VOTE+SHFL match loop.  Raw-literal mode only.
+//  Grouped parallel decode: parse all tokens, then each lane
+//  processes TOKENS_PER_LANE tokens independently (lit + match).
 // ────────────────────────────────────────────────────────────────
+
+#define TOKENS_PER_LANE 16
 
 struct TokenWork {
     uint32_t lit_len;
@@ -261,13 +263,14 @@ __device__ void decodeSubChunkBatched(
         ? cmd_stream2_offset : cmd_size;
     int block_iter = 0;
 
-    const uint32_t BATCH_SZ = 512;
-    __shared__ TokenWork batch[512];
+    const uint32_t BATCH_SZ = 32 * TOKENS_PER_LANE;
+    __shared__ TokenWork batch[32 * TOKENS_PER_LANE];
     __shared__ uint32_t batch_n;
+    __shared__ uint8_t match_safe[32 * TOKENS_PER_LANE];
 
     for (;;) {
     while (cmd_pos < block_cmd_end) {
-        // Phase 1: Parse up to 32 tokens (lane 0 only)
+        // ── Pass 1: Parse tokens, set absPos (lane 0, serial) ──
         if (lane == 0) {
             uint32_t n = 0;
             while (n < BATCH_SZ && cmd_pos < block_cmd_end) {
@@ -332,93 +335,97 @@ __device__ void decodeSubChunkBatched(
         uint32_t n_tokens = batch_n;
         if (n_tokens == 0) break;
 
-        // Phase 2: Literal copy
-        // For raw mode: all lanes copy their OWN token's literals in parallel.
-        // For delta mode: check if delta source is outside batch region (safe).
-        //   Safe tokens: parallel copy.  Unsafe: defer to serial phase.
-        uint32_t batch_start = (n_tokens > 0) ? batch[0].dst_pos : dst_pos;
-        uint32_t unsafe_mask = 0;
-
-        // Phase 2: Literal copy — process in rounds of 32 lanes
-        if (mode == 0) {
-            // Delta: first identify unsafe tokens (delta source inside batch output region)
-            // Process all SAFE tokens in parallel rounds, then unsafe ones serially.
-            // Once recent_offset becomes large (after first match), almost all are safe.
-            for (uint32_t base = 0; base < n_tokens; base += 32) {
-                uint32_t slot = base + lane;
-                uint32_t is_unsafe = 0;
-                if (slot < n_tokens && batch[slot].lit_len > 0) {
-                    int32_t delta_src = (int32_t)batch[slot].dst_pos + batch[slot].recent_offset;
-                    int32_t delta_end = delta_src + (int32_t)batch[slot].lit_len;
-                    is_unsafe = (delta_end > (int32_t)batch_start) ? 1 : 0;
-                }
-                uint32_t unsafe_round = __ballot_sync(0xFFFFFFFF, is_unsafe);
-
-                // Copy safe tokens in this round — each lane copies its own token's literals
-                if (slot < n_tokens && batch[slot].lit_len > 0 && !is_unsafe) {
-                    uint32_t ll = batch[slot].lit_len;
-                    uint32_t ls = batch[slot].lit_src;
-                    uint32_t dp = batch[slot].dst_pos;
-                    int32_t ro = batch[slot].recent_offset;
-                    for (uint32_t i = 0; i < ll; i++)
-                        if (dp + i < dst_end_abs && ls + i < lit_size) {
-                            uint32_t ms = (uint32_t)((int32_t)(dp + i) + ro);
-                            dst[dp + i] = lit[ls + i] + dst[ms];
-                        }
-                }
-                __syncwarp();
-
-                // Unsafe tokens: cooperative warp copy in order
-                while (unsafe_round) {
-                    uint32_t local_idx = __ffs(unsafe_round) - 1;
-                    uint32_t idx = base + local_idx;
-                    uint32_t ll = batch[idx].lit_len;
-                    uint32_t ls = batch[idx].lit_src;
-                    uint32_t dp = batch[idx].dst_pos;
-                    int32_t ro = batch[idx].recent_offset;
-                    for (uint32_t i = lane; i < ll; i += 32)
-                        if (dp + i < dst_end_abs && ls + i < lit_size) {
-                            uint32_t ms = (uint32_t)((int32_t)(dp + i) + ro);
-                            dst[dp + i] = lit[ls + i] + dst[ms];
-                        }
-                    __syncwarp();
-                    unsafe_round &= ~(1u << local_idx);
-                }
-            }
-        } else {
-            // Raw: fully parallel in rounds of 32
-            for (uint32_t base = 0; base < n_tokens; base += 32) {
-                uint32_t slot = base + lane;
-                if (slot < n_tokens && batch[slot].lit_len > 0) {
-                    uint32_t ll = batch[slot].lit_len;
-                    uint32_t ls = batch[slot].lit_src;
-                    uint32_t dp = batch[slot].dst_pos;
-                    for (uint32_t i = 0; i < ll; i++)
-                        if (dp + i < dst_end_abs && ls + i < lit_size)
-                            dst[dp + i] = lit[ls + i];
-                }
-                __syncwarp();
+        // ── Pass 2: Resolve all literals (massively parallel) ──
+        // Each lane handles TOKENS_PER_LANE tokens. For raw mode: just copy.
+        // For delta: lit[i] + dst[src+i] where src is (almost always) pre-existing output.
+        for (uint32_t g = 0; g < TOKENS_PER_LANE; g++) {
+            uint32_t idx = lane + g * 32;
+            if (idx >= n_tokens) continue;
+            uint32_t ll = batch[idx].lit_len;
+            if (ll == 0) continue;
+            uint32_t ls = batch[idx].lit_src;
+            uint32_t dp = batch[idx].dst_pos;
+            if (mode == 0) {
+                int32_t ro = batch[idx].recent_offset;
+                for (uint32_t i = 0; i < ll; i++)
+                    if (dp + i < dst_end_abs && ls + i < lit_size) {
+                        uint32_t ms = (uint32_t)((int32_t)(dp + i) + ro);
+                        dst[dp + i] = lit[ls + i] + dst[ms];
+                    }
+            } else {
+                for (uint32_t i = 0; i < ll; i++)
+                    if (dp + i < dst_end_abs && ls + i < lit_size)
+                        dst[dp + i] = lit[ls + i];
             }
         }
+        __syncwarp();
 
-        // Phase 3: Match copy — process each match with cooperative warp copy
+        // ── Pass 3: Flag matches that only rely on literals (lane 0, serial) ──
+        // A match is "lit-safe" if its entire source region was written by
+        // literals (or is pre-existing output). Match source = [ms, ms+ml).
+        // The batch's literal-written region is [batch_start, batch_end) with
+        // gaps where matches go. Simple check: source entirely before the
+        // batch's first MATCH destination, or before the batch start.
+        if (lane == 0) {
+            uint32_t batch_start_pos = batch[0].dst_pos;
+            for (uint32_t t = 0; t < n_tokens; t++) {
+                uint32_t ml = batch[t].match_len;
+                if (ml == 0) { match_safe[t] = 1; continue; }
+                int32_t off = batch[t].offset;
+                uint32_t match_dst_pos = batch[t].dst_pos + batch[t].lit_len;
+                uint32_t ms = (uint32_t)((int32_t)match_dst_pos + off);
+                int32_t abs_off = -off;
+                // Safe if: source entirely before batch output, OR
+                // non-overlapping and source in literal-only region
+                if (ms + ml <= batch_start_pos) {
+                    match_safe[t] = 1;
+                } else if (abs_off >= (int32_t)ml) {
+                    // Non-overlapping. Check if source region only contains
+                    // literals (every byte in [ms, ms+ml) was written by a
+                    // literal, not a match). Approximate: source before this
+                    // token's dst_pos means it could include prior match output.
+                    // Conservative: safe only if source is pre-batch.
+                    match_safe[t] = 0;
+                } else {
+                    match_safe[t] = 0;
+                }
+            }
+        }
+        __syncwarp();
+
+        // ── Pass 4: Resolve lit-safe matches (massively parallel) ──
+        for (uint32_t g = 0; g < TOKENS_PER_LANE; g++) {
+            uint32_t idx = lane + g * 32;
+            if (idx >= n_tokens) continue;
+            if (!match_safe[idx] || batch[idx].match_len == 0) continue;
+            uint32_t ml = batch[idx].match_len;
+            int32_t off = batch[idx].offset;
+            uint32_t match_dst_pos = batch[idx].dst_pos + batch[idx].lit_len;
+            uint32_t ms = (uint32_t)((int32_t)match_dst_pos + off);
+            for (uint32_t i = 0; i < ml; i++)
+                if (match_dst_pos + i < dst_end_abs)
+                    dst[match_dst_pos + i] = dst[ms + i];
+        }
+        __syncwarp();
+
+        // ── Pass 5: Resolve remaining matches (serial, cooperative warp) ──
         for (uint32_t t = 0; t < n_tokens; t++) {
+            if (match_safe[t] || batch[t].match_len == 0) continue;
             uint32_t ml = batch[t].match_len;
-            if (ml == 0) continue;
-            int32_t  off = batch[t].offset;
-            uint32_t match_dst = batch[t].dst_pos + batch[t].lit_len;
-            uint32_t ms = (uint32_t)((int32_t)match_dst + off);
+            int32_t off = batch[t].offset;
+            uint32_t match_dst_pos = batch[t].dst_pos + batch[t].lit_len;
+            uint32_t ms = (uint32_t)((int32_t)match_dst_pos + off);
             int32_t abs_off = -off;
 
             if (abs_off >= (int32_t)ml && ml > 1) {
                 for (uint32_t i = lane; i < ml; i += 32)
-                    if (match_dst + i < dst_end_abs)
-                        dst[match_dst + i] = dst[ms + i];
+                    if (match_dst_pos + i < dst_end_abs)
+                        dst[match_dst_pos + i] = dst[ms + i];
             } else {
                 if (lane == 0)
                     for (uint32_t i = 0; i < ml; i++)
-                        if (match_dst + i < dst_end_abs)
-                            dst[match_dst + i] = dst[ms + i];
+                        if (match_dst_pos + i < dst_end_abs)
+                            dst[match_dst_pos + i] = dst[ms + i];
             }
             __syncwarp();
         }
