@@ -320,9 +320,9 @@ fn decompressOneFrame(
                 const prefix_base: [*]const u8 = block_src[block_src.len - prefix_sz ..].ptr;
                 var pi: usize = 0;
                 while (pi + 1 < num_chunks_est) : (pi += 1) {
-                    const cdst = dst_off - block_hdr.decompressed_size + (pi + 1) * constants.chunk_size;
+                    const cdst = dst_off - block_hdr.decompressed_size + (pi + 1) * eff_cs_gpu;
                     var csz: usize = 8;
-                    if ((pi + 1) * constants.chunk_size + csz > block_hdr.decompressed_size) csz = block_hdr.decompressed_size - (pi + 1) * constants.chunk_size;
+                    if ((pi + 1) * eff_cs_gpu + csz > block_hdr.decompressed_size) csz = block_hdr.decompressed_size - (pi + 1) * eff_cs_gpu;
                     @memcpy(dst[cdst..][0..csz], prefix_base[pi * 8 ..][0..csz]);
                 }
             }
