@@ -228,8 +228,9 @@ struct TokenWork {
     uint32_t lit_len;
     uint32_t match_len;
     int32_t  offset;
-    uint32_t lit_src;   // position in literal stream
-    uint32_t dst_pos;   // output position for this token's literals
+    uint32_t lit_src;        // position in literal stream
+    uint32_t dst_pos;        // output position for this token's literals
+    int32_t  recent_offset;  // recent_offset at time of this token (for delta)
 };
 
 __device__ void decodeSubChunkBatched(
@@ -242,7 +243,8 @@ __device__ void decodeSubChunkBatched(
     uint8_t* __restrict__ dst, uint32_t dst_size,
     uint32_t initial_copy,
     uint32_t cmd_stream2_offset,
-    uint32_t dst_offset
+    uint32_t dst_offset,
+    uint32_t mode
 ) {
     const int lane = threadIdx.x & 31;
     uint32_t cmd_pos = 0, lit_pos = 0, off16_pos = 0, off32_pos = 0;
@@ -314,6 +316,7 @@ __device__ void decodeSubChunkBatched(
                 batch[n].offset = offset;
                 batch[n].lit_src = lit_pos;
                 batch[n].dst_pos = dst_pos;
+                batch[n].recent_offset = recent_offset;
 
                 if (!use_recent && token != 0)
                     recent_offset = offset;
@@ -328,16 +331,64 @@ __device__ void decodeSubChunkBatched(
         uint32_t n_tokens = batch_n;
         if (n_tokens == 0) break;
 
-        // Phase 2: All lanes copy their OWN token's literals in parallel
-        if (lane < n_tokens) {
-            uint32_t ll = batch[lane].lit_len;
-            uint32_t ls = batch[lane].lit_src;
-            uint32_t dp = batch[lane].dst_pos;
-            for (uint32_t i = 0; i < ll; i++)
-                if (dp + i < dst_end_abs && ls + i < lit_size)
-                    dst[dp + i] = lit[ls + i];
+        // Phase 2: Literal copy
+        // For raw mode: all lanes copy their OWN token's literals in parallel.
+        // For delta mode: check if delta source is outside batch region (safe).
+        //   Safe tokens: parallel copy.  Unsafe: defer to serial phase.
+        uint32_t batch_start = (n_tokens > 0) ? batch[0].dst_pos : dst_pos;
+        uint32_t unsafe_mask = 0;
+
+        if (mode == 0) {
+            // Delta: check safety per token
+            uint32_t is_unsafe = 0;
+            if (lane < n_tokens && batch[lane].lit_len > 0) {
+                int32_t delta_src = (int32_t)batch[lane].dst_pos + batch[lane].recent_offset;
+                int32_t delta_end = delta_src + (int32_t)batch[lane].lit_len;
+                is_unsafe = (delta_end > (int32_t)batch_start) ? 1 : 0;
+            }
+            unsafe_mask = __ballot_sync(0xFFFFFFFF, is_unsafe);
+
+            // Copy SAFE delta literals in parallel
+            if (lane < n_tokens && batch[lane].lit_len > 0 && !is_unsafe) {
+                uint32_t ll = batch[lane].lit_len;
+                uint32_t ls = batch[lane].lit_src;
+                uint32_t dp = batch[lane].dst_pos;
+                int32_t ro = batch[lane].recent_offset;
+                for (uint32_t i = 0; i < ll; i++)
+                    if (dp + i < dst_end_abs && ls + i < lit_size) {
+                        uint32_t ms = (uint32_t)((int32_t)(dp + i) + ro);
+                        dst[dp + i] = lit[ls + i] + dst[ms];
+                    }
+            }
+            __syncwarp();
+
+            // Process UNSAFE tokens in order with cooperative warp copy
+            while (unsafe_mask) {
+                uint32_t idx = __ffs(unsafe_mask) - 1;
+                uint32_t ll = batch[idx].lit_len;
+                uint32_t ls = batch[idx].lit_src;
+                uint32_t dp = batch[idx].dst_pos;
+                int32_t ro = batch[idx].recent_offset;
+                for (uint32_t i = lane; i < ll; i += 32)
+                    if (dp + i < dst_end_abs && ls + i < lit_size) {
+                        uint32_t ms = (uint32_t)((int32_t)(dp + i) + ro);
+                        dst[dp + i] = lit[ls + i] + dst[ms];
+                    }
+                __syncwarp();
+                unsafe_mask &= ~(1u << idx);
+            }
+        } else {
+            // Raw: fully parallel
+            if (lane < n_tokens) {
+                uint32_t ll = batch[lane].lit_len;
+                uint32_t ls = batch[lane].lit_src;
+                uint32_t dp = batch[lane].dst_pos;
+                for (uint32_t i = 0; i < ll; i++)
+                    if (dp + i < dst_end_abs && ls + i < lit_size)
+                        dst[dp + i] = lit[ls + i];
+            }
+            __syncwarp();
         }
-        __syncwarp();
 
         // Phase 3: VOTE loop for matches — process one at a time, all lanes help
         uint32_t has_match = (lane < n_tokens && batch[lane].match_len > 0) ? 1 : 0;
@@ -387,9 +438,17 @@ __device__ void decodeSubChunkBatched(
         uint32_t block_end = block_dst_start + 0x10000;
         if (block_end > dst_end_abs) block_end = dst_end_abs;
         uint32_t block_trailing = (block_end > dst_pos) ? (block_end - dst_pos) : 0;
-        for (uint32_t i = lane; i < block_trailing; i += 32)
-            if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size)
-                dst[dst_pos + i] = lit[lit_pos + i];
+        if (mode == 0) {
+            for (uint32_t i = lane; i < block_trailing; i += 32)
+                if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size) {
+                    uint32_t ms = (uint32_t)((int32_t)(dst_pos + i) + recent_offset);
+                    dst[dst_pos + i] = lit[lit_pos + i] + dst[ms];
+                }
+        } else {
+            for (uint32_t i = lane; i < block_trailing; i += 32)
+                if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size)
+                    dst[dst_pos + i] = lit[lit_pos + i];
+        }
         __syncwarp();
         dst_pos += block_trailing;
         lit_pos += block_trailing;
@@ -409,9 +468,17 @@ __device__ void decodeSubChunkBatched(
     dst_pos = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
     lit_pos = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
     uint32_t trailing = (lit_size > lit_pos) ? (lit_size - lit_pos) : 0;
-    for (uint32_t i = lane; i < trailing; i += 32)
-        if (dst_pos + i < dst_end_abs)
-            dst[dst_pos + i] = lit[lit_pos + i];
+    if (mode == 0) {
+        for (uint32_t i = lane; i < trailing; i += 32)
+            if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size) {
+                uint32_t ms = (uint32_t)((int32_t)(dst_pos + i) + recent_offset);
+                dst[dst_pos + i] = lit[lit_pos + i] + dst[ms];
+            }
+    } else {
+        for (uint32_t i = lane; i < trailing; i += 32)
+            if (dst_pos + i < dst_end_abs)
+                dst[dst_pos + i] = lit[lit_pos + i];
+    }
 }
 
 // --- Serial kernel (legacy, wraps decodeSubChunk) ---
@@ -640,29 +707,16 @@ __device__ void parseAndDecodeSubChunk(
     }
     __syncwarp();
 
-    if (mode == 1) {
-        decodeSubChunkBatched(
-            cmd_ptr, cmd_size,
-            lit_ptr, lit_size,
-            off16_raw, off16_count,
-            off32_exp1, off32_count1,
-            off32_exp2, off32_count2,
-            len_stream, len_avail,
-            dst, sc_decomp_size, initial_copy, cmd_stream2_offset,
-            dst_offset
-        );
-    } else {
-        decodeSubChunk(
-            cmd_ptr, cmd_size,
-            lit_ptr, lit_size,
-            off16_raw, off16_count,
-            off32_exp1, off32_count1,
-            off32_exp2, off32_count2,
-            len_stream, len_avail,
-            dst, sc_decomp_size, initial_copy, cmd_stream2_offset,
-            dst_offset, mode
-        );
-    }
+    decodeSubChunkBatched(
+        cmd_ptr, cmd_size,
+        lit_ptr, lit_size,
+        off16_raw, off16_count,
+        off32_exp1, off32_count1,
+        off32_exp2, off32_count2,
+        len_stream, len_avail,
+        dst, sc_decomp_size, initial_copy, cmd_stream2_offset,
+        dst_offset, mode
+    );
 }
 
 // Full GPU L1 kernel: 1 block per SC group, parses raw compressed chunks.
