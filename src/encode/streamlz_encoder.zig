@@ -97,6 +97,9 @@ pub const Options = struct {
     /// Force self-contained mode (each block independently decodable).
     /// L6-L8 are always SC; this forces it for L9-L11 too.
     self_contained: bool = false,
+    /// Override SC group size. Values 1-3 = fractional (1=64KB, 2=128KB).
+    /// Values 4+ = that many chunks. null = auto from level.
+    sc_group_size_override: ?u8 = null,
 
     // ── Advanced (rarely changed) ───────────────────────────────────────
 

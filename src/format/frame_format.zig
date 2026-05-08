@@ -179,12 +179,33 @@ pub fn parseHeader(src: []const u8) ParseError!FrameHeader {
     };
 }
 
+/// Convert an sc_group_size header byte to the group size in bytes.
+/// Values 1-3: fractional chunks (1=64KB, 2=128KB, 3=192KB).
+/// Values 4+: that many 256KB chunks.
+pub fn scGroupSizeToBytes(sc_group_size: u8) usize {
+    if (sc_group_size < 4) {
+        return @as(usize, sc_group_size) * (constants.chunk_size / 4);
+    }
+    return @as(usize, sc_group_size) * constants.chunk_size;
+}
+
+/// Convert an sc_group_size header byte to a sub-chunk size for the encoder.
+/// For fractional groups (1-3), sub-chunks must be ≤ the group size.
+/// For integer groups (4+), sub-chunks use the default 128KB.
+pub fn scGroupSubChunkSize(sc_group_size: u8) usize {
+    if (sc_group_size < 4) {
+        return @as(usize, sc_group_size) * (constants.chunk_size / 4);
+    }
+    return constants.sub_chunk_size;
+}
+
 pub const WriteHeaderOptions = struct {
     codec: Codec,
     level: u8,
     block_size: u32 = default_block_size,
-    /// Number of 256 KB chunks per SC group. Default 4 matches the
-    /// historical hardcoded value; can be overridden for future encoders.
+    /// SC group size. Values >= 4: number of 256KB chunks per group.
+    /// Values 1-3: fractional (1=0.25 chunk=64KB, 2=0.5=128KB, 3=0.75=192KB).
+    /// Use `scGroupSizeToBytes()` to convert to bytes.
     sc_group_size: u8 = constants.default_sc_group_size,
     parallel_decode_metadata_present: bool = false,
     content_size: ?u64 = null,
