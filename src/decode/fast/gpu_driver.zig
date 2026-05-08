@@ -394,6 +394,7 @@ pub fn fullGpuLaunch(
     decompressed_size: usize,
     num_groups: u32,
     chunks_per_group: u32,
+    sub_chunk_cap: u32,
     io: ?std.Io,
 ) fast_dec.DecodeError!void {
     if (!init() or full_kernel_fn == 0) return error.BadMode;
@@ -431,6 +432,7 @@ pub fn fullGpuLaunch(
     var p_dst = d_output;
     var p_cpg = chunks_per_group;
     var p_total: u32 = @intCast(chunk_descs.len);
+    var p_sc_cap = sub_chunk_cap;
 
     var params = [_]?*anyopaque{
         @ptrCast(&p_comp),
@@ -438,6 +440,7 @@ pub fn fullGpuLaunch(
         @ptrCast(&p_dst),
         @ptrCast(&p_cpg),
         @ptrCast(&p_total),
+        @ptrCast(&p_sc_cap),
     };
     var extra = [_]?*anyopaque{null};
 

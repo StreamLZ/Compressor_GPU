@@ -967,6 +967,7 @@ fn gpuBatchDecode(
         chunk_idx += 1;
     }
 
+    const eff_sc_cap: u32 = @intCast(frame.scGroupSubChunkSize(sc_group_size_in));
     try gpu.fullGpuLaunch(
         chunk_descs[0..chunk_idx],
         block_src,
@@ -975,6 +976,7 @@ fn gpuBatchDecode(
         decompressed_size,
         num_groups,
         chunks_per_group,
+        eff_sc_cap,
         io_opt,
     );
 }

@@ -690,7 +690,8 @@ extern "C" __global__ void slzFullDecompressL1Kernel(
     const SlzChunkDesc* __restrict__ chunks,
     uint8_t* __restrict__ dst,
     uint32_t chunks_per_group,
-    uint32_t total_chunks
+    uint32_t total_chunks,
+    uint32_t sub_chunk_cap
 ) {
     const uint32_t group_id = blockIdx.x;
     const int lane = threadIdx.x & 31;
@@ -727,7 +728,7 @@ extern "C" __global__ void slzFullDecompressL1Kernel(
 
         while (sc_remaining > 0) {
             uint32_t sc_size = sc_remaining;
-            if (sc_size > 0x20000) sc_size = 0x20000;  // sub_chunk_size = 128KB
+            if (sc_size > sub_chunk_cap) sc_size = sub_chunk_cap;
 
             // Parse 3-byte sub-chunk header (big-endian)
             uint32_t chunkhdr = 0;
