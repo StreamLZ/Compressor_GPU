@@ -219,6 +219,201 @@ __device__ void decodeSubChunk(
     }
 }
 
+// ────────────────────────────────────────────────────────────────
+//  Batched token model (nvCOMP-style): parse 32 tokens, parallel
+//  literal copy, VOTE+SHFL match loop.  Raw-literal mode only.
+// ────────────────────────────────────────────────────────────────
+
+struct TokenWork {
+    uint32_t lit_len;
+    uint32_t match_len;
+    int32_t  offset;
+    uint32_t lit_src;   // position in literal stream
+    uint32_t dst_pos;   // output position for this token's literals
+};
+
+__device__ void decodeSubChunkBatched(
+    const uint8_t* __restrict__ cmd, uint32_t cmd_size,
+    const uint8_t* __restrict__ lit, uint32_t lit_size,
+    const uint8_t* __restrict__ off16_raw, uint32_t off16_count,
+    const uint8_t* __restrict__ off32_raw1, uint32_t off32_count1,
+    const uint8_t* __restrict__ off32_raw2, uint32_t off32_count2,
+    const uint8_t* __restrict__ len_data, uint32_t len_avail,
+    uint8_t* __restrict__ dst, uint32_t dst_size,
+    uint32_t initial_copy,
+    uint32_t cmd_stream2_offset,
+    uint32_t dst_offset
+) {
+    const int lane = threadIdx.x & 31;
+    uint32_t cmd_pos = 0, lit_pos = 0, off16_pos = 0, off32_pos = 0;
+    uint32_t dst_pos = dst_offset + initial_copy;
+    int32_t recent_offset = -8;
+    uint32_t dst_end_abs = dst_offset + dst_size;
+    const uint8_t* len_stream = len_data;
+    const uint8_t* len_end = len_data + len_avail;
+    const uint8_t* off32_cur = off32_raw1;
+    uint32_t off32_count_cur = off32_count1;
+    uint32_t block_dst_start = dst_offset;
+
+    uint32_t block_cmd_end = (cmd_stream2_offset > 0 && cmd_stream2_offset < cmd_size)
+        ? cmd_stream2_offset : cmd_size;
+    int block_iter = 0;
+
+    __shared__ TokenWork batch[32];
+    __shared__ uint32_t batch_n;
+
+    for (;;) {
+    while (cmd_pos < block_cmd_end) {
+        // Phase 1: Parse up to 32 tokens (lane 0 only)
+        if (lane == 0) {
+            uint32_t n = 0;
+            while (n < 32 && cmd_pos < block_cmd_end) {
+                uint32_t token = cmd[cmd_pos++];
+                uint32_t local_lit = 0, local_match = 0;
+                int32_t offset = recent_offset;
+                uint32_t use_recent = 0;
+
+                if (token >= 24) {
+                    local_lit = token & 7;
+                    local_match = (token >> 3) & 0xF;
+                    use_recent = (token >> 7) & 1;
+                    if (!use_recent && off16_pos < off16_count) {
+                        uint16_t v; memcpy(&v, off16_raw + off16_pos * 2, 2);
+                        offset = -(int32_t)v;
+                        off16_pos++;
+                    }
+                } else if (token == 0) {
+                    local_lit = readLength(len_stream, len_end) + 64;
+                } else if (token == 1) {
+                    local_match = readLength(len_stream, len_end) + 91;
+                    if (off16_pos < off16_count) {
+                        uint16_t v; memcpy(&v, off16_raw + off16_pos * 2, 2);
+                        offset = -(int32_t)v; off16_pos++;
+                    }
+                    use_recent = 0;
+                } else if (token == 2) {
+                    local_match = readLength(len_stream, len_end) + 29;
+                    if (off32_pos < off32_count_cur) {
+                        uint32_t v; memcpy(&v, off32_cur + off32_pos * 4, 4);
+                        offset = (int32_t)block_dst_start - (int32_t)v - (int32_t)dst_pos;
+                        off32_pos++;
+                    }
+                    use_recent = 0;
+                } else {
+                    local_match = token + 5;
+                    if (off32_pos < off32_count_cur) {
+                        uint32_t v; memcpy(&v, off32_cur + off32_pos * 4, 4);
+                        offset = (int32_t)block_dst_start - (int32_t)v - (int32_t)dst_pos;
+                        off32_pos++;
+                    }
+                    use_recent = 0;
+                }
+
+                batch[n].lit_len = local_lit;
+                batch[n].match_len = local_match;
+                batch[n].offset = offset;
+                batch[n].lit_src = lit_pos;
+                batch[n].dst_pos = dst_pos;
+
+                if (!use_recent && token != 0)
+                    recent_offset = offset;
+
+                lit_pos += local_lit;
+                dst_pos += local_lit + local_match;
+                n++;
+            }
+            batch_n = n;
+        }
+        __syncwarp();
+        uint32_t n_tokens = batch_n;
+        if (n_tokens == 0) break;
+
+        // Phase 2: All lanes copy their OWN token's literals in parallel
+        if (lane < n_tokens) {
+            uint32_t ll = batch[lane].lit_len;
+            uint32_t ls = batch[lane].lit_src;
+            uint32_t dp = batch[lane].dst_pos;
+            for (uint32_t i = 0; i < ll; i++)
+                if (dp + i < dst_end_abs && ls + i < lit_size)
+                    dst[dp + i] = lit[ls + i];
+        }
+        __syncwarp();
+
+        // Phase 3: VOTE loop for matches — process one at a time, all lanes help
+        uint32_t has_match = (lane < n_tokens && batch[lane].match_len > 0) ? 1 : 0;
+        uint32_t active = __ballot_sync(0xFFFFFFFF, has_match);
+
+        while (active) {
+            uint32_t winner = __ffs(active) - 1;
+            uint32_t ml = batch[winner].match_len;
+            int32_t  off = batch[winner].offset;
+            uint32_t match_dst = batch[winner].dst_pos + batch[winner].lit_len;
+            uint32_t ms = (uint32_t)((int32_t)match_dst + off);
+            int32_t abs_off = -off;
+
+            if (abs_off >= (int32_t)ml && ml > 1) {
+                for (uint32_t i = lane; i < ml; i += 32)
+                    if (match_dst + i < dst_end_abs)
+                        dst[match_dst + i] = dst[ms + i];
+            } else {
+                if (lane == 0)
+                    for (uint32_t i = 0; i < ml; i++)
+                        if (match_dst + i < dst_end_abs)
+                            dst[match_dst + i] = dst[ms + i];
+            }
+            __syncwarp();
+            active &= ~(1u << winner);
+        }
+
+        // Broadcast updated state from lane 0
+        dst_pos   = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
+        lit_pos   = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
+        cmd_pos   = __shfl_sync(0xFFFFFFFF, cmd_pos, 0);
+        off16_pos = __shfl_sync(0xFFFFFFFF, off16_pos, 0);
+        off32_pos = __shfl_sync(0xFFFFFFFF, off32_pos, 0);
+        recent_offset = __shfl_sync(0xFFFFFFFF, recent_offset, 0);
+        {
+            uint32_t len_off = (uint32_t)((uintptr_t)len_stream - (uintptr_t)len_data);
+            len_off = __shfl_sync(0xFFFFFFFF, len_off, 0);
+            len_stream = len_data + len_off;
+        }
+    }
+
+    // Per-block trailing literals
+    __syncwarp();
+    dst_pos = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
+    lit_pos = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
+    {
+        uint32_t block_end = block_dst_start + 0x10000;
+        if (block_end > dst_end_abs) block_end = dst_end_abs;
+        uint32_t block_trailing = (block_end > dst_pos) ? (block_end - dst_pos) : 0;
+        for (uint32_t i = lane; i < block_trailing; i += 32)
+            if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size)
+                dst[dst_pos + i] = lit[lit_pos + i];
+        __syncwarp();
+        dst_pos += block_trailing;
+        lit_pos += block_trailing;
+    }
+
+    block_iter++;
+    if (block_iter >= 2) break;
+    block_cmd_end = cmd_size;
+    off32_cur = off32_raw2;
+    off32_count_cur = off32_count2;
+    off32_pos = 0;
+    block_dst_start = dst_pos;
+    }
+
+    // Final trailing literals
+    __syncwarp();
+    dst_pos = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
+    lit_pos = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
+    uint32_t trailing = (lit_size > lit_pos) ? (lit_size - lit_pos) : 0;
+    for (uint32_t i = lane; i < trailing; i += 32)
+        if (dst_pos + i < dst_end_abs)
+            dst[dst_pos + i] = lit[lit_pos + i];
+}
+
 // --- Serial kernel (legacy, wraps decodeSubChunk) ---
 
 extern "C" __global__ void slzDecompressL1Kernel(
@@ -445,16 +640,29 @@ __device__ void parseAndDecodeSubChunk(
     }
     __syncwarp();
 
-    decodeSubChunk(
-        cmd_ptr, cmd_size,
-        lit_ptr, lit_size,
-        off16_raw, off16_count,
-        off32_exp1, off32_count1,
-        off32_exp2, off32_count2,
-        len_stream, len_avail,
-        dst, sc_decomp_size, initial_copy, cmd_stream2_offset,
-        dst_offset, mode
-    );
+    if (mode == 1) {
+        decodeSubChunkBatched(
+            cmd_ptr, cmd_size,
+            lit_ptr, lit_size,
+            off16_raw, off16_count,
+            off32_exp1, off32_count1,
+            off32_exp2, off32_count2,
+            len_stream, len_avail,
+            dst, sc_decomp_size, initial_copy, cmd_stream2_offset,
+            dst_offset
+        );
+    } else {
+        decodeSubChunk(
+            cmd_ptr, cmd_size,
+            lit_ptr, lit_size,
+            off16_raw, off16_count,
+            off32_exp1, off32_count1,
+            off32_exp2, off32_count2,
+            len_stream, len_avail,
+            dst, sc_decomp_size, initial_copy, cmd_stream2_offset,
+            dst_offset, mode
+        );
+    }
 }
 
 // Full GPU L1 kernel: 1 block per SC group, parses raw compressed chunks.
