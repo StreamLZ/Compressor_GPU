@@ -20,7 +20,7 @@ __device__ uint32_t readLength(const uint8_t* &len_stream, const uint8_t* len_en
     return v;
 }
 
-__global__ void slzDecompressL1Kernel(
+extern "C" __global__ void slzDecompressL1Kernel(
     const uint8_t* __restrict__ cmd, uint32_t cmd_size,
     const uint8_t* __restrict__ lit, uint32_t lit_size,
     const uint8_t* __restrict__ off16_raw, uint32_t off16_count,

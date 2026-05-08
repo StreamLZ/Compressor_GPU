@@ -18,6 +18,8 @@
 //!     via a comptime parameter, so each path is branch-free internally.
 
 const std = @import("std");
+const build_options = @import("build_options");
+const use_gpu = if (@hasDecl(build_options, "gpu")) build_options.gpu else false;
 const constants = @import("../../format/streamlz_constants.zig");
 const copy = @import("../../io/copy_helpers.zig");
 const ptr_math = @import("../../io/ptr_math.zig");
@@ -885,16 +887,26 @@ pub fn decodeChunk(
                     inner_scratch_end,
                     lz_ptr,
                 );
-                try processLzRuns(
-                    mode,
-                    src,
-                    src + src_used,
-                    dst,
-                    dst_count,
-                    @intCast(@intFromPtr(dst) - @intFromPtr(dst_start)),
-                    dst_end,
-                    lz_ptr,
-                );
+                const gpu_ok = if (use_gpu) blk: {
+                    const gpu = @import("gpu_driver.zig");
+                    if (!gpu.isAvailable()) break :blk false;
+                    lz_ptr.src_end = src + src_used;
+                    gpu.processLzRunsGpu(lz_ptr, dst, dst_count, @intFromPtr(dst) - @intFromPtr(dst_start), src + src_used, dst_start) catch break :blk false;
+                    break :blk true;
+                } else false;
+
+                if (!gpu_ok) {
+                    try processLzRuns(
+                        mode,
+                        src,
+                        src + src_used,
+                        dst,
+                        dst_count,
+                        @intCast(@intFromPtr(dst) - @intFromPtr(dst_start)),
+                        dst_end,
+                        lz_ptr,
+                    );
+                }
             } else if (src_used > dst_count or mode != 0) {
                 return error.InvalidChunkHeader;
             } else {

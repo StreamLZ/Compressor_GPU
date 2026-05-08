@@ -39,8 +39,11 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .link_libc = true,
     });
+    const gpu = b.option(bool, "gpu", "Enable GPU (CUDA) decompression via Driver API (default: false)") orelse false;
+
     const bench_option = b.addOptions();
     bench_option.addOption(bool, "enable_bench", bench);
+    bench_option.addOption(bool, "gpu", gpu);
     root_module.addOptions("build_options", bench_option);
 
     const exe = b.addExecutable(.{
