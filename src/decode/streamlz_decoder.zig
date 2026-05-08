@@ -312,7 +312,7 @@ fn decompressOneFrame(
             const prefix_sz: usize = if (peek.self_contained and num_chunks_est > 1) (num_chunks_est - 1) * 8 else 0;
             const block_payload = block_src[0 .. block_src.len - prefix_sz];
 
-            gpuBatchDecode(block_payload, dst, dst_off, block_hdr.decompressed_size, @as(usize, hdr.sc_group_size), &scratch) catch break :gpu_frame;
+            gpuBatchDecode(block_payload, dst, dst_off, block_hdr.decompressed_size, @as(usize, hdr.sc_group_size), &scratch, io_opt) catch break :gpu_frame;
             dst_off += block_hdr.decompressed_size;
 
             if (prefix_sz != 0) {
@@ -664,7 +664,7 @@ fn decompressCompressedBlock(
     if (use_gpu) gpu_batch: {
         const gpu = @import("fast/gpu_driver.zig");
         if (!gpu.isAvailable()) break :gpu_batch;
-        gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, @as(usize, sc_group_size), scratch) catch |e| {
+        gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, @as(usize, sc_group_size), scratch, null) catch |e| {
             std.debug.print("GPU batch failed: {s}\n", .{@errorName(e)});
             break :gpu_batch;
         };
@@ -853,6 +853,7 @@ fn gpuBatchDecode(
     decompressed_size: usize,
     sc_group_size_in: usize,
     scratch: []u8,
+    io_opt: ?std.Io,
 ) DecompressError!void {
     _ = scratch;
     const gpu = @import("fast/gpu_driver.zig");
@@ -970,6 +971,7 @@ fn gpuBatchDecode(
         decompressed_size,
         num_groups,
         chunks_per_group,
+        io_opt,
     );
 }
 

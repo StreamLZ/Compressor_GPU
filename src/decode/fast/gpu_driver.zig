@@ -6,23 +6,7 @@ const std = @import("std");
 const win32 = struct {
     extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.c) ?*anyopaque;
     extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.c) ?*anyopaque;
-    extern "kernel32" fn QueryPerformanceCounter(lpPerformanceCount: *i64) callconv(.c) c_int;
-    extern "kernel32" fn QueryPerformanceFrequency(lpFrequency: *i64) callconv(.c) c_int;
-    extern "kernel32" fn GetStdHandle(nStdHandle: u32) callconv(.c) ?*anyopaque;
-    extern "kernel32" fn WriteFile(hFile: *anyopaque, lpBuffer: [*]const u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: ?*u32, lpOverlapped: ?*anyopaque) callconv(.c) c_int;
 };
-
-pub fn writeStderr(msg: []const u8) void {
-    std.debug.print("{s}", .{msg});
-}
-
-fn qpcMs() i64 {
-    var count: i64 = 0;
-    var freq: i64 = 0;
-    _ = win32.QueryPerformanceCounter(&count);
-    _ = win32.QueryPerformanceFrequency(&freq);
-    return @divTrunc(count * 1000, freq);
-}
 
 const CUresult = c_int;
 const CUdevice = c_int;
@@ -141,6 +125,8 @@ var d_comp_persist: CUdeviceptr = 0;
 var d_comp_persist_size: usize = 0;
 var d_descs_persist: CUdeviceptr = 0;
 var d_descs_persist_size: usize = 0;
+
+pub var last_kernel_ns: i64 = 0;
 
 fn ensureDeviceBuf(ptr: *CUdeviceptr, current_size: *usize, needed: usize) bool {
     if (current_size.* >= needed) return true;
@@ -408,6 +394,7 @@ pub fn fullGpuLaunch(
     decompressed_size: usize,
     num_groups: u32,
     chunks_per_group: u32,
+    io: ?std.Io,
 ) fast_dec.DecodeError!void {
     if (!init() or full_kernel_fn == 0) return error.BadMode;
 
@@ -436,6 +423,8 @@ pub fn fullGpuLaunch(
     if (compressed_block.len > 0)
         _ = h2d_fn(d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len);
     _ = h2d_fn(d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes);
+    _ = sync_fn();
+    const t_before_kern = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
 
     var p_comp = d_comp_persist;
     var p_descs_dev = d_descs_persist;
@@ -456,6 +445,12 @@ pub fn fullGpuLaunch(
         return error.BadMode;
 
     if (sync_fn() != CUDA_SUCCESS) return error.BadMode;
+
+    if (t_before_kern) |t_start| {
+        if (io) |io_val| {
+            last_kernel_ns = @intCast(t_start.untilNow(io_val, .awake).toNanoseconds());
+        }
+    }
 
     _ = d2h_fn(@ptrCast(dst_full + dst_start_off), d_output + dst_start_off, decompressed_size);
 }

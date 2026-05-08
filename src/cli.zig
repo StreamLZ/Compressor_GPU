@@ -916,8 +916,15 @@ fn runBenchDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
         std.process.exit(1);
     };
 
+    const use_gpu_bench = comptime blk: {
+        const bo = @import("build_options");
+        break :blk if (@hasDecl(bo, "gpu")) bo.gpu else false;
+    };
+
     var best_ns: u64 = std.math.maxInt(u64);
     var total_ns: u64 = 0;
+    var best_kern_ns: i64 = std.math.maxInt(i64);
+    var total_kern_ns: i64 = 0;
     var run_i: u32 = 0;
     while (run_i < runs) : (run_i += 1) {
         const timer_start = std.Io.Clock.awake.now(io);
@@ -925,6 +932,14 @@ fn runBenchDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
         const elapsed = @as(u64, @intCast(timer_start.untilNow(io, .awake).toNanoseconds()));
         if (elapsed < best_ns) best_ns = elapsed;
         total_ns += elapsed;
+        if (use_gpu_bench) {
+            const gpu = @import("decode/fast/gpu_driver.zig");
+            if (gpu.last_kernel_ns > 0) {
+                const kns = gpu.last_kernel_ns;
+                if (kns < best_kern_ns) best_kern_ns = kns;
+                total_kern_ns += kns;
+            }
+        }
     }
 
     const mean_ns: u64 = total_ns / runs;
@@ -947,6 +962,19 @@ fn runBenchDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
         @as(f64, @floatFromInt(mean_ns)) / 1_000_000.0,
         mean_mbps,
     });
+    if (use_gpu_bench and best_kern_ns < std.math.maxInt(i64)) {
+        const mean_kern_ns = @divTrunc(total_kern_ns, @as(i64, @intCast(runs)));
+        const best_kern_ms: f64 = @as(f64, @floatFromInt(best_kern_ns)) / 1_000_000.0;
+        const mean_kern_ms: f64 = @as(f64, @floatFromInt(mean_kern_ns)) / 1_000_000.0;
+        try w.print("  gpu kernel best: {d:.3} ms  ({d:.0} MB/s)\n", .{
+            best_kern_ms,
+            mb * 1000.0 / best_kern_ms,
+        });
+        try w.print("  gpu kernel mean: {d:.3} ms  ({d:.0} MB/s)\n", .{
+            mean_kern_ms,
+            mb * 1000.0 / mean_kern_ms,
+        });
+    }
 }
 
 // ─── Benchmark: all levels (-ba) ─────────────────────────────────────
