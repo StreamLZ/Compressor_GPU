@@ -34,6 +34,107 @@ __device__ uint32_t readLength(const uint8_t* &len_stream, const uint8_t* len_en
     return v;
 }
 
+// Streamlined single-block raw decoder for 64KB chunks (no off32, no delta, no block split).
+__device__ void decodeSubChunkL1(
+    const uint8_t* __restrict__ cmd, uint32_t cmd_size,
+    const uint8_t* __restrict__ lit, uint32_t lit_size,
+    const uint8_t* __restrict__ off16_raw, uint32_t off16_count,
+    const uint8_t* __restrict__ len_data, uint32_t len_avail,
+    uint8_t* __restrict__ dst, uint32_t dst_size,
+    uint32_t initial_copy,
+    uint32_t dst_offset
+) {
+    const int lane = threadIdx.x & 31;
+    uint32_t cmd_pos = 0, lit_pos = 0, off16_pos = 0;
+    uint32_t dst_pos = dst_offset + initial_copy;
+    int32_t recent_offset = -8;
+    const uint32_t dst_end_abs = dst_offset + dst_size;
+    const uint8_t* len_stream = len_data;
+    const uint8_t* len_end = len_data + len_avail;
+
+    while (cmd_pos < cmd_size) {
+        uint32_t local_lit = 0, local_match = 0;
+        int32_t offset = recent_offset;
+        uint32_t use_recent = 0, is_lit_only = 0;
+
+        if (lane == 0) {
+            uint32_t token = cmd[cmd_pos++];
+            if (token >= 24) {
+                local_lit = token & 7;
+                local_match = (token >> 3) & 0xF;
+                use_recent = (token >> 7) & 1;
+                if (!use_recent && off16_pos < off16_count) {
+                    uint16_t v; memcpy(&v, off16_raw + off16_pos * 2, 2);
+                    offset = -(int32_t)v;
+                    off16_pos++;
+                }
+            } else if (token == 0) {
+                is_lit_only = 1;
+                local_lit = readLength(len_stream, len_end) + 64;
+            } else if (token == 1) {
+                local_match = readLength(len_stream, len_end) + 91;
+                if (off16_pos < off16_count) {
+                    uint16_t v; memcpy(&v, off16_raw + off16_pos * 2, 2);
+                    offset = -(int32_t)v; off16_pos++;
+                }
+            }
+        }
+
+        local_lit   = __shfl_sync(0xFFFFFFFF, local_lit, 0);
+        local_match = __shfl_sync(0xFFFFFFFF, local_match, 0);
+        offset      = __shfl_sync(0xFFFFFFFF, offset, 0);
+        use_recent  = __shfl_sync(0xFFFFFFFF, use_recent, 0);
+        is_lit_only = __shfl_sync(0xFFFFFFFF, is_lit_only, 0);
+        cmd_pos     = __shfl_sync(0xFFFFFFFF, cmd_pos, 0);
+        lit_pos     = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
+        off16_pos   = __shfl_sync(0xFFFFFFFF, off16_pos, 0);
+
+        if (local_lit > 0) {
+            for (uint32_t i = lane; i < local_lit; i += 32)
+                if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size)
+                    dst[dst_pos + i] = lit[lit_pos + i];
+            __syncwarp();
+            dst_pos += local_lit;
+            lit_pos += local_lit;
+        }
+
+        if (local_match > 0) {
+            uint32_t ms = (uint32_t)((int32_t)dst_pos + offset);
+            int32_t abs_off = -offset;
+            if (abs_off >= (int32_t)local_match && local_match > 1) {
+                for (uint32_t i = lane; i < local_match; i += 32)
+                    if (dst_pos + i < dst_end_abs)
+                        dst[dst_pos + i] = dst[ms + i];
+            } else {
+                if (lane == 0)
+                    for (uint32_t i = 0; i < local_match; i++)
+                        if (dst_pos + i < dst_end_abs)
+                            dst[dst_pos + i] = dst[ms + i];
+            }
+            __syncwarp();
+            dst_pos += local_match;
+        }
+
+        dst_pos   = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
+        lit_pos   = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
+        if (!use_recent && !is_lit_only) recent_offset = offset;
+        recent_offset = __shfl_sync(0xFFFFFFFF, recent_offset, 0);
+        {
+            uint32_t len_off = (uint32_t)((uintptr_t)len_stream - (uintptr_t)len_data);
+            len_off = __shfl_sync(0xFFFFFFFF, len_off, 0);
+            len_stream = len_data + len_off;
+        }
+    }
+
+    __syncwarp();
+    dst_pos = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
+    lit_pos = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
+    uint32_t trailing = (lit_size > lit_pos) ? (lit_size - lit_pos) : 0;
+    for (uint32_t i = lane; i < trailing; i += 32)
+        if (dst_pos + i < dst_end_abs)
+            dst[dst_pos + i] = lit[lit_pos + i];
+}
+
 // Core sub-chunk decode: used by both serial and batch kernels.
 // mode: 0 = delta literals, 1 = raw literals
 __device__ void decodeSubChunk(
@@ -658,35 +759,31 @@ __device__ void parseAndDecodeSubChunk(
         off32_raw1 = off32_raw2 - off32_count1 * 3;
     }
 
-    __shared__ uint8_t off32_scratch[2][2][4096];  // [warp][block][data]
-    uint8_t* off32_exp1 = off32_scratch[threadIdx.y][0];
-    uint8_t* off32_exp2 = off32_scratch[threadIdx.y][1];
-
-    // Expand 3-byte off32 values to 4-byte
-    for (uint32_t i = lane; i < off32_count1; i += 32) {
-        uint32_t v = (uint32_t)off32_raw1[i*3] | ((uint32_t)off32_raw1[i*3+1] << 8) | ((uint32_t)off32_raw1[i*3+2] << 16);
-        memcpy(off32_exp1 + i*4, &v, 4);
+    if (mode == 1 && off32_count1 == 0 && off32_count2 == 0) {
+        decodeSubChunkL1(
+            cmd_ptr, cmd_size,
+            lit_ptr, lit_size,
+            off16_raw, off16_count,
+            len_stream, len_avail,
+            dst, sc_decomp_size, initial_copy,
+            dst_offset
+        );
+    } else {
+        decodeSubChunk(
+            cmd_ptr, cmd_size,
+            lit_ptr, lit_size,
+            off16_raw, off16_count,
+            off32_raw1, off32_count1,
+            off32_raw2, off32_count2,
+            len_stream, len_avail,
+            dst, sc_decomp_size, initial_copy, cmd_stream2_offset,
+            dst_offset, mode
+        );
     }
-    for (uint32_t i = lane; i < off32_count2; i += 32) {
-        uint32_t v = (uint32_t)off32_raw2[i*3] | ((uint32_t)off32_raw2[i*3+1] << 8) | ((uint32_t)off32_raw2[i*3+2] << 16);
-        memcpy(off32_exp2 + i*4, &v, 4);
-    }
-    __syncwarp();
-
-    decodeSubChunkBatched(
-        cmd_ptr, cmd_size,
-        lit_ptr, lit_size,
-        off16_raw, off16_count,
-        off32_exp1, off32_count1,
-        off32_exp2, off32_count2,
-        len_stream, len_avail,
-        dst, sc_decomp_size, initial_copy, cmd_stream2_offset,
-        dst_offset, mode
-    );
 }
 
 // Full GPU L1 kernel: 1 block per SC group, parses raw compressed chunks.
-extern "C" __global__ void slzFullDecompressL1Kernel(
+extern "C" __global__ void __launch_bounds__(64, 20) slzFullDecompressL1Kernel(
     const uint8_t* __restrict__ compressed,
     const SlzChunkDesc* __restrict__ chunks,
     uint8_t* __restrict__ dst,

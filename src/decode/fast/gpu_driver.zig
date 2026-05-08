@@ -92,10 +92,10 @@ pub fn init() bool {
     const ctx_result = ctx_fn(&ctx, 0, dev);
     if (ctx_result != CUDA_SUCCESS) return false;
 
-    // Load PTX module
-    const ptx = @embedFile("slz_kernel.ptx") ++ "\x00";
+    // Load pre-compiled CUBIN module (SM 8.9, 48 regs, no JIT overhead)
+    const cubin = @embedFile("slz_kernel.cubin");
     const mod_fn = cuModuleLoadData_fn orelse return false;
-    const mod_result = mod_fn(&module, ptx.ptr);
+    const mod_result = mod_fn(&module, cubin.ptr);
     if (mod_result != CUDA_SUCCESS) return false;
 
     const get_fn = cuModuleGetFunction_fn orelse return false;
