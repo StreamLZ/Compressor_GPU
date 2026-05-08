@@ -93,12 +93,10 @@ pub const FrameHeader = struct {
     codec: Codec,
     level: u8,
     block_size: u32,
-    /// Number of 256 KB chunks per SC (self-contained) group.
-    /// Currently always 4 in practice, but stored in the header so
-    /// future encoders can pick different group sizes without a format
-    /// bump. Decoders must use this value (not a hardcoded constant)
-    /// when walking SC-block group boundaries.
-    sc_group_size: u8,
+    /// SC group size in units of 256KB chunks. Fractional values < 1.0
+    /// mean sub-chunk-level SC (0.25 = 64KB blocks, 0.5 = 128KB sub-chunks).
+    /// Wire format: u8 byte × 0.25 (byte=1 → 0.25, byte=4 → 1.0, byte=16 → 4.0).
+    sc_group_size: f32,
     content_size: ?u64,
     dictionary_id: ?u32,
     header_size: usize,
@@ -141,15 +139,10 @@ pub fn parseHeader(src: []const u8) ParseError!FrameHeader {
     if (block_size_log2 < min_log2 or block_size_log2 > max_log2) return error.BadBlockSize;
     const block_size: u32 = @as(u32, 1) << @intCast(block_size_log2);
 
-    // v2: dedicated sc_group_size byte replaces the v1 reserved byte.
-    // Value must be in 1..255; 0 is reserved to catch accidental zero-init.
-    const sc_group_size = src[pos];
-    pos += 1;
-    if (sc_group_size == 0) return error.BadScGroupSize;
-
-    // v2: 4 reserved bytes for future use. Not validated on read (future
-    // v2-compatible encoders may use them, but current decoders ignore).
+    // sc_group_size as f32 (4 bytes LE) + 1 reserved byte = 5 bytes total.
+    const sc_group_size: f32 = @bitCast(std.mem.readInt(u32, src[pos..][0..4], .little));
     pos += 4;
+    pos += 1; // reserved
 
     var content_size: ?u64 = null;
     if (raw_flags.content_size_present) {
@@ -179,22 +172,17 @@ pub fn parseHeader(src: []const u8) ParseError!FrameHeader {
     };
 }
 
-/// Convert an sc_group_size header byte to the group size in bytes.
-/// Values 1-3: fractional chunks (1=64KB, 2=128KB, 3=192KB).
-/// Values 4+: that many 256KB chunks.
-pub fn scGroupSizeToBytes(sc_group_size: u8) usize {
-    if (sc_group_size < 4) {
-        return @as(usize, sc_group_size) * (constants.chunk_size / 4);
-    }
-    return @as(usize, sc_group_size) * constants.chunk_size;
+/// Convert sc_group_size (float, in units of 256KB chunks) to bytes.
+pub fn scGroupSizeToBytes(sc_group_size: f32) usize {
+    return @intFromFloat(sc_group_size * @as(f32, @floatFromInt(constants.chunk_size)));
 }
 
-/// Convert an sc_group_size header byte to a sub-chunk size for the encoder.
-/// For fractional groups (1-3), sub-chunks must be ≤ the group size.
-/// For integer groups (4+), sub-chunks use the default 128KB.
-pub fn scGroupSubChunkSize(sc_group_size: u8) usize {
-    if (sc_group_size < 4) {
-        return @as(usize, sc_group_size) * (constants.chunk_size / 4);
+/// Effective sub-chunk size for a given sc_group_size.
+/// For fractional groups (< 1.0), sub-chunks are the group size.
+/// For integer groups (>= 1.0), sub-chunks use the default 128KB.
+pub fn scGroupSubChunkSize(sc_group_size: f32) usize {
+    if (sc_group_size < 1.0) {
+        return scGroupSizeToBytes(sc_group_size);
     }
     return constants.sub_chunk_size;
 }
@@ -203,10 +191,9 @@ pub const WriteHeaderOptions = struct {
     codec: Codec,
     level: u8,
     block_size: u32 = default_block_size,
-    /// SC group size. Values >= 4: number of 256KB chunks per group.
-    /// Values 1-3: fractional (1=0.25 chunk=64KB, 2=0.5=128KB, 3=0.75=192KB).
-    /// Use `scGroupSizeToBytes()` to convert to bytes.
-    sc_group_size: u8 = constants.default_sc_group_size,
+    /// SC group size in units of 256KB chunks. 4.0 = default (1MB groups).
+    /// 0.25 = 64KB blocks (maximum GPU parallelism).
+    sc_group_size: f32 = @as(f32, @floatFromInt(constants.default_sc_group_size)),
     parallel_decode_metadata_present: bool = false,
     content_size: ?u64 = null,
     content_checksum: bool = false,
@@ -222,7 +209,7 @@ pub fn writeHeader(dst: []u8, opts: WriteHeaderOptions) WriteError!usize {
     if (opts.level < 1 or opts.level > 9) return error.BadLevel;
     if (opts.block_size < min_block_size or opts.block_size > max_block_size) return error.BadBlockSize;
     if (!std.math.isPowerOfTwo(opts.block_size)) return error.BadBlockSize;
-    if (opts.sc_group_size == 0) return error.BadScGroupSize;
+    if (opts.sc_group_size <= 0) return error.BadScGroupSize;
 
     const flags: FrameFlags = .{
         .content_size_present = opts.content_size != null,
@@ -248,12 +235,12 @@ pub fn writeHeader(dst: []u8, opts: WriteHeaderOptions) WriteError!usize {
     const this_log2: u8 = @intCast(std.math.log2_int(u32, opts.block_size));
     dst[pos] = this_log2 - min_log2;
     pos += 1;
-    // v2: sc_group_size byte (replaces the v1 single reserved byte).
-    dst[pos] = opts.sc_group_size;
-    pos += 1;
-    // v2: 4 reserved bytes for future use, must be zero on write.
-    @memset(dst[pos..][0..4], 0);
+    // sc_group_size as f32 (4 bytes LE) + 1 reserved byte = 5 bytes total
+    // (replaces the old 1-byte sc_group_size + 4 reserved bytes).
+    std.mem.writeInt(u32, dst[pos..][0..4], @bitCast(opts.sc_group_size), .little);
     pos += 4;
+    dst[pos] = 0;
+    pos += 1;
 
     if (opts.content_size) |cs| {
         std.mem.writeInt(i64, dst[pos..][0..8], @intCast(cs), .little);

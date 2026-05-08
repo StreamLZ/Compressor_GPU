@@ -312,7 +312,7 @@ fn decompressOneFrame(
             const prefix_sz: usize = if (peek.self_contained and num_chunks_est > 1) (num_chunks_est - 1) * 8 else 0;
             const block_payload = block_src[0 .. block_src.len - prefix_sz];
 
-            gpuBatchDecode(block_payload, dst, dst_off, block_hdr.decompressed_size, @as(usize, hdr.sc_group_size), &scratch, io_opt) catch break :gpu_frame;
+            gpuBatchDecode(block_payload, dst, dst_off, block_hdr.decompressed_size, hdr.sc_group_size, &scratch, io_opt) catch break :gpu_frame;
             dst_off += block_hdr.decompressed_size;
 
             if (prefix_sz != 0) {
@@ -615,7 +615,7 @@ pub fn decompressBlockWithDict(
     // v2 default sc_group_size. Streaming / framed callers should
     // instead use `decompressFramed` / `decompressStream` so the
     // header-declared sc_group_size flows through.
-    try decompressCompressedBlock(src, dst, &dst_off, decompressed_size, &scratch, constants.default_sc_group_size);
+    try decompressCompressedBlock(src, dst, &dst_off, decompressed_size, &scratch, @as(f32, @floatFromInt(constants.default_sc_group_size)));
     return dst_off - dst_offset;
 }
 
@@ -638,9 +638,8 @@ fn decompressCompressedBlock(
     dst_off_inout: *usize,
     decompressed_size: usize,
     scratch: []u8,
-    sc_group_size: u8,
+    sc_group_size: f32,
 ) DecompressError!void {
-    std.debug.print("decompressCompressedBlock: gpu={} sc_group={d}\n", .{ use_gpu, sc_group_size });
     // Peek the first 2-byte internal block header to detect SC mode up-front.
     const is_sc = blk: {
         if (block_src_in.len < 2) break :blk false;
@@ -664,7 +663,7 @@ fn decompressCompressedBlock(
     if (use_gpu) gpu_batch: {
         const gpu = @import("fast/gpu_driver.zig");
         if (!gpu.isAvailable()) break :gpu_batch;
-        gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, @as(usize, sc_group_size), scratch, null) catch |e| {
+        gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, sc_group_size, scratch, null) catch |e| {
             std.debug.print("GPU batch failed: {s}\n", .{@errorName(e)});
             break :gpu_batch;
         };
@@ -788,7 +787,7 @@ fn decompressCompressedBlock(
                 const scratch_end_ptr: [*]u8 = scratch.ptr + scratch.len;
 
                 const n = if (is_sc) blk: {
-                    const gs: usize = sc_group_size;
+                    const gs: usize = if (sc_group_size >= 1.0) @max(1, @as(usize, @intFromFloat(sc_group_size))) else 1;
                     const group_start_chunk = (chunk_idx_in_block / gs) * gs;
                     const group_start_offset = sc_start_dst_off + group_start_chunk * constants.chunk_size;
                     break :blk try high.decodeChunkSc(
@@ -851,7 +850,7 @@ fn gpuBatchDecode(
     dst: []u8,
     dst_start_off: usize,
     decompressed_size: usize,
-    sc_group_size_in: usize,
+    sc_group_size_in: f32,
     scratch: []u8,
     io_opt: ?std.Io,
 ) DecompressError!void {
@@ -868,7 +867,10 @@ fn gpuBatchDecode(
         const peek = block_header.parseBlockHeader(block_src) catch break :blk false;
         break :blk peek.self_contained;
     };
-    const effective_group_size = if (block_is_sc and sc_group_size_in > 0 and sc_group_size_in < num_chunks) sc_group_size_in else num_chunks;
+    // Group size in chunks (rounded up to 1 minimum). For sc_group < 1.0,
+    // each chunk is its own group (fractional means sub-chunk-level SC).
+    const sc_grp_chunks: usize = if (sc_group_size_in >= 1.0) @max(1, @as(usize, @intFromFloat(sc_group_size_in))) else 1;
+    const effective_group_size = if (block_is_sc and sc_grp_chunks < num_chunks) sc_grp_chunks else num_chunks;
     const num_groups: u32 = @intCast((num_chunks + effective_group_size - 1) / effective_group_size);
     const chunks_per_group: u32 = @intCast(effective_group_size);
 

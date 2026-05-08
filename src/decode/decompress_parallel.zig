@@ -436,7 +436,7 @@ pub fn decompressCoreParallel(
     dst: []u8,
     dst_off_inout: *usize,
     decompressed_size: usize,
-    sc_group_size: u8,
+    sc_group_size: f32,
     max_threads: usize,
 ) DecodeError!void {
     // Pre-scan to count chunks and compute prefix size. The pre-scan
@@ -460,7 +460,7 @@ pub fn decompressCoreParallel(
     // -- Invariant assertions (debug only) --
     // sc_group_size must be positive; zero would cause division-by-zero
     // in the group count calculation below.
-    std.debug.assert(sc_group_size > 0);
+    std.debug.assert(sc_group_size > 0.0);
     // The dst buffer must have safe_space padding (64 bytes) beyond the
     // decompressed region for SIMD wildCopy16 overcopy at chunk tails.
     std.debug.assert(dst.len >= dst_start_off + decompressed_size + 64);
@@ -470,7 +470,7 @@ pub fn decompressCoreParallel(
     // v2: `group_size` is now taken from the frame header rather than
     // the compile-time `constants.sc_group_size` constant. Encoders may
     // eventually pick different sizes without a format bump.
-    const group_size: usize = sc_group_size;
+    const group_size: usize = if (sc_group_size >= 1.0) @max(1, @as(usize, @intFromFloat(sc_group_size))) else 1;
     const num_groups = (num_chunks + group_size - 1) / group_size;
     var cpu_count_raw: usize = if (max_threads > 0) max_threads else std.Thread.getCpuCount() catch 1;
     if (max_threads == 0) {

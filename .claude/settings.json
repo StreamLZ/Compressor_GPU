@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(zig zen *)",
+      "Read(//c/Users/james.JAMESWORK2025/AppData/Local/Microsoft/WinGet/Packages/zig.zig_Microsoft.Winget.Source_8wekyb3d8bbwe/zig-x86_64-windows-0.16.0/lib/std/Build/**)",
+      "Bash(./zig-out/bin/streamlz.exe -ba -r 30 -t 24 C:/tmp/enwik8.raw)",
+      "Bash(dir \"c:\\\\Users\\\\james.JAMESWORK2025\\\\Repos\\\\StreamLZ_native\\\\src\\\\encode\\\\fast\\\\fast_lz_parser_v2.zig\")",
+      "PowerShell(.\\\\zig-out\\\\bin\\\\streamlz.exe -ba -r 30 -t 24 C:\\\\tmp\\\\enwik8.raw 2>&1)",
+      "Bash(ls \"C:\\\\Program Files\\\\NVIDIA nvCOMP\\\\\")",
+      "Read(//c/Program Files/**)",
+      "PowerShell(nvcc --version 2>$null)",
+      "PowerShell(if \\(-not $?\\) { \"CUDA toolkit not found\" })",
+      "PowerShell(cuobjdump --list-elf \"C:\\\\Program Files\\\\NVIDIA nvCOMP\\\\v5.2\\\\bin\\\\13\\\\nvcomp64_5.dll\")",
+      "Bash(nvcc --version)",
+      "Bash(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader)",
+      "PowerShell(.\\\\zig-out\\\\bin\\\\streamlz.exe -d -t 1 -r 5 c:\\\\tmp\\\\enwik8_gpu.slz -o c:\\\\tmp\\\\enwik8_batch_out.bin 2>&1)",
+      "PowerShell(zig build -Doptimize=ReleaseFast -Dgpu=true 2>&1)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\james.JAMESWORK2025\\.claude\\projects\\c--Users-james-JAMESWORK2025-Repos-StreamLZ-native\\memory"
+    ]
+  }
+}

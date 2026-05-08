@@ -381,11 +381,11 @@ pub fn compressFramedOne(
         else => unreachable,
     };
     var pos: usize = 0;
-    const sc_grp: u8 = if (opts.sc_group_size_override) |ov| ov else switch (opts.level) {
-        1 => lz_constants.default_sc_group_size, // TODO: use sc_group_size_override for 0.25
-        2, 3, 4 => @min(high_framed.computeAdaptiveGroupSize(src.len), 16),
-        5 => high_framed.computeAdaptiveGroupSize(src.len),
-        else => lz_constants.default_sc_group_size,
+    const sc_grp: f32 = if (opts.sc_group_size_override) |ov| ov else switch (opts.level) {
+        1 => @as(f32, @floatFromInt(lz_constants.default_sc_group_size)),
+        2, 3, 4 => @floatFromInt(@min(high_framed.computeAdaptiveGroupSize(src.len), 16)),
+        5 => @floatFromInt(high_framed.computeAdaptiveGroupSize(src.len)),
+        else => @as(f32, @floatFromInt(lz_constants.default_sc_group_size)),
     };
     const hdr_len = try frame.writeHeader(dst, .{
         .codec = .fast,
@@ -518,7 +518,7 @@ pub fn compressFramedOne(
     const num_chunks: usize = if (can_compress) (src.len + lz_constants.chunk_size - 1) / lz_constants.chunk_size else 0;
     const effective_threads: u32 = if (opts.num_threads == 0) @intCast(@max(1, std.Thread.getCpuCount() catch 1)) else opts.num_threads;
     if (self_contained and can_compress and effective_threads > 1 and num_chunks > 1) {
-        const parallel_sc_grp: usize = sc_grp;
+        const parallel_sc_grp: usize = @max(1, @as(usize, @intFromFloat(sc_grp)));
         const parallel_payload_size = try compressFastChunksParallel(
             allocator,
             io,
@@ -559,29 +559,23 @@ pub fn compressFramedOne(
     //              else → LZ; compare lzCost vs memsetCost
     //            if totalCost > blockMemsetCost → rewind, emit uncompressed block
     //            else backfill chunk hdr
-    const effective_sub_chunk_size: usize = frame.scGroupSubChunkSize(sc_grp);
+    const effective_sc_sub_chunk: usize = frame.scGroupSubChunkSize(sc_grp);
     var src_off: usize = dict_len;
     var chunk_in_group: usize = 0;
     var group_start_off: usize = dict_len;
-    var bytes_in_group: usize = 0;
     while (can_compress and src_off < effective_src.len) {
         const block_src_len: usize = @min(effective_src.len - src_off, lz_constants.chunk_size);
         const block_src: []const u8 = effective_src[src_off..][0..block_src_len];
 
         // SC mode: reset hasher at group boundaries.
-        // For sc_grp >= 4: every sc_grp chunks (old behavior).
-        // For sc_grp < 4 (fractional): within each chunk at sub-chunk boundaries.
-        if (self_contained and (chunk_in_group == 0 or sc_grp < 4)) {
-            if (chunk_in_group == 0 or sc_grp < 4) {
-                if (greedy_hasher_u32) |*h| h.reset();
-                if (chain_hasher) |*h| {
-                    h.reset();
-                    h.setSrcBase(effective_src[src_off..].ptr);
-                    h.setBaseWithoutPreload(0);
-                }
-                group_start_off = src_off;
-                bytes_in_group = 0;
+        if (self_contained and chunk_in_group == 0) {
+            if (greedy_hasher_u32) |*h| h.reset();
+            if (chain_hasher) |*h| {
+                h.reset();
+                h.setSrcBase(effective_src[src_off..].ptr);
+                h.setBaseWithoutPreload(0);
             }
+            group_start_off = src_off;
         }
         var window_base_ptr: [*]const u8 = if (self_contained) effective_src[group_start_off..].ptr else effective_src.ptr;
 
@@ -626,8 +620,8 @@ pub fn compressFramedOne(
         var sub_off: usize = 0;
 
         while (sub_off < block_src_len) {
-            // For fractional SC groups, reset match window per sub-chunk
-            if (self_contained and sc_grp < 4 and sub_off > 0) {
+            // For fractional SC groups (< 1.0), reset match window per sub-chunk
+            if (self_contained and sc_grp < 1.0 and sub_off > 0) {
                 if (greedy_hasher_u32) |*h| h.reset();
                 if (chain_hasher) |*h| {
                     h.reset();
@@ -637,7 +631,7 @@ pub fn compressFramedOne(
                 group_start_off = src_off + sub_off;
                 window_base_ptr = effective_src[group_start_off..].ptr;
             }
-            const round_bytes: usize = @min(block_src_len - sub_off, effective_sub_chunk_size);
+            const round_bytes: usize = @min(block_src_len - sub_off, effective_sc_sub_chunk);
             const sub_src: []const u8 = effective_src[src_off + sub_off ..][0..round_bytes];
 
             const round_f: f32 = @floatFromInt(round_bytes);
@@ -753,7 +747,8 @@ pub fn compressFramedOne(
 
         src_off += block_src_len;
         chunk_in_group += 1;
-        if (chunk_in_group >= sc_grp) chunk_in_group = 0;
+        const sc_grp_int: usize = @max(1, @as(usize, @intFromFloat(sc_grp)));
+        if (chunk_in_group >= sc_grp_int) chunk_in_group = 0;
     }
 
     // SC mode: append a prefix table of (num_chunks - 1) * 8 bytes at the

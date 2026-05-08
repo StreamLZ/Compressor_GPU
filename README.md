@@ -138,6 +138,55 @@ L1-L5 SC group-parallel (adaptive group size), L6-L8 SC group-parallel
 | L9  |  53,090,767 | 24.9% |    11 MB/s |  3,253 MB/s |
 | L11 |  51,541,859 | 24.2% |   3.5 MB/s |  3,954 MB/s |
 
+### Apple M4 Pro — vs zstd and LZ4 (single-threaded, enwik8 100 MB)
+
+Mac Mini, Apple M4 Pro (14 cores), 64 GB RAM, macOS, Zig 0.16 / LLVM 21.
+Best of 30 runs.
+
+| Compressor | Ratio | Compress | Decompress |
+|-----------|-------|----------|------------|
+| LZ4       | 57.3% |     714 MB/s |   5,384 MB/s |
+| LZ4 HC 9  | 42.2% |    48.9 MB/s |   4,810 MB/s |
+| LZ4 HC 12 | 41.9% |    25.0 MB/s |   4,696 MB/s |
+| zstd 1    | 40.7% |     593 MB/s |   1,933 MB/s |
+| zstd 3    | 35.4% |     322 MB/s |   1,755 MB/s |
+| zstd 9    | 31.1% |    83.5 MB/s |   1,942 MB/s |
+| zstd 19   | 26.9% |     3.2 MB/s |   2,000 MB/s |
+| **SLZ L1**  | 53.7% |     321 MB/s | **10,002 MB/s** |
+| **SLZ L3**  | 51.7% |     256 MB/s |  **6,943 MB/s** |
+| **SLZ L5**  | 41.9% |    80.4 MB/s |  **7,741 MB/s** |
+| **SLZ L6**  | 27.4% |     4.0 MB/s |   1,321 MB/s |
+| **SLZ L8**  | 25.5% |     1.2 MB/s |   1,317 MB/s |
+| **SLZ L9**  | 27.4% |     4.1 MB/s |   1,318 MB/s |
+| **SLZ L11** | 25.5% |     0.3 MB/s |   1,319 MB/s |
+
+SLZ L1 decompresses at **10.0 GB/s** — 1.9x faster than LZ4 and
+5.2x faster than zstd 1. SLZ L5 matches LZ4 HC 12's ratio while
+decoding **1.6x faster** (7.7 vs 4.7 GB/s).
+
+### Apple M4 Pro — All levels (14 cores, enwik8 100 MB)
+
+`streamlz -ba -r 100`.
+
+| Level | Compressed | Ratio | Compress | Decompress |
+|-------|------------|-------|----------|------------|
+| L1  | 53,741,965 | 53.7% | 3,052 MB/s | 76,197 MB/s |
+| L2  | 53,045,282 | 53.0% | 2,358 MB/s | 73,463 MB/s |
+| L3  | 51,702,960 | 51.7% | 1,961 MB/s | 56,371 MB/s |
+| L4  | 48,963,945 | 49.0% | 1,556 MB/s | 58,353 MB/s |
+| L5  | 41,929,522 | 41.9% |   563 MB/s | 53,970 MB/s |
+| L6  | 29,137,356 | 29.1% |  32.0 MB/s |  8,992 MB/s |
+| L7  | 29,031,250 | 29.0% |  23.8 MB/s |  9,016 MB/s |
+| L8  | 28,639,482 | 28.6% |  13.9 MB/s |  9,190 MB/s |
+| L9  | 27,430,880 | 27.4% |   8.4 MB/s |  3,788 MB/s |
+| L10 | 27,280,109 | 27.3% |   8.0 MB/s |  3,827 MB/s |
+| L11 | 25,550,450 | 25.6% |   1.8 MB/s |  3,609 MB/s |
+
+L1 parallel decompress hits **76 GB/s** — 1.4x faster than LZ4 MT
+(54 GB/s) and 3.7x faster than zstd 1 MT (20 GB/s). The decoder
+scales with memory bandwidth; the M4 Pro's ~60 GB/s DRAM bandwidth
+is fully saturated.
+
 ---
 
 ## Dictionary support
