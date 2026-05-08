@@ -33,6 +33,7 @@ const FnMemcpyDtoH = *const fn (*anyopaque, CUdeviceptr, usize) callconv(.c) CUr
 const FnLaunchKernel = *const fn (usize, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, usize, [*]?*anyopaque, [*]?*anyopaque) callconv(.c) CUresult;
 const FnCtxSync = *const fn () callconv(.c) CUresult;
 const FnMemsetD8 = *const fn (CUdeviceptr, u8, usize) callconv(.c) CUresult;
+const FnCtxSetCurrent = *const fn (usize) callconv(.c) CUresult;
 
 var cuInit_fn: ?FnInit = null;
 var cuDeviceGet_fn: ?FnDeviceGet = null;
@@ -59,7 +60,7 @@ pub fn init() bool {
     initialized = true;
 
     lib = win32.LoadLibraryA("nvcuda.dll");
-    if (lib == null) { std.debug.print("Failed to load nvcuda.dll\n", .{}); return false; }
+    if (lib == null) return false;
 
     cuInit_fn = getProc(FnInit, "cuInit");
     cuDeviceGet_fn = getProc(FnDeviceGet, "cuDeviceGet");
@@ -74,33 +75,30 @@ pub fn init() bool {
     cuCtxSynchronize_fn = getProc(FnCtxSync, "cuCtxSynchronize");
     cuMemsetD8_fn = getProc(FnMemsetD8, "cuMemsetD8_v2");
 
-    const init_fn = cuInit_fn orelse { std.debug.print("cuInit not found\n", .{}); return false; };
+    const init_fn = cuInit_fn orelse return false;
     const init_result = init_fn(0);
-    if (init_result != CUDA_SUCCESS) { std.debug.print("cuInit failed: {d}\n", .{init_result}); return false; }
-    std.debug.print("cuInit OK\n", .{});
+    if (init_result != CUDA_SUCCESS) return false;
 
     var dev: CUdevice = 0;
-    const dev_fn = cuDeviceGet_fn orelse { std.debug.print("cuDeviceGet not found\n", .{}); return false; };
+    const dev_fn = cuDeviceGet_fn orelse return false;
     const dev_result = dev_fn(&dev, 0);
-    if (dev_result != CUDA_SUCCESS) { std.debug.print("cuDeviceGet failed: {d}\n", .{dev_result}); return false; }
-    std.debug.print("cuDeviceGet OK: dev={d}\n", .{dev});
+    if (dev_result != CUDA_SUCCESS) return false;
 
     cuCtxCreate_fn = getProc(FnCtxCreate, "cuCtxCreate_v2");
     if (cuCtxCreate_fn == null) cuCtxCreate_fn = getProc(FnCtxCreate, "cuCtxCreate");
-    const ctx_fn = cuCtxCreate_fn orelse { std.debug.print("cuCtxCreate not found\n", .{}); return false; };
+    const ctx_fn = cuCtxCreate_fn orelse return false;
     const ctx_result = ctx_fn(&ctx, 0, dev);
-    if (ctx_result != CUDA_SUCCESS) { std.debug.print("cuCtxCreate failed: {d}\n", .{ctx_result}); return false; }
-    std.debug.print("cuCtxCreate OK\n", .{});
+    if (ctx_result != CUDA_SUCCESS) return false;
 
     // Load PTX module
     const ptx = @embedFile("slz_kernel.ptx") ++ "\x00";
     const mod_fn = cuModuleLoadData_fn orelse return false;
     const mod_result = mod_fn(&module, ptx.ptr);
-    if (mod_result != CUDA_SUCCESS) { std.debug.print("cuModuleLoadData failed: {d}\n", .{mod_result}); return false; }
+    if (mod_result != CUDA_SUCCESS) return false;
 
     const get_fn = cuModuleGetFunction_fn orelse return false;
     const fn_result = get_fn(&kernel_fn, module, "slzDecompressL1Kernel");
-    if (fn_result != CUDA_SUCCESS) { std.debug.print("cuModuleGetFunction failed: {d}\n", .{fn_result}); return false; }
+    if (fn_result != CUDA_SUCCESS) return false;
 
     return true;
 }
@@ -134,11 +132,7 @@ pub fn processLzRunsGpu(
     src_end: [*]const u8,
     dst_start: [*]const u8,
 ) fast_dec.DecodeError!void {
-    if (!init()) {
-        std.debug.print("GPU init failed (kernel_fn={d})\n", .{kernel_fn});
-        return error.BadMode;
-    }
-    std.debug.print("GPU processLzRuns: dst_size={d} base_offset={d}\n", .{dst_size, base_offset});
+    if (!init()) return error.BadMode;
 
     const alloc_fn = cuMemAlloc_fn orelse return error.BadMode;
     const free_fn = cuMemFree_fn orelse return error.BadMode;

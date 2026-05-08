@@ -897,14 +897,8 @@ pub fn decodeChunk(
 
                 if (!gpu_ok) {
                     try processLzRuns(
-                        mode,
-                        src,
-                        src + src_used,
-                        dst,
-                        dst_count,
-                        @intCast(@intFromPtr(dst) - @intFromPtr(dst_start)),
-                        dst_end,
-                        lz_ptr,
+                        mode, src, src + src_used, dst, dst_count,
+                        @intCast(@intFromPtr(dst) - @intFromPtr(dst_start)), dst_end, lz_ptr,
                     );
                 }
             } else if (src_used > dst_count or mode != 0) {

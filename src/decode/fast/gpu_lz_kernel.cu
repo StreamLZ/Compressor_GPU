@@ -146,6 +146,23 @@ extern "C" __global__ void slzDecompressL1Kernel(
             len_stream = len_data + len_off;
         }
     }
+
+    // Per-block trailing literals (CPU does this at end of each block)
+    __syncwarp();
+    dst_pos = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
+    lit_pos = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
+    {
+        uint32_t block_end = block_dst_start + 0x10000;
+        if (block_end > dst_end_abs) block_end = dst_end_abs;
+        uint32_t block_trailing = (block_end > dst_pos) ? (block_end - dst_pos) : 0;
+        for (uint32_t i = lane; i < block_trailing; i += 32)
+            if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size)
+                dst[dst_pos + i] = lit[lit_pos + i];
+        __syncwarp();
+        dst_pos += block_trailing;
+        lit_pos += block_trailing;
+    }
+
     block_iter++;
     if (block_iter >= 2) break;
     block_cmd_end = cmd_size;
