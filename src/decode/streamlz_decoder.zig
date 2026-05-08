@@ -328,7 +328,8 @@ fn decompressOneFrame(
             dispatched_parallel = true;
         }
 
-        if (allocator_opt) |allocator| {
+        if (!dispatched_parallel and allocator_opt != null) {
+            const allocator = allocator_opt.?;
             if (block_src.len >= 2) {
                 const peek = block_header.parseBlockHeader(block_src) catch null;
                 if (peek) |ph| {
@@ -858,7 +859,15 @@ fn gpuBatchDecode(
     const alloc = std.heap.page_allocator;
 
     const num_chunks = (decompressed_size + constants.chunk_size - 1) / constants.chunk_size;
-    const effective_group_size = if (sc_group_size_in > 0 and sc_group_size_in < num_chunks) sc_group_size_in else num_chunks;
+
+    // For SC blocks, use the SC group size (chunks are independent across groups).
+    // For non-SC blocks, all chunks must be in one group (cross-chunk dependencies).
+    const block_is_sc = blk: {
+        if (block_src.len < 2) break :blk false;
+        const peek = block_header.parseBlockHeader(block_src) catch break :blk false;
+        break :blk peek.self_contained;
+    };
+    const effective_group_size = if (block_is_sc and sc_group_size_in > 0 and sc_group_size_in < num_chunks) sc_group_size_in else num_chunks;
     const num_groups: u32 = @intCast((num_chunks + effective_group_size - 1) / effective_group_size);
     const chunks_per_group: u32 = @intCast(effective_group_size);
 

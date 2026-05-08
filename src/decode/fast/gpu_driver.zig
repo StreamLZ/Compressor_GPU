@@ -418,8 +418,6 @@ pub fn fullGpuLaunch(
     const launch_fn = cuLaunchKernel_fn orelse return error.BadMode;
     const sync_fn = cuCtxSynchronize_fn orelse return error.BadMode;
 
-    const t0 = qpcMs();
-
     const total_output = dst_start_off + decompressed_size;
     if (!ensureDeviceOutput(total_output + 64)) return error.BadMode;
 
@@ -438,8 +436,6 @@ pub fn fullGpuLaunch(
     if (compressed_block.len > 0)
         _ = h2d_fn(d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len);
     _ = h2d_fn(d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes);
-
-    const t_h2d = qpcMs() - t0;
 
     var p_comp = d_comp_persist;
     var p_descs_dev = d_descs_persist;
@@ -460,15 +456,6 @@ pub fn fullGpuLaunch(
         return error.BadMode;
 
     if (sync_fn() != CUDA_SUCCESS) return error.BadMode;
-    const t_kernel = qpcMs() - t0;
 
     _ = d2h_fn(@ptrCast(dst_full + dst_start_off), d_output + dst_start_off, decompressed_size);
-    const t_total = qpcMs() - t0;
-
-    {
-        var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "GPU: h2d={d}ms kern={d}ms d2h={d}ms tot={d}ms\n", .{ t_h2d, t_kernel - t_h2d, t_total - t_kernel, t_total }) catch "";
-        const stderr_handle = win32.GetStdHandle(0xFFFFFFF4); // STD_ERROR_HANDLE
-        if (stderr_handle) |h| _ = win32.WriteFile(h, msg.ptr, @intCast(msg.len), null, null);
-    }
 }
