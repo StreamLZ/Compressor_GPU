@@ -444,7 +444,8 @@ pub fn fullGpuLaunch(
     };
     var extra = [_]?*anyopaque{null};
 
-    if (launch_fn(full_kernel_fn, num_groups, 1, 1, 32, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS)
+    const grid_x = (num_groups + 1) / 2;
+    if (launch_fn(full_kernel_fn, grid_x, 1, 1, 32, 2, 1, 0, 0, &params, &extra) != CUDA_SUCCESS)
         return error.BadMode;
 
     if (sync_fn() != CUDA_SUCCESS) return error.BadMode;

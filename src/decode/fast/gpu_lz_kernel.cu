@@ -264,8 +264,9 @@ __device__ void decodeSubChunkBatched(
     int block_iter = 0;
 
     const uint32_t BATCH_SZ = 32 * TOKENS_PER_LANE;
-    __shared__ TokenWork batch[32 * TOKENS_PER_LANE];
-    __shared__ uint32_t batch_n;
+    __shared__ TokenWork batch[2][32 * TOKENS_PER_LANE];
+    __shared__ uint32_t batch_n[2];
+    const uint32_t wy = threadIdx.y;
 
     for (;;) {
     while (cmd_pos < block_cmd_end) {
@@ -314,12 +315,12 @@ __device__ void decodeSubChunkBatched(
                     use_recent = 0;
                 }
 
-                batch[n].lit_len = local_lit;
-                batch[n].match_len = local_match;
-                batch[n].offset = offset;
-                batch[n].lit_src = lit_pos;
-                batch[n].dst_pos = dst_pos;
-                batch[n].recent_offset = recent_offset;
+                batch[wy][n].lit_len = local_lit;
+                batch[wy][n].match_len = local_match;
+                batch[wy][n].offset = offset;
+                batch[wy][n].lit_src = lit_pos;
+                batch[wy][n].dst_pos = dst_pos;
+                batch[wy][n].recent_offset = recent_offset;
 
                 if (!use_recent && token != 0)
                     recent_offset = offset;
@@ -328,10 +329,10 @@ __device__ void decodeSubChunkBatched(
                 dst_pos += local_lit + local_match;
                 n++;
             }
-            batch_n = n;
+            batch_n[wy] = n;
         }
         __syncwarp();
-        uint32_t n_tokens = batch_n;
+        uint32_t n_tokens = batch_n[wy];
         if (n_tokens == 0) break;
 
         // ── Pass 2: Resolve all literals (massively parallel) ──
@@ -340,12 +341,12 @@ __device__ void decodeSubChunkBatched(
         for (uint32_t g = 0; g < TOKENS_PER_LANE; g++) {
             uint32_t idx = lane + g * 32;
             if (idx >= n_tokens) continue;
-            uint32_t ll = batch[idx].lit_len;
+            uint32_t ll = batch[wy][idx].lit_len;
             if (ll == 0) continue;
-            uint32_t ls = batch[idx].lit_src;
-            uint32_t dp = batch[idx].dst_pos;
+            uint32_t ls = batch[wy][idx].lit_src;
+            uint32_t dp = batch[wy][idx].dst_pos;
             if (mode == 0) {
-                int32_t ro = batch[idx].recent_offset;
+                int32_t ro = batch[wy][idx].recent_offset;
                 for (uint32_t i = 0; i < ll; i++)
                     if (dp + i < dst_end_abs && ls + i < lit_size) {
                         uint32_t ms = (uint32_t)((int32_t)(dp + i) + ro);
@@ -361,10 +362,10 @@ __device__ void decodeSubChunkBatched(
 
         // ── Pass 3: Resolve all matches (serial order, cooperative warp copy) ──
         for (uint32_t t = 0; t < n_tokens; t++) {
-            uint32_t ml = batch[t].match_len;
+            uint32_t ml = batch[wy][t].match_len;
             if (ml == 0) continue;
-            int32_t off = batch[t].offset;
-            uint32_t match_dst_pos = batch[t].dst_pos + batch[t].lit_len;
+            int32_t off = batch[wy][t].offset;
+            uint32_t match_dst_pos = batch[wy][t].dst_pos + batch[wy][t].lit_len;
             uint32_t ms = (uint32_t)((int32_t)match_dst_pos + off);
             int32_t abs_off = -off;
 
@@ -657,9 +658,9 @@ __device__ void parseAndDecodeSubChunk(
         off32_raw1 = off32_raw2 - off32_count1 * 3;
     }
 
-    __shared__ uint8_t off32_scratch[2][4096];  // up to 1024 off32 values per block
-    uint8_t* off32_exp1 = off32_scratch[0];
-    uint8_t* off32_exp2 = off32_scratch[1];
+    __shared__ uint8_t off32_scratch[2][2][4096];  // [warp][block][data]
+    uint8_t* off32_exp1 = off32_scratch[threadIdx.y][0];
+    uint8_t* off32_exp2 = off32_scratch[threadIdx.y][1];
 
     // Expand 3-byte off32 values to 4-byte
     for (uint32_t i = lane; i < off32_count1; i += 32) {
@@ -693,8 +694,11 @@ extern "C" __global__ void slzFullDecompressL1Kernel(
     uint32_t total_chunks,
     uint32_t sub_chunk_cap
 ) {
-    const uint32_t group_id = blockIdx.x;
+    // 2 warps per block: warp 0 = threadIdx.y==0, warp 1 = threadIdx.y==1
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t group_id = blockIdx.x * 2 + warp_id;
     const int lane = threadIdx.x & 31;
+    if (group_id >= (total_chunks + chunks_per_group - 1) / chunks_per_group) return;
     const uint32_t base_chunk = group_id * chunks_per_group;
 
     for (uint32_t c = 0; c < chunks_per_group; c++) {
