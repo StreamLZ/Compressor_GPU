@@ -46,6 +46,7 @@
 //! matching the wire format).
 
 const std = @import("std");
+const frame = @import("../format/frame_format.zig");
 const block_header = @import("../format/block_header.zig");
 const constants = @import("../format/streamlz_constants.zig");
 const pdm = @import("../format/parallel_decode_metadata.zig");
@@ -179,6 +180,7 @@ const Shared = struct {
     dst: []u8,
     dst_start_off: usize,
     group_size: usize,
+    sub_chunk_cap: usize,
     next_group: std.atomic.Value(usize),
     error_flag: std.atomic.Value(u32),
     /// First error code captured by a worker — used by the main
@@ -208,6 +210,7 @@ fn workerFn(shared: *Shared, scratch: []u8) void {
             shared.dst_start_off,
             group_dst_off,
             scratch,
+            shared.sub_chunk_cap,
         ) catch |err| {
             const code: u16 = @intFromError(err);
             // Only the first error sticks.
@@ -225,6 +228,7 @@ fn decodeGroup(
     dst_start_off: usize,
     group_dst_off: usize,
     scratch: []u8,
+    sub_chunk_cap: usize,
 ) DecodeError!void {
     for (group_chunks) |q| {
         const chunk_dst_off = dst_start_off + q.dst_offset;
@@ -235,6 +239,7 @@ fn decodeGroup(
             q.dst_size,
             group_dst_off,
             scratch,
+            sub_chunk_cap,
         );
     }
 }
@@ -250,6 +255,7 @@ fn decodeOneChunk(
     dst_size: usize,
     group_dst_start_off: usize,
     scratch: []u8,
+    sub_chunk_cap: usize,
 ) DecodeError!void {
     if (src.len < block_header.BlockHeader.size) return error.Truncated;
     const block_hdr= block_header.parseBlockHeader(src) catch return error.InvalidInternalHeader;
@@ -295,7 +301,7 @@ fn decodeOneChunk(
 
     switch (block_hdr.decoder_type) {
         .fast, .turbo => {
-            const n = try fast.decodeChunk(
+            const n = try fast.decodeChunkWithSubSize(
                 dst_ptr,
                 dst_end_ptr,
                 dst.ptr,
@@ -303,6 +309,7 @@ fn decodeOneChunk(
                 src_slice_end,
                 scratch_ptr,
                 scratch_end_ptr,
+                sub_chunk_cap,
             );
             if (n != comp_size) return error.ChunkSizeMismatch;
         },
@@ -503,6 +510,7 @@ pub fn decompressCoreParallel(
         .dst = dst,
         .dst_start_off = dst_start_off,
         .group_size = group_size,
+        .sub_chunk_cap = frame.scGroupSubChunkSize(sc_group_size),
         .next_group = std.atomic.Value(usize).init(0),
         .error_flag = std.atomic.Value(u32).init(0),
         .captured_err = std.atomic.Value(u16).init(0),
@@ -929,6 +937,7 @@ const FastL14Shared = struct {
     block_src: []const u8,
     dst: []u8,
     dst_start_off: usize,
+    sub_chunk_cap: usize,
     error_flag: std.atomic.Value(u32),
     captured_err: std.atomic.Value(u16),
     /// Sidecar literal bytes (sorted by position, relative to frame
@@ -984,6 +993,7 @@ fn fastL14WorkerFn(shared: *FastL14Shared, scratch: []u8, start: usize, end: usi
             q.dst_size,
             shared.dst_start_off,
             scratch,
+            shared.sub_chunk_cap,
         ) catch |err| {
             const code: u16 = @intFromError(err);
             _ = shared.captured_err.cmpxchgStrong(0, code, .release, .monotonic);
@@ -1161,6 +1171,7 @@ pub fn decompressFastL14Parallel(
         .block_src = block_src,
         .dst = dst,
         .dst_start_off = dst_start_off,
+        .sub_chunk_cap = constants.sub_chunk_size,
         .error_flag = std.atomic.Value(u32).init(0),
         .captured_err = std.atomic.Value(u16).init(0),
         .sidecar_literals = sidecar.literal_bytes,

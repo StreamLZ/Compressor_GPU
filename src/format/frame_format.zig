@@ -182,7 +182,9 @@ pub fn scGroupSizeToBytes(sc_group_size: f32) usize {
 /// For integer groups (>= 1.0), sub-chunks use the default 128KB.
 pub fn scGroupSubChunkSize(sc_group_size: f32) usize {
     if (sc_group_size < 1.0) {
-        return scGroupSizeToBytes(sc_group_size);
+        // Cap at 0xFFFF (65535) so all match offsets fit in off16.
+        // No off32 values produced → no OffsetOutOfBounds risk.
+        return @min(scGroupSizeToBytes(sc_group_size), 0xFFFF);
     }
     return constants.sub_chunk_size;
 }

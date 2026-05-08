@@ -766,7 +766,8 @@ fn decompressCompressedBlock(
                 const scratch_ptr: [*]u8 = scratch.ptr;
                 const scratch_end_ptr: [*]u8 = scratch.ptr + scratch.len;
 
-                const n = try fast.decodeChunk(
+                const eff_sc_sub = frame.scGroupSubChunkSize(sc_group_size);
+                const n = try fast.decodeChunkWithSubSize(
                     dst_ptr,
                     dst_end_ptr,
                     dst_start_ptr,
@@ -774,6 +775,7 @@ fn decompressCompressedBlock(
                     src_slice_end,
                     scratch_ptr,
                     scratch_end_ptr,
+                    eff_sc_sub,
                 );
                 if (n != comp_size) return error.SizeMismatch;
             },

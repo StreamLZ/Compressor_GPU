@@ -837,12 +837,25 @@ pub fn decodeChunk(
     scratch: [*]u8,
     scratch_end: [*]u8,
 ) DecodeError!usize {
+    return decodeChunkWithSubSize(dst_in, dst_end, dst_start, src_in, src_end, scratch, scratch_end, constants.sub_chunk_size);
+}
+
+pub fn decodeChunkWithSubSize(
+    dst_in: [*]u8,
+    dst_end: [*]u8,
+    dst_start: [*]const u8,
+    src_in: [*]const u8,
+    src_end: [*]const u8,
+    scratch: [*]u8,
+    scratch_end: [*]u8,
+    sub_chunk_cap: usize,
+) DecodeError!usize {
     var src = src_in;
     var dst = dst_in;
 
     while (@intFromPtr(dst_end) - @intFromPtr(dst) != 0) {
         var dst_count: usize = @intFromPtr(dst_end) - @intFromPtr(dst);
-        if (dst_count > constants.sub_chunk_size) dst_count = constants.sub_chunk_size;
+        if (dst_count > sub_chunk_cap) dst_count = sub_chunk_cap;
         if (@intFromPtr(src_end) - @intFromPtr(src) < 4) return error.SourceTruncated;
 
         // 3-byte big-endian sub-chunk header: [23] comp flag | [22:19] mode | [18:0] size
