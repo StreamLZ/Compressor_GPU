@@ -510,7 +510,7 @@ pub fn decompressCoreParallel(
         .dst = dst,
         .dst_start_off = dst_start_off,
         .group_size = group_size,
-        .sub_chunk_cap = frame.scGroupSubChunkSize(sc_group_size),
+        .sub_chunk_cap = constants.sub_chunk_size,
         .next_group = std.atomic.Value(usize).init(0),
         .error_flag = std.atomic.Value(u32).init(0),
         .captured_err = std.atomic.Value(u16).init(0),

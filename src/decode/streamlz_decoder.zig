@@ -308,7 +308,8 @@ fn decompressOneFrame(
             if (!is_fast) break :gpu_frame;
             if (block_hdr.decompressed_size <= constants.chunk_size) break :gpu_frame;
 
-            const num_chunks_est = (block_hdr.decompressed_size + constants.chunk_size - 1) / constants.chunk_size;
+            const eff_cs_gpu = @min(frame.scGroupSizeToBytes(hdr.sc_group_size), constants.chunk_size);
+            const num_chunks_est = (block_hdr.decompressed_size + eff_cs_gpu - 1) / eff_cs_gpu;
             const prefix_sz: usize = if (peek.self_contained and num_chunks_est > 1) (num_chunks_est - 1) * 8 else 0;
             const block_payload = block_src[0 .. block_src.len - prefix_sz];
 
@@ -328,7 +329,7 @@ fn decompressOneFrame(
             dispatched_parallel = true;
         }
 
-        if (!dispatched_parallel and allocator_opt != null) {
+        if (!dispatched_parallel and allocator_opt != null and hdr.sc_group_size >= 1.0) {
             const allocator = allocator_opt.?;
             if (block_src.len >= 2) {
                 const peek = block_header.parseBlockHeader(block_src) catch null;
@@ -646,8 +647,9 @@ fn decompressCompressedBlock(
         const peek = block_header.parseBlockHeader(block_src_in) catch break :blk false;
         break :blk peek.self_contained;
     };
+    const eff_cs = @min(frame.scGroupSizeToBytes(sc_group_size), constants.chunk_size);
     const num_chunks: usize = if (is_sc)
-        (decompressed_size + constants.chunk_size - 1) / constants.chunk_size
+        (decompressed_size + eff_cs - 1) / eff_cs
     else
         0;
     const prefix_size: usize = if (is_sc and num_chunks > 1) (num_chunks - 1) * 8 else 0;
@@ -674,9 +676,10 @@ fn decompressCompressedBlock(
             const prefix_base: [*]const u8 = block_src_in[block_src_in.len - prefix_size ..].ptr;
             var i: usize = 0;
             while (i + 1 < num_chunks) : (i += 1) {
-                const chunk_dst_off: usize = sc_start_dst_off + (i + 1) * constants.chunk_size;
+                const eff_cs_tail = @min(frame.scGroupSizeToBytes(sc_group_size), constants.chunk_size);
+                const chunk_dst_off: usize = sc_start_dst_off + (i + 1) * eff_cs_tail;
                 var copy_size: usize = 8;
-                const remaining_in_chunk: usize = decompressed_size - (i + 1) * constants.chunk_size;
+                const remaining_in_chunk: usize = decompressed_size - (i + 1) * eff_cs_tail;
                 if (copy_size > remaining_in_chunk) copy_size = remaining_in_chunk;
                 @memcpy(dst[chunk_dst_off..][0..copy_size], prefix_base[i * 8 ..][0..copy_size]);
             }
@@ -690,7 +693,8 @@ fn decompressCompressedBlock(
 
     while (dst_remaining > 0) {
         const dst_off = dst_off_inout.*;
-        const at_chunk_boundary = ((dst_off - sc_start_dst_off) & (constants.chunk_size - 1)) == 0;
+        const eff_chunk_size = @min(frame.scGroupSizeToBytes(sc_group_size), constants.chunk_size);
+        const at_chunk_boundary = ((dst_off - sc_start_dst_off) % eff_chunk_size) == 0;
 
         if (at_chunk_boundary or internal_hdr == null) {
             if (src_pos + 2 > block_src.len) return error.Truncated;
@@ -699,7 +703,8 @@ fn decompressCompressedBlock(
         }
         const hdr = internal_hdr.?;
 
-        var dst_this_chunk: usize = constants.chunk_size;
+        const sc_group_bytes: usize = frame.scGroupSizeToBytes(sc_group_size);
+        var dst_this_chunk: usize = @min(sc_group_bytes, constants.chunk_size);
         if (dst_this_chunk > dst_remaining) dst_this_chunk = dst_remaining;
 
         // ── Uncompressed chunk (header says so) — raw copy ──
@@ -766,7 +771,7 @@ fn decompressCompressedBlock(
                 const scratch_ptr: [*]u8 = scratch.ptr;
                 const scratch_end_ptr: [*]u8 = scratch.ptr + scratch.len;
 
-                const eff_sc_sub = frame.scGroupSubChunkSize(sc_group_size);
+                const eff_sc_sub = constants.sub_chunk_size;
                 const n = try fast.decodeChunkWithSubSize(
                     dst_ptr,
                     dst_end_ptr,
@@ -791,7 +796,7 @@ fn decompressCompressedBlock(
                 const n = if (is_sc) blk: {
                     const gs: usize = if (sc_group_size >= 1.0) @max(1, @as(usize, @intFromFloat(sc_group_size))) else 1;
                     const group_start_chunk = (chunk_idx_in_block / gs) * gs;
-                    const group_start_offset = sc_start_dst_off + group_start_chunk * constants.chunk_size;
+                    const group_start_offset = sc_start_dst_off + group_start_chunk * eff_chunk_size;
                     break :blk try high.decodeChunkSc(
                         dst_ptr,
                         dst_end_ptr,
@@ -831,9 +836,9 @@ fn decompressCompressedBlock(
         const prefix_base: [*]const u8 = block_src_in[block_src_in.len - prefix_size ..].ptr;
         var i: usize = 0;
         while (i + 1 < num_chunks) : (i += 1) {
-            const chunk_dst_off: usize = sc_start_dst_off + (i + 1) * constants.chunk_size;
+            const chunk_dst_off: usize = sc_start_dst_off + (i + 1) * eff_cs;
             var copy_size: usize = 8;
-            const remaining_in_chunk: usize = decompressed_size - (i + 1) * constants.chunk_size;
+            const remaining_in_chunk: usize = decompressed_size - (i + 1) * eff_cs;
             if (copy_size > remaining_in_chunk) copy_size = remaining_in_chunk;
             @memcpy(
                 dst[chunk_dst_off..][0..copy_size],
@@ -860,7 +865,8 @@ fn gpuBatchDecode(
     const gpu = @import("fast/gpu_driver.zig");
     const alloc = std.heap.page_allocator;
 
-    const num_chunks = (decompressed_size + constants.chunk_size - 1) / constants.chunk_size;
+    const eff_chunk_sz = @min(frame.scGroupSizeToBytes(sc_group_size_in), constants.chunk_size);
+    const num_chunks = (decompressed_size + eff_chunk_sz - 1) / eff_chunk_sz;
 
     // For SC blocks, use the SC group size (chunks are independent across groups).
     // For non-SC blocks, all chunks must be in one group (cross-chunk dependencies).
@@ -887,14 +893,16 @@ fn gpuBatchDecode(
     var dst_off: usize = dst_start_off;
 
     while (dst_remaining > 0) {
-        const at_chunk_boundary = ((dst_off - dst_start_off) & (constants.chunk_size - 1)) == 0;
+        const eff_chunk_size_gpu = @min(frame.scGroupSizeToBytes(sc_group_size_in), constants.chunk_size);
+        const at_chunk_boundary = ((dst_off - dst_start_off) % eff_chunk_size_gpu) == 0;
         if (at_chunk_boundary or internal_hdr == null) {
             if (src_pos + 2 > block_src.len) return error.Truncated;
             internal_hdr = block_header.parseBlockHeader(block_src[src_pos..]) catch return error.InvalidInternalHeader;
             src_pos += 2;
         }
         const hdr = internal_hdr.?;
-        var dst_this_chunk: usize = constants.chunk_size;
+        const sc_group_bytes_gpu: usize = frame.scGroupSizeToBytes(sc_group_size_in);
+        var dst_this_chunk: usize = @min(sc_group_bytes_gpu, constants.chunk_size);
         if (dst_this_chunk > dst_remaining) dst_this_chunk = dst_remaining;
 
         if (hdr.uncompressed) {
@@ -967,7 +975,7 @@ fn gpuBatchDecode(
         chunk_idx += 1;
     }
 
-    const eff_sc_cap: u32 = @intCast(frame.scGroupSubChunkSize(sc_group_size_in));
+    const eff_sc_cap: u32 = @intCast(constants.sub_chunk_size);
     try gpu.fullGpuLaunch(
         chunk_descs[0..chunk_idx],
         block_src,

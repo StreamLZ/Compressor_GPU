@@ -258,6 +258,8 @@ fn compressFastChunksParallel(
     sc_group_size: usize,
 ) CompressError!usize {
     const dict_len = if (opts.dictionary) |d| d.len else 0;
+    // For the parallel path, sc_group_size is passed as chunks (integer).
+    // chunk iteration in the parallel path still uses lz_constants.chunk_size.
     const num_chunks = (src.len + lz_constants.chunk_size - 1) / lz_constants.chunk_size;
 
     const tmp_bufs = try allocator.alloc([]u8, num_chunks);
@@ -515,9 +517,10 @@ pub fn compressFramedOne(
     const sc_flag_bit: u8 = if (self_contained) 0x10 else 0;
     const two_phase_flag_bit: u8 = if (opts.two_phase) 0x20 else 0;
 
-    const num_chunks: usize = if (can_compress) (src.len + lz_constants.chunk_size - 1) / lz_constants.chunk_size else 0;
+    const eff_chunk_sz: usize = frame.scGroupSizeToBytes(sc_grp);
+    const num_chunks: usize = if (can_compress) (src.len + @min(eff_chunk_sz, lz_constants.chunk_size) - 1) / @min(eff_chunk_sz, lz_constants.chunk_size) else 0;
     const effective_threads: u32 = if (opts.num_threads == 0) @intCast(@max(1, std.Thread.getCpuCount() catch 1)) else opts.num_threads;
-    if (self_contained and can_compress and effective_threads > 1 and num_chunks > 1) {
+    if (self_contained and can_compress and effective_threads > 1 and num_chunks > 1 and sc_grp >= 1.0) {
         const parallel_sc_grp: usize = @max(1, @as(usize, @intFromFloat(sc_grp)));
         const parallel_payload_size = try compressFastChunksParallel(
             allocator,
@@ -559,12 +562,12 @@ pub fn compressFramedOne(
     //              else → LZ; compare lzCost vs memsetCost
     //            if totalCost > blockMemsetCost → rewind, emit uncompressed block
     //            else backfill chunk hdr
-    const effective_sc_sub_chunk: usize = frame.scGroupSubChunkSize(sc_grp);
     var src_off: usize = dict_len;
     var chunk_in_group: usize = 0;
     var group_start_off: usize = dict_len;
     while (can_compress and src_off < effective_src.len) {
-        const block_src_len: usize = @min(effective_src.len - src_off, lz_constants.chunk_size);
+        const sc_group_bytes: usize = frame.scGroupSizeToBytes(sc_grp);
+        const block_src_len: usize = @min(sc_group_bytes, @min(effective_src.len - src_off, lz_constants.chunk_size));
         const block_src: []const u8 = effective_src[src_off..][0..block_src_len];
 
         // SC mode: reset hasher at group boundaries.
@@ -577,7 +580,7 @@ pub fn compressFramedOne(
             }
             group_start_off = src_off;
         }
-        var window_base_ptr: [*]const u8 = if (self_contained) effective_src[group_start_off..].ptr else effective_src.ptr;
+        const window_base_ptr: [*]const u8 = if (self_contained) effective_src[group_start_off..].ptr else effective_src.ptr;
 
         const block_start: usize = pos;
         // For SC mode, EVERY block is a keyframe (independently decodable).
@@ -620,18 +623,7 @@ pub fn compressFramedOne(
         var sub_off: usize = 0;
 
         while (sub_off < block_src_len) {
-            // For fractional SC groups (< 1.0), reset match window per sub-chunk
-            if (self_contained and sc_grp < 1.0 and sub_off > 0) {
-                if (greedy_hasher_u32) |*h| h.reset();
-                if (chain_hasher) |*h| {
-                    h.reset();
-                    h.setSrcBase(effective_src[src_off + sub_off ..].ptr);
-                    h.setBaseWithoutPreload(0);
-                }
-                group_start_off = src_off + sub_off;
-                window_base_ptr = effective_src[group_start_off..].ptr;
-            }
-            const round_bytes: usize = @min(block_src_len - sub_off, effective_sc_sub_chunk);
+            const round_bytes: usize = @min(block_src_len - sub_off, fast_constants.sub_chunk_size);
             const sub_src: []const u8 = effective_src[src_off + sub_off ..][0..round_bytes];
 
             const round_f: f32 = @floatFromInt(round_bytes);
@@ -758,7 +750,7 @@ pub fn compressFramedOne(
     if (self_contained and can_compress) {
         var i: usize = 1;
         while (i < num_chunks) : (i += 1) {
-            const chunk_start = i * lz_constants.chunk_size;
+            const chunk_start = i * @min(eff_chunk_sz, lz_constants.chunk_size);
             if (chunk_start >= src.len) break;
             const copy_size: usize = @min(@as(usize, 8), src.len - chunk_start);
             if (pos + 8 > dst.len) return error.DestinationTooSmall;
