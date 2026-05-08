@@ -384,7 +384,7 @@ pub fn compressFramedOne(
     };
     var pos: usize = 0;
     const sc_grp: f32 = if (opts.sc_group_size_override) |ov| ov else switch (opts.level) {
-        1 => @as(f32, @floatFromInt(lz_constants.default_sc_group_size)),
+        1 => 0.25,
         2, 3, 4 => @floatFromInt(@min(high_framed.computeAdaptiveGroupSize(src.len), 16)),
         5 => @floatFromInt(high_framed.computeAdaptiveGroupSize(src.len)),
         else => @as(f32, @floatFromInt(lz_constants.default_sc_group_size)),
