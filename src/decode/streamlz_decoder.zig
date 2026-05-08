@@ -10,6 +10,8 @@
 //!   * High codec (L6-11) compressed path via high_lz_decoder
 
 const std = @import("std");
+const build_options = @import("build_options");
+const use_gpu = if (@hasDecl(build_options, "gpu")) build_options.gpu else false;
 const frame = @import("../format/frame_format.zig");
 const block_header = @import("../format/block_header.zig");
 const constants = @import("../format/streamlz_constants.zig");
@@ -625,6 +627,28 @@ fn decompressCompressedBlock(
     // decodes with base_offset == 0 and fires the initial 8-byte Copy64.
     var chunk_idx_in_block: usize = 0;
 
+    // GPU batch path: entropy-decode all sub-chunks on CPU, token-decode all groups on GPU simultaneously.
+    if (use_gpu and is_sc) gpu_batch: {
+        const gpu = @import("fast/gpu_driver.zig");
+        if (!gpu.isAvailable()) break :gpu_batch;
+        gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, @as(usize, sc_group_size), scratch) catch break :gpu_batch;
+        dst_off_inout.* = sc_start_dst_off + decompressed_size;
+        // Fall through to tail prefix restoration below.
+        // Skip the serial chunk loop.
+        if (prefix_size != 0) {
+            const prefix_base: [*]const u8 = block_src_in[block_src_in.len - prefix_size ..].ptr;
+            var i: usize = 0;
+            while (i + 1 < num_chunks) : (i += 1) {
+                const chunk_dst_off: usize = sc_start_dst_off + (i + 1) * constants.chunk_size;
+                var copy_size: usize = 8;
+                const remaining_in_chunk: usize = decompressed_size - (i + 1) * constants.chunk_size;
+                if (copy_size > remaining_in_chunk) copy_size = remaining_in_chunk;
+                @memcpy(dst[chunk_dst_off..][0..copy_size], prefix_base[i * 8 ..][0..copy_size]);
+            }
+        }
+        return;
+    }
+
     var src_pos: usize = 0;
     var dst_remaining: usize = decompressed_size;
     var internal_hdr: ?block_header.BlockHeader = null;
@@ -780,6 +804,222 @@ fn decompressCompressedBlock(
             );
         }
     }
+}
+
+// ────────────────────────────────────────────────────────────
+//  GPU batch decode orchestration
+// ────────────────────────────────────────────────────────────
+
+fn gpuBatchDecode(
+    block_src: []const u8,
+    dst: []u8,
+    dst_start_off: usize,
+    decompressed_size: usize,
+    sc_group_size_in: usize,
+    scratch: []u8,
+) DecompressError!void {
+    const gpu = @import("fast/gpu_driver.zig");
+    const alloc = std.heap.page_allocator;
+
+    const num_chunks = (decompressed_size + constants.chunk_size - 1) / constants.chunk_size;
+    const num_groups: u32 = @intCast((num_chunks + sc_group_size_in - 1) / sc_group_size_in);
+    const sc_per_group: u32 = @intCast(sc_group_size_in * 2);
+
+    const max_sub_chunks = num_chunks * 2;
+    var descs = alloc.alloc(gpu.SubChunkDesc, max_sub_chunks) catch return error.OutOfMemory;
+    defer alloc.free(descs);
+    @memset(std.mem.sliceAsBytes(descs), 0);
+
+    // Packed stream buffers — pre-allocate conservatively (compressed size is an upper bound for all streams combined)
+    const packed_cap = block_src.len + 4096;
+    var cmd_data = alloc.alloc(u8, packed_cap) catch return error.OutOfMemory;
+    defer alloc.free(cmd_data);
+    var lit_data = alloc.alloc(u8, packed_cap) catch return error.OutOfMemory;
+    defer alloc.free(lit_data);
+    var off16_data = alloc.alloc(u8, packed_cap) catch return error.OutOfMemory;
+    defer alloc.free(off16_data);
+    var off32_data = alloc.alloc(u8, packed_cap) catch return error.OutOfMemory;
+    defer alloc.free(off32_data);
+    var len_data_buf = alloc.alloc(u8, packed_cap) catch return error.OutOfMemory;
+    defer alloc.free(len_data_buf);
+    var cmd_len: usize = 0;
+    var lit_len: usize = 0;
+    var off16_len: usize = 0;
+    var off32_len: usize = 0;
+    var len_len: usize = 0;
+
+    var src_pos: usize = 0;
+    var dst_remaining: usize = decompressed_size;
+    var internal_hdr: ?block_header.BlockHeader = null;
+    var chunk_idx: usize = 0;
+    var desc_idx: usize = 0;
+    var dst_off: usize = dst_start_off;
+
+    while (dst_remaining > 0) {
+        const at_chunk_boundary = ((dst_off - dst_start_off) & (constants.chunk_size - 1)) == 0;
+        if (at_chunk_boundary or internal_hdr == null) {
+            if (src_pos + 2 > block_src.len) return error.Truncated;
+            internal_hdr = block_header.parseBlockHeader(block_src[src_pos..]) catch return error.InvalidInternalHeader;
+            src_pos += 2;
+        }
+        const hdr = internal_hdr.?;
+        var dst_this_chunk: usize = constants.chunk_size;
+        if (dst_this_chunk > dst_remaining) dst_this_chunk = dst_remaining;
+
+        if (hdr.uncompressed) {
+            if (src_pos + dst_this_chunk > block_src.len) return error.Truncated;
+            @memcpy(dst[dst_off..][0..dst_this_chunk], block_src[src_pos..][0..dst_this_chunk]);
+            dst_off += dst_this_chunk;
+            dst_remaining -= dst_this_chunk;
+            src_pos += dst_this_chunk;
+            chunk_idx += 1;
+            desc_idx = chunk_idx * 2;
+            continue;
+        }
+
+        const ch = block_header.parseChunkHeader(block_src[src_pos..], hdr.use_checksums) catch return error.BadChunkHeader;
+        src_pos += ch.bytes_consumed;
+        const comp_size = ch.compressed_size;
+
+        if (ch.is_memset) {
+            if (dst_off + dst_this_chunk > dst.len) return error.OutputTooSmall;
+            @memset(dst[dst_off..][0..dst_this_chunk], ch.memset_fill);
+            dst_off += dst_this_chunk;
+            dst_remaining -= dst_this_chunk;
+            chunk_idx += 1;
+            desc_idx = chunk_idx * 2;
+            continue;
+        }
+
+        if (src_pos + comp_size > block_src.len) return error.Truncated;
+        if (comp_size == dst_this_chunk) {
+            @memcpy(dst[dst_off..][0..dst_this_chunk], block_src[src_pos..][0..dst_this_chunk]);
+            dst_off += dst_this_chunk;
+            dst_remaining -= dst_this_chunk;
+            src_pos += comp_size;
+            chunk_idx += 1;
+            desc_idx = chunk_idx * 2;
+            continue;
+        }
+
+        if (hdr.decoder_type != .fast and hdr.decoder_type != .turbo) return error.InvalidInternalHeader;
+
+        // Decode this chunk's sub-chunks via readLzTable (CPU entropy decode)
+        const chunk_src: [*]const u8 = block_src[src_pos..].ptr;
+        const chunk_src_end: [*]const u8 = chunk_src + comp_size;
+
+        var sc_src = chunk_src;
+        var sc_dst_off = dst_off;
+        var sc_remaining = dst_this_chunk;
+
+        while (sc_remaining > 0) {
+            var sc_size: usize = sc_remaining;
+            if (sc_size > constants.sub_chunk_size) sc_size = constants.sub_chunk_size;
+
+            if (@intFromPtr(chunk_src_end) - @intFromPtr(sc_src) < 4) return error.Truncated;
+            const chunkhdr: u32 = (@as(u32, sc_src[0]) << 16) | (@as(u32, sc_src[1]) << 8) | @as(u32, sc_src[2]);
+
+            if ((chunkhdr & constants.chunk_header_compressed_flag) == 0) {
+                // Entropy-only sub-chunk — not supported in batch GPU path
+                return error.BadMode;
+            }
+
+            sc_src += 3;
+            const sc_comp_size = chunkhdr & 0x7FFFF;
+            const mode: u32 = (chunkhdr >> constants.sub_chunk_type_shift) & 0xF;
+
+            if (sc_comp_size >= sc_size) {
+                // Uncompressed sub-chunk
+                @memcpy(dst[sc_dst_off..][0..sc_size], sc_src[0..sc_size]);
+                sc_src += sc_comp_size;
+                sc_dst_off += sc_size;
+                sc_remaining -= sc_size;
+                desc_idx += 1;
+                continue;
+            }
+
+            // readLzTable: entropy decode into scratch
+            const lz_table_size = @sizeOf(fast.FastLzTable);
+            const lz_ptr: *fast.FastLzTable = @ptrCast(@alignCast(scratch.ptr));
+            const inner_scratch: [*]u8 = scratch.ptr + lz_table_size;
+            const inner_scratch_end: [*]u8 = scratch.ptr + @min(2 * sc_size + 32, scratch.len);
+
+            const base_offset: i64 = @intCast(sc_dst_off - dst_start_off);
+            var dst_slot: [*]u8 = dst[sc_dst_off..].ptr;
+            fast.readLzTable(
+                mode,
+                sc_src,
+                sc_src + sc_comp_size,
+                &dst_slot,
+                @intCast(sc_size),
+                base_offset,
+                inner_scratch,
+                inner_scratch_end,
+                lz_ptr,
+            ) catch return error.Truncated;
+
+            lz_ptr.src_end = sc_src + sc_comp_size;
+
+            // Pack streams into batch buffers and build descriptor
+            const cmd_sz = @intFromPtr(lz_ptr.cmd_end) - @intFromPtr(lz_ptr.cmd_start);
+            const lit_sz = @intFromPtr(lz_ptr.lit_end) - @intFromPtr(lz_ptr.lit_start);
+            const off16_cnt = (@intFromPtr(lz_ptr.off16_end) - @intFromPtr(lz_ptr.off16_start)) / 2;
+            const len_avail = @intFromPtr(lz_ptr.src_end) -| @intFromPtr(lz_ptr.length_stream);
+
+            const initial_copy: u32 = if (base_offset == 0) 8 else 0;
+            const dst_offset_abs: u32 = @intCast(sc_dst_off);
+
+            var d = &descs[desc_idx];
+            d.cmd_offset = @intCast(cmd_len);
+            d.cmd_size = @intCast(cmd_sz);
+            d.lit_offset = @intCast(lit_len);
+            d.lit_size = @intCast(lit_sz);
+            d.off16_offset = @intCast(off16_len);
+            d.off16_count = @intCast(off16_cnt);
+            d.off32_1_offset = @intCast(off32_len);
+            d.off32_count1 = lz_ptr.off32_count1;
+            d.off32_2_offset = @intCast(off32_len + lz_ptr.off32_count1 * 4);
+            d.off32_count2 = lz_ptr.off32_count2;
+            d.len_offset = @intCast(len_len);
+            d.len_avail = @intCast(len_avail);
+            d.dst_offset = dst_offset_abs;
+            d.dst_size = @intCast(sc_size);
+            d.initial_copy = initial_copy;
+            d.cmd_stream2_offset = lz_ptr.cmd_stream2_offset;
+
+            if (cmd_sz > 0) { @memcpy(cmd_data[cmd_len..][0..cmd_sz], @as([*]const u8, @ptrCast(lz_ptr.cmd_start))[0..cmd_sz]); cmd_len += cmd_sz; }
+            if (lit_sz > 0) { @memcpy(lit_data[lit_len..][0..lit_sz], @as([*]const u8, @ptrCast(lz_ptr.lit_start))[0..lit_sz]); lit_len += lit_sz; }
+            if (off16_cnt > 0) { const n = off16_cnt * 2; @memcpy(off16_data[off16_len..][0..n], @as([*]const u8, @ptrCast(lz_ptr.off16_start))[0..n]); off16_len += n; }
+            if (lz_ptr.off32_count1 > 0) { const n = lz_ptr.off32_count1 * 4; @memcpy(off32_data[off32_len..][0..n], @as([*]const u8, @ptrCast(lz_ptr.off32_backing1))[0..n]); off32_len += n; }
+            if (lz_ptr.off32_count2 > 0) { const n = lz_ptr.off32_count2 * 4; @memcpy(off32_data[off32_len..][0..n], @as([*]const u8, @ptrCast(lz_ptr.off32_backing2))[0..n]); off32_len += n; }
+            if (len_avail > 0) { @memcpy(len_data_buf[len_len..][0..len_avail], @as([*]const u8, @ptrCast(lz_ptr.length_stream))[0..len_avail]); len_len += len_avail; }
+
+            sc_src += sc_comp_size;
+            sc_dst_off += sc_size;
+            sc_remaining -= sc_size;
+            desc_idx += 1;
+        }
+
+        dst_off += dst_this_chunk;
+        dst_remaining -= dst_this_chunk;
+        src_pos += comp_size;
+        chunk_idx += 1;
+        desc_idx = chunk_idx * 2;
+    }
+
+    try gpu.batchLaunch(
+        descs[0..desc_idx],
+        cmd_data[0..cmd_len],
+        lit_data[0..lit_len],
+        off16_data[0..off16_len],
+        off32_data[0..off32_len],
+        len_data_buf[0..len_len],
+        dst.ptr,
+        dst_start_off,
+        decompressed_size,
+        num_groups,
+        sc_per_group,
+    );
 }
 
 // ────────────────────────────────────────────────────────────

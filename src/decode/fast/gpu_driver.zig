@@ -18,6 +18,7 @@ var lib: ?*anyopaque = null;
 var ctx: usize = 0;
 var module: usize = 0;
 var kernel_fn: usize = 0;
+var batch_kernel_fn: usize = 0;
 var initialized = false;
 
 // Function pointer types
@@ -99,6 +100,8 @@ pub fn init() bool {
     const get_fn = cuModuleGetFunction_fn orelse return false;
     const fn_result = get_fn(&kernel_fn, module, "slzDecompressL1Kernel");
     if (fn_result != CUDA_SUCCESS) return false;
+
+    _ = get_fn(&batch_kernel_fn, module, "slzBatchDecompressL1Kernel");
 
     return true;
 }
@@ -232,4 +235,125 @@ pub fn processLzRunsGpu(
 
     // Copy result back — just this sub-chunk's output
     _ = d2h_fn(@ptrCast(dst), d_output + dst_offset, dst_size);
+}
+
+// ────────────────────────────────────────────────────────────
+//  Batch parallel: 1 warp per SC group, all groups at once
+// ────────────────────────────────────────────────────────────
+
+pub const SubChunkDesc = extern struct {
+    cmd_offset: u32,
+    cmd_size: u32,
+    lit_offset: u32,
+    lit_size: u32,
+    off16_offset: u32,
+    off16_count: u32,
+    off32_1_offset: u32,
+    off32_count1: u32,
+    off32_2_offset: u32,
+    off32_count2: u32,
+    len_offset: u32,
+    len_avail: u32,
+    dst_offset: u32,
+    dst_size: u32,
+    initial_copy: u32,
+    cmd_stream2_offset: u32,
+};
+
+pub fn batchLaunch(
+    descs: []const SubChunkDesc,
+    cmd_packed: []const u8,
+    lit_packed: []const u8,
+    off16_packed: []const u8,
+    off32_packed: []const u8,
+    len_packed: []const u8,
+    dst_full: [*]u8,
+    dst_start_off: usize,
+    decompressed_size: usize,
+    num_groups: u32,
+    sub_chunks_per_group: u32,
+) fast_dec.DecodeError!void {
+    if (!init() or batch_kernel_fn == 0) return error.BadMode;
+
+    const alloc_fn = cuMemAlloc_fn orelse return error.BadMode;
+    const free_fn = cuMemFree_fn orelse return error.BadMode;
+    const h2d_fn = cuMemcpyHtoD_fn orelse return error.BadMode;
+    const d2h_fn = cuMemcpyDtoH_fn orelse return error.BadMode;
+    const launch_fn = cuLaunchKernel_fn orelse return error.BadMode;
+    const sync_fn = cuCtxSynchronize_fn orelse return error.BadMode;
+
+    const total_output = dst_start_off + decompressed_size;
+    if (!ensureDeviceOutput(total_output + 64)) return error.BadMode;
+
+    // Upload dictionary / initial bytes to device output buffer
+    if (dst_start_off > 0) {
+        _ = h2d_fn(d_output, @ptrCast(dst_full), dst_start_off);
+    }
+
+    const desc_bytes = descs.len * @sizeOf(SubChunkDesc);
+    const cmd_bytes = if (cmd_packed.len > 0) cmd_packed.len else 4;
+    const lit_bytes = if (lit_packed.len > 0) lit_packed.len else 4;
+    const off16_bytes = if (off16_packed.len > 0) off16_packed.len else 4;
+    const off32_bytes = if (off32_packed.len > 0) off32_packed.len else 4;
+    const len_bytes = if (len_packed.len > 0) len_packed.len else 4;
+
+    var d_descs: CUdeviceptr = 0;
+    var d_cmd: CUdeviceptr = 0;
+    var d_lit: CUdeviceptr = 0;
+    var d_off16: CUdeviceptr = 0;
+    var d_off32: CUdeviceptr = 0;
+    var d_len: CUdeviceptr = 0;
+
+    if (alloc_fn(&d_descs, desc_bytes) != CUDA_SUCCESS) return error.BadMode;
+    if (alloc_fn(&d_cmd, cmd_bytes) != CUDA_SUCCESS) { _ = free_fn(d_descs); return error.BadMode; }
+    if (alloc_fn(&d_lit, lit_bytes) != CUDA_SUCCESS) { _ = free_fn(d_descs); _ = free_fn(d_cmd); return error.BadMode; }
+    if (alloc_fn(&d_off16, off16_bytes) != CUDA_SUCCESS) { _ = free_fn(d_descs); _ = free_fn(d_cmd); _ = free_fn(d_lit); return error.BadMode; }
+    if (alloc_fn(&d_off32, off32_bytes) != CUDA_SUCCESS) { _ = free_fn(d_descs); _ = free_fn(d_cmd); _ = free_fn(d_lit); _ = free_fn(d_off16); return error.BadMode; }
+    if (alloc_fn(&d_len, len_bytes) != CUDA_SUCCESS) { _ = free_fn(d_descs); _ = free_fn(d_cmd); _ = free_fn(d_lit); _ = free_fn(d_off16); _ = free_fn(d_off32); return error.BadMode; }
+    defer {
+        _ = free_fn(d_descs);
+        _ = free_fn(d_cmd);
+        _ = free_fn(d_lit);
+        _ = free_fn(d_off16);
+        _ = free_fn(d_off32);
+        _ = free_fn(d_len);
+    }
+
+    _ = h2d_fn(d_descs, @ptrCast(descs.ptr), desc_bytes);
+    if (cmd_packed.len > 0) _ = h2d_fn(d_cmd, @ptrCast(cmd_packed.ptr), cmd_packed.len);
+    if (lit_packed.len > 0) _ = h2d_fn(d_lit, @ptrCast(lit_packed.ptr), lit_packed.len);
+    if (off16_packed.len > 0) _ = h2d_fn(d_off16, @ptrCast(off16_packed.ptr), off16_packed.len);
+    if (off32_packed.len > 0) _ = h2d_fn(d_off32, @ptrCast(off32_packed.ptr), off32_packed.len);
+    if (len_packed.len > 0) _ = h2d_fn(d_len, @ptrCast(len_packed.ptr), len_packed.len);
+
+    var p_cmd = d_cmd;
+    var p_lit = d_lit;
+    var p_off16 = d_off16;
+    var p_off32 = d_off32;
+    var p_len = d_len;
+    var p_dst = d_output;
+    var p_descs_dev = d_descs;
+    var p_sc_per_group = sub_chunks_per_group;
+    var p_total_sc: u32 = @intCast(descs.len);
+
+    var params = [_]?*anyopaque{
+        @ptrCast(&p_cmd),
+        @ptrCast(&p_lit),
+        @ptrCast(&p_off16),
+        @ptrCast(&p_off32),
+        @ptrCast(&p_len),
+        @ptrCast(&p_dst),
+        @ptrCast(&p_descs_dev),
+        @ptrCast(&p_sc_per_group),
+        @ptrCast(&p_total_sc),
+    };
+    var extra = [_]?*anyopaque{null};
+
+    if (launch_fn(batch_kernel_fn, num_groups, 1, 1, 32, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS)
+        return error.BadMode;
+
+    if (sync_fn() != CUDA_SUCCESS) return error.BadMode;
+
+    // D2H: decompressed output (skip dictionary prefix)
+    _ = d2h_fn(@ptrCast(dst_full + dst_start_off), d_output + dst_start_off, decompressed_size);
 }

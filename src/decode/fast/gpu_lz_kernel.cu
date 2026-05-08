@@ -1,9 +1,23 @@
 // StreamLZ L1 GPU Decompressor Kernel
-// Replaces processLzRuns: token parse + copy on GPU.
-// CPU does frame/chunk parsing and entropy decode (readLzTable).
+// Phase 1: batch parallel — 1 warp per SC group, all groups simultaneously.
+// CPU does entropy decode (readLzTable), GPU does token decode (processLzRuns).
 
 #include <cstdint>
 #include <cstdio>
+
+// Batch descriptor: one per sub-chunk, indexes into packed stream buffers.
+struct SlzSubChunkDesc {
+    uint32_t cmd_offset;      uint32_t cmd_size;
+    uint32_t lit_offset;      uint32_t lit_size;
+    uint32_t off16_offset;    uint32_t off16_count;
+    uint32_t off32_1_offset;  uint32_t off32_count1;
+    uint32_t off32_2_offset;  uint32_t off32_count2;
+    uint32_t len_offset;      uint32_t len_avail;
+    uint32_t dst_offset;
+    uint32_t dst_size;
+    uint32_t initial_copy;
+    uint32_t cmd_stream2_offset;
+};
 
 // Extended length decode
 __device__ uint32_t readLength(const uint8_t* &len_stream, const uint8_t* len_end) {
@@ -20,7 +34,8 @@ __device__ uint32_t readLength(const uint8_t* &len_stream, const uint8_t* len_en
     return v;
 }
 
-extern "C" __global__ void slzDecompressL1Kernel(
+// Core sub-chunk decode: used by both serial and batch kernels.
+__device__ void decodeSubChunk(
     const uint8_t* __restrict__ cmd, uint32_t cmd_size,
     const uint8_t* __restrict__ lit, uint32_t lit_size,
     const uint8_t* __restrict__ off16_raw, uint32_t off16_count,
@@ -30,7 +45,6 @@ extern "C" __global__ void slzDecompressL1Kernel(
     uint8_t* __restrict__ dst, uint32_t dst_size,
     uint32_t initial_copy,
     uint32_t cmd_stream2_offset,
-    uint32_t base_offset,
     uint32_t dst_offset
 ) {
     const int lane = threadIdx.x & 31;
@@ -108,7 +122,6 @@ extern "C" __global__ void slzDecompressL1Kernel(
         off16_pos   = __shfl_sync(0xFFFFFFFF, off16_pos, 0);
         off32_pos   = __shfl_sync(0xFFFFFFFF, off32_pos, 0);
 
-        // Literal copy (warp-cooperative)
         if (local_lit > 0) {
             for (uint32_t i = lane; i < local_lit; i += 32)
                 if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size)
@@ -118,7 +131,6 @@ extern "C" __global__ void slzDecompressL1Kernel(
             lit_pos += local_lit;
         }
 
-        // Match copy
         if (local_match > 0) {
             uint32_t ms = (uint32_t)((int32_t)dst_pos + offset);
             int32_t abs_off = -offset;
@@ -147,7 +159,6 @@ extern "C" __global__ void slzDecompressL1Kernel(
         }
     }
 
-    // Per-block trailing literals (CPU does this at end of each block)
     __syncwarp();
     dst_pos = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
     lit_pos = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
@@ -172,7 +183,6 @@ extern "C" __global__ void slzDecompressL1Kernel(
     block_dst_start = dst_pos;
     }
 
-    // Trailing literals
     __syncwarp();
     dst_pos = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
     lit_pos = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
@@ -180,6 +190,64 @@ extern "C" __global__ void slzDecompressL1Kernel(
     for (uint32_t i = lane; i < trailing; i += 32)
         if (dst_pos + i < dst_end_abs)
             dst[dst_pos + i] = lit[lit_pos + i];
+}
+
+// --- Serial kernel (legacy, wraps decodeSubChunk) ---
+
+extern "C" __global__ void slzDecompressL1Kernel(
+    const uint8_t* __restrict__ cmd, uint32_t cmd_size,
+    const uint8_t* __restrict__ lit, uint32_t lit_size,
+    const uint8_t* __restrict__ off16_raw, uint32_t off16_count,
+    const uint8_t* __restrict__ off32_raw1, uint32_t off32_count1,
+    const uint8_t* __restrict__ off32_raw2, uint32_t off32_count2,
+    const uint8_t* __restrict__ len_data, uint32_t len_avail,
+    uint8_t* __restrict__ dst, uint32_t dst_size,
+    uint32_t initial_copy,
+    uint32_t cmd_stream2_offset,
+    uint32_t base_offset,
+    uint32_t dst_offset
+) {
+    decodeSubChunk(cmd, cmd_size, lit, lit_size,
+        off16_raw, off16_count, off32_raw1, off32_count1,
+        off32_raw2, off32_count2, len_data, len_avail,
+        dst, dst_size, initial_copy, cmd_stream2_offset, dst_offset);
+}
+
+// --- Batch kernel: 1 block per SC group, all groups simultaneously ---
+
+extern "C" __global__ void slzBatchDecompressL1Kernel(
+    const uint8_t* __restrict__ cmd_all,
+    const uint8_t* __restrict__ lit_all,
+    const uint8_t* __restrict__ off16_all,
+    const uint8_t* __restrict__ off32_all,
+    const uint8_t* __restrict__ len_all,
+    uint8_t* __restrict__ dst,
+    const SlzSubChunkDesc* __restrict__ descs,
+    uint32_t sub_chunks_per_group,
+    uint32_t total_sub_chunks
+) {
+    const uint32_t group_id = blockIdx.x;
+    const uint32_t base_idx = group_id * sub_chunks_per_group;
+
+    for (uint32_t sc = 0; sc < sub_chunks_per_group; sc++) {
+        uint32_t idx = base_idx + sc;
+        if (idx >= total_sub_chunks) return;
+
+        const SlzSubChunkDesc& d = descs[idx];
+        if (d.dst_size == 0) continue;
+
+        decodeSubChunk(
+            cmd_all + d.cmd_offset,    d.cmd_size,
+            lit_all + d.lit_offset,    d.lit_size,
+            off16_all + d.off16_offset, d.off16_count,
+            off32_all + d.off32_1_offset, d.off32_count1,
+            off32_all + d.off32_2_offset, d.off32_count2,
+            len_all + d.len_offset,    d.len_avail,
+            dst, d.dst_size, d.initial_copy, d.cmd_stream2_offset,
+            d.dst_offset
+        );
+        __syncwarp();
+    }
 }
 
 extern "C" {
