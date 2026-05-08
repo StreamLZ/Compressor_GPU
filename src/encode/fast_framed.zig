@@ -383,8 +383,8 @@ pub fn compressFramedOne(
         else => unreachable,
     };
     var pos: usize = 0;
-    const sc_grp: f32 = if (opts.sc_group_size_override) |ov| ov else switch (opts.level) {
-        1 => 0.25,
+    const sc_grp: f32 = if (opts.gpu_mode) 0.25 else if (opts.sc_group_size_override) |ov| ov else switch (opts.level) {
+        1 => @as(f32, @floatFromInt(lz_constants.default_sc_group_size)),
         2, 3, 4 => @floatFromInt(@min(high_framed.computeAdaptiveGroupSize(src.len), 16)),
         5 => @floatFromInt(high_framed.computeAdaptiveGroupSize(src.len)),
         else => @as(f32, @floatFromInt(lz_constants.default_sc_group_size)),
@@ -443,8 +443,14 @@ pub fn compressFramedOne(
 
     switch (opts.level) {
         5 => {
-            // Fast 6 (engine 4): lazy chain hasher with lazy-2 evaluation.
-            chain_hasher = try MatchHasher2.init(allocator, resolved.hash_bits);
+            if (opts.gpu_mode) {
+                greedy_hasher_u32 = FastMatchHasher(u32).init(allocator, .{
+                    .hash_bits = greedy_hash_bits,
+                    .min_match_length = resolved.hasher_k,
+                }) catch |err| return if (err == error.HashBitsOutOfRange) error.BadLevel else @errorCast(err);
+            } else {
+                chain_hasher = try MatchHasher2.init(allocator, resolved.hash_bits);
+            }
         },
         else => {
             // Fast 2 (engine -1), Fast 3 (engine 1), Fast 5 (engine 2).
@@ -653,7 +659,14 @@ pub fn compressFramedOne(
 
                 const start_position_for_sub: usize = src_off + sub_off;
                 const entropy_options = entropyOptionsForLevel(opts.level);
-                const result = try switch (opts.level) {
+                const result = try if (opts.gpu_mode) switch (opts.level) {
+                    1 => fast_enc.encodeSubChunkRaw(-2, u32, allocator, &greedy_hasher_u32.?, sub_src, window_base_ptr, dst[sub_payload_start..], start_position_for_sub, parser_config),
+                    2 => fast_enc.encodeSubChunkRaw(-1, u32, allocator, &greedy_hasher_u32.?, sub_src, window_base_ptr, dst[sub_payload_start..], start_position_for_sub, parser_config),
+                    3 => fast_enc.encodeSubChunkRaw(1, u32, allocator, &greedy_hasher_u32.?, sub_src, window_base_ptr, dst[sub_payload_start..], start_position_for_sub, parser_config),
+                    4 => fast_enc.encodeSubChunkRaw(2, u32, allocator, &greedy_hasher_u32.?, sub_src, window_base_ptr, dst[sub_payload_start..], start_position_for_sub, parser_config),
+                    5 => fast_enc.encodeSubChunkRaw(4, u32, allocator, &greedy_hasher_u32.?, sub_src, window_base_ptr, dst[sub_payload_start..], start_position_for_sub, parser_config),
+                    else => unreachable,
+                } else switch (opts.level) {
                     1 => fast_enc.encodeSubChunkRaw(-2, u32, allocator, &greedy_hasher_u32.?, sub_src, window_base_ptr, dst[sub_payload_start..], start_position_for_sub, parser_config),
                     2 => fast_enc.encodeSubChunkRaw(-1, u32, allocator, &greedy_hasher_u32.?, sub_src, window_base_ptr, dst[sub_payload_start..], start_position_for_sub, parser_config),
                     3 => fast_enc.encodeSubChunkEntropy(1, allocator, &greedy_hasher_u32.?, sub_src, window_base_ptr, dst[sub_payload_start..], start_position_for_sub, entropy_options, parser_config),

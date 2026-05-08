@@ -47,6 +47,7 @@ const Args = struct {
     dict_name: ?[]const u8 = null, // -D name or path
     no_dict: bool = false, // --no-dict disables auto-detection
     report_mem: bool = false, // -mem: print peak commit at exit
+    gpu: bool = false, // -gpu: encode for GPU decode (sc_group=0.25, raw mode)
     engine: Engine = .slz, // --zstd or --lz4 to use external compressor
 };
 
@@ -155,6 +156,10 @@ fn parseArgs(raw: []const []const u8, w: *std.Io.Writer) Args {
         }
         if (eql(arg, "-mem")) {
             result.report_mem = true;
+            continue;
+        }
+        if (eql(arg, "-gpu")) {
+            result.gpu = true;
             continue;
         }
         if (eql(arg, "--zstd")) {
@@ -531,6 +536,7 @@ fn runCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
         .num_threads = @intCast(threads),
         .dictionary = dict_data,
         .dictionary_id = dict_id,
+        .gpu_mode = args.gpu,
     }) catch |err| {
         out_map.unmap();
         try w.print("error: compression failed: {s}\n", .{@errorName(err)});

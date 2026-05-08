@@ -100,6 +100,9 @@ pub const Options = struct {
     /// Override SC group size (in units of 256KB chunks). 0.25 = 64KB blocks,
     /// 1.0 = one chunk, 4.0 = four chunks. null = auto from level.
     sc_group_size_override: ?f32 = null,
+    /// GPU decode mode: forces sc_group=0.25 (64KB independent chunks) and
+    /// raw literal encoding (no tANS entropy). Works with all levels L1-L5.
+    gpu_mode: bool = false,
 
     // ── Advanced (rarely changed) ───────────────────────────────────────
 
