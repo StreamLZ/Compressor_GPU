@@ -402,9 +402,6 @@ __device__ void parseAndDecodeSubChunk(
         off32_raw1 = off32_raw2 - off32_count1 * 3;
     }
 
-    // Off32 values are 3-byte LE in the compressed stream.
-    // Expand to 4-byte u32 in shared memory for decodeSubChunk.
-    // Use a small shared-memory scratch per warp for off32 expansion.
     __shared__ uint8_t off32_scratch[2][4096];  // up to 1024 off32 values per block
     uint8_t* off32_exp1 = off32_scratch[0];
     uint8_t* off32_exp2 = off32_scratch[1];
@@ -492,8 +489,7 @@ extern "C" __global__ void slzFullDecompressL1Kernel(
             const uint8_t* sc_payload = chunk_src + 3;
 
             if (sc_comp_size < sc_size) {
-                uint32_t group_base = chunks[base_chunk].dst_offset;
-                uint32_t base_offset_val = sc_dst_off - group_base;
+                uint32_t base_offset_val = sc_dst_off;
 
                 parseAndDecodeSubChunk(
                     sc_payload, sc_comp_size, sc_size,

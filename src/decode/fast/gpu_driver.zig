@@ -6,7 +6,23 @@ const std = @import("std");
 const win32 = struct {
     extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.c) ?*anyopaque;
     extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.c) ?*anyopaque;
+    extern "kernel32" fn QueryPerformanceCounter(lpPerformanceCount: *i64) callconv(.c) c_int;
+    extern "kernel32" fn QueryPerformanceFrequency(lpFrequency: *i64) callconv(.c) c_int;
+    extern "kernel32" fn GetStdHandle(nStdHandle: u32) callconv(.c) ?*anyopaque;
+    extern "kernel32" fn WriteFile(hFile: *anyopaque, lpBuffer: [*]const u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: ?*u32, lpOverlapped: ?*anyopaque) callconv(.c) c_int;
 };
+
+pub fn writeStderr(msg: []const u8) void {
+    std.debug.print("{s}", .{msg});
+}
+
+fn qpcMs() i64 {
+    var count: i64 = 0;
+    var freq: i64 = 0;
+    _ = win32.QueryPerformanceCounter(&count);
+    _ = win32.QueryPerformanceFrequency(&freq);
+    return @divTrunc(count * 1000, freq);
+}
 
 const CUresult = c_int;
 const CUdevice = c_int;
@@ -102,8 +118,11 @@ pub fn init() bool {
     const fn_result = get_fn(&kernel_fn, module, "slzDecompressL1Kernel");
     if (fn_result != CUDA_SUCCESS) return false;
 
-    _ = get_fn(&batch_kernel_fn, module, "slzBatchDecompressL1Kernel");
-    _ = get_fn(&full_kernel_fn, module, "slzFullDecompressL1Kernel");
+    const batch_res = get_fn(&batch_kernel_fn, module, "slzBatchDecompressL1Kernel");
+    const full_res = get_fn(&full_kernel_fn, module, "slzFullDecompressL1Kernel");
+    if (batch_res != CUDA_SUCCESS or full_res != CUDA_SUCCESS) {
+        std.debug.print("batch_kernel={d} full_kernel={d} batch_err={d} full_err={d}\n", .{ batch_kernel_fn, full_kernel_fn, batch_res, full_res });
+    }
 
     return true;
 }
@@ -115,18 +134,25 @@ pub fn isAvailable() bool {
 const fast_dec = @import("fast_lz_decoder.zig");
 const constants = @import("../../format/streamlz_constants.zig");
 
-// Persistent device output buffer (grows as needed)
+// Persistent device buffers (grow as needed, never shrink)
 var d_output: CUdeviceptr = 0;
 var d_output_size: usize = 0;
+var d_comp_persist: CUdeviceptr = 0;
+var d_comp_persist_size: usize = 0;
+var d_descs_persist: CUdeviceptr = 0;
+var d_descs_persist_size: usize = 0;
+
+fn ensureDeviceBuf(ptr: *CUdeviceptr, current_size: *usize, needed: usize) bool {
+    if (current_size.* >= needed) return true;
+    if (ptr.* != 0) _ = (cuMemFree_fn orelse return false)(ptr.*);
+    current_size.* = 0;
+    if ((cuMemAlloc_fn orelse return false)(ptr, needed) != CUDA_SUCCESS) return false;
+    current_size.* = needed;
+    return true;
+}
 
 fn ensureDeviceOutput(size: usize) bool {
-    if (d_output_size >= size) return true;
-    if (d_output != 0) _ = (cuMemFree_fn orelse return false)(d_output);
-    d_output_size = 0;
-    if ((cuMemAlloc_fn orelse return false)(&d_output, size) != CUDA_SUCCESS) return false;
-    _ = (cuMemsetD8_fn orelse return false)(d_output, 0, size);
-    d_output_size = size;
-    return true;
+    return ensureDeviceBuf(&d_output, &d_output_size, size);
 }
 
 pub fn processLzRunsGpu(
@@ -392,30 +418,31 @@ pub fn fullGpuLaunch(
     const launch_fn = cuLaunchKernel_fn orelse return error.BadMode;
     const sync_fn = cuCtxSynchronize_fn orelse return error.BadMode;
 
+    const t0 = qpcMs();
+
     const total_output = dst_start_off + decompressed_size;
     if (!ensureDeviceOutput(total_output + 64)) return error.BadMode;
 
-    // Upload dictionary prefix
     if (dst_start_off > 0)
         _ = h2d_fn(d_output, @ptrCast(dst_full), dst_start_off);
 
-    // Upload compressed block + chunk descriptors
+    _ = alloc_fn;
+    _ = free_fn;
+
     const comp_bytes = if (compressed_block.len > 0) compressed_block.len else 4;
     const desc_bytes = chunk_descs.len * @sizeOf(ChunkDesc);
 
-    var d_comp: CUdeviceptr = 0;
-    var d_descs: CUdeviceptr = 0;
-
-    if (alloc_fn(&d_comp, comp_bytes) != CUDA_SUCCESS) return error.BadMode;
-    if (alloc_fn(&d_descs, desc_bytes) != CUDA_SUCCESS) { _ = free_fn(d_comp); return error.BadMode; }
-    defer { _ = free_fn(d_comp); _ = free_fn(d_descs); }
+    if (!ensureDeviceBuf(&d_comp_persist, &d_comp_persist_size, comp_bytes)) return error.BadMode;
+    if (!ensureDeviceBuf(&d_descs_persist, &d_descs_persist_size, desc_bytes)) return error.BadMode;
 
     if (compressed_block.len > 0)
-        _ = h2d_fn(d_comp, @ptrCast(compressed_block.ptr), compressed_block.len);
-    _ = h2d_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes);
+        _ = h2d_fn(d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len);
+    _ = h2d_fn(d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes);
 
-    var p_comp = d_comp;
-    var p_descs_dev = d_descs;
+    const t_h2d = qpcMs() - t0;
+
+    var p_comp = d_comp_persist;
+    var p_descs_dev = d_descs_persist;
     var p_dst = d_output;
     var p_cpg = chunks_per_group;
     var p_total: u32 = @intCast(chunk_descs.len);
@@ -429,10 +456,19 @@ pub fn fullGpuLaunch(
     };
     var extra = [_]?*anyopaque{null};
 
-    if (launch_fn(full_kernel_fn, num_groups, 1, 1, 32, 1, 1, 4096 * 2, 0, &params, &extra) != CUDA_SUCCESS)
+    if (launch_fn(full_kernel_fn, num_groups, 1, 1, 32, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS)
         return error.BadMode;
 
     if (sync_fn() != CUDA_SUCCESS) return error.BadMode;
+    const t_kernel = qpcMs() - t0;
 
     _ = d2h_fn(@ptrCast(dst_full + dst_start_off), d_output + dst_start_off, decompressed_size);
+    const t_total = qpcMs() - t0;
+
+    {
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "GPU: h2d={d}ms kern={d}ms d2h={d}ms tot={d}ms\n", .{ t_h2d, t_kernel - t_h2d, t_total - t_kernel, t_total }) catch "";
+        const stderr_handle = win32.GetStdHandle(0xFFFFFFF4); // STD_ERROR_HANDLE
+        if (stderr_handle) |h| _ = win32.WriteFile(h, msg.ptr, @intCast(msg.len), null, null);
+    }
 }

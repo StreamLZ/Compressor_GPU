@@ -297,6 +297,37 @@ fn decompressOneFrame(
         // decoder types) falls through to the existing serial loop.
         const block_src = src[pos .. pos + block_hdr.compressed_size];
         var dispatched_parallel: bool = false;
+
+        // GPU batch path: full decode on GPU (bypasses CPU parallel dispatcher)
+        if (use_gpu) gpu_frame: {
+            const gpu = @import("fast/gpu_driver.zig");
+            if (!gpu.isAvailable()) break :gpu_frame;
+            if (block_src.len < 2) break :gpu_frame;
+            const peek = block_header.parseBlockHeader(block_src) catch break :gpu_frame;
+            const is_fast = peek.decoder_type == .fast or peek.decoder_type == .turbo;
+            if (!is_fast) break :gpu_frame;
+            if (block_hdr.decompressed_size <= constants.chunk_size) break :gpu_frame;
+
+            const num_chunks_est = (block_hdr.decompressed_size + constants.chunk_size - 1) / constants.chunk_size;
+            const prefix_sz: usize = if (peek.self_contained and num_chunks_est > 1) (num_chunks_est - 1) * 8 else 0;
+            const block_payload = block_src[0 .. block_src.len - prefix_sz];
+
+            gpuBatchDecode(block_payload, dst, dst_off, block_hdr.decompressed_size, @as(usize, hdr.sc_group_size), &scratch) catch break :gpu_frame;
+            dst_off += block_hdr.decompressed_size;
+
+            if (prefix_sz != 0) {
+                const prefix_base: [*]const u8 = block_src[block_src.len - prefix_sz ..].ptr;
+                var pi: usize = 0;
+                while (pi + 1 < num_chunks_est) : (pi += 1) {
+                    const cdst = dst_off - block_hdr.decompressed_size + (pi + 1) * constants.chunk_size;
+                    var csz: usize = 8;
+                    if ((pi + 1) * constants.chunk_size + csz > block_hdr.decompressed_size) csz = block_hdr.decompressed_size - (pi + 1) * constants.chunk_size;
+                    @memcpy(dst[cdst..][0..csz], prefix_base[pi * 8 ..][0..csz]);
+                }
+            }
+            dispatched_parallel = true;
+        }
+
         if (allocator_opt) |allocator| {
             if (block_src.len >= 2) {
                 const peek = block_header.parseBlockHeader(block_src) catch null;
@@ -608,6 +639,7 @@ fn decompressCompressedBlock(
     scratch: []u8,
     sc_group_size: u8,
 ) DecompressError!void {
+    std.debug.print("decompressCompressedBlock: gpu={} sc_group={d}\n", .{ use_gpu, sc_group_size });
     // Peek the first 2-byte internal block header to detect SC mode up-front.
     const is_sc = blk: {
         if (block_src_in.len < 2) break :blk false;
@@ -627,11 +659,14 @@ fn decompressCompressedBlock(
     // decodes with base_offset == 0 and fires the initial 8-byte Copy64.
     var chunk_idx_in_block: usize = 0;
 
-    // GPU batch path: entropy-decode all sub-chunks on CPU, token-decode all groups on GPU simultaneously.
-    if (use_gpu and is_sc) gpu_batch: {
+    // GPU batch path
+    if (use_gpu) gpu_batch: {
         const gpu = @import("fast/gpu_driver.zig");
         if (!gpu.isAvailable()) break :gpu_batch;
-        gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, @as(usize, sc_group_size), scratch) catch break :gpu_batch;
+        gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, @as(usize, sc_group_size), scratch) catch |e| {
+            std.debug.print("GPU batch failed: {s}\n", .{@errorName(e)});
+            break :gpu_batch;
+        };
         dst_off_inout.* = sc_start_dst_off + decompressed_size;
         // Fall through to tail prefix restoration below.
         // Skip the serial chunk loop.
@@ -823,8 +858,9 @@ fn gpuBatchDecode(
     const alloc = std.heap.page_allocator;
 
     const num_chunks = (decompressed_size + constants.chunk_size - 1) / constants.chunk_size;
-    const num_groups: u32 = @intCast((num_chunks + sc_group_size_in - 1) / sc_group_size_in);
-    const chunks_per_group: u32 = @intCast(sc_group_size_in);
+    const effective_group_size = if (sc_group_size_in > 0 and sc_group_size_in < num_chunks) sc_group_size_in else num_chunks;
+    const num_groups: u32 = @intCast((num_chunks + effective_group_size - 1) / effective_group_size);
+    const chunks_per_group: u32 = @intCast(effective_group_size);
 
     var chunk_descs = alloc.alloc(gpu.ChunkDesc, num_chunks) catch return error.OutOfMemory;
     defer alloc.free(chunk_descs);
