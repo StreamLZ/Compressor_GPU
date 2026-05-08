@@ -19,6 +19,7 @@ var ctx: usize = 0;
 var module: usize = 0;
 var kernel_fn: usize = 0;
 var batch_kernel_fn: usize = 0;
+var full_kernel_fn: usize = 0;
 var initialized = false;
 
 // Function pointer types
@@ -102,6 +103,7 @@ pub fn init() bool {
     if (fn_result != CUDA_SUCCESS) return false;
 
     _ = get_fn(&batch_kernel_fn, module, "slzBatchDecompressL1Kernel");
+    _ = get_fn(&full_kernel_fn, module, "slzFullDecompressL1Kernel");
 
     return true;
 }
@@ -355,5 +357,82 @@ pub fn batchLaunch(
     if (sync_fn() != CUDA_SUCCESS) return error.BadMode;
 
     // D2H: decompressed output (skip dictionary prefix)
+    _ = d2h_fn(@ptrCast(dst_full + dst_start_off), d_output + dst_start_off, decompressed_size);
+}
+
+// ────────────────────────────────────────────────────────────
+//  Phase 2: Full GPU decode — raw compressed block upload
+// ────────────────────────────────────────────────────────────
+
+pub const ChunkDesc = extern struct {
+    src_offset: u32,
+    comp_size: u32,
+    decomp_size: u32,
+    dst_offset: u32,
+    flags: u32,
+    memset_fill: u8,
+    _pad: [3]u8 = .{ 0, 0, 0 },
+};
+
+pub fn fullGpuLaunch(
+    chunk_descs: []const ChunkDesc,
+    compressed_block: []const u8,
+    dst_full: [*]u8,
+    dst_start_off: usize,
+    decompressed_size: usize,
+    num_groups: u32,
+    chunks_per_group: u32,
+) fast_dec.DecodeError!void {
+    if (!init() or full_kernel_fn == 0) return error.BadMode;
+
+    const alloc_fn = cuMemAlloc_fn orelse return error.BadMode;
+    const free_fn = cuMemFree_fn orelse return error.BadMode;
+    const h2d_fn = cuMemcpyHtoD_fn orelse return error.BadMode;
+    const d2h_fn = cuMemcpyDtoH_fn orelse return error.BadMode;
+    const launch_fn = cuLaunchKernel_fn orelse return error.BadMode;
+    const sync_fn = cuCtxSynchronize_fn orelse return error.BadMode;
+
+    const total_output = dst_start_off + decompressed_size;
+    if (!ensureDeviceOutput(total_output + 64)) return error.BadMode;
+
+    // Upload dictionary prefix
+    if (dst_start_off > 0)
+        _ = h2d_fn(d_output, @ptrCast(dst_full), dst_start_off);
+
+    // Upload compressed block + chunk descriptors
+    const comp_bytes = if (compressed_block.len > 0) compressed_block.len else 4;
+    const desc_bytes = chunk_descs.len * @sizeOf(ChunkDesc);
+
+    var d_comp: CUdeviceptr = 0;
+    var d_descs: CUdeviceptr = 0;
+
+    if (alloc_fn(&d_comp, comp_bytes) != CUDA_SUCCESS) return error.BadMode;
+    if (alloc_fn(&d_descs, desc_bytes) != CUDA_SUCCESS) { _ = free_fn(d_comp); return error.BadMode; }
+    defer { _ = free_fn(d_comp); _ = free_fn(d_descs); }
+
+    if (compressed_block.len > 0)
+        _ = h2d_fn(d_comp, @ptrCast(compressed_block.ptr), compressed_block.len);
+    _ = h2d_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes);
+
+    var p_comp = d_comp;
+    var p_descs_dev = d_descs;
+    var p_dst = d_output;
+    var p_cpg = chunks_per_group;
+    var p_total: u32 = @intCast(chunk_descs.len);
+
+    var params = [_]?*anyopaque{
+        @ptrCast(&p_comp),
+        @ptrCast(&p_descs_dev),
+        @ptrCast(&p_dst),
+        @ptrCast(&p_cpg),
+        @ptrCast(&p_total),
+    };
+    var extra = [_]?*anyopaque{null};
+
+    if (launch_fn(full_kernel_fn, num_groups, 1, 1, 32, 1, 1, 4096 * 2, 0, &params, &extra) != CUDA_SUCCESS)
+        return error.BadMode;
+
+    if (sync_fn() != CUDA_SUCCESS) return error.BadMode;
+
     _ = d2h_fn(@ptrCast(dst_full + dst_start_off), d_output + dst_start_off, decompressed_size);
 }
