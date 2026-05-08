@@ -900,20 +900,10 @@ pub fn decodeChunkWithSubSize(
                     inner_scratch_end,
                     lz_ptr,
                 );
-                const gpu_ok = if (use_gpu) blk: {
-                    const gpu = @import("gpu_driver.zig");
-                    if (!gpu.isAvailable()) break :blk false;
-                    lz_ptr.src_end = src + src_used;
-                    gpu.processLzRunsGpu(lz_ptr, dst, dst_count, @intFromPtr(dst) - @intFromPtr(dst_start), src + src_used, dst_start) catch break :blk false;
-                    break :blk true;
-                } else false;
-
-                if (!gpu_ok) {
-                    try processLzRuns(
-                        mode, src, src + src_used, dst, dst_count,
-                        @intCast(@intFromPtr(dst) - @intFromPtr(dst_start)), dst_end, lz_ptr,
-                    );
-                }
+                try processLzRuns(
+                    mode, src, src + src_used, dst, dst_count,
+                    @intCast(@intFromPtr(dst) - @intFromPtr(dst_start)), dst_end, lz_ptr,
+                );
             } else if (src_used > dst_count or mode != 0) {
                 return error.InvalidChunkHeader;
             } else {
