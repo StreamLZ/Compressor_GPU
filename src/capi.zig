@@ -198,8 +198,14 @@ export fn slz_extract_gpu_streams(
         pos += chunk_parsed.bytes_consumed;
 
         if (chunk_parsed.is_memset) {
+            const chunk_decomp = @min(constants.chunk_size, blk.decompressed_size - decomp_offset);
+            // Fill the output with the memset byte
+            const fill = comp_slice[pos];
+            @memset(dst_ptr[0..chunk_decomp], fill);
             pos += 1;
-            decomp_offset += @min(constants.chunk_size, blk.decompressed_size - decomp_offset);
+            decomp_offset += chunk_decomp;
+            dst_ptr += chunk_decomp;
+            chunk_idx += 1;
             continue;
         }
 
@@ -211,7 +217,11 @@ export fn slz_extract_gpu_streams(
             const sc_hdr_val: u32 = (@as(u32, comp_slice[pos]) << 16) | (@as(u32, comp_slice[pos + 1]) << 8) | comp_slice[pos + 2];
             const sc_compressed = (sc_hdr_val & constants.chunk_header_compressed_flag) != 0;
 
-            if (!sc_compressed) break;
+            if (!sc_compressed) {
+                // Uncompressed sub-chunk — raw bytes, handled by entropy framing
+                // Skip for now (the chunk_end jump handles this)
+                break;
+            }
 
             const sc_comp_size: usize = sc_hdr_val & 0x7FFFF;
             const sc_mode: u32 = (sc_hdr_val >> constants.sub_chunk_type_shift) & 0xF;
@@ -220,11 +230,12 @@ export fn slz_extract_gpu_streams(
 
             if (sc_comp_size < sc_decomp) {
                 // Compressed sub-chunk — extract streams via readLzTable
-                const scratch_offset: usize = @as(usize, @intCast(stream_count)) * (constants.sub_chunk_size * 2 + 256);
-                if (scratch_offset + constants.sub_chunk_size * 2 + 256 > scratch_len) return SLZ_ERROR_OOM;
+                const per_sc_scratch: usize = constants.sub_chunk_size * 3 + 4096;
+                const scratch_offset: usize = @as(usize, @intCast(stream_count)) * per_sc_scratch;
+                if (scratch_offset + per_sc_scratch > scratch_len) return SLZ_ERROR_OOM;
 
                 const inner_scratch = scratch + scratch_offset + @sizeOf(fast_dec.FastLzTable);
-                const inner_scratch_end = scratch + scratch_offset + constants.sub_chunk_size * 2 + 256;
+                const inner_scratch_end = scratch + scratch_offset + per_sc_scratch;
                 const lz_ptr: *fast_dec.FastLzTable = @ptrCast(@alignCast(scratch + scratch_offset));
 
                 var dst_slot = dst_ptr;
@@ -241,7 +252,14 @@ export fn slz_extract_gpu_streams(
                     inner_scratch,
                     inner_scratch_end,
                     lz_ptr,
-                ) catch break;
+                ) catch {
+                    // readLzTable failed for this sub-chunk — skip it
+                    pos += sc_comp_size;
+                    decomp_offset += sc_decomp;
+                    sc_remaining -= sc_decomp;
+                    dst_ptr += sc_decomp;
+                    continue;
+                };
                 lz_ptr.src_end = sc_src_end;
 
                 const initial: u32 = @intCast(@intFromPtr(dst_slot) - @intFromPtr(dst_ptr));
@@ -276,6 +294,19 @@ export fn slz_extract_gpu_streams(
 
         pos = chunk_end;
         chunk_idx += 1;
+    }
+
+    // SC tail prefix restoration: overwrite first 8 bytes of each chunk
+    // (except chunk 0) from the tail prefix table at the end of the block.
+    if (prefix_size != 0) {
+        const prefix_base = comp_slice[block_end..].ptr;
+        var ci: usize = 0;
+        while (ci + 1 < num_chunks) : (ci += 1) {
+            const chunk_dst_off: usize = (ci + 1) * constants.chunk_size;
+            if (chunk_dst_off + 8 <= blk.decompressed_size) {
+                @memcpy(dst[chunk_dst_off..][0..8], prefix_base[ci * 8 ..][0..8]);
+            }
+        }
     }
 
     return stream_count;

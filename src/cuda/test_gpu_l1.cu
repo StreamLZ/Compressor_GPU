@@ -271,7 +271,7 @@ int main(int argc, char** argv) {
     uint8_t* d_dst_full;
     cudaMalloc(&d_dst_full, src_size + 256);
     cudaMemset(d_dst_full, 0, src_size + 256);
-    // Copy initial bytes of first sub-chunk
+    // Copy initial bytes for first sub-chunk only (tail prefix applied after kernels)
     if (num > 0 && streams[0].initial_copy > 0)
         cudaMemcpy(d_dst_full, gpu_dst, streams[0].initial_copy, cudaMemcpyHostToDevice);
 
@@ -349,7 +349,33 @@ int main(int argc, char** argv) {
         dst_offset += s.decomp_size;
     }
 
-    printf("\n%u PASS, %u FAIL\n", total_pass, total_fail);
+    // Apply tail prefix restoration on device (first 8 bytes of each chunk > 0)
+    // The host buffer gpu_dst has the restored bytes from slz_extract_gpu_streams
+    {
+        uint32_t chunk_size = 262144;
+        uint32_t n_chunks = (uint32_t)((src_size + chunk_size - 1) / chunk_size);
+        for (uint32_t ci = 1; ci < n_chunks; ci++) {
+            uint32_t off = ci * chunk_size;
+            if (off + 8 <= src_size)
+                cudaMemcpy(d_dst_full + off, gpu_dst + off, 8, cudaMemcpyHostToDevice);
+        }
+    }
+
+    // Re-verify after tail prefix restoration
+    cudaMemcpy(gpu_dst, d_dst_full, src_size, cudaMemcpyDeviceToHost);
+    total_pass = 0; total_fail = 0;
+    for (int i = 0; i < num; i++) {
+        const GpuStreams& s = streams[i];
+        uint32_t mis = 0;
+        for (uint32_t j = 0; j < s.decomp_size; j++)
+            if (gpu_dst[s.dst_offset + j] != cpu_dst[s.dst_offset + j]) mis++;
+        if (mis == 0) total_pass++; else {
+            if (total_fail < 3) printf("  SC %d: FAIL after prefix (%u mismatches)\n", i, mis);
+            total_fail++;
+        }
+    }
+
+    printf("\n%u PASS, %u FAIL (after tail prefix)\n", total_pass, total_fail);
     printf("%s\n", total_fail == 0 ? "ALL SUB-CHUNKS PASS" : "SOME FAILED");
 
     // Quick throughput estimate: total decomp bytes / wall time
