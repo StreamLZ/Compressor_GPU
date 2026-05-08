@@ -189,7 +189,7 @@ fn writeExtLen(out: [*]u8, value: u32) [*]u8 {
 
 // ── Decompress ──
 
-inline fn readExtLen(src: *[*]const u8) u32 {
+noinline fn readExtLen(src: *[*]const u8) u32 {
     const first = src.*[0];
     if (first != 255) {
         src.* += 1;
@@ -228,7 +228,7 @@ inline fn copy16(dst: [*]u8, src: [*]const u8) void {
     d.* = s.*;
 }
 
-pub fn decompress(dst: []u8, src: []const u8, original_size: usize) !usize {
+pub noinline fn decompress(dst: []u8, src: []const u8, original_size: usize) !usize {
     _ = original_size;
     const overlap_tbl = [8]u8{ 0, 0, 1, 1, 3, 2, 1, 0 };
     var sp = src.ptr;

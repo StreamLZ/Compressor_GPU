@@ -1,92 +1,104 @@
 // StreamLZ L1 GPU Decompressor Kernel
-// Replaces processLzRuns: serial token parse on lane 0, warp-cooperative copies.
-// CPU does entropy decode + stream extraction (readLzTable), GPU does LZ copy.
+// Replaces processLzRuns: token parse + copy on GPU.
+// CPU does frame/chunk parsing and entropy decode (readLzTable).
 
 #include <cstdint>
 #include <cstdio>
 
-extern "C" {
-
-// Batch descriptor for one sub-chunk (matches Zig bridge struct)
-struct GpuSubChunkDesc {
-    const uint8_t* cmd_data;    uint32_t cmd_size;
-    const uint8_t* lit_data;    uint32_t lit_size;
-    const uint8_t* off16_data;  uint32_t off16_count;
-    uint8_t* dst;               uint32_t dst_size;
-    uint32_t initial_copy;      // 8 if base_offset==0, else 0
-};
-
-// ── Kernel ──
-// One warp per sub-chunk. Lane 0 parses tokens, all lanes copy.
+// Extended length decode
+__device__ uint32_t readLength(const uint8_t* &len_stream, const uint8_t* len_end) {
+    if (len_stream >= len_end) return 0;
+    uint32_t v = *len_stream;
+    if (v > 251) {
+        if (len_stream + 2 >= len_end) { len_stream++; return v; }
+        uint16_t extra;
+        memcpy(&extra, len_stream + 1, 2);
+        v += (uint32_t)extra * 4;
+        len_stream += 2;
+    }
+    len_stream++;
+    return v;
+}
 
 __global__ void slzDecompressL1Kernel(
-    const GpuSubChunkDesc* __restrict__ descs,
-    int num_descs
+    const uint8_t* __restrict__ cmd, uint32_t cmd_size,
+    const uint8_t* __restrict__ lit, uint32_t lit_size,
+    const uint8_t* __restrict__ off16_raw, uint32_t off16_count,
+    const uint8_t* __restrict__ off32_raw1, uint32_t off32_count1,
+    const uint8_t* __restrict__ off32_raw2, uint32_t off32_count2,
+    const uint8_t* __restrict__ len_data, uint32_t len_avail,
+    uint8_t* __restrict__ dst, uint32_t dst_size,
+    uint32_t initial_copy,
+    uint32_t cmd_stream2_offset,
+    uint32_t base_offset,
+    uint32_t dst_offset
 ) {
-    // Each warp handles one descriptor
-    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     const int lane = threadIdx.x & 31;
-
-    if (warp_id >= num_descs) return;
-
-    const GpuSubChunkDesc& desc = descs[warp_id];
-
-    const uint8_t* cmd = desc.cmd_data;
-    const uint8_t* lit = desc.lit_data;
-    const uint8_t* off16_raw = desc.off16_data;
-    uint8_t* dst = desc.dst;
-
-    uint32_t cmd_pos = 0, lit_pos = 0, off16_pos = 0;
-    uint32_t dst_pos = 0;
+    uint32_t cmd_pos = 0, lit_pos = 0, off16_pos = 0, off32_pos = 0;
+    uint32_t dst_pos = dst_offset + initial_copy;
     int32_t recent_offset = -8;
+    uint32_t dst_end_abs = dst_offset + dst_size;
+    const uint8_t* len_stream = len_data;
+    const uint8_t* len_end = len_data + len_avail;
+    const uint8_t* off32_cur = off32_raw1;
+    uint32_t off32_count_cur = off32_count1;
+    uint32_t block_dst_start = dst_offset;
 
-    // Initial 8-byte raw copy (first sub-chunk of first chunk)
-    if (desc.initial_copy > 0) {
-        // The initial bytes are at the start of the lit stream
-        // (readLzTable already advanced dst past them and put them in dst)
-        // So we need to account for the 8 bytes already in dst
-        dst_pos = desc.initial_copy;
-    }
+    uint32_t block_cmd_end = (cmd_stream2_offset > 0 && cmd_stream2_offset < cmd_size)
+        ? cmd_stream2_offset : cmd_size;
+    int block_iter = 0;
 
-    const uint32_t cmd_end = desc.cmd_size;
-    const uint32_t dst_end = desc.dst_size;
-
-    while (cmd_pos < cmd_end) {
-        uint32_t token = 0;
-        uint32_t local_lit = 0, local_match = 0;
+    for (;;) {
+    while (cmd_pos < block_cmd_end) {
+        uint32_t token = 0, local_lit = 0, local_match = 0;
         int32_t offset = recent_offset;
-        uint32_t use_recent = 0;
-        uint32_t token_valid = 1;
+        uint32_t use_recent = 0, token_type = 0;
 
-        // ── Token parse (lane 0) ──
         if (lane == 0) {
             token = cmd[cmd_pos++];
-
             if (token >= 24) {
-                // Short token (hot path ~90%)
+                token_type = 0;
                 local_lit = token & 7;
                 local_match = (token >> 3) & 0xF;
                 use_recent = (token >> 7) & 1;
-
-                if (!use_recent && off16_pos < desc.off16_count) {
-                    uint16_t off_val;
-                    memcpy(&off_val, off16_raw + off16_pos * 2, 2);
-                    offset = -(int32_t)off_val;
+                if (!use_recent && off16_pos < off16_count) {
+                    uint16_t v; memcpy(&v, off16_raw + off16_pos * 2, 2);
+                    offset = -(int32_t)v;
                     off16_pos++;
                 }
+            } else if (token == 0) {
+                token_type = 1;
+                local_lit = readLength(len_stream, len_end) + 64;
+            } else if (token == 1) {
+                token_type = 2;
+                local_match = readLength(len_stream, len_end) + 91;
+                if (off16_pos < off16_count) {
+                    uint16_t v; memcpy(&v, off16_raw + off16_pos * 2, 2);
+                    offset = -(int32_t)v; off16_pos++;
+                }
+                use_recent = 0;
+            } else if (token == 2) {
+                token_type = 4;
+                local_match = readLength(len_stream, len_end) + 29;
+                if (off32_pos < off32_count_cur) {
+                    uint32_t v; memcpy(&v, off32_cur + off32_pos * 4, 4);
+                    offset = (int32_t)block_dst_start - (int32_t)v - (int32_t)dst_pos;
+                    off32_pos++;
+                }
+                use_recent = 0;
             } else {
-                // Non-short token — stop for now
-                // TODO: handle cmd 0 (long literal), 1 (long near match),
-                //       2 (long far match), 3-23 (medium matches)
-                token_valid = 0;
+                token_type = 3;
+                local_match = token + 5;
+                if (off32_pos < off32_count_cur) {
+                    uint32_t v; memcpy(&v, off32_cur + off32_pos * 4, 4);
+                    offset = (int32_t)block_dst_start - (int32_t)v - (int32_t)dst_pos;
+                    off32_pos++;
+                }
+                use_recent = 0;
             }
         }
 
-        // Broadcast from lane 0
-        token       = __shfl_sync(0xFFFFFFFF, token, 0);
-        token_valid = __shfl_sync(0xFFFFFFFF, token_valid, 0);
-        if (!token_valid) break;
-
+        token_type  = __shfl_sync(0xFFFFFFFF, token_type, 0);
         local_lit   = __shfl_sync(0xFFFFFFFF, local_lit, 0);
         local_match = __shfl_sync(0xFFFFFFFF, local_match, 0);
         offset      = __shfl_sync(0xFFFFFFFF, offset, 0);
@@ -94,32 +106,31 @@ __global__ void slzDecompressL1Kernel(
         cmd_pos     = __shfl_sync(0xFFFFFFFF, cmd_pos, 0);
         lit_pos     = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
         off16_pos   = __shfl_sync(0xFFFFFFFF, off16_pos, 0);
+        off32_pos   = __shfl_sync(0xFFFFFFFF, off32_pos, 0);
 
-        // ── Literal copy (warp-cooperative) ──
-        for (uint32_t i = lane; i < local_lit; i += 32) {
-            if (dst_pos + i < dst_end && lit_pos + i < desc.lit_size)
-                dst[dst_pos + i] = lit[lit_pos + i];
+        // Literal copy (warp-cooperative)
+        if (local_lit > 0) {
+            for (uint32_t i = lane; i < local_lit; i += 32)
+                if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size)
+                    dst[dst_pos + i] = lit[lit_pos + i];
+            __syncwarp();
+            dst_pos += local_lit;
+            lit_pos += local_lit;
         }
-        __syncwarp();
-        dst_pos += local_lit;
-        lit_pos += local_lit;
 
-        // ── Match copy ──
+        // Match copy
         if (local_match > 0) {
-            uint32_t match_src = (uint32_t)((int32_t)dst_pos + offset);
+            uint32_t ms = (uint32_t)((int32_t)dst_pos + offset);
             int32_t abs_off = -offset;
-
             if (abs_off >= (int32_t)local_match && local_match > 1) {
-                // Non-overlapping: all lanes help
                 for (uint32_t i = lane; i < local_match; i += 32)
-                    if (dst_pos + i < dst_end)
-                        dst[dst_pos + i] = dst[match_src + i];
+                    if (dst_pos + i < dst_end_abs)
+                        dst[dst_pos + i] = dst[ms + i];
             } else {
-                // Overlapping or very short: lane 0 serial
                 if (lane == 0)
                     for (uint32_t i = 0; i < local_match; i++)
-                        if (dst_pos + i < dst_end)
-                            dst[dst_pos + i] = dst[match_src + i];
+                        if (dst_pos + i < dst_end_abs)
+                            dst[dst_pos + i] = dst[ms + i];
             }
             __syncwarp();
             dst_pos += local_match;
@@ -127,13 +138,34 @@ __global__ void slzDecompressL1Kernel(
 
         dst_pos   = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
         lit_pos   = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
-
-        if (!use_recent) recent_offset = offset;
+        if (!use_recent && (token_type != 1)) recent_offset = offset;
         recent_offset = __shfl_sync(0xFFFFFFFF, recent_offset, 0);
+        {
+            uint32_t len_off = (uint32_t)((uintptr_t)len_stream - (uintptr_t)len_data);
+            len_off = __shfl_sync(0xFFFFFFFF, len_off, 0);
+            len_stream = len_data + len_off;
+        }
     }
+    block_iter++;
+    if (block_iter >= 2) break;
+    block_cmd_end = cmd_size;
+    off32_cur = off32_raw2;
+    off32_count_cur = off32_count2;
+    off32_pos = 0;
+    block_dst_start = dst_pos;
+    }
+
+    // Trailing literals
+    __syncwarp();
+    dst_pos = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
+    lit_pos = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
+    uint32_t trailing = (lit_size > lit_pos) ? (lit_size - lit_pos) : 0;
+    for (uint32_t i = lane; i < trailing; i += 32)
+        if (dst_pos + i < dst_end_abs)
+            dst[dst_pos + i] = lit[lit_pos + i];
 }
 
-// ── Host API ──
+extern "C" {
 
 int slz_gpu_available() {
     int count = 0;
@@ -141,94 +173,71 @@ int slz_gpu_available() {
     return (err == cudaSuccess && count > 0) ? 1 : 0;
 }
 
-int slz_gpu_decompress_batch(
-    const GpuSubChunkDesc* host_descs,
-    int num_descs,
-    // Pre-allocated device memory for streams (caller manages)
-    // For simplicity, we'll copy everything internally for now
-    void* /* reserved */
-) {
-    if (num_descs <= 0) return 0;
+struct GpuLzRunsDesc {
+    const uint8_t* cmd_data;    uint32_t cmd_size;
+    const uint8_t* lit_data;    uint32_t lit_size;
+    const uint8_t* off16_data;  uint32_t off16_count;
+    const uint8_t* off32_data1; uint32_t off32_count1;
+    const uint8_t* off32_data2; uint32_t off32_count2;
+    const uint8_t* length_data; uint32_t length_avail;
+    uint8_t* dst;               uint32_t dst_size;
+    uint32_t initial_copy;
+    uint32_t cmd_stream2_offset;
+    uint32_t base_offset;
+    uint32_t dst_offset;
+};
 
-    // Allocate device descriptors
-    GpuSubChunkDesc* d_descs;
-    cudaMalloc(&d_descs, num_descs * sizeof(GpuSubChunkDesc));
+int slz_gpu_process_lz_runs(const GpuLzRunsDesc* desc) {
+    uint8_t *d_cmd, *d_lit, *d_off16, *d_off32_1, *d_off32_2, *d_len, *d_dst;
+    uint32_t total_dst = desc->base_offset + desc->dst_size;
 
-    // For each descriptor, copy streams to device and update pointers
-    GpuSubChunkDesc* h_descs_dev = new GpuSubChunkDesc[num_descs];
+    cudaMalloc(&d_cmd, desc->cmd_size);
+    cudaMalloc(&d_lit, desc->lit_size);
+    cudaMalloc(&d_off16, desc->off16_count * 2 + 4);
+    cudaMalloc(&d_off32_1, desc->off32_count1 * 4 + 4);
+    cudaMalloc(&d_off32_2, desc->off32_count2 * 4 + 4);
+    cudaMalloc(&d_len, desc->length_avail + 4);
+    cudaMalloc(&d_dst, total_dst + 64);
 
-    for (int i = 0; i < num_descs; i++) {
-        const GpuSubChunkDesc& h = host_descs[i];
-        GpuSubChunkDesc& d = h_descs_dev[i];
-        d = h; // copy metadata
+    cudaMemcpy(d_cmd, desc->cmd_data, desc->cmd_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_lit, desc->lit_data, desc->lit_size, cudaMemcpyHostToDevice);
+    if (desc->off16_count > 0)
+        cudaMemcpy(d_off16, desc->off16_data, desc->off16_count * 2, cudaMemcpyHostToDevice);
+    if (desc->off32_count1 > 0)
+        cudaMemcpy(d_off32_1, desc->off32_data1, desc->off32_count1 * 4, cudaMemcpyHostToDevice);
+    if (desc->off32_count2 > 0)
+        cudaMemcpy(d_off32_2, desc->off32_data2, desc->off32_count2 * 4, cudaMemcpyHostToDevice);
+    if (desc->length_avail > 0)
+        cudaMemcpy(d_len, desc->length_data, desc->length_avail, cudaMemcpyHostToDevice);
 
-        // Allocate and copy cmd stream
-        uint8_t* d_cmd; cudaMalloc(&d_cmd, h.cmd_size);
-        cudaMemcpy(d_cmd, h.cmd_data, h.cmd_size, cudaMemcpyHostToDevice);
-        d.cmd_data = d_cmd;
+    // Copy prior output for cross-sub-chunk match references
+    if (desc->base_offset > 0)
+        cudaMemcpy(d_dst, desc->dst - desc->base_offset,
+                   desc->base_offset + desc->initial_copy, cudaMemcpyHostToDevice);
+    else if (desc->initial_copy > 0)
+        cudaMemcpy(d_dst, desc->dst, desc->initial_copy, cudaMemcpyHostToDevice);
 
-        // Allocate and copy lit stream
-        uint8_t* d_lit; cudaMalloc(&d_lit, h.lit_size);
-        cudaMemcpy(d_lit, h.lit_data, h.lit_size, cudaMemcpyHostToDevice);
-        d.lit_data = d_lit;
+    slzDecompressL1Kernel<<<1, 32>>>(
+        d_cmd, desc->cmd_size, d_lit, desc->lit_size,
+        d_off16, desc->off16_count,
+        d_off32_1, desc->off32_count1,
+        d_off32_2, desc->off32_count2,
+        d_len, desc->length_avail,
+        d_dst, desc->dst_size, desc->initial_copy,
+        desc->cmd_stream2_offset,
+        desc->base_offset, desc->base_offset);
 
-        // Allocate and copy off16 stream
-        uint8_t* d_off16; cudaMalloc(&d_off16, h.off16_count * 2);
-        cudaMemcpy(d_off16, h.off16_data, h.off16_count * 2, cudaMemcpyHostToDevice);
-        d.off16_data = d_off16;
-
-        // Allocate output buffer
-        uint8_t* d_dst; cudaMalloc(&d_dst, h.dst_size);
-        // Copy initial bytes if present
-        if (h.initial_copy > 0) {
-            cudaMemcpy(d_dst, h.dst, h.initial_copy, cudaMemcpyHostToDevice);
-        }
-        d.dst = d_dst;
-    }
-
-    // Copy descriptors to device
-    cudaMemcpy(d_descs, h_descs_dev, num_descs * sizeof(GpuSubChunkDesc), cudaMemcpyHostToDevice);
-
-    // Launch: 1 warp per descriptor, 2 warps per block (64 threads)
-    int warps_per_block = 2;
-    int threads_per_block = warps_per_block * 32;
-    int num_blocks = (num_descs + warps_per_block - 1) / warps_per_block;
-
-    slzDecompressL1Kernel<<<num_blocks, threads_per_block>>>(d_descs, num_descs);
     cudaDeviceSynchronize();
-
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA kernel error: %s\n", cudaGetErrorString(err));
-        // Cleanup
-        for (int i = 0; i < num_descs; i++) {
-            cudaFree((void*)h_descs_dev[i].cmd_data);
-            cudaFree((void*)h_descs_dev[i].lit_data);
-            cudaFree((void*)h_descs_dev[i].off16_data);
-            cudaFree(h_descs_dev[i].dst);
-        }
-        cudaFree(d_descs);
-        delete[] h_descs_dev;
-        return -1;
-    }
 
-    // Copy results back to host
-    for (int i = 0; i < num_descs; i++) {
-        cudaMemcpy((void*)host_descs[i].dst, h_descs_dev[i].dst,
-                   host_descs[i].dst_size, cudaMemcpyDeviceToHost);
-    }
+    if (err == cudaSuccess)
+        cudaMemcpy(desc->dst, d_dst + desc->base_offset,
+                   desc->dst_size, cudaMemcpyDeviceToHost);
 
-    // Cleanup device memory
-    for (int i = 0; i < num_descs; i++) {
-        cudaFree((void*)h_descs_dev[i].cmd_data);
-        cudaFree((void*)h_descs_dev[i].lit_data);
-        cudaFree((void*)h_descs_dev[i].off16_data);
-        cudaFree(h_descs_dev[i].dst);
-    }
-    cudaFree(d_descs);
-    delete[] h_descs_dev;
+    cudaFree(d_cmd); cudaFree(d_lit); cudaFree(d_off16);
+    cudaFree(d_off32_1); cudaFree(d_off32_2); cudaFree(d_len); cudaFree(d_dst);
 
-    return 0;
+    return (err == cudaSuccess) ? 0 : -1;
 }
 
 } // extern "C"
