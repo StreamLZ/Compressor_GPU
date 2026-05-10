@@ -254,6 +254,12 @@ const VkFenceCreateInfo = extern struct {
     flags: u32 = 0,
 };
 
+const VkBufferCopy = extern struct {
+    srcOffset: VkDeviceSize = 0,
+    dstOffset: VkDeviceSize = 0,
+    size: VkDeviceSize = 0,
+};
+
 const VkQueueFamilyProperties = extern struct {
     queueFlags: u32,
     queueCount: u32,
@@ -337,10 +343,23 @@ fn initInstance() bool {
     return f(&ci, null, &vk_instance) == VK_SUCCESS;
 }
 
+const VkPhysicalDeviceProperties = extern struct {
+    apiVersion: u32,
+    driverVersion: u32,
+    vendorID: u32,
+    deviceID: u32,
+    deviceType: u32, // 1=integrated, 2=discrete
+    deviceName: [256]u8,
+    pipelineCacheUUID: [16]u8,
+    limits: [504]u8, // VkPhysicalDeviceLimits — large, opaque here
+    sparseProperties: [20]u8,
+};
+
 fn pickDevice() bool {
     const enumDev = vkProc(*const fn (Handle, *u32, ?[*]Handle) callconv(.c) VkResult, "vkEnumeratePhysicalDevices") orelse return false;
     const getQF = vkProc(*const fn (Handle, *u32, ?[*]VkQueueFamilyProperties) callconv(.c) void, "vkGetPhysicalDeviceQueueFamilyProperties") orelse return false;
     const getMemProps = vkProc(*const fn (Handle, *VkPhysicalDeviceMemoryProperties) callconv(.c) void, "vkGetPhysicalDeviceMemoryProperties") orelse return false;
+    const getProps = vkProc(*const fn (Handle, *VkPhysicalDeviceProperties) callconv(.c) void, "vkGetPhysicalDeviceProperties") orelse return false;
 
     var count: u32 = 0;
     if (enumDev(vk_instance, &count, null) != VK_SUCCESS or count == 0) return false;
@@ -348,19 +367,27 @@ fn pickDevice() bool {
     var n: u32 = @min(count, 16);
     if (enumDev(vk_instance, &n, &devs) != VK_SUCCESS) return false;
 
-    for (devs[0..n]) |pd| {
-        var qf_count: u32 = 0;
-        getQF(pd, &qf_count, null);
-        if (qf_count == 0) continue;
-        var qf: [16]VkQueueFamilyProperties = undefined;
-        var qf_n: u32 = @min(qf_count, 16);
-        getQF(pd, &qf_n, &qf);
-        for (0..qf_n) |qi| {
-            if ((qf[qi].queueFlags & VK_QUEUE_COMPUTE) != 0) {
-                vk_phys = pd;
-                comp_family = @intCast(qi);
-                getMemProps(pd, &mem_props);
-                return true;
+    // Two passes: prefer discrete GPUs (type=2), then accept any
+    for (0..2) |pass| {
+        for (devs[0..n]) |pd| {
+            if (pass == 0) {
+                var props: VkPhysicalDeviceProperties = undefined;
+                getProps(pd, &props);
+                if (props.deviceType != 2) continue;
+            }
+            var qf_count: u32 = 0;
+            getQF(pd, &qf_count, null);
+            if (qf_count == 0) continue;
+            var qf: [16]VkQueueFamilyProperties = undefined;
+            var qf_n: u32 = @min(qf_count, 16);
+            getQF(pd, &qf_n, &qf);
+            for (0..qf_n) |qi| {
+                if ((qf[qi].queueFlags & VK_QUEUE_COMPUTE) != 0) {
+                    vk_phys = pd;
+                    comp_family = @intCast(qi);
+                    getMemProps(pd, &mem_props);
+                    return true;
+                }
             }
         }
     }
@@ -446,6 +473,18 @@ fn initCmdResources() bool {
 }
 
 // ── Buffer helpers ──────────────────────────────────────────────
+// Discrete GPUs need device-local memory for compute performance.
+// We allocate a staging buffer (host-visible) alongside each device
+// buffer and use vkCmdCopyBuffer to transfer between them.
+
+const VK_MEM_DEVICE_LOCAL: u32 = 0x1;
+
+var has_device_local: bool = false;
+
+// Staging buffer (host-visible, for upload/download)
+var b_staging: Handle = null;
+var m_staging: Handle = null;
+var b_staging_sz: usize = 0;
 
 fn findMemType(type_bits: u32, props: u32) ?u32 {
     for (0..mem_props.memoryTypeCount) |i| {
@@ -456,9 +495,7 @@ fn findMemType(type_bits: u32, props: u32) ?u32 {
     return null;
 }
 
-fn ensureBuf(buf: *Handle, mem: *Handle, cur_sz: *usize, needed: usize) bool {
-    if (cur_sz.* >= needed) return true;
-
+fn createBufWithMem(buf: *Handle, mem: *Handle, needed: usize, usage: u32, mem_flags: u32) bool {
     const destroyBuf = vkProc(*const fn (Handle, Handle, ?*anyopaque) callconv(.c) void, "vkDestroyBuffer") orelse return false;
     const freeMem = vkProc(*const fn (Handle, Handle, ?*anyopaque) callconv(.c) void, "vkFreeMemory") orelse return false;
     const createBuf = vkProc(*const fn (Handle, *const VkBufferCreateInfo, ?*anyopaque, *Handle) callconv(.c) VkResult, "vkCreateBuffer") orelse return false;
@@ -468,44 +505,112 @@ fn ensureBuf(buf: *Handle, mem: *Handle, cur_sz: *usize, needed: usize) bool {
 
     if (buf.* != null) destroyBuf(vk_dev, buf.*, null);
     if (mem.* != null) freeMem(vk_dev, mem.*, null);
-    cur_sz.* = 0;
 
-    var bci = VkBufferCreateInfo{ .size = needed, .usage = VK_BUFFER_USAGE_STORAGE | VK_BUFFER_USAGE_TRANSFER_DST | VK_BUFFER_USAGE_TRANSFER_SRC };
+    var bci = VkBufferCreateInfo{ .size = needed, .usage = usage };
     if (createBuf(vk_dev, &bci, null, buf) != VK_SUCCESS) return false;
 
     var reqs: VkMemoryRequirements = undefined;
     getReqs(vk_dev, buf.*, &reqs);
 
-    const mt = findMemType(reqs.memoryTypeBits, VK_MEM_HOST_VISIBLE | VK_MEM_HOST_COHERENT) orelse return false;
+    const mt = findMemType(reqs.memoryTypeBits, mem_flags) orelse return false;
     var mai = VkMemoryAllocateInfo{ .allocationSize = reqs.size, .memoryTypeIndex = mt };
     if (allocMem(vk_dev, &mai, null, mem) != VK_SUCCESS) return false;
-    if (bindMem(vk_dev, buf.*, mem.*, 0) != VK_SUCCESS) return false;
+    return bindMem(vk_dev, buf.*, mem.*, 0) == VK_SUCCESS;
+}
 
-    cur_sz.* = needed;
+fn ensureBuf(buf: *Handle, mem: *Handle, cur_sz: *usize, needed: usize) bool {
+    if (cur_sz.* >= needed) return true;
+    cur_sz.* = 0;
+    const usage = VK_BUFFER_USAGE_STORAGE | VK_BUFFER_USAGE_TRANSFER_DST | VK_BUFFER_USAGE_TRANSFER_SRC;
+    // Try device-local first (fast VRAM), fall back to host-visible
+    if (findMemType(0xFFFFFFFF, VK_MEM_DEVICE_LOCAL) != null) {
+        if (createBufWithMem(buf, mem, needed, usage, VK_MEM_DEVICE_LOCAL)) {
+            has_device_local = true;
+            cur_sz.* = needed;
+            return true;
+        }
+    }
+    if (createBufWithMem(buf, mem, needed, usage, VK_MEM_HOST_VISIBLE | VK_MEM_HOST_COHERENT)) {
+        has_device_local = false;
+        cur_sz.* = needed;
+        return true;
+    }
+    return false;
+}
+
+fn ensureStaging(needed: usize) bool {
+    if (b_staging_sz >= needed) return true;
+    b_staging_sz = 0;
+    const usage = VK_BUFFER_USAGE_TRANSFER_SRC | VK_BUFFER_USAGE_TRANSFER_DST;
+    if (!createBufWithMem(&b_staging, &m_staging, needed, usage, VK_MEM_HOST_VISIBLE | VK_MEM_HOST_COHERENT))
+        return false;
+    b_staging_sz = needed;
     return true;
 }
 
-fn uploadBuf(mem_h: Handle, data: [*]const u8, size: usize) bool {
-    const mapMem = vkProc(*const fn (Handle, Handle, VkDeviceSize, VkDeviceSize, u32, *?*anyopaque) callconv(.c) VkResult, "vkMapMemory") orelse return false;
-    const unmapMem = vkProc(*const fn (Handle, Handle) callconv(.c) void, "vkUnmapMemory") orelse return false;
-
+fn mapMem(mem_h: Handle, offset: usize, size: usize) ?[*]u8 {
+    const mapFn = vkProc(*const fn (Handle, Handle, VkDeviceSize, VkDeviceSize, u32, *?*anyopaque) callconv(.c) VkResult, "vkMapMemory") orelse return null;
     var ptr: ?*anyopaque = null;
-    if (mapMem(vk_dev, mem_h, 0, size, 0, &ptr) != VK_SUCCESS) return false;
-    const dst: [*]u8 = @ptrCast(ptr.?);
+    if (mapFn(vk_dev, mem_h, offset, size, 0, &ptr) != VK_SUCCESS) return null;
+    return @ptrCast(ptr.?);
+}
+
+fn unmapMem(mem_h: Handle) void {
+    const unmapFn = vkProc(*const fn (Handle, Handle) callconv(.c) void, "vkUnmapMemory") orelse return;
+    unmapFn(vk_dev, mem_h);
+}
+
+fn uploadToDevice(dev_buf: Handle, dev_mem: Handle, data: [*]const u8, size: usize) bool {
+    if (!has_device_local) {
+        const dst = mapMem(dev_mem, 0, size) orelse return false;
+        @memcpy(dst[0..size], data[0..size]);
+        unmapMem(dev_mem);
+        return true;
+    }
+    if (!ensureStaging(size)) return false;
+    const dst = mapMem(m_staging, 0, size) orelse return false;
     @memcpy(dst[0..size], data[0..size]);
-    unmapMem(vk_dev, mem_h);
+    unmapMem(m_staging);
+    return copyBuf(b_staging, dev_buf, size);
+}
+
+fn downloadFromDevice(dev_buf: Handle, dev_mem: Handle, data: [*]u8, offset: usize, size: usize) bool {
+    if (!has_device_local) {
+        const src = mapMem(dev_mem, offset, size) orelse return false;
+        @memcpy(data[0..size], src[0..size]);
+        unmapMem(dev_mem);
+        return true;
+    }
+    if (!ensureStaging(offset + size)) return false;
+    if (!copyBuf(dev_buf, b_staging, offset + size)) return false;
+    const src = mapMem(m_staging, offset, size) orelse return false;
+    @memcpy(data[0..size], src[0..size]);
+    unmapMem(m_staging);
     return true;
 }
 
-fn downloadBuf(mem_h: Handle, data: [*]u8, offset: usize, size: usize) bool {
-    const mapMem = vkProc(*const fn (Handle, Handle, VkDeviceSize, VkDeviceSize, u32, *?*anyopaque) callconv(.c) VkResult, "vkMapMemory") orelse return false;
-    const unmapMem = vkProc(*const fn (Handle, Handle) callconv(.c) void, "vkUnmapMemory") orelse return false;
+fn copyBuf(src_buf: Handle, dst_buf: Handle, size: usize) bool {
+    const resetCB = vkProc(*const fn (Handle, u32) callconv(.c) VkResult, "vkResetCommandBuffer") orelse return false;
+    const beginCB = vkProc(*const fn (Handle, *const VkCommandBufferBeginInfo) callconv(.c) VkResult, "vkBeginCommandBuffer") orelse return false;
+    const endCB = vkProc(*const fn (Handle) callconv(.c) VkResult, "vkEndCommandBuffer") orelse return false;
+    const cmdCopy = vkProc(*const fn (Handle, Handle, Handle, u32, [*]const VkBufferCopy) callconv(.c) void, "vkCmdCopyBuffer") orelse return false;
+    const queueSubmit = vkProc(*const fn (Handle, u32, [*]const VkSubmitInfo, Handle) callconv(.c) VkResult, "vkQueueSubmit") orelse return false;
+    const waitFence = vkProc(*const fn (Handle, u32, [*]const Handle, u32, u64) callconv(.c) VkResult, "vkWaitForFences") orelse return false;
+    const resetFence = vkProc(*const fn (Handle, u32, [*]const Handle) callconv(.c) VkResult, "vkResetFences") orelse return false;
 
-    var ptr: ?*anyopaque = null;
-    if (mapMem(vk_dev, mem_h, offset, size, 0, &ptr) != VK_SUCCESS) return false;
-    const src: [*]const u8 = @ptrCast(ptr.?);
-    @memcpy(data[0..size], src[0..size]);
-    unmapMem(vk_dev, mem_h);
+    _ = resetCB(vk_cmd_buf, 0);
+    var begin = VkCommandBufferBeginInfo{};
+    if (beginCB(vk_cmd_buf, &begin) != VK_SUCCESS) return false;
+
+    const region = VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = size };
+    cmdCopy(vk_cmd_buf, src_buf, dst_buf, 1, &[1]VkBufferCopy{region});
+
+    if (endCB(vk_cmd_buf) != VK_SUCCESS) return false;
+
+    const submit = VkSubmitInfo{ .commandBufferCount = 1, .pCommandBuffers = &vk_cmd_buf };
+    if (queueSubmit(vk_queue, 1, &[1]VkSubmitInfo{submit}, vk_fence) != VK_SUCCESS) return false;
+    _ = waitFence(vk_dev, 1, &[1]Handle{vk_fence}, 1, ~@as(u64, 0));
+    _ = resetFence(vk_dev, 1, &[1]Handle{vk_fence});
     return true;
 }
 
@@ -554,12 +659,12 @@ pub fn fullVkLaunch(
     if (!ensureBuf(&b_out, &m_out, &b_out_sz, total_output + 64)) return error.BadMode;
     if (!ensureBuf(&b_desc, &m_desc, &b_desc_sz, desc_bytes)) return error.BadMode;
 
-    // Upload data
+    // Upload data (staging → device-local on discrete GPUs)
     if (compressed_block.len > 0)
-        if (!uploadBuf(m_comp, compressed_block.ptr, compressed_block.len)) return error.BadMode;
-    if (!uploadBuf(m_desc, @ptrCast(chunk_descs.ptr), desc_bytes)) return error.BadMode;
+        if (!uploadToDevice(b_comp, m_comp, compressed_block.ptr, compressed_block.len)) return error.BadMode;
+    if (!uploadToDevice(b_desc, m_desc, @ptrCast(chunk_descs.ptr), desc_bytes)) return error.BadMode;
     if (dst_start_off > 0)
-        if (!uploadBuf(m_out, dst_full, dst_start_off)) return error.BadMode;
+        if (!uploadToDevice(b_out, m_out, dst_full, dst_start_off)) return error.BadMode;
 
     // Update descriptor set
     var buf_infos = [3]VkDescriptorBufferInfo{
@@ -605,6 +710,6 @@ pub fn fullVkLaunch(
         }
     }
 
-    // Download output
-    if (!downloadBuf(m_out, dst_full + dst_start_off, dst_start_off, decompressed_size)) return error.BadMode;
+    // Download output (device-local → staging → host on discrete GPUs)
+    if (!downloadFromDevice(b_out, m_out, dst_full + dst_start_off, dst_start_off, decompressed_size)) return error.BadMode;
 }
