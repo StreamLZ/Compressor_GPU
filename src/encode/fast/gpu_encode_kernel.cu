@@ -1,6 +1,6 @@
 // ── StreamLZ GPU L1 Compress Kernel ─────────────────────────────
-// Warp-parallel hash probe, serial token emission on lane 0.
-// Each warp compresses one 64KB chunk independently.
+// Exact port of CPU writeOffset/writeComplexOffset token emission.
+// Serial greedy scan on lane 0 with hash table in global memory.
 //
 // Build: nvcc -ptx -arch=sm_89 -O3 gpu_encode_kernel.cu
 
@@ -25,18 +25,129 @@ __device__ uint32_t hashKey(uint32_t key) {
     return (key >> (32 - HASH_BITS)) & HASH_MASK;
 }
 
-__device__ uint32_t writeLength(uint8_t* buf, uint32_t pos, uint32_t value) {
+// ── writeLengthValue: exact port of CPU ─────────────────────────
+__device__ void writeLengthValue(uint8_t* len_buf, uint32_t &len_count, uint32_t value) {
     if (value <= 251) {
-        buf[pos] = (uint8_t)value;
-        return 1;
+        len_buf[len_count++] = (uint8_t)value;
+    } else {
+        uint32_t low2 = value & 3;
+        uint8_t tag = (uint8_t)((low2 - 4) & 0xFF);
+        len_buf[len_count++] = tag;
+        uint16_t remainder = (uint16_t)((value - (low2 + 252)) >> 2);
+        memcpy(len_buf + len_count, &remainder, 2);
+        len_count += 2;
     }
-    uint16_t extra = (uint16_t)((value - 252) / 4);
-    uint8_t base = (uint8_t)(value - extra * 4);
-    buf[pos] = base;
-    memcpy(buf + pos + 1, &extra, 2);
-    return 3;
 }
 
+// ── writeComplexOffset: exact port of CPU ───────────────────────
+// offset=0 means "use recent offset" (reuse flag)
+__device__ void emitComplex(
+    uint8_t* lit_buf, uint32_t &lit_count,
+    uint8_t* cmd_buf, uint32_t &token_count,
+    uint8_t* off16_buf, uint32_t &off16_count,
+    uint8_t* len_buf, uint32_t &length_count,
+    const uint8_t* src,
+    uint32_t anchor, uint32_t lit_len,
+    uint32_t match_len, uint32_t offset  // offset=0 means recent
+) {
+    // Copy ALL literals to literal stream
+    for (uint32_t i = 0; i < lit_len; i++)
+        lit_buf[lit_count + i] = src[anchor + i];
+    lit_count += lit_len;
+
+    uint32_t remaining_lit = lit_len;
+
+    if (remaining_lit < 64) {
+        // Drain 8-63 with 0x87 continuation tokens (7 lit + 8 match at recent)
+        while (remaining_lit > 7) {
+            cmd_buf[token_count++] = 0x87;
+            remaining_lit -= 7;
+        }
+    } else {
+        // Long literal: token 0 + length value
+        writeLengthValue(len_buf, length_count, remaining_lit - 64);
+        cmd_buf[token_count++] = 0x00;
+        remaining_lit = 0;
+        if (match_len == 0) return;
+    }
+
+    if (offset <= 0xFFFF && match_len <= 15) {
+        // Near-offset match: first token includes remaining literals
+        uint8_t token = (uint8_t)(remaining_lit + 8 * match_len);
+        if (offset == 0) token |= 0x80;
+        cmd_buf[token_count++] = token;
+        if (offset != 0) {
+            uint16_t off_val = (uint16_t)offset;
+            memcpy(off16_buf + off16_count * 2, &off_val, 2);
+            off16_count++;
+        }
+        return;
+    }
+
+    if (offset <= 0xFFFF) {
+        // Near-offset, match > 15: first token takes up to 15, then continuations
+        uint32_t current = (match_len < 15) ? match_len : 15;
+        uint8_t token = (uint8_t)(remaining_lit + 8 * current);
+        if (offset == 0) token |= 0x80;
+        cmd_buf[token_count++] = token;
+        if (offset != 0) {
+            uint16_t off_val = (uint16_t)offset;
+            memcpy(off16_buf + off16_count * 2, &off_val, 2);
+            off16_count++;
+        }
+        uint32_t remaining_match = match_len - current;
+        while (remaining_match > 0) {
+            current = (remaining_match < 15) ? remaining_match : 15;
+            cmd_buf[token_count++] = (uint8_t)(0x80 + 8 * current);
+            remaining_match -= current;
+        }
+        return;
+    }
+
+    // Far-offset path (off32) — not used for 64KB chunks
+    // but included for completeness
+    if (remaining_lit != 0) {
+        cmd_buf[token_count++] = (uint8_t)(0x80 + remaining_lit);
+    }
+    cmd_buf[token_count++] = 1; // TOKEN_LONG_NEAR as fallback
+    writeLengthValue(len_buf, length_count, match_len > 91 ? match_len - 91 : 0);
+    uint16_t off_val = (uint16_t)offset;
+    memcpy(off16_buf + off16_count * 2, &off_val, 2);
+    off16_count++;
+}
+
+// ── writeOffset: exact port of CPU fast path ────────────────────
+__device__ void emitToken(
+    uint8_t* lit_buf, uint32_t &lit_count,
+    uint8_t* cmd_buf, uint32_t &token_count,
+    uint8_t* off16_buf, uint32_t &off16_count,
+    uint8_t* len_buf, uint32_t &length_count,
+    const uint8_t* src,
+    uint32_t anchor, uint32_t lit_len,
+    uint32_t match_len, uint32_t offset  // offset=0 means recent
+) {
+    if (lit_len <= 7 && match_len <= 15 && offset <= 0xFFFF) {
+        // Fast path: single token byte
+        for (uint32_t i = 0; i < lit_len; i++)
+            lit_buf[lit_count + i] = src[anchor + i];
+        lit_count += lit_len;
+
+        uint8_t token = (uint8_t)(lit_len + 8 * match_len);
+        if (offset == 0) token |= 0x80;
+        cmd_buf[token_count++] = token;
+        if (offset != 0) {
+            uint16_t off_val = (uint16_t)offset;
+            memcpy(off16_buf + off16_count * 2, &off_val, 2);
+            off16_count++;
+        }
+        return;
+    }
+    emitComplex(lit_buf, lit_count, cmd_buf, token_count,
+                off16_buf, off16_count, len_buf, length_count,
+                src, anchor, lit_len, match_len, offset);
+}
+
+// ── Main compress kernel ────────────────────────────────────────
 extern "C" __global__ void __launch_bounds__(64, 24) slzCompressL1Kernel(
     const uint8_t* __restrict__ input,
     uint8_t* __restrict__ output,
@@ -60,7 +171,7 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzCompressL1Kernel(
         ht[i] = 0xFFFF;
     __syncwarp();
 
-    // Output streams (temp regions past src_size in output buffer)
+    // Output streams
     uint8_t* dst = output + desc.dst_offset;
     const uint32_t lit_data_start = (desc.is_first ? INITIAL_COPY : 0) + 3;
     uint8_t* lit_buf = dst + lit_data_start;
@@ -72,15 +183,6 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzCompressL1Kernel(
     uint32_t anchor = desc.is_first ? INITIAL_COPY : 0;
     int32_t recent_offset = -8;
 
-    // ── Serial greedy scan on lane 0 ──────────────────────────────
-    // Only two token types for correctness:
-    //   Standard (>= 24): lit 0-7, match 8-22
-    //   Token 0: long literal (>= 64 bytes)
-    // Matches > 22 are capped at 22. Matches < 8 are skipped.
-    // Literals 8-63 are flushed as long literal (token 0, length = lit-64,
-    // but lit < 64 needs special handling: emit as multiple short tokens
-    // by advancing without a match, letting literals accumulate to >= 64
-    // or drain as part of a short token with a match).
     if (lane == 0) {
         uint32_t pos = anchor;
 
@@ -97,89 +199,34 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzCompressL1Kernel(
                               ((uint32_t)src[ref+2] << 16) | ((uint32_t)src[ref+3] << 24);
             if (ref_key != key4) { pos++; continue; }
 
-            // Extend match (cap at 22 for standard tokens only)
+            // Extend match (no cap — emitToken handles arbitrary lengths)
             uint32_t match_len = MIN_MATCH;
             uint32_t max_len = src_size - pos;
-            if (max_len > 22) max_len = 22;
             while (match_len < max_len && src[pos + match_len] == src[ref + match_len])
                 match_len++;
 
-            if (match_len < 8) { pos++; continue; }
-
-            int32_t offset = -(int32_t)(pos - ref);
             uint32_t lit_len = pos - anchor;
-            uint32_t use_recent = (offset == recent_offset) ? 1 : 0;
+            int32_t neg_offset = -(int32_t)(pos - ref);
+            // offset=0 means "use recent", otherwise actual distance
+            uint32_t offset_param = (neg_offset == recent_offset) ? 0 : (uint32_t)(-neg_offset);
 
-            // Flush long literals (>= 64) as token 0
-            while (lit_len >= 64) {
-                uint32_t emit = (lit_len >= 64 + 251) ? 64 + 251 : lit_len;
-                if (emit < 64) emit = 64;
-                // Clamp to available literals
-                if (emit > lit_len) emit = lit_len;
-                for (uint32_t i = 0; i < emit; i++)
-                    lit_buf[lit_count + i] = src[anchor + i];
-                lit_count += emit;
-                cmd_buf[token_count++] = 0;
-                length_count += writeLength(len_buf, length_count, emit - 64);
-                anchor += emit;
-                lit_len -= emit;
-            }
+            emitToken(lit_buf, lit_count, cmd_buf, token_count,
+                      off16_buf, off16_count, len_buf, length_count,
+                      src, anchor, lit_len, match_len, offset_param);
 
-            // Now lit_len < 64. If < 8, emit standard token directly.
-            // If 8-63, we can't use token 0 (needs >= 64). Skip this match
-            // and let literals accumulate until they reach 64 or drain
-            // with a future match that has lit < 8.
-            if (lit_len >= 8) {
-                pos++;
-                continue;
-            }
-
-            // Standard short token: lit 0-7, match 8-22
-            uint32_t token = (lit_len & 7) | (((match_len - 8) & 0xF) << 3) |
-                            (use_recent << 7);
-            // token >= 24 is guaranteed when match >= 8 (minimum (0 | 0<<3) = 0
-            // but match-8 >= 0 so (0 << 3) = 0, token = lit. Need match >= 11
-            // for token >= 24 when lit = 0: (3 << 3) = 24. Actually:
-            // match=8 → (0<<3) = 0, token = lit. match=11 → (3<<3) = 24.
-            // For match 8-10 with lit 0-2: token < 24. Skip these.
-            if (token < 24) {
-                pos++;
-                continue;
-            }
-
-            for (uint32_t i = 0; i < lit_len; i++)
-                lit_buf[lit_count + i] = src[anchor + i];
-            lit_count += lit_len;
-            cmd_buf[token_count++] = (uint8_t)token;
-            if (!use_recent) {
-                uint16_t off_val = (uint16_t)(-offset);
-                memcpy(off16_buf + off16_count * 2, &off_val, 2);
-                off16_count++;
-            }
-            recent_offset = offset;
+            recent_offset = neg_offset;
             anchor = pos + match_len;
             pos = anchor;
         }
 
-        // Trailing literals
+        // Trailing literals — emit as lit-only (match_len=0)
         uint32_t trailing = src_size - anchor;
-        if (trailing >= 64) {
-            // Emit as long literal tokens
-            while (trailing >= 64) {
-                uint32_t emit = (trailing > 64 + 251) ? 64 + 251 : trailing;
-                for (uint32_t i = 0; i < emit; i++)
-                    lit_buf[lit_count + i] = src[anchor + i];
-                lit_count += emit;
-                cmd_buf[token_count++] = 0;
-                length_count += writeLength(len_buf, length_count, emit - 64);
-                anchor += emit;
-                trailing -= emit;
-            }
+        if (trailing > 0) {
+            // Use emitComplex with match_len=0 to handle long trailing
+            emitComplex(lit_buf, lit_count, cmd_buf, token_count,
+                       off16_buf, off16_count, len_buf, length_count,
+                       src, anchor, trailing, 0, 0);
         }
-        // Remaining trailing (< 64): just append as raw literals
-        for (uint32_t i = 0; i < trailing; i++)
-            lit_buf[lit_count + i] = src[anchor + i];
-        lit_count += trailing;
     }
     __syncwarp();
 
@@ -212,7 +259,7 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzCompressL1Kernel(
         memcpy(dst + out_pos, off16_buf, off16_count * 2);
         out_pos += off16_count * 2;
 
-        // Off32 (empty)
+        // Off32 (empty for 64KB chunks)
         dst[out_pos] = 0; dst[out_pos + 1] = 0; dst[out_pos + 2] = 0;
         out_pos += 3;
 
