@@ -3,10 +3,6 @@
 // finding (MATCH.ANY + hash table) and extension (VOTE/ballot).
 // Token emission on lane 0 using StreamLZ separated stream format.
 //
-// Architecture follows nvCOMP LZ4 compress: per-lane byte loads,
-// SHFL.DOWN rolling hash, MATCH.ANY intra-warp, hash fallback,
-// warp-parallel extension via ballot mismatch detection.
-//
 // Build: nvcc -ptx -arch=sm_89 -O3 gpu_encode_kernel.cu
 
 #include <cstdint>
@@ -43,7 +39,6 @@ __device__ void writeLengthValue(uint8_t* len_buf, uint32_t &len_count, uint32_t
     }
 }
 
-// ── Emit command/offset/length streams (literals already copied) ──
 __device__ void emitCmd(
     uint8_t* cmd_buf, uint32_t &token_count,
     uint8_t* off16_buf, uint32_t &off16_count,
@@ -118,7 +113,6 @@ __device__ void emitCmd(
     off16_count++;
 }
 
-// ── Main compress kernel ────────────────────────────────────────
 extern "C" __global__ void __launch_bounds__(64, 16) slzCompressL1Kernel(
     const uint8_t* __restrict__ input,
     uint8_t* __restrict__ output,
@@ -153,20 +147,15 @@ extern "C" __global__ void __launch_bounds__(64, 16) slzCompressL1Kernel(
     int32_t recent_offset = -8;
     uint32_t pos = anchor;
 
-    // ── Warp-parallel main loop: 32-byte windows ────────────────
     while (pos + MIN_MATCH <= src_size) {
-        // Each lane loads one byte at pos + lane
         uint32_t my_pos = pos + lane;
         uint32_t my_byte = (my_pos < src_size) ? (uint32_t)src[my_pos] : 0u;
 
-        // Build 4-byte rolling key via SHFL.DOWN
         uint32_t b1 = __shfl_down_sync(0xFFFFFFFF, my_byte, 1);
         uint32_t b2 = __shfl_down_sync(0xFFFFFFFF, my_byte, 2);
         uint32_t b3 = __shfl_down_sync(0xFFFFFFFF, my_byte, 3);
         uint32_t key4 = my_byte | (b1 << 8) | (b2 << 16) | (b3 << 24);
 
-        // Active lanes: need pos+lane+3 < src_size AND lane <= 28
-        // (lanes 29-31 get garbage from SHFL.DOWN wrapping)
         uint32_t remaining = src_size - pos;
         uint32_t active_count;
         if (remaining >= 32) active_count = 29;
@@ -174,15 +163,13 @@ extern "C" __global__ void __launch_bounds__(64, 16) slzCompressL1Kernel(
         else active_count = 0;
         bool is_active = (lane < active_count);
 
-        // ── Hash table probe (all active lanes simultaneously) ──
+        // Probe hash table (read-only, no write yet)
         uint32_t h = hashKey(key4);
         bool hash_match = false;
         uint32_t hash_ref = 0;
 
         if (is_active) {
             uint32_t ref_val = ht[h];
-            ht[h] = (uint16_t)my_pos;
-
             if (ref_val != 0xFFFF && ref_val < my_pos) {
                 uint32_t rk = (uint32_t)src[ref_val] |
                              ((uint32_t)src[ref_val+1] << 8) |
@@ -195,7 +182,6 @@ extern "C" __global__ void __launch_bounds__(64, 16) slzCompressL1Kernel(
             }
         }
 
-        // ── MATCH.ANY: single-cycle warp-wide duplicate detection ──
         uint32_t warp_match = __match_any_sync(0xFFFFFFFF, key4);
         uint32_t active_mask = __ballot_sync(0xFFFFFFFF, is_active);
         warp_match &= active_mask;
@@ -204,7 +190,6 @@ extern "C" __global__ void __launch_bounds__(64, 16) slzCompressL1Kernel(
         bool has_match = hash_match;
         uint32_t my_ref = hash_ref;
 
-        // Intra-warp match (closer ref, overwrites hash when present)
         if (is_active && lower_mask != 0) {
             uint32_t intra_lane = __ffs(lower_mask) - 1;
             has_match = true;
@@ -213,17 +198,26 @@ extern "C" __global__ void __launch_bounds__(64, 16) slzCompressL1Kernel(
 
         uint32_t match_ballot = __ballot_sync(0xFFFFFFFF, has_match);
 
+        // Deferred HT write: only update consumed positions
+        // On no-match: all active positions are consumed (advance by active_count)
+        // On match: only positions 0..first_lane are consumed
+        {
+            uint32_t write_limit = (match_ballot != 0)
+                ? (uint32_t)(__ffs(match_ballot) - 1) : active_count;
+            if (is_active && lane <= write_limit) {
+                ht[h] = (uint16_t)my_pos;
+            }
+        }
+
         if (match_ballot == 0) {
             pos += active_count;
             continue;
         }
 
-        // ── First matching lane wins (greedy) ───────────────────
         uint32_t first_lane = __ffs(match_ballot) - 1;
         uint32_t match_pos = pos + first_lane;
         uint32_t match_ref = __shfl_sync(0xFFFFFFFF, my_ref, first_lane);
 
-        // ── Warp-parallel match extension: 32 bytes per cycle ───
         uint32_t match_len = MIN_MATCH;
         uint32_t max_match = src_size - match_pos;
         for (uint32_t ext = MIN_MATCH; ext < max_match; ext += 32) {
@@ -242,7 +236,6 @@ extern "C" __global__ void __launch_bounds__(64, 16) slzCompressL1Kernel(
         match_len = max_match;
         ext_done:
 
-        // ── Cooperative literal copy (all 32 lanes) ─────────────
         {
             uint32_t lit_len = match_pos - anchor;
             for (uint32_t i = lane; i < lit_len; i += 32)
@@ -250,7 +243,6 @@ extern "C" __global__ void __launch_bounds__(64, 16) slzCompressL1Kernel(
 
             lit_count += lit_len;
 
-            // Lane 0: emit command/offset/length tokens
             if (lane == 0) {
                 int32_t neg_off = -(int32_t)(match_pos - match_ref);
                 uint32_t off_param = (neg_off == recent_offset) ? 0 : (uint32_t)(-neg_off);
@@ -264,7 +256,6 @@ extern "C" __global__ void __launch_bounds__(64, 16) slzCompressL1Kernel(
         pos = anchor;
     }
 
-    // ── Trailing literals ───────────────────────────────────────
     {
         uint32_t trailing = src_size - anchor;
         if (trailing > 0) {
@@ -280,7 +271,6 @@ extern "C" __global__ void __launch_bounds__(64, 16) slzCompressL1Kernel(
     }
     __syncwarp();
 
-    // ── Pack output (lane 0) ────────────────────────────────────
     if (lane == 0) {
         uint32_t out_pos = 0;
         if (desc.is_first) {
