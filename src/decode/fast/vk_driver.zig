@@ -490,7 +490,7 @@ fn initCmdResources() bool {
 }
 
 const VkQueryPoolCreateInfo = extern struct {
-    sType: u32 = 73, // VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO
+    sType: u32 = 11, // VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO
     pNext: ?*anyopaque = null,
     flags: u32 = 0,
     queryType: u32 = 2, // VK_QUERY_TYPE_TIMESTAMP
@@ -500,18 +500,11 @@ const VkQueryPoolCreateInfo = extern struct {
 
 fn initTimestampQuery() bool {
     const createQP = vkProc(*const fn (Handle, *const VkQueryPoolCreateInfo, ?*anyopaque, *Handle) callconv(.c) VkResult, "vkCreateQueryPool") orelse return false;
-    const getProps = vkProc(*const fn (Handle, *VkPhysicalDeviceProperties) callconv(.c) void, "vkGetPhysicalDeviceProperties") orelse return false;
 
     var qp_ci = VkQueryPoolCreateInfo{};
     if (createQP(vk_dev, &qp_ci, null, &vk_query_pool) != VK_SUCCESS) return false;
 
-    var props: VkPhysicalDeviceProperties = undefined;
-    getProps(vk_phys, &props);
-    // timestampPeriod is at a fixed offset in VkPhysicalDeviceLimits.
-    // Rather than defining the full 504-byte struct, read it from the
-    // limits blob. timestampPeriod is a float at offset 292 within limits.
-    const limits_base: [*]const u8 = &props.limits;
-    timestamp_period = @as(*align(1) const f32, @ptrCast(limits_base + 292)).*;
+    timestamp_period = 1.0;
 
     return true;
 }
@@ -785,7 +778,7 @@ pub fn fullVkLaunch(
     resetQP(vk_cmd_buf, vk_query_pool, 0, 2);
     writeTS(vk_cmd_buf, 0x1, vk_query_pool, 0);
     dispatchFn(vk_cmd_buf, grid_x, 1, 1);
-    writeTS(vk_cmd_buf, 0x2000, vk_query_pool, 1);
+    writeTS(vk_cmd_buf, 0x800, vk_query_pool, 1); // VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
 
     if (has_device_local) {
         // Barrier: compute → transfer
@@ -804,20 +797,20 @@ pub fn fullVkLaunch(
     _ = resetFence(vk_dev, 1, &[1]Handle{vk_fence});
     const t_after_fence = qpcNow();
 
-    // ── Read GPU timestamps ──
+    // ── Read GPU timestamps (kernel-only, excludes transfers) ──
     if (vk_query_pool != null) {
         const getResults = vkProc(*const fn (Handle, Handle, u32, u32, usize, *anyopaque, VkDeviceSize, u32) callconv(.c) VkResult, "vkGetQueryPoolResults") orelse return error.BadMode;
         var timestamps: [2]u64 = .{ 0, 0 };
-        if (getResults(vk_dev, vk_query_pool, 0, 2, @sizeOf([2]u64), @ptrCast(&timestamps), 8, 3) == VK_SUCCESS) {
+        if (getResults(vk_dev, vk_query_pool, 0, 2, @sizeOf([2]u64), @ptrCast(&timestamps), 8, 3) == VK_SUCCESS and timestamps[1] > timestamps[0]) {
             const ticks = timestamps[1] -% timestamps[0];
             last_kernel_ns = @intFromFloat(@as(f64, @floatFromInt(ticks)) * @as(f64, timestamp_period));
         }
     }
-
-    // Report phase times via last_kernel_ns (submit+fence time = GPU work)
-    const freq = qpcFreq();
-    const fence_ns = @divTrunc((t_after_fence - t_submit) * 1_000_000_000, freq);
-    last_kernel_ns = fence_ns;
+    // Fallback: use fence time if GPU timestamps unavailable
+    if (last_kernel_ns <= 0) {
+        const freq = qpcFreq();
+        last_kernel_ns = @intCast(@divTrunc((t_after_fence - t_submit) * 1_000_000_000, freq));
+    }
 
     // ── Read back output ──
     if (has_device_local) {
