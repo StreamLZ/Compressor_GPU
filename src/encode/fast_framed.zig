@@ -119,9 +119,9 @@ fn reencodeGpuWithEntropy(
         .supports_new_huffman = true,
         .supports_short_memset = true,
     };
-    // Huffman/RLE for all streams (tANS has pre-existing roundtrip bug).
-    // When tANS is fixed, use ent_opts (allow_tans=true) for ~4pp ratio gain.
-    _ = ent_opts;
+    // Tokens: Huffman/RLE only. tANS roundtrips correctly but the GPU
+    // decoder can't decode tANS sub-chunks — it silently corrupts output.
+    // Enable tANS when a native GPU tANS kernel is implemented.
     const huff_opts: entropy_enc.EntropyOptions = .{
         .allow_rle_entropy = true,
         .allow_double_huffman = true,
@@ -129,6 +129,7 @@ fn reencodeGpuWithEntropy(
         .supports_new_huffman = true,
         .supports_short_memset = true,
     };
+    _ = ent_opts;
     const tok_n = entropy_enc.encodeArrayU8(allocator, dst[wp..], tokens, huff_opts, speed_tradeoff, null, 0, null) catch return 0;
     wp += tok_n;
 
@@ -686,7 +687,7 @@ pub fn compressFramedOne(
 
     const can_compress = src.len > fast_constants.min_source_length;
 
-    const self_contained: bool = opts.self_contained or opts.two_phase or (opts.level >= 1 and opts.level <= 5);
+    const self_contained: bool = opts.self_contained or opts.two_phase or (opts.level >= 1 and opts.level <= 4);
     const sc_flag_bit: u8 = if (self_contained) 0x10 else 0;
     const two_phase_flag_bit: u8 = if (opts.two_phase) 0x20 else 0;
 

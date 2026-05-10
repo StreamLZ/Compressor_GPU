@@ -298,8 +298,8 @@ fn decompressOneFrame(
         const block_src = src[pos .. pos + block_hdr.compressed_size];
         var dispatched_parallel: bool = false;
 
-        // GPU batch path: full decode on GPU (bypasses CPU parallel dispatcher)
-        if (use_gpu) gpu_frame: {
+        // GPU batch path: only for per-chunk independent data (sc_group <= 1)
+        if (use_gpu and hdr.sc_group_size <= 1.0) gpu_frame: {
             const gpu = @import("fast/gpu_driver.zig");
             if (!gpu.isAvailable()) break :gpu_frame;
             if (block_src.len < 2) break :gpu_frame;
@@ -330,7 +330,7 @@ fn decompressOneFrame(
         }
 
         // Vulkan fallback: try Vulkan compute when CUDA is unavailable
-        if (!dispatched_parallel and use_gpu) vk_frame: {
+        if (!dispatched_parallel and use_gpu and hdr.sc_group_size <= 1.0) vk_frame: {
             const vk = @import("fast/vk_driver.zig");
             if (!vk.isAvailable()) break :vk_frame;
             if (block_src.len < 2) break :vk_frame;
@@ -692,8 +692,9 @@ fn decompressCompressedBlock(
     // decodes with base_offset == 0 and fires the initial 8-byte Copy64.
     var chunk_idx_in_block: usize = 0;
 
-    // GPU batch path
-    if (use_gpu) gpu_batch: {
+    // GPU batch path — only for per-chunk independent data (sc_group <= 1)
+    // Cross-chunk off32 references can't be resolved in parallel GPU decode.
+    if (use_gpu and sc_group_size <= 1.0) gpu_batch: {
         const gpu = @import("fast/gpu_driver.zig");
         if (!gpu.isAvailable()) break :gpu_batch;
         gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, sc_group_size, scratch, null) catch |e| {
@@ -798,9 +799,15 @@ fn decompressCompressedBlock(
                 const src_slice_end: [*]const u8 = src_slice_start + comp_size;
                 const dst_ptr: [*]u8 = dst[dst_off..].ptr;
                 const dst_end_ptr: [*]u8 = dst_ptr + dst_this_chunk;
-                const dst_start_ptr: [*]const u8 = dst.ptr;
                 const scratch_ptr: [*]u8 = scratch.ptr;
                 const scratch_end_ptr: [*]u8 = scratch.ptr + scratch.len;
+
+                const dst_start_ptr: [*]const u8 = if (is_sc) blk: {
+                    const gs: usize = if (sc_group_size >= 1.0) @max(1, @as(usize, @intFromFloat(sc_group_size))) else 1;
+                    const group_start_chunk = (chunk_idx_in_block / gs) * gs;
+                    const group_start_offset = sc_start_dst_off + group_start_chunk * eff_chunk_size;
+                    break :blk dst[group_start_offset..].ptr;
+                } else dst.ptr;
 
                 const eff_sc_sub = constants.sub_chunk_size;
                 const n = try fast.decodeChunkWithSubSize(
