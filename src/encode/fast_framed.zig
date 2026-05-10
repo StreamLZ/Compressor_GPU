@@ -572,6 +572,7 @@ pub fn compressFramedOne(
     // When gpu_mode and CUDA is available, compress all chunks on GPU
     // and assemble the frame from GPU results.
     if (opts.gpu_mode and can_compress) gpu_compress: {
+        std.debug.print("GPU path: pos={d} dst.len={d}\n", .{ pos, dst.len });
         const use_gpu_enc = comptime blk: {
             break :blk @hasDecl(@import("build_options"), "gpu") and @import("build_options").gpu;
         };
@@ -680,6 +681,15 @@ pub fn compressFramedOne(
                 pos += csz;
             }
         }
+
+        // Backfill frame block header (8 bytes at frame_block_hdr_pos)
+        const block_payload_size = pos - frame_block_start;
+        frame.writeBlockHeader(dst[frame_block_hdr_pos..], .{
+            .compressed_size = @intCast(block_payload_size),
+            .decompressed_size = @intCast(src.len),
+            .uncompressed = false,
+            .parallel_decode_metadata = false,
+        });
 
         // End mark
         if (pos + 4 > dst.len) return error.DestinationTooSmall;
