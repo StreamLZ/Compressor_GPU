@@ -539,7 +539,7 @@ pub fn fullVkLaunch(
     const endCB = vkProc(*const fn (Handle) callconv(.c) VkResult, "vkEndCommandBuffer") orelse return error.BadMode;
     const resetCB = vkProc(*const fn (Handle, u32) callconv(.c) VkResult, "vkResetCommandBuffer") orelse return error.BadMode;
     const bindPipe = vkProc(*const fn (Handle, u32, Handle) callconv(.c) void, "vkCmdBindPipeline") orelse return error.BadMode;
-    const bindDS = vkProc(*const fn (Handle, u32, Handle, u32, [*]const Handle, u32, ?*anyopaque) callconv(.c) void, "vkCmdBindDescriptorSets") orelse return error.BadMode;
+    const bindDS = vkProc(*const fn (Handle, u32, Handle, u32, u32, [*]const Handle, u32, ?*const u32) callconv(.c) void, "vkCmdBindDescriptorSets") orelse return error.BadMode;
     const pushConst = vkProc(*const fn (Handle, Handle, u32, u32, u32, *const anyopaque) callconv(.c) void, "vkCmdPushConstants") orelse return error.BadMode;
     const dispatch = vkProc(*const fn (Handle, u32, u32, u32) callconv(.c) void, "vkCmdDispatch") orelse return error.BadMode;
     const queueSubmit = vkProc(*const fn (Handle, u32, [*]const VkSubmitInfo, Handle) callconv(.c) VkResult, "vkQueueSubmit") orelse return error.BadMode;
@@ -581,7 +581,7 @@ pub fn fullVkLaunch(
 
     bindPipe(vk_cmd_buf, VK_BIND_COMPUTE, vk_pipeline);
     var ds_arr = [1]Handle{vk_desc_set};
-    bindDS(vk_cmd_buf, VK_BIND_COMPUTE, vk_pipe_layout, 0, &ds_arr, 0, null);
+    bindDS(vk_cmd_buf, VK_BIND_COMPUTE, vk_pipe_layout, 0, 1, &ds_arr, 0, null);
 
     var pc_data = [3]u32{ chunks_per_group, @intCast(chunk_descs.len), sub_chunk_cap };
     pushConst(vk_cmd_buf, vk_pipe_layout, VK_SHADER_COMPUTE, 0, 12, @ptrCast(&pc_data));
