@@ -41,6 +41,7 @@ fn reencodeGpuWithEntropy(
     _: entropy_enc.EntropyOptions,
     speed_tradeoff: f32,
     initial_bytes: usize,
+    src_size: usize,
 ) !usize {
     var rp: usize = 0;
     var wp: usize = 0;
@@ -69,6 +70,14 @@ fn reencodeGpuWithEntropy(
     if (rp + token_count > raw.len) return 0;
     const tokens = raw[rp..][0..token_count];
     rp += token_count;
+
+    // cmd_stream2_offset: present for sub-chunks > 64KB
+    var cmd_stream2_data: ?[2]u8 = null;
+    if (src_size > 0x10000) {
+        if (rp + 2 > raw.len) return 0;
+        cmd_stream2_data = raw[rp..][0..2].*;
+        rp += 2;
+    }
 
     // Parse off16 stream
     if (rp + 2 > raw.len) return 0;
@@ -110,8 +119,26 @@ fn reencodeGpuWithEntropy(
         .supports_new_huffman = true,
         .supports_short_memset = true,
     };
-    const tok_n = entropy_enc.encodeArrayU8(allocator, dst[wp..], tokens, ent_opts, speed_tradeoff, null, 0, null) catch return 0;
+    // Huffman/RLE for all streams (tANS has pre-existing roundtrip bug).
+    // When tANS is fixed, use ent_opts (allow_tans=true) for ~4pp ratio gain.
+    _ = ent_opts;
+    const huff_opts: entropy_enc.EntropyOptions = .{
+        .allow_rle_entropy = true,
+        .allow_double_huffman = true,
+        .allow_rle = true,
+        .supports_new_huffman = true,
+        .supports_short_memset = true,
+    };
+    const tok_n = entropy_enc.encodeArrayU8(allocator, dst[wp..], tokens, huff_opts, speed_tradeoff, null, 0, null) catch return 0;
     wp += tok_n;
+
+    // Write cmd_stream2_offset if present
+    if (cmd_stream2_data) |cs2d| {
+        if (wp + 2 > dst.len) return 0;
+        dst[wp] = cs2d[0];
+        dst[wp + 1] = cs2d[1];
+        wp += 2;
+    }
 
     // Off16: split hi/lo, entropy encode each half
     if (off16_count >= 32) {
@@ -125,8 +152,8 @@ fn reencodeGpuWithEntropy(
         }
         const split_enc = allocator.alloc(u8, off16_bytes + 512) catch return 0;
         defer allocator.free(split_enc);
-        const hi_n = entropy_enc.encodeArrayU8(allocator, split_enc, hi_bytes, ent_opts, speed_tradeoff, null, 0, null) catch return 0;
-        const lo_n = entropy_enc.encodeArrayU8(allocator, split_enc[hi_n..], lo_bytes, ent_opts, speed_tradeoff, null, 0, null) catch return 0;
+        const hi_n = entropy_enc.encodeArrayU8(allocator, split_enc, hi_bytes, huff_opts, speed_tradeoff, null, 0, null) catch return 0;
+        const lo_n = entropy_enc.encodeArrayU8(allocator, split_enc[hi_n..], lo_bytes, huff_opts, speed_tradeoff, null, 0, null) catch return 0;
         const split_total = hi_n + lo_n;
         if (split_total < off16_bytes) {
             if (wp + 2 + split_total > dst.len) return 0;
@@ -766,6 +793,22 @@ pub fn compressFramedOne(
         if (!gpu_enc.gpuCompress(effective_src, gpu_out, descs, comp_sizes, io))
             break :gpu_compress;
 
+        const gpu_entropy_opts: entropy_enc.EntropyOptions = .{
+            .allow_tans = true,
+            .allow_rle_entropy = true,
+            .allow_double_huffman = true,
+            .allow_rle = true,
+            .supports_new_huffman = true,
+            .supports_short_memset = true,
+        };
+        // Entropy re-encoding scratch
+        const gpu_speed_tradeoff = cost_coeffs.speedTradeoffFor(
+            cost_coeffs.default_space_speed_tradeoff_bytes,
+            true,
+        );
+        const entropy_scratch = allocator.alloc(u8, gpu_block * 2) catch null;
+        defer if (entropy_scratch) |s| allocator.free(s);
+
         // Assemble frame from GPU-compressed sub-chunks grouped into chunks
         var soff: usize = dict_len;
         var gpu_bi: usize = 0;
@@ -773,7 +816,6 @@ pub fn compressFramedOne(
             const chunk_size = @min(eff_chunk, data_src.len - ci * eff_chunk);
             const n_subs = (chunk_size + gpu_block - 1) / gpu_block;
 
-            // Block header (2 bytes)
             if (pos + 2 > dst.len) return error.DestinationTooSmall;
             const flags0: u8 = 0x05 | sc_flag_bit | two_phase_flag_bit | 0x40;
 
@@ -784,7 +826,7 @@ pub fn compressFramedOne(
                 const sub_size = @min(gpu_block, chunk_size - si * gpu_block);
                 const cs = comp_sizes[gpu_bi + si];
                 if (cs >= sub_size) { all_ok = false; break; }
-                total_comp += cs + 3; // +3 for sub-chunk header
+                total_comp += cs + 3;
             }
 
             if (!all_ok) {
@@ -798,25 +840,45 @@ pub fn compressFramedOne(
                 dst[pos + 1] = @intFromEnum(block_header.CodecType.fast);
                 pos += 2;
 
-                // Chunk header (4 bytes): total compressed size of all sub-chunks - 1
+                // Reserve 4 bytes for chunk header (backfill after sub-chunks)
                 if (pos + 4 > dst.len) return error.DestinationTooSmall;
-                std.mem.writeInt(u32, dst[pos..][0..4], @intCast(total_comp - 1), .little);
+                const chunk_hdr_pos = pos;
                 pos += 4;
 
-                // Write each sub-chunk
+                // Write each sub-chunk (with entropy re-encoding)
                 for (0..n_subs) |si| {
-                    const cs = comp_sizes[gpu_bi + si];
-                    const payload = gpu_out[(gpu_bi + si) * per_block_cap ..][0..cs];
+                    const raw_cs = comp_sizes[gpu_bi + si];
+                    const raw_payload = gpu_out[(gpu_bi + si) * per_block_cap ..][0..raw_cs];
+                    const init_bytes: usize = if (ci == 0 and si == 0 and dict_len == 0) 8 else 0;
 
-                    if (pos + 3 + cs > dst.len) return error.DestinationTooSmall;
-                    const sc_hdr: u32 = @as(u32, @intCast(cs)) |
+                    var use_payload = raw_payload;
+                    var use_cs: usize = raw_cs;
+
+                    if (entropy_scratch) |scratch| {
+                        const sub_src_size = @min(gpu_block, chunk_size - si * gpu_block);
+                        const ent_cs = reencodeGpuWithEntropy(
+                            allocator, raw_payload, scratch,
+                            gpu_entropy_opts, gpu_speed_tradeoff, init_bytes, sub_src_size,
+                        ) catch 0;
+                        if (ent_cs > 0 and ent_cs < raw_cs) {
+                            use_payload = scratch[0..ent_cs];
+                            use_cs = ent_cs;
+                        }
+                    }
+
+                    if (pos + 3 + use_cs > dst.len) return error.DestinationTooSmall;
+                    const sc_hdr: u32 = @as(u32, @intCast(use_cs)) |
                         (@as(u32, 1) << lz_constants.sub_chunk_type_shift) |
                         lz_constants.chunk_header_compressed_flag;
                     block_header.writeBE24(dst[pos..].ptr, sc_hdr);
                     pos += 3;
-                    @memcpy(dst[pos..][0..cs], payload);
-                    pos += cs;
+                    @memcpy(dst[pos..][0..use_cs], use_payload);
+                    pos += use_cs;
                 }
+
+                // Backfill chunk header
+                const chunk_payload = pos - chunk_hdr_pos - 4;
+                std.mem.writeInt(u32, dst[chunk_hdr_pos..][0..4], @intCast(chunk_payload - 1), .little);
             }
             soff += chunk_size;
             gpu_bi += n_subs;
