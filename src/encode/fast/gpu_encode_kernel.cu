@@ -1,6 +1,11 @@
 // ── StreamLZ GPU L1 Compress Kernel ─────────────────────────────
-// Exact port of CPU writeOffset/writeComplexOffset token emission.
-// Serial greedy scan on lane 0 with hash table in global memory.
+// Warp-parallel greedy scan: all 32 lanes participate in match
+// finding (MATCH.ANY + hash table) and extension (VOTE/ballot).
+// Token emission on lane 0 using StreamLZ separated stream format.
+//
+// Architecture follows nvCOMP LZ4 compress: per-lane byte loads,
+// SHFL.DOWN rolling hash, MATCH.ANY intra-warp, hash fallback,
+// warp-parallel extension via ballot mismatch detection.
 //
 // Build: nvcc -ptx -arch=sm_89 -O3 gpu_encode_kernel.cu
 
@@ -25,7 +30,6 @@ __device__ uint32_t hashKey(uint32_t key) {
     return (key >> (32 - HASH_BITS)) & HASH_MASK;
 }
 
-// ── writeLengthValue: exact port of CPU ─────────────────────────
 __device__ void writeLengthValue(uint8_t* len_buf, uint32_t &len_count, uint32_t value) {
     if (value <= 251) {
         len_buf[len_count++] = (uint8_t)value;
@@ -39,32 +43,34 @@ __device__ void writeLengthValue(uint8_t* len_buf, uint32_t &len_count, uint32_t
     }
 }
 
-// ── writeComplexOffset: exact port of CPU ───────────────────────
-// offset=0 means "use recent offset" (reuse flag)
-__device__ void emitComplex(
-    uint8_t* lit_buf, uint32_t &lit_count,
+// ── Emit command/offset/length streams (literals already copied) ──
+__device__ void emitCmd(
     uint8_t* cmd_buf, uint32_t &token_count,
     uint8_t* off16_buf, uint32_t &off16_count,
     uint8_t* len_buf, uint32_t &length_count,
-    const uint8_t* src,
-    uint32_t anchor, uint32_t lit_len,
-    uint32_t match_len, uint32_t offset  // offset=0 means recent
+    uint32_t lit_len,
+    uint32_t match_len, uint32_t offset
 ) {
-    // Copy ALL literals to literal stream
-    for (uint32_t i = 0; i < lit_len; i++)
-        lit_buf[lit_count + i] = src[anchor + i];
-    lit_count += lit_len;
-
     uint32_t remaining_lit = lit_len;
 
+    if (remaining_lit <= 7 && match_len <= 15 && offset <= 0xFFFF) {
+        uint8_t token = (uint8_t)(remaining_lit + 8 * match_len);
+        if (offset == 0) token |= 0x80;
+        cmd_buf[token_count++] = token;
+        if (offset != 0) {
+            uint16_t off_val = (uint16_t)offset;
+            memcpy(off16_buf + off16_count * 2, &off_val, 2);
+            off16_count++;
+        }
+        return;
+    }
+
     if (remaining_lit < 64) {
-        // Drain 8-63 with 0x87 continuation tokens (7 lit + 8 match at recent)
         while (remaining_lit > 7) {
             cmd_buf[token_count++] = 0x87;
             remaining_lit -= 7;
         }
     } else {
-        // Long literal: token 0 + length value
         writeLengthValue(len_buf, length_count, remaining_lit - 64);
         cmd_buf[token_count++] = 0x00;
         remaining_lit = 0;
@@ -72,7 +78,6 @@ __device__ void emitComplex(
     }
 
     if (offset <= 0xFFFF && match_len <= 15) {
-        // Near-offset match: first token includes remaining literals
         uint8_t token = (uint8_t)(remaining_lit + 8 * match_len);
         if (offset == 0) token |= 0x80;
         cmd_buf[token_count++] = token;
@@ -85,7 +90,6 @@ __device__ void emitComplex(
     }
 
     if (offset <= 0xFFFF) {
-        // Near-offset, match > 15: first token takes up to 15, then continuations
         uint32_t current = (match_len < 15) ? match_len : 15;
         uint8_t token = (uint8_t)(remaining_lit + 8 * current);
         if (offset == 0) token |= 0x80;
@@ -104,51 +108,18 @@ __device__ void emitComplex(
         return;
     }
 
-    // Far-offset path (off32) — not used for 64KB chunks
-    // but included for completeness
     if (remaining_lit != 0) {
         cmd_buf[token_count++] = (uint8_t)(0x80 + remaining_lit);
     }
-    cmd_buf[token_count++] = 1; // TOKEN_LONG_NEAR as fallback
+    cmd_buf[token_count++] = 1;
     writeLengthValue(len_buf, length_count, match_len > 91 ? match_len - 91 : 0);
     uint16_t off_val = (uint16_t)offset;
     memcpy(off16_buf + off16_count * 2, &off_val, 2);
     off16_count++;
 }
 
-// ── writeOffset: exact port of CPU fast path ────────────────────
-__device__ void emitToken(
-    uint8_t* lit_buf, uint32_t &lit_count,
-    uint8_t* cmd_buf, uint32_t &token_count,
-    uint8_t* off16_buf, uint32_t &off16_count,
-    uint8_t* len_buf, uint32_t &length_count,
-    const uint8_t* src,
-    uint32_t anchor, uint32_t lit_len,
-    uint32_t match_len, uint32_t offset  // offset=0 means recent
-) {
-    if (lit_len <= 7 && match_len <= 15 && offset <= 0xFFFF) {
-        // Fast path: single token byte
-        for (uint32_t i = 0; i < lit_len; i++)
-            lit_buf[lit_count + i] = src[anchor + i];
-        lit_count += lit_len;
-
-        uint8_t token = (uint8_t)(lit_len + 8 * match_len);
-        if (offset == 0) token |= 0x80;
-        cmd_buf[token_count++] = token;
-        if (offset != 0) {
-            uint16_t off_val = (uint16_t)offset;
-            memcpy(off16_buf + off16_count * 2, &off_val, 2);
-            off16_count++;
-        }
-        return;
-    }
-    emitComplex(lit_buf, lit_count, cmd_buf, token_count,
-                off16_buf, off16_count, len_buf, length_count,
-                src, anchor, lit_len, match_len, offset);
-}
-
 // ── Main compress kernel ────────────────────────────────────────
-extern "C" __global__ void __launch_bounds__(64, 24) slzCompressL1Kernel(
+extern "C" __global__ void __launch_bounds__(64, 16) slzCompressL1Kernel(
     const uint8_t* __restrict__ input,
     uint8_t* __restrict__ output,
     const CompressChunkDesc* __restrict__ descs,
@@ -158,7 +129,7 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzCompressL1Kernel(
 ) {
     const uint32_t warp_id = threadIdx.y;
     const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
-    const int lane = threadIdx.x & 31;
+    const uint32_t lane = threadIdx.x & 31;
     if (chunk_id >= total_chunks) return;
 
     const CompressChunkDesc& desc = descs[chunk_id];
@@ -166,12 +137,10 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzCompressL1Kernel(
     const uint32_t src_size = desc.src_size;
     uint16_t* ht = hash_tables + chunk_id * HASH_SIZE;
 
-    // Init hash table (all lanes)
     for (uint32_t i = lane; i < HASH_SIZE; i += 32)
         ht[i] = 0xFFFF;
     __syncwarp();
 
-    // Output streams
     uint8_t* dst = output + desc.dst_offset;
     const uint32_t lit_data_start = (desc.is_first ? INITIAL_COPY : 0) + 3;
     uint8_t* lit_buf = dst + lit_data_start;
@@ -182,50 +151,131 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzCompressL1Kernel(
     uint32_t lit_count = 0, token_count = 0, off16_count = 0, length_count = 0;
     uint32_t anchor = desc.is_first ? INITIAL_COPY : 0;
     int32_t recent_offset = -8;
+    uint32_t pos = anchor;
 
-    if (lane == 0) {
-        uint32_t pos = anchor;
+    // ── Warp-parallel main loop: 32-byte windows ────────────────
+    while (pos + MIN_MATCH <= src_size) {
+        // Each lane loads one byte at pos + lane
+        uint32_t my_pos = pos + lane;
+        uint32_t my_byte = (my_pos < src_size) ? (uint32_t)src[my_pos] : 0u;
 
-        while (pos + MIN_MATCH <= src_size) {
-            uint32_t key4 = (uint32_t)src[pos] | ((uint32_t)src[pos+1] << 8) |
-                           ((uint32_t)src[pos+2] << 16) | ((uint32_t)src[pos+3] << 24);
-            uint32_t h = hashKey(key4);
-            uint32_t ref = ht[h];
-            ht[h] = (uint16_t)pos;
+        // Build 4-byte rolling key via SHFL.DOWN
+        uint32_t b1 = __shfl_down_sync(0xFFFFFFFF, my_byte, 1);
+        uint32_t b2 = __shfl_down_sync(0xFFFFFFFF, my_byte, 2);
+        uint32_t b3 = __shfl_down_sync(0xFFFFFFFF, my_byte, 3);
+        uint32_t key4 = my_byte | (b1 << 8) | (b2 << 16) | (b3 << 24);
 
-            if (ref >= pos || ref == 0xFFFF) { pos++; continue; }
+        // Active lanes: need pos+lane+3 < src_size AND lane <= 28
+        // (lanes 29-31 get garbage from SHFL.DOWN wrapping)
+        uint32_t remaining = src_size - pos;
+        uint32_t active_count;
+        if (remaining >= 32) active_count = 29;
+        else if (remaining >= 4) active_count = remaining - 3;
+        else active_count = 0;
+        bool is_active = (lane < active_count);
 
-            uint32_t ref_key = (uint32_t)src[ref] | ((uint32_t)src[ref+1] << 8) |
-                              ((uint32_t)src[ref+2] << 16) | ((uint32_t)src[ref+3] << 24);
-            if (ref_key != key4) { pos++; continue; }
+        // ── Hash table probe (all active lanes simultaneously) ──
+        uint32_t h = hashKey(key4);
+        bool hash_match = false;
+        uint32_t hash_ref = 0;
 
-            // Extend match (no cap — emitToken handles arbitrary lengths)
-            uint32_t match_len = MIN_MATCH;
-            uint32_t max_len = src_size - pos;
-            while (match_len < max_len && src[pos + match_len] == src[ref + match_len])
-                match_len++;
+        if (is_active) {
+            uint32_t ref_val = ht[h];
+            ht[h] = (uint16_t)my_pos;
 
-            uint32_t lit_len = pos - anchor;
-            int32_t neg_offset = -(int32_t)(pos - ref);
-            // offset=0 means "use recent", otherwise actual distance
-            uint32_t offset_param = (neg_offset == recent_offset) ? 0 : (uint32_t)(-neg_offset);
-
-            emitToken(lit_buf, lit_count, cmd_buf, token_count,
-                      off16_buf, off16_count, len_buf, length_count,
-                      src, anchor, lit_len, match_len, offset_param);
-
-            recent_offset = neg_offset;
-            anchor = pos + match_len;
-            pos = anchor;
+            if (ref_val != 0xFFFF && ref_val < my_pos) {
+                uint32_t rk = (uint32_t)src[ref_val] |
+                             ((uint32_t)src[ref_val+1] << 8) |
+                             ((uint32_t)src[ref_val+2] << 16) |
+                             ((uint32_t)src[ref_val+3] << 24);
+                if (rk == key4) {
+                    hash_match = true;
+                    hash_ref = ref_val;
+                }
+            }
         }
 
-        // Trailing literals — emit as lit-only (match_len=0)
+        // ── MATCH.ANY: single-cycle warp-wide duplicate detection ──
+        uint32_t warp_match = __match_any_sync(0xFFFFFFFF, key4);
+        uint32_t active_mask = __ballot_sync(0xFFFFFFFF, is_active);
+        warp_match &= active_mask;
+        uint32_t lower_mask = warp_match & ((1u << lane) - 1);
+
+        bool has_match = hash_match;
+        uint32_t my_ref = hash_ref;
+
+        // Intra-warp match (closer ref, overwrites hash when present)
+        if (is_active && lower_mask != 0) {
+            uint32_t intra_lane = __ffs(lower_mask) - 1;
+            has_match = true;
+            my_ref = pos + intra_lane;
+        }
+
+        uint32_t match_ballot = __ballot_sync(0xFFFFFFFF, has_match);
+
+        if (match_ballot == 0) {
+            pos += active_count;
+            continue;
+        }
+
+        // ── First matching lane wins (greedy) ───────────────────
+        uint32_t first_lane = __ffs(match_ballot) - 1;
+        uint32_t match_pos = pos + first_lane;
+        uint32_t match_ref = __shfl_sync(0xFFFFFFFF, my_ref, first_lane);
+
+        // ── Warp-parallel match extension: 32 bytes per cycle ───
+        uint32_t match_len = MIN_MATCH;
+        uint32_t max_match = src_size - match_pos;
+        for (uint32_t ext = MIN_MATCH; ext < max_match; ext += 32) {
+            uint32_t check = ext + lane;
+            bool mm;
+            if (check >= max_match)
+                mm = true;
+            else
+                mm = (src[match_pos + check] != src[match_ref + check]);
+            uint32_t mm_mask = __ballot_sync(0xFFFFFFFF, mm);
+            if (mm_mask != 0) {
+                match_len = ext + __ffs(mm_mask) - 1;
+                goto ext_done;
+            }
+        }
+        match_len = max_match;
+        ext_done:
+
+        // ── Cooperative literal copy (all 32 lanes) ─────────────
+        {
+            uint32_t lit_len = match_pos - anchor;
+            for (uint32_t i = lane; i < lit_len; i += 32)
+                lit_buf[lit_count + i] = src[anchor + i];
+
+            lit_count += lit_len;
+
+            // Lane 0: emit command/offset/length tokens
+            if (lane == 0) {
+                int32_t neg_off = -(int32_t)(match_pos - match_ref);
+                uint32_t off_param = (neg_off == recent_offset) ? 0 : (uint32_t)(-neg_off);
+                emitCmd(cmd_buf, token_count, off16_buf, off16_count,
+                        len_buf, length_count, lit_len, match_len, off_param);
+                recent_offset = neg_off;
+            }
+        }
+
+        anchor = match_pos + match_len;
+        pos = anchor;
+    }
+
+    // ── Trailing literals ───────────────────────────────────────
+    {
         uint32_t trailing = src_size - anchor;
         if (trailing > 0) {
-            // Use emitComplex with match_len=0 to handle long trailing
-            emitComplex(lit_buf, lit_count, cmd_buf, token_count,
-                       off16_buf, off16_count, len_buf, length_count,
-                       src, anchor, trailing, 0, 0);
+            for (uint32_t i = lane; i < trailing; i += 32)
+                lit_buf[lit_count + i] = src[anchor + i];
+            lit_count += trailing;
+
+            if (lane == 0) {
+                emitCmd(cmd_buf, token_count, off16_buf, off16_count,
+                        len_buf, length_count, trailing, 0, 0);
+            }
         }
     }
     __syncwarp();
@@ -238,13 +288,11 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzCompressL1Kernel(
             out_pos = INITIAL_COPY;
         }
 
-        // Literal header (3 bytes BE)
         dst[out_pos] = (uint8_t)((lit_count >> 16) & 0xFF);
         dst[out_pos + 1] = (uint8_t)((lit_count >> 8) & 0xFF);
         dst[out_pos + 2] = (uint8_t)(lit_count & 0xFF);
         out_pos += 3 + lit_count;
 
-        // Token stream
         dst[out_pos] = (uint8_t)((token_count >> 16) & 0xFF);
         dst[out_pos + 1] = (uint8_t)((token_count >> 8) & 0xFF);
         dst[out_pos + 2] = (uint8_t)(token_count & 0xFF);
@@ -252,18 +300,15 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzCompressL1Kernel(
         memcpy(dst + out_pos, cmd_buf, token_count);
         out_pos += token_count;
 
-        // Off16
         dst[out_pos] = (uint8_t)(off16_count & 0xFF);
         dst[out_pos + 1] = (uint8_t)((off16_count >> 8) & 0xFF);
         out_pos += 2;
         memcpy(dst + out_pos, off16_buf, off16_count * 2);
         out_pos += off16_count * 2;
 
-        // Off32 (empty for 64KB chunks)
         dst[out_pos] = 0; dst[out_pos + 1] = 0; dst[out_pos + 2] = 0;
         out_pos += 3;
 
-        // Length stream
         memcpy(dst + out_pos, len_buf, length_count);
         out_pos += length_count;
 

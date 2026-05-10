@@ -557,6 +557,18 @@ fn runCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
     try w.print("compressed {d} -> {d} bytes  ({d:.1}%)  L{d}  ({s} -> {s})\n", .{
         src.len, written, ratio, level, in_path, out_path,
     });
+
+    if (comptime blk: {
+        const bo = @import("build_options");
+        break :blk if (@hasDecl(bo, "gpu")) bo.gpu else false;
+    }) {
+        const gpu_enc = @import("encode/fast/gpu_encoder.zig");
+        if (gpu_enc.last_kernel_ns > 0) {
+            const kms: f64 = @as(f64, @floatFromInt(gpu_enc.last_kernel_ns)) / 1e6;
+            const kmbps: f64 = @as(f64, @floatFromInt(src.len)) / (1024.0 * 1024.0) * 1e9 / @as(f64, @floatFromInt(gpu_enc.last_kernel_ns));
+            try w.print("  GPU kernel: {d:.1}ms ({d:.0} MB/s)\n", .{ kms, kmbps });
+        }
+    }
 }
 
 // ─── Decompress ──────────────────────────────────────────────────────
