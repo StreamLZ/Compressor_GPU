@@ -329,6 +329,37 @@ fn decompressOneFrame(
             dispatched_parallel = true;
         }
 
+        // Vulkan fallback: try Vulkan compute when CUDA is unavailable
+        if (!dispatched_parallel and use_gpu) vk_frame: {
+            const vk = @import("fast/vk_driver.zig");
+            if (!vk.isAvailable()) break :vk_frame;
+            if (block_src.len < 2) break :vk_frame;
+            const peek_vk = block_header.parseBlockHeader(block_src) catch break :vk_frame;
+            const is_fast_vk = peek_vk.decoder_type == .fast or peek_vk.decoder_type == .turbo;
+            if (!is_fast_vk) break :vk_frame;
+            if (block_hdr.decompressed_size <= constants.chunk_size) break :vk_frame;
+
+            const eff_cs_vk = @min(frame.scGroupSizeToBytes(hdr.sc_group_size), constants.chunk_size);
+            const num_chunks_vk = (block_hdr.decompressed_size + eff_cs_vk - 1) / eff_cs_vk;
+            const prefix_sz_vk: usize = if (peek_vk.self_contained and num_chunks_vk > 1) (num_chunks_vk - 1) * 8 else 0;
+            const block_payload_vk = block_src[0 .. block_src.len - prefix_sz_vk];
+
+            vkBatchDecode(block_payload_vk, dst, dst_off, block_hdr.decompressed_size, hdr.sc_group_size, &scratch, io_opt) catch break :vk_frame;
+            dst_off += block_hdr.decompressed_size;
+
+            if (prefix_sz_vk != 0) {
+                const prefix_base_vk: [*]const u8 = block_src[block_src.len - prefix_sz_vk ..].ptr;
+                var pvi: usize = 0;
+                while (pvi + 1 < num_chunks_vk) : (pvi += 1) {
+                    const cdst_vk = dst_off - block_hdr.decompressed_size + (pvi + 1) * eff_cs_vk;
+                    var csz_vk: usize = 8;
+                    if ((pvi + 1) * eff_cs_vk + csz_vk > block_hdr.decompressed_size) csz_vk = block_hdr.decompressed_size - (pvi + 1) * eff_cs_vk;
+                    @memcpy(dst[cdst_vk..][0..csz_vk], prefix_base_vk[pvi * 8 ..][0..csz_vk]);
+                }
+            }
+            dispatched_parallel = true;
+        }
+
         if (!dispatched_parallel and allocator_opt != null and hdr.sc_group_size >= 1.0) {
             const allocator = allocator_opt.?;
             if (block_src.len >= 2) {
@@ -977,6 +1008,143 @@ fn gpuBatchDecode(
 
     const eff_sc_cap: u32 = @intCast(constants.sub_chunk_size);
     try gpu.fullGpuLaunch(
+        chunk_descs[0..chunk_idx],
+        block_src,
+        dst.ptr,
+        dst_start_off,
+        decompressed_size,
+        num_groups,
+        chunks_per_group,
+        eff_sc_cap,
+        io_opt,
+    );
+}
+
+// ────────────────────────────────────────────────────────────
+//  Vulkan batch decode (mirrors gpuBatchDecode for Vulkan path)
+// ────────────────────────────────────────────────────────────
+
+fn vkBatchDecode(
+    block_src: []const u8,
+    dst: []u8,
+    dst_start_off: usize,
+    decompressed_size: usize,
+    sc_group_size_in: f32,
+    scratch: []u8,
+    io_opt: ?std.Io,
+) DecompressError!void {
+    _ = scratch;
+    const vk = @import("fast/vk_driver.zig");
+    const alloc = std.heap.page_allocator;
+
+    const eff_chunk_sz = @min(frame.scGroupSizeToBytes(sc_group_size_in), constants.chunk_size);
+    const num_chunks = (decompressed_size + eff_chunk_sz - 1) / eff_chunk_sz;
+
+    const block_is_sc = blk: {
+        if (block_src.len < 2) break :blk false;
+        const peek = block_header.parseBlockHeader(block_src) catch break :blk false;
+        break :blk peek.self_contained;
+    };
+    const sc_grp_chunks: usize = if (sc_group_size_in >= 1.0) @max(1, @as(usize, @intFromFloat(sc_group_size_in))) else 1;
+    const effective_group_size = if (block_is_sc and sc_grp_chunks < num_chunks) sc_grp_chunks else num_chunks;
+    const num_groups: u32 = @intCast((num_chunks + effective_group_size - 1) / effective_group_size);
+    const chunks_per_group: u32 = @intCast(effective_group_size);
+
+    var chunk_descs = alloc.alloc(vk.ChunkDesc, num_chunks) catch return error.OutOfMemory;
+    defer alloc.free(chunk_descs);
+    @memset(std.mem.sliceAsBytes(chunk_descs), 0);
+
+    var src_pos: usize = 0;
+    var dst_remaining: usize = decompressed_size;
+    var internal_hdr: ?block_header.BlockHeader = null;
+    var chunk_idx: usize = 0;
+    var dst_off: usize = dst_start_off;
+
+    while (dst_remaining > 0) {
+        const eff_chunk_size_vk = @min(frame.scGroupSizeToBytes(sc_group_size_in), constants.chunk_size);
+        const at_chunk_boundary = ((dst_off - dst_start_off) % eff_chunk_size_vk) == 0;
+        if (at_chunk_boundary or internal_hdr == null) {
+            if (src_pos + 2 > block_src.len) return error.Truncated;
+            internal_hdr = block_header.parseBlockHeader(block_src[src_pos..]) catch return error.InvalidInternalHeader;
+            src_pos += 2;
+        }
+        const hdr = internal_hdr.?;
+        const sc_group_bytes_vk: usize = frame.scGroupSizeToBytes(sc_group_size_in);
+        var dst_this_chunk: usize = @min(sc_group_bytes_vk, constants.chunk_size);
+        if (dst_this_chunk > dst_remaining) dst_this_chunk = dst_remaining;
+
+        if (hdr.uncompressed) {
+            chunk_descs[chunk_idx] = .{
+                .src_offset = @intCast(src_pos),
+                .comp_size = @intCast(dst_this_chunk),
+                .decomp_size = @intCast(dst_this_chunk),
+                .dst_offset = @intCast(dst_off),
+                .flags = 1,
+                .memset_fill = 0,
+            };
+            dst_off += dst_this_chunk;
+            dst_remaining -= dst_this_chunk;
+            src_pos += dst_this_chunk;
+            chunk_idx += 1;
+            continue;
+        }
+
+        const ch = block_header.parseChunkHeader(block_src[src_pos..], hdr.use_checksums) catch return error.BadChunkHeader;
+        src_pos += ch.bytes_consumed;
+        const comp_size = ch.compressed_size;
+
+        if (ch.is_memset) {
+            chunk_descs[chunk_idx] = .{
+                .src_offset = 0,
+                .comp_size = 0,
+                .decomp_size = @intCast(dst_this_chunk),
+                .dst_offset = @intCast(dst_off),
+                .flags = 2,
+                .memset_fill = ch.memset_fill,
+            };
+            dst_off += dst_this_chunk;
+            dst_remaining -= dst_this_chunk;
+            chunk_idx += 1;
+            continue;
+        }
+
+        if (src_pos + comp_size > block_src.len) return error.Truncated;
+
+        if (comp_size == dst_this_chunk) {
+            chunk_descs[chunk_idx] = .{
+                .src_offset = @intCast(src_pos),
+                .comp_size = @intCast(comp_size),
+                .decomp_size = @intCast(dst_this_chunk),
+                .dst_offset = @intCast(dst_off),
+                .flags = 1,
+                .memset_fill = 0,
+            };
+            dst_off += dst_this_chunk;
+            dst_remaining -= dst_this_chunk;
+            src_pos += comp_size;
+            chunk_idx += 1;
+            continue;
+        }
+
+        if (hdr.decoder_type != .fast and hdr.decoder_type != .turbo) return error.InvalidInternalHeader;
+
+        chunk_descs[chunk_idx] = .{
+            .src_offset = @intCast(src_pos),
+            .comp_size = @intCast(comp_size),
+            .decomp_size = @intCast(dst_this_chunk),
+            .dst_offset = @intCast(dst_off),
+            .flags = 0,
+            .memset_fill = 0,
+        };
+
+        dst_off += dst_this_chunk;
+        dst_remaining -= dst_this_chunk;
+        src_pos += comp_size;
+        chunk_idx += 1;
+    }
+
+    const eff_sc_cap: u32 = @intCast(constants.sub_chunk_size);
+    try vk.fullVkLaunch(
         chunk_descs[0..chunk_idx],
         block_src,
         dst.ptr,

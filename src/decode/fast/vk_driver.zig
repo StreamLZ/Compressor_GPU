@@ -4,137 +4,326 @@
 //! Fallback path when CUDA is unavailable (AMD, Intel, etc).
 
 const std = @import("std");
+const fast_dec = @import("fast_lz_decoder.zig");
+
 const win32 = struct {
     extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.c) ?*anyopaque;
     extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.c) ?*anyopaque;
 };
 
-// ── Vulkan type aliases ─────────────────────────────────────────
+// ── Vulkan handle/constant types ────────────────────────────────
 const VkResult = i32;
 const VK_SUCCESS: VkResult = 0;
-const VkBool32 = u32;
-const VK_TRUE: VkBool32 = 1;
-const VK_FALSE: VkBool32 = 0;
-
-const VkInstance = ?*anyopaque;
-const VkPhysicalDevice = ?*anyopaque;
-const VkDevice = ?*anyopaque;
-const VkQueue = ?*anyopaque;
-const VkCommandPool = ?*anyopaque;
-const VkCommandBuffer = ?*anyopaque;
-const VkFence = ?*anyopaque;
-const VkBuffer = ?*anyopaque;
-const VkDeviceMemory = ?*anyopaque;
-const VkShaderModule = ?*anyopaque;
-const VkPipeline = ?*anyopaque;
-const VkPipelineLayout = ?*anyopaque;
-const VkDescriptorSetLayout = ?*anyopaque;
-const VkDescriptorPool = ?*anyopaque;
-const VkDescriptorSet = ?*anyopaque;
+const Handle = ?*anyopaque;
 const VkDeviceSize = u64;
 
-// ── Vulkan struct IDs (sType) ───────────────────────────────────
-const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: u32 = 1;
-const VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO: u32 = 3;
-const VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO: u32 = 2;
-const VK_STRUCTURE_TYPE_SUBMIT_INFO: u32 = 4;
-const VK_STRUCTURE_TYPE_FENCE_CREATE_INFO: u32 = 8;
-const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: u32 = 12;
-const VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: u32 = 5;
-const VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO: u32 = 16;
-const VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO: u32 = 30;
-const VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO: u32 = 29;
-const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO: u32 = 32;
-const VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO: u32 = 33;
-const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO: u32 = 34;
-const VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET: u32 = 35;
-const VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO: u32 = 39;
-const VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO: u32 = 40;
-const VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: u32 = 42;
-const VK_STRUCTURE_TYPE_APPLICATION_INFO: u32 = 0;
+const VK_BUFFER_USAGE_STORAGE: u32 = 0x20;
+const VK_BUFFER_USAGE_TRANSFER_DST: u32 = 0x2;
+const VK_BUFFER_USAGE_TRANSFER_SRC: u32 = 0x1;
+const VK_MEM_HOST_VISIBLE: u32 = 0x2;
+const VK_MEM_HOST_COHERENT: u32 = 0x4;
+const VK_DESC_STORAGE_BUFFER: u32 = 7;
+const VK_SHADER_COMPUTE: u32 = 0x20;
+const VK_BIND_COMPUTE: u32 = 1;
+const VK_QUEUE_COMPUTE: u32 = 0x2;
 
-const VK_BUFFER_USAGE_STORAGE_BUFFER_BIT: u32 = 0x20;
-const VK_BUFFER_USAGE_TRANSFER_SRC_BIT: u32 = 0x1;
-const VK_BUFFER_USAGE_TRANSFER_DST_BIT: u32 = 0x2;
-const VK_SHARING_MODE_EXCLUSIVE: u32 = 0;
-const VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT: u32 = 0x2;
-const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: u32 = 0x4;
-const VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: u32 = 7;
-const VK_SHADER_STAGE_COMPUTE_BIT: u32 = 0x20;
-const VK_PIPELINE_BIND_POINT_COMPUTE: u32 = 1;
-const VK_COMMAND_BUFFER_LEVEL_PRIMARY: u32 = 0;
-const VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT: u32 = 0x2;
-const VK_QUEUE_COMPUTE_BIT: u32 = 0x2;
-const VK_API_VERSION_1_3: u32 = (1 << 22) | (3 << 12);
+// sType values
+const STYPE_INSTANCE_CI: u32 = 1;
+const STYPE_DEVICE_QUEUE_CI: u32 = 2;
+const STYPE_DEVICE_CI: u32 = 3;
+const STYPE_SUBMIT_INFO: u32 = 4;
+const STYPE_MEM_ALLOC: u32 = 5;
+const STYPE_FENCE_CI: u32 = 8;
+const STYPE_BUFFER_CI: u32 = 12;
+const STYPE_SHADER_MODULE_CI: u32 = 16;
+const STYPE_PIPELINE_STAGE_CI: u32 = 18;
+const STYPE_COMPUTE_PIPE_CI: u32 = 29;
+const STYPE_PIPE_LAYOUT_CI: u32 = 30;
+const STYPE_DSL_CI: u32 = 32;
+const STYPE_DESC_POOL_CI: u32 = 33;
+const STYPE_DESC_SET_AI: u32 = 34;
+const STYPE_WRITE_DESC_SET: u32 = 35;
+const STYPE_CMD_POOL_CI: u32 = 39;
+const STYPE_CMD_BUF_AI: u32 = 40;
+const STYPE_CMD_BUF_BEGIN: u32 = 42;
+
+// ── Vulkan C-ABI structs (64-bit Windows) ───────────────────────
+
+const VkInstanceCreateInfo = extern struct {
+    sType: u32 = STYPE_INSTANCE_CI,
+    pNext: ?*anyopaque = null,
+    flags: u32 = 0,
+    pApplicationInfo: ?*anyopaque = null,
+    enabledLayerCount: u32 = 0,
+    ppEnabledLayerNames: ?*anyopaque = null,
+    enabledExtensionCount: u32 = 0,
+    ppEnabledExtensionNames: ?*anyopaque = null,
+};
+
+const VkDeviceQueueCreateInfo = extern struct {
+    sType: u32 = STYPE_DEVICE_QUEUE_CI,
+    pNext: ?*anyopaque = null,
+    flags: u32 = 0,
+    queueFamilyIndex: u32 = 0,
+    queueCount: u32 = 1,
+    pQueuePriorities: ?*const f32 = null,
+};
+
+const VkDeviceCreateInfo = extern struct {
+    sType: u32 = STYPE_DEVICE_CI,
+    pNext: ?*anyopaque = null,
+    flags: u32 = 0,
+    queueCreateInfoCount: u32 = 0,
+    pQueueCreateInfos: ?*const VkDeviceQueueCreateInfo = null,
+    enabledLayerCount: u32 = 0,
+    ppEnabledLayerNames: ?*anyopaque = null,
+    enabledExtensionCount: u32 = 0,
+    ppEnabledExtensionNames: ?*anyopaque = null,
+    pEnabledFeatures: ?*anyopaque = null,
+};
+
+const VkBufferCreateInfo = extern struct {
+    sType: u32 = STYPE_BUFFER_CI,
+    pNext: ?*anyopaque = null,
+    flags: u32 = 0,
+    size: VkDeviceSize = 0,
+    usage: u32 = 0,
+    sharingMode: u32 = 0,
+    queueFamilyIndexCount: u32 = 0,
+    pQueueFamilyIndices: ?*anyopaque = null,
+};
+
+const VkMemoryRequirements = extern struct {
+    size: VkDeviceSize,
+    alignment: VkDeviceSize,
+    memoryTypeBits: u32,
+};
+
+const VkMemoryAllocateInfo = extern struct {
+    sType: u32 = STYPE_MEM_ALLOC,
+    pNext: ?*anyopaque = null,
+    allocationSize: VkDeviceSize = 0,
+    memoryTypeIndex: u32 = 0,
+};
+
+const VkPhysicalDeviceMemoryProperties = extern struct {
+    memoryTypeCount: u32,
+    memoryTypes: [32]extern struct { propertyFlags: u32, heapIndex: u32 },
+    memoryHeapCount: u32,
+    memoryHeaps: [16]extern struct { size: VkDeviceSize, flags: u32, _pad: u32 = 0 },
+};
+
+const VkDescriptorSetLayoutBinding = extern struct {
+    binding: u32 = 0,
+    descriptorType: u32 = 0,
+    descriptorCount: u32 = 1,
+    stageFlags: u32 = 0,
+    pImmutableSamplers: ?*anyopaque = null,
+};
+
+const VkDescriptorSetLayoutCreateInfo = extern struct {
+    sType: u32 = STYPE_DSL_CI,
+    pNext: ?*anyopaque = null,
+    flags: u32 = 0,
+    bindingCount: u32 = 0,
+    pBindings: ?[*]const VkDescriptorSetLayoutBinding = null,
+};
+
+const VkPushConstantRange = extern struct {
+    stageFlags: u32 = 0,
+    offset: u32 = 0,
+    size: u32 = 0,
+};
+
+const VkPipelineLayoutCreateInfo = extern struct {
+    sType: u32 = STYPE_PIPE_LAYOUT_CI,
+    pNext: ?*anyopaque = null,
+    flags: u32 = 0,
+    setLayoutCount: u32 = 0,
+    pSetLayouts: ?*const Handle = null,
+    pushConstantRangeCount: u32 = 0,
+    pPushConstantRanges: ?*const VkPushConstantRange = null,
+};
+
+const VkShaderModuleCreateInfo = extern struct {
+    sType: u32 = STYPE_SHADER_MODULE_CI,
+    pNext: ?*anyopaque = null,
+    flags: u32 = 0,
+    codeSize: usize = 0,
+    pCode: ?[*]const u32 = null,
+};
+
+const VkPipelineShaderStageCreateInfo = extern struct {
+    sType: u32 = STYPE_PIPELINE_STAGE_CI,
+    pNext: ?*anyopaque = null,
+    flags: u32 = 0,
+    stage: u32 = 0,
+    module: Handle = null,
+    pName: ?[*:0]const u8 = null,
+    pSpecializationInfo: ?*anyopaque = null,
+};
+
+const VkComputePipelineCreateInfo = extern struct {
+    sType: u32 = STYPE_COMPUTE_PIPE_CI,
+    pNext: ?*anyopaque = null,
+    flags: u32 = 0,
+    stage: VkPipelineShaderStageCreateInfo = .{},
+    layout: Handle = null,
+    basePipelineHandle: Handle = null,
+    basePipelineIndex: i32 = -1,
+};
+
+const VkDescriptorPoolSize = extern struct {
+    type_: u32 = 0,
+    descriptorCount: u32 = 0,
+};
+
+const VkDescriptorPoolCreateInfo = extern struct {
+    sType: u32 = STYPE_DESC_POOL_CI,
+    pNext: ?*anyopaque = null,
+    flags: u32 = 0,
+    maxSets: u32 = 0,
+    poolSizeCount: u32 = 0,
+    pPoolSizes: ?*const VkDescriptorPoolSize = null,
+};
+
+const VkDescriptorSetAllocateInfo = extern struct {
+    sType: u32 = STYPE_DESC_SET_AI,
+    pNext: ?*anyopaque = null,
+    descriptorPool: Handle = null,
+    descriptorSetCount: u32 = 0,
+    pSetLayouts: ?*const Handle = null,
+};
+
+const VkDescriptorBufferInfo = extern struct {
+    buffer: Handle = null,
+    offset: VkDeviceSize = 0,
+    range: VkDeviceSize = 0,
+};
+
+const VkWriteDescriptorSet = extern struct {
+    sType: u32 = STYPE_WRITE_DESC_SET,
+    pNext: ?*anyopaque = null,
+    dstSet: Handle = null,
+    dstBinding: u32 = 0,
+    dstArrayElement: u32 = 0,
+    descriptorCount: u32 = 1,
+    descriptorType: u32 = 0,
+    pImageInfo: ?*anyopaque = null,
+    pBufferInfo: ?*const VkDescriptorBufferInfo = null,
+    pTexelBufferView: ?*anyopaque = null,
+};
+
+const VkCommandPoolCreateInfo = extern struct {
+    sType: u32 = STYPE_CMD_POOL_CI,
+    pNext: ?*anyopaque = null,
+    flags: u32 = 0,
+    queueFamilyIndex: u32 = 0,
+};
+
+const VkCommandBufferAllocateInfo = extern struct {
+    sType: u32 = STYPE_CMD_BUF_AI,
+    pNext: ?*anyopaque = null,
+    commandPool: Handle = null,
+    level: u32 = 0,
+    commandBufferCount: u32 = 1,
+};
+
+const VkCommandBufferBeginInfo = extern struct {
+    sType: u32 = STYPE_CMD_BUF_BEGIN,
+    pNext: ?*anyopaque = null,
+    flags: u32 = 0,
+    pInheritanceInfo: ?*anyopaque = null,
+};
+
+const VkSubmitInfo = extern struct {
+    sType: u32 = STYPE_SUBMIT_INFO,
+    pNext: ?*anyopaque = null,
+    waitSemaphoreCount: u32 = 0,
+    pWaitSemaphores: ?*anyopaque = null,
+    pWaitDstStageMask: ?*anyopaque = null,
+    commandBufferCount: u32 = 0,
+    pCommandBuffers: ?*const Handle = null,
+    signalSemaphoreCount: u32 = 0,
+    pSignalSemaphores: ?*anyopaque = null,
+};
+
+const VkFenceCreateInfo = extern struct {
+    sType: u32 = STYPE_FENCE_CI,
+    pNext: ?*anyopaque = null,
+    flags: u32 = 0,
+};
+
+const VkQueueFamilyProperties = extern struct {
+    queueFlags: u32,
+    queueCount: u32,
+    timestampValidBits: u32,
+    minImageTransferGranularity: extern struct { width: u32, height: u32, depth: u32 },
+};
+
+// ── Function pointer types ──────────────────────────────────────
+const FnGetProcAddr = *const fn (Handle, [*:0]const u8) callconv(.c) ?*anyopaque;
+const FnVoidResult = *const fn (Handle, *const anyopaque, ?*const anyopaque, *Handle) callconv(.c) VkResult;
 
 // ── Module state ────────────────────────────────────────────────
 var lib: ?*anyopaque = null;
 var initialized = false;
-var vk_available = false;
+var vk_ok = false;
+var gpa: ?FnGetProcAddr = null;
 
-var instance: VkInstance = null;
-var phys_device: VkPhysicalDevice = null;
-var device: VkDevice = null;
-var queue: VkQueue = null;
-var compute_family: u32 = 0;
-var cmd_pool: VkCommandPool = null;
-var cmd_buf: VkCommandBuffer = null;
-var fence: VkFence = null;
-var pipeline: VkPipeline = null;
-var pipe_layout: VkPipelineLayout = null;
-var desc_set_layout: VkDescriptorSetLayout = null;
-var desc_pool: VkDescriptorPool = null;
+var vk_instance: Handle = null;
+var vk_phys: Handle = null;
+var vk_dev: Handle = null;
+var vk_queue: Handle = null;
+var comp_family: u32 = 0;
+var vk_cmd_pool: Handle = null;
+var vk_cmd_buf: Handle = null;
+var vk_fence: Handle = null;
+var vk_pipeline: Handle = null;
+var vk_pipe_layout: Handle = null;
+var vk_dsl: Handle = null;
+var vk_desc_pool: Handle = null;
+var vk_desc_set: Handle = null;
+var mem_props: VkPhysicalDeviceMemoryProperties = undefined;
 
-// Persistent buffers
-var buf_compressed: VkBuffer = null;
-var mem_compressed: VkDeviceMemory = null;
-var buf_compressed_size: usize = 0;
-var buf_output: VkBuffer = null;
-var mem_output: VkDeviceMemory = null;
-var buf_output_size: usize = 0;
-var buf_descs: VkBuffer = null;
-var mem_descs: VkDeviceMemory = null;
-var buf_descs_size: usize = 0;
+// Persistent buffers (grow as needed)
+var b_comp: Handle = null;
+var m_comp: Handle = null;
+var b_comp_sz: usize = 0;
+var b_out: Handle = null;
+var m_out: Handle = null;
+var b_out_sz: usize = 0;
+var b_desc: Handle = null;
+var m_desc: Handle = null;
+var b_desc_sz: usize = 0;
 
 pub var last_kernel_ns: i64 = 0;
 
-// ── Function pointer types ──────────────────────────────────────
-// We load a minimal set: instance/device creation, memory, commands, compute.
-const FnGetInstanceProcAddr = *const fn (VkInstance, [*:0]const u8) callconv(.c) ?*anyopaque;
-var vkGetInstanceProcAddr_fn: ?FnGetInstanceProcAddr = null;
-
-fn getInstanceProc(comptime T: type, name: [*:0]const u8) ?T {
-    const f = vkGetInstanceProcAddr_fn orelse return null;
-    const raw = f(instance, name) orelse return null;
-    return @ptrCast(raw);
-}
-
-fn getDeviceProc(comptime T: type, name: [*:0]const u8) ?T {
-    const f = vkGetInstanceProcAddr_fn orelse return null;
-    const raw = f(instance, name) orelse return null;
+fn vkProc(comptime T: type, name: [*:0]const u8) ?T {
+    const f = gpa orelse return null;
+    const raw = f(vk_instance, name) orelse return null;
     return @ptrCast(raw);
 }
 
 // ── Initialization ──────────────────────────────────────────────
 
 pub fn init() bool {
-    if (initialized) return vk_available;
+    if (initialized) return vk_ok;
     initialized = true;
 
     lib = win32.LoadLibraryA("vulkan-1.dll");
     if (lib == null) return false;
-
     const raw = win32.GetProcAddress(lib.?, "vkGetInstanceProcAddr") orelse return false;
-    vkGetInstanceProcAddr_fn = @ptrCast(raw);
+    gpa = @ptrCast(raw);
 
-    // Create instance
-    if (!createInstance()) return false;
-    if (!pickPhysicalDevice()) return false;
-    if (!createDevice()) return false;
-    if (!createPipeline()) return false;
-    if (!createCommandResources()) return false;
+    if (!initInstance()) return false;
+    if (!pickDevice()) return false;
+    if (!initDevice()) return false;
+    if (!initPipeline()) return false;
+    if (!initDescPool()) return false;
+    if (!initCmdResources()) return false;
 
-    vk_available = true;
+    vk_ok = true;
     return true;
 }
 
@@ -142,55 +331,35 @@ pub fn isAvailable() bool {
     return init();
 }
 
-fn createInstance() bool {
-    const FnCreateInstance = *const fn (*const anyopaque, ?*const anyopaque, *VkInstance) callconv(.c) VkResult;
-    const create = getInstanceProc(FnCreateInstance, "vkCreateInstance") orelse return false;
-
-    // Minimal instance — no layers, no extensions needed for compute-only
-    const app_info = [_]u8{0} ** 64; // zeroed VkApplicationInfo
-    _ = app_info;
-
-    var ci = std.mem.zeroes([128]u8);
-    const ci_ptr: *align(1) u32 = @ptrCast(&ci[0]);
-    ci_ptr.* = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    // apiVersion at offset 56 in VkApplicationInfo — skip, default is fine
-
-    var temp_instance: VkInstance = null;
-    if (create(@ptrCast(&ci), null, &temp_instance) != VK_SUCCESS) return false;
-    instance = temp_instance;
-    return true;
+fn initInstance() bool {
+    const f = vkProc(*const fn (*const VkInstanceCreateInfo, ?*anyopaque, *Handle) callconv(.c) VkResult, "vkCreateInstance") orelse return false;
+    var ci = VkInstanceCreateInfo{};
+    return f(&ci, null, &vk_instance) == VK_SUCCESS;
 }
 
-fn pickPhysicalDevice() bool {
-    const FnEnumPhysDevices = *const fn (VkInstance, *u32, ?[*]VkPhysicalDevice) callconv(.c) VkResult;
-    const enumerate = getInstanceProc(FnEnumPhysDevices, "vkEnumeratePhysicalDevices") orelse return false;
+fn pickDevice() bool {
+    const enumDev = vkProc(*const fn (Handle, *u32, ?[*]Handle) callconv(.c) VkResult, "vkEnumeratePhysicalDevices") orelse return false;
+    const getQF = vkProc(*const fn (Handle, *u32, ?[*]VkQueueFamilyProperties) callconv(.c) void, "vkGetPhysicalDeviceQueueFamilyProperties") orelse return false;
+    const getMemProps = vkProc(*const fn (Handle, *VkPhysicalDeviceMemoryProperties) callconv(.c) void, "vkGetPhysicalDeviceMemoryProperties") orelse return false;
 
     var count: u32 = 0;
-    if (enumerate(instance, &count, null) != VK_SUCCESS or count == 0) return false;
+    if (enumDev(vk_instance, &count, null) != VK_SUCCESS or count == 0) return false;
+    var devs: [16]Handle = .{null} ** 16;
+    var n: u32 = @min(count, 16);
+    if (enumDev(vk_instance, &n, &devs) != VK_SUCCESS) return false;
 
-    var devices: [16]VkPhysicalDevice = .{null} ** 16;
-    var fetch_count = @min(count, 16);
-    if (enumerate(instance, &fetch_count, &devices) != VK_SUCCESS) return false;
-
-    // Find first device with a compute queue
-    const FnGetQueueFamilyProps = *const fn (VkPhysicalDevice, *u32, ?[*]u8) callconv(.c) void;
-    const getProps = getInstanceProc(FnGetQueueFamilyProps, "vkGetPhysicalDeviceQueueFamilyProperties") orelse return false;
-
-    for (devices[0..fetch_count]) |pd| {
+    for (devs[0..n]) |pd| {
         var qf_count: u32 = 0;
-        getProps(pd, &qf_count, null);
+        getQF(pd, &qf_count, null);
         if (qf_count == 0) continue;
-
-        // Each VkQueueFamilyProperties is 24 bytes, queueFlags at offset 0
-        var qf_buf: [16 * 24]u8 = undefined;
-        var qf_fetch = @min(qf_count, 16);
-        getProps(pd, &qf_fetch, &qf_buf);
-
-        for (0..qf_fetch) |qi| {
-            const flags: u32 = @as(*align(1) const u32, @ptrCast(&qf_buf[qi * 24])).*;
-            if ((flags & VK_QUEUE_COMPUTE_BIT) != 0) {
-                phys_device = pd;
-                compute_family = @intCast(qi);
+        var qf: [16]VkQueueFamilyProperties = undefined;
+        var qf_n: u32 = @min(qf_count, 16);
+        getQF(pd, &qf_n, &qf);
+        for (0..qf_n) |qi| {
+            if ((qf[qi].queueFlags & VK_QUEUE_COMPUTE) != 0) {
+                vk_phys = pd;
+                comp_family = @intCast(qi);
+                getMemProps(pd, &mem_props);
                 return true;
             }
         }
@@ -198,188 +367,149 @@ fn pickPhysicalDevice() bool {
     return false;
 }
 
-fn createDevice() bool {
-    const FnCreateDevice = *const fn (VkPhysicalDevice, *const anyopaque, ?*const anyopaque, *VkDevice) callconv(.c) VkResult;
-    const create = getInstanceProc(FnCreateDevice, "vkCreateDevice") orelse return false;
-    const FnGetQueue = *const fn (VkDevice, u32, u32, *VkQueue) callconv(.c) void;
+fn initDevice() bool {
+    const createDev = vkProc(*const fn (Handle, *const VkDeviceCreateInfo, ?*anyopaque, *Handle) callconv(.c) VkResult, "vkCreateDevice") orelse return false;
+    const getQueue = vkProc(*const fn (Handle, u32, u32, *Handle) callconv(.c) void, "vkGetDeviceQueue") orelse return false;
 
-    var priority: f32 = 1.0;
-    var queue_ci = std.mem.zeroes([40]u8);
-    var q_stype: *align(1) u32 = @ptrCast(&queue_ci[0]);
-    q_stype.* = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    var q_family: *align(1) u32 = @ptrCast(&queue_ci[16]);
-    q_family.* = compute_family;
-    var q_count: *align(1) u32 = @ptrCast(&queue_ci[20]);
-    q_count.* = 1;
-    var q_prio: *align(1) usize = @ptrCast(&queue_ci[24]);
-    q_prio.* = @intFromPtr(&priority);
+    var prio: f32 = 1.0;
+    var qci = VkDeviceQueueCreateInfo{ .queueFamilyIndex = comp_family, .pQueuePriorities = &prio };
+    var dci = VkDeviceCreateInfo{ .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci };
 
-    var dev_ci = std.mem.zeroes([72]u8);
-    var d_stype: *align(1) u32 = @ptrCast(&dev_ci[0]);
-    d_stype.* = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    var d_qci_count: *align(1) u32 = @ptrCast(&dev_ci[16]);
-    d_qci_count.* = 1;
-    var d_qci_ptr: *align(1) usize = @ptrCast(&dev_ci[24]);
-    d_qci_ptr.* = @intFromPtr(&queue_ci);
-
-    var temp_device: VkDevice = null;
-    if (create(phys_device, @ptrCast(&dev_ci), null, &temp_device) != VK_SUCCESS) return false;
-    device = temp_device;
-
-    const getQueue = getDeviceProc(FnGetQueue, "vkGetDeviceQueue") orelse return false;
-    getQueue(device, compute_family, 0, &queue);
-    return queue != null;
+    if (createDev(vk_phys, &dci, null, &vk_dev) != VK_SUCCESS) return false;
+    getQueue(vk_dev, comp_family, 0, &vk_queue);
+    return vk_queue != null;
 }
 
-fn createPipeline() bool {
-    // Create shader module from embedded SPIR-V
+fn initPipeline() bool {
+    const createSM = vkProc(*const fn (Handle, *const VkShaderModuleCreateInfo, ?*anyopaque, *Handle) callconv(.c) VkResult, "vkCreateShaderModule") orelse return false;
+    const createDSL = vkProc(*const fn (Handle, *const VkDescriptorSetLayoutCreateInfo, ?*anyopaque, *Handle) callconv(.c) VkResult, "vkCreateDescriptorSetLayout") orelse return false;
+    const createPL = vkProc(*const fn (Handle, *const VkPipelineLayoutCreateInfo, ?*anyopaque, *Handle) callconv(.c) VkResult, "vkCreatePipelineLayout") orelse return false;
+    const createCP = vkProc(*const fn (Handle, Handle, u32, [*]const VkComputePipelineCreateInfo, ?*anyopaque, [*]Handle) callconv(.c) VkResult, "vkCreateComputePipelines") orelse return false;
+
     const spv align(@alignOf(u32)) = @embedFile("gpu_decode_kernel.spv");
-    const FnCreateShaderModule = *const fn (VkDevice, *const anyopaque, ?*const anyopaque, *VkShaderModule) callconv(.c) VkResult;
-    const createSM = getDeviceProc(FnCreateShaderModule, "vkCreateShaderModule") orelse return false;
+    var sm_ci = VkShaderModuleCreateInfo{ .codeSize = spv.len, .pCode = @ptrCast(@alignCast(spv.ptr)) };
+    var shader_mod: Handle = null;
+    if (createSM(vk_dev, &sm_ci, null, &shader_mod) != VK_SUCCESS) return false;
 
-    var sm_ci = std.mem.zeroes([40]u8);
-    var sm_stype: *align(1) u32 = @ptrCast(&sm_ci[0]);
-    sm_stype.* = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    var sm_size: *align(1) usize = @ptrCast(&sm_ci[16]);
-    sm_size.* = spv.len;
-    var sm_code: *align(1) usize = @ptrCast(&sm_ci[24]);
-    sm_code.* = @intFromPtr(spv.ptr);
+    var bindings = [_]VkDescriptorSetLayoutBinding{
+        .{ .binding = 0, .descriptorType = VK_DESC_STORAGE_BUFFER, .stageFlags = VK_SHADER_COMPUTE },
+        .{ .binding = 1, .descriptorType = VK_DESC_STORAGE_BUFFER, .stageFlags = VK_SHADER_COMPUTE },
+        .{ .binding = 2, .descriptorType = VK_DESC_STORAGE_BUFFER, .stageFlags = VK_SHADER_COMPUTE },
+    };
+    var dsl_ci = VkDescriptorSetLayoutCreateInfo{ .bindingCount = 3, .pBindings = &bindings };
+    if (createDSL(vk_dev, &dsl_ci, null, &vk_dsl) != VK_SUCCESS) return false;
 
-    var shader_mod: VkShaderModule = null;
-    if (createSM(device, @ptrCast(&sm_ci), null, &shader_mod) != VK_SUCCESS) return false;
+    var pc_range = VkPushConstantRange{ .stageFlags = VK_SHADER_COMPUTE, .size = 12 };
+    var pl_ci = VkPipelineLayoutCreateInfo{ .setLayoutCount = 1, .pSetLayouts = &vk_dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pc_range };
+    if (createPL(vk_dev, &pl_ci, null, &vk_pipe_layout) != VK_SUCCESS) return false;
 
-    // Descriptor set layout: 3 storage buffers
-    const FnCreateDSL = *const fn (VkDevice, *const anyopaque, ?*const anyopaque, *VkDescriptorSetLayout) callconv(.c) VkResult;
-    const createDSL = getDeviceProc(FnCreateDSL, "vkCreateDescriptorSetLayout") orelse return false;
+    var cp_ci = [1]VkComputePipelineCreateInfo{.{
+        .stage = .{ .stage = VK_SHADER_COMPUTE, .module = shader_mod, .pName = "main" },
+        .layout = vk_pipe_layout,
+    }};
+    var pipes: [1]Handle = .{null};
+    if (createCP(vk_dev, null, 1, &cp_ci, null, &pipes) != VK_SUCCESS) return false;
+    vk_pipeline = pipes[0];
+    return true;
+}
 
-    // VkDescriptorSetLayoutBinding is 24 bytes: binding(4), descriptorType(4), descriptorCount(4), stageFlags(4), pImmutableSamplers(8)
-    var bindings: [3 * 24]u8 = std.mem.zeroes([3 * 24]u8);
-    for (0..3) |bi| {
-        const off = bi * 24;
-        var b_binding: *align(1) u32 = @ptrCast(&bindings[off]);
-        b_binding.* = @intCast(bi);
-        var b_type: *align(1) u32 = @ptrCast(&bindings[off + 4]);
-        b_type.* = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        var b_count: *align(1) u32 = @ptrCast(&bindings[off + 8]);
-        b_count.* = 1;
-        var b_stage: *align(1) u32 = @ptrCast(&bindings[off + 12]);
-        b_stage.* = VK_SHADER_STAGE_COMPUTE_BIT;
+fn initDescPool() bool {
+    const createDP = vkProc(*const fn (Handle, *const VkDescriptorPoolCreateInfo, ?*anyopaque, *Handle) callconv(.c) VkResult, "vkCreateDescriptorPool") orelse return false;
+    const allocDS = vkProc(*const fn (Handle, *const VkDescriptorSetAllocateInfo, [*]Handle) callconv(.c) VkResult, "vkAllocateDescriptorSets") orelse return false;
+
+    var ps = VkDescriptorPoolSize{ .type_ = VK_DESC_STORAGE_BUFFER, .descriptorCount = 3 };
+    var dp_ci = VkDescriptorPoolCreateInfo{ .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps };
+    if (createDP(vk_dev, &dp_ci, null, &vk_desc_pool) != VK_SUCCESS) return false;
+
+    var ds_ai = VkDescriptorSetAllocateInfo{ .descriptorPool = vk_desc_pool, .descriptorSetCount = 1, .pSetLayouts = &vk_dsl };
+    var sets: [1]Handle = .{null};
+    if (allocDS(vk_dev, &ds_ai, &sets) != VK_SUCCESS) return false;
+    vk_desc_set = sets[0];
+    return true;
+}
+
+fn initCmdResources() bool {
+    const createPool = vkProc(*const fn (Handle, *const VkCommandPoolCreateInfo, ?*anyopaque, *Handle) callconv(.c) VkResult, "vkCreateCommandPool") orelse return false;
+    const allocCB = vkProc(*const fn (Handle, *const VkCommandBufferAllocateInfo, [*]Handle) callconv(.c) VkResult, "vkAllocateCommandBuffers") orelse return false;
+    const createFence = vkProc(*const fn (Handle, *const VkFenceCreateInfo, ?*anyopaque, *Handle) callconv(.c) VkResult, "vkCreateFence") orelse return false;
+
+    var pool_ci = VkCommandPoolCreateInfo{ .flags = 0x2, .queueFamilyIndex = comp_family };
+    if (createPool(vk_dev, &pool_ci, null, &vk_cmd_pool) != VK_SUCCESS) return false;
+
+    var cb_ai = VkCommandBufferAllocateInfo{ .commandPool = vk_cmd_pool };
+    var bufs: [1]Handle = .{null};
+    if (allocCB(vk_dev, &cb_ai, &bufs) != VK_SUCCESS) return false;
+    vk_cmd_buf = bufs[0];
+
+    var fence_ci = VkFenceCreateInfo{};
+    return createFence(vk_dev, &fence_ci, null, &vk_fence) == VK_SUCCESS;
+}
+
+// ── Buffer helpers ──────────────────────────────────────────────
+
+fn findMemType(type_bits: u32, props: u32) ?u32 {
+    for (0..mem_props.memoryTypeCount) |i| {
+        if ((type_bits & (@as(u32, 1) << @intCast(i))) != 0 and
+            (mem_props.memoryTypes[i].propertyFlags & props) == props)
+            return @intCast(i);
     }
+    return null;
+}
 
-    var dsl_ci = std.mem.zeroes([32]u8);
-    var dsl_stype: *align(1) u32 = @ptrCast(&dsl_ci[0]);
-    dsl_stype.* = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    var dsl_count: *align(1) u32 = @ptrCast(&dsl_ci[16]);
-    dsl_count.* = 3;
-    var dsl_bindings: *align(1) usize = @ptrCast(&dsl_ci[24]);
-    dsl_bindings.* = @intFromPtr(&bindings);
+fn ensureBuf(buf: *Handle, mem: *Handle, cur_sz: *usize, needed: usize) bool {
+    if (cur_sz.* >= needed) return true;
 
-    if (createDSL(device, @ptrCast(&dsl_ci), null, &desc_set_layout) != VK_SUCCESS) return false;
+    const destroyBuf = vkProc(*const fn (Handle, Handle, ?*anyopaque) callconv(.c) void, "vkDestroyBuffer") orelse return false;
+    const freeMem = vkProc(*const fn (Handle, Handle, ?*anyopaque) callconv(.c) void, "vkFreeMemory") orelse return false;
+    const createBuf = vkProc(*const fn (Handle, *const VkBufferCreateInfo, ?*anyopaque, *Handle) callconv(.c) VkResult, "vkCreateBuffer") orelse return false;
+    const getReqs = vkProc(*const fn (Handle, Handle, *VkMemoryRequirements) callconv(.c) void, "vkGetBufferMemoryRequirements") orelse return false;
+    const allocMem = vkProc(*const fn (Handle, *const VkMemoryAllocateInfo, ?*anyopaque, *Handle) callconv(.c) VkResult, "vkAllocateMemory") orelse return false;
+    const bindMem = vkProc(*const fn (Handle, Handle, Handle, VkDeviceSize) callconv(.c) VkResult, "vkBindBufferMemory") orelse return false;
 
-    // Pipeline layout with push constants (3 × u32 = 12 bytes)
-    const FnCreatePL = *const fn (VkDevice, *const anyopaque, ?*const anyopaque, *VkPipelineLayout) callconv(.c) VkResult;
-    const createPL = getDeviceProc(FnCreatePL, "vkCreatePipelineLayout") orelse return false;
+    if (buf.* != null) destroyBuf(vk_dev, buf.*, null);
+    if (mem.* != null) freeMem(vk_dev, mem.*, null);
+    cur_sz.* = 0;
 
-    // VkPushConstantRange: stageFlags(4), offset(4), size(4)
-    var pc_range: [12]u8 = std.mem.zeroes([12]u8);
-    var pc_stage: *align(1) u32 = @ptrCast(&pc_range[0]);
-    pc_stage.* = VK_SHADER_STAGE_COMPUTE_BIT;
-    var pc_size: *align(1) u32 = @ptrCast(&pc_range[8]);
-    pc_size.* = 12; // 3 × u32
+    var bci = VkBufferCreateInfo{ .size = needed, .usage = VK_BUFFER_USAGE_STORAGE | VK_BUFFER_USAGE_TRANSFER_DST | VK_BUFFER_USAGE_TRANSFER_SRC };
+    if (createBuf(vk_dev, &bci, null, buf) != VK_SUCCESS) return false;
 
-    var pl_ci = std.mem.zeroes([48]u8);
-    var pl_stype: *align(1) u32 = @ptrCast(&pl_ci[0]);
-    pl_stype.* = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    var pl_dsl_count: *align(1) u32 = @ptrCast(&pl_ci[16]);
-    pl_dsl_count.* = 1;
-    var pl_dsl_ptr: *align(1) usize = @ptrCast(&pl_ci[24]);
-    pl_dsl_ptr.* = @intFromPtr(&desc_set_layout);
-    var pl_pc_count: *align(1) u32 = @ptrCast(&pl_ci[32]);
-    pl_pc_count.* = 1;
-    var pl_pc_ptr: *align(1) usize = @ptrCast(&pl_ci[40]);
-    pl_pc_ptr.* = @intFromPtr(&pc_range);
+    var reqs: VkMemoryRequirements = undefined;
+    getReqs(vk_dev, buf.*, &reqs);
 
-    if (createPL(device, @ptrCast(&pl_ci), null, &pipe_layout) != VK_SUCCESS) return false;
+    const mt = findMemType(reqs.memoryTypeBits, VK_MEM_HOST_VISIBLE | VK_MEM_HOST_COHERENT) orelse return false;
+    var mai = VkMemoryAllocateInfo{ .allocationSize = reqs.size, .memoryTypeIndex = mt };
+    if (allocMem(vk_dev, &mai, null, mem) != VK_SUCCESS) return false;
+    if (bindMem(vk_dev, buf.*, mem.*, 0) != VK_SUCCESS) return false;
 
-    // Compute pipeline
-    const FnCreateCP = *const fn (VkDevice, ?*anyopaque, u32, *const anyopaque, ?*const anyopaque, *VkPipeline) callconv(.c) VkResult;
-    const createCP = getDeviceProc(FnCreateCP, "vkCreateComputePipelines") orelse return false;
-
-    // VkComputePipelineCreateInfo: sType(4), pNext(8), flags(4), stage(VkPipelineShaderStageCreateInfo=48), layout(8), basePipelineHandle(8), basePipelineIndex(4)
-    // Total ~96 bytes. stage starts at offset 16.
-    // VkPipelineShaderStageCreateInfo: sType(4), pNext(8), flags(4), stage(4), module(8), pName(8), pSpecializationInfo(8)
-    var cp_ci = std.mem.zeroes([96]u8);
-    var cp_stype: *align(1) u32 = @ptrCast(&cp_ci[0]);
-    cp_stype.* = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-
-    // Embedded stage create info at offset 16
-    var stage_stype: *align(1) u32 = @ptrCast(&cp_ci[16]);
-    stage_stype.* = 18; // VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
-    var stage_stage: *align(1) u32 = @ptrCast(&cp_ci[32]);
-    stage_stage.* = VK_SHADER_STAGE_COMPUTE_BIT;
-    var stage_module: *align(1) usize = @ptrCast(&cp_ci[40]);
-    stage_module.* = @intFromPtr(shader_mod);
-    const entry_name: [*:0]const u8 = "main";
-    var stage_name: *align(1) usize = @ptrCast(&cp_ci[48]);
-    stage_name.* = @intFromPtr(entry_name);
-
-    // layout at offset 64
-    var cp_layout: *align(1) usize = @ptrCast(&cp_ci[64]);
-    cp_layout.* = @intFromPtr(pipe_layout);
-
-    if (createCP(device, null, 1, @ptrCast(&cp_ci), null, &pipeline) != VK_SUCCESS) return false;
-
+    cur_sz.* = needed;
     return true;
 }
 
-fn createCommandResources() bool {
-    // Command pool
-    const FnCreateCmdPool = *const fn (VkDevice, *const anyopaque, ?*const anyopaque, *VkCommandPool) callconv(.c) VkResult;
-    const createPool = getDeviceProc(FnCreateCmdPool, "vkCreateCommandPool") orelse return false;
+fn uploadBuf(mem_h: Handle, data: [*]const u8, size: usize) bool {
+    const mapMem = vkProc(*const fn (Handle, Handle, VkDeviceSize, VkDeviceSize, u32, *?*anyopaque) callconv(.c) VkResult, "vkMapMemory") orelse return false;
+    const unmapMem = vkProc(*const fn (Handle, Handle) callconv(.c) void, "vkUnmapMemory") orelse return false;
 
-    var pool_ci = std.mem.zeroes([24]u8);
-    var pool_stype: *align(1) u32 = @ptrCast(&pool_ci[0]);
-    pool_stype.* = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    var pool_flags: *align(1) u32 = @ptrCast(&pool_ci[16]);
-    pool_flags.* = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    var pool_family: *align(1) u32 = @ptrCast(&pool_ci[20]);
-    pool_family.* = compute_family;
-
-    if (createPool(device, @ptrCast(&pool_ci), null, &cmd_pool) != VK_SUCCESS) return false;
-
-    // Allocate command buffer
-    const FnAllocCmdBuf = *const fn (VkDevice, *const anyopaque, *VkCommandBuffer) callconv(.c) VkResult;
-    const allocCB = getDeviceProc(FnAllocCmdBuf, "vkAllocateCommandBuffers") orelse return false;
-
-    var cb_ai = std.mem.zeroes([32]u8);
-    var cb_stype: *align(1) u32 = @ptrCast(&cb_ai[0]);
-    cb_stype.* = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    var cb_pool: *align(1) usize = @ptrCast(&cb_ai[16]);
-    cb_pool.* = @intFromPtr(cmd_pool);
-    var cb_level: *align(1) u32 = @ptrCast(&cb_ai[24]);
-    cb_level.* = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    var cb_count: *align(1) u32 = @ptrCast(&cb_ai[28]);
-    cb_count.* = 1;
-
-    if (allocCB(device, @ptrCast(&cb_ai), &cmd_buf) != VK_SUCCESS) return false;
-
-    // Fence
-    const FnCreateFence = *const fn (VkDevice, *const anyopaque, ?*const anyopaque, *VkFence) callconv(.c) VkResult;
-    const createFence = getDeviceProc(FnCreateFence, "vkCreateFence") orelse return false;
-
-    var fence_ci = std.mem.zeroes([16]u8);
-    var fence_stype: *align(1) u32 = @ptrCast(&fence_ci[0]);
-    fence_stype.* = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-
-    if (createFence(device, @ptrCast(&fence_ci), null, &fence) != VK_SUCCESS) return false;
-
+    var ptr: ?*anyopaque = null;
+    if (mapMem(vk_dev, mem_h, 0, size, 0, &ptr) != VK_SUCCESS) return false;
+    const dst: [*]u8 = @ptrCast(ptr.?);
+    @memcpy(dst[0..size], data[0..size]);
+    unmapMem(vk_dev, mem_h);
     return true;
 }
 
-// ── Public interface (placeholder) ──────────────────────────────
-// TODO: implement fullVkLaunch mirroring gpu_driver.zig fullGpuLaunch
+fn downloadBuf(mem_h: Handle, data: [*]u8, offset: usize, size: usize) bool {
+    const mapMem = vkProc(*const fn (Handle, Handle, VkDeviceSize, VkDeviceSize, u32, *?*anyopaque) callconv(.c) VkResult, "vkMapMemory") orelse return false;
+    const unmapMem = vkProc(*const fn (Handle, Handle) callconv(.c) void, "vkUnmapMemory") orelse return false;
 
-const fast_dec = @import("fast_lz_decoder.zig");
+    var ptr: ?*anyopaque = null;
+    if (mapMem(vk_dev, mem_h, offset, size, 0, &ptr) != VK_SUCCESS) return false;
+    const src: [*]const u8 = @ptrCast(ptr.?);
+    @memcpy(data[0..size], src[0..size]);
+    unmapMem(vk_dev, mem_h);
+    return true;
+}
+
+// ── Public dispatch ─────────────────────────────────────────────
 
 pub const ChunkDesc = extern struct {
     src_offset: u32,
@@ -403,15 +533,78 @@ pub fn fullVkLaunch(
     io: ?std.Io,
 ) fast_dec.DecodeError!void {
     if (!init()) return error.BadMode;
-    _ = chunk_descs;
-    _ = compressed_block;
-    _ = dst_full;
-    _ = dst_start_off;
-    _ = decompressed_size;
-    _ = num_groups;
-    _ = chunks_per_group;
-    _ = sub_chunk_cap;
-    _ = io;
-    // TODO: buffer creation, descriptor updates, command recording, dispatch
-    return error.BadMode;
+
+    const updateDS = vkProc(*const fn (Handle, u32, [*]const VkWriteDescriptorSet, u32, ?*anyopaque) callconv(.c) void, "vkUpdateDescriptorSets") orelse return error.BadMode;
+    const beginCB = vkProc(*const fn (Handle, *const VkCommandBufferBeginInfo) callconv(.c) VkResult, "vkBeginCommandBuffer") orelse return error.BadMode;
+    const endCB = vkProc(*const fn (Handle) callconv(.c) VkResult, "vkEndCommandBuffer") orelse return error.BadMode;
+    const resetCB = vkProc(*const fn (Handle, u32) callconv(.c) VkResult, "vkResetCommandBuffer") orelse return error.BadMode;
+    const bindPipe = vkProc(*const fn (Handle, u32, Handle) callconv(.c) void, "vkCmdBindPipeline") orelse return error.BadMode;
+    const bindDS = vkProc(*const fn (Handle, u32, Handle, u32, [*]const Handle, u32, ?*anyopaque) callconv(.c) void, "vkCmdBindDescriptorSets") orelse return error.BadMode;
+    const pushConst = vkProc(*const fn (Handle, Handle, u32, u32, u32, *const anyopaque) callconv(.c) void, "vkCmdPushConstants") orelse return error.BadMode;
+    const dispatch = vkProc(*const fn (Handle, u32, u32, u32) callconv(.c) void, "vkCmdDispatch") orelse return error.BadMode;
+    const queueSubmit = vkProc(*const fn (Handle, u32, [*]const VkSubmitInfo, Handle) callconv(.c) VkResult, "vkQueueSubmit") orelse return error.BadMode;
+    const waitFence = vkProc(*const fn (Handle, u32, [*]const Handle, u32, u64) callconv(.c) VkResult, "vkWaitForFences") orelse return error.BadMode;
+    const resetFence = vkProc(*const fn (Handle, u32, [*]const Handle) callconv(.c) VkResult, "vkResetFences") orelse return error.BadMode;
+
+    const total_output = dst_start_off + decompressed_size;
+    const comp_bytes = if (compressed_block.len > 0) compressed_block.len else 4;
+    const desc_bytes = chunk_descs.len * @sizeOf(ChunkDesc);
+
+    if (!ensureBuf(&b_comp, &m_comp, &b_comp_sz, comp_bytes)) return error.BadMode;
+    if (!ensureBuf(&b_out, &m_out, &b_out_sz, total_output + 64)) return error.BadMode;
+    if (!ensureBuf(&b_desc, &m_desc, &b_desc_sz, desc_bytes)) return error.BadMode;
+
+    // Upload data
+    if (compressed_block.len > 0)
+        if (!uploadBuf(m_comp, compressed_block.ptr, compressed_block.len)) return error.BadMode;
+    if (!uploadBuf(m_desc, @ptrCast(chunk_descs.ptr), desc_bytes)) return error.BadMode;
+    if (dst_start_off > 0)
+        if (!uploadBuf(m_out, dst_full, dst_start_off)) return error.BadMode;
+
+    // Update descriptor set
+    var buf_infos = [3]VkDescriptorBufferInfo{
+        .{ .buffer = b_comp, .range = comp_bytes },
+        .{ .buffer = b_out, .range = total_output + 64 },
+        .{ .buffer = b_desc, .range = desc_bytes },
+    };
+    var writes = [3]VkWriteDescriptorSet{
+        .{ .dstSet = vk_desc_set, .dstBinding = 0, .descriptorType = VK_DESC_STORAGE_BUFFER, .pBufferInfo = &buf_infos[0] },
+        .{ .dstSet = vk_desc_set, .dstBinding = 1, .descriptorType = VK_DESC_STORAGE_BUFFER, .pBufferInfo = &buf_infos[1] },
+        .{ .dstSet = vk_desc_set, .dstBinding = 2, .descriptorType = VK_DESC_STORAGE_BUFFER, .pBufferInfo = &buf_infos[2] },
+    };
+    updateDS(vk_dev, 3, &writes, 0, null);
+
+    // Record command buffer
+    _ = resetCB(vk_cmd_buf, 0);
+    var begin_info = VkCommandBufferBeginInfo{};
+    if (beginCB(vk_cmd_buf, &begin_info) != VK_SUCCESS) return error.BadMode;
+
+    bindPipe(vk_cmd_buf, VK_BIND_COMPUTE, vk_pipeline);
+    var ds_arr = [1]Handle{vk_desc_set};
+    bindDS(vk_cmd_buf, VK_BIND_COMPUTE, vk_pipe_layout, 0, &ds_arr, 0, null);
+
+    var pc_data = [3]u32{ chunks_per_group, @intCast(chunk_descs.len), sub_chunk_cap };
+    pushConst(vk_cmd_buf, vk_pipe_layout, VK_SHADER_COMPUTE, 0, 12, @ptrCast(&pc_data));
+
+    const grid_x = (num_groups + 1) / 2;
+    const t_before = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
+
+    dispatch(vk_cmd_buf, grid_x, 1, 1);
+
+    if (endCB(vk_cmd_buf) != VK_SUCCESS) return error.BadMode;
+
+    // Submit and wait
+    const submit = VkSubmitInfo{ .commandBufferCount = 1, .pCommandBuffers = &vk_cmd_buf };
+    if (queueSubmit(vk_queue, 1, &[1]VkSubmitInfo{submit}, vk_fence) != VK_SUCCESS) return error.BadMode;
+    _ = waitFence(vk_dev, 1, &[1]Handle{vk_fence}, 1, ~@as(u64, 0));
+    _ = resetFence(vk_dev, 1, &[1]Handle{vk_fence});
+
+    if (t_before) |t_start| {
+        if (io) |io_val| {
+            last_kernel_ns = @intCast(t_start.untilNow(io_val, .awake).toNanoseconds());
+        }
+    }
+
+    // Download output
+    if (!downloadBuf(m_out, dst_full + dst_start_off, dst_start_off, decompressed_size)) return error.BadMode;
 }
