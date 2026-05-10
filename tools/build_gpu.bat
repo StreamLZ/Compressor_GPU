@@ -9,3 +9,10 @@ cuobjdump -res-usage "%OUT%.cubin"
 echo.
 echo Also generating PTX...
 nvcc -ptx -o "%OUT%.ptx" "%SRC%" -arch=sm_89 -O3
+
+echo.
+echo Compiling Vulkan SPIR-V...
+set COMP=%~dp0..\src\decode\fast\gpu_decode_kernel.comp
+set SPV=%~dp0..\src\decode\fast\gpu_decode_kernel.spv
+"C:\VulkanSDK\1.4.341.1\Bin\glslangValidator.exe" -V -S comp --target-env vulkan1.3 -o "%SPV%" "%COMP%"
+echo glslang exit code: %ERRORLEVEL%

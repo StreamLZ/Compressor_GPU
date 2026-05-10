@@ -1,0 +1,374 @@
+// ── StreamLZ GPU Decode Kernel (Vulkan Compute / SPIR-V) ───────
+// Cross-vendor port of gpu_decode_kernel.cu.
+// Each subgroup (32 invocations) decodes one StreamLZ chunk.
+// Two subgroups per workgroup for occupancy (workgroup size 64 = 32×2).
+//
+// Build: glslangValidator -V -S comp -o gpu_decode_kernel.spv gpu_decode_kernel.comp
+// Embed: @embedFile("gpu_decode_kernel.spv") in vk_driver.zig
+
+#version 450
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_subgroup_extended_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 32, local_size_y = 2, local_size_z = 1) in;
+
+// ── Bindings ────────────────────────────────────────────────────
+layout(set = 0, binding = 0) readonly buffer CompressedBuf { uint8_t data[]; } compressed;
+layout(set = 0, binding = 1) buffer OutputBuf { uint8_t data[]; } output_buf;
+layout(set = 0, binding = 2) readonly buffer ChunkDescBuf { uint data[]; } chunk_descs;
+
+layout(push_constant) uniform PushConstants {
+    uint chunks_per_group;
+    uint total_chunks;
+    uint sub_chunk_cap;
+} pc;
+
+// ── Token format constants ──────────────────────────────────────
+const uint TOKEN_SHORT_MIN    = 24;
+const uint TOKEN_LONG_LITERAL = 0;
+const uint TOKEN_LONG_NEAR    = 1;
+const uint TOKEN_LONG_FAR     = 2;
+const uint LONG_LITERAL_BASE  = 64;
+const uint LONG_NEAR_BASE     = 91;
+const uint LONG_FAR_BASE      = 29;
+const uint SHORT_FAR_BASE     = 5;
+const uint BLOCK_SIZE         = 0x10000;
+
+// ── Chunk descriptor accessors ──────────────────────────────────
+// ChunkDesc is 24 bytes = 6 uint32s, but due to the uint8+pad at
+// the end, we pack as 6 uints where field 5 holds memset_fill in
+// the low byte.
+struct ChunkDesc {
+    uint src_offset;
+    uint comp_size;
+    uint decomp_size;
+    uint dst_offset;
+    uint flags;
+    uint memset_fill;  // low byte only
+};
+
+ChunkDesc loadChunkDesc(uint idx) {
+    uint base = idx * 6;
+    ChunkDesc cd;
+    cd.src_offset  = chunk_descs.data[base + 0];
+    cd.comp_size   = chunk_descs.data[base + 1];
+    cd.decomp_size = chunk_descs.data[base + 2];
+    cd.dst_offset  = chunk_descs.data[base + 3];
+    cd.flags       = chunk_descs.data[base + 4];
+    cd.memset_fill = chunk_descs.data[base + 5] & 0xFF;
+    return cd;
+}
+
+// ── Extended length decode ──────────────────────────────────────
+uint readLength(uint len_off, uint len_avail, uint sc_base) {
+    if (len_off >= len_avail) return 0;
+    uint v = uint(compressed.data[sc_base + len_off]);
+    // readLength is called with the local len_off but we need to
+    // advance it — caller tracks len_off via inout in the main loop.
+    // This standalone version just reads; the caller does the advance.
+    return v;
+}
+
+// ── Type 0 entropy header parser ────────────────────────────────
+// Returns payload size. Advances 'pos' past the header.
+uint parseType0Header(inout uint pos, uint sc_base) {
+    uint b0 = uint(compressed.data[sc_base + pos]);
+    if (b0 >= 0x80) {
+        uint b1 = uint(compressed.data[sc_base + pos + 1]);
+        uint sz = ((b0 << 8) | b1) & 0xFFF;
+        pos += 2;
+        return sz;
+    } else {
+        uint b1 = uint(compressed.data[sc_base + pos + 1]);
+        uint b2 = uint(compressed.data[sc_base + pos + 2]);
+        uint sz = (b0 << 16) | (b1 << 8) | b2;
+        pos += 3;
+        return sz;
+    }
+}
+
+// ── L1 raw-mode sub-chunk decoder ───────────────────────────────
+void decodeSubChunkL1(
+    uint cmd_base, uint cmd_size,
+    uint lit_base, uint lit_size,
+    uint off16_base, uint off16_count,
+    uint len_base, uint len_avail,
+    uint dst_size, uint initial_copy, uint dst_offset
+) {
+    uint lane = gl_SubgroupInvocationID;
+    uint cmd_pos = 0;
+    uint lit_pos = 0;
+    uint off16_pos = 0;
+    uint dst_pos = dst_offset + initial_copy;
+    int recent_offset = -8;
+    uint len_off = 0;
+
+    while (cmd_pos < cmd_size) {
+        uint lit_len = 0;
+        uint match_len = 0;
+        int match_offset = recent_offset;
+        uint use_recent = 0;
+
+        // ── Token parse (lane 0 only) ──
+        if (lane == 0) {
+            uint token = uint(compressed.data[cmd_base + cmd_pos]);
+            if (token >= TOKEN_SHORT_MIN) {
+                lit_len = token & 7;
+                match_len = (token >> 3) & 0xF;
+                use_recent = (token >> 7) & 1;
+                if (use_recent == 0 && off16_pos < off16_count) {
+                    uint lo = uint(compressed.data[off16_base + off16_pos * 2]);
+                    uint hi = uint(compressed.data[off16_base + off16_pos * 2 + 1]);
+                    match_offset = -int((hi << 8) | lo);
+                    off16_pos++;
+                }
+            } else if (token == TOKEN_LONG_LITERAL) {
+                use_recent = 1;
+                // readLength inline
+                uint v = uint(compressed.data[len_base + len_off]);
+                if (v > 251 && len_off + 2 < len_avail) {
+                    uint elo = uint(compressed.data[len_base + len_off + 1]);
+                    uint ehi = uint(compressed.data[len_base + len_off + 2]);
+                    v += ((ehi << 8) | elo) * 4;
+                    len_off += 2;
+                }
+                len_off++;
+                lit_len = v + LONG_LITERAL_BASE;
+            } else if (token == TOKEN_LONG_NEAR) {
+                // readLength inline
+                uint v = uint(compressed.data[len_base + len_off]);
+                if (v > 251 && len_off + 2 < len_avail) {
+                    uint elo = uint(compressed.data[len_base + len_off + 1]);
+                    uint ehi = uint(compressed.data[len_base + len_off + 2]);
+                    v += ((ehi << 8) | elo) * 4;
+                    len_off += 2;
+                }
+                len_off++;
+                match_len = v + LONG_NEAR_BASE;
+                if (off16_pos < off16_count) {
+                    uint lo = uint(compressed.data[off16_base + off16_pos * 2]);
+                    uint hi = uint(compressed.data[off16_base + off16_pos * 2 + 1]);
+                    match_offset = -int((hi << 8) | lo);
+                    off16_pos++;
+                }
+            }
+        }
+        cmd_pos++;
+
+        // ── Broadcast parsed values from lane 0 ──
+        lit_len      = subgroupBroadcastFirst(lit_len);
+        match_len    = subgroupBroadcastFirst(match_len);
+        match_offset = int(subgroupBroadcastFirst(uint(match_offset)));
+        use_recent   = subgroupBroadcastFirst(use_recent);
+        off16_pos    = subgroupBroadcastFirst(off16_pos);
+
+        // ── Warp-cooperative literal copy ──
+        if (lit_len > 0) {
+            for (uint i = lane; i < lit_len; i += 32)
+                output_buf.data[dst_pos + i] = compressed.data[lit_base + lit_pos + i];
+            subgroupBarrier();
+        }
+        dst_pos += lit_len;
+        lit_pos += lit_len;
+
+        // ── Warp-cooperative match copy ──
+        if (match_len > 0) {
+            uint match_src = uint(int(dst_pos) + match_offset);
+            int match_dist = -match_offset;
+            if (match_dist >= int(match_len) && match_len > 1) {
+                for (uint i = lane; i < match_len; i += 32)
+                    output_buf.data[dst_pos + i] = output_buf.data[match_src + i];
+            } else {
+                if (lane == 0)
+                    for (uint i = 0; i < match_len; i++)
+                        output_buf.data[dst_pos + i] = output_buf.data[match_src + i];
+            }
+            subgroupBarrier();
+        }
+        dst_pos += match_len;
+
+        if (use_recent == 0) recent_offset = match_offset;
+        recent_offset = int(subgroupBroadcastFirst(uint(recent_offset)));
+        len_off = subgroupBroadcastFirst(len_off);
+    }
+
+    // ── Trailing literals ──
+    uint trailing = (lit_size > lit_pos) ? (lit_size - lit_pos) : 0;
+    for (uint i = lane; i < trailing; i += 32)
+        output_buf.data[dst_pos + i] = compressed.data[lit_base + lit_pos + i];
+}
+
+// ── Sub-chunk header parser + decoder dispatch ──────────────────
+void parseAndDecodeSubChunk(
+    uint sc_base, uint sc_comp_size, uint sc_decomp_size,
+    uint dst_offset, uint base_offset, uint mode
+) {
+    uint lane = gl_SubgroupInvocationID;
+    uint pos = 0;
+
+    uint initial_copy = 0;
+    if (base_offset == 0) {
+        if (lane < 8)
+            output_buf.data[dst_offset + lane] = compressed.data[sc_base + lane];
+        subgroupBarrier();
+        pos = 8;
+        initial_copy = 8;
+    }
+
+    // Parse stream headers on lane 0, broadcast offset to all lanes.
+
+    // Literal stream
+    uint lit_size = 0;
+    uint lit_base = 0;
+    if (lane == 0) {
+        lit_size = parseType0Header(pos, sc_base);
+        lit_base = sc_base + pos;
+        pos += lit_size;
+    }
+    lit_size = subgroupBroadcastFirst(lit_size);
+    pos = subgroupBroadcastFirst(pos);
+    lit_base = sc_base + pos - lit_size;
+
+    // Command stream
+    uint cmd_size = 0;
+    uint cmd_base = 0;
+    if (lane == 0) {
+        cmd_size = parseType0Header(pos, sc_base);
+        cmd_base = sc_base + pos;
+        pos += cmd_size;
+    }
+    cmd_size = subgroupBroadcastFirst(cmd_size);
+    pos = subgroupBroadcastFirst(pos);
+    cmd_base = sc_base + pos - cmd_size;
+
+    // cmd_stream2_offset (only for multi-block sub-chunks, skip for L1)
+    if (lane == 0 && sc_decomp_size > BLOCK_SIZE)
+        pos += 2;
+    pos = subgroupBroadcastFirst(pos);
+
+    // Off16 stream
+    uint off16_count = 0;
+    uint off16_base = 0;
+    if (lane == 0) {
+        uint lo = uint(compressed.data[sc_base + pos]);
+        uint hi = uint(compressed.data[sc_base + pos + 1]);
+        off16_count = (hi << 8) | lo;
+        off16_base = sc_base + pos + 2;
+        pos += 2 + off16_count * 2;
+    }
+    off16_count = subgroupBroadcastFirst(off16_count);
+    pos = subgroupBroadcastFirst(pos);
+    off16_base = sc_base + pos - off16_count * 2;
+
+    // Off32 header (3 bytes) — skip for L1 path
+    if (lane == 0) {
+        uint b0 = uint(compressed.data[sc_base + pos]);
+        uint b1 = uint(compressed.data[sc_base + pos + 1]);
+        uint b2 = uint(compressed.data[sc_base + pos + 2]);
+        uint tmp = b0 | (b1 << 8) | (b2 << 16);
+        pos += 3;
+        if (tmp != 0) {
+            uint c1 = tmp >> 12;
+            uint c2 = tmp & 0xFFF;
+            if (c1 == 4095) pos += 2;
+            if (c2 == 4095) pos += 2;
+            pos += c1 * 3 + c2 * 3;
+        }
+    }
+    pos = subgroupBroadcastFirst(pos);
+
+    // Length stream = remainder
+    uint len_base = sc_base + pos;
+    uint len_avail = sc_comp_size - pos;
+    if (pos > sc_comp_size) len_avail = 0;
+
+    // Dispatch to L1 fast path (mode==1, no off32)
+    decodeSubChunkL1(
+        cmd_base, cmd_size,
+        lit_base, lit_size,
+        off16_base, off16_count,
+        len_base, len_avail,
+        sc_decomp_size, initial_copy, dst_offset
+    );
+}
+
+// ── Main kernel ─────────────────────────────────────────────────
+void main() {
+    uint warp_id = gl_LocalInvocationID.y;
+    uint group_id = gl_WorkGroupID.x * 2 + warp_id;
+    uint lane = gl_SubgroupInvocationID;
+
+    if (group_id >= (pc.total_chunks + pc.chunks_per_group - 1) / pc.chunks_per_group)
+        return;
+
+    uint base_chunk = group_id * pc.chunks_per_group;
+
+    for (uint c = 0; c < pc.chunks_per_group; c++) {
+        uint chunk_idx = base_chunk + c;
+        if (chunk_idx >= pc.total_chunks) return;
+
+        ChunkDesc ch = loadChunkDesc(chunk_idx);
+        if (ch.decomp_size == 0) continue;
+
+        // Uncompressed chunk: cooperative copy
+        if ((ch.flags & 1) != 0) {
+            for (uint i = lane; i < ch.decomp_size; i += 32)
+                output_buf.data[ch.dst_offset + i] = compressed.data[ch.src_offset + i];
+            subgroupBarrier();
+            continue;
+        }
+
+        // Memset chunk
+        if ((ch.flags & 2) != 0) {
+            uint8_t fill = uint8_t(ch.memset_fill);
+            for (uint i = lane; i < ch.decomp_size; i += 32)
+                output_buf.data[ch.dst_offset + i] = fill;
+            subgroupBarrier();
+            continue;
+        }
+
+        // LZ-compressed chunk: iterate sub-chunks
+        uint chunk_src = ch.src_offset;
+        uint sc_dst_off = ch.dst_offset;
+        uint sc_remaining = ch.decomp_size;
+
+        while (sc_remaining > 0) {
+            uint sc_size = min(sc_remaining, pc.sub_chunk_cap);
+
+            // Parse 3-byte sub-chunk header (big-endian)
+            uint chunkhdr = 0;
+            if (lane == 0) {
+                uint b0 = uint(compressed.data[chunk_src]);
+                uint b1 = uint(compressed.data[chunk_src + 1]);
+                uint b2 = uint(compressed.data[chunk_src + 2]);
+                chunkhdr = (b0 << 16) | (b1 << 8) | b2;
+            }
+            chunkhdr = subgroupBroadcastFirst(chunkhdr);
+
+            if ((chunkhdr & 0x800000) == 0)
+                break;
+
+            uint sc_comp_size = chunkhdr & 0x7FFFF;
+            uint sc_mode = (chunkhdr >> 19) & 0xF;
+            uint sc_payload = chunk_src + 3;
+
+            if (sc_comp_size < sc_size) {
+                parseAndDecodeSubChunk(
+                    sc_payload, sc_comp_size, sc_size,
+                    sc_dst_off, sc_dst_off, sc_mode
+                );
+            } else {
+                for (uint i = lane; i < sc_size; i += 32)
+                    output_buf.data[sc_dst_off + i] = compressed.data[sc_payload + i];
+            }
+            subgroupBarrier();
+
+            chunk_src += 3 + sc_comp_size;
+            sc_dst_off += sc_size;
+            sc_remaining -= sc_size;
+        }
+    }
+}
