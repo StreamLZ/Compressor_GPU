@@ -81,8 +81,11 @@ pub fn init() bool {
     if (cuCtxCreate_fn == null) cuCtxCreate_fn = getProc(FnCtxCreate, "cuCtxCreate");
     if ((cuCtxCreate_fn orelse return false)(&ctx, 0, dev) != CUDA_SUCCESS) return false;
 
-    const cubin = @embedFile("gpu_decode_kernel.cubin");
-    if ((cuModuleLoadData_fn orelse return false)(&module, cubin.ptr) != CUDA_SUCCESS) return false;
+    // PTX is portable across all NVIDIA GPUs — the driver JIT-compiles it
+    // for the specific hardware at load time. launch_bounds(64,24) in the
+    // source emits .minnctapersm 24 which the JIT clamps per-architecture.
+    const ptx = @embedFile("gpu_decode_kernel.ptx") ++ "\x00";
+    if ((cuModuleLoadData_fn orelse return false)(&module, ptx.ptr) != CUDA_SUCCESS) return false;
 
     const get_fn = cuModuleGetFunction_fn orelse return false;
     if (get_fn(&kernel_fn, module, "slzFullDecompressL1Kernel") != CUDA_SUCCESS) return false;
