@@ -243,13 +243,29 @@ extern "C" __global__ void __launch_bounds__(64, 16) slzCompressL1Kernel(
 
             lit_count += lit_len;
 
-            if (lane == 0) {
-                int32_t neg_off = -(int32_t)(match_pos - match_ref);
-                uint32_t off_param = (neg_off == recent_offset) ? 0 : (uint32_t)(-neg_off);
-                emitCmd(cmd_buf, token_count, off16_buf, off16_count,
-                        len_buf, length_count, lit_len, match_len, off_param);
-                recent_offset = neg_off;
+            // Warp-uniform offset computation (all lanes participate)
+            int32_t neg_off = -(int32_t)(match_pos - match_ref);
+            uint32_t off_param = (neg_off == recent_offset) ? 0 : (uint32_t)(-neg_off);
+
+            // Inline fast path avoids emitCmd function call overhead
+            if (lit_len <= 7 && match_len <= 15 && off_param <= 0xFFFF) {
+                if (lane == 0) {
+                    uint8_t token = (uint8_t)(lit_len + 8 * match_len);
+                    if (off_param == 0) token |= 0x80;
+                    cmd_buf[token_count++] = token;
+                    if (off_param != 0) {
+                        uint16_t ov = (uint16_t)off_param;
+                        memcpy(off16_buf + off16_count * 2, &ov, 2);
+                        off16_count++;
+                    }
+                }
+            } else {
+                if (lane == 0) {
+                    emitCmd(cmd_buf, token_count, off16_buf, off16_count,
+                            len_buf, length_count, lit_len, match_len, off_param);
+                }
             }
+            recent_offset = neg_off;
         }
 
         anchor = match_pos + match_len;
