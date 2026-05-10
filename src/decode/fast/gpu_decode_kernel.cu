@@ -1,17 +1,37 @@
 // ── StreamLZ GPU Decode Kernel ──────────────────────────────────
-// 1 warp per chunk, 2 warps per block. Parses compressed sub-chunk
-// headers on-GPU and decodes LZ tokens cooperatively.
+// Each warp (32 threads) decodes one StreamLZ chunk independently.
+// Two warps are packed per CUDA thread-block for SM occupancy
+// (blockDim 32,2,1 — the two warps do NOT cooperate).
+// Lane 0 of each warp parses tokens serially; all 32 lanes
+// participate in literal and match byte copies.
 //
-// Three decode paths:
-//   decodeSubChunkL1  — 64KB raw-mode chunks (no off32, no delta)
-//   decodeSubChunk    — general path (off32, delta, multi-block)
-//   parseAndDecodeSubChunk — parses Type 0 entropy headers, dispatches above
+// Decode paths:
+//   decodeSubChunkL1      — 64KB raw-mode (no off32, no delta, no block split)
+//   decodeSubChunk        — general (off32, delta literals, 2-block sub-chunks)
+//   parseAndDecodeSubChunk — parses stream headers, dispatches to above
 //
-// Compiled to CUBIN via: nvcc -cubin -arch=sm_89 -O3 gpu_decode_kernel.cu
-// Embedded in Zig via @embedFile("gpu_decode_kernel.cubin")
+// Build: nvcc -cubin -arch=sm_89 -O3 gpu_decode_kernel.cu
+// Embed: @embedFile("gpu_decode_kernel.cubin") in gpu_driver.zig
 
 #include <cstdint>
 #include <cstdio>
+
+// ── StreamLZ token format constants ────────────────────────────
+// Tokens encode literal-length + match-length + offset type in one byte.
+//   token >= 24:  standard — lit[2:0], match[6:3], use_recent[7], off16
+//   token == 0:   long literal — length from length stream + 64
+//   token == 1:   long near match — length from length stream + 91, off16
+//   token == 2:   long far match — length from length stream + 29, off32
+//   token 3-23:   short far match — match = token + 5, off32
+static constexpr uint32_t TOKEN_SHORT_MIN      = 24;
+static constexpr uint32_t TOKEN_LONG_LITERAL   = 0;
+static constexpr uint32_t TOKEN_LONG_NEAR      = 1;
+static constexpr uint32_t TOKEN_LONG_FAR       = 2;
+static constexpr uint32_t LONG_LITERAL_BASE    = 64;
+static constexpr uint32_t LONG_NEAR_BASE       = 91;
+static constexpr uint32_t LONG_FAR_BASE        = 29;
+static constexpr uint32_t SHORT_FAR_BASE       = 5;
+static constexpr uint32_t BLOCK_SIZE           = 0x10000;  // 64KB
 
 // ── Chunk descriptor (extern-matched with gpu_driver.zig ChunkDesc) ────
 struct SlzChunkDesc {
@@ -62,68 +82,75 @@ __device__ void decodeSubChunkL1(
     uint32_t len_off = 0;
 
     while (cmd_pos < cmd_size) {
-        uint32_t local_lit = 0, local_match = 0;
-        int32_t offset = recent_offset;
+        uint32_t lit_len = 0, match_len = 0;
+        int32_t match_offset = recent_offset;
         uint32_t use_recent = 0;
 
+        // ── Token parse (lane 0 only) ──
         if (lane == 0) {
             uint32_t token = cmd[cmd_pos];
-            if (token >= 24) {
-                local_lit = token & 7;
-                local_match = (token >> 3) & 0xF;
+            if (token >= TOKEN_SHORT_MIN) {
+                lit_len = token & 7;
+                match_len = (token >> 3) & 0xF;
                 use_recent = (token >> 7) & 1;
                 if (!use_recent && off16_pos < off16_count) {
                     uint16_t v; memcpy(&v, off16_raw + off16_pos * 2, 2);
-                    offset = -(int32_t)v;
+                    match_offset = -(int32_t)v;
                     off16_pos++;
                 }
-            } else if (token == 0) {
+            } else if (token == TOKEN_LONG_LITERAL) {
                 use_recent = 1;
-                local_lit = readLength(len_data, len_off, len_avail) + 64;
-            } else if (token == 1) {
-                local_match = readLength(len_data, len_off, len_avail) + 91;
+                lit_len = readLength(len_data, len_off, len_avail) + LONG_LITERAL_BASE;
+            } else if (token == TOKEN_LONG_NEAR) {
+                match_len = readLength(len_data, len_off, len_avail) + LONG_NEAR_BASE;
                 if (off16_pos < off16_count) {
                     uint16_t v; memcpy(&v, off16_raw + off16_pos * 2, 2);
-                    offset = -(int32_t)v; off16_pos++;
+                    match_offset = -(int32_t)v; off16_pos++;
                 }
             }
         }
         cmd_pos++;
 
-        local_lit   = __shfl_sync(0xFFFFFFFF, local_lit, 0);
-        local_match = __shfl_sync(0xFFFFFFFF, local_match, 0);
-        offset      = __shfl_sync(0xFFFFFFFF, offset, 0);
-        use_recent  = __shfl_sync(0xFFFFFFFF, use_recent, 0);
-        off16_pos   = __shfl_sync(0xFFFFFFFF, off16_pos, 0);
+        // ── Broadcast parsed values from lane 0 to all lanes ──
+        lit_len      = __shfl_sync(0xFFFFFFFF, lit_len, 0);
+        match_len    = __shfl_sync(0xFFFFFFFF, match_len, 0);
+        match_offset = __shfl_sync(0xFFFFFFFF, match_offset, 0);
+        use_recent   = __shfl_sync(0xFFFFFFFF, use_recent, 0);
+        off16_pos    = __shfl_sync(0xFFFFFFFF, off16_pos, 0);
 
-        if (local_lit > 0) {
-            for (uint32_t i = lane; i < local_lit; i += 32)
+        // ── Warp-cooperative literal copy ──
+        if (lit_len > 0) {
+            for (uint32_t i = lane; i < lit_len; i += 32)
                 dst[dst_pos + i] = lit[lit_pos + i];
             __syncwarp();
         }
-        dst_pos += local_lit;
-        lit_pos += local_lit;
+        dst_pos += lit_len;
+        lit_pos += lit_len;
 
-        if (local_match > 0) {
-            uint32_t ms = (uint32_t)((int32_t)dst_pos + offset);
-            int32_t abs_off = -offset;
-            if (abs_off >= (int32_t)local_match && local_match > 1) {
-                for (uint32_t i = lane; i < local_match; i += 32)
-                    dst[dst_pos + i] = dst[ms + i];
+        // ── Warp-cooperative match copy ──
+        if (match_len > 0) {
+            uint32_t match_src = (uint32_t)((int32_t)dst_pos + match_offset);
+            int32_t match_dist = -match_offset;
+            if (match_dist >= (int32_t)match_len && match_len > 1) {
+                // Non-overlapping: all lanes copy in parallel
+                for (uint32_t i = lane; i < match_len; i += 32)
+                    dst[dst_pos + i] = dst[match_src + i];
             } else {
+                // Overlapping (RLE-like): serial copy on lane 0
                 if (lane == 0)
-                    for (uint32_t i = 0; i < local_match; i++)
-                        dst[dst_pos + i] = dst[ms + i];
+                    for (uint32_t i = 0; i < match_len; i++)
+                        dst[dst_pos + i] = dst[match_src + i];
             }
             __syncwarp();
         }
-        dst_pos += local_match;
+        dst_pos += match_len;
 
-        if (!use_recent) recent_offset = offset;
+        if (!use_recent) recent_offset = match_offset;
         recent_offset = __shfl_sync(0xFFFFFFFF, recent_offset, 0);
         len_off = __shfl_sync(0xFFFFFFFF, len_off, 0);
     }
 
+    // ── Trailing literals (bytes after the last token) ──
     uint32_t trailing = (lit_size > lit_pos) ? (lit_size - lit_pos) : 0;
     for (uint32_t i = lane; i < trailing; i += 32)
         dst[dst_pos + i] = lit[lit_pos + i];
@@ -162,118 +189,122 @@ __device__ void decodeSubChunk(
 
     for (;;) {
     while (cmd_pos < block_cmd_end) {
-        uint32_t token = 0, local_lit = 0, local_match = 0;
-        int32_t offset = recent_offset;
+        uint32_t token = 0, lit_len = 0, match_len = 0;
+        int32_t match_offset = recent_offset;
         uint32_t use_recent = 0, token_type = 0;
 
+        // ── Token parse (lane 0 only) ──
         if (lane == 0) {
             token = cmd[cmd_pos++];
-            if (token >= 24) {
+            if (token >= TOKEN_SHORT_MIN) {
                 token_type = 0;
-                local_lit = token & 7;
-                local_match = (token >> 3) & 0xF;
+                lit_len = token & 7;
+                match_len = (token >> 3) & 0xF;
                 use_recent = (token >> 7) & 1;
                 if (!use_recent && off16_pos < off16_count) {
                     uint16_t v; memcpy(&v, off16_raw + off16_pos * 2, 2);
-                    offset = -(int32_t)v;
+                    match_offset = -(int32_t)v;
                     off16_pos++;
                 }
-            } else if (token == 0) {
+            } else if (token == TOKEN_LONG_LITERAL) {
                 token_type = 1;
-                local_lit = readLength(len_data, len_off, len_avail) + 64;
-            } else if (token == 1) {
+                lit_len = readLength(len_data, len_off, len_avail) + LONG_LITERAL_BASE;
+            } else if (token == TOKEN_LONG_NEAR) {
                 token_type = 2;
-                local_match = readLength(len_data, len_off, len_avail) + 91;
+                match_len = readLength(len_data, len_off, len_avail) + LONG_NEAR_BASE;
                 if (off16_pos < off16_count) {
                     uint16_t v; memcpy(&v, off16_raw + off16_pos * 2, 2);
-                    offset = -(int32_t)v; off16_pos++;
+                    match_offset = -(int32_t)v; off16_pos++;
                 }
                 use_recent = 0;
-            } else if (token == 2) {
+            } else if (token == TOKEN_LONG_FAR) {
                 token_type = 4;
-                local_match = readLength(len_data, len_off, len_avail) + 29;
+                match_len = readLength(len_data, len_off, len_avail) + LONG_FAR_BASE;
                 if (off32_pos < off32_count_cur) {
                     uint32_t v; memcpy(&v, off32_cur + off32_pos * 4, 4);
-                    offset = (int32_t)block_dst_start - (int32_t)v - (int32_t)dst_pos;
+                    match_offset = (int32_t)block_dst_start - (int32_t)v - (int32_t)dst_pos;
                     off32_pos++;
                 }
                 use_recent = 0;
             } else {
                 token_type = 3;
-                local_match = token + 5;
+                match_len = token + SHORT_FAR_BASE;
                 if (off32_pos < off32_count_cur) {
                     uint32_t v; memcpy(&v, off32_cur + off32_pos * 4, 4);
-                    offset = (int32_t)block_dst_start - (int32_t)v - (int32_t)dst_pos;
+                    match_offset = (int32_t)block_dst_start - (int32_t)v - (int32_t)dst_pos;
                     off32_pos++;
                 }
                 use_recent = 0;
             }
         }
 
-        token_type  = __shfl_sync(0xFFFFFFFF, token_type, 0);
-        local_lit   = __shfl_sync(0xFFFFFFFF, local_lit, 0);
-        local_match = __shfl_sync(0xFFFFFFFF, local_match, 0);
-        offset      = __shfl_sync(0xFFFFFFFF, offset, 0);
-        use_recent  = __shfl_sync(0xFFFFFFFF, use_recent, 0);
-        cmd_pos     = __shfl_sync(0xFFFFFFFF, cmd_pos, 0);
-        lit_pos     = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
-        off16_pos   = __shfl_sync(0xFFFFFFFF, off16_pos, 0);
-        off32_pos   = __shfl_sync(0xFFFFFFFF, off32_pos, 0);
+        // ── Broadcast parsed values from lane 0 to all lanes ──
+        token_type   = __shfl_sync(0xFFFFFFFF, token_type, 0);
+        lit_len      = __shfl_sync(0xFFFFFFFF, lit_len, 0);
+        match_len    = __shfl_sync(0xFFFFFFFF, match_len, 0);
+        match_offset = __shfl_sync(0xFFFFFFFF, match_offset, 0);
+        use_recent   = __shfl_sync(0xFFFFFFFF, use_recent, 0);
+        cmd_pos      = __shfl_sync(0xFFFFFFFF, cmd_pos, 0);
+        lit_pos      = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
+        off16_pos    = __shfl_sync(0xFFFFFFFF, off16_pos, 0);
+        off32_pos    = __shfl_sync(0xFFFFFFFF, off32_pos, 0);
 
-        if (local_lit > 0) {
+        // ── Warp-cooperative literal copy ──
+        if (lit_len > 0) {
             if (mode == 0) {
-                // Delta literals: dst[i] = lit[i] + dst[match_src + i]
-                for (uint32_t i = lane; i < local_lit; i += 32)
+                for (uint32_t i = lane; i < lit_len; i += 32)
                     if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size) {
-                        uint32_t ms = (uint32_t)((int32_t)(dst_pos + i) + recent_offset);
-                        dst[dst_pos + i] = lit[lit_pos + i] + dst[ms];
+                        uint32_t match_src = (uint32_t)((int32_t)(dst_pos + i) + recent_offset);
+                        dst[dst_pos + i] = lit[lit_pos + i] + dst[match_src];
                     }
             } else {
-                for (uint32_t i = lane; i < local_lit; i += 32)
+                for (uint32_t i = lane; i < lit_len; i += 32)
                     if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size)
                         dst[dst_pos + i] = lit[lit_pos + i];
             }
             __syncwarp();
-            dst_pos += local_lit;
-            lit_pos += local_lit;
+            dst_pos += lit_len;
+            lit_pos += lit_len;
         }
 
-        if (local_match > 0) {
-            uint32_t ms = (uint32_t)((int32_t)dst_pos + offset);
-            int32_t abs_off = -offset;
-            if (abs_off >= (int32_t)local_match && local_match > 1) {
-                for (uint32_t i = lane; i < local_match; i += 32)
+        // ── Warp-cooperative match copy ──
+        if (match_len > 0) {
+            uint32_t match_src = (uint32_t)((int32_t)dst_pos + match_offset);
+            int32_t match_dist = -match_offset;
+            if (match_dist >= (int32_t)match_len && match_len > 1) {
+                for (uint32_t i = lane; i < match_len; i += 32)
                     if (dst_pos + i < dst_end_abs)
-                        dst[dst_pos + i] = dst[ms + i];
+                        dst[dst_pos + i] = dst[match_src + i];
             } else {
                 if (lane == 0)
-                    for (uint32_t i = 0; i < local_match; i++)
+                    for (uint32_t i = 0; i < match_len; i++)
                         if (dst_pos + i < dst_end_abs)
-                            dst[dst_pos + i] = dst[ms + i];
+                            dst[dst_pos + i] = dst[match_src + i];
             }
             __syncwarp();
-            dst_pos += local_match;
+            dst_pos += match_len;
         }
 
         dst_pos   = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
         lit_pos   = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
-        if (!use_recent && (token_type != 1)) recent_offset = offset;
+        if (!use_recent && (token_type != 1)) recent_offset = match_offset;
         recent_offset = __shfl_sync(0xFFFFFFFF, recent_offset, 0);
         len_off = __shfl_sync(0xFFFFFFFF, len_off, 0);
     }
 
+    // ── Per-block trailing literals (at 64KB boundary) ──
     __syncwarp();
     dst_pos = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
     lit_pos = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
     {
-        uint32_t block_end = block_dst_start + 0x10000;
+        uint32_t block_end = block_dst_start + BLOCK_SIZE;
         if (block_end > dst_end_abs) block_end = dst_end_abs;
         uint32_t block_trailing = (block_end > dst_pos) ? (block_end - dst_pos) : 0;
         if (mode == 0) {
             for (uint32_t i = lane; i < block_trailing; i += 32)
                 if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size) {
-                    uint32_t ms = (uint32_t)((int32_t)(dst_pos + i) + recent_offset);
-                    dst[dst_pos + i] = lit[lit_pos + i] + dst[ms];
+                    uint32_t match_src = (uint32_t)((int32_t)(dst_pos + i) + recent_offset);
+                    dst[dst_pos + i] = lit[lit_pos + i] + dst[match_src];
                 }
         } else {
             for (uint32_t i = lane; i < block_trailing; i += 32)
@@ -285,6 +316,7 @@ __device__ void decodeSubChunk(
         lit_pos += block_trailing;
     }
 
+    // ── Advance to block 2 ──
     block_iter++;
     if (block_iter >= 2) break;
     block_cmd_end = cmd_size;
@@ -294,6 +326,7 @@ __device__ void decodeSubChunk(
     block_dst_start = dst_pos;
     }
 
+    // ── Final trailing literals ──
     __syncwarp();
     dst_pos = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
     lit_pos = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
@@ -301,8 +334,8 @@ __device__ void decodeSubChunk(
     if (mode == 0) {
         for (uint32_t i = lane; i < trailing; i += 32)
             if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size) {
-                uint32_t ms = (uint32_t)((int32_t)(dst_pos + i) + recent_offset);
-                dst[dst_pos + i] = lit[lit_pos + i] + dst[ms];
+                uint32_t match_src = (uint32_t)((int32_t)(dst_pos + i) + recent_offset);
+                dst[dst_pos + i] = lit[lit_pos + i] + dst[match_src];
             }
     } else {
         for (uint32_t i = lane; i < trailing; i += 32)
@@ -350,6 +383,9 @@ __device__ void parseAndDecodeSubChunk(
         src += 8;
         initial_copy = 8;
     }
+
+    // Parse each stream header on lane 0, then broadcast the src offset
+    // to all lanes so every lane can compute derived pointers.
 
     // Literal stream (Type 0)
     const uint8_t* lit_ptr = src;
