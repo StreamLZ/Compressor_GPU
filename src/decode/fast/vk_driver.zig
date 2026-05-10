@@ -516,12 +516,19 @@ fn initTimestampQuery() bool {
 
 const VK_MEM_DEVICE_LOCAL: u32 = 0x1;
 
+const VK_MEM_HOST_CACHED: u32 = 0x8;
+
 var has_device_local: bool = false;
 
-// Staging buffer (host-visible, for upload/download)
+// Upload staging: host-visible+coherent (write-combining, fast CPU writes)
 var b_staging: Handle = null;
 var m_staging: Handle = null;
 var b_staging_sz: usize = 0;
+
+// Download staging: host-visible+cached (fast CPU reads)
+var b_download: Handle = null;
+var m_download: Handle = null;
+var b_download_sz: usize = 0;
 
 fn findMemType(type_bits: u32, props: u32) ?u32 {
     for (0..mem_props.memoryTypeCount) |i| {
@@ -583,6 +590,22 @@ fn ensureStaging(needed: usize) bool {
         return false;
     b_staging_sz = needed;
     return true;
+}
+
+fn ensureDownloadBuf(needed: usize) bool {
+    if (b_download_sz >= needed) return true;
+    b_download_sz = 0;
+    const usage = VK_BUFFER_USAGE_TRANSFER_DST;
+    // Prefer cached memory for fast CPU reads; fall back to coherent
+    if (createBufWithMem(&b_download, &m_download, needed, usage, VK_MEM_HOST_VISIBLE | VK_MEM_HOST_CACHED)) {
+        b_download_sz = needed;
+        return true;
+    }
+    if (createBufWithMem(&b_download, &m_download, needed, usage, VK_MEM_HOST_VISIBLE | VK_MEM_HOST_COHERENT)) {
+        b_download_sz = needed;
+        return true;
+    }
+    return false;
 }
 
 fn mapMem(mem_h: Handle, offset: usize, size: usize) ?[*]u8 {
@@ -709,8 +732,8 @@ pub fn fullVkLaunch(
     const staging_upload_size = comp_bytes + desc_bytes + dst_start_off;
 
     if (has_device_local) {
-        const dl_needed = if (staging_upload_size > total_output + 64) staging_upload_size else total_output + 64;
-        if (!ensureStaging(dl_needed)) return error.BadMode;
+        if (!ensureStaging(staging_upload_size)) return error.BadMode;
+        if (!ensureDownloadBuf(total_output + 64)) return error.BadMode;
 
         // Single map, write all upload data at sequential offsets
         const p = mapMem(m_staging, 0, staging_upload_size) orelse return error.BadMode;
@@ -783,8 +806,8 @@ pub fn fullVkLaunch(
     if (has_device_local) {
         // Barrier: compute → transfer
         pipeBarrier(vk_cmd_buf, 0x800, 0x1000, 0, null, 0, null, 0, null);
-        // Device → staging copy for output
-        cmdCopy(vk_cmd_buf, b_out, b_staging, 1, &[1]VkBufferCopy{.{ .srcOffset = dst_start_off, .size = decompressed_size }});
+        // Device → cached download buffer for output
+        cmdCopy(vk_cmd_buf, b_out, b_download, 1, &[1]VkBufferCopy{.{ .srcOffset = dst_start_off, .size = decompressed_size }});
     }
 
     if (endCB(vk_cmd_buf) != VK_SUCCESS) return error.BadMode;
@@ -812,9 +835,9 @@ pub fn fullVkLaunch(
         last_kernel_ns = @intCast(@divTrunc((t_after_fence - t_submit) * 1_000_000_000, freq));
     }
 
-    // ── Read back output ──
+    // ── Read back output (from cached download buffer — fast CPU reads) ──
     if (has_device_local) {
-        const p = mapMem(m_staging, 0, decompressed_size) orelse return error.BadMode;
+        const p = mapMem(m_download, 0, decompressed_size) orelse return error.BadMode;
         @memcpy((dst_full + dst_start_off)[0..decompressed_size], p[0..decompressed_size]);
         unmapMem(m_staging);
     } else {
