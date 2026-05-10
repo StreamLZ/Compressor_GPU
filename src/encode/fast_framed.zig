@@ -38,7 +38,7 @@ fn reencodeGpuWithEntropy(
     allocator: std.mem.Allocator,
     raw: []const u8,
     dst: []u8,
-    options: entropy_enc.EntropyOptions,
+    _: entropy_enc.EntropyOptions,
     speed_tradeoff: f32,
     initial_bytes: usize,
 ) !usize {
@@ -97,15 +97,20 @@ fn reencodeGpuWithEntropy(
     const length_data = raw[rp..];
 
     // Encode to dst
-    const enc_buf = allocator.alloc(u8, @max(lit_count, token_count) + 512) catch return 0;
-    defer allocator.free(enc_buf);
 
-    // Literals: raw memcpy (tANS on literals is marginal for L1/L2 greedy)
+    // Literals: raw memcpy
     const lit_n = entropy_enc.encodeArrayU8Memcpy(dst[wp..], literals) catch return 0;
     wp += lit_n;
 
-    // Tokens: entropy encode
-    const tok_n = entropy_enc.encodeArrayU8(allocator, dst[wp..], tokens, options, speed_tradeoff, null, 0, null) catch return 0;
+    // Tokens: Huffman/RLE entropy (tANS disabled — pre-existing roundtrip bug)
+    const ent_opts: entropy_enc.EntropyOptions = .{
+        .allow_rle_entropy = true,
+        .allow_double_huffman = true,
+        .allow_rle = true,
+        .supports_new_huffman = true,
+        .supports_short_memset = true,
+    };
+    const tok_n = entropy_enc.encodeArrayU8(allocator, dst[wp..], tokens, ent_opts, speed_tradeoff, null, 0, null) catch return 0;
     wp += tok_n;
 
     // Off16: split hi/lo, entropy encode each half
@@ -120,8 +125,8 @@ fn reencodeGpuWithEntropy(
         }
         const split_enc = allocator.alloc(u8, off16_bytes + 512) catch return 0;
         defer allocator.free(split_enc);
-        const hi_n = entropy_enc.encodeArrayU8(allocator, split_enc, hi_bytes, options, speed_tradeoff, null, 0, null) catch return 0;
-        const lo_n = entropy_enc.encodeArrayU8(allocator, split_enc[hi_n..], lo_bytes, options, speed_tradeoff, null, 0, null) catch return 0;
+        const hi_n = entropy_enc.encodeArrayU8(allocator, split_enc, hi_bytes, ent_opts, speed_tradeoff, null, 0, null) catch return 0;
+        const lo_n = entropy_enc.encodeArrayU8(allocator, split_enc[hi_n..], lo_bytes, ent_opts, speed_tradeoff, null, 0, null) catch return 0;
         const split_total = hi_n + lo_n;
         if (split_total < off16_bytes) {
             if (wp + 2 + split_total > dst.len) return 0;
@@ -748,10 +753,12 @@ pub fn compressFramedOne(
             break :gpu_compress;
 
         // Re-encode GPU raw sub-chunks with entropy (tANS) if level >= 2
-        // TODO: enable tANS once multi-chunk entropy roundtrip bug is fixed
-        // Single-chunk tANS roundtrips correctly; multi-chunk has a decoder
-        // interaction issue with mixed raw/entropy sub-chunks.
         const gpu_entropy_opts: entropy_enc.EntropyOptions = .{
+            .allow_tans = true,
+            .allow_rle_entropy = true,
+            .allow_double_huffman = true,
+            .allow_rle = true,
+            .supports_new_huffman = true,
             .supports_short_memset = true,
         };
         const gpu_speed_tradeoff = cost_coeffs.speedTradeoffFor(
