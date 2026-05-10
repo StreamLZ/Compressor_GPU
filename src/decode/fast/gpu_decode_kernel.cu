@@ -25,25 +25,27 @@ struct SlzChunkDesc {
 };
 
 // ── Extended length decode ─────────────────────────────────────
-// Reads a variable-length count from the length stream (used for
-// tokens 0, 1, 2 whose lengths exceed the inline capacity).
-__device__ uint32_t readLength(const uint8_t* &len_stream, const uint8_t* len_end) {
-    if (len_stream >= len_end) return 0;
-    uint32_t v = *len_stream;
+// Reads a variable-length count from the length stream. Uses a uint32
+// offset from len_data base to avoid 64-bit pointer register pressure.
+__device__ uint32_t readLength(const uint8_t* len_data, uint32_t &len_off, uint32_t len_avail) {
+    if (len_off >= len_avail) return 0;
+    uint32_t v = len_data[len_off];
     if (v > 251) {
-        if (len_stream + 2 >= len_end) { len_stream++; return v; }
+        if (len_off + 2 >= len_avail) { len_off++; return v; }
         uint16_t extra;
-        memcpy(&extra, len_stream + 1, 2);
+        memcpy(&extra, len_data + len_off + 1, 2);
         v += (uint32_t)extra * 4;
-        len_stream += 2;
+        len_off += 2;
     }
-    len_stream++;
+    len_off++;
     return v;
 }
 
 // ── L1 raw-mode sub-chunk decoder ──────────────────────────────
 // Streamlined single-block raw decoder for 64KB chunks.
 // No off32, no delta, no block split — fastest path for L1 data.
+// Register-optimized: uses uint32 offsets instead of 64-bit pointers,
+// removes redundant bounds checks and shuffles.
 __device__ void decodeSubChunkL1(
     const uint8_t* __restrict__ cmd, uint32_t cmd_size,
     const uint8_t* __restrict__ lit, uint32_t lit_size,
@@ -57,17 +59,15 @@ __device__ void decodeSubChunkL1(
     uint32_t cmd_pos = 0, lit_pos = 0, off16_pos = 0;
     uint32_t dst_pos = dst_offset + initial_copy;
     int32_t recent_offset = -8;
-    const uint32_t dst_end_abs = dst_offset + dst_size;
-    const uint8_t* len_stream = len_data;
-    const uint8_t* len_end = len_data + len_avail;
+    uint32_t len_off = 0;
 
     while (cmd_pos < cmd_size) {
         uint32_t local_lit = 0, local_match = 0;
         int32_t offset = recent_offset;
-        uint32_t use_recent = 0, is_lit_only = 0;
+        uint32_t use_recent = 0;
 
         if (lane == 0) {
-            uint32_t token = cmd[cmd_pos++];
+            uint32_t token = cmd[cmd_pos];
             if (token >= 24) {
                 local_lit = token & 7;
                 local_match = (token >> 3) & 0xF;
@@ -78,70 +78,55 @@ __device__ void decodeSubChunkL1(
                     off16_pos++;
                 }
             } else if (token == 0) {
-                is_lit_only = 1;
-                local_lit = readLength(len_stream, len_end) + 64;
+                use_recent = 1;
+                local_lit = readLength(len_data, len_off, len_avail) + 64;
             } else if (token == 1) {
-                local_match = readLength(len_stream, len_end) + 91;
+                local_match = readLength(len_data, len_off, len_avail) + 91;
                 if (off16_pos < off16_count) {
                     uint16_t v; memcpy(&v, off16_raw + off16_pos * 2, 2);
                     offset = -(int32_t)v; off16_pos++;
                 }
             }
         }
+        cmd_pos++;
 
         local_lit   = __shfl_sync(0xFFFFFFFF, local_lit, 0);
         local_match = __shfl_sync(0xFFFFFFFF, local_match, 0);
         offset      = __shfl_sync(0xFFFFFFFF, offset, 0);
         use_recent  = __shfl_sync(0xFFFFFFFF, use_recent, 0);
-        is_lit_only = __shfl_sync(0xFFFFFFFF, is_lit_only, 0);
-        cmd_pos     = __shfl_sync(0xFFFFFFFF, cmd_pos, 0);
-        lit_pos     = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
         off16_pos   = __shfl_sync(0xFFFFFFFF, off16_pos, 0);
 
         if (local_lit > 0) {
             for (uint32_t i = lane; i < local_lit; i += 32)
-                if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size)
-                    dst[dst_pos + i] = lit[lit_pos + i];
+                dst[dst_pos + i] = lit[lit_pos + i];
             __syncwarp();
-            dst_pos += local_lit;
-            lit_pos += local_lit;
         }
+        dst_pos += local_lit;
+        lit_pos += local_lit;
 
         if (local_match > 0) {
             uint32_t ms = (uint32_t)((int32_t)dst_pos + offset);
             int32_t abs_off = -offset;
             if (abs_off >= (int32_t)local_match && local_match > 1) {
                 for (uint32_t i = lane; i < local_match; i += 32)
-                    if (dst_pos + i < dst_end_abs)
-                        dst[dst_pos + i] = dst[ms + i];
+                    dst[dst_pos + i] = dst[ms + i];
             } else {
                 if (lane == 0)
                     for (uint32_t i = 0; i < local_match; i++)
-                        if (dst_pos + i < dst_end_abs)
-                            dst[dst_pos + i] = dst[ms + i];
+                        dst[dst_pos + i] = dst[ms + i];
             }
             __syncwarp();
-            dst_pos += local_match;
         }
+        dst_pos += local_match;
 
-        dst_pos   = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
-        lit_pos   = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
-        if (!use_recent && !is_lit_only) recent_offset = offset;
+        if (!use_recent) recent_offset = offset;
         recent_offset = __shfl_sync(0xFFFFFFFF, recent_offset, 0);
-        {
-            uint32_t len_off = (uint32_t)((uintptr_t)len_stream - (uintptr_t)len_data);
-            len_off = __shfl_sync(0xFFFFFFFF, len_off, 0);
-            len_stream = len_data + len_off;
-        }
+        len_off = __shfl_sync(0xFFFFFFFF, len_off, 0);
     }
 
-    __syncwarp();
-    dst_pos = __shfl_sync(0xFFFFFFFF, dst_pos, 0);
-    lit_pos = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
     uint32_t trailing = (lit_size > lit_pos) ? (lit_size - lit_pos) : 0;
     for (uint32_t i = lane; i < trailing; i += 32)
-        if (dst_pos + i < dst_end_abs)
-            dst[dst_pos + i] = lit[lit_pos + i];
+        dst[dst_pos + i] = lit[lit_pos + i];
 }
 
 // ── General sub-chunk decoder ──────────────────────────────────
@@ -166,8 +151,7 @@ __device__ void decodeSubChunk(
     uint32_t dst_pos = dst_offset + initial_copy;
     int32_t recent_offset = -8;
     uint32_t dst_end_abs = dst_offset + dst_size;
-    const uint8_t* len_stream = len_data;
-    const uint8_t* len_end = len_data + len_avail;
+    uint32_t len_off = 0;
     const uint8_t* off32_cur = off32_raw1;
     uint32_t off32_count_cur = off32_count1;
     uint32_t block_dst_start = dst_offset;
@@ -196,10 +180,10 @@ __device__ void decodeSubChunk(
                 }
             } else if (token == 0) {
                 token_type = 1;
-                local_lit = readLength(len_stream, len_end) + 64;
+                local_lit = readLength(len_data, len_off, len_avail) + 64;
             } else if (token == 1) {
                 token_type = 2;
-                local_match = readLength(len_stream, len_end) + 91;
+                local_match = readLength(len_data, len_off, len_avail) + 91;
                 if (off16_pos < off16_count) {
                     uint16_t v; memcpy(&v, off16_raw + off16_pos * 2, 2);
                     offset = -(int32_t)v; off16_pos++;
@@ -207,7 +191,7 @@ __device__ void decodeSubChunk(
                 use_recent = 0;
             } else if (token == 2) {
                 token_type = 4;
-                local_match = readLength(len_stream, len_end) + 29;
+                local_match = readLength(len_data, len_off, len_avail) + 29;
                 if (off32_pos < off32_count_cur) {
                     uint32_t v; memcpy(&v, off32_cur + off32_pos * 4, 4);
                     offset = (int32_t)block_dst_start - (int32_t)v - (int32_t)dst_pos;
@@ -275,11 +259,7 @@ __device__ void decodeSubChunk(
         lit_pos   = __shfl_sync(0xFFFFFFFF, lit_pos, 0);
         if (!use_recent && (token_type != 1)) recent_offset = offset;
         recent_offset = __shfl_sync(0xFFFFFFFF, recent_offset, 0);
-        {
-            uint32_t len_off = (uint32_t)((uintptr_t)len_stream - (uintptr_t)len_data);
-            len_off = __shfl_sync(0xFFFFFFFF, len_off, 0);
-            len_stream = len_data + len_off;
-        }
+        len_off = __shfl_sync(0xFFFFFFFF, len_off, 0);
     }
 
     __syncwarp();
@@ -498,7 +478,7 @@ __device__ void parseAndDecodeSubChunk(
 // ── Production kernel ──────────────────────────────────────────
 // Full GPU L1 kernel: 1 block per SC group, parses raw compressed
 // chunks on-GPU. 2 warps per block for SM occupancy.
-extern "C" __global__ void __launch_bounds__(64, 20) slzFullDecompressL1Kernel(
+extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
     const uint8_t* __restrict__ compressed,
     const SlzChunkDesc* __restrict__ chunks,
     uint8_t* __restrict__ dst,
