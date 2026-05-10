@@ -9,7 +9,21 @@ const fast_dec = @import("fast_lz_decoder.zig");
 const win32 = struct {
     extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.c) ?*anyopaque;
     extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.c) ?*anyopaque;
+    extern "kernel32" fn QueryPerformanceCounter(lpPerformanceCount: *i64) callconv(.c) i32;
+    extern "kernel32" fn QueryPerformanceFrequency(lpFrequency: *i64) callconv(.c) i32;
 };
+
+fn qpcNow() i64 {
+    var v: i64 = 0;
+    _ = win32.QueryPerformanceCounter(&v);
+    return v;
+}
+
+fn qpcFreq() i64 {
+    var v: i64 = 0;
+    _ = win32.QueryPerformanceFrequency(&v);
+    return v;
+}
 
 // ── Vulkan handle/constant types ────────────────────────────────
 const VkResult = i32;
@@ -290,6 +304,8 @@ var vk_pipe_layout: Handle = null;
 var vk_dsl: Handle = null;
 var vk_desc_pool: Handle = null;
 var vk_desc_set: Handle = null;
+var vk_query_pool: Handle = null;
+var timestamp_period: f32 = 1.0; // nanoseconds per tick
 var mem_props: VkPhysicalDeviceMemoryProperties = undefined;
 
 // Persistent buffers (grow as needed)
@@ -328,6 +344,7 @@ pub fn init() bool {
     if (!initPipeline()) return false;
     if (!initDescPool()) return false;
     if (!initCmdResources()) return false;
+    if (!initTimestampQuery()) return false;
 
     vk_ok = true;
     return true;
@@ -470,6 +487,33 @@ fn initCmdResources() bool {
 
     var fence_ci = VkFenceCreateInfo{};
     return createFence(vk_dev, &fence_ci, null, &vk_fence) == VK_SUCCESS;
+}
+
+const VkQueryPoolCreateInfo = extern struct {
+    sType: u32 = 73, // VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO
+    pNext: ?*anyopaque = null,
+    flags: u32 = 0,
+    queryType: u32 = 2, // VK_QUERY_TYPE_TIMESTAMP
+    queryCount: u32 = 2,
+    pipelineStatistics: u32 = 0,
+};
+
+fn initTimestampQuery() bool {
+    const createQP = vkProc(*const fn (Handle, *const VkQueryPoolCreateInfo, ?*anyopaque, *Handle) callconv(.c) VkResult, "vkCreateQueryPool") orelse return false;
+    const getProps = vkProc(*const fn (Handle, *VkPhysicalDeviceProperties) callconv(.c) void, "vkGetPhysicalDeviceProperties") orelse return false;
+
+    var qp_ci = VkQueryPoolCreateInfo{};
+    if (createQP(vk_dev, &qp_ci, null, &vk_query_pool) != VK_SUCCESS) return false;
+
+    var props: VkPhysicalDeviceProperties = undefined;
+    getProps(vk_phys, &props);
+    // timestampPeriod is at a fixed offset in VkPhysicalDeviceLimits.
+    // Rather than defining the full 504-byte struct, read it from the
+    // limits blob. timestampPeriod is a float at offset 292 within limits.
+    const limits_base: [*]const u8 = &props.limits;
+    timestamp_period = @as(*align(1) const f32, @ptrCast(limits_base + 292)).*;
+
+    return true;
 }
 
 // ── Buffer helpers ──────────────────────────────────────────────
@@ -638,6 +682,7 @@ pub fn fullVkLaunch(
     io: ?std.Io,
 ) fast_dec.DecodeError!void {
     if (!init()) return error.BadMode;
+    _ = io;
 
     const updateDS = vkProc(*const fn (Handle, u32, [*]const VkWriteDescriptorSet, u32, ?*anyopaque) callconv(.c) void, "vkUpdateDescriptorSets") orelse return error.BadMode;
     const beginCB = vkProc(*const fn (Handle, *const VkCommandBufferBeginInfo) callconv(.c) VkResult, "vkBeginCommandBuffer") orelse return error.BadMode;
@@ -660,11 +705,13 @@ pub fn fullVkLaunch(
     if (!ensureBuf(&b_desc, &m_desc, &b_desc_sz, desc_bytes)) return error.BadMode;
 
     // Upload data (staging → device-local on discrete GPUs)
+    const t_io_start = qpcNow();
     if (compressed_block.len > 0)
         if (!uploadToDevice(b_comp, m_comp, compressed_block.ptr, compressed_block.len)) return error.BadMode;
     if (!uploadToDevice(b_desc, m_desc, @ptrCast(chunk_descs.ptr), desc_bytes)) return error.BadMode;
     if (dst_start_off > 0)
         if (!uploadToDevice(b_out, m_out, dst_full, dst_start_off)) return error.BadMode;
+    const t_after_upload = qpcNow();
 
     // Update descriptor set
     var buf_infos = [3]VkDescriptorBufferInfo{
@@ -692,9 +739,15 @@ pub fn fullVkLaunch(
     pushConst(vk_cmd_buf, vk_pipe_layout, VK_SHADER_COMPUTE, 0, 12, @ptrCast(&pc_data));
 
     const grid_x = (num_groups + 1) / 2;
-    const t_before = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
 
+    // GPU timestamps around the dispatch for kernel-only timing
+    const resetQP = vkProc(*const fn (Handle, Handle, u32, u32) callconv(.c) void, "vkCmdResetQueryPool") orelse return error.BadMode;
+    const writeTS = vkProc(*const fn (Handle, u32, Handle, u32) callconv(.c) void, "vkCmdWriteTimestamp") orelse return error.BadMode;
+
+    resetQP(vk_cmd_buf, vk_query_pool, 0, 2);
+    writeTS(vk_cmd_buf, 0x1, vk_query_pool, 0); // VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
     dispatch(vk_cmd_buf, grid_x, 1, 1);
+    writeTS(vk_cmd_buf, 0x2000, vk_query_pool, 1); // VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
 
     if (endCB(vk_cmd_buf) != VK_SUCCESS) return error.BadMode;
 
@@ -704,12 +757,25 @@ pub fn fullVkLaunch(
     _ = waitFence(vk_dev, 1, &[1]Handle{vk_fence}, 1, ~@as(u64, 0));
     _ = resetFence(vk_dev, 1, &[1]Handle{vk_fence});
 
-    if (t_before) |t_start| {
-        if (io) |io_val| {
-            last_kernel_ns = @intCast(t_start.untilNow(io_val, .awake).toNanoseconds());
+    // Read GPU timestamps for kernel-only timing
+    if (vk_query_pool != null) {
+        const getResults = vkProc(*const fn (Handle, Handle, u32, u32, usize, *anyopaque, VkDeviceSize, u32) callconv(.c) VkResult, "vkGetQueryPoolResults") orelse return error.BadMode;
+        var timestamps: [2]u64 = .{ 0, 0 };
+        if (getResults(vk_dev, vk_query_pool, 0, 2, @sizeOf([2]u64), @ptrCast(&timestamps), 8, 3) == VK_SUCCESS) {
+            const ticks = timestamps[1] -% timestamps[0];
+            last_kernel_ns = @intFromFloat(@as(f64, @floatFromInt(ticks)) * @as(f64, timestamp_period));
         }
     }
 
     // Download output (device-local → staging → host on discrete GPUs)
+    const t_before_download = qpcNow();
     if (!downloadFromDevice(b_out, m_out, dst_full + dst_start_off, dst_start_off, decompressed_size)) return error.BadMode;
+    const t_after_download = qpcNow();
+
+    const freq = qpcFreq();
+    const upload_ticks = t_after_upload - t_io_start;
+    const download_ticks = t_after_download - t_before_download;
+    const total_ticks = t_after_download - t_io_start;
+    const kernel_ticks = total_ticks - upload_ticks - download_ticks;
+    last_kernel_ns = @intCast(@divTrunc(kernel_ticks * 1_000_000_000, freq));
 }

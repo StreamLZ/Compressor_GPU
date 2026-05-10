@@ -940,8 +940,9 @@ fn runBenchDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
         total_ns += elapsed;
         if (use_gpu_bench) {
             const gpu = @import("decode/fast/gpu_driver.zig");
-            if (gpu.last_kernel_ns > 0) {
-                const kns = gpu.last_kernel_ns;
+            const vk = @import("decode/fast/vk_driver.zig");
+            const kns = if (gpu.last_kernel_ns > 0) gpu.last_kernel_ns else vk.last_kernel_ns;
+            if (kns > 0) {
                 if (kns < best_kern_ns) best_kern_ns = kns;
                 total_kern_ns += kns;
             }
