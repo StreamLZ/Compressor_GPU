@@ -344,7 +344,7 @@ pub fn init() bool {
     if (!initPipeline()) return false;
     if (!initDescPool()) return false;
     if (!initCmdResources()) return false;
-    if (!initTimestampQuery()) return false;
+    _ = initTimestampQuery(); // non-fatal: timestamps are optional
 
     vk_ok = true;
     return true;
@@ -689,12 +689,16 @@ pub fn fullVkLaunch(
     const endCB = vkProc(*const fn (Handle) callconv(.c) VkResult, "vkEndCommandBuffer") orelse return error.BadMode;
     const resetCB = vkProc(*const fn (Handle, u32) callconv(.c) VkResult, "vkResetCommandBuffer") orelse return error.BadMode;
     const bindPipe = vkProc(*const fn (Handle, u32, Handle) callconv(.c) void, "vkCmdBindPipeline") orelse return error.BadMode;
-    const bindDS = vkProc(*const fn (Handle, u32, Handle, u32, u32, [*]const Handle, u32, ?*const u32) callconv(.c) void, "vkCmdBindDescriptorSets") orelse return error.BadMode;
+    const bindDS_fn = vkProc(*const fn (Handle, u32, Handle, u32, u32, [*]const Handle, u32, ?*const u32) callconv(.c) void, "vkCmdBindDescriptorSets") orelse return error.BadMode;
     const pushConst = vkProc(*const fn (Handle, Handle, u32, u32, u32, *const anyopaque) callconv(.c) void, "vkCmdPushConstants") orelse return error.BadMode;
-    const dispatch = vkProc(*const fn (Handle, u32, u32, u32) callconv(.c) void, "vkCmdDispatch") orelse return error.BadMode;
+    const dispatchFn = vkProc(*const fn (Handle, u32, u32, u32) callconv(.c) void, "vkCmdDispatch") orelse return error.BadMode;
     const queueSubmit = vkProc(*const fn (Handle, u32, [*]const VkSubmitInfo, Handle) callconv(.c) VkResult, "vkQueueSubmit") orelse return error.BadMode;
     const waitFence = vkProc(*const fn (Handle, u32, [*]const Handle, u32, u64) callconv(.c) VkResult, "vkWaitForFences") orelse return error.BadMode;
     const resetFence = vkProc(*const fn (Handle, u32, [*]const Handle) callconv(.c) VkResult, "vkResetFences") orelse return error.BadMode;
+    const cmdCopy = vkProc(*const fn (Handle, Handle, Handle, u32, [*]const VkBufferCopy) callconv(.c) void, "vkCmdCopyBuffer") orelse return error.BadMode;
+    const resetQP = vkProc(*const fn (Handle, Handle, u32, u32) callconv(.c) void, "vkCmdResetQueryPool") orelse return error.BadMode;
+    const writeTS = vkProc(*const fn (Handle, u32, Handle, u32) callconv(.c) void, "vkCmdWriteTimestamp") orelse return error.BadMode;
+    const pipeBarrier = vkProc(*const fn (Handle, u32, u32, u32, ?*const anyopaque, u32, ?*const anyopaque, u32, ?*const anyopaque) callconv(.c) void, "vkCmdPipelineBarrier") orelse return error.BadMode;
 
     const total_output = dst_start_off + decompressed_size;
     const comp_bytes = if (compressed_block.len > 0) compressed_block.len else 4;
@@ -704,60 +708,103 @@ pub fn fullVkLaunch(
     if (!ensureBuf(&b_out, &m_out, &b_out_sz, total_output + 64)) return error.BadMode;
     if (!ensureBuf(&b_desc, &m_desc, &b_desc_sz, desc_bytes)) return error.BadMode;
 
-    // Upload data (staging → device-local on discrete GPUs)
-    const t_io_start = qpcNow();
-    if (compressed_block.len > 0)
-        if (!uploadToDevice(b_comp, m_comp, compressed_block.ptr, compressed_block.len)) return error.BadMode;
-    if (!uploadToDevice(b_desc, m_desc, @ptrCast(chunk_descs.ptr), desc_bytes)) return error.BadMode;
-    if (dst_start_off > 0)
-        if (!uploadToDevice(b_out, m_out, dst_full, dst_start_off)) return error.BadMode;
-    const t_after_upload = qpcNow();
+    // ── Write upload data to host memory ──
+    // Staging layout for device-local path: [compressed | descriptors | dict_prefix]
+    const stage_off_comp: usize = 0;
+    const stage_off_desc: usize = comp_bytes;
+    const stage_off_dict: usize = comp_bytes + desc_bytes;
+    const staging_upload_size = comp_bytes + desc_bytes + dst_start_off;
 
-    // Update descriptor set
+    if (has_device_local) {
+        const dl_needed = if (staging_upload_size > total_output + 64) staging_upload_size else total_output + 64;
+        if (!ensureStaging(dl_needed)) return error.BadMode;
+
+        // Single map, write all upload data at sequential offsets
+        const p = mapMem(m_staging, 0, staging_upload_size) orelse return error.BadMode;
+        if (compressed_block.len > 0)
+            @memcpy(p[stage_off_comp..][0..compressed_block.len], compressed_block);
+        @memcpy(p[stage_off_desc..][0..desc_bytes], @as([*]const u8, @ptrCast(chunk_descs.ptr))[0..desc_bytes]);
+        if (dst_start_off > 0)
+            @memcpy(p[stage_off_dict..][0..dst_start_off], dst_full[0..dst_start_off]);
+        unmapMem(m_staging);
+    } else {
+        // Host-visible (iGPU): write directly to device buffers
+        if (compressed_block.len > 0) {
+            const p = mapMem(m_comp, 0, compressed_block.len) orelse return error.BadMode;
+            @memcpy(p[0..compressed_block.len], compressed_block);
+            unmapMem(m_comp);
+        }
+        {
+            const p = mapMem(m_desc, 0, desc_bytes) orelse return error.BadMode;
+            @memcpy(p[0..desc_bytes], @as([*]const u8, @ptrCast(chunk_descs.ptr))[0..desc_bytes]);
+            unmapMem(m_desc);
+        }
+        if (dst_start_off > 0) {
+            const p = mapMem(m_out, 0, dst_start_off) orelse return error.BadMode;
+            @memcpy(p[0..dst_start_off], dst_full[0..dst_start_off]);
+            unmapMem(m_out);
+        }
+    }
+
+    // ── Update descriptor set ──
     var buf_infos = [3]VkDescriptorBufferInfo{
         .{ .buffer = b_comp, .range = comp_bytes },
         .{ .buffer = b_out, .range = total_output + 64 },
         .{ .buffer = b_desc, .range = desc_bytes },
     };
-    var writes = [3]VkWriteDescriptorSet{
+    var desc_writes = [3]VkWriteDescriptorSet{
         .{ .dstSet = vk_desc_set, .dstBinding = 0, .descriptorType = VK_DESC_STORAGE_BUFFER, .pBufferInfo = &buf_infos[0] },
         .{ .dstSet = vk_desc_set, .dstBinding = 1, .descriptorType = VK_DESC_STORAGE_BUFFER, .pBufferInfo = &buf_infos[1] },
         .{ .dstSet = vk_desc_set, .dstBinding = 2, .descriptorType = VK_DESC_STORAGE_BUFFER, .pBufferInfo = &buf_infos[2] },
     };
-    updateDS(vk_dev, 3, &writes, 0, null);
+    updateDS(vk_dev, 3, &desc_writes, 0, null);
 
-    // Record command buffer
+    // ── Record single command buffer: [copies] → barrier → dispatch → barrier → [copy back] ──
     _ = resetCB(vk_cmd_buf, 0);
     var begin_info = VkCommandBufferBeginInfo{};
     if (beginCB(vk_cmd_buf, &begin_info) != VK_SUCCESS) return error.BadMode;
 
+    if (has_device_local) {
+        // Staging → device copies (offsets match staging layout)
+        if (compressed_block.len > 0)
+            cmdCopy(vk_cmd_buf, b_staging, b_comp, 1, &[1]VkBufferCopy{.{ .srcOffset = stage_off_comp, .size = compressed_block.len }});
+        cmdCopy(vk_cmd_buf, b_staging, b_desc, 1, &[1]VkBufferCopy{.{ .srcOffset = stage_off_desc, .size = desc_bytes }});
+        if (dst_start_off > 0)
+            cmdCopy(vk_cmd_buf, b_staging, b_out, 1, &[1]VkBufferCopy{.{ .srcOffset = stage_off_dict, .size = dst_start_off }});
+        // Barrier: transfer → compute
+        pipeBarrier(vk_cmd_buf, 0x1000, 0x800, 0, null, 0, null, 0, null);
+    }
+
     bindPipe(vk_cmd_buf, VK_BIND_COMPUTE, vk_pipeline);
     var ds_arr = [1]Handle{vk_desc_set};
-    bindDS(vk_cmd_buf, VK_BIND_COMPUTE, vk_pipe_layout, 0, 1, &ds_arr, 0, null);
-
+    bindDS_fn(vk_cmd_buf, VK_BIND_COMPUTE, vk_pipe_layout, 0, 1, &ds_arr, 0, null);
     var pc_data = [3]u32{ chunks_per_group, @intCast(chunk_descs.len), sub_chunk_cap };
     pushConst(vk_cmd_buf, vk_pipe_layout, VK_SHADER_COMPUTE, 0, 12, @ptrCast(&pc_data));
 
     const grid_x = (num_groups + 1) / 2;
-
-    // GPU timestamps around the dispatch for kernel-only timing
-    const resetQP = vkProc(*const fn (Handle, Handle, u32, u32) callconv(.c) void, "vkCmdResetQueryPool") orelse return error.BadMode;
-    const writeTS = vkProc(*const fn (Handle, u32, Handle, u32) callconv(.c) void, "vkCmdWriteTimestamp") orelse return error.BadMode;
-
     resetQP(vk_cmd_buf, vk_query_pool, 0, 2);
-    writeTS(vk_cmd_buf, 0x1, vk_query_pool, 0); // VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-    dispatch(vk_cmd_buf, grid_x, 1, 1);
-    writeTS(vk_cmd_buf, 0x2000, vk_query_pool, 1); // VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+    writeTS(vk_cmd_buf, 0x1, vk_query_pool, 0);
+    dispatchFn(vk_cmd_buf, grid_x, 1, 1);
+    writeTS(vk_cmd_buf, 0x2000, vk_query_pool, 1);
+
+    if (has_device_local) {
+        // Barrier: compute → transfer
+        pipeBarrier(vk_cmd_buf, 0x800, 0x1000, 0, null, 0, null, 0, null);
+        // Device → staging copy for output
+        cmdCopy(vk_cmd_buf, b_out, b_staging, 1, &[1]VkBufferCopy{.{ .srcOffset = dst_start_off, .size = decompressed_size }});
+    }
 
     if (endCB(vk_cmd_buf) != VK_SUCCESS) return error.BadMode;
 
-    // Submit and wait
+    // ── Single submit, single fence ──
+    const t_submit = qpcNow();
     const submit = VkSubmitInfo{ .commandBufferCount = 1, .pCommandBuffers = &vk_cmd_buf };
     if (queueSubmit(vk_queue, 1, &[1]VkSubmitInfo{submit}, vk_fence) != VK_SUCCESS) return error.BadMode;
     _ = waitFence(vk_dev, 1, &[1]Handle{vk_fence}, 1, ~@as(u64, 0));
     _ = resetFence(vk_dev, 1, &[1]Handle{vk_fence});
+    const t_after_fence = qpcNow();
 
-    // Read GPU timestamps for kernel-only timing
+    // ── Read GPU timestamps ──
     if (vk_query_pool != null) {
         const getResults = vkProc(*const fn (Handle, Handle, u32, u32, usize, *anyopaque, VkDeviceSize, u32) callconv(.c) VkResult, "vkGetQueryPoolResults") orelse return error.BadMode;
         var timestamps: [2]u64 = .{ 0, 0 };
@@ -767,15 +814,19 @@ pub fn fullVkLaunch(
         }
     }
 
-    // Download output (device-local → staging → host on discrete GPUs)
-    const t_before_download = qpcNow();
-    if (!downloadFromDevice(b_out, m_out, dst_full + dst_start_off, dst_start_off, decompressed_size)) return error.BadMode;
-    const t_after_download = qpcNow();
-
+    // Report phase times via last_kernel_ns (submit+fence time = GPU work)
     const freq = qpcFreq();
-    const upload_ticks = t_after_upload - t_io_start;
-    const download_ticks = t_after_download - t_before_download;
-    const total_ticks = t_after_download - t_io_start;
-    const kernel_ticks = total_ticks - upload_ticks - download_ticks;
-    last_kernel_ns = @intCast(@divTrunc(kernel_ticks * 1_000_000_000, freq));
+    const fence_ns = @divTrunc((t_after_fence - t_submit) * 1_000_000_000, freq);
+    last_kernel_ns = fence_ns;
+
+    // ── Read back output ──
+    if (has_device_local) {
+        const p = mapMem(m_staging, 0, decompressed_size) orelse return error.BadMode;
+        @memcpy((dst_full + dst_start_off)[0..decompressed_size], p[0..decompressed_size]);
+        unmapMem(m_staging);
+    } else {
+        const p = mapMem(m_out, dst_start_off, decompressed_size) orelse return error.BadMode;
+        @memcpy((dst_full + dst_start_off)[0..decompressed_size], p[0..decompressed_size]);
+        unmapMem(m_out);
+    }
 }
