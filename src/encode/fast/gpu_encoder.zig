@@ -153,7 +153,7 @@ pub fn gpuCompress(
 
     const t_before = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
 
-    // Launch: 2 warps per block
+    // Launch: 1 warp per block, shared memory hash table
     var p_input = d_input;
     var p_output = d_output;
     var p_descs = d_descs;
@@ -171,8 +171,7 @@ pub fn gpuCompress(
     };
     var extra = [_]?*anyopaque{null};
 
-    const grid_x = (num_chunks + 1) / 2;
-    if (launch_fn(kernel_fn, grid_x, 1, 1, 32, 2, 1, 0, 0, &params, &extra) != CUDA_SUCCESS)
+    if (launch_fn(kernel_fn, num_chunks, 1, 1, 32, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS)
         return false;
 
     if (sync_fn() != CUDA_SUCCESS) return false;

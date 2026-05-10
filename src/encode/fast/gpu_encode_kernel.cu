@@ -1,13 +1,13 @@
 // ── StreamLZ GPU L1 Compress Kernel ─────────────────────────────
-// Warp-parallel greedy scan: all 32 lanes participate in match
-// finding (MATCH.ANY + hash table) and extension (VOTE/ballot).
-// Token emission on lane 0 using StreamLZ separated stream format.
+// Warp-parallel greedy scan with shared-memory hash table.
+// 1 warp per block, 32KB hash table in shared memory for
+// ~30-cycle probe latency vs ~hundreds from global memory.
 //
 // Build: nvcc -ptx -arch=sm_89 -O3 gpu_encode_kernel.cu
 
 #include <cstdint>
 
-static constexpr uint32_t HASH_BITS    = 14;
+static constexpr uint32_t HASH_BITS    = 11;
 static constexpr uint32_t HASH_SIZE    = 1 << HASH_BITS;
 static constexpr uint32_t HASH_MASK    = HASH_SIZE - 1;
 static constexpr uint32_t MIN_MATCH    = 4;
@@ -113,23 +113,24 @@ __device__ void emitCmd(
     off16_count++;
 }
 
-extern "C" __global__ void __launch_bounds__(64, 16) slzCompressL1Kernel(
+// 1 warp per block, 32KB shared memory hash table
+extern "C" __global__ void __launch_bounds__(32, 24) slzCompressL1Kernel(
     const uint8_t* __restrict__ input,
     uint8_t* __restrict__ output,
     const CompressChunkDesc* __restrict__ descs,
-    uint16_t* __restrict__ hash_tables,
+    uint16_t* __restrict__ hash_tables_unused,
     uint32_t* __restrict__ comp_sizes,
     uint32_t total_chunks
 ) {
-    const uint32_t warp_id = threadIdx.y;
-    const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
+    __shared__ uint16_t ht[HASH_SIZE];
+
+    const uint32_t chunk_id = blockIdx.x;
     const uint32_t lane = threadIdx.x & 31;
     if (chunk_id >= total_chunks) return;
 
     const CompressChunkDesc& desc = descs[chunk_id];
     const uint8_t* src = input + desc.src_offset;
     const uint32_t src_size = desc.src_size;
-    uint16_t* ht = hash_tables + chunk_id * HASH_SIZE;
 
     for (uint32_t i = lane; i < HASH_SIZE; i += 32)
         ht[i] = 0xFFFF;
@@ -163,7 +164,6 @@ extern "C" __global__ void __launch_bounds__(64, 16) slzCompressL1Kernel(
         else active_count = 0;
         bool is_active = (lane < active_count);
 
-        // Probe hash table (read-only, no write yet)
         uint32_t h = hashKey(key4);
         bool hash_match = false;
         uint32_t hash_ref = 0;
@@ -198,9 +198,6 @@ extern "C" __global__ void __launch_bounds__(64, 16) slzCompressL1Kernel(
 
         uint32_t match_ballot = __ballot_sync(0xFFFFFFFF, has_match);
 
-        // Deferred HT write: only update consumed positions
-        // On no-match: all active positions are consumed (advance by active_count)
-        // On match: only positions 0..first_lane are consumed
         {
             uint32_t write_limit = (match_ballot != 0)
                 ? (uint32_t)(__ffs(match_ballot) - 1) : active_count;
@@ -243,11 +240,9 @@ extern "C" __global__ void __launch_bounds__(64, 16) slzCompressL1Kernel(
 
             lit_count += lit_len;
 
-            // Warp-uniform offset computation (all lanes participate)
             int32_t neg_off = -(int32_t)(match_pos - match_ref);
             uint32_t off_param = (neg_off == recent_offset) ? 0 : (uint32_t)(-neg_off);
 
-            // Inline fast path avoids emitCmd function call overhead
             if (lit_len <= 7 && match_len <= 15 && off_param <= 0xFFFF) {
                 if (lane == 0) {
                     uint8_t token = (uint8_t)(lit_len + 8 * match_len);
