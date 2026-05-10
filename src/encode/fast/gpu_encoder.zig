@@ -148,10 +148,7 @@ pub fn gpuCompress(
     // Upload input + descriptors, zero sizes
     _ = h2d_fn(d_input, @ptrCast(input.ptr), input.len);
     _ = h2d_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes);
-    if (cuMemsetD8_fn) |memset_fn| {
-        const ms_res = memset_fn(d_sizes, 0x42, sizes_bytes);
-        std.debug.print("memset result={d} d_sizes=0x{x} bytes={d}\n", .{ ms_res, d_sizes, sizes_bytes });
-    }
+    if (cuMemsetD8_fn) |memset_fn| _ = memset_fn(d_sizes, 0, sizes_bytes);
     _ = sync_fn();
 
     const t_before = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
@@ -175,17 +172,10 @@ pub fn gpuCompress(
     var extra = [_]?*anyopaque{null};
 
     const grid_x = (num_chunks + 1) / 2;
-    const launch_res = launch_fn(kernel_fn, grid_x, 1, 1, 32, 2, 1, 0, 0, &params, &extra);
-    if (launch_res != CUDA_SUCCESS) {
-        std.debug.print("GPU compress launch failed: {d}\n", .{launch_res});
+    if (launch_fn(kernel_fn, grid_x, 1, 1, 32, 2, 1, 0, 0, &params, &extra) != CUDA_SUCCESS)
         return false;
-    }
 
-    const sync_res = sync_fn();
-    if (sync_res != CUDA_SUCCESS) {
-        std.debug.print("GPU compress sync failed: {d}\n", .{sync_res});
-        return false;
-    }
+    if (sync_fn() != CUDA_SUCCESS) return false;
 
     if (t_before) |t_start| {
         if (io) |io_val| {
@@ -193,13 +183,8 @@ pub fn gpuCompress(
         }
     }
 
-    // Zero host buffer, then D2H, then check
-    @memset(std.mem.sliceAsBytes(comp_sizes_out), 0xAA);
-    std.debug.print("  before D2H: sizes[0] = 0x{x}\n", .{comp_sizes_out[0]});
-
-    const r1 = d2h_fn(@ptrCast(output.ptr), d_output, output.len);
-    const r2 = d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes);
-    std.debug.print("  after D2H: r1={d} r2={d} sizes[0] = 0x{x}\n", .{ r1, r2, comp_sizes_out[0] });
+    _ = d2h_fn(@ptrCast(output.ptr), d_output, output.len);
+    _ = d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes);
 
     return true;
 }

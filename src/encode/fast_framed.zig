@@ -572,7 +572,6 @@ pub fn compressFramedOne(
     // When gpu_mode and CUDA is available, compress all chunks on GPU
     // and assemble the frame from GPU results.
     if (opts.gpu_mode and can_compress) gpu_compress: {
-        std.debug.print("GPU path: pos={d} dst.len={d}\n", .{ pos, dst.len });
         const use_gpu_enc = comptime blk: {
             break :blk @hasDecl(@import("build_options"), "gpu") and @import("build_options").gpu;
         };
@@ -606,24 +605,12 @@ pub fn compressFramedOne(
                 .src_size = @intCast(chunk_size),
                 .dst_offset = @intCast(ci * per_chunk_cap),
                 .dst_capacity = @intCast(per_chunk_cap),
-                .is_first = if (ci == 0) 1 else 0,
+                .is_first = if (ci == 0 and dict_len == 0) @as(u32, 1) else 0,
             };
         }
 
         if (!gpu_enc.gpuCompress(effective_src, gpu_out, descs, comp_sizes, io))
             break :gpu_compress;
-
-        // Debug: check GPU compress results
-        {
-            var gpu_total: usize = 0;
-            var gpu_zero: usize = 0;
-            for (comp_sizes) |s| {
-                gpu_total += s;
-                if (s == 0) gpu_zero += 1;
-            }
-            std.debug.print("GPU compress: {d} chunks, {d} zero-size, total={d} bytes\n", .{ n_chunks, gpu_zero, gpu_total });
-            if (n_chunks > 0) std.debug.print("  chunk[0] comp_size={d} src_size={d}\n", .{ comp_sizes[0], descs[0].src_size });
-        }
 
         // Assemble frame from GPU-compressed chunks
         var soff: usize = dict_len;
