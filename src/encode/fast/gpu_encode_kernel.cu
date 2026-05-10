@@ -1,7 +1,7 @@
 // ── StreamLZ GPU L1 Compress Kernel ─────────────────────────────
 // Warp-parallel greedy scan with shared-memory hash table.
-// 1 warp per block, 32KB hash table in shared memory for
-// ~30-cycle probe latency vs ~hundreds from global memory.
+// 32-bit hash entries support chunks up to 256KB (sc_group=1).
+// 1 warp per block, 8KB hash table (2K × u32) in shared memory.
 //
 // Build: nvcc -ptx -arch=sm_89 -O3 gpu_encode_kernel.cu
 
@@ -12,6 +12,7 @@ static constexpr uint32_t HASH_SIZE    = 1 << HASH_BITS;
 static constexpr uint32_t HASH_MASK    = HASH_SIZE - 1;
 static constexpr uint32_t MIN_MATCH    = 4;
 static constexpr uint32_t INITIAL_COPY = 8;
+static constexpr uint32_t HASH_EMPTY   = 0xFFFFFFFFu;
 
 struct CompressChunkDesc {
     uint32_t src_offset;
@@ -113,16 +114,16 @@ __device__ void emitCmd(
     off16_count++;
 }
 
-// 1 warp per block, 32KB shared memory hash table
-extern "C" __global__ void __launch_bounds__(32, 24) slzCompressL1Kernel(
+// 1 warp per block, 8KB shared memory hash table (2K × u32)
+extern "C" __global__ void __launch_bounds__(32, 12) slzCompressL1Kernel(
     const uint8_t* __restrict__ input,
     uint8_t* __restrict__ output,
     const CompressChunkDesc* __restrict__ descs,
-    uint16_t* __restrict__ hash_tables_unused,
+    uint32_t* __restrict__ hash_tables_unused,
     uint32_t* __restrict__ comp_sizes,
     uint32_t total_chunks
 ) {
-    __shared__ uint16_t ht[HASH_SIZE];
+    __shared__ uint32_t ht[HASH_SIZE];
 
     const uint32_t chunk_id = blockIdx.x;
     const uint32_t lane = threadIdx.x & 31;
@@ -133,15 +134,16 @@ extern "C" __global__ void __launch_bounds__(32, 24) slzCompressL1Kernel(
     const uint32_t src_size = desc.src_size;
 
     for (uint32_t i = lane; i < HASH_SIZE; i += 32)
-        ht[i] = 0xFFFF;
+        ht[i] = HASH_EMPTY;
     __syncwarp();
 
     uint8_t* dst = output + desc.dst_offset;
     const uint32_t lit_data_start = (desc.is_first ? INITIAL_COPY : 0) + 3;
     uint8_t* lit_buf = dst + lit_data_start;
+    // Scale temp stream regions by src_size
     uint8_t* cmd_buf = dst + src_size;
-    uint8_t* off16_buf = cmd_buf + 16384;
-    uint8_t* len_buf = off16_buf + 32768;
+    uint8_t* off16_buf = cmd_buf + (src_size / 4);
+    uint8_t* len_buf = off16_buf + (src_size / 2);
 
     uint32_t lit_count = 0, token_count = 0, off16_count = 0, length_count = 0;
     uint32_t anchor = desc.is_first ? INITIAL_COPY : 0;
@@ -170,7 +172,7 @@ extern "C" __global__ void __launch_bounds__(32, 24) slzCompressL1Kernel(
 
         if (is_active) {
             uint32_t ref_val = ht[h];
-            if (ref_val != 0xFFFF && ref_val < my_pos) {
+            if (ref_val != HASH_EMPTY && ref_val < my_pos) {
                 uint32_t rk = (uint32_t)src[ref_val] |
                              ((uint32_t)src[ref_val+1] << 8) |
                              ((uint32_t)src[ref_val+2] << 16) |
@@ -202,7 +204,7 @@ extern "C" __global__ void __launch_bounds__(32, 24) slzCompressL1Kernel(
             uint32_t write_limit = (match_ballot != 0)
                 ? (uint32_t)(__ffs(match_ballot) - 1) : active_count;
             if (is_active && lane <= write_limit) {
-                ht[h] = (uint16_t)my_pos;
+                ht[h] = my_pos;
             }
         }
 

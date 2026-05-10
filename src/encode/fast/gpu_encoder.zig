@@ -98,7 +98,7 @@ pub const CompressChunkDesc = extern struct {
     is_first: u32,
 };
 
-const HASH_SIZE = 16384;
+const HASH_SIZE = 2048;
 
 pub var last_kernel_ns: i64 = 0;
 
@@ -122,7 +122,7 @@ pub fn gpuCompress(
 
     const num_chunks: u32 = @intCast(chunk_descs.len);
     const desc_bytes = chunk_descs.len * @sizeOf(CompressChunkDesc);
-    const hash_bytes = @as(usize, num_chunks) * HASH_SIZE * 2; // u16 per entry
+    const hash_bytes = @as(usize, num_chunks) * HASH_SIZE * 4; // u32 per entry
     const sizes_bytes = @as(usize, num_chunks) * 4;
 
     // Allocate device buffers
