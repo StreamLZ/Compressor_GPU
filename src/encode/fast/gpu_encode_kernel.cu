@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-static constexpr uint32_t HASH_BITS    = 11;
+static constexpr uint32_t HASH_BITS    = 12;
 static constexpr uint32_t HASH_SIZE    = 1 << HASH_BITS;
 static constexpr uint32_t HASH_MASK    = HASH_SIZE - 1;
 static constexpr uint32_t MIN_MATCH    = 4;
@@ -115,7 +115,7 @@ __device__ void emitCmd(
 }
 
 // 1 warp per block, 8KB shared memory hash table (2K × u32)
-extern "C" __global__ void __launch_bounds__(32, 12) slzCompressL1Kernel(
+extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
     const uint8_t* __restrict__ input,
     uint8_t* __restrict__ output,
     const CompressChunkDesc* __restrict__ descs,
@@ -146,6 +146,7 @@ extern "C" __global__ void __launch_bounds__(32, 12) slzCompressL1Kernel(
     uint8_t* len_buf = off16_buf + (src_size / 2);
 
     uint32_t lit_count = 0, token_count = 0, off16_count = 0, length_count = 0;
+    uint32_t cmd_stream2_offset = 0;
     uint32_t anchor = desc.is_first ? INITIAL_COPY : 0;
     int32_t recent_offset = -8;
     uint32_t pos = anchor;
@@ -172,7 +173,7 @@ extern "C" __global__ void __launch_bounds__(32, 12) slzCompressL1Kernel(
 
         if (is_active) {
             uint32_t ref_val = ht[h];
-            if (ref_val != HASH_EMPTY && ref_val < my_pos) {
+            if (ref_val != HASH_EMPTY && ref_val < my_pos && (my_pos - ref_val) <= 0xFFFF) {
                 uint32_t rk = (uint32_t)src[ref_val] |
                              ((uint32_t)src[ref_val+1] << 8) |
                              ((uint32_t)src[ref_val+2] << 16) |
@@ -263,6 +264,11 @@ extern "C" __global__ void __launch_bounds__(32, 12) slzCompressL1Kernel(
                 }
             }
             recent_offset = neg_off;
+
+            // Track block boundary for cmd_stream2_offset
+            if (cmd_stream2_offset == 0 && match_pos + match_len > 0x10000 && lane == 0) {
+                cmd_stream2_offset = token_count;
+            }
         }
 
         anchor = match_pos + match_len;
@@ -302,6 +308,13 @@ extern "C" __global__ void __launch_bounds__(32, 12) slzCompressL1Kernel(
         out_pos += 3;
         memcpy(dst + out_pos, cmd_buf, token_count);
         out_pos += token_count;
+
+        // cmd_stream2_offset: written for sub-chunks > 64KB
+        if (src_size > 0x10000) {
+            uint16_t cs2o = (cmd_stream2_offset > 0) ? (uint16_t)cmd_stream2_offset : (uint16_t)token_count;
+            memcpy(dst + out_pos, &cs2o, 2);
+            out_pos += 2;
+        }
 
         dst[out_pos] = (uint8_t)(off16_count & 0xFF);
         dst[out_pos + 1] = (uint8_t)((off16_count >> 8) & 0xFF);
