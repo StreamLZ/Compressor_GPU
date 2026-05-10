@@ -102,8 +102,8 @@ fn reencodeGpuWithEntropy(
     const lit_n = entropy_enc.encodeArrayU8Memcpy(dst[wp..], literals) catch return 0;
     wp += lit_n;
 
-    // Tokens: Huffman/RLE entropy (tANS disabled — pre-existing roundtrip bug)
     const ent_opts: entropy_enc.EntropyOptions = .{
+        .allow_tans = true,
         .allow_rle_entropy = true,
         .allow_double_huffman = true,
         .allow_rle = true,
