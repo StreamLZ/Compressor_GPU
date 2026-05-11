@@ -345,7 +345,8 @@ __device__ ChainMatch findMatchChain(
     int32_t recent_offset,
     uint32_t* first_hash, uint32_t* long_hash, uint16_t* next_hash,
     uint32_t hash_bits, uint32_t hash_mask,
-    uint32_t end_pos
+    uint32_t end_pos,
+    uint32_t lit_run_length
 ) {
     // Read 4 bytes at current position
     uint32_t bytes_at_pos = (uint32_t)src[pos]
@@ -386,9 +387,15 @@ __device__ ChainMatch findMatchChain(
         }
     }
 
+    // Min match length bump for long literal runs (matches CPU)
+    int32_t minimum_match_length = (int32_t)MIN_MATCH;
+    if (lit_run_length >= 64) {
+        if (recent_match_length < 3) recent_match_length = 0;
+        minimum_match_length += 1;
+    }
+
     int32_t best_offset = 0;
     int32_t best_match_length = 0;
-    int32_t minimum_match_length = (int32_t)MIN_MATCH;
 
     // (b) Walk first_hash chain (max CHAIN_MAX_STEPS steps)
     {
@@ -475,6 +482,16 @@ __device__ ChainMatch findMatchChain(
                                       | ((uint32_t)src[ref + 2] << 16)
                                       | ((uint32_t)src[ref + 3] << 24);
                     if (ref_word == bytes_at_pos) {
+                        // Three-stage filter: check byte at best_match_length
+                        bool quick_ok = true;
+                        if (best_match_length >= 4) {
+                            uint32_t tail_pos = pos + (uint32_t)best_match_length;
+                            if (tail_pos >= end_pos)
+                                quick_ok = false;
+                            else if (src[tail_pos] != src[tail_pos - cand_off])
+                                quick_ok = false;
+                        }
+                        if (quick_ok) {
                         uint32_t ml = 4;
                         uint32_t max_ext = end_pos - pos;
                         while (ml < max_ext && src[pos + ml] == src[ref + ml]) ml++;
@@ -483,6 +500,7 @@ __device__ ChainMatch findMatchChain(
                             isMatchBetter(cand_len, (int32_t)cand_off, best_match_length, best_offset)) {
                             best_match_length = cand_len;
                             best_offset = (int32_t)cand_off;
+                        }
                         }
                     }
                 }
@@ -609,9 +627,10 @@ __device__ void scanBlockChain(
 
     while (pos + 5 < end_pos) {
         // Find a match at current position
+        uint32_t cur_lit_run = pos - anchor;
         ChainMatch match = findMatchChain(src, src_size, pos, recent_offset,
                                           first_hash, long_hash, next_hash,
-                                          hash_bits, hash_mask, end_pos);
+                                          hash_bits, hash_mask, end_pos, cur_lit_run);
         if (match.length < 2) {
             pos++;
             continue;
@@ -621,7 +640,7 @@ __device__ void scanBlockChain(
         while (pos + 6 < end_pos) {
             ChainMatch lazy1 = findMatchChain(src, src_size, pos + 1, recent_offset,
                                               first_hash, long_hash, next_hash,
-                                              hash_bits, hash_mask, end_pos);
+                                              hash_bits, hash_mask, end_pos, cur_lit_run + 1);
             if (lazy1.length >= 2 && isLazyMatchBetter(lazy1, match, 0)) {
                 pos++;
                 match = lazy1;
@@ -630,7 +649,7 @@ __device__ void scanBlockChain(
                 if (pos + 7 >= end_pos || match.length == 2) break;
                 ChainMatch lazy2 = findMatchChain(src, src_size, pos + 2, recent_offset,
                                                   first_hash, long_hash, next_hash,
-                                                  hash_bits, hash_mask, end_pos);
+                                                  hash_bits, hash_mask, end_pos, cur_lit_run + 2);
                 if (lazy2.length >= 2 && isLazyMatchBetter(lazy2, match, 1)) {
                     pos += 2;
                     match = lazy2;
