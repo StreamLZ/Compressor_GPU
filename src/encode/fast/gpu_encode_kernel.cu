@@ -43,22 +43,33 @@ __device__ uint32_t hashKey(uint32_t key, uint32_t hash_bits, uint32_t hash_mask
     return (key >> (32 - hash_bits)) & hash_mask;
 }
 
-// Hash-A: distinct multiplier to decorrelate from hash-B
-__device__ uint32_t hashKeyA(uint32_t key, uint32_t hash_bits, uint32_t hash_mask) {
-    uint32_t h = key * 0xB7A56463u;
-    return (h >> (32 - hash_bits)) & hash_mask;
+// Read up to 8 bytes at p, zero-padding if fewer than 8 remain.
+__device__ uint64_t read8safe(const uint8_t* p, uint32_t pos, uint32_t src_size) {
+    uint64_t v = 0;
+    uint32_t avail = (pos + 8 <= src_size) ? 8 : (src_size > pos ? src_size - pos : 0);
+    memcpy(&v, p, avail);
+    return v;
 }
 
-// Hash-B: golden ratio multiplier (same as greedy)
-__device__ uint32_t hashKeyB(uint32_t key, uint32_t hash_bits, uint32_t hash_mask) {
-    uint32_t h = key * 0x9E3779B1u;
-    return (h >> (32 - hash_bits)) & hash_mask;
+// Hash-A: 8-byte key with 64-bit multiply, matching CPU MatchHasher2.
+__device__ uint32_t hashKeyA8(const uint8_t* p, uint32_t hash_bits, uint32_t hash_mask, uint64_t at_src) {
+    uint64_t product = (uint64_t)0xB7A5646300000000ULL * at_src;
+    uint32_t hi32 = (uint32_t)(product >> 32);
+    return (hi32 >> (32 - hash_bits)) & hash_mask;
 }
 
-// Hash-B tag: 6-bit tag from the hash, shifted differently
-__device__ uint32_t hashKeyBTag(uint32_t key, uint32_t hash_bits) {
-    uint32_t h = key * 0x9E3779B1u;
-    return (h >> (32 - hash_bits - 6)) & 0x3F;
+// Hash-B: 8-byte key with Fibonacci 64-bit multiply, matching CPU.
+__device__ uint32_t hashKeyB8(const uint8_t* p, uint32_t hash_bits, uint32_t hash_mask, uint64_t at_src) {
+    uint64_t product = (uint64_t)0x9E3779B97F4A7C15ULL * at_src;
+    uint32_t hi32 = (uint32_t)(product >> 32);
+    return (hi32 >> (32 - hash_bits)) & hash_mask;
+}
+
+// Hash-B tag: full 32-bit hash value, caller uses & 0x3F.
+__device__ uint32_t hashKeyBTag8(const uint8_t* p, uint32_t hash_bits, uint64_t at_src) {
+    uint64_t product = (uint64_t)0x9E3779B97F4A7C15ULL * at_src;
+    uint32_t hi32 = (uint32_t)(product >> 32);
+    return hi32;
 }
 
 __device__ void writeLengthValue(uint8_t* len_buf, uint32_t &len_count, uint32_t value) {
@@ -354,9 +365,10 @@ __device__ ChainMatch findMatchChain(
                           | ((uint32_t)src[pos + 2] << 16)
                           | ((uint32_t)src[pos + 3] << 24);
 
-    uint32_t ha = hashKeyA(bytes_at_pos, hash_bits, hash_mask);
-    uint32_t hb = hashKeyB(bytes_at_pos, hash_bits, hash_mask);
-    uint32_t hb_tag = hashKeyBTag(bytes_at_pos, hash_bits);
+    uint64_t at_src = read8safe(src + pos, pos, src_size);
+    uint32_t ha = hashKeyA8(src + pos, hash_bits, hash_mask, at_src);
+    uint32_t hb = hashKeyB8(src + pos, hash_bits, hash_mask, at_src);
+    uint32_t hb_tag = hashKeyBTag8(src + pos, hash_bits, at_src);
 
     // (a) Recent-offset match: compare 4 bytes at src[pos] vs src[pos + recent_offset]
     int32_t recent_match_length = 0;
@@ -548,7 +560,7 @@ __device__ ChainMatch findMatchChain(
 // matched byte range. longHash at exponentially spaced positions;
 // firstHash/nextHash at every position.
 __device__ void insertChainRange(
-    const uint8_t* src,
+    const uint8_t* src, uint32_t src_size,
     uint32_t from, uint32_t to,
     uint32_t* first_hash, uint32_t* long_hash, uint16_t* next_hash,
     uint32_t hash_bits, uint32_t hash_mask
@@ -559,12 +571,9 @@ __device__ void insertChainRange(
         uint32_t i = 0;
         while (i < len) {
             uint32_t p = from + i;
-            uint32_t key4 = (uint32_t)src[p]
-                          | ((uint32_t)src[p + 1] << 8)
-                          | ((uint32_t)src[p + 2] << 16)
-                          | ((uint32_t)src[p + 3] << 24);
-            uint32_t hb = hashKeyB(key4, hash_bits, hash_mask);
-            uint32_t hb_tag = hashKeyBTag(key4, hash_bits);
+            uint64_t at = read8safe(src + p, p, src_size);
+            uint32_t hb = hashKeyB8(src + p, hash_bits, hash_mask, at);
+            uint32_t hb_tag = hashKeyBTag8(src + p, hash_bits, at);
             long_hash[hb] = (hb_tag & 0x3F) | (p << 6);
             i = 2 * i + 1;
         }
@@ -572,11 +581,8 @@ __device__ void insertChainRange(
 
     // firstHash + nextHash at every position
     for (uint32_t p = from; p < to; p++) {
-        uint32_t key4 = (uint32_t)src[p]
-                      | ((uint32_t)src[p + 1] << 8)
-                      | ((uint32_t)src[p + 2] << 16)
-                      | ((uint32_t)src[p + 3] << 24);
-        uint32_t ha = hashKeyA(key4, hash_bits, hash_mask);
+        uint64_t at = read8safe(src + p, p, src_size);
+        uint32_t ha = hashKeyA8(src + p, hash_bits, hash_mask, at);
         uint32_t prev_head = first_hash[ha];
         next_hash[p & 0xFFFF] = (uint16_t)(prev_head & 0xFFFF);
         first_hash[ha] = p;
@@ -703,7 +709,7 @@ __device__ void scanBlockChain(
         // Insert from pos+1 (pos was already inserted by findMatchChain) up to match_end
         if (match_end > pos + 1 && match_end + 4 <= src_size) {
             uint32_t insert_end = (match_end + 4 <= src_size) ? match_end : src_size - 4;
-            insertChainRange(src, pos + 1, insert_end, first_hash, long_hash, next_hash,
+            insertChainRange(src, src_size, pos + 1, insert_end, first_hash, long_hash, next_hash,
                              hash_bits, hash_mask);
         }
 
