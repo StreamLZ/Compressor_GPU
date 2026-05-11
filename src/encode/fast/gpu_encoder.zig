@@ -20,6 +20,8 @@ var lib: ?*anyopaque = null;
 var ctx: usize = 0;
 var module: usize = 0;
 var kernel_fn: usize = 0;
+var tans_module: usize = 0;
+var tans_kernel_fn: usize = 0;
 var initialized = false;
 
 const FnInit = *const fn (c_uint) callconv(.c) CUresult;
@@ -81,6 +83,11 @@ pub fn init() bool {
     const get_fn = cuModuleGetFunction_fn orelse return false;
     if (get_fn(&kernel_fn, module, "slzCompressL1Kernel") != CUDA_SUCCESS) return false;
 
+    // Load tANS entropy kernel
+    const tans_ptx = @embedFile("gpu_tans_kernel.ptx") ++ "\x00";
+    if ((cuModuleLoadData_fn orelse return false)(&tans_module, tans_ptx.ptr) != CUDA_SUCCESS) return false;
+    if (get_fn(&tans_kernel_fn, tans_module, "slzTansEncodeKernel") != CUDA_SUCCESS) return false;
+
     return true;
 }
 
@@ -121,6 +128,13 @@ fn useChainParser(level: u8) bool {
 
 pub var last_kernel_ns: i64 = 0;
 
+pub const TansChunkDesc = extern struct {
+    src_offset: u32,
+    src_size: u32,
+    dst_offset: u32,
+    dst_capacity: u32,
+};
+
 // ── Persistent device buffers ──────────────────────────────────
 var d_input_persist: CUdeviceptr = 0;
 var d_input_size: usize = 0;
@@ -128,6 +142,12 @@ var d_output_persist: CUdeviceptr = 0;
 var d_output_size: usize = 0;
 var d_descs_persist: CUdeviceptr = 0;
 var d_descs_size: usize = 0;
+var d_tans_descs_persist: CUdeviceptr = 0;
+var d_tans_descs_size: usize = 0;
+var d_tans_out_persist: CUdeviceptr = 0;
+var d_tans_out_size: usize = 0;
+var d_tans_sizes_persist: CUdeviceptr = 0;
+var d_tans_sizes_size: usize = 0;
 var d_hash_persist: CUdeviceptr = 0;
 var d_hash_size: usize = 0;
 var d_sizes_persist: CUdeviceptr = 0;
@@ -146,6 +166,10 @@ fn ensureBuf(ptr: *CUdeviceptr, cur: *usize, needed: usize) bool {
 
 /// Compress all chunks on GPU. Returns per-chunk compressed sizes.
 /// Caller provides input data, output buffer, and chunk layout.
+pub var tans_lit_sizes: ?[]u32 = null;
+pub var tans_lit_data: ?[]u8 = null;
+pub var tans_lit_offsets: ?[]u32 = null;
+
 pub fn gpuCompress(
     input: []const u8,
     output: []u8,
@@ -241,6 +265,93 @@ pub fn gpuCompress(
             const dst_off = chunk_descs[i].dst_offset;
             _ = d2h_fn(@ptrCast(output.ptr + dst_off), d_output + dst_off, cs);
         }
+    }
+
+    // ── GPU tANS entropy encoding on literal streams ──
+    if (level >= 3 and tans_kernel_fn != 0) tans_pass: {
+        const allocator = std.heap.page_allocator;
+
+        // Parse literal offsets/sizes from the downloaded sub-chunk headers
+        var tans_descs_host = allocator.alloc(TansChunkDesc, num_chunks) catch break :tans_pass;
+        defer allocator.free(tans_descs_host);
+        var lit_dst_offsets = allocator.alloc(u32, num_chunks) catch break :tans_pass;
+        // NOT deferred — frame assembler reads these via tans_lit_offsets
+
+        const tans_cap_per: usize = 65536 + 512; // max literal size + table overhead
+        var total_tans_dst: usize = 0;
+
+        for (0..chunk_descs.len) |i| {
+            const cs = comp_sizes_out[i];
+            const init_bytes: usize = if (chunk_descs[i].is_first != 0) 8 else 0;
+            const src_off = chunk_descs[i].dst_offset;
+
+            // Parse 3-byte BE literal count from the downloaded output
+            var lit_count: u32 = 0;
+            if (cs > init_bytes + 3) {
+                const hdr_base = src_off + init_bytes;
+                lit_count = (@as(u32, output[hdr_base]) << 16) |
+                    (@as(u32, output[hdr_base + 1]) << 8) |
+                    @as(u32, output[hdr_base + 2]);
+            }
+
+            // Literal data starts right after the 3-byte header
+            const lit_offset_in_output: u32 = @intCast(src_off + init_bytes + 3);
+            lit_dst_offsets[i] = @intCast(total_tans_dst);
+
+            tans_descs_host[i] = .{
+                .src_offset = lit_offset_in_output, // offset into d_output
+                .src_size = lit_count,
+                .dst_offset = @intCast(total_tans_dst),
+                .dst_capacity = @intCast(@min(tans_cap_per, lit_count + 512)),
+            };
+            total_tans_dst += @min(tans_cap_per, lit_count + 512);
+        }
+
+        if (total_tans_dst == 0) break :tans_pass;
+
+        // Allocate device buffers for tANS
+        const tans_descs_bytes = num_chunks * @sizeOf(TansChunkDesc);
+        const tans_sizes_bytes = @as(usize, num_chunks) * 4;
+        if (!ensureBuf(&d_tans_descs_persist, &d_tans_descs_size, tans_descs_bytes)) break :tans_pass;
+        if (!ensureBuf(&d_tans_out_persist, &d_tans_out_size, total_tans_dst)) break :tans_pass;
+        if (!ensureBuf(&d_tans_sizes_persist, &d_tans_sizes_size, tans_sizes_bytes)) break :tans_pass;
+
+        // Upload descriptors, zero sizes
+        _ = h2d_fn(d_tans_descs_persist, @ptrCast(tans_descs_host.ptr), tans_descs_bytes);
+        if (cuMemsetD8_fn) |memset_fn| _ = memset_fn(d_tans_sizes_persist, 0, tans_sizes_bytes);
+        _ = sync_fn();
+
+        // Launch tANS kernel: source is d_output (literal data already there from LZ kernel)
+        var tp_src = d_output; // literals are in the LZ output buffer
+        var tp_dst = d_tans_out_persist;
+        var tp_descs = d_tans_descs_persist;
+        var tp_sizes = d_tans_sizes_persist;
+        var tp_total = num_chunks;
+
+        var tans_params = [_]?*anyopaque{
+            @ptrCast(&tp_src),
+            @ptrCast(&tp_dst),
+            @ptrCast(&tp_descs),
+            @ptrCast(&tp_sizes),
+            @ptrCast(&tp_total),
+        };
+        var tans_extra = [_]?*anyopaque{null};
+
+        if (launch_fn(tans_kernel_fn, num_chunks, 1, 1, 32, 1, 1, 0, 0, &tans_params, &tans_extra) != CUDA_SUCCESS)
+            break :tans_pass;
+
+        if (sync_fn() != CUDA_SUCCESS) break :tans_pass;
+
+        // Download tANS sizes and encoded data
+        const h_tans_sizes = allocator.alloc(u32, num_chunks) catch break :tans_pass;
+        const h_tans_data = allocator.alloc(u8, total_tans_dst) catch break :tans_pass;
+        _ = d2h_fn(@ptrCast(h_tans_sizes.ptr), d_tans_sizes_persist, tans_sizes_bytes);
+        _ = d2h_fn(@ptrCast(h_tans_data.ptr), d_tans_out_persist, total_tans_dst);
+
+        // Store for frame assembler
+        tans_lit_sizes = h_tans_sizes;
+        tans_lit_data = h_tans_data;
+        tans_lit_offsets = lit_dst_offsets;
     }
 
     return true;

@@ -52,7 +52,7 @@ pub fn encodeArrayU8Memcpy(dst: []u8, src: []const u8) EncodeError!usize {
 
 /// Write a 5-byte non-compact chunk header. `decompressed_size` and
 /// `compressed_size` must each fit in 18 bits; `chunk_type` in 4 bits.
-fn writeNonCompactChunkHeader(dst: []u8, chunk_type: u8, compressed_size: u32, decompressed_size: u32) void {
+pub fn writeNonCompactChunkHeader(dst: []u8, chunk_type: u8, compressed_size: u32, decompressed_size: u32) void {
     const dst_minus_1: u32 = decompressed_size - 1;
     dst[0] = @intCast((@as(u32, chunk_type) << 4) | ((dst_minus_1 >> 14) & 0xF));
     const bits: u32 = compressed_size | ((dst_minus_1 & 0x3FFF) << 18);

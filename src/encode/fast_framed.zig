@@ -42,6 +42,7 @@ fn reencodeGpuWithEntropy(
     speed_tradeoff: f32,
     initial_bytes: usize,
     src_size: usize,
+    tans_encoded_lits: ?[]const u8,
 ) !usize {
     var rp: usize = 0;
     var wp: usize = 0;
@@ -124,8 +125,24 @@ fn reencodeGpuWithEntropy(
 
     // Encode to dst
 
-    // Literals: raw memcpy
-    const lit_n = entropy_enc.encodeArrayU8Memcpy(dst[wp..], literals) catch return 0;
+    // Literals: use GPU tANS if provided and smaller, else raw memcpy
+    const lit_n = blk: {
+        if (tans_encoded_lits) |tans_data| {
+            if (tans_data.len > 0 and tans_data.len + 5 < literals.len + 3) {
+                // Write as tANS-encoded block: 5-byte non-compact header (chunk_type=1) + data
+                if (wp + 5 + tans_data.len > dst.len) break :blk @as(usize, 0);
+                entropy_enc.writeNonCompactChunkHeader(
+                    dst[wp..],
+                    1, // chunk_type = tANS
+                    @intCast(tans_data.len),
+                    @intCast(literals.len),
+                );
+                @memcpy(dst[wp + 5 ..][0..tans_data.len], tans_data);
+                break :blk 5 + tans_data.len;
+            }
+        }
+        break :blk entropy_enc.encodeArrayU8Memcpy(dst[wp..], literals) catch 0;
+    };
     wp += lit_n;
 
     const tok_n = entropy_enc.encodeArrayU8(allocator, dst[wp..], tokens, options, speed_tradeoff, null, 0, null) catch return 0;
@@ -792,14 +809,7 @@ pub fn compressFramedOne(
         if (!gpu_enc.gpuCompress(effective_src, gpu_out, descs, comp_sizes, io, opts.level))
             break :gpu_compress;
 
-        const gpu_entropy_opts = entropyOptionsForLevel(opts.level);
-        // Entropy re-encoding scratch
-        const gpu_speed_tradeoff = cost_coeffs.speedTradeoffFor(
-            cost_coeffs.default_space_speed_tradeoff_bytes,
-            true,
-        );
-        const entropy_scratch = try allocator.alloc(u8, gpu_block * 2);
-        defer allocator.free(entropy_scratch);
+        // tANS entropy handled by GPU kernel — no CPU-side re-encoding needed
 
         // Assemble frame from GPU-compressed sub-chunks grouped into chunks
         var soff: usize = dict_len;
@@ -837,35 +847,82 @@ pub fn compressFramedOne(
                 const chunk_hdr_pos = pos;
                 pos += 4;
 
-                // Write each sub-chunk (with entropy re-encoding)
+                // Write each sub-chunk, splicing GPU tANS literal data when beneficial
                 for (0..n_subs) |si| {
                     const raw_cs = comp_sizes[gpu_bi + si];
                     const raw_payload = gpu_out[(gpu_bi + si) * per_block_cap ..][0..raw_cs];
                     const init_bytes: usize = if (ci == 0 and si == 0 and dict_len == 0) 8 else 0;
+                    const gpu_bi_idx = gpu_bi + si;
 
-                    var use_payload = raw_payload;
-                    var use_cs: usize = raw_cs;
-
-                    {
-                        const sub_src_size = @min(gpu_block, chunk_size - si * gpu_block);
-                        const ent_cs = try reencodeGpuWithEntropy(
-                            allocator, raw_payload, entropy_scratch,
-                            gpu_entropy_opts, gpu_speed_tradeoff, init_bytes, sub_src_size,
-                        );
-                        if (ent_cs > 0 and ent_cs < raw_cs) {
-                            use_payload = entropy_scratch[0..ent_cs];
-                            use_cs = ent_cs;
+                    // Check if GPU tANS produced smaller literal encoding
+                    const tans_lits: ?[]const u8 = if (gpu_enc.tans_lit_sizes) |tsizes| blk: {
+                        if (gpu_bi_idx >= tsizes.len) break :blk null;
+                        const tsz = tsizes[gpu_bi_idx];
+                        const is_raw = (tsz & 0x80000000) != 0;
+                        const actual_sz = tsz & 0x7FFFFFFF;
+                        if (is_raw or actual_sz == 0) break :blk null;
+                        // Parse raw literal count from the sub-chunk
+                        if (raw_cs <= init_bytes + 3) break :blk null;
+                        const raw_lit_count: usize = (@as(usize, raw_payload[init_bytes]) << 16) |
+                            (@as(usize, raw_payload[init_bytes + 1]) << 8) |
+                            raw_payload[init_bytes + 2];
+                        // tANS worthwhile? 5-byte header + data < 3-byte header + raw
+                        if (actual_sz + 5 >= raw_lit_count + 3) break :blk null;
+                        if (gpu_enc.tans_lit_data) |tdata| {
+                            if (gpu_enc.tans_lit_offsets) |toffs| {
+                                const off = toffs[gpu_bi_idx];
+                                if (off + actual_sz <= tdata.len) {
+                                    break :blk tdata[off..][0..actual_sz];
+                                }
+                            }
                         }
-                    }
+                        break :blk null;
+                    } else null;
 
-                    if (pos + 3 + use_cs > dst.len) return error.DestinationTooSmall;
-                    const sc_hdr: u32 = @as(u32, @intCast(use_cs)) |
-                        (@as(u32, 1) << lz_constants.sub_chunk_type_shift) |
-                        lz_constants.chunk_header_compressed_flag;
-                    block_header.writeBE24(dst[pos..].ptr, sc_hdr);
-                    pos += 3;
-                    @memcpy(dst[pos..][0..use_cs], use_payload);
-                    pos += use_cs;
+                    if (tans_lits) |tans_data| {
+                        // Splice: rebuild sub-chunk with tANS-encoded literal stream
+                        const raw_lit_count: usize = (@as(usize, raw_payload[init_bytes]) << 16) |
+                            (@as(usize, raw_payload[init_bytes + 1]) << 8) |
+                            raw_payload[init_bytes + 2];
+                        const rest_start = init_bytes + 3 + raw_lit_count;
+                        const rest_data = raw_payload[rest_start..];
+
+                        // New sub-chunk: init_bytes + 5-byte tANS header + tANS data + rest
+                        const new_cs = init_bytes + 5 + tans_data.len + rest_data.len;
+                        if (pos + 3 + new_cs > dst.len) return error.DestinationTooSmall;
+
+                        const sc_hdr: u32 = @as(u32, @intCast(new_cs)) |
+                            (@as(u32, 1) << lz_constants.sub_chunk_type_shift) |
+                            lz_constants.chunk_header_compressed_flag;
+                        block_header.writeBE24(dst[pos..].ptr, sc_hdr);
+                        pos += 3;
+
+                        // Copy initial bytes
+                        if (init_bytes > 0) {
+                            @memcpy(dst[pos..][0..init_bytes], raw_payload[0..init_bytes]);
+                            pos += init_bytes;
+                        }
+                        // Write tANS literal header + data
+                        entropy_enc.writeNonCompactChunkHeader(
+                            dst[pos..], 1, @intCast(tans_data.len), @intCast(raw_lit_count),
+                        );
+                        pos += 5;
+                        @memcpy(dst[pos..][0..tans_data.len], tans_data);
+                        pos += tans_data.len;
+                        // Copy rest (tokens, off16, off32, lengths)
+                        @memcpy(dst[pos..][0..rest_data.len], rest_data);
+                        pos += rest_data.len;
+                    } else {
+                        // Use raw sub-chunk as-is
+                        if (pos + 3 + raw_cs > dst.len) return error.DestinationTooSmall;
+                        const sc_hdr: u32 = @as(u32, @intCast(raw_cs)) |
+                            (@as(u32, 1) << lz_constants.sub_chunk_type_shift) |
+                            lz_constants.chunk_header_compressed_flag;
+                        block_header.writeBE24(dst[pos..].ptr, sc_hdr);
+                        pos += 3;
+                        @memcpy(dst[pos..][0..raw_cs], raw_payload);
+                        pos += raw_cs;
+                    }
                 }
 
                 // Backfill chunk header
