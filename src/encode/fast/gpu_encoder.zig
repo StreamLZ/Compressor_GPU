@@ -115,6 +115,10 @@ fn useGlobalHash(level: u8) bool {
     return level >= 3;
 }
 
+fn useChainParser(level: u8) bool {
+    return level >= 5;
+}
+
 pub var last_kernel_ns: i64 = 0;
 
 // ── Persistent device buffers ──────────────────────────────────
@@ -163,14 +167,21 @@ pub fn gpuCompress(
     const hash_bits: u32 = hashBitsForLevel(level);
     const hash_size: usize = @as(usize, 1) << @intCast(hash_bits);
     const global = useGlobalHash(level);
+    const chain = useChainParser(level);
 
     if (!ensureBuf(&d_input_persist, &d_input_size, input.len)) return false;
     if (!ensureBuf(&d_output_persist, &d_output_size, output.len)) return false;
     if (!ensureBuf(&d_descs_persist, &d_descs_size, desc_bytes)) return false;
     if (!ensureBuf(&d_sizes_persist, &d_sizes_size, sizes_bytes)) return false;
 
-    // Global hash tables for L3+ (too large for shared memory)
-    if (global) {
+    // Global hash tables — chain mode uses 3 tables per block:
+    //   first_hash (hash_size u32) + long_hash (hash_size u32) + next_hash (32768 u16 = 16384 u32)
+    if (chain) {
+        const next_hash_words: usize = 65536 / 2; // 65536 u16 entries = 32768 u32 words
+        const table_stride = hash_size + hash_size + next_hash_words;
+        const hash_bytes = @as(usize, num_chunks) * table_stride * 4;
+        if (!ensureBuf(&d_hash_persist, &d_hash_size, hash_bytes)) return false;
+    } else if (global) {
         const hash_bytes = @as(usize, num_chunks) * hash_size * 4;
         if (!ensureBuf(&d_hash_persist, &d_hash_size, hash_bytes)) return false;
     }
@@ -191,10 +202,11 @@ pub fn gpuCompress(
     var p_input = d_input;
     var p_output = d_output;
     var p_descs = d_descs;
-    var p_global_hash: CUdeviceptr = if (global) d_hash_persist else 0;
+    var p_global_hash: CUdeviceptr = if (global or chain) d_hash_persist else 0;
     var p_sizes = d_sizes;
     var p_total = num_chunks;
     var p_hash_bits = hash_bits;
+    var p_use_chain: u32 = if (chain) 1 else 0;
 
     var params = [_]?*anyopaque{
         @ptrCast(&p_input),
@@ -204,10 +216,11 @@ pub fn gpuCompress(
         @ptrCast(&p_sizes),
         @ptrCast(&p_total),
         @ptrCast(&p_hash_bits),
+        @ptrCast(&p_use_chain),
     };
     var extra = [_]?*anyopaque{null};
 
-    const shared_bytes: u32 = if (global) 0 else @intCast(hash_size * 4);
+    const shared_bytes: u32 = if (global or chain) 0 else @intCast(hash_size * 4);
     if (launch_fn(kernel_fn, num_chunks, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra) != CUDA_SUCCESS)
         return false;
 

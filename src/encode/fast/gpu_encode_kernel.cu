@@ -1,12 +1,16 @@
 // ── StreamLZ GPU L1 Compress Kernel ─────────────────────────────
 // Warp-parallel greedy scan with shared-memory hash table.
 // 32-bit hash entries support chunks up to 256KB (sc_group=1).
-// 1 warp per block, 16KB hash table (4K × u32) in shared memory.
+// 1 warp per block, 16KB hash table (4K x u32) in shared memory.
 //
 // Two-pass block design: the parser scans block 1 [0..64KB) and
 // block 2 [64KB..src_size) separately so that literal runs and
 // match extensions never cross the 64KB boundary. This matches
 // the CPU encoder's architecture exactly.
+//
+// Two parser modes:
+//   use_chain=0 (default): warp-parallel greedy scan (scanBlock)
+//   use_chain=1:           serial chain-hash lazy parser (scanBlockChain)
 //
 // Build: nvcc -ptx -arch=sm_89 -O3 gpu_encode_kernel.cu
 
@@ -17,6 +21,8 @@ static constexpr uint32_t INITIAL_COPY = 8;
 static constexpr uint32_t HASH_EMPTY   = 0xFFFFFFFFu;
 static constexpr uint32_t LARGE_OFFSET_THRESHOLD = 0xC00000u;
 static constexpr uint32_t BLOCK1_SIZE  = 0x10000u;
+static constexpr uint32_t CHAIN_MAX_STEPS = 8;
+static constexpr uint32_t NEXT_HASH_SIZE = 65536;  // 2^16 entries of uint16_t (matches CPU c_bits=16)
 
 struct CompressChunkDesc {
     uint32_t src_offset;
@@ -26,9 +32,33 @@ struct CompressChunkDesc {
     uint32_t is_first;
 };
 
+// Match result returned by findMatchChain
+struct ChainMatch {
+    int32_t length;
+    int32_t offset;  // 0 = recent-offset reuse, >0 = explicit distance
+};
+
 __device__ uint32_t hashKey(uint32_t key, uint32_t hash_bits, uint32_t hash_mask) {
     key *= 0x9E3779B1u;
     return (key >> (32 - hash_bits)) & hash_mask;
+}
+
+// Hash-A: distinct multiplier to decorrelate from hash-B
+__device__ uint32_t hashKeyA(uint32_t key, uint32_t hash_bits, uint32_t hash_mask) {
+    uint32_t h = key * 0xB7A56463u;
+    return (h >> (32 - hash_bits)) & hash_mask;
+}
+
+// Hash-B: golden ratio multiplier (same as greedy)
+__device__ uint32_t hashKeyB(uint32_t key, uint32_t hash_bits, uint32_t hash_mask) {
+    uint32_t h = key * 0x9E3779B1u;
+    return (h >> (32 - hash_bits)) & hash_mask;
+}
+
+// Hash-B tag: 6-bit tag from the hash, shifted differently
+__device__ uint32_t hashKeyBTag(uint32_t key, uint32_t hash_bits) {
+    uint32_t h = key * 0x9E3779B1u;
+    return (h >> (32 - hash_bits - 6)) & 0x3F;
 }
 
 __device__ void writeLengthValue(uint8_t* len_buf, uint32_t &len_count, uint32_t value) {
@@ -58,7 +88,7 @@ __device__ void writeOffset32(uint8_t* off32_buf, uint32_t &off32_pos, uint32_t 
     }
 }
 
-// Emit tokens — 1:1 port of CPU writeComplexOffset.
+// Emit tokens -- 1:1 port of CPU writeComplexOffset.
 // Flow matches the CPU exactly:
 //   1. Fast path (lit<=7, match<=15, off<=0xFFFF)
 //   2. Literal encoding (0x87 or 0x00)
@@ -166,6 +196,420 @@ __device__ void emitCmd(
         uint16_t off_val = (uint16_t)effective_offset;
         memcpy(off16_buf + off16_count * 2, &off_val, 2);
         off16_count++;
+    }
+}
+
+// ── isLazyMatchBetter ────────────────────────────────────────────
+// Returns true if `cand` (found at pos + step) is better than `current`.
+// Port of CPU isLazyMatchBetter: 5*(len_diff) - 5 - (bits_diff) > step*4
+__device__ bool isLazyMatchBetter(ChainMatch cand, ChainMatch current, int32_t step) {
+    int32_t bits_cand = (cand.offset > 0) ? ((cand.offset > 0xFFFF) ? 32 : 16) : 0;
+    int32_t bits_cur  = (current.offset > 0) ? ((current.offset > 0xFFFF) ? 32 : 16) : 0;
+    return 5 * (cand.length - current.length) - 5 - (bits_cand - bits_cur) > step * 4;
+}
+
+// ── isBetterThanRecentMatch ──────────────────────────────────────
+// Returns true if the hash match is preferable to the recent-offset match.
+__device__ bool isBetterThanRecentMatch(int32_t recent_match_length, int32_t match_length, int32_t match_offset) {
+    return recent_match_length < 2 ||
+        (recent_match_length + 1 < match_length && (recent_match_length + 4 < match_length || match_offset < 65536));
+}
+
+// ── findMatchChain ───────────────────────────────────────────────
+// Chain-hash match finder for the lazy parser. Port of CPU
+// findMatchWithChainHasher. Called by lane 0 only.
+//
+// Parameters:
+//   src, src_size, pos  -- source data and current scan position
+//   recent_offset       -- recent match offset (negative distance)
+//   first_hash          -- chain head table (hash_size entries)
+//   long_hash           -- secondary direct-mapped table (hash_size entries)
+//   next_hash           -- chain link table (NEXT_HASH_SIZE u16 entries)
+//   hash_bits           -- log2 of hash_size
+//   hash_mask           -- hash_size - 1
+//   end_pos             -- block boundary (do not extend past this)
+//
+// Returns ChainMatch: {length, offset}
+//   offset=0 means recent-offset reuse; offset>0 is explicit distance
+__device__ ChainMatch findMatchChain(
+    const uint8_t* src, uint32_t src_size,
+    uint32_t pos,
+    int32_t recent_offset,
+    uint32_t* first_hash, uint32_t* long_hash, uint16_t* next_hash,
+    uint32_t hash_bits, uint32_t hash_mask,
+    uint32_t end_pos
+) {
+    // Read 4 bytes at current position
+    uint32_t bytes_at_pos = (uint32_t)src[pos]
+                          | ((uint32_t)src[pos + 1] << 8)
+                          | ((uint32_t)src[pos + 2] << 16)
+                          | ((uint32_t)src[pos + 3] << 24);
+
+    uint32_t ha = hashKeyA(bytes_at_pos, hash_bits, hash_mask);
+    uint32_t hb = hashKeyB(bytes_at_pos, hash_bits, hash_mask);
+    uint32_t hb_tag = hashKeyBTag(bytes_at_pos, hash_bits);
+
+    // (a) Recent-offset match: compare 4 bytes at src[pos] vs src[pos + recent_offset]
+    int32_t recent_match_length = 0;
+    {
+        uint32_t recent_ref = (uint32_t)((int32_t)pos + recent_offset);
+        if (recent_ref < pos) {  // valid backward reference
+            uint32_t recent_word = (uint32_t)src[recent_ref]
+                                 | ((uint32_t)src[recent_ref + 1] << 8)
+                                 | ((uint32_t)src[recent_ref + 2] << 16)
+                                 | ((uint32_t)src[recent_ref + 3] << 24);
+            uint32_t xor_val = bytes_at_pos ^ recent_word;
+            if (xor_val == 0) {
+                // Full 4-byte match -- extend forward
+                uint32_t ml = 4;
+                uint32_t max_ext = end_pos - pos;
+                while (ml < max_ext && src[pos + ml] == src[recent_ref + ml]) ml++;
+
+                // Insert current position into hash tables before returning
+                uint32_t prev_head = first_hash[ha];
+                next_hash[pos & 0xFFFF] = (uint16_t)(prev_head & 0xFFFF);
+                first_hash[ha] = pos;
+                long_hash[hb] = (hb_tag & 0x3F) | (pos << 6);
+
+                return {(int32_t)ml, 0};
+            }
+            // Partial recent match: count leading matching bytes (0-3)
+            recent_match_length = (int32_t)(__ffs(xor_val) - 1) / 8;
+        }
+    }
+
+    int32_t best_offset = 0;
+    int32_t best_match_length = 0;
+    int32_t minimum_match_length = (int32_t)MIN_MATCH;
+
+    // (b) Walk first_hash chain (max CHAIN_MAX_STEPS steps)
+    {
+        uint32_t head = first_hash[ha];
+        uint32_t candidate_offset = pos - head;
+
+        if (candidate_offset <= 0xFFFF) {
+            if (candidate_offset != 0) {
+                uint32_t chain_steps = CHAIN_MAX_STEPS;
+                uint32_t hash_value = head;
+                while (candidate_offset < 0x10000u) {  // stays within 64KB block
+                    if (candidate_offset > 8) {
+                        if (candidate_offset <= pos) {
+                            uint32_t ref = pos - candidate_offset;
+                            uint32_t ref_word = (uint32_t)src[ref]
+                                              | ((uint32_t)src[ref + 1] << 8)
+                                              | ((uint32_t)src[ref + 2] << 16)
+                                              | ((uint32_t)src[ref + 3] << 24);
+                            if (ref_word == bytes_at_pos) {
+                                // Three-stage filter: check byte at best_match_length
+                                bool quick_ok = true;
+                                if (best_match_length >= 4) {
+                                    uint32_t tail_pos = pos + (uint32_t)best_match_length;
+                                    if (tail_pos >= end_pos) {
+                                        quick_ok = false;
+                                    } else {
+                                        if (src[tail_pos] != src[tail_pos - candidate_offset])
+                                            quick_ok = false;
+                                    }
+                                }
+                                if (quick_ok) {
+                                    uint32_t ml = 4;
+                                    uint32_t max_ext = end_pos - pos;
+                                    while (ml < max_ext && src[pos + ml] == src[ref + ml]) ml++;
+                                    int32_t cand_len = (int32_t)ml;
+                                    if (cand_len > best_match_length && cand_len >= minimum_match_length) {
+                                        best_match_length = cand_len;
+                                        best_offset = (int32_t)candidate_offset;
+                                    }
+                                }
+                            }
+                        }
+                        chain_steps--;
+                        if (chain_steps == 0) break;
+                    }
+                    uint32_t previous_offset = candidate_offset;
+                    hash_value = (uint32_t)next_hash[hash_value & 0xFFFF];
+                    // Chain positions are modulo 64K
+                    candidate_offset = (uint16_t)(pos - hash_value);
+                    if (candidate_offset <= previous_offset) break;
+                }
+            }
+        } else if (candidate_offset <= pos && candidate_offset < 0x10000u) {
+            // Far first-hash hit (> 0xFFFF but within dictionary)
+            uint32_t ref = pos - candidate_offset;
+            uint32_t ref_word = (uint32_t)src[ref]
+                              | ((uint32_t)src[ref + 1] << 8)
+                              | ((uint32_t)src[ref + 2] << 16)
+                              | ((uint32_t)src[ref + 3] << 24);
+            if (ref_word == bytes_at_pos) {
+                uint32_t ml = 4;
+                uint32_t max_ext = end_pos - pos;
+                while (ml < max_ext && src[pos + ml] == src[ref + ml]) ml++;
+                int32_t cand_len = (int32_t)ml;
+                if (cand_len > minimum_match_length && cand_len >= 14) {
+                    best_match_length = cand_len;
+                    best_offset = (int32_t)candidate_offset;
+                }
+            }
+        }
+    }
+
+    // (c) Check long_hash secondary table
+    {
+        uint32_t lh_value = long_hash[hb];
+        if (((hb_tag ^ lh_value) & 0x3F) == 0) {
+            uint32_t cand_pos = lh_value >> 6;
+            if (cand_pos < pos) {
+                uint32_t cand_off = pos - cand_pos;
+                if (cand_off >= 8 && cand_off <= 0xFFFF) {
+                    uint32_t ref = pos - cand_off;
+                    uint32_t ref_word = (uint32_t)src[ref]
+                                      | ((uint32_t)src[ref + 1] << 8)
+                                      | ((uint32_t)src[ref + 2] << 16)
+                                      | ((uint32_t)src[ref + 3] << 24);
+                    if (ref_word == bytes_at_pos) {
+                        uint32_t ml = 4;
+                        uint32_t max_ext = end_pos - pos;
+                        while (ml < max_ext && src[pos + ml] == src[ref + ml]) ml++;
+                        int32_t cand_len = (int32_t)ml;
+                        // isMatchBetter logic: prefer longer, or shorter offset at equal length
+                        bool is_better = false;
+                        if (cand_len == best_match_length)
+                            is_better = (int32_t)cand_off < best_offset;
+                        else
+                            is_better = cand_len > best_match_length;
+                        if (is_better && cand_len >= minimum_match_length) {
+                            best_match_length = cand_len;
+                            best_offset = (int32_t)cand_off;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // (d) Fixed offset-8 fallback
+    if (pos >= 8) {
+        uint32_t ref = pos - 8;
+        uint32_t ref_word = (uint32_t)src[ref]
+                          | ((uint32_t)src[ref + 1] << 8)
+                          | ((uint32_t)src[ref + 2] << 16)
+                          | ((uint32_t)src[ref + 3] << 24);
+        if (ref_word == bytes_at_pos) {
+            uint32_t ml = 4;
+            uint32_t max_ext = end_pos - pos;
+            while (ml < max_ext && src[pos + ml] == src[ref + ml]) ml++;
+            int32_t cand_len = (int32_t)ml;
+            if (cand_len >= best_match_length && cand_len >= minimum_match_length) {
+                best_match_length = cand_len;
+                best_offset = 8;
+            }
+        }
+    }
+
+    // (e) Insert current position into all three hash tables
+    {
+        uint32_t prev_head = first_hash[ha];
+        next_hash[pos & 0xFFFF] = (uint16_t)(prev_head & 0xFFFF);
+        first_hash[ha] = pos;
+        long_hash[hb] = (hb_tag & 0x3F) | (pos << 6);
+    }
+
+    // (f) Return best match vs recent match (prefer recent if close)
+    if (best_offset == 0 || !isBetterThanRecentMatch(recent_match_length, best_match_length, best_offset)) {
+        return {recent_match_length, 0};
+    }
+    return {best_match_length, best_offset};
+}
+
+// ── insertChainRange ─────────────────────────────────────────────
+// Insert positions [from..to) into the chain hash tables.
+// Used after emitting a match to populate hash entries for the
+// matched byte range. longHash at exponentially spaced positions;
+// firstHash/nextHash at every position.
+__device__ void insertChainRange(
+    const uint8_t* src,
+    uint32_t from, uint32_t to,
+    uint32_t* first_hash, uint32_t* long_hash, uint16_t* next_hash,
+    uint32_t hash_bits, uint32_t hash_mask
+) {
+    // longHash at exponentially spaced positions: i = 0, 1, 3, 7, 15, ...
+    {
+        uint32_t len = to - from;
+        uint32_t i = 0;
+        while (i < len) {
+            uint32_t p = from + i;
+            uint32_t key4 = (uint32_t)src[p]
+                          | ((uint32_t)src[p + 1] << 8)
+                          | ((uint32_t)src[p + 2] << 16)
+                          | ((uint32_t)src[p + 3] << 24);
+            uint32_t hb = hashKeyB(key4, hash_bits, hash_mask);
+            uint32_t hb_tag = hashKeyBTag(key4, hash_bits);
+            long_hash[hb] = (hb_tag & 0x3F) | (p << 6);
+            i = 2 * i + 1;
+        }
+    }
+
+    // firstHash + nextHash at every position
+    for (uint32_t p = from; p < to; p++) {
+        uint32_t key4 = (uint32_t)src[p]
+                      | ((uint32_t)src[p + 1] << 8)
+                      | ((uint32_t)src[p + 2] << 16)
+                      | ((uint32_t)src[p + 3] << 24);
+        uint32_t ha = hashKeyA(key4, hash_bits, hash_mask);
+        uint32_t prev_head = first_hash[ha];
+        next_hash[p & 0xFFFF] = (uint16_t)(prev_head & 0xFFFF);
+        first_hash[ha] = p;
+    }
+}
+
+// ── scanBlockChain: serial chain-hash lazy parser for one block ──
+// Port of CPU runLazyParserChain. Lane 0 does all work; other lanes
+// participate only in the final __syncwarp().
+//
+// Scans positions [start_pos .. end_pos), using the chain hasher to
+// find matches with lazy-1 and lazy-2 evaluation, backward extension,
+// and emitting tokens via emitCmd.
+__device__ void scanBlockChain(
+    const uint8_t* src, uint32_t src_size,
+    uint32_t* first_hash, uint32_t* long_hash, uint16_t* next_hash,
+    uint32_t hash_bits, uint32_t hash_mask,
+    uint8_t* lit_buf, uint32_t &lit_count,
+    uint8_t* cmd_buf, uint32_t &token_count,
+    uint8_t* off16_buf, uint32_t &off16_count,
+    uint8_t* off32_buf, uint32_t &off32_pos, uint32_t &off32_count,
+    uint8_t* len_buf, uint32_t &length_count,
+    uint32_t &anchor, int32_t &recent_offset,
+    uint32_t start_pos, uint32_t end_pos, uint32_t block2_start
+) {
+    const uint32_t lane = threadIdx.x & 31;
+
+    if (lane != 0) return;  // All work done by lane 0
+
+    uint32_t pos = start_pos;
+
+    // Guard: need at least 5 bytes of lookahead
+    if (pos + 5 >= end_pos) {
+        // Handle trailing literals and return
+        uint32_t trailing = end_pos - anchor;
+        if (trailing > 0) {
+            for (uint32_t i = 0; i < trailing; i++)
+                lit_buf[lit_count + i] = src[anchor + i];
+            lit_count += trailing;
+            emitCmd(cmd_buf, token_count, off16_buf, off16_count,
+                    off32_buf, off32_pos, off32_count,
+                    len_buf, length_count, trailing, 0, 0,
+                    anchor, block2_start, recent_offset);
+            anchor = end_pos;
+        }
+        return;
+    }
+
+    while (pos + 5 < end_pos) {
+        // Find a match at current position
+        ChainMatch match = findMatchChain(src, src_size, pos, recent_offset,
+                                          first_hash, long_hash, next_hash,
+                                          hash_bits, hash_mask, end_pos);
+        if (match.length < 2) {
+            pos++;
+            continue;
+        }
+
+        // Lazy-1: check pos+1 for a better match
+        while (pos + 6 < end_pos) {
+            ChainMatch lazy1 = findMatchChain(src, src_size, pos + 1, recent_offset,
+                                              first_hash, long_hash, next_hash,
+                                              hash_bits, hash_mask, end_pos);
+            if (lazy1.length >= 2 && isLazyMatchBetter(lazy1, match, 0)) {
+                pos++;
+                match = lazy1;
+            } else {
+                // Lazy-2: check pos+2 (only if current match length > 2)
+                if (pos + 7 >= end_pos || match.length == 2) break;
+                ChainMatch lazy2 = findMatchChain(src, src_size, pos + 2, recent_offset,
+                                                  first_hash, long_hash, next_hash,
+                                                  hash_bits, hash_mask, end_pos);
+                if (lazy2.length >= 2 && isLazyMatchBetter(lazy2, match, 1)) {
+                    pos += 2;
+                    match = lazy2;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Resolve actual offset for backward extension
+        uint32_t actual_offset;
+        if (match.offset == 0)
+            actual_offset = (uint32_t)(-recent_offset);
+        else
+            actual_offset = (uint32_t)match.offset;
+
+        // Enforce minimum match length for far offsets
+        uint32_t off_param = (uint32_t)match.offset;
+        uint32_t resolved_off = off_param;
+        if (resolved_off == 0) resolved_off = (uint32_t)(-recent_offset);
+        if (resolved_off > 0xFFFF && (uint32_t)match.length < 14) {
+            pos++;
+            continue;
+        }
+
+        // (e) Backward extension: extend match backward into literal run
+        while (pos > anchor && pos > actual_offset) {
+            uint32_t prev = pos - 1;
+            uint32_t back = prev - actual_offset;
+            if (src[prev] != src[back]) break;
+            pos--;
+            match.length++;
+        }
+
+        // Compute literal run and copy literals
+        uint32_t lit_len = pos - anchor;
+        for (uint32_t i = 0; i < lit_len; i++)
+            lit_buf[lit_count + i] = src[anchor + i];
+        lit_count += lit_len;
+
+        // Distance cap: (my_pos - ref) <= 0xFFFF for sc_group=0.25
+        // off_param is already set: 0 for recent, positive distance otherwise
+
+        // Emit the match
+        emitCmd(cmd_buf, token_count, off16_buf, off16_count,
+                off32_buf, off32_pos, off32_count,
+                len_buf, length_count, lit_len, (uint32_t)match.length, off_param,
+                anchor, block2_start, recent_offset);
+
+        // Update recent offset
+        recent_offset = -(int32_t)actual_offset;
+
+        // Advance past the match
+        uint32_t match_end = pos + (uint32_t)match.length;
+
+        // (g) Insert matched range positions into hash tables
+        // Insert from pos+1 (pos was already inserted by findMatchChain) up to match_end
+        if (match_end > pos + 1 && match_end + 4 <= src_size) {
+            uint32_t insert_end = (match_end + 4 <= src_size) ? match_end : src_size - 4;
+            insertChainRange(src, pos + 1, insert_end, first_hash, long_hash, next_hash,
+                             hash_bits, hash_mask);
+        }
+
+        anchor = match_end;
+        pos = match_end;
+    }
+
+    // (h) Trailing literals at end_pos
+    {
+        uint32_t trailing = end_pos - anchor;
+        if (trailing > 0) {
+            for (uint32_t i = 0; i < trailing; i++)
+                lit_buf[lit_count + i] = src[anchor + i];
+            lit_count += trailing;
+
+            emitCmd(cmd_buf, token_count, off16_buf, off16_count,
+                    off32_buf, off32_pos, off32_count,
+                    len_buf, length_count, trailing, 0, 0,
+                    anchor, block2_start, recent_offset);
+
+            anchor = end_pos;
+        }
     }
 }
 
@@ -346,7 +790,8 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzCompressL1Kernel(
     uint32_t* __restrict__ global_hash,
     uint32_t* __restrict__ comp_sizes,
     uint32_t total_chunks,
-    uint32_t hash_bits
+    uint32_t hash_bits,
+    uint32_t use_chain
 ) {
     extern __shared__ uint32_t shared_ht[];
 
@@ -357,18 +802,9 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzCompressL1Kernel(
     const uint32_t hash_size = 1u << hash_bits;
     const uint32_t hash_mask = hash_size - 1;
 
-    // Use shared memory if available, else global memory per-block tables
-    uint32_t* ht = (global_hash != nullptr)
-        ? global_hash + (uint64_t)chunk_id * hash_size
-        : shared_ht;
-
     const CompressChunkDesc& desc = descs[chunk_id];
     const uint8_t* src = input + desc.src_offset;
     const uint32_t src_size = desc.src_size;
-
-    for (uint32_t i = lane; i < hash_size; i += 32)
-        ht[i] = HASH_EMPTY;
-    __syncwarp();
 
     uint8_t* dst = output + desc.dst_offset;
     const uint32_t lit_data_start = (desc.is_first ? INITIAL_COPY : 0) + 3;
@@ -384,35 +820,97 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzCompressL1Kernel(
     uint32_t anchor = desc.is_first ? INITIAL_COPY : 0;
     int32_t recent_offset = -8;
 
-    // ── Block 1 pass: [anchor .. min(BLOCK1_SIZE, src_size)) ────
-    {
-        uint32_t block1_end = (src_size < BLOCK1_SIZE) ? src_size : BLOCK1_SIZE;
-        scanBlock(src, src_size, ht, hash_bits, hash_mask,
-                  lit_buf, lit_count,
-                  cmd_buf, token_count,
-                  off16_buf, off16_count,
-                  off32_buf, off32_pos, off32_count,
-                  len_buf, length_count,
-                  anchor, recent_offset,
-                  anchor, block1_end, /*block2_start=*/0);
-        off32_count_block1 = off32_count;
-        off32_count = 0;
-    }
+    if (use_chain) {
+        // ── Chain parser mode ────────────────────────────────────
+        // Three hash tables per block laid out contiguously in global_hash:
+        //   first_hash: hash_size u32
+        //   long_hash:  hash_size u32
+        //   next_hash:  NEXT_HASH_SIZE u16 (= NEXT_HASH_SIZE/2 u32 words)
+        uint32_t table_stride = hash_size + hash_size + (NEXT_HASH_SIZE / 2);
+        uint32_t* base = global_hash + (uint64_t)chunk_id * table_stride;
+        uint32_t* chain_first_hash = base;
+        uint32_t* chain_long_hash  = base + hash_size;
+        uint16_t* chain_next_hash  = (uint16_t*)(base + hash_size + hash_size);
 
-    // ── Block 2 pass: [max(anchor, BLOCK1_SIZE) .. src_size) ────
-    // Hash table and recent_offset carry over from block 1.
-    if (src_size > BLOCK1_SIZE) {
-        cmd_stream2_offset = token_count;
-        uint32_t block2_start_pos = (anchor > BLOCK1_SIZE) ? anchor : BLOCK1_SIZE;
-        scanBlock(src, src_size, ht, hash_bits, hash_mask,
-                  lit_buf, lit_count,
-                  cmd_buf, token_count,
-                  off16_buf, off16_count,
-                  off32_buf, off32_pos, off32_count,
-                  len_buf, length_count,
-                  anchor, recent_offset,
-                  block2_start_pos, src_size, /*block2_start=*/BLOCK1_SIZE);
-        off32_count_block2 = off32_count;
+        // Initialize all three tables to 0
+        uint32_t total_words = hash_size + hash_size + (NEXT_HASH_SIZE / 2);
+        for (uint32_t i = lane; i < total_words; i += 32)
+            base[i] = 0;
+        __syncwarp();
+
+        // ── Block 1 pass ────
+        {
+            uint32_t block1_end = (src_size < BLOCK1_SIZE) ? src_size : BLOCK1_SIZE;
+            scanBlockChain(src, src_size,
+                           chain_first_hash, chain_long_hash, chain_next_hash,
+                           hash_bits, hash_mask,
+                           lit_buf, lit_count,
+                           cmd_buf, token_count,
+                           off16_buf, off16_count,
+                           off32_buf, off32_pos, off32_count,
+                           len_buf, length_count,
+                           anchor, recent_offset,
+                           anchor, block1_end, /*block2_start=*/0);
+            off32_count_block1 = off32_count;
+            off32_count = 0;
+        }
+
+        // ── Block 2 pass ────
+        if (src_size > BLOCK1_SIZE) {
+            cmd_stream2_offset = token_count;
+            uint32_t block2_start_pos = (anchor > BLOCK1_SIZE) ? anchor : BLOCK1_SIZE;
+            scanBlockChain(src, src_size,
+                           chain_first_hash, chain_long_hash, chain_next_hash,
+                           hash_bits, hash_mask,
+                           lit_buf, lit_count,
+                           cmd_buf, token_count,
+                           off16_buf, off16_count,
+                           off32_buf, off32_pos, off32_count,
+                           len_buf, length_count,
+                           anchor, recent_offset,
+                           block2_start_pos, src_size, /*block2_start=*/BLOCK1_SIZE);
+            off32_count_block2 = off32_count;
+        }
+    } else {
+        // ── Greedy parser mode (original) ────────────────────────
+        // Use shared memory if available, else global memory per-block tables
+        uint32_t* ht = (global_hash != nullptr)
+            ? global_hash + (uint64_t)chunk_id * hash_size
+            : shared_ht;
+
+        for (uint32_t i = lane; i < hash_size; i += 32)
+            ht[i] = HASH_EMPTY;
+        __syncwarp();
+
+        // ── Block 1 pass ────
+        {
+            uint32_t block1_end = (src_size < BLOCK1_SIZE) ? src_size : BLOCK1_SIZE;
+            scanBlock(src, src_size, ht, hash_bits, hash_mask,
+                      lit_buf, lit_count,
+                      cmd_buf, token_count,
+                      off16_buf, off16_count,
+                      off32_buf, off32_pos, off32_count,
+                      len_buf, length_count,
+                      anchor, recent_offset,
+                      anchor, block1_end, /*block2_start=*/0);
+            off32_count_block1 = off32_count;
+            off32_count = 0;
+        }
+
+        // ── Block 2 pass ────
+        if (src_size > BLOCK1_SIZE) {
+            cmd_stream2_offset = token_count;
+            uint32_t block2_start_pos = (anchor > BLOCK1_SIZE) ? anchor : BLOCK1_SIZE;
+            scanBlock(src, src_size, ht, hash_bits, hash_mask,
+                      lit_buf, lit_count,
+                      cmd_buf, token_count,
+                      off16_buf, off16_count,
+                      off32_buf, off32_pos, off32_count,
+                      len_buf, length_count,
+                      anchor, recent_offset,
+                      block2_start_pos, src_size, /*block2_start=*/BLOCK1_SIZE);
+            off32_count_block2 = off32_count;
+        }
     }
 
     __syncwarp();
