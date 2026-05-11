@@ -29,7 +29,7 @@
 	.reg .b32 	%r<810>;
 	.reg .b64 	%rd<319>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ19slzCompressL1KernelE2ht[16384];
+	.shared .align 4 .b8 _ZZ19slzCompressL1KernelE2ht[8192];
 
 	ld.param.u64 	%rd52, [slzCompressL1Kernel_param_0];
 	ld.param.u64 	%rd55, [slzCompressL1Kernel_param_1];
@@ -63,7 +63,7 @@ $L__BB0_2:
 	st.shared.u32 	[%r315+256], %r316;
 	st.shared.u32 	[%r315+384], %r316;
 	add.s32 	%r661, %r661, 128;
-	setp.lt.u32 	%p8, %r661, 4096;
+	setp.lt.u32 	%p8, %r661, 2048;
 	@%p8 bra 	$L__BB0_2;
 
 	cvt.u32.u64 	%r324, %rd4;
@@ -412,8 +412,8 @@ $L__BB0_7:
 	selp.b32 	%r22, 29, %r354, %p16;
 	setp.ge.u32 	%p18, %r1, %r22;
 	mul.lo.s32 	%r355, %r21, -1640531535;
-	shr.u32 	%r356, %r355, 18;
-	and.b32  	%r357, %r356, 16380;
+	shr.u32 	%r356, %r355, 19;
+	and.b32  	%r357, %r356, 8188;
 	add.s32 	%r23, %r314, %r357;
 	mov.u32 	%r673, %r672;
 	@%p18 bra 	$L__BB0_10;
@@ -1118,8 +1118,8 @@ $L__BB0_88:
 	selp.b32 	%r167, 29, %r492, %p97;
 	setp.ge.u32 	%p99, %r1, %r167;
 	mul.lo.s32 	%r493, %r166, -1640531535;
-	shr.u32 	%r494, %r493, 18;
-	and.b32  	%r495, %r494, 16380;
+	shr.u32 	%r494, %r493, 19;
+	and.b32  	%r495, %r494, 8188;
 	add.s32 	%r168, %r314, %r495;
 	mov.u32 	%r744, %r743;
 	@%p99 bra 	$L__BB0_91;

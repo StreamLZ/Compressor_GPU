@@ -549,7 +549,7 @@ pub fn compressFramedOne(
         else => unreachable,
     };
     var pos: usize = 0;
-    const sc_grp: f32 = if (opts.gpu_mode) 1.0 else if (opts.sc_group_size_override) |ov| ov else switch (opts.level) {
+    const sc_grp: f32 = if (opts.gpu_mode) 0.25 else if (opts.sc_group_size_override) |ov| ov else switch (opts.level) {
         1 => @as(f32, @floatFromInt(lz_constants.default_sc_group_size)),
         2, 3, 4 => @floatFromInt(@min(high_framed.computeAdaptiveGroupSize(src.len), 16)),
         5 => @floatFromInt(high_framed.computeAdaptiveGroupSize(src.len)),
@@ -877,16 +877,16 @@ pub fn compressFramedOne(
             gpu_bi += n_subs;
         }
 
-        // Tail prefix table
+        // Tail prefix table: (n_chunks - 1) × 8 bytes, matching CPU format.
         if (self_contained and n_chunks > 1) {
             for (1..n_chunks) |ci| {
                 const chunk_start = ci * eff_chunk;
                 if (chunk_start >= data_src.len) break;
-                var csz: usize = 8;
-                if (chunk_start + csz > data_src.len) csz = data_src.len - chunk_start;
-                if (pos + csz > dst.len) return error.DestinationTooSmall;
-                @memcpy(dst[pos..][0..csz], data_src[chunk_start..][0..csz]);
-                pos += csz;
+                const copy_size: usize = @min(@as(usize, 8), data_src.len - chunk_start);
+                if (pos + 8 > dst.len) return error.DestinationTooSmall;
+                @memset(dst[pos..][0..8], 0);
+                @memcpy(dst[pos..][0..copy_size], data_src[chunk_start..][0..copy_size]);
+                pos += 8;
             }
         }
 

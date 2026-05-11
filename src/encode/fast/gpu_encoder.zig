@@ -97,7 +97,8 @@ pub const CompressChunkDesc = extern struct {
     is_first: u32,
 };
 
-const HASH_SIZE = 4096;
+const HASH_BITS = 11;
+const HASH_SIZE = 1 << HASH_BITS;
 
 pub var last_kernel_ns: i64 = 0;
 

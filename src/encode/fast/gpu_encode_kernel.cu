@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-static constexpr uint32_t HASH_BITS    = 12;
+static constexpr uint32_t HASH_BITS    = 11;
 static constexpr uint32_t HASH_SIZE    = 1 << HASH_BITS;
 static constexpr uint32_t HASH_MASK    = HASH_SIZE - 1;
 static constexpr uint32_t MIN_MATCH    = 4;
