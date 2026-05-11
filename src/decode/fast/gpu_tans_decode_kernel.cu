@@ -743,8 +743,7 @@ done:
                (long)ptr_diff, (long)adjust, (long)(ptr_diff+adjust),
                bitpos_f, bitpos_b);
     }
-    // TODO: convergence check disabled for debugging
-    // if (ptr_diff + adjust != 0) return TANS_ERR_STREAM_MISMATCH;
+    if (ptr_diff + adjust != 0) return TANS_ERR_STREAM_MISMATCH;
 
     uint32_t states_or = state0 | state1 | state2 | state3 | state4;
     if ((states_or & ~0xFFu) != 0) return TANS_ERR_STATE_RANGE;
@@ -802,6 +801,13 @@ __device__ uint32_t decodeTansChunk(
     td.b_used = 0;
     uint32_t err = decodeTable(br, log_table_bits, td);
     if (err != TANS_OK) return err;
+
+    // Compute post-table source position (matching CPU: src = br.p - (24 - br.bit_pos) / 8)
+    if (blockIdx.x == 0) {
+        uint32_t table_consumed = (uint32_t)(br.p - src_buf - desc.src_offset);
+        printf("DEC table: consumed=%u bytes, br.bit_pos=%d, a_used=%u b_used=%u\n",
+               table_consumed, br.bit_pos, td.a_used, td.b_used);
+    }
 
     // Finalize src position after table read
     // src = br.p - (24 - br.bit_pos) / 8

@@ -1026,8 +1026,12 @@ extern "C" __global__ void slzTansEncodeKernel(
     );
 
     // Verify sizes match
+    if (blockIdx.x == 0) {
+        printf("ENC sizes: fwd=%u bwd=%u payload=%u table=%u total=%u\n",
+               fwd_bytes, bwd_bytes, payload_bytes, table_bytes, total_size);
+    }
     if (fwd_bytes + bwd_bytes != payload_bytes) {
-        // Mismatch — fall back to raw
+        if (blockIdx.x == 0) printf("ENC SIZE MISMATCH! falling back to raw\n");
         out_sizes[chunk_id] = src_len | 0x80000000u;
         for (uint32_t i = 0; i < src_len && i < dst_capacity; i++)
             dst[i] = src[i];
