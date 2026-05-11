@@ -1,7 +1,7 @@
 // ── StreamLZ GPU L1 Compress Kernel ─────────────────────────────
 // Warp-parallel greedy scan with shared-memory hash table.
 // 32-bit hash entries support chunks up to 256KB (sc_group=1).
-// 1 warp per block, 8KB hash table (2K × u32) in shared memory.
+// 1 warp per block, 16KB hash table (4K × u32) in shared memory.
 //
 // Build: nvcc -ptx -arch=sm_89 -O3 gpu_encode_kernel.cu
 
@@ -13,6 +13,7 @@ static constexpr uint32_t HASH_MASK    = HASH_SIZE - 1;
 static constexpr uint32_t MIN_MATCH    = 4;
 static constexpr uint32_t INITIAL_COPY = 8;
 static constexpr uint32_t HASH_EMPTY   = 0xFFFFFFFFu;
+static constexpr uint32_t LARGE_OFFSET_THRESHOLD = 0xC00000u;
 
 struct CompressChunkDesc {
     uint32_t src_offset;
@@ -40,14 +41,34 @@ __device__ void writeLengthValue(uint8_t* len_buf, uint32_t &len_count, uint32_t
     }
 }
 
+__device__ void writeOffset32(uint8_t* off32_buf, uint32_t &off32_pos, uint32_t offset) {
+    if (offset >= LARGE_OFFSET_THRESHOLD) {
+        uint32_t truncated = (offset & 0x3FFFFF) | 0xC00000;
+        off32_buf[off32_pos++] = (uint8_t)(truncated & 0xFF);
+        off32_buf[off32_pos++] = (uint8_t)((truncated >> 8) & 0xFF);
+        off32_buf[off32_pos++] = (uint8_t)((truncated >> 16) & 0xFF);
+        off32_buf[off32_pos++] = (uint8_t)((offset - truncated) >> 22);
+    } else {
+        off32_buf[off32_pos++] = (uint8_t)(offset & 0xFF);
+        off32_buf[off32_pos++] = (uint8_t)((offset >> 8) & 0xFF);
+        off32_buf[off32_pos++] = (uint8_t)((offset >> 16) & 0xFF);
+    }
+}
+
+// Emit command/offset/length streams. Handles near (off16) and far (off32) offsets.
+// anchor_pos and match_pos are positions within the sub-chunk source.
+// block2_start is the block2 offset (0 for block1, 0x10000 for block2).
 __device__ void emitCmd(
     uint8_t* cmd_buf, uint32_t &token_count,
     uint8_t* off16_buf, uint32_t &off16_count,
+    uint8_t* off32_buf, uint32_t &off32_pos, uint32_t &off32_count,
     uint8_t* len_buf, uint32_t &length_count,
     uint32_t lit_len,
-    uint32_t match_len, uint32_t offset
+    uint32_t match_len, uint32_t offset,
+    uint32_t anchor_pos, uint32_t block2_start
 ) {
     uint32_t remaining_lit = lit_len;
+    uint32_t match_pos = anchor_pos + lit_len;
 
     if (remaining_lit <= 7 && match_len <= 15 && offset <= 0xFFFF) {
         uint8_t token = (uint8_t)(remaining_lit + 8 * match_len);
@@ -71,6 +92,29 @@ __device__ void emitCmd(
         cmd_buf[token_count++] = 0x00;
         remaining_lit = 0;
         if (match_len == 0) return;
+    }
+
+    // Resolve effective offset (0 = recent → actual distance)
+    uint32_t effective_offset = offset;
+
+    if (effective_offset > 0xFFFF) {
+        // Far-offset path: token 2-23 (short far) or token 2 + length (long far)
+        if (remaining_lit != 0) {
+            cmd_buf[token_count++] = (uint8_t)(0x80 + remaining_lit);
+            remaining_lit = 0;
+        }
+        int32_t delta = (int32_t)match_len - 5;
+        if (delta >= 0 && delta <= 23) {
+            cmd_buf[token_count++] = (uint8_t)(match_len - 5);
+        } else {
+            cmd_buf[token_count++] = 2;
+            writeLengthValue(len_buf, length_count, match_len > 29 ? match_len - 29 : 0);
+        }
+        // Off32 adjustment: adjusted = effective_offset + (block2_start - match_pos)
+        uint32_t adjusted = effective_offset + block2_start - match_pos;
+        writeOffset32(off32_buf, off32_pos, adjusted);
+        off32_count++;
+        return;
     }
 
     if (offset <= 0xFFFF && match_len <= 15) {
@@ -103,18 +147,9 @@ __device__ void emitCmd(
         }
         return;
     }
-
-    if (remaining_lit != 0) {
-        cmd_buf[token_count++] = (uint8_t)(0x80 + remaining_lit);
-    }
-    cmd_buf[token_count++] = 1;
-    writeLengthValue(len_buf, length_count, match_len > 91 ? match_len - 91 : 0);
-    uint16_t off_val = (uint16_t)offset;
-    memcpy(off16_buf + off16_count * 2, &off_val, 2);
-    off16_count++;
 }
 
-// 1 warp per block, 8KB shared memory hash table (2K × u32)
+// 1 warp per block, 16KB shared memory hash table (4K × u32)
 extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
     const uint8_t* __restrict__ input,
     uint8_t* __restrict__ output,
@@ -140,12 +175,14 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
     uint8_t* dst = output + desc.dst_offset;
     const uint32_t lit_data_start = (desc.is_first ? INITIAL_COPY : 0) + 3;
     uint8_t* lit_buf = dst + lit_data_start;
-    // Scale temp stream regions by src_size
+    // Temp stream regions scaled by src_size
     uint8_t* cmd_buf = dst + src_size;
     uint8_t* off16_buf = cmd_buf + (src_size / 4);
-    uint8_t* len_buf = off16_buf + (src_size / 2);
+    uint8_t* off32_buf = off16_buf + (src_size / 2);
+    uint8_t* len_buf = off32_buf + (src_size / 4);
 
     uint32_t lit_count = 0, token_count = 0, off16_count = 0, length_count = 0;
+    uint32_t off32_pos = 0, off32_count_block1 = 0, off32_count_block2 = 0, off32_count = 0;
     uint32_t cmd_stream2_offset = 0;
     uint32_t anchor = desc.is_first ? INITIAL_COPY : 0;
     int32_t recent_offset = -8;
@@ -173,7 +210,7 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
 
         if (is_active) {
             uint32_t ref_val = ht[h];
-            if (ref_val != HASH_EMPTY && ref_val < my_pos && (my_pos - ref_val) <= 0xFFFF) {
+            if (ref_val != HASH_EMPTY && ref_val < my_pos) {
                 uint32_t rk = (uint32_t)src[ref_val] |
                              ((uint32_t)src[ref_val+1] << 8) |
                              ((uint32_t)src[ref_val+2] << 16) |
@@ -246,6 +283,10 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
             int32_t neg_off = -(int32_t)(match_pos - match_ref);
             uint32_t off_param = (neg_off == recent_offset) ? 0 : (uint32_t)(-neg_off);
 
+            // Track block boundary for off32 counts
+            uint32_t block2_start = 0;
+            if (match_pos >= 0x10000) block2_start = 0x10000;
+
             if (lit_len <= 7 && match_len <= 15 && off_param <= 0xFFFF) {
                 if (lane == 0) {
                     uint8_t token = (uint8_t)(lit_len + 8 * match_len);
@@ -259,22 +300,35 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
                 }
             } else {
                 if (lane == 0) {
+                    // Save off32_count before emitCmd to track per-block counts
+                    uint32_t off32_before = off32_count;
                     emitCmd(cmd_buf, token_count, off16_buf, off16_count,
-                            len_buf, length_count, lit_len, match_len, off_param);
+                            off32_buf, off32_pos, off32_count,
+                            len_buf, length_count, lit_len, match_len, off_param,
+                            anchor, block2_start);
+                    // Track off32 counts per block
+                    if (off32_count > off32_before) {
+                        if (block2_start == 0)
+                            off32_count_block1 += (off32_count - off32_before);
+                        else
+                            off32_count_block2 += (off32_count - off32_before);
+                    }
                 }
             }
-            recent_offset = neg_off;
 
             // Track block boundary for cmd_stream2_offset
             if (cmd_stream2_offset == 0 && match_pos + match_len > 0x10000 && lane == 0) {
                 cmd_stream2_offset = token_count;
             }
+
+            recent_offset = neg_off;
         }
 
         anchor = match_pos + match_len;
         pos = anchor;
     }
 
+    // Trailing literals
     {
         uint32_t trailing = src_size - anchor;
         if (trailing > 0) {
@@ -283,8 +337,11 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
             lit_count += trailing;
 
             if (lane == 0) {
+                uint32_t block2_start = (anchor >= 0x10000) ? 0x10000u : 0u;
                 emitCmd(cmd_buf, token_count, off16_buf, off16_count,
-                        len_buf, length_count, trailing, 0, 0);
+                        off32_buf, off32_pos, off32_count,
+                        len_buf, length_count, trailing, 0, 0,
+                        anchor, block2_start);
             }
         }
     }
@@ -309,7 +366,6 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
         memcpy(dst + out_pos, cmd_buf, token_count);
         out_pos += token_count;
 
-        // cmd_stream2_offset: written for sub-chunks > 64KB
         if (src_size > 0x10000) {
             uint16_t cs2o = (cmd_stream2_offset > 0) ? (uint16_t)cmd_stream2_offset : (uint16_t)token_count;
             memcpy(dst + out_pos, &cs2o, 2);
@@ -322,8 +378,25 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
         memcpy(dst + out_pos, off16_buf, off16_count * 2);
         out_pos += off16_count * 2;
 
-        dst[out_pos] = 0; dst[out_pos + 1] = 0; dst[out_pos + 2] = 0;
-        out_pos += 3;
+        // Off32 header: packed (block1_count << 12) | block2_count
+        uint32_t c1 = (off32_count_block1 < 4095) ? off32_count_block1 : 4095;
+        uint32_t c2 = (off32_count_block2 < 4095) ? off32_count_block2 : 4095;
+        uint32_t packed = (c1 << 12) | c2;
+        dst[out_pos++] = (uint8_t)(packed & 0xFF);
+        dst[out_pos++] = (uint8_t)((packed >> 8) & 0xFF);
+        dst[out_pos++] = (uint8_t)((packed >> 16) & 0xFF);
+        if (off32_count_block1 >= 4095) {
+            uint16_t ext = (uint16_t)off32_count_block1;
+            memcpy(dst + out_pos, &ext, 2);
+            out_pos += 2;
+        }
+        if (off32_count_block2 >= 4095) {
+            uint16_t ext = (uint16_t)off32_count_block2;
+            memcpy(dst + out_pos, &ext, 2);
+            out_pos += 2;
+        }
+        memcpy(dst + out_pos, off32_buf, off32_pos);
+        out_pos += off32_pos;
 
         memcpy(dst + out_pos, len_buf, length_count);
         out_pos += length_count;
