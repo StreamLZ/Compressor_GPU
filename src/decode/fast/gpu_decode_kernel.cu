@@ -132,11 +132,9 @@ __device__ void decodeSubChunkL1(
             uint32_t match_src = (uint32_t)((int32_t)dst_pos + match_offset);
             int32_t match_dist = -match_offset;
             if (match_dist >= (int32_t)match_len && match_len > 1) {
-                // Non-overlapping: all lanes copy in parallel
                 for (uint32_t i = lane; i < match_len; i += 32)
                     dst[dst_pos + i] = dst[match_src + i];
             } else {
-                // Overlapping (RLE-like): serial copy on lane 0
                 if (lane == 0)
                     for (uint32_t i = 0; i < match_len; i++)
                         dst[dst_pos + i] = dst[match_src + i];
@@ -154,6 +152,7 @@ __device__ void decodeSubChunkL1(
     uint32_t trailing = (lit_size > lit_pos) ? (lit_size - lit_pos) : 0;
     for (uint32_t i = lane; i < trailing; i += 32)
         dst[dst_pos + i] = lit[lit_pos + i];
+
 }
 
 // ── General sub-chunk decoder ──────────────────────────────────

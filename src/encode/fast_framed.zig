@@ -685,7 +685,7 @@ pub fn compressFramedOne(
 
     const can_compress = src.len > fast_constants.min_source_length;
 
-    const self_contained: bool = opts.self_contained or opts.two_phase or (opts.level >= 1 and opts.level <= 4);
+    const self_contained: bool = opts.self_contained or opts.two_phase or opts.gpu_mode or (opts.level >= 1 and opts.level <= 4);
     const sc_flag_bit: u8 = if (self_contained) 0x10 else 0;
     const two_phase_flag_bit: u8 = if (opts.two_phase) 0x20 else 0;
 
