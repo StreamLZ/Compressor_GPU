@@ -3,6 +3,11 @@
 // 32-bit hash entries support chunks up to 256KB (sc_group=1).
 // 1 warp per block, 16KB hash table (4K × u32) in shared memory.
 //
+// Two-pass block design: the parser scans block 1 [0..64KB) and
+// block 2 [64KB..src_size) separately so that literal runs and
+// match extensions never cross the 64KB boundary. This matches
+// the CPU encoder's architecture exactly.
+//
 // Build: nvcc -ptx -arch=sm_89 -O3 gpu_encode_kernel.cu
 
 #include <cstdint>
@@ -14,6 +19,7 @@ static constexpr uint32_t MIN_MATCH    = 4;
 static constexpr uint32_t INITIAL_COPY = 8;
 static constexpr uint32_t HASH_EMPTY   = 0xFFFFFFFFu;
 static constexpr uint32_t LARGE_OFFSET_THRESHOLD = 0xC00000u;
+static constexpr uint32_t BLOCK1_SIZE  = 0x10000u;
 
 struct CompressChunkDesc {
     uint32_t src_offset;
@@ -55,9 +61,12 @@ __device__ void writeOffset32(uint8_t* off32_buf, uint32_t &off32_pos, uint32_t 
     }
 }
 
-// Emit command/offset/length streams. Handles near (off16) and far (off32) offsets.
-// anchor_pos and match_pos are positions within the sub-chunk source.
-// block2_start is the block2 offset (0 for block1, 0x10000 for block2).
+// Emit tokens — 1:1 port of CPU writeComplexOffset.
+// Flow matches the CPU exactly:
+//   1. Fast path (lit<=7, match<=15, off<=0xFFFF)
+//   2. Literal encoding (0x87 or 0x00)
+//   3. Near-offset continuation (off<=0xFFFF, match<=90): remaining_lit in first match token
+//   4. Long-match / far-offset: emit remaining_lit separately, then resolve offset
 __device__ void emitCmd(
     uint8_t* cmd_buf, uint32_t &token_count,
     uint8_t* off16_buf, uint32_t &off16_count,
@@ -65,11 +74,13 @@ __device__ void emitCmd(
     uint8_t* len_buf, uint32_t &length_count,
     uint32_t lit_len,
     uint32_t match_len, uint32_t offset,
-    uint32_t anchor_pos, uint32_t block2_start
+    uint32_t anchor_pos, uint32_t block2_start,
+    int32_t recent_offset
 ) {
     uint32_t remaining_lit = lit_len;
     uint32_t match_pos = anchor_pos + lit_len;
 
+    // Step 1: Fast path
     if (remaining_lit <= 7 && match_len <= 15 && offset <= 0xFFFF) {
         uint8_t token = (uint8_t)(remaining_lit + 8 * match_len);
         if (offset == 0) token |= 0x80;
@@ -82,6 +93,7 @@ __device__ void emitCmd(
         return;
     }
 
+    // Step 2: Literal encoding
     if (remaining_lit < 64) {
         while (remaining_lit > 7) {
             cmd_buf[token_count++] = 0x87;
@@ -94,42 +106,8 @@ __device__ void emitCmd(
         if (match_len == 0) return;
     }
 
-    // Resolve effective offset (0 = recent → actual distance)
-    uint32_t effective_offset = offset;
-
-    if (effective_offset > 0xFFFF) {
-        // Far-offset path
-        if (remaining_lit != 0) {
-            cmd_buf[token_count++] = (uint8_t)(0x80 + remaining_lit);
-            remaining_lit = 0;
-        }
-        // Tokens 3-23: short far (match_len = token + 5, i.e. 8-28)
-        // Token 2: long far (with length value, for match_len < 8 or > 28)
-        if (match_len >= 8 && match_len <= 28) {
-            cmd_buf[token_count++] = (uint8_t)(match_len - 5);
-        } else {
-            cmd_buf[token_count++] = 2;
-            writeLengthValue(len_buf, length_count, match_len > 29 ? match_len - 29 : 0);
-        }
-        uint32_t adjusted = effective_offset + block2_start - match_pos;
-        writeOffset32(off32_buf, off32_pos, adjusted);
-        off32_count++;
-        return;
-    }
-
-    if (offset <= 0xFFFF && match_len <= 15) {
-        uint8_t token = (uint8_t)(remaining_lit + 8 * match_len);
-        if (offset == 0) token |= 0x80;
-        cmd_buf[token_count++] = token;
-        if (offset != 0) {
-            uint16_t off_val = (uint16_t)offset;
-            memcpy(off16_buf + off16_count * 2, &off_val, 2);
-            off16_count++;
-        }
-        return;
-    }
-
-    if (offset <= 0xFFFF) {
+    // Step 3: Near-offset continuation (remaining_lit folded into first match token)
+    if (offset <= 0xFFFF && match_len <= 90) {
         uint32_t current = (match_len < 15) ? match_len : 15;
         uint8_t token = (uint8_t)(remaining_lit + 8 * current);
         if (offset == 0) token |= 0x80;
@@ -147,48 +125,72 @@ __device__ void emitCmd(
         }
         return;
     }
+
+    // Step 4: Long-match / far-offset path
+    if (remaining_lit != 0) {
+        cmd_buf[token_count++] = (uint8_t)(0x80 + remaining_lit);
+    }
+
+    uint32_t effective_offset = offset;
+    if (effective_offset == 0) {
+        effective_offset = (uint32_t)(-recent_offset);
+    }
+
+    uint8_t token_byte = 0;
+    bool write_length = false;
+    int32_t length_value = 0;
+
+    if (effective_offset > 0xFFFF) {
+        int32_t delta = (int32_t)match_len - 5;
+        if (delta >= 0 && delta <= 23) {
+            token_byte = (uint8_t)(match_len - 5);
+        } else {
+            token_byte = 2;
+            length_value = (int32_t)match_len - 29;
+            write_length = true;
+        }
+    } else {
+        token_byte = 1;
+        length_value = (int32_t)match_len - 91;
+        write_length = true;
+    }
+
+    cmd_buf[token_count++] = token_byte;
+    if (write_length) {
+        uint32_t lv = (length_value > 0) ? (uint32_t)length_value : 0;
+        writeLengthValue(len_buf, length_count, lv);
+    }
+
+    if (effective_offset > 0xFFFF) {
+        uint32_t adjusted = effective_offset + block2_start - match_pos;
+        writeOffset32(off32_buf, off32_pos, adjusted);
+        off32_count++;
+    } else {
+        uint16_t off_val = (uint16_t)effective_offset;
+        memcpy(off16_buf + off16_count * 2, &off_val, 2);
+        off16_count++;
+    }
 }
 
-// 1 warp per block, 16KB shared memory hash table (4K × u32)
-extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
-    const uint8_t* __restrict__ input,
-    uint8_t* __restrict__ output,
-    const CompressChunkDesc* __restrict__ descs,
-    uint32_t* __restrict__ hash_tables_unused,
-    uint32_t* __restrict__ comp_sizes,
-    uint32_t total_chunks
+// ── scanBlock: warp-parallel greedy scan for one block ──────────
+// Scans positions [start_pos .. end_pos), finding matches, extending
+// them (capped at end_pos), and emitting tokens + trailing literals.
+// All counters are passed by reference and accumulate across calls.
+__device__ void scanBlock(
+    const uint8_t* src, uint32_t src_size,
+    uint32_t* ht,
+    uint8_t* lit_buf, uint32_t &lit_count,
+    uint8_t* cmd_buf, uint32_t &token_count,
+    uint8_t* off16_buf, uint32_t &off16_count,
+    uint8_t* off32_buf, uint32_t &off32_pos, uint32_t &off32_count,
+    uint8_t* len_buf, uint32_t &length_count,
+    uint32_t &anchor, int32_t &recent_offset,
+    uint32_t start_pos, uint32_t end_pos, uint32_t block2_start
 ) {
-    __shared__ uint32_t ht[HASH_SIZE];
-
-    const uint32_t chunk_id = blockIdx.x;
     const uint32_t lane = threadIdx.x & 31;
-    if (chunk_id >= total_chunks) return;
+    uint32_t pos = start_pos;
 
-    const CompressChunkDesc& desc = descs[chunk_id];
-    const uint8_t* src = input + desc.src_offset;
-    const uint32_t src_size = desc.src_size;
-
-    for (uint32_t i = lane; i < HASH_SIZE; i += 32)
-        ht[i] = HASH_EMPTY;
-    __syncwarp();
-
-    uint8_t* dst = output + desc.dst_offset;
-    const uint32_t lit_data_start = (desc.is_first ? INITIAL_COPY : 0) + 3;
-    uint8_t* lit_buf = dst + lit_data_start;
-    // Temp stream regions scaled by src_size
-    uint8_t* cmd_buf = dst + src_size;
-    uint8_t* off16_buf = cmd_buf + (src_size / 4);
-    uint8_t* off32_buf = off16_buf + (src_size / 2);
-    uint8_t* len_buf = off32_buf + (src_size / 4);
-
-    uint32_t lit_count = 0, token_count = 0, off16_count = 0, length_count = 0;
-    uint32_t off32_pos = 0, off32_count_block1 = 0, off32_count_block2 = 0, off32_count = 0;
-    uint32_t cmd_stream2_offset = 0;
-    uint32_t anchor = desc.is_first ? INITIAL_COPY : 0;
-    int32_t recent_offset = -8;
-    uint32_t pos = anchor;
-
-    while (pos + MIN_MATCH <= src_size) {
+    while (pos + MIN_MATCH <= end_pos) {
         uint32_t my_pos = pos + lane;
         uint32_t my_byte = (my_pos < src_size) ? (uint32_t)src[my_pos] : 0u;
 
@@ -197,7 +199,7 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
         uint32_t b3 = __shfl_down_sync(0xFFFFFFFF, my_byte, 3);
         uint32_t key4 = my_byte | (b1 << 8) | (b2 << 16) | (b3 << 24);
 
-        uint32_t remaining = src_size - pos;
+        uint32_t remaining = end_pos - pos;
         uint32_t active_count;
         if (remaining >= 32) active_count = 29;
         else if (remaining >= 4) active_count = remaining - 3;
@@ -210,7 +212,7 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
 
         if (is_active) {
             uint32_t ref_val = ht[h];
-            if (ref_val != HASH_EMPTY && ref_val < my_pos) {
+            if (ref_val != HASH_EMPTY && ref_val < my_pos && (my_pos - ref_val) <= 0xFFFF) {
                 uint32_t rk = (uint32_t)src[ref_val] |
                              ((uint32_t)src[ref_val+1] << 8) |
                              ((uint32_t)src[ref_val+2] << 16) |
@@ -255,8 +257,9 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
         uint32_t match_pos = pos + first_lane;
         uint32_t match_ref = __shfl_sync(0xFFFFFFFF, my_ref, first_lane);
 
+        // Match extension capped at end_pos (block boundary)
         uint32_t match_len = MIN_MATCH;
-        uint32_t max_match = src_size - match_pos;
+        uint32_t max_match = end_pos - match_pos;
         for (uint32_t ext = MIN_MATCH; ext < max_match; ext += 32) {
             uint32_t check = ext + lane;
             bool mm;
@@ -274,20 +277,25 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
         ext_done:
 
         {
-            uint32_t lit_len = match_pos - anchor;
-            for (uint32_t i = lane; i < lit_len; i += 32)
-                lit_buf[lit_count + i] = src[anchor + i];
-
-            lit_count += lit_len;
-
             int32_t neg_off = -(int32_t)(match_pos - match_ref);
             uint32_t off_param = (neg_off == recent_offset) ? 0 : (uint32_t)(-neg_off);
 
-            // Track block boundary for off32 counts
-            uint32_t block2_start = 0;
-            if (match_pos >= 0x10000) block2_start = 0x10000;
+            // Resolve actual offset for fast-path decision
+            uint32_t resolved_off = off_param;
+            if (resolved_off == 0) resolved_off = (uint32_t)(-recent_offset);
 
-            if (lit_len <= 7 && match_len <= 15 && off_param <= 0xFFFF) {
+            // Enforce minimum match length for far offsets (CPU mmlt = 14)
+            if (resolved_off > 0xFFFF && match_len < 14) {
+                pos = match_pos + 1;
+                continue;
+            }
+
+            uint32_t lit_len = match_pos - anchor;
+            for (uint32_t i = lane; i < lit_len; i += 32)
+                lit_buf[lit_count + i] = src[anchor + i];
+            lit_count += lit_len;
+
+            if (lit_len <= 7 && match_len <= 15 && resolved_off <= 0xFFFF) {
                 if (lane == 0) {
                     uint8_t token = (uint8_t)(lit_len + 8 * match_len);
                     if (off_param == 0) token |= 0x80;
@@ -300,25 +308,11 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
                 }
             } else {
                 if (lane == 0) {
-                    // Save off32_count before emitCmd to track per-block counts
-                    uint32_t off32_before = off32_count;
                     emitCmd(cmd_buf, token_count, off16_buf, off16_count,
                             off32_buf, off32_pos, off32_count,
                             len_buf, length_count, lit_len, match_len, off_param,
-                            anchor, block2_start);
-                    // Track off32 counts per block
-                    if (off32_count > off32_before) {
-                        if (block2_start == 0)
-                            off32_count_block1 += (off32_count - off32_before);
-                        else
-                            off32_count_block2 += (off32_count - off32_before);
-                    }
+                            anchor, block2_start, recent_offset);
                 }
-            }
-
-            // Track block boundary for cmd_stream2_offset
-            if (cmd_stream2_offset == 0 && match_pos + match_len > 0x10000 && lane == 0) {
-                cmd_stream2_offset = token_count;
             }
 
             recent_offset = neg_off;
@@ -328,23 +322,93 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
         pos = anchor;
     }
 
-    // Trailing literals
+    // Trailing literals up to end_pos
     {
-        uint32_t trailing = src_size - anchor;
+        uint32_t trailing = end_pos - anchor;
         if (trailing > 0) {
             for (uint32_t i = lane; i < trailing; i += 32)
                 lit_buf[lit_count + i] = src[anchor + i];
             lit_count += trailing;
 
             if (lane == 0) {
-                uint32_t block2_start = (anchor >= 0x10000) ? 0x10000u : 0u;
                 emitCmd(cmd_buf, token_count, off16_buf, off16_count,
                         off32_buf, off32_pos, off32_count,
                         len_buf, length_count, trailing, 0, 0,
-                        anchor, block2_start);
+                        anchor, block2_start, recent_offset);
             }
+
+            anchor = end_pos;
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
+    const uint8_t* __restrict__ input,
+    uint8_t* __restrict__ output,
+    const CompressChunkDesc* __restrict__ descs,
+    uint32_t* __restrict__ hash_tables_unused,
+    uint32_t* __restrict__ comp_sizes,
+    uint32_t total_chunks
+) {
+    __shared__ uint32_t ht[HASH_SIZE];
+
+    const uint32_t chunk_id = blockIdx.x;
+    const uint32_t lane = threadIdx.x & 31;
+    if (chunk_id >= total_chunks) return;
+
+    const CompressChunkDesc& desc = descs[chunk_id];
+    const uint8_t* src = input + desc.src_offset;
+    const uint32_t src_size = desc.src_size;
+
+    for (uint32_t i = lane; i < HASH_SIZE; i += 32)
+        ht[i] = HASH_EMPTY;
+    __syncwarp();
+
+    uint8_t* dst = output + desc.dst_offset;
+    const uint32_t lit_data_start = (desc.is_first ? INITIAL_COPY : 0) + 3;
+    uint8_t* lit_buf = dst + lit_data_start;
+    uint8_t* cmd_buf = dst + src_size;
+    uint8_t* off16_buf = cmd_buf + (src_size / 4);
+    uint8_t* off32_buf = off16_buf + (src_size / 2);
+    uint8_t* len_buf = off32_buf + (src_size / 4);
+
+    uint32_t lit_count = 0, token_count = 0, off16_count = 0, length_count = 0;
+    uint32_t off32_pos = 0, off32_count_block1 = 0, off32_count_block2 = 0, off32_count = 0;
+    uint32_t cmd_stream2_offset = 0;
+    uint32_t anchor = desc.is_first ? INITIAL_COPY : 0;
+    int32_t recent_offset = -8;
+
+    // ── Block 1 pass: [anchor .. min(BLOCK1_SIZE, src_size)) ────
+    {
+        uint32_t block1_end = (src_size < BLOCK1_SIZE) ? src_size : BLOCK1_SIZE;
+        scanBlock(src, src_size, ht,
+                  lit_buf, lit_count,
+                  cmd_buf, token_count,
+                  off16_buf, off16_count,
+                  off32_buf, off32_pos, off32_count,
+                  len_buf, length_count,
+                  anchor, recent_offset,
+                  anchor, block1_end, /*block2_start=*/0);
+        off32_count_block1 = off32_count;
+        off32_count = 0;
+    }
+
+    // ── Block 2 pass: [max(anchor, BLOCK1_SIZE) .. src_size) ────
+    // Hash table and recent_offset carry over from block 1.
+    if (src_size > BLOCK1_SIZE) {
+        cmd_stream2_offset = token_count;
+        uint32_t block2_start_pos = (anchor > BLOCK1_SIZE) ? anchor : BLOCK1_SIZE;
+        scanBlock(src, src_size, ht,
+                  lit_buf, lit_count,
+                  cmd_buf, token_count,
+                  off16_buf, off16_count,
+                  off32_buf, off32_pos, off32_count,
+                  len_buf, length_count,
+                  anchor, recent_offset,
+                  block2_start_pos, src_size, /*block2_start=*/BLOCK1_SIZE);
+        off32_count_block2 = off32_count;
+    }
+
     __syncwarp();
 
     if (lane == 0) {
@@ -366,7 +430,7 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
         memcpy(dst + out_pos, cmd_buf, token_count);
         out_pos += token_count;
 
-        if (src_size > 0x10000) {
+        if (src_size > BLOCK1_SIZE) {
             uint16_t cs2o = (cmd_stream2_offset > 0) ? (uint16_t)cmd_stream2_offset : (uint16_t)token_count;
             memcpy(dst + out_pos, &cs2o, 2);
             out_pos += 2;
@@ -378,7 +442,6 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
         memcpy(dst + out_pos, off16_buf, off16_count * 2);
         out_pos += off16_count * 2;
 
-        // Off32 header: packed (block1_count << 12) | block2_count
         uint32_t c1 = (off32_count_block1 < 4095) ? off32_count_block1 : 4095;
         uint32_t c2 = (off32_count_block2 < 4095) ? off32_count_block2 : 4095;
         uint32_t packed = (c1 << 12) | c2;

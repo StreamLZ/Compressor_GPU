@@ -98,7 +98,24 @@ fn reencodeGpuWithEntropy(
     var off32_extra: usize = 0;
     if (off32_c1 >= 4095) { if (rp + 2 > raw.len) return 0; off32_c1 = std.mem.readInt(u16, raw[rp..][0..2], .little); rp += 2; off32_extra += 2; }
     if (off32_c2 >= 4095) { if (rp + 2 > raw.len) return 0; off32_c2 = std.mem.readInt(u16, raw[rp..][0..2], .little); rp += 2; off32_extra += 2; }
-    const off32_byte_count = off32_c1 * 3 + off32_c2 * 4;
+    // Scan off32 entries to compute actual byte count (3 or 4 bytes per entry)
+    const off32_byte_count: usize = blk: {
+        var count: usize = 0;
+        var scan = rp;
+        const total_entries = off32_c1 + off32_c2;
+        for (0..total_entries) |_| {
+            if (scan + 3 > raw.len) break :blk count;
+            if (raw[scan + 2] >= 0xC0) {
+                if (scan + 4 > raw.len) break :blk count;
+                count += 4;
+                scan += 4;
+            } else {
+                count += 3;
+                scan += 3;
+            }
+        }
+        break :blk count;
+    };
     if (rp + off32_byte_count > raw.len) return 0;
     rp += off32_byte_count;
 
