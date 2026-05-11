@@ -1050,31 +1050,32 @@ extern "C" __global__ void slzTansEncodeKernel(
     // careful. Copy backward stream first (it's at bwd_ptr), then forward.
     // Use a small temp buffer approach — copy via backwards iteration if needed.
 
-    // The backward stream is at bwd_ptr (somewhere near dst+dst_capacity-16-bwd_bytes)
-    // and needs to go to dst+table_bytes. These shouldn't overlap for reasonable sizes.
+    // Assembly: copy forward stream FIRST (before backward overwrites its source region),
+    // then copy backward stream.
+    // Forward: src at fwd_ptr (= dst+table_bytes+16), dest at dst+table_bytes+bwd_bytes.
+    // Backward: src at bwd_ptr (near dst+dst_capacity-16), dest at dst+table_bytes.
+    //
+    // The forward source region [fwd_ptr .. fwd_ptr+fwd_bytes) overlaps with
+    // the backward destination [dst+table_bytes .. dst+table_bytes+bwd_bytes) when
+    // bwd_bytes > 16. Copying forward first preserves its source data.
+    uint8_t* fwd_dst = dst + table_bytes + bwd_bytes;
+    if (fwd_ptr != fwd_dst) {
+        if (fwd_dst > fwd_ptr) {
+            // Dest is past source — copy backward to avoid clobbering
+            for (int i = (int)fwd_bytes - 1; i >= 0; i--)
+                fwd_dst[i] = fwd_ptr[i];
+        } else {
+            for (uint32_t i = 0; i < fwd_bytes; i++)
+                fwd_dst[i] = fwd_ptr[i];
+        }
+    }
+
+    // Now copy backward stream (its source at bwd_ptr is in the high region,
+    // far from the forward data we just placed)
     uint8_t* bwd_dst = dst + table_bytes;
-    // Copy backward stream
     if (bwd_ptr != bwd_dst) {
         for (uint32_t i = 0; i < bwd_bytes; i++)
             bwd_dst[i] = bwd_ptr[i];
-    }
-
-    // The forward stream is at fwd_ptr (= fwd_start = dst+table_bytes+16)
-    // and needs to go to dst+table_bytes+bwd_bytes. If bwd_bytes < 16, regions overlap,
-    // so copy forward (source is always >= destination here since fwd_start is offset by 16).
-    uint8_t* fwd_dst = dst + table_bytes + bwd_bytes;
-    if (fwd_ptr != fwd_dst) {
-        // fwd_ptr = dst + table_bytes + 16, fwd_dst = dst + table_bytes + bwd_bytes
-        // If bwd_bytes <= 16, fwd_dst <= fwd_ptr, so forward copy is safe.
-        // If bwd_bytes > 16, fwd_dst > fwd_ptr, need backward copy.
-        if (fwd_dst <= fwd_ptr) {
-            for (uint32_t i = 0; i < fwd_bytes; i++)
-                fwd_dst[i] = fwd_ptr[i];
-        } else {
-            // Backward copy to handle overlap
-            for (int i = (int)fwd_bytes - 1; i >= 0; i--)
-                fwd_dst[i] = fwd_ptr[i];
-        }
     }
 
     out_sizes[chunk_id] = total_size;
