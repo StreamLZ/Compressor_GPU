@@ -199,6 +199,104 @@ __device__ void emitCmd(
     }
 }
 
+// ── literalRunSlotCount ─────────────────────────────────────────
+// Port of CPU fast_constants.literalRunSlotCount: value mod 7 for > 7.
+__device__ uint32_t literalRunSlotCount(uint32_t value) {
+    return (value > 7) ? ((value - 1) % 7 + 1) : value;
+}
+
+// ── emitWithLiteral1 ───────────────────────────────────────────
+// Port of CPU writeOffsetWithLiteral1. For literal runs 8-63 bytes,
+// scans for single-byte recent-offset matches and splits the run
+// to emit them as (lit_count, match=1, offset=0) tokens.
+__device__ void emitWithLiteral1(
+    const uint8_t* src,
+    uint8_t* lit_buf, uint32_t &lit_count,
+    uint8_t* cmd_buf, uint32_t &token_count,
+    uint8_t* off16_buf, uint32_t &off16_count,
+    uint8_t* off32_buf, uint32_t &off32_pos, uint32_t &off32_count,
+    uint8_t* len_buf, uint32_t &length_count,
+    uint32_t anchor, uint32_t lit_len,
+    uint32_t match_len, uint32_t offset,
+    uint32_t block2_start, int32_t recent_offset
+) {
+    // Only scan literal runs in [8, 63]
+    if (lit_len < 8 || lit_len > 63) {
+        for (uint32_t i = 0; i < lit_len; i++)
+            lit_buf[lit_count + i] = src[anchor + i];
+        lit_count += lit_len;
+        emitCmd(cmd_buf, token_count, off16_buf, off16_count,
+                off32_buf, off32_pos, off32_count,
+                len_buf, length_count, lit_len, match_len, offset,
+                anchor, block2_start, recent_offset);
+        return;
+    }
+
+    // Scan for bytes matching recent-offset pattern
+    uint32_t found[33];
+    uint32_t found_count = 0;
+    uint32_t last = 0;
+    int32_t ro = recent_offset; // negative distance
+
+    for (uint32_t i = 1; i < lit_len; i++) {
+        uint32_t p = anchor + i;
+        int32_t back = (int32_t)p + ro;
+        if (back >= 0 && src[p] == src[(uint32_t)back]) {
+            if (i != last) {
+                found[found_count] = i - last;
+                found_count++;
+                last = i + 1;
+            } else {
+                last = i + 1;
+            }
+            if (found_count >= 32) break;
+        }
+    }
+
+    if (found_count != 0) {
+        found[found_count] = lit_len - last;
+        uint32_t cur_anchor = anchor;
+        uint32_t cur_lit = lit_len;
+
+        for (uint32_t fi = 0; fi < found_count; fi++) {
+            uint32_t current = found[fi];
+            uint32_t next_val = found[fi + 1];
+            if (literalRunSlotCount(current) + literalRunSlotCount(next_val) + 1 > 7) {
+                // Emit: `current` literals + 1 match byte at recent offset
+                for (uint32_t i = 0; i < current; i++)
+                    lit_buf[lit_count + i] = src[cur_anchor + i];
+                lit_count += current;
+                emitCmd(cmd_buf, token_count, off16_buf, off16_count,
+                        off32_buf, off32_pos, off32_count,
+                        len_buf, length_count, current, 1, 0,
+                        cur_anchor, block2_start, recent_offset);
+                cur_anchor += current + 1;
+                cur_lit -= current + 1;
+            } else {
+                found[fi + 1] += current + 1;
+            }
+        }
+
+        // Emit remaining literals + the actual match
+        for (uint32_t i = 0; i < cur_lit; i++)
+            lit_buf[lit_count + i] = src[cur_anchor + i];
+        lit_count += cur_lit;
+        emitCmd(cmd_buf, token_count, off16_buf, off16_count,
+                off32_buf, off32_pos, off32_count,
+                len_buf, length_count, cur_lit, match_len, offset,
+                cur_anchor, block2_start, recent_offset);
+    } else {
+        // No recent-offset bytes found — emit normally
+        for (uint32_t i = 0; i < lit_len; i++)
+            lit_buf[lit_count + i] = src[anchor + i];
+        lit_count += lit_len;
+        emitCmd(cmd_buf, token_count, off16_buf, off16_count,
+                off32_buf, off32_pos, off32_count,
+                len_buf, length_count, lit_len, match_len, offset,
+                anchor, block2_start, recent_offset);
+    }
+}
+
 // ── isLazyMatchBetter ────────────────────────────────────────────
 // Returns true if `cand` (found at pos + step) is better than `current`.
 // Port of CPU isLazyMatchBetter: 5*(len_diff) - 5 - (bits_diff) > step*4
@@ -562,20 +660,14 @@ __device__ void scanBlockChain(
             match.length++;
         }
 
-        // Compute literal run and copy literals
+        // Compute literal run and emit with literal-1 splitting
         uint32_t lit_len = pos - anchor;
-        for (uint32_t i = 0; i < lit_len; i++)
-            lit_buf[lit_count + i] = src[anchor + i];
-        lit_count += lit_len;
-
-        // Distance cap: (my_pos - ref) <= 0xFFFF for sc_group=0.25
-        // off_param is already set: 0 for recent, positive distance otherwise
-
-        // Emit the match
-        emitCmd(cmd_buf, token_count, off16_buf, off16_count,
-                off32_buf, off32_pos, off32_count,
-                len_buf, length_count, lit_len, (uint32_t)match.length, off_param,
-                anchor, block2_start, recent_offset);
+        emitWithLiteral1(src, lit_buf, lit_count,
+                         cmd_buf, token_count, off16_buf, off16_count,
+                         off32_buf, off32_pos, off32_count,
+                         len_buf, length_count,
+                         anchor, lit_len, (uint32_t)match.length, off_param,
+                         block2_start, recent_offset);
 
         // Update recent offset
         recent_offset = -(int32_t)actual_offset;
