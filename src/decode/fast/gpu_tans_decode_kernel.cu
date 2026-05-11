@@ -613,7 +613,8 @@ __device__ uint32_t initLut(
 
 // Byte-swap a 32-bit value (big-endian to little-endian).
 __device__ uint32_t bswap32(uint32_t v) {
-    return __byte_perm(v, 0, 0x0123);
+    return ((v >> 24) & 0xFF) | ((v >> 8) & 0xFF00) |
+           ((v << 8) & 0xFF0000) | ((v << 24) & 0xFF000000u);
 }
 
 // Read 4 bytes as little-endian uint32 at arbitrary alignment.
@@ -672,12 +673,17 @@ __device__ uint32_t decode5State(
     if (ptr_f > ptr_b) return TANS_ERR_STREAM_MISMATCH;
     if (dst >= dst_end) goto done;
 
+    uint32_t dbg_sym = 0;
     for (;;) {
         // ── Forward refill + decode state0, state1 ──
         if (ptr_f > src_end_orig) return TANS_ERR_SRC_TRUNCATED;
         refillForward(ptr_f, bits_f, bitpos_f);
 
+        if (blockIdx.x == 0 && dbg_sym < 10) {
+            printf("DEC[%u] fwd: bits=%08X bpf=%d state0=%u\n", dbg_sym, bits_f, bitpos_f, state0);
+        }
         *dst++ = decodeOneSymbol(lut, state0, bits_f, bitpos_f, lut_mask);
+        dbg_sym++;
         if (dst >= dst_end) break;
 
         *dst++ = decodeOneSymbol(lut, state1, bits_f, bitpos_f, lut_mask);
@@ -732,6 +738,11 @@ done:
     // Pointer convergence check
     intptr_t ptr_diff = (intptr_t)ptr_b - (intptr_t)ptr_f;
     intptr_t adjust = (intptr_t)(bitpos_f >> 3) + (intptr_t)(bitpos_b >> 3);
+    if (blockIdx.x == 0) {
+        printf("DEC convergence: ptr_diff=%ld adjust=%ld sum=%ld bpf=%d bpb=%d\n",
+               (long)ptr_diff, (long)adjust, (long)(ptr_diff+adjust),
+               bitpos_f, bitpos_b);
+    }
     if (ptr_diff + adjust != 0) return TANS_ERR_STREAM_MISMATCH;
 
     uint32_t states_or = state0 | state1 | state2 | state3 | state4;
@@ -847,6 +858,11 @@ __device__ uint32_t decodeTansChunk(
 
     uint32_t state4 = bits_f & lut_mask;
     bits_f >>= ltb;  bitpos_f -= ltb;
+
+    if (blockIdx.x == 0) {
+        printf("DEC init states: [%u,%u,%u,%u,%u] ltb=%u lut_mask=%u\n",
+               state0, state1, state2, state3, state4, ltb, lut_mask);
+    }
 
     // Compute pointer positions for decode loop
     // The CPU does: position_f = src - (bitpos_f >> 3)

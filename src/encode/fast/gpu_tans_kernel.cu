@@ -601,6 +601,14 @@ __device__ void tansEncodeBytes(
 
     // Write final states
     uint32_t mask_L = L - 1;
+    if (blockIdx.x == 0) {
+        printf("ENC final states: [%u,%u,%u,%u,%u] L=%u ltb=%u\n",
+               states[0]&mask_L, states[1]&mask_L, states[2]&mask_L,
+               states[3]&mask_L, states[4]&mask_L, L, log_table_bits);
+        printf("ENC fwd_pos=%u bwd_pos=%u\n",
+               (uint32_t)(forward.position - fwd_start),
+               (uint32_t)(bwd_end - backward.position));
+    }
     backward.writeNoFlush(states[4] & mask_L, log_table_bits);
     backward.writeNoFlush(states[2] & mask_L, log_table_bits);
     backward.writeNoFlush(states[0] & mask_L, log_table_bits);
