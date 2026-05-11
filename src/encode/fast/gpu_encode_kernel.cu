@@ -306,6 +306,16 @@ __device__ bool isLazyMatchBetter(ChainMatch cand, ChainMatch current, int32_t s
     return 5 * (cand.length - current.length) - 5 - (bits_cand - bits_cur) > step * 4;
 }
 
+// ── isMatchBetter ───────────────────────────────────────────────
+// Port of CPU isMatchBetter: accounts for near/far offset cost.
+__device__ bool isMatchBetter(int32_t match_length, int32_t match_offset,
+                               int32_t best_length, int32_t best_offset) {
+    if (match_length == best_length) return match_offset < best_offset;
+    if ((match_offset <= 0xFFFF) == (best_offset <= 0xFFFF)) return match_length > best_length;
+    if (best_offset <= 0xFFFF) return match_length > best_length + 5;
+    return match_length >= best_length - 5;
+}
+
 // ── isBetterThanRecentMatch ──────────────────────────────────────
 // Returns true if the hash match is preferable to the recent-offset match.
 __device__ bool isBetterThanRecentMatch(int32_t recent_match_length, int32_t match_length, int32_t match_offset) {
@@ -469,13 +479,8 @@ __device__ ChainMatch findMatchChain(
                         uint32_t max_ext = end_pos - pos;
                         while (ml < max_ext && src[pos + ml] == src[ref + ml]) ml++;
                         int32_t cand_len = (int32_t)ml;
-                        // isMatchBetter logic: prefer longer, or shorter offset at equal length
-                        bool is_better = false;
-                        if (cand_len == best_match_length)
-                            is_better = (int32_t)cand_off < best_offset;
-                        else
-                            is_better = cand_len > best_match_length;
-                        if (is_better && cand_len >= minimum_match_length) {
+                        if (cand_len >= minimum_match_length &&
+                            isMatchBetter(cand_len, (int32_t)cand_off, best_match_length, best_offset)) {
                             best_match_length = cand_len;
                             best_offset = (int32_t)cand_off;
                         }

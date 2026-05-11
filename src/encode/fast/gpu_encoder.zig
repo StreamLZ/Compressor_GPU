@@ -97,9 +97,9 @@ pub const CompressChunkDesc = extern struct {
     is_first: u32,
 };
 
-/// Hash bits per level. L1-L2 use shared memory; L3+ use global memory.
-/// Shared memory max on Ada Lovelace: ~48KB default per block.
-/// L1: 11-bit (2K×4=8KB), L2: 14-bit (16K×4=64KB), L3+: 17-bit (128K×4=512KB global).
+/// Hash bits per level. Sized for 64KB blocks (sc_group=0.25):
+/// larger tables don't help ratio but waste VRAM and slow down init.
+/// L1-L2 use shared memory; L3+ use global memory.
 fn hashBitsForLevel(level: u8) u32 {
     return switch (level) {
         1 => 11,
