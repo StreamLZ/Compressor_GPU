@@ -789,7 +789,7 @@ pub fn compressFramedOne(
             }
         }
 
-        if (!gpu_enc.gpuCompress(effective_src, gpu_out, descs, comp_sizes, io))
+        if (!gpu_enc.gpuCompress(effective_src, gpu_out, descs, comp_sizes, io, opts.level))
             break :gpu_compress;
 
         const gpu_entropy_opts = entropyOptionsForLevel(opts.level);

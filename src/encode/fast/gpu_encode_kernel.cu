@@ -12,9 +12,6 @@
 
 #include <cstdint>
 
-static constexpr uint32_t HASH_BITS    = 11;
-static constexpr uint32_t HASH_SIZE    = 1 << HASH_BITS;
-static constexpr uint32_t HASH_MASK    = HASH_SIZE - 1;
 static constexpr uint32_t MIN_MATCH    = 4;
 static constexpr uint32_t INITIAL_COPY = 8;
 static constexpr uint32_t HASH_EMPTY   = 0xFFFFFFFFu;
@@ -29,9 +26,9 @@ struct CompressChunkDesc {
     uint32_t is_first;
 };
 
-__device__ uint32_t hashKey(uint32_t key) {
+__device__ uint32_t hashKey(uint32_t key, uint32_t hash_bits, uint32_t hash_mask) {
     key *= 0x9E3779B1u;
-    return (key >> (32 - HASH_BITS)) & HASH_MASK;
+    return (key >> (32 - hash_bits)) & hash_mask;
 }
 
 __device__ void writeLengthValue(uint8_t* len_buf, uint32_t &len_count, uint32_t value) {
@@ -178,7 +175,7 @@ __device__ void emitCmd(
 // All counters are passed by reference and accumulate across calls.
 __device__ void scanBlock(
     const uint8_t* src, uint32_t src_size,
-    uint32_t* ht,
+    uint32_t* ht, uint32_t hash_bits, uint32_t hash_mask,
     uint8_t* lit_buf, uint32_t &lit_count,
     uint8_t* cmd_buf, uint32_t &token_count,
     uint8_t* off16_buf, uint32_t &off16_count,
@@ -206,7 +203,7 @@ __device__ void scanBlock(
         else active_count = 0;
         bool is_active = (lane < active_count);
 
-        uint32_t h = hashKey(key4);
+        uint32_t h = hashKey(key4, hash_bits, hash_mask);
         bool hash_match = false;
         uint32_t hash_ref = 0;
 
@@ -342,25 +339,34 @@ __device__ void scanBlock(
     }
 }
 
-extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
+extern "C" __global__ void __launch_bounds__(32, 1) slzCompressL1Kernel(
     const uint8_t* __restrict__ input,
     uint8_t* __restrict__ output,
     const CompressChunkDesc* __restrict__ descs,
-    uint32_t* __restrict__ hash_tables_unused,
+    uint32_t* __restrict__ global_hash,
     uint32_t* __restrict__ comp_sizes,
-    uint32_t total_chunks
+    uint32_t total_chunks,
+    uint32_t hash_bits
 ) {
-    __shared__ uint32_t ht[HASH_SIZE];
+    extern __shared__ uint32_t shared_ht[];
 
     const uint32_t chunk_id = blockIdx.x;
     const uint32_t lane = threadIdx.x & 31;
     if (chunk_id >= total_chunks) return;
 
+    const uint32_t hash_size = 1u << hash_bits;
+    const uint32_t hash_mask = hash_size - 1;
+
+    // Use shared memory if available, else global memory per-block tables
+    uint32_t* ht = (global_hash != nullptr)
+        ? global_hash + (uint64_t)chunk_id * hash_size
+        : shared_ht;
+
     const CompressChunkDesc& desc = descs[chunk_id];
     const uint8_t* src = input + desc.src_offset;
     const uint32_t src_size = desc.src_size;
 
-    for (uint32_t i = lane; i < HASH_SIZE; i += 32)
+    for (uint32_t i = lane; i < hash_size; i += 32)
         ht[i] = HASH_EMPTY;
     __syncwarp();
 
@@ -381,7 +387,7 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
     // ── Block 1 pass: [anchor .. min(BLOCK1_SIZE, src_size)) ────
     {
         uint32_t block1_end = (src_size < BLOCK1_SIZE) ? src_size : BLOCK1_SIZE;
-        scanBlock(src, src_size, ht,
+        scanBlock(src, src_size, ht, hash_bits, hash_mask,
                   lit_buf, lit_count,
                   cmd_buf, token_count,
                   off16_buf, off16_count,
@@ -398,7 +404,7 @@ extern "C" __global__ void __launch_bounds__(32, 6) slzCompressL1Kernel(
     if (src_size > BLOCK1_SIZE) {
         cmd_stream2_offset = token_count;
         uint32_t block2_start_pos = (anchor > BLOCK1_SIZE) ? anchor : BLOCK1_SIZE;
-        scanBlock(src, src_size, ht,
+        scanBlock(src, src_size, ht, hash_bits, hash_mask,
                   lit_buf, lit_count,
                   cmd_buf, token_count,
                   off16_buf, off16_count,

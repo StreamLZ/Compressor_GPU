@@ -97,8 +97,23 @@ pub const CompressChunkDesc = extern struct {
     is_first: u32,
 };
 
-const HASH_BITS = 11;
-const HASH_SIZE = 1 << HASH_BITS;
+/// Hash bits per level. L1-L2 use shared memory; L3+ use global memory.
+/// Shared memory max on Ada Lovelace: ~48KB default per block.
+/// L1: 11-bit (2K×4=8KB), L2: 14-bit (16K×4=64KB), L3+: 17-bit (128K×4=512KB global).
+fn hashBitsForLevel(level: u8) u32 {
+    return switch (level) {
+        1 => 11,
+        2 => 14,
+        3 => 17,
+        4 => 18,
+        5 => 18,
+        else => 11,
+    };
+}
+
+fn useGlobalHash(level: u8) bool {
+    return level >= 3;
+}
 
 pub var last_kernel_ns: i64 = 0;
 
@@ -133,6 +148,7 @@ pub fn gpuCompress(
     chunk_descs: []const CompressChunkDesc,
     comp_sizes_out: []u32,
     io: ?std.Io,
+    level: u8,
 ) bool {
     if (!init()) return false;
 
@@ -143,19 +159,25 @@ pub fn gpuCompress(
 
     const num_chunks: u32 = @intCast(chunk_descs.len);
     const desc_bytes = chunk_descs.len * @sizeOf(CompressChunkDesc);
-    const hash_bytes = @as(usize, num_chunks) * HASH_SIZE * 4;
     const sizes_bytes = @as(usize, num_chunks) * 4;
+    const hash_bits: u32 = hashBitsForLevel(level);
+    const hash_size: usize = @as(usize, 1) << @intCast(hash_bits);
+    const global = useGlobalHash(level);
 
     if (!ensureBuf(&d_input_persist, &d_input_size, input.len)) return false;
     if (!ensureBuf(&d_output_persist, &d_output_size, output.len)) return false;
     if (!ensureBuf(&d_descs_persist, &d_descs_size, desc_bytes)) return false;
-    if (!ensureBuf(&d_hash_persist, &d_hash_size, hash_bytes)) return false;
     if (!ensureBuf(&d_sizes_persist, &d_sizes_size, sizes_bytes)) return false;
+
+    // Global hash tables for L3+ (too large for shared memory)
+    if (global) {
+        const hash_bytes = @as(usize, num_chunks) * hash_size * 4;
+        if (!ensureBuf(&d_hash_persist, &d_hash_size, hash_bytes)) return false;
+    }
 
     const d_input = d_input_persist;
     const d_output = d_output_persist;
     const d_descs = d_descs_persist;
-    const d_hash = d_hash_persist;
     const d_sizes = d_sizes_persist;
 
     // Upload input + descriptors, zero sizes
@@ -169,21 +191,24 @@ pub fn gpuCompress(
     var p_input = d_input;
     var p_output = d_output;
     var p_descs = d_descs;
-    var p_hash = d_hash;
+    var p_global_hash: CUdeviceptr = if (global) d_hash_persist else 0;
     var p_sizes = d_sizes;
     var p_total = num_chunks;
+    var p_hash_bits = hash_bits;
 
     var params = [_]?*anyopaque{
         @ptrCast(&p_input),
         @ptrCast(&p_output),
         @ptrCast(&p_descs),
-        @ptrCast(&p_hash),
+        @ptrCast(&p_global_hash),
         @ptrCast(&p_sizes),
         @ptrCast(&p_total),
+        @ptrCast(&p_hash_bits),
     };
     var extra = [_]?*anyopaque{null};
 
-    if (launch_fn(kernel_fn, num_chunks, 1, 1, 32, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS)
+    const shared_bytes: u32 = if (global) 0 else @intCast(hash_size * 4);
+    if (launch_fn(kernel_fn, num_chunks, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra) != CUDA_SUCCESS)
         return false;
 
     if (sync_fn() != CUDA_SUCCESS) return false;
