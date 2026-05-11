@@ -386,7 +386,7 @@ __device__ ChainMatch findMatchChain(
                 uint32_t max_ext = end_pos - pos;
                 while (ml < max_ext && src[pos + ml] == src[recent_ref + ml]) ml++;
 
-                // Insert current position into hash tables before returning
+                // Insert current position into hash tables
                 uint32_t prev_head = first_hash[ha];
                 next_hash[pos & 0xFFFF] = (uint16_t)(prev_head & 0xFFFF);
                 first_hash[ha] = pos;
@@ -706,9 +706,8 @@ __device__ void scanBlockChain(
         uint32_t match_end = pos + (uint32_t)match.length;
 
         // (g) Insert matched range positions into hash tables
-        // Insert from pos+1 (pos was already inserted by findMatchChain) up to match_end
-        if (match_end > pos + 1 && match_end + 4 <= src_size) {
-            uint32_t insert_end = (match_end + 4 <= src_size) ? match_end : src_size - 4;
+        if (match_end > pos + 1 && match_end + 8 <= src_size) {
+            uint32_t insert_end = (match_end + 8 <= src_size) ? match_end : src_size - 8;
             insertChainRange(src, src_size, pos + 1, insert_end, first_hash, long_hash, next_hash,
                              hash_bits, hash_mask);
         }
