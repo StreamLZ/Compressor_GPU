@@ -798,8 +798,8 @@ pub fn compressFramedOne(
             cost_coeffs.default_space_speed_tradeoff_bytes,
             true,
         );
-        const entropy_scratch: ?[]u8 = null; // GPU decoder only handles raw sub-chunks
-        defer if (entropy_scratch) |s| allocator.free(s);
+        const entropy_scratch = try allocator.alloc(u8, gpu_block * 2);
+        defer allocator.free(entropy_scratch);
 
         // Assemble frame from GPU-compressed sub-chunks grouped into chunks
         var soff: usize = dict_len;
@@ -846,14 +846,14 @@ pub fn compressFramedOne(
                     var use_payload = raw_payload;
                     var use_cs: usize = raw_cs;
 
-                    if (entropy_scratch) |scratch| {
+                    {
                         const sub_src_size = @min(gpu_block, chunk_size - si * gpu_block);
-                        const ent_cs = reencodeGpuWithEntropy(
-                            allocator, raw_payload, scratch,
+                        const ent_cs = try reencodeGpuWithEntropy(
+                            allocator, raw_payload, entropy_scratch,
                             gpu_entropy_opts, gpu_speed_tradeoff, init_bytes, sub_src_size,
-                        ) catch 0;
+                        );
                         if (ent_cs > 0 and ent_cs < raw_cs) {
-                            use_payload = scratch[0..ent_cs];
+                            use_payload = entropy_scratch[0..ent_cs];
                             use_cs = ent_cs;
                         }
                     }
