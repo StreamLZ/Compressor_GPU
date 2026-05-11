@@ -748,7 +748,7 @@ pub fn compressFramedOne(
         const comp_sizes = allocator.alloc(u32, n_gpu_blocks) catch break :gpu_compress;
         defer allocator.free(comp_sizes);
 
-        const per_block_cap = gpu_block * 2;
+        const per_block_cap = gpu_block * 3;
         var gpu_out = allocator.alloc(u8, n_gpu_blocks * per_block_cap) catch break :gpu_compress;
         defer allocator.free(gpu_out);
 

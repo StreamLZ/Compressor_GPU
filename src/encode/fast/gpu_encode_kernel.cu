@@ -98,19 +98,19 @@ __device__ void emitCmd(
     uint32_t effective_offset = offset;
 
     if (effective_offset > 0xFFFF) {
-        // Far-offset path: token 2-23 (short far) or token 2 + length (long far)
+        // Far-offset path
         if (remaining_lit != 0) {
             cmd_buf[token_count++] = (uint8_t)(0x80 + remaining_lit);
             remaining_lit = 0;
         }
-        int32_t delta = (int32_t)match_len - 5;
-        if (delta >= 0 && delta <= 23) {
+        // Tokens 3-23: short far (match_len = token + 5, i.e. 8-28)
+        // Token 2: long far (with length value, for match_len < 8 or > 28)
+        if (match_len >= 8 && match_len <= 28) {
             cmd_buf[token_count++] = (uint8_t)(match_len - 5);
         } else {
             cmd_buf[token_count++] = 2;
             writeLengthValue(len_buf, length_count, match_len > 29 ? match_len - 29 : 0);
         }
-        // Off32 adjustment: adjusted = effective_offset + (block2_start - match_pos)
         uint32_t adjusted = effective_offset + block2_start - match_pos;
         writeOffset32(off32_buf, off32_pos, adjusted);
         off32_count++;
