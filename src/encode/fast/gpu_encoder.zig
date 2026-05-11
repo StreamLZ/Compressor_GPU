@@ -34,6 +34,8 @@ const FnMemcpyDtoH = *const fn (*anyopaque, CUdeviceptr, usize) callconv(.c) CUr
 const FnLaunchKernel = *const fn (usize, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, usize, [*]?*anyopaque, [*]?*anyopaque) callconv(.c) CUresult;
 const FnCtxSync = *const fn () callconv(.c) CUresult;
 const FnMemsetD8 = *const fn (CUdeviceptr, u8, usize) callconv(.c) CUresult;
+const FnMemAllocHost = *const fn (**anyopaque, usize) callconv(.c) CUresult;
+const FnMemFreeHost = *const fn (*anyopaque) callconv(.c) CUresult;
 
 var cuInit_fn: ?FnInit = null;
 var cuDeviceGet_fn: ?FnDeviceGet = null;
@@ -47,6 +49,8 @@ var cuMemcpyDtoH_fn: ?FnMemcpyDtoH = null;
 var cuLaunchKernel_fn: ?FnLaunchKernel = null;
 var cuCtxSynchronize_fn: ?FnCtxSync = null;
 var cuMemsetD8_fn: ?FnMemsetD8 = null;
+var cuMemAllocHost_fn: ?FnMemAllocHost = null;
+var cuMemFreeHost_fn: ?FnMemFreeHost = null;
 
 fn getProc(comptime T: type, name: [*:0]const u8) ?T {
     const h = lib orelse return null;
@@ -75,6 +79,8 @@ pub fn init() bool {
     cuLaunchKernel_fn = getProc(FnLaunchKernel, "cuLaunchKernel");
     cuCtxSynchronize_fn = getProc(FnCtxSync, "cuCtxSynchronize");
     cuMemsetD8_fn = getProc(FnMemsetD8, "cuMemsetD8_v2");
+    cuMemAllocHost_fn = getProc(FnMemAllocHost, "cuMemAllocHost_v2");
+    cuMemFreeHost_fn = getProc(FnMemFreeHost, "cuMemFreeHost");
 
     const ptx = @embedFile("gpu_encode_kernel.ptx") ++ "\x00";
     if ((cuModuleLoadData_fn orelse return false)(&module, ptx.ptr) != CUDA_SUCCESS) return false;
@@ -102,6 +108,29 @@ const HASH_SIZE = 4096;
 
 pub var last_kernel_ns: i64 = 0;
 
+// ── Persistent device buffers ──────────────────────────────────
+var d_input_persist: CUdeviceptr = 0;
+var d_input_size: usize = 0;
+var d_output_persist: CUdeviceptr = 0;
+var d_output_size: usize = 0;
+var d_descs_persist: CUdeviceptr = 0;
+var d_descs_size: usize = 0;
+var d_hash_persist: CUdeviceptr = 0;
+var d_hash_size: usize = 0;
+var d_sizes_persist: CUdeviceptr = 0;
+var d_sizes_size: usize = 0;
+
+fn ensureBuf(ptr: *CUdeviceptr, cur: *usize, needed: usize) bool {
+    if (cur.* >= needed) return true;
+    const free_fn = cuMemFree_fn orelse return false;
+    const alloc_fn = cuMemAlloc_fn orelse return false;
+    if (ptr.* != 0) _ = free_fn(ptr.*);
+    cur.* = 0;
+    if (alloc_fn(ptr, needed) != CUDA_SUCCESS) return false;
+    cur.* = needed;
+    return true;
+}
+
 /// Compress all chunks on GPU. Returns per-chunk compressed sizes.
 /// Caller provides input data, output buffer, and chunk layout.
 pub fn gpuCompress(
@@ -113,8 +142,6 @@ pub fn gpuCompress(
 ) bool {
     if (!init()) return false;
 
-    const alloc_fn = cuMemAlloc_fn orelse return false;
-    const free_fn = cuMemFree_fn orelse return false;
     const h2d_fn = cuMemcpyHtoD_fn orelse return false;
     const d2h_fn = cuMemcpyDtoH_fn orelse return false;
     const launch_fn = cuLaunchKernel_fn orelse return false;
@@ -122,28 +149,20 @@ pub fn gpuCompress(
 
     const num_chunks: u32 = @intCast(chunk_descs.len);
     const desc_bytes = chunk_descs.len * @sizeOf(CompressChunkDesc);
-    const hash_bytes = @as(usize, num_chunks) * HASH_SIZE * 4; // u32 per entry
+    const hash_bytes = @as(usize, num_chunks) * HASH_SIZE * 4;
     const sizes_bytes = @as(usize, num_chunks) * 4;
 
-    // Allocate device buffers
-    var d_input: CUdeviceptr = 0;
-    var d_output: CUdeviceptr = 0;
-    var d_descs: CUdeviceptr = 0;
-    var d_hash: CUdeviceptr = 0;
-    var d_sizes: CUdeviceptr = 0;
+    if (!ensureBuf(&d_input_persist, &d_input_size, input.len)) return false;
+    if (!ensureBuf(&d_output_persist, &d_output_size, output.len)) return false;
+    if (!ensureBuf(&d_descs_persist, &d_descs_size, desc_bytes)) return false;
+    if (!ensureBuf(&d_hash_persist, &d_hash_size, hash_bytes)) return false;
+    if (!ensureBuf(&d_sizes_persist, &d_sizes_size, sizes_bytes)) return false;
 
-    if (alloc_fn(&d_input, input.len) != CUDA_SUCCESS) return false;
-    if (alloc_fn(&d_output, output.len) != CUDA_SUCCESS) { _ = free_fn(d_input); return false; }
-    if (alloc_fn(&d_descs, desc_bytes) != CUDA_SUCCESS) { _ = free_fn(d_input); _ = free_fn(d_output); return false; }
-    if (alloc_fn(&d_hash, hash_bytes) != CUDA_SUCCESS) { _ = free_fn(d_input); _ = free_fn(d_output); _ = free_fn(d_descs); return false; }
-    if (alloc_fn(&d_sizes, sizes_bytes) != CUDA_SUCCESS) { _ = free_fn(d_input); _ = free_fn(d_output); _ = free_fn(d_descs); _ = free_fn(d_hash); return false; }
-    defer {
-        _ = free_fn(d_input);
-        _ = free_fn(d_output);
-        _ = free_fn(d_descs);
-        _ = free_fn(d_hash);
-        _ = free_fn(d_sizes);
-    }
+    const d_input = d_input_persist;
+    const d_output = d_output_persist;
+    const d_descs = d_descs_persist;
+    const d_hash = d_hash_persist;
+    const d_sizes = d_sizes_persist;
 
     // Upload input + descriptors, zero sizes
     _ = h2d_fn(d_input, @ptrCast(input.ptr), input.len);
@@ -182,8 +201,16 @@ pub fn gpuCompress(
         }
     }
 
-    _ = d2h_fn(@ptrCast(output.ptr), d_output, output.len);
+    // Download comp_sizes first, then only the actual compressed bytes per block
     _ = d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes);
+
+    for (0..chunk_descs.len) |i| {
+        const cs = comp_sizes_out[i];
+        if (cs > 0) {
+            const dst_off = chunk_descs[i].dst_offset;
+            _ = d2h_fn(@ptrCast(output.ptr + dst_off), d_output + dst_off, cs);
+        }
+    }
 
     return true;
 }
