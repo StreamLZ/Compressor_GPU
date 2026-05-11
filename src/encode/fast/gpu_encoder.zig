@@ -34,9 +34,6 @@ const FnMemcpyDtoH = *const fn (*anyopaque, CUdeviceptr, usize) callconv(.c) CUr
 const FnLaunchKernel = *const fn (usize, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, usize, [*]?*anyopaque, [*]?*anyopaque) callconv(.c) CUresult;
 const FnCtxSync = *const fn () callconv(.c) CUresult;
 const FnMemsetD8 = *const fn (CUdeviceptr, u8, usize) callconv(.c) CUresult;
-const FnMemAllocHost = *const fn (**anyopaque, usize) callconv(.c) CUresult;
-const FnMemFreeHost = *const fn (*anyopaque) callconv(.c) CUresult;
-
 var cuInit_fn: ?FnInit = null;
 var cuDeviceGet_fn: ?FnDeviceGet = null;
 var cuCtxCreate_fn: ?FnCtxCreate = null;
@@ -49,8 +46,6 @@ var cuMemcpyDtoH_fn: ?FnMemcpyDtoH = null;
 var cuLaunchKernel_fn: ?FnLaunchKernel = null;
 var cuCtxSynchronize_fn: ?FnCtxSync = null;
 var cuMemsetD8_fn: ?FnMemsetD8 = null;
-var cuMemAllocHost_fn: ?FnMemAllocHost = null;
-var cuMemFreeHost_fn: ?FnMemFreeHost = null;
 
 fn getProc(comptime T: type, name: [*:0]const u8) ?T {
     const h = lib orelse return null;
@@ -79,8 +74,6 @@ pub fn init() bool {
     cuLaunchKernel_fn = getProc(FnLaunchKernel, "cuLaunchKernel");
     cuCtxSynchronize_fn = getProc(FnCtxSync, "cuCtxSynchronize");
     cuMemsetD8_fn = getProc(FnMemsetD8, "cuMemsetD8_v2");
-    cuMemAllocHost_fn = getProc(FnMemAllocHost, "cuMemAllocHost_v2");
-    cuMemFreeHost_fn = getProc(FnMemFreeHost, "cuMemFreeHost");
 
     const ptx = @embedFile("gpu_encode_kernel.ptx") ++ "\x00";
     if ((cuModuleLoadData_fn orelse return false)(&module, ptx.ptr) != CUDA_SUCCESS) return false;
@@ -172,7 +165,6 @@ pub fn gpuCompress(
 
     const t_before = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
 
-    // Launch: 1 warp per block, shared memory hash table
     var p_input = d_input;
     var p_output = d_output;
     var p_descs = d_descs;

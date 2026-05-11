@@ -798,7 +798,8 @@ pub fn compressFramedOne(
             cost_coeffs.default_space_speed_tradeoff_bytes,
             true,
         );
-        const entropy_scratch = allocator.alloc(u8, gpu_block * 2) catch null;
+        const use_entropy = opts.level >= 3;
+        const entropy_scratch = if (use_entropy) allocator.alloc(u8, gpu_block * 2) catch null else null;
         defer if (entropy_scratch) |s| allocator.free(s);
 
         // Assemble frame from GPU-compressed sub-chunks grouped into chunks
