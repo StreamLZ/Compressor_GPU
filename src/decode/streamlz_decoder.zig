@@ -699,8 +699,8 @@ fn decompressCompressedBlock(
 
     // GPU batch path — only for per-chunk independent data (sc_group <= 1)
     // Cross-chunk off32 references can't be resolved in parallel GPU decode.
-    // Skip GPU decode if sub-chunks contain entropy-coded literals (tANS/Huffman)
-    // that the GPU kernel can't handle.
+    // tANS literal/token streams are pre-decoded by the tANS kernel (Pass 1).
+    // Entropy-coded off16 streams are decoded on the CPU and uploaded.
     if (use_gpu and sc_group_size <= 1.0) gpu_batch: {
         const gpu = @import("fast/gpu_driver.zig");
         if (!gpu.isAvailable()) break :gpu_batch;
