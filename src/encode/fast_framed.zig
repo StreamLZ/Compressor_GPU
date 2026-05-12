@@ -879,40 +879,33 @@ pub fn compressFramedOne(
                         break :blk null;
                     } else null;
 
-                    if (tans_lits) |tans_data| {
-                        // Splice: rebuild sub-chunk with tANS-encoded literal stream
-                        const raw_lit_count: usize = (@as(usize, raw_payload[init_bytes]) << 16) |
-                            (@as(usize, raw_payload[init_bytes + 1]) << 8) |
-                            raw_payload[init_bytes + 2];
-                        const rest_start = init_bytes + 3 + raw_lit_count;
-                        const rest_data = raw_payload[rest_start..];
+                    // Re-encode all streams with CPU entropy (tANS literals + Huffman tokens/off16)
+                    const reencode_ok: bool = blk_reencode: {
+                        if (opts.level < 3) break :blk_reencode false;
+                        const sub_size = @min(gpu_block, chunk_size - si * gpu_block);
+                        var entropy_options = entropyOptionsForLevel(opts.level);
+                        entropy_options.allow_tans = true;
+                        const enc_buf = allocator.alloc(u8, raw_cs + 4096) catch break :blk_reencode false;
+                        defer allocator.free(enc_buf);
+                        const enc_n = reencodeGpuWithEntropy(
+                            allocator, raw_payload, enc_buf, entropy_options,
+                            0.0, // minimize size, not speed
+                            init_bytes, sub_size,
+                            if (tans_lits) |t| t else null,
+                        ) catch break :blk_reencode false;
+                        if (enc_n == 0 or enc_n >= raw_cs) break :blk_reencode false;
 
-                        // New sub-chunk: init_bytes + 5-byte tANS header + tANS data + rest
-                        const new_cs = init_bytes + 5 + tans_data.len + rest_data.len;
-                        if (pos + 3 + new_cs > dst.len) return error.DestinationTooSmall;
-
-                        const sc_hdr: u32 = @as(u32, @intCast(new_cs)) |
+                        if (pos + 3 + enc_n > dst.len) break :blk_reencode false;
+                        const sc_hdr: u32 = @as(u32, @intCast(enc_n)) |
                             (@as(u32, 1) << lz_constants.sub_chunk_type_shift) |
                             lz_constants.chunk_header_compressed_flag;
                         block_header.writeBE24(dst[pos..].ptr, sc_hdr);
                         pos += 3;
-
-                        // Copy initial bytes
-                        if (init_bytes > 0) {
-                            @memcpy(dst[pos..][0..init_bytes], raw_payload[0..init_bytes]);
-                            pos += init_bytes;
-                        }
-                        // Write tANS literal header + data
-                        entropy_enc.writeNonCompactChunkHeader(
-                            dst[pos..], 1, @intCast(tans_data.len), @intCast(raw_lit_count),
-                        );
-                        pos += 5;
-                        @memcpy(dst[pos..][0..tans_data.len], tans_data);
-                        pos += tans_data.len;
-                        // Copy rest (tokens, off16, off32, lengths)
-                        @memcpy(dst[pos..][0..rest_data.len], rest_data);
-                        pos += rest_data.len;
-                    } else {
+                        @memcpy(dst[pos..][0..enc_n], enc_buf[0..enc_n]);
+                        pos += enc_n;
+                        break :blk_reencode true;
+                    };
+                    if (!reencode_ok) {
                         // Use raw sub-chunk as-is
                         if (pos + 3 + raw_cs > dst.len) return error.DestinationTooSmall;
                         const sc_hdr: u32 = @as(u32, @intCast(raw_cs)) |
