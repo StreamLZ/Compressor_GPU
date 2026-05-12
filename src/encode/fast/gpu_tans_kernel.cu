@@ -601,14 +601,6 @@ __device__ void tansEncodeBytes(
 
     // Write final states
     uint32_t mask_L = L - 1;
-    if (blockIdx.x == 0) {
-        printf("ENC final states: [%u,%u,%u,%u,%u] L=%u ltb=%u\n",
-               states[0]&mask_L, states[1]&mask_L, states[2]&mask_L,
-               states[3]&mask_L, states[4]&mask_L, L, log_table_bits);
-        printf("ENC fwd_pos=%u bwd_pos=%u\n",
-               (uint32_t)(forward.position - fwd_start),
-               (uint32_t)(bwd_end - backward.position));
-    }
     backward.writeNoFlush(states[4] & mask_L, log_table_bits);
     backward.writeNoFlush(states[2] & mask_L, log_table_bits);
     backward.writeNoFlush(states[0] & mask_L, log_table_bits);
@@ -1026,12 +1018,7 @@ extern "C" __global__ void slzTansEncodeKernel(
     );
 
     // Verify sizes match
-    if (blockIdx.x == 0) {
-        printf("ENC sizes: fwd=%u bwd=%u payload=%u table=%u total=%u\n",
-               fwd_bytes, bwd_bytes, payload_bytes, table_bytes, total_size);
-    }
     if (fwd_bytes + bwd_bytes != payload_bytes) {
-        if (blockIdx.x == 0) printf("ENC SIZE MISMATCH! falling back to raw\n");
         out_sizes[chunk_id] = src_len | 0x80000000u;
         for (uint32_t i = 0; i < src_len && i < dst_capacity; i++)
             dst[i] = src[i];
@@ -1050,32 +1037,42 @@ extern "C" __global__ void slzTansEncodeKernel(
     // careful. Copy backward stream first (it's at bwd_ptr), then forward.
     // Use a small temp buffer approach — copy via backwards iteration if needed.
 
-    // Assembly: copy forward stream FIRST (before backward overwrites its source region),
-    // then copy backward stream.
-    // Forward: src at fwd_ptr (= dst+table_bytes+16), dest at dst+table_bytes+bwd_bytes.
-    // Backward: src at bwd_ptr (near dst+dst_capacity-16), dest at dst+table_bytes.
+    // Assembly into dst: [table | backward_stream | forward_stream]
+    // Source regions in dst may overlap with final destinations.
+    // Safe strategy: copy backward stream to final position first (source
+    // is in the HIGH region of dst, dest is LOW — no overlap with forward source
+    // in the LOW-MID region). Then copy forward from end-to-start.
     //
-    // The forward source region [fwd_ptr .. fwd_ptr+fwd_bytes) overlaps with
-    // the backward destination [dst+table_bytes .. dst+table_bytes+bwd_bytes) when
-    // bwd_bytes > 16. Copying forward first preserves its source data.
-    uint8_t* fwd_dst = dst + table_bytes + bwd_bytes;
-    if (fwd_ptr != fwd_dst) {
+    // BUT: forward dest [table_bytes+bwd_bytes, total_size) may overlap backward
+    // source [bwd_ptr, bwd_ptr+bwd_bytes) when the forward stream is large.
+    // Solution: copy backward to a safe non-overlapping area first.
+    //
+    // Use dst[total_size..dst_capacity] as temp for the backward stream
+    // (guaranteed not to overlap with the final output [0..total_size]).
+    uint8_t* bwd_temp = dst + total_size;
+    uint32_t temp_avail = dst_capacity - total_size;
+    if (temp_avail >= bwd_bytes) {
+        // Stage backward in temp
+        for (uint32_t i = 0; i < bwd_bytes; i++) bwd_temp[i] = bwd_ptr[i];
+
+        // Copy forward to final position (backward-direction if overlapping)
+        uint8_t* fwd_dst = dst + table_bytes + bwd_bytes;
         if (fwd_dst > fwd_ptr) {
-            // Dest is past source — copy backward to avoid clobbering
             for (int i = (int)fwd_bytes - 1; i >= 0; i--)
                 fwd_dst[i] = fwd_ptr[i];
-        } else {
+        } else if (fwd_dst != fwd_ptr) {
             for (uint32_t i = 0; i < fwd_bytes; i++)
                 fwd_dst[i] = fwd_ptr[i];
         }
-    }
 
-    // Now copy backward stream (its source at bwd_ptr is in the high region,
-    // far from the forward data we just placed)
-    uint8_t* bwd_dst = dst + table_bytes;
-    if (bwd_ptr != bwd_dst) {
-        for (uint32_t i = 0; i < bwd_bytes; i++)
-            bwd_dst[i] = bwd_ptr[i];
+        // Copy backward from temp to final position
+        uint8_t* bwd_dst = dst + table_bytes;
+        for (uint32_t i = 0; i < bwd_bytes; i++) bwd_dst[i] = bwd_temp[i];
+    } else {
+        // Not enough temp space — fall back to raw
+        out_sizes[chunk_id] = src_len | 0x80000000u;
+        for (uint32_t i = 0; i < src_len && i < dst_capacity; i++) dst[i] = src[i];
+        return;
     }
 
     out_sizes[chunk_id] = total_size;

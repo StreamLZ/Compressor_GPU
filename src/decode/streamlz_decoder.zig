@@ -299,7 +299,9 @@ fn decompressOneFrame(
         var dispatched_parallel: bool = false;
 
         // GPU batch path: only for per-chunk independent data (sc_group <= 1)
-        if (use_gpu and hdr.sc_group_size <= 1.0) gpu_frame: {
+        // Skip GPU/Vulkan LZ decode for L3+ with fractional SC (GPU-encoded with tANS)
+        // since the GPU LZ kernel can't handle entropy-coded literal streams.
+        if (use_gpu and hdr.sc_group_size <= 1.0 and !(hdr.sc_group_size < 1.0 and hdr.level >= 6)) gpu_frame: {
             const gpu = @import("fast/gpu_driver.zig");
             if (!gpu.isAvailable()) break :gpu_frame;
             if (block_src.len < 2) break :gpu_frame;
@@ -330,7 +332,7 @@ fn decompressOneFrame(
         }
 
         // Vulkan fallback: try Vulkan compute when CUDA is unavailable
-        if (!dispatched_parallel and use_gpu and hdr.sc_group_size <= 1.0) vk_frame: {
+        if (!dispatched_parallel and use_gpu and hdr.sc_group_size <= 1.0 and !(hdr.sc_group_size < 1.0 and hdr.level >= 6)) vk_frame: {
             const vk = @import("fast/vk_driver.zig");
             if (!vk.isAvailable()) break :vk_frame;
             if (block_src.len < 2) break :vk_frame;
@@ -425,6 +427,7 @@ fn decompressOneFrame(
                 block_hdr.decompressed_size,
                 &scratch,
                 hdr.sc_group_size,
+                hdr.level,
             );
         }
         pos += block_hdr.compressed_size;
@@ -647,7 +650,7 @@ pub fn decompressBlockWithDict(
     // v2 default sc_group_size. Streaming / framed callers should
     // instead use `decompressFramed` / `decompressStream` so the
     // header-declared sc_group_size flows through.
-    try decompressCompressedBlock(src, dst, &dst_off, decompressed_size, &scratch, @as(f32, @floatFromInt(constants.default_sc_group_size)));
+    try decompressCompressedBlock(src, dst, &dst_off, decompressed_size, &scratch, @as(f32, @floatFromInt(constants.default_sc_group_size)), 0);
     return dst_off - dst_offset;
 }
 
@@ -671,6 +674,7 @@ fn decompressCompressedBlock(
     decompressed_size: usize,
     scratch: []u8,
     sc_group_size: f32,
+    frame_level: u8,
 ) DecompressError!void {
     // Peek the first 2-byte internal block header to detect SC mode up-front.
     const is_sc = blk: {
@@ -694,11 +698,12 @@ fn decompressCompressedBlock(
 
     // GPU batch path — only for per-chunk independent data (sc_group <= 1)
     // Cross-chunk off32 references can't be resolved in parallel GPU decode.
-    if (use_gpu and sc_group_size <= 1.0) gpu_batch: {
+    // Skip GPU decode if sub-chunks contain entropy-coded literals (tANS/Huffman)
+    // that the GPU kernel can't handle.
+    if (use_gpu and sc_group_size <= 1.0 and !(sc_group_size < 1.0 and frame_level >= 6)) gpu_batch: {
         const gpu = @import("fast/gpu_driver.zig");
         if (!gpu.isAvailable()) break :gpu_batch;
-        gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, sc_group_size, scratch, null) catch |e| {
-            std.debug.print("GPU batch failed: {s}\n", .{@errorName(e)});
+        gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, sc_group_size, scratch, null) catch {
             break :gpu_batch;
         };
         dst_off_inout.* = sc_start_dst_off + decompressed_size;
@@ -751,7 +756,9 @@ fn decompressCompressedBlock(
         }
 
         // ── Parse 4-byte chunk header ──
-        const ch = block_header.parseChunkHeader(block_src[src_pos..], hdr.use_checksums) catch return error.BadChunkHeader;
+        const ch = block_header.parseChunkHeader(block_src[src_pos..], hdr.use_checksums) catch {
+            return error.BadChunkHeader;
+        };
         src_pos += ch.bytes_consumed;
 
         if (ch.is_memset) {
@@ -779,7 +786,9 @@ fn decompressCompressedBlock(
 
         const comp_size: usize = ch.compressed_size;
         if (src_pos + comp_size > block_src.len) return error.Truncated;
-        if (comp_size > dst_this_chunk) return error.BadChunkHeader;
+        if (comp_size > dst_this_chunk) {
+            return error.BadChunkHeader;
+        }
 
         if (comp_size == dst_this_chunk) {
             // Stored raw within a "compressed" flag block.

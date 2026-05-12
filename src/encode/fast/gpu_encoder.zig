@@ -277,7 +277,7 @@ pub fn gpuCompress(
         var lit_dst_offsets = allocator.alloc(u32, num_chunks) catch break :tans_pass;
         // NOT deferred — frame assembler reads these via tans_lit_offsets
 
-        const tans_cap_per: usize = 65536 + 512; // max literal size + table overhead
+        const tans_cap_per: usize = 65536 * 2; // 2x literal size for temp staging in assembly
         var total_tans_dst: usize = 0;
 
         for (0..chunk_descs.len) |i| {
@@ -302,9 +302,9 @@ pub fn gpuCompress(
                 .src_offset = lit_offset_in_output, // offset into d_output
                 .src_size = lit_count,
                 .dst_offset = @intCast(total_tans_dst),
-                .dst_capacity = @intCast(@min(tans_cap_per, lit_count + 512)),
+                .dst_capacity = @intCast(@min(tans_cap_per, @max(lit_count * 2, lit_count + 4096))),
             };
-            total_tans_dst += @min(tans_cap_per, lit_count + 512);
+            total_tans_dst += @min(tans_cap_per, @max(lit_count * 2, lit_count + 4096));
         }
 
         if (total_tans_dst == 0) break :tans_pass;
