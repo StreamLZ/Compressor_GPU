@@ -991,7 +991,6 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzTansDecodeKernel(
     if (chunk_id >= num_chunks) return;
 
     __shared__ TansLutEnt s_lut[2048];
-    __shared__ uint8_t s_stage[12];  // 10 symbols + 2 padding
 
     const int lane = threadIdx.x & 31;
 
@@ -1025,34 +1024,38 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzTansDecodeKernel(
         lut_mask = ds.lut_mask;
     }
 
-    for (uint32_t batch = 0; batch < full_batches; batch++) {
-        // Lane 0: decode 10 symbols into shared staging
-        if (lane == 0) {
+    if (lane == 0) {
+        uint8_t* dst = dst_base;
+        for (uint32_t batch = 0; batch < full_batches; batch++) {
+            uint8_t s0, s1, s2, s3, s4, s5, s6, s7, s8, s9;
+
             refillForward(ptr_f, bits_f, bp_f);
-            s_stage[0] = decodeOneSymbol(s_lut, st0, bits_f, bp_f, lut_mask);
-            s_stage[1] = decodeOneSymbol(s_lut, st1, bits_f, bp_f, lut_mask);
+            s0 = decodeOneSymbol(s_lut, st0, bits_f, bp_f, lut_mask);
+            s1 = decodeOneSymbol(s_lut, st1, bits_f, bp_f, lut_mask);
             refillForward(ptr_f, bits_f, bp_f);
-            s_stage[2] = decodeOneSymbol(s_lut, st2, bits_f, bp_f, lut_mask);
-            s_stage[3] = decodeOneSymbol(s_lut, st3, bits_f, bp_f, lut_mask);
+            s2 = decodeOneSymbol(s_lut, st2, bits_f, bp_f, lut_mask);
+            s3 = decodeOneSymbol(s_lut, st3, bits_f, bp_f, lut_mask);
             refillForward(ptr_f, bits_f, bp_f);
-            s_stage[4] = decodeOneSymbol(s_lut, st4, bits_f, bp_f, lut_mask);
+            s4 = decodeOneSymbol(s_lut, st4, bits_f, bp_f, lut_mask);
 
             refillBackward(ptr_b, bits_b, bp_b);
-            s_stage[5] = decodeOneSymbol(s_lut, st0, bits_b, bp_b, lut_mask);
-            s_stage[6] = decodeOneSymbol(s_lut, st1, bits_b, bp_b, lut_mask);
+            s5 = decodeOneSymbol(s_lut, st0, bits_b, bp_b, lut_mask);
+            s6 = decodeOneSymbol(s_lut, st1, bits_b, bp_b, lut_mask);
             refillBackward(ptr_b, bits_b, bp_b);
-            s_stage[7] = decodeOneSymbol(s_lut, st2, bits_b, bp_b, lut_mask);
-            s_stage[8] = decodeOneSymbol(s_lut, st3, bits_b, bp_b, lut_mask);
+            s7 = decodeOneSymbol(s_lut, st2, bits_b, bp_b, lut_mask);
+            s8 = decodeOneSymbol(s_lut, st3, bits_b, bp_b, lut_mask);
             refillBackward(ptr_b, bits_b, bp_b);
-            s_stage[9] = decodeOneSymbol(s_lut, st4, bits_b, bp_b, lut_mask);
+            s9 = decodeOneSymbol(s_lut, st4, bits_b, bp_b, lut_mask);
+
+            // Write 10 bytes as 8-byte + 2-byte store (2 stores vs 10)
+            uint64_t w8 = (uint64_t)s0 | ((uint64_t)s1<<8) | ((uint64_t)s2<<16) | ((uint64_t)s3<<24) |
+                          ((uint64_t)s4<<32) | ((uint64_t)s5<<40) | ((uint64_t)s6<<48) | ((uint64_t)s7<<56);
+            memcpy(dst, &w8, 8);
+            uint16_t w2 = (uint16_t)s8 | ((uint16_t)s9 << 8);
+            memcpy(dst + 8, &w2, 2);
+            dst += 10;
         }
-        __syncwarp();
-
-        // Lanes 0-9: coalesced write (10 bytes, 10/32 sector utilization)
-        if (lane < 10)
-            dst_base[out_pos + lane] = s_stage[lane];
-        __syncwarp();
-        out_pos += 10;
+        out_pos = full_batches * 10;
     }
 
     // Tail: remaining < 10 symbols, lane 0 writes directly
