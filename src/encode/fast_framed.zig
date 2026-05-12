@@ -800,7 +800,7 @@ pub fn compressFramedOne(
                     .src_size = @intCast(sub_size),
                     .dst_offset = @intCast(bi * per_block_cap),
                     .dst_capacity = @intCast(per_block_cap),
-                    .is_first = if (si == 0 and (opts.level >= 5 or dict_len == 0)) @as(u32, 1) else 0,
+                    .is_first = if (si == 0 and (opts.level >= 3 or dict_len == 0)) @as(u32, 1) else 0,
                 };
                 bi += 1;
             }
@@ -851,7 +851,7 @@ pub fn compressFramedOne(
                 for (0..n_subs) |si| {
                     const raw_cs = comp_sizes[gpu_bi + si];
                     const raw_payload = gpu_out[(gpu_bi + si) * per_block_cap ..][0..raw_cs];
-                    const init_bytes: usize = if (si == 0 and (opts.level >= 5 or dict_len == 0)) 8 else 0;
+                    const init_bytes: usize = if (si == 0 and (opts.level >= 3 or dict_len == 0)) 8 else 0;
                     const gpu_bi_idx = gpu_bi + si;
 
                     // Check if GPU tANS produced smaller literal encoding
