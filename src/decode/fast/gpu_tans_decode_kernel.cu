@@ -497,20 +497,22 @@ __device__ uint32_t initLut(
     sb += sa + ((slots_left & 3) > 2 ? 1 : 0);
     pointers[3] = sb;
 
-    // Single-weight entries at the end
+    // Single-weight entries at the end (all 32 lanes write in parallel)
     {
         uint32_t singles_start = slots_left;
-        uint8_t bits_x = (uint8_t)log_table_bits;
-        uint32_t x = (1u << log_table_bits) - 1;
-        TansLutEnt le;
-        le.x = x; le.bits_x = bits_x; le.symbol = 0; le.w = 0;
+        uint8_t bits_x_v = (uint8_t)log_table_bits;
+        uint32_t x_v = (1u << log_table_bits) - 1;
+        int32_t lane_id = threadIdx.x & 31;
 
-        for (int32_t i = 0; i < a_used; i++) {
+        for (int32_t i = lane_id; i < a_used; i += 32) {
             uint32_t idx = singles_start + (uint32_t)i;
-            if (idx >= L_u) return TANS_ERR_LUT_FAILED;
-            le.symbol = td.a[i];
-            lut[idx] = le;
+            if (idx < L_u) {
+                TansLutEnt le;
+                le.x = x_v; le.bits_x = bits_x_v; le.symbol = td.a[i]; le.w = 0;
+                lut[idx] = le;
+            }
         }
+        __syncwarp();
     }
 
     // Weight >= 2 entries
@@ -947,57 +949,78 @@ struct DecodeState {
     uint32_t error;
 };
 
-__device__ __noinline__ void setupDecode(
+// Intermediate state between table parse (lane 0) and LUT build (all lanes)
+struct TableParseResult {
+    TansData td;
+    uint32_t log_table_bits;
+    const uint8_t* src_after_table;
+    const uint8_t* src_end;
+    const uint8_t* src_end_orig;
+    uint32_t dst_size;
+    uint32_t error;
+};
+
+// Phase 1a: parse the tANS frequency table (lane 0 only, serial)
+__device__ __noinline__ void parseTable(
     const uint8_t* __restrict__ src_buf,
     const TansDecChunkDesc& desc,
-    TansLutEnt* lut,
-    DecodeState& ds
+    TableParseResult& tp
 ) {
-    ds.error = TANS_OK;
+    tp.error = TANS_OK;
+    tp.dst_size = desc.dst_size;
 
     const uint8_t* src = src_buf + desc.src_offset;
     uint32_t src_size = desc.src_size;
-    if (src_size < 8 || desc.dst_size < 5) { ds.error = TANS_ERR_SRC_TRUNCATED; return; }
+    if (src_size < 8 || desc.dst_size < 5) { tp.error = TANS_ERR_SRC_TRUNCATED; return; }
 
     const uint8_t* src_end_orig = src + src_size;
     const uint8_t* src_end = src_end_orig;
-    ds.src_end_orig = src_end_orig;
+    tp.src_end_orig = src_end_orig;
+    tp.src_end = src_end;
 
     BitReader br;
     br.p = src; br.p_end = src_end; br.bits = 0; br.bit_pos = 24;
     brRefill(br);
-    if (brReadBitNoRefill(br) != 0) { ds.error = TANS_ERR_BAD_TABLE; return; }
-    uint32_t log_table_bits = brReadBitsNoRefill(br, 2) + 8;
+    if (brReadBitNoRefill(br) != 0) { tp.error = TANS_ERR_BAD_TABLE; return; }
+    tp.log_table_bits = brReadBitsNoRefill(br, 2) + 8;
 
-    TansData td; td.a_used = 0; td.b_used = 0;
-    uint32_t err = decodeTable(br, log_table_bits, td);
-    if (err != TANS_OK) { ds.error = err; return; }
+    tp.td.a_used = 0; tp.td.b_used = 0;
+    uint32_t err = decodeTable(br, tp.log_table_bits, tp.td);
+    if (err != TANS_OK) { tp.error = err; return; }
 
     int32_t byte_rewind = (24 - br.bit_pos) / 8;
     src = br.p - byte_rewind;
-    ds.src_start = src;
-    if (src >= src_end || (src_end - src) < 8) { ds.error = TANS_ERR_SRC_TRUNCATED; return; }
+    tp.src_after_table = src;
 
-    int32_t L = 1 << log_table_bits;
-    int32_t a_used_i = (int32_t)td.a_used;
-    int32_t b_used_i = (int32_t)td.b_used;
-    if (a_used_i < 0 || a_used_i > L || b_used_i < 0 || b_used_i > 256) { ds.error = TANS_ERR_BAD_WEIGHTS; return; }
+    if (src >= src_end || (src_end - src) < 8) { tp.error = TANS_ERR_SRC_TRUNCATED; return; }
+
+    int32_t L = 1 << tp.log_table_bits;
+    int32_t a_used_i = (int32_t)tp.td.a_used;
+    int32_t b_used_i = (int32_t)tp.td.b_used;
+    if (a_used_i < 0 || a_used_i > L || b_used_i < 0 || b_used_i > 256) { tp.error = TANS_ERR_BAD_WEIGHTS; return; }
     int32_t w_sum = a_used_i;
-    for (uint32_t i = 0; i < td.b_used; i++) {
-        int32_t w = (int32_t)(td.b[i] & 0xFFFF);
-        if (w < 2 || w > L) { ds.error = TANS_ERR_BAD_WEIGHTS; return; }
+    for (uint32_t i = 0; i < tp.td.b_used; i++) {
+        int32_t w = (int32_t)(tp.td.b[i] & 0xFFFF);
+        if (w < 2 || w > L) { tp.error = TANS_ERR_BAD_WEIGHTS; return; }
         w_sum += w;
     }
-    if (w_sum != L) { ds.error = TANS_ERR_BAD_WEIGHTS; return; }
+    if (w_sum != L) { tp.error = TANS_ERR_BAD_WEIGHTS; return; }
+}
 
-    err = initLut(td, log_table_bits, lut);
-    if (err != TANS_OK) { ds.error = err; return; }
+// Phase 1c: init 5 decode states from bitstream (lane 0 only, serial)
+__device__ void initDecodeStates(
+    const TableParseResult& tp,
+    TansLutEnt* lut,
+    DecodeState& ds
+) {
+    const uint8_t* src = tp.src_after_table;
+    const uint8_t* src_end = tp.src_end;
 
     uint32_t bits_f = readLE32(src); src += 4;
     uint32_t bits_b = bswap32(readLE32(src_end - 4)); src_end -= 4;
     int32_t bitpos_f = 32, bitpos_b = 32;
-    uint32_t lut_mask = (1u << log_table_bits) - 1;
-    uint32_t ltb = log_table_bits;
+    uint32_t lut_mask = (1u << tp.log_table_bits) - 1;
+    uint32_t ltb = tp.log_table_bits;
 
     ds.st0 = bits_f & lut_mask; bits_f >>= ltb; bitpos_f -= ltb;
     ds.st1 = bits_b & lut_mask; bits_b >>= ltb; bitpos_b -= ltb;
@@ -1012,7 +1035,10 @@ __device__ __noinline__ void setupDecode(
     ds.bits_f = bits_f; ds.bits_b = bits_b;
     ds.bp_f = bitpos_f & 7; ds.bp_b = bitpos_b & 7;
     ds.lut_mask = lut_mask;
-    ds.total_syms = desc.dst_size - 5;
+    ds.total_syms = tp.dst_size - 5;
+    ds.src_start = tp.src_after_table;
+    ds.src_end_orig = tp.src_end_orig;
+    ds.error = TANS_OK;
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1042,11 +1068,30 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTansDecodeKernel(
 
     const int lane = threadIdx.x & 31;
 
-    // Phase 1: table parse + LUT build (lane 0, initLut has parallel singles loop)
-    DecodeState ds;
-    if (lane == 0) setupDecode(src_buf, descs[chunk_id], my_lut, ds);
+    // Phase 1a: table parse (lane 0 only — serial Golomb-Rice decode)
+    __shared__ TableParseResult s_tp[2]; // one per warp
+    if (lane == 0) parseTable(src_buf, descs[chunk_id], s_tp[warp_id]);
+    __syncwarp();
 
-    uint32_t err = __shfl_sync(0xFFFFFFFF, ds.error, 0);
+    uint32_t err = s_tp[warp_id].error;
+    if (err != TANS_OK) {
+        if (lane == 0) out_status[chunk_id] = err;
+        return;
+    }
+
+    // Phase 1b: LUT build (ALL 32 lanes — parallel entry writes)
+    err = initLut(s_tp[warp_id].td, s_tp[warp_id].log_table_bits, my_lut);
+    __syncwarp();
+    if (err != TANS_OK) {
+        if (lane == 0) out_status[chunk_id] = err;
+        return;
+    }
+
+    // Phase 1c: init decode states (lane 0 only)
+    DecodeState ds;
+    if (lane == 0) initDecodeStates(s_tp[warp_id], my_lut, ds);
+
+    err = __shfl_sync(0xFFFFFFFF, ds.error, 0);
     if (err != TANS_OK) {
         if (lane == 0) out_status[chunk_id] = err;
         return;
