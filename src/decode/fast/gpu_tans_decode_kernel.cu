@@ -887,12 +887,98 @@ __device__ uint32_t decodeTansChunk(
 }
 
 // ══════════════════════════════════════════════════════════════════
+//  Table parse + LUT build — __noinline__ to free registers for
+//  the decode hot loop.
+// ══════════════════════════════════════════════════════════════════
+
+struct DecodeState {
+    const uint8_t* ptr_f;
+    const uint8_t* ptr_b;
+    const uint8_t* src_start;
+    const uint8_t* src_end_orig;
+    uint32_t bits_f, bits_b;
+    int32_t  bp_f, bp_b;
+    uint32_t st0, st1, st2, st3, st4;
+    uint32_t lut_mask;
+    uint32_t total_syms;  // dst_size - 5
+    uint32_t error;
+};
+
+__device__ __noinline__ void setupDecode(
+    const uint8_t* __restrict__ src_buf,
+    const TansDecChunkDesc& desc,
+    TansLutEnt* lut,
+    DecodeState& ds
+) {
+    ds.error = TANS_OK;
+
+    const uint8_t* src = src_buf + desc.src_offset;
+    uint32_t src_size = desc.src_size;
+    if (src_size < 8 || desc.dst_size < 5) { ds.error = TANS_ERR_SRC_TRUNCATED; return; }
+
+    const uint8_t* src_end_orig = src + src_size;
+    const uint8_t* src_end = src_end_orig;
+    ds.src_end_orig = src_end_orig;
+
+    BitReader br;
+    br.p = src; br.p_end = src_end; br.bits = 0; br.bit_pos = 24;
+    brRefill(br);
+    if (brReadBitNoRefill(br) != 0) { ds.error = TANS_ERR_BAD_TABLE; return; }
+    uint32_t log_table_bits = brReadBitsNoRefill(br, 2) + 8;
+
+    TansData td; td.a_used = 0; td.b_used = 0;
+    uint32_t err = decodeTable(br, log_table_bits, td);
+    if (err != TANS_OK) { ds.error = err; return; }
+
+    int32_t byte_rewind = (24 - br.bit_pos) / 8;
+    src = br.p - byte_rewind;
+    ds.src_start = src;
+    if (src >= src_end || (src_end - src) < 8) { ds.error = TANS_ERR_SRC_TRUNCATED; return; }
+
+    int32_t L = 1 << log_table_bits;
+    int32_t a_used_i = (int32_t)td.a_used;
+    int32_t b_used_i = (int32_t)td.b_used;
+    if (a_used_i < 0 || a_used_i > L || b_used_i < 0 || b_used_i > 256) { ds.error = TANS_ERR_BAD_WEIGHTS; return; }
+    int32_t w_sum = a_used_i;
+    for (uint32_t i = 0; i < td.b_used; i++) {
+        int32_t w = (int32_t)(td.b[i] & 0xFFFF);
+        if (w < 2 || w > L) { ds.error = TANS_ERR_BAD_WEIGHTS; return; }
+        w_sum += w;
+    }
+    if (w_sum != L) { ds.error = TANS_ERR_BAD_WEIGHTS; return; }
+
+    err = initLut(td, log_table_bits, lut);
+    if (err != TANS_OK) { ds.error = err; return; }
+
+    uint32_t bits_f = readLE32(src); src += 4;
+    uint32_t bits_b = bswap32(readLE32(src_end - 4)); src_end -= 4;
+    int32_t bitpos_f = 32, bitpos_b = 32;
+    uint32_t lut_mask = (1u << log_table_bits) - 1;
+    uint32_t ltb = log_table_bits;
+
+    ds.st0 = bits_f & lut_mask; bits_f >>= ltb; bitpos_f -= ltb;
+    ds.st1 = bits_b & lut_mask; bits_b >>= ltb; bitpos_b -= ltb;
+    ds.st2 = bits_f & lut_mask; bits_f >>= ltb; bitpos_f -= ltb;
+    ds.st3 = bits_b & lut_mask; bits_b >>= ltb; bitpos_b -= ltb;
+    bits_f |= readLE32(src) << bitpos_f;
+    src += (31 - bitpos_f) >> 3; bitpos_f |= 24;
+    ds.st4 = bits_f & lut_mask; bits_f >>= ltb; bitpos_f -= ltb;
+
+    ds.ptr_f = src - (bitpos_f >> 3);
+    ds.ptr_b = src_end + (bitpos_b >> 3);
+    ds.bits_f = bits_f; ds.bits_b = bits_b;
+    ds.bp_f = bitpos_f & 7; ds.bp_b = bitpos_b & 7;
+    ds.lut_mask = lut_mask;
+    ds.total_syms = desc.dst_size - 5;
+}
+
+// ══════════════════════════════════════════════════════════════════
 //  CUDA kernel entry point
 // ══════════════════════════════════════════════════════════════════
 //
 // Launch config: 1 block per chunk, 32 threads per block (1 warp).
-// Lane 0 does all work; other lanes are present for warp scheduling.
-// Shared memory: MAX_LUT_ENTRIES * 8 bytes for the decode LUT.
+// Lane 0 decodes symbols; lanes 0-9 cooperate on coalesced output.
+// Shared memory: 2048-entry LUT (16KB) + 10-byte staging buffer.
 
 extern "C" __global__ void __launch_bounds__(32, 1) slzTansDecodeKernel(
     const uint8_t* __restrict__ src_buf,
@@ -904,13 +990,117 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzTansDecodeKernel(
     const uint32_t chunk_id = blockIdx.x;
     if (chunk_id >= num_chunks) return;
 
-    // LUT in shared memory — up to 4096 entries x 8 bytes = 32KB
-    __shared__ TansLutEnt s_lut[MAX_LUT_ENTRIES];
+    __shared__ TansLutEnt s_lut[2048];
+    __shared__ uint8_t s_stage[12];  // 10 symbols + 2 padding
 
     const int lane = threadIdx.x & 31;
 
+    // Phase 1: table parse + LUT build (__noinline__, lane 0)
+    DecodeState ds;
+    if (lane == 0) setupDecode(src_buf, descs[chunk_id], s_lut, ds);
+
+    uint32_t err = __shfl_sync(0xFFFFFFFF, ds.error, 0);
+    if (err != TANS_OK) {
+        if (lane == 0) out_status[chunk_id] = err;
+        return;
+    }
+
+    // Phase 2: decode + coalesced output
+    uint32_t total_syms = __shfl_sync(0xFFFFFFFF, ds.total_syms, 0);
+    uint32_t dst_offset = __shfl_sync(0xFFFFFFFF, descs[chunk_id].dst_offset, 0);
+    uint8_t* dst_base = dst_buf + dst_offset;
+    uint32_t full_batches = total_syms / 10;
+    uint32_t out_pos = 0;
+
+    // Lane 0 owns the decode state
+    const uint8_t* ptr_f, *ptr_b;
+    uint32_t bits_f, bits_b, lut_mask;
+    int32_t bp_f, bp_b;
+    uint32_t st0, st1, st2, st3, st4;
     if (lane == 0) {
-        uint32_t status = decodeTansChunk(src_buf, dst_buf, descs[chunk_id], s_lut);
-        out_status[chunk_id] = status;
+        ptr_f = ds.ptr_f; ptr_b = ds.ptr_b;
+        bits_f = ds.bits_f; bits_b = ds.bits_b;
+        bp_f = ds.bp_f; bp_b = ds.bp_b;
+        st0 = ds.st0; st1 = ds.st1; st2 = ds.st2; st3 = ds.st3; st4 = ds.st4;
+        lut_mask = ds.lut_mask;
+    }
+
+    for (uint32_t batch = 0; batch < full_batches; batch++) {
+        // Lane 0: decode 10 symbols into shared staging
+        if (lane == 0) {
+            refillForward(ptr_f, bits_f, bp_f);
+            s_stage[0] = decodeOneSymbol(s_lut, st0, bits_f, bp_f, lut_mask);
+            s_stage[1] = decodeOneSymbol(s_lut, st1, bits_f, bp_f, lut_mask);
+            refillForward(ptr_f, bits_f, bp_f);
+            s_stage[2] = decodeOneSymbol(s_lut, st2, bits_f, bp_f, lut_mask);
+            s_stage[3] = decodeOneSymbol(s_lut, st3, bits_f, bp_f, lut_mask);
+            refillForward(ptr_f, bits_f, bp_f);
+            s_stage[4] = decodeOneSymbol(s_lut, st4, bits_f, bp_f, lut_mask);
+
+            refillBackward(ptr_b, bits_b, bp_b);
+            s_stage[5] = decodeOneSymbol(s_lut, st0, bits_b, bp_b, lut_mask);
+            s_stage[6] = decodeOneSymbol(s_lut, st1, bits_b, bp_b, lut_mask);
+            refillBackward(ptr_b, bits_b, bp_b);
+            s_stage[7] = decodeOneSymbol(s_lut, st2, bits_b, bp_b, lut_mask);
+            s_stage[8] = decodeOneSymbol(s_lut, st3, bits_b, bp_b, lut_mask);
+            refillBackward(ptr_b, bits_b, bp_b);
+            s_stage[9] = decodeOneSymbol(s_lut, st4, bits_b, bp_b, lut_mask);
+        }
+        __syncwarp();
+
+        // Lanes 0-9: coalesced write (10 bytes, 10/32 sector utilization)
+        if (lane < 10)
+            dst_base[out_pos + lane] = s_stage[lane];
+        __syncwarp();
+        out_pos += 10;
+    }
+
+    // Tail: remaining < 10 symbols, lane 0 writes directly
+    if (lane == 0) {
+        uint8_t* dst = dst_base + out_pos;
+        uint8_t* dst_end = dst_base + total_syms;
+
+        while (dst < dst_end) {
+            refillForward(ptr_f, bits_f, bp_f);
+            *dst++ = decodeOneSymbol(s_lut, st0, bits_f, bp_f, lut_mask);
+            if (dst >= dst_end) break;
+            *dst++ = decodeOneSymbol(s_lut, st1, bits_f, bp_f, lut_mask);
+            if (dst >= dst_end) break;
+            refillForward(ptr_f, bits_f, bp_f);
+            *dst++ = decodeOneSymbol(s_lut, st2, bits_f, bp_f, lut_mask);
+            if (dst >= dst_end) break;
+            *dst++ = decodeOneSymbol(s_lut, st3, bits_f, bp_f, lut_mask);
+            if (dst >= dst_end) break;
+            refillForward(ptr_f, bits_f, bp_f);
+            *dst++ = decodeOneSymbol(s_lut, st4, bits_f, bp_f, lut_mask);
+            if (dst >= dst_end) break;
+            refillBackward(ptr_b, bits_b, bp_b);
+            *dst++ = decodeOneSymbol(s_lut, st0, bits_b, bp_b, lut_mask);
+            if (dst >= dst_end) break;
+            *dst++ = decodeOneSymbol(s_lut, st1, bits_b, bp_b, lut_mask);
+            if (dst >= dst_end) break;
+            refillBackward(ptr_b, bits_b, bp_b);
+            *dst++ = decodeOneSymbol(s_lut, st2, bits_b, bp_b, lut_mask);
+            if (dst >= dst_end) break;
+            *dst++ = decodeOneSymbol(s_lut, st3, bits_b, bp_b, lut_mask);
+            if (dst >= dst_end) break;
+            refillBackward(ptr_b, bits_b, bp_b);
+            *dst++ = decodeOneSymbol(s_lut, st4, bits_b, bp_b, lut_mask);
+        }
+
+        // Convergence check
+        intptr_t ptr_diff = (intptr_t)ptr_b - (intptr_t)ptr_f;
+        intptr_t adjust = (intptr_t)(bp_f >> 3) + (intptr_t)(bp_b >> 3);
+        if (ptr_diff + adjust != 0) { out_status[chunk_id] = TANS_ERR_STREAM_MISMATCH; return; }
+
+        uint32_t states_or = st0 | st1 | st2 | st3 | st4;
+        if ((states_or & ~0xFFu) != 0) { out_status[chunk_id] = TANS_ERR_STATE_RANGE; return; }
+
+        dst_base[total_syms + 0] = (uint8_t)st0;
+        dst_base[total_syms + 1] = (uint8_t)st1;
+        dst_base[total_syms + 2] = (uint8_t)st2;
+        dst_base[total_syms + 3] = (uint8_t)st3;
+        dst_base[total_syms + 4] = (uint8_t)st4;
+        out_status[chunk_id] = TANS_OK;
     }
 }
