@@ -1008,7 +1008,6 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzTansDecodeKernel(
     uint32_t total_syms = __shfl_sync(0xFFFFFFFF, ds.total_syms, 0);
     uint32_t dst_offset = __shfl_sync(0xFFFFFFFF, descs[chunk_id].dst_offset, 0);
     uint8_t* dst_base = dst_buf + dst_offset;
-    uint32_t full_batches = total_syms / 10;
     uint32_t out_pos = 0;
 
     // Lane 0 owns the decode state
@@ -1026,9 +1025,11 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzTansDecodeKernel(
 
     if (lane == 0) {
         uint8_t* dst = dst_base;
-        for (uint32_t batch = 0; batch < full_batches; batch++) {
-            uint8_t s0, s1, s2, s3, s4, s5, s6, s7, s8, s9;
+        uint32_t full20 = total_syms / 20;
+        for (uint32_t batch = 0; batch < full20; batch++) {
+            uint8_t s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15,s16,s17,s18,s19;
 
+            // Round 1: fwd 5
             refillForward(ptr_f, bits_f, bp_f);
             s0 = decodeOneSymbol(s_lut, st0, bits_f, bp_f, lut_mask);
             s1 = decodeOneSymbol(s_lut, st1, bits_f, bp_f, lut_mask);
@@ -1037,7 +1038,7 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzTansDecodeKernel(
             s3 = decodeOneSymbol(s_lut, st3, bits_f, bp_f, lut_mask);
             refillForward(ptr_f, bits_f, bp_f);
             s4 = decodeOneSymbol(s_lut, st4, bits_f, bp_f, lut_mask);
-
+            // Round 1: bwd 5
             refillBackward(ptr_b, bits_b, bp_b);
             s5 = decodeOneSymbol(s_lut, st0, bits_b, bp_b, lut_mask);
             s6 = decodeOneSymbol(s_lut, st1, bits_b, bp_b, lut_mask);
@@ -1046,16 +1047,64 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzTansDecodeKernel(
             s8 = decodeOneSymbol(s_lut, st3, bits_b, bp_b, lut_mask);
             refillBackward(ptr_b, bits_b, bp_b);
             s9 = decodeOneSymbol(s_lut, st4, bits_b, bp_b, lut_mask);
+            // Round 2: fwd 5
+            refillForward(ptr_f, bits_f, bp_f);
+            s10 = decodeOneSymbol(s_lut, st0, bits_f, bp_f, lut_mask);
+            s11 = decodeOneSymbol(s_lut, st1, bits_f, bp_f, lut_mask);
+            refillForward(ptr_f, bits_f, bp_f);
+            s12 = decodeOneSymbol(s_lut, st2, bits_f, bp_f, lut_mask);
+            s13 = decodeOneSymbol(s_lut, st3, bits_f, bp_f, lut_mask);
+            refillForward(ptr_f, bits_f, bp_f);
+            s14 = decodeOneSymbol(s_lut, st4, bits_f, bp_f, lut_mask);
+            // Round 2: bwd 5
+            refillBackward(ptr_b, bits_b, bp_b);
+            s15 = decodeOneSymbol(s_lut, st0, bits_b, bp_b, lut_mask);
+            s16 = decodeOneSymbol(s_lut, st1, bits_b, bp_b, lut_mask);
+            refillBackward(ptr_b, bits_b, bp_b);
+            s17 = decodeOneSymbol(s_lut, st2, bits_b, bp_b, lut_mask);
+            s18 = decodeOneSymbol(s_lut, st3, bits_b, bp_b, lut_mask);
+            refillBackward(ptr_b, bits_b, bp_b);
+            s19 = decodeOneSymbol(s_lut, st4, bits_b, bp_b, lut_mask);
 
-            // Write 10 bytes as 8-byte + 2-byte store (2 stores vs 10)
+            // Write 20 bytes as 8+8+4 (3 stores)
+            uint64_t w0 = (uint64_t)s0 | ((uint64_t)s1<<8) | ((uint64_t)s2<<16) | ((uint64_t)s3<<24) |
+                          ((uint64_t)s4<<32) | ((uint64_t)s5<<40) | ((uint64_t)s6<<48) | ((uint64_t)s7<<56);
+            uint64_t w1 = (uint64_t)s8 | ((uint64_t)s9<<8) | ((uint64_t)s10<<16) | ((uint64_t)s11<<24) |
+                          ((uint64_t)s12<<32) | ((uint64_t)s13<<40) | ((uint64_t)s14<<48) | ((uint64_t)s15<<56);
+            uint32_t w2 = (uint32_t)s16 | ((uint32_t)s17<<8) | ((uint32_t)s18<<16) | ((uint32_t)s19<<24);
+            memcpy(dst, &w0, 8);
+            memcpy(dst + 8, &w1, 8);
+            memcpy(dst + 16, &w2, 4);
+            dst += 20;
+        }
+        // Handle remaining full groups of 10
+        uint32_t rem = total_syms - full20 * 20;
+        if (rem >= 10) {
+            uint8_t s0,s1,s2,s3,s4,s5,s6,s7,s8,s9;
+            refillForward(ptr_f, bits_f, bp_f);
+            s0 = decodeOneSymbol(s_lut, st0, bits_f, bp_f, lut_mask);
+            s1 = decodeOneSymbol(s_lut, st1, bits_f, bp_f, lut_mask);
+            refillForward(ptr_f, bits_f, bp_f);
+            s2 = decodeOneSymbol(s_lut, st2, bits_f, bp_f, lut_mask);
+            s3 = decodeOneSymbol(s_lut, st3, bits_f, bp_f, lut_mask);
+            refillForward(ptr_f, bits_f, bp_f);
+            s4 = decodeOneSymbol(s_lut, st4, bits_f, bp_f, lut_mask);
+            refillBackward(ptr_b, bits_b, bp_b);
+            s5 = decodeOneSymbol(s_lut, st0, bits_b, bp_b, lut_mask);
+            s6 = decodeOneSymbol(s_lut, st1, bits_b, bp_b, lut_mask);
+            refillBackward(ptr_b, bits_b, bp_b);
+            s7 = decodeOneSymbol(s_lut, st2, bits_b, bp_b, lut_mask);
+            s8 = decodeOneSymbol(s_lut, st3, bits_b, bp_b, lut_mask);
+            refillBackward(ptr_b, bits_b, bp_b);
+            s9 = decodeOneSymbol(s_lut, st4, bits_b, bp_b, lut_mask);
             uint64_t w8 = (uint64_t)s0 | ((uint64_t)s1<<8) | ((uint64_t)s2<<16) | ((uint64_t)s3<<24) |
                           ((uint64_t)s4<<32) | ((uint64_t)s5<<40) | ((uint64_t)s6<<48) | ((uint64_t)s7<<56);
             memcpy(dst, &w8, 8);
-            uint16_t w2 = (uint16_t)s8 | ((uint16_t)s9 << 8);
-            memcpy(dst + 8, &w2, 2);
+            uint16_t wt = (uint16_t)s8 | ((uint16_t)s9 << 8);
+            memcpy(dst + 8, &wt, 2);
             dst += 10;
         }
-        out_pos = full_batches * 10;
+        out_pos = (uint32_t)(dst - dst_base);
     }
 
     // Tail: remaining < 10 symbols, lane 0 writes directly
