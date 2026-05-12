@@ -137,6 +137,9 @@ pub const ChunkDesc = extern struct {
     _pad: [3]u8 = .{ 0, 0, 0 },
 };
 
+var d_tans_scratch: CUdeviceptr = 0;
+var d_tans_scratch_size: usize = 0;
+
 pub fn fullGpuLaunch(
     chunk_descs: []const ChunkDesc,
     compressed_block: []const u8,
@@ -167,6 +170,10 @@ pub fn fullGpuLaunch(
     if (!ensureDeviceBuf(&d_comp_persist, &d_comp_persist_size, comp_bytes)) return error.BadMode;
     if (!ensureDeviceBuf(&d_descs_persist, &d_descs_persist_size, desc_bytes)) return error.BadMode;
 
+    // Allocate tANS scratch: 65536 bytes per chunk for decoded tANS literals
+    const tans_scratch_bytes = chunk_descs.len * 65536;
+    if (!ensureDeviceBuf(&d_tans_scratch, &d_tans_scratch_size, tans_scratch_bytes)) return error.BadMode;
+
     if (compressed_block.len > 0)
         _ = h2d_fn(d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len);
     _ = h2d_fn(d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes);
@@ -180,6 +187,7 @@ pub fn fullGpuLaunch(
     var p_cpg = chunks_per_group;
     var p_total: u32 = @intCast(chunk_descs.len);
     var p_sc_cap = sub_chunk_cap;
+    var p_tans_scratch = d_tans_scratch;
 
     var params = [_]?*anyopaque{
         @ptrCast(&p_comp),
@@ -188,6 +196,7 @@ pub fn fullGpuLaunch(
         @ptrCast(&p_cpg),
         @ptrCast(&p_total),
         @ptrCast(&p_sc_cap),
+        @ptrCast(&p_tans_scratch),
     };
     var extra = [_]?*anyopaque{null};
 

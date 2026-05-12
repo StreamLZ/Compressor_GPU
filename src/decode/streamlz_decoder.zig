@@ -301,7 +301,7 @@ fn decompressOneFrame(
         // GPU batch path: only for per-chunk independent data (sc_group <= 1)
         // Skip GPU/Vulkan LZ decode for L3+ with fractional SC (GPU-encoded with tANS)
         // since the GPU LZ kernel can't handle entropy-coded literal streams.
-        if (use_gpu and hdr.sc_group_size <= 1.0 and !(hdr.sc_group_size < 1.0 and hdr.level >= 6)) gpu_frame: {
+        if (use_gpu and hdr.sc_group_size <= 1.0) gpu_frame: {
             const gpu = @import("fast/gpu_driver.zig");
             if (!gpu.isAvailable()) break :gpu_frame;
             if (block_src.len < 2) break :gpu_frame;
@@ -332,7 +332,7 @@ fn decompressOneFrame(
         }
 
         // Vulkan fallback: try Vulkan compute when CUDA is unavailable
-        if (!dispatched_parallel and use_gpu and hdr.sc_group_size <= 1.0 and !(hdr.sc_group_size < 1.0 and hdr.level >= 6)) vk_frame: {
+        if (!dispatched_parallel and use_gpu and hdr.sc_group_size <= 1.0) vk_frame: {
             const vk = @import("fast/vk_driver.zig");
             if (!vk.isAvailable()) break :vk_frame;
             if (block_src.len < 2) break :vk_frame;
@@ -676,6 +676,7 @@ fn decompressCompressedBlock(
     sc_group_size: f32,
     frame_level: u8,
 ) DecompressError!void {
+    _ = frame_level;
     // Peek the first 2-byte internal block header to detect SC mode up-front.
     const is_sc = blk: {
         if (block_src_in.len < 2) break :blk false;
@@ -700,7 +701,7 @@ fn decompressCompressedBlock(
     // Cross-chunk off32 references can't be resolved in parallel GPU decode.
     // Skip GPU decode if sub-chunks contain entropy-coded literals (tANS/Huffman)
     // that the GPU kernel can't handle.
-    if (use_gpu and sc_group_size <= 1.0 and !(sc_group_size < 1.0 and frame_level >= 6)) gpu_batch: {
+    if (use_gpu and sc_group_size <= 1.0) gpu_batch: {
         const gpu = @import("fast/gpu_driver.zig");
         if (!gpu.isAvailable()) break :gpu_batch;
         gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, sc_group_size, scratch, null) catch {
