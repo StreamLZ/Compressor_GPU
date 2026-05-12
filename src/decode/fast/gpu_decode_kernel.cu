@@ -80,6 +80,10 @@ __device__ void decodeSubChunkL1(
     int32_t recent_offset = -8;
     uint32_t len_off = 0;
 
+    // Prefetch first token
+    uint32_t next_token = 0;
+    if (lane == 0 && cmd_pos < cmd_size) next_token = cmd[cmd_pos];
+
     while (cmd_pos < cmd_size) {
         uint32_t lit_len = 0, match_len = 0;
         int32_t match_offset = recent_offset;
@@ -87,7 +91,9 @@ __device__ void decodeSubChunkL1(
 
         // ── Token parse (lane 0 only) ──
         if (lane == 0) {
-            uint32_t token = cmd[cmd_pos];
+            uint32_t token = next_token;
+            // Prefetch next token while processing this one
+            if (cmd_pos + 1 < cmd_size) next_token = cmd[cmd_pos + 1];
             if (token >= TOKEN_SHORT_MIN) {
                 lit_len = token & 7;
                 match_len = (token >> 3) & 0xF;
@@ -185,6 +191,10 @@ __device__ void decodeSubChunk(
         ? cmd_stream2_offset : cmd_size;
     int block_iter = 0;
 
+    // Prefetch first token
+    uint32_t next_token_g = 0;
+    if (lane == 0 && cmd_pos < block_cmd_end) next_token_g = cmd[cmd_pos];
+
     for (;;) {
     while (cmd_pos < block_cmd_end) {
         uint32_t token = 0, lit_len = 0, match_len = 0;
@@ -193,7 +203,9 @@ __device__ void decodeSubChunk(
 
         // ── Token parse (lane 0 only) ──
         if (lane == 0) {
-            token = cmd[cmd_pos++];
+            token = next_token_g;
+            cmd_pos++;
+            if (cmd_pos < block_cmd_end) next_token_g = cmd[cmd_pos];
             if (token >= TOKEN_SHORT_MIN) {
                 token_type = 0;
                 lit_len = token & 7;
@@ -322,6 +334,7 @@ __device__ void decodeSubChunk(
     off32_count_cur = off32_count2;
     off32_pos = 0;
     block_dst_start = dst_pos;
+    if (lane == 0 && cmd_pos < block_cmd_end) next_token_g = cmd[cmd_pos];
     }
 
     // ── Final trailing literals ──
