@@ -1042,7 +1042,7 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTansDecodeKernel(
 
     const int lane = threadIdx.x & 31;
 
-    // Phase 1: table parse + LUT build (__noinline__, lane 0)
+    // Phase 1: table parse + LUT build (lane 0, initLut has parallel singles loop)
     DecodeState ds;
     if (lane == 0) setupDecode(src_buf, descs[chunk_id], my_lut, ds);
 
