@@ -707,8 +707,7 @@ fn launchTansKernel(
     };
     var tans_extra = [_]?*anyopaque{null};
 
-    const tans_grid = (num_descs + 1) / 2;
-    if (launch_fn(tans_kernel_fn, tans_grid, 1, 1, 32, 2, 1, 0, 0, &tans_params, &tans_extra) != CUDA_SUCCESS)
+    if (launch_fn(tans_kernel_fn, num_descs, 1, 1, 32, 1, 1, 0, 0, &tans_params, &tans_extra) != CUDA_SUCCESS)
         return error.BadMode;
 }
 
