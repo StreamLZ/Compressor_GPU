@@ -536,11 +536,15 @@ pub fn fullGpuLaunch(
     if (!ensureDeviceBuf(&d_comp_persist, &d_comp_persist_size, comp_bytes)) return error.BadMode;
     if (!ensureDeviceBuf(&d_descs_persist, &d_descs_persist_size, desc_bytes)) return error.BadMode;
 
-    // Allocate tANS scratch: 65536 bytes per chunk for decoded literals/tokens/off16
-    const tans_scratch_bytes = chunk_descs.len * 65536;
+    // Allocate unified tANS scratch: 3 regions × 65536 bytes per chunk
+    // Layout: [lit: N*64K] [tok: N*64K] [off16: N*64K]
+    const per_chunk_scratch: usize = 65536;
+    const tans_scratch_bytes = chunk_descs.len * per_chunk_scratch * 3;
     if (!ensureDeviceBuf(&d_tans_scratch, &d_tans_scratch_size, tans_scratch_bytes)) return error.BadMode;
-    if (!ensureDeviceBuf(&d_tans_tok_scratch, &d_tans_tok_scratch_size, tans_scratch_bytes)) return error.BadMode;
-    if (!ensureDeviceBuf(&d_tans_off16_scratch, &d_tans_off16_scratch_size, tans_scratch_bytes)) return error.BadMode;
+    const tok_offset = chunk_descs.len * per_chunk_scratch;
+    const off16_offset = chunk_descs.len * per_chunk_scratch * 2;
+    d_tans_tok_scratch = d_tans_scratch + tok_offset;
+    d_tans_off16_scratch = d_tans_scratch + off16_offset;
 
     if (compressed_block.len > 0)
         _ = h2d_fn(d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len);
@@ -564,39 +568,44 @@ pub fn fullGpuLaunch(
             &raw_off16_buf,
         );
 
-        // ── Pass 1a: tANS literal decode ──
-        if (scan.num_lit > 0) {
-            launchTansKernel(h2d_fn, launch_fn, sync_fn, scan.num_lit,
-                &tans_host_buf, d_tans_scratch,
+        // Merge all tANS descriptors into one array, adjust offsets for unified scratch
+        // Tok descriptors: add tok_offset to dst_offset
+        // Off16 descriptors: add off16_offset to dst_offset
+        var merged_buf: [4096 * 4]TansDecChunkDesc = undefined;
+        var merged_count: u32 = 0;
+
+        for (0..scan.num_lit) |i| {
+            merged_buf[merged_count] = tans_host_buf[i];
+            merged_count += 1;
+        }
+        for (0..scan.num_tok) |i| {
+            var d = tans_tok_host_buf[i];
+            d.dst_offset += @intCast(tok_offset);
+            merged_buf[merged_count] = d;
+            merged_count += 1;
+        }
+        for (0..scan.num_off16hi) |i| {
+            var d = tans_off16hi_host_buf[i];
+            d.dst_offset += @intCast(off16_offset);
+            merged_buf[merged_count] = d;
+            merged_count += 1;
+        }
+        for (0..scan.num_off16lo) |i| {
+            var d = tans_off16lo_host_buf[i];
+            d.dst_offset += @intCast(off16_offset);
+            merged_buf[merged_count] = d;
+            merged_count += 1;
+        }
+
+        // Single tANS kernel launch for all stream types
+        if (merged_count > 0) {
+            launchTansKernel(h2d_fn, launch_fn, sync_fn, merged_count,
+                @as([*]TansDecChunkDesc, &merged_buf), d_tans_scratch,
                 &d_tans_descs_persist, &d_tans_descs_persist_size,
                 &d_tans_status_persist, &d_tans_status_persist_size) catch return error.BadMode;
         }
 
-        // ── Pass 1b: tANS token decode ──
-        if (scan.num_tok > 0) {
-            launchTansKernel(h2d_fn, launch_fn, sync_fn, scan.num_tok,
-                &tans_tok_host_buf, d_tans_tok_scratch,
-                &d_tans_tok_descs_persist, &d_tans_tok_descs_persist_size,
-                &d_tans_tok_status_persist, &d_tans_tok_status_persist_size) catch return error.BadMode;
-        }
-
-        // ── Pass 1c: tANS off16 hi decode ──
-        if (scan.num_off16hi > 0) {
-            launchTansKernel(h2d_fn, launch_fn, sync_fn, scan.num_off16hi,
-                &tans_off16hi_host_buf, d_tans_off16_scratch,
-                &d_tans_off16hi_descs, &d_tans_off16hi_descs_size,
-                &d_tans_off16hi_status, &d_tans_off16hi_status_size) catch return error.BadMode;
-        }
-
-        // ── Pass 1d: tANS off16 lo decode ──
-        if (scan.num_off16lo > 0) {
-            launchTansKernel(h2d_fn, launch_fn, sync_fn, scan.num_off16lo,
-                &tans_off16lo_host_buf, d_tans_off16_scratch,
-                &d_tans_off16lo_descs, &d_tans_off16lo_descs_size,
-                &d_tans_off16lo_status, &d_tans_off16lo_status_size) catch return error.BadMode;
-        }
-
-        // ── Pass 1e: Upload raw (type 0) off16 sub-streams to GPU ──
+        // Upload raw (type 0) off16 sub-streams to GPU scratch
         for (0..scan.num_raw_off16) |ri| {
             const rd = raw_off16_buf[ri];
             if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len) {
@@ -604,7 +613,7 @@ pub fn fullGpuLaunch(
             }
         }
 
-        // Single sync after all tANS launches + raw uploads
+        // Sync
         if (sync_fn() != CUDA_SUCCESS) return error.BadMode;
     }
 
@@ -662,7 +671,7 @@ fn launchTansKernel(
     launch_fn: FnLaunchKernel,
     _: FnCtxSync,
     num_descs: u32,
-    host_descs: *[4096]TansDecChunkDesc,
+    host_descs: [*]TansDecChunkDesc,
     dst_scratch: CUdeviceptr,
     d_descs: *CUdeviceptr,
     d_descs_size: *usize,
