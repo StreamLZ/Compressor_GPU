@@ -936,6 +936,14 @@ __device__ uint32_t decodeTansChunk(
 //  the decode hot loop.
 // ══════════════════════════════════════════════════════════════════
 
+// Per-stream metadata written by table-build kernel, read by decode kernel
+struct TansTableMeta {
+    uint32_t src_after_table_off;  // offset from src_buf to post-table position
+    uint32_t src_end_off;          // offset from src_buf to end of stream
+    uint32_t log_table_bits;
+    uint32_t error;
+};
+
 struct DecodeState {
     const uint8_t* ptr_f;
     const uint8_t* ptr_b;
@@ -1049,6 +1057,58 @@ __device__ void initDecodeStates(
 // Each warp has its own LUT (16KB × 2 = 32KB shared, fits in 48KB).
 // Grid = ceil(num_chunks / 2).
 
+// ══════════════════════════════════════════════════════════════════
+//  Table-build kernel: parse tables + build LUTs (all 32 lanes)
+// ══════════════════════════════════════════════════════════════════
+// Separate from decode so table-build registers are freed.
+// All 32 lanes cooperate on initLut writes.
+// Writes TansTableMeta for the decode kernel to read.
+
+extern "C" __global__ void __launch_bounds__(64, 4) slzTansBuildTablesKernel(
+    const uint8_t* __restrict__ src_buf,
+    const TansDecChunkDesc* __restrict__ descs,
+    TansLutEnt*    __restrict__ lut_buf,
+    TansTableMeta* __restrict__ meta_buf,
+    uint32_t       num_chunks
+) {
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
+    if (chunk_id >= num_chunks) return;
+
+    TansLutEnt* my_lut = lut_buf + (uint64_t)chunk_id * 2048;
+    const int lane = threadIdx.x & 31;
+
+    // Lane 0: parse table header
+    __shared__ TableParseResult s_tp[2];
+    if (lane == 0) parseTable(src_buf, descs[chunk_id], s_tp[warp_id]);
+    __syncwarp();
+
+    if (s_tp[warp_id].error != TANS_OK) {
+        if (lane == 0) {
+            meta_buf[chunk_id].error = s_tp[warp_id].error;
+        }
+        return;
+    }
+
+    // All 32 lanes: build LUT
+    uint32_t err = initLut(s_tp[warp_id].td, s_tp[warp_id].log_table_bits, my_lut);
+    __syncwarp();
+
+    // Lane 0: write metadata for decode kernel
+    if (lane == 0) {
+        meta_buf[chunk_id].error = err;
+        if (err == TANS_OK) {
+            meta_buf[chunk_id].src_after_table_off = (uint32_t)((uintptr_t)s_tp[warp_id].src_after_table - (uintptr_t)src_buf);
+            meta_buf[chunk_id].src_end_off = (uint32_t)((uintptr_t)s_tp[warp_id].src_end_orig - (uintptr_t)src_buf);
+            meta_buf[chunk_id].log_table_bits = s_tp[warp_id].log_table_bits;
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  Decode-only kernel: reads pre-built LUTs + metadata
+// ══════════════════════════════════════════════════════════════════
+
 // LUT in global memory: each stream gets 2048 entries at lut_buf[chunk_id * 2048].
 // Eliminates 32KB shared memory constraint, allowing higher occupancy.
 // L1 cache (92% hit rate) handles the random LUT accesses.
@@ -1058,7 +1118,8 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTansDecodeKernel(
     const TansDecChunkDesc* __restrict__ descs,
     uint32_t*      __restrict__ out_status,
     uint32_t       num_chunks,
-    TansLutEnt*    __restrict__ lut_buf      // global LUT: num_chunks * 2048 entries
+    TansLutEnt*    __restrict__ lut_buf,
+    const TansTableMeta* __restrict__ meta_buf  // pre-built table metadata (or nullptr)
 ) {
     const uint32_t warp_id = threadIdx.y;
     const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
@@ -1068,32 +1129,50 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTansDecodeKernel(
 
     const int lane = threadIdx.x & 31;
 
-    // Phase 1a: table parse (lane 0 only — serial Golomb-Rice decode)
-    __shared__ TableParseResult s_tp[2]; // one per warp
-    if (lane == 0) parseTable(src_buf, descs[chunk_id], s_tp[warp_id]);
-    __syncwarp();
-
-    uint32_t err = s_tp[warp_id].error;
-    if (err != TANS_OK) {
-        if (lane == 0) out_status[chunk_id] = err;
-        return;
-    }
-
-    // Phase 1b: LUT build (ALL 32 lanes — parallel entry writes)
-    err = initLut(s_tp[warp_id].td, s_tp[warp_id].log_table_bits, my_lut);
-    __syncwarp();
-    if (err != TANS_OK) {
-        if (lane == 0) out_status[chunk_id] = err;
-        return;
-    }
-
-    // Phase 1c: init decode states (lane 0 only)
     DecodeState ds;
-    if (lane == 0) initDecodeStates(s_tp[warp_id], my_lut, ds);
 
-    err = __shfl_sync(0xFFFFFFFF, ds.error, 0);
-    if (err != TANS_OK) {
-        if (lane == 0) out_status[chunk_id] = err;
+    if (meta_buf != nullptr) {
+        // Fast path: LUT already built by slzTansBuildTablesKernel
+        uint32_t err = meta_buf[chunk_id].error;
+        if (err != TANS_OK) {
+            if (lane == 0) out_status[chunk_id] = err;
+            return;
+        }
+        // Init decode states from metadata (lane 0 only)
+        if (lane == 0) {
+            TableParseResult tp;
+            tp.src_after_table = src_buf + meta_buf[chunk_id].src_after_table_off;
+            tp.src_end = src_buf + meta_buf[chunk_id].src_end_off;
+            tp.src_end_orig = tp.src_end;
+            tp.log_table_bits = meta_buf[chunk_id].log_table_bits;
+            tp.dst_size = descs[chunk_id].dst_size;
+            initDecodeStates(tp, my_lut, ds);
+        }
+    } else {
+        // Fallback: build table + LUT inline (original path)
+        __shared__ TableParseResult s_tp[2];
+        if (lane == 0) parseTable(src_buf, descs[chunk_id], s_tp[warp_id]);
+        __syncwarp();
+
+        uint32_t err = s_tp[warp_id].error;
+        if (err != TANS_OK) {
+            if (lane == 0) out_status[chunk_id] = err;
+            return;
+        }
+
+        err = initLut(s_tp[warp_id].td, s_tp[warp_id].log_table_bits, my_lut);
+        __syncwarp();
+        if (err != TANS_OK) {
+            if (lane == 0) out_status[chunk_id] = err;
+            return;
+        }
+
+        if (lane == 0) initDecodeStates(s_tp[warp_id], my_lut, ds);
+    }
+
+    uint32_t decode_err = __shfl_sync(0xFFFFFFFF, ds.error, 0);
+    if (decode_err != TANS_OK) {
+        if (lane == 0) out_status[chunk_id] = decode_err;
         return;
     }
 

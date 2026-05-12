@@ -24,6 +24,7 @@ var module: usize = 0;
 var kernel_fn: usize = 0;
 var tans_module: usize = 0;
 var tans_kernel_fn: usize = 0;
+var tans_build_fn: usize = 0;
 var initialized = false;
 
 // ── Driver API function signatures ──────────────────────────────
@@ -102,6 +103,7 @@ pub fn init() bool {
     const tans_ptx = @embedFile("gpu_tans_decode_kernel.ptx") ++ "\x00";
     if (load_fn(&tans_module, tans_ptx.ptr) == CUDA_SUCCESS) {
         _ = get_fn(&tans_kernel_fn, tans_module, "slzTansDecodeKernel");
+        _ = get_fn(&tans_build_fn, tans_module, "slzTansBuildTablesKernel");
     }
 
     return true;
@@ -193,6 +195,10 @@ var d_tans_off16lo_status_size: usize = 0;
 // Global LUT buffer for tANS decode (replaces shared memory)
 var d_tans_lut: CUdeviceptr = 0;
 var d_tans_lut_size: usize = 0;
+
+// Table metadata buffer (table-build kernel → decode kernel)
+var d_tans_meta: CUdeviceptr = 0;
+var d_tans_meta_size: usize = 0;
 
 // Host-side tANS descriptor buffers (avoids 64KB stack allocations)
 var tans_host_buf: [4096]TansDecChunkDesc = undefined;
@@ -649,25 +655,50 @@ pub fn fullGpuLaunch(
     // ── KERNEL TIMER: only pure GPU kernel time from here ──
     const t_before_kern = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
 
-    // Launch tANS kernel
+    // Launch tANS table-build + decode kernels
     if (tans_kernel_fn != 0 and d_tans_descs_persist_size > 0) {
         const tans_count = @as(u32, @intCast(d_tans_descs_persist_size / @sizeOf(TansDecChunkDesc)));
         if (tans_count > 0) {
-            var tp_comp = d_comp_persist;
-            var tp_scratch = d_tans_scratch;
-            var tp_descs = d_tans_descs_persist;
-            var tp_status = d_tans_status_persist;
-            var tp_num = tans_count;
-            var tp_lut = d_tans_lut;
-            var tans_params = [_]?*anyopaque{
-                @ptrCast(&tp_comp), @ptrCast(&tp_scratch),
-                @ptrCast(&tp_descs), @ptrCast(&tp_status), @ptrCast(&tp_num),
-                @ptrCast(&tp_lut),
-            };
-            var tans_extra = [_]?*anyopaque{null};
+            // Allocate meta buffer
+            const meta_bytes = @as(usize, tans_count) * 16; // TansTableMeta = 4 × u32 = 16 bytes
+            if (!ensureDeviceBuf(&d_tans_meta, &d_tans_meta_size, meta_bytes)) return error.BadMode;
+
             const tans_grid = (tans_count + 1) / 2;
-            if (launch_fn(tans_kernel_fn, tans_grid, 1, 1, 32, 2, 1, 0, 0, &tans_params, &tans_extra) != CUDA_SUCCESS)
-                return error.BadMode;
+
+            // Kernel A: build tables + LUTs
+            if (tans_build_fn != 0) {
+                var bp_comp = d_comp_persist;
+                var bp_descs = d_tans_descs_persist;
+                var bp_lut = d_tans_lut;
+                var bp_meta = d_tans_meta;
+                var bp_num = tans_count;
+                var build_params = [_]?*anyopaque{
+                    @ptrCast(&bp_comp), @ptrCast(&bp_descs),
+                    @ptrCast(&bp_lut), @ptrCast(&bp_meta), @ptrCast(&bp_num),
+                };
+                var build_extra = [_]?*anyopaque{null};
+                if (launch_fn(tans_build_fn, tans_grid, 1, 1, 32, 2, 1, 0, 0, &build_params, &build_extra) != CUDA_SUCCESS)
+                    return error.BadMode;
+            }
+
+            // Kernel B: decode (reads pre-built LUTs + meta)
+            {
+                var tp_comp = d_comp_persist;
+                var tp_scratch = d_tans_scratch;
+                var tp_descs = d_tans_descs_persist;
+                var tp_status = d_tans_status_persist;
+                var tp_num = tans_count;
+                var tp_lut = d_tans_lut;
+                var tp_meta: CUdeviceptr = if (tans_build_fn != 0) d_tans_meta else 0;
+                var tans_params = [_]?*anyopaque{
+                    @ptrCast(&tp_comp), @ptrCast(&tp_scratch),
+                    @ptrCast(&tp_descs), @ptrCast(&tp_status), @ptrCast(&tp_num),
+                    @ptrCast(&tp_lut), @ptrCast(&tp_meta),
+                };
+                var tans_extra = [_]?*anyopaque{null};
+                if (launch_fn(tans_kernel_fn, tans_grid, 1, 1, 32, 2, 1, 0, 0, &tans_params, &tans_extra) != CUDA_SUCCESS)
+                    return error.BadMode;
+            }
         }
     }
 
