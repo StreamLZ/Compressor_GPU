@@ -123,6 +123,7 @@ var d_descs_persist: CUdeviceptr = 0;
 var d_descs_persist_size: usize = 0;
 
 pub var last_kernel_ns: i64 = 0;
+pub var last_tans_kernel_ns: i64 = 0;
 
 fn ensureDeviceBuf(ptr: *CUdeviceptr, current_size: *usize, needed: usize) bool {
     if (current_size.* >= needed) return true;
@@ -166,6 +167,9 @@ var d_tans_descs_persist: CUdeviceptr = 0;
 var d_tans_descs_persist_size: usize = 0;
 var d_tans_status_persist: CUdeviceptr = 0;
 var d_tans_status_persist_size: usize = 0;
+
+// Host-side tANS descriptor buffer (avoids 64KB stack allocation)
+var tans_host_buf: [4096]TansDecChunkDesc = undefined;
 
 // ── tANS header scanning ───────────────────────────────────────
 // Scans the host-side compressed data to find tANS literal headers
@@ -326,18 +330,19 @@ pub fn fullGpuLaunch(
     _ = h2d_fn(d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes);
     _ = sync_fn();
 
+    const t_before_kern = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
+
     // ── Pass 1: tANS decode ────────────────────────────────────
     // Scan compressed data for tANS literal headers, launch tANS kernel
     if (tans_kernel_fn != 0) {
-        // Stack buffer for tANS descriptors (max one per chunk)
-        var tans_descs_buf: [4096]TansDecChunkDesc = undefined;
-        const max_tans = @min(chunk_descs.len, tans_descs_buf.len);
+        // tANS descriptors — use global buffer to avoid 64KB stack allocation
+        const max_tans = @min(chunk_descs.len, tans_host_buf.len);
 
         const num_tans = scanForTansChunks(
             chunk_descs,
             compressed_block,
             sub_chunk_cap,
-            tans_descs_buf[0..max_tans],
+            tans_host_buf[0..max_tans],
         );
 
         if (num_tans > 0) {
@@ -349,7 +354,7 @@ pub fn fullGpuLaunch(
             if (!ensureDeviceBuf(&d_tans_status_persist, &d_tans_status_persist_size, tans_status_bytes))
                 return error.BadMode;
 
-            _ = h2d_fn(d_tans_descs_persist, @ptrCast(&tans_descs_buf), tans_desc_bytes);
+            _ = h2d_fn(d_tans_descs_persist, @ptrCast(&tans_host_buf), tans_desc_bytes);
 
             // Zero the status buffer
             if (cuMemsetD8_fn) |memset_fn| {
@@ -373,15 +378,22 @@ pub fn fullGpuLaunch(
             };
             var tans_extra = [_]?*anyopaque{null};
 
+            const t_tans_start = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
+
             if (launch_fn(tans_kernel_fn, num_tans, 1, 1, 32, 1, 1, 0, 0, &tans_params, &tans_extra) != CUDA_SUCCESS)
                 return error.BadMode;
 
             if (sync_fn() != CUDA_SUCCESS) return error.BadMode;
+
+            if (t_tans_start) |t_start| {
+                if (io) |io_val| {
+                    last_tans_kernel_ns = @intCast(t_start.untilNow(io_val, .awake).toNanoseconds());
+                }
+            }
         }
     }
 
     // ── Pass 2: LZ decode ──────────────────────────────────────
-    const t_before_kern = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
 
     var p_comp = d_comp_persist;
     var p_descs_dev = d_descs_persist;

@@ -673,60 +673,73 @@ __device__ uint32_t decode5State(
     if (ptr_f > ptr_b) return TANS_ERR_STREAM_MISMATCH;
     if (dst >= dst_end) goto done;
 
-    for (;;) {
-        // ── Forward refill + decode state0, state1 ──
-        if (ptr_f > src_end_orig) return TANS_ERR_SRC_TRUNCATED;
-        refillForward(ptr_f, bits_f, bitpos_f);
+    {
+        // Fast path: decode in batches of 10 symbols (5 forward + 5 backward)
+        // with no per-symbol exit checks and batched 4-byte output writes.
+        uint32_t total_syms = (uint32_t)(dst_end - dst);
+        uint32_t full_iters = total_syms / 10;
 
-        *dst++ = decodeOneSymbol(lut, state0, bits_f, bitpos_f, lut_mask);
-        if (dst >= dst_end) break;
+        for (uint32_t iter = 0; iter < full_iters; iter++) {
+            uint8_t s0, s1, s2, s3, s4;
 
-        *dst++ = decodeOneSymbol(lut, state1, bits_f, bitpos_f, lut_mask);
-        if (dst >= dst_end) break;
+            // ── Forward: 5 symbols ──
+            refillForward(ptr_f, bits_f, bitpos_f);
+            s0 = decodeOneSymbol(lut, state0, bits_f, bitpos_f, lut_mask);
+            s1 = decodeOneSymbol(lut, state1, bits_f, bitpos_f, lut_mask);
+            refillForward(ptr_f, bits_f, bitpos_f);
+            s2 = decodeOneSymbol(lut, state2, bits_f, bitpos_f, lut_mask);
+            s3 = decodeOneSymbol(lut, state3, bits_f, bitpos_f, lut_mask);
+            refillForward(ptr_f, bits_f, bitpos_f);
+            s4 = decodeOneSymbol(lut, state4, bits_f, bitpos_f, lut_mask);
 
-        // ── Forward refill + decode state2, state3 ──
-        if (ptr_f > src_end_orig) return TANS_ERR_SRC_TRUNCATED;
-        refillForward(ptr_f, bits_f, bitpos_f);
+            // Batch write 5 bytes (4-byte aligned write + 1 byte)
+            { uint32_t w4 = (uint32_t)s0 | ((uint32_t)s1 << 8) | ((uint32_t)s2 << 16) | ((uint32_t)s3 << 24); memcpy(dst, &w4, 4); }
+            dst[4] = s4;
+            dst += 5;
 
-        *dst++ = decodeOneSymbol(lut, state2, bits_f, bitpos_f, lut_mask);
-        if (dst >= dst_end) break;
+            // ── Backward: 5 symbols ──
+            refillBackward(ptr_b, bits_b, bitpos_b);
+            s0 = decodeOneSymbol(lut, state0, bits_b, bitpos_b, lut_mask);
+            s1 = decodeOneSymbol(lut, state1, bits_b, bitpos_b, lut_mask);
+            refillBackward(ptr_b, bits_b, bitpos_b);
+            s2 = decodeOneSymbol(lut, state2, bits_b, bitpos_b, lut_mask);
+            s3 = decodeOneSymbol(lut, state3, bits_b, bitpos_b, lut_mask);
+            refillBackward(ptr_b, bits_b, bitpos_b);
+            s4 = decodeOneSymbol(lut, state4, bits_b, bitpos_b, lut_mask);
 
-        *dst++ = decodeOneSymbol(lut, state3, bits_f, bitpos_f, lut_mask);
-        if (dst >= dst_end) break;
+            { uint32_t w4 = (uint32_t)s0 | ((uint32_t)s1 << 8) | ((uint32_t)s2 << 16) | ((uint32_t)s3 << 24); memcpy(dst, &w4, 4); }
+            dst[4] = s4;
+            dst += 5;
+        }
 
-        // ── Forward refill + decode state4 ──
-        if (ptr_f > src_end_orig) return TANS_ERR_SRC_TRUNCATED;
-        refillForward(ptr_f, bits_f, bitpos_f);
-
-        *dst++ = decodeOneSymbol(lut, state4, bits_f, bitpos_f, lut_mask);
-        if (dst >= dst_end) break;
-
-        // ── Backward refill + decode state0, state1 ──
-        if (ptr_b < src_start) return TANS_ERR_SRC_TRUNCATED;
-        refillBackward(ptr_b, bits_b, bitpos_b);
-
-        *dst++ = decodeOneSymbol(lut, state0, bits_b, bitpos_b, lut_mask);
-        if (dst >= dst_end) break;
-
-        *dst++ = decodeOneSymbol(lut, state1, bits_b, bitpos_b, lut_mask);
-        if (dst >= dst_end) break;
-
-        // ── Backward refill + decode state2, state3 ──
-        if (ptr_b < src_start) return TANS_ERR_SRC_TRUNCATED;
-        refillBackward(ptr_b, bits_b, bitpos_b);
-
-        *dst++ = decodeOneSymbol(lut, state2, bits_b, bitpos_b, lut_mask);
-        if (dst >= dst_end) break;
-
-        *dst++ = decodeOneSymbol(lut, state3, bits_b, bitpos_b, lut_mask);
-        if (dst >= dst_end) break;
-
-        // ── Backward refill + decode state4 ──
-        if (ptr_b < src_start) return TANS_ERR_SRC_TRUNCATED;
-        refillBackward(ptr_b, bits_b, bitpos_b);
-
-        *dst++ = decodeOneSymbol(lut, state4, bits_b, bitpos_b, lut_mask);
-        if (dst >= dst_end) break;
+        // Tail: remaining < 10 symbols, use per-symbol checks
+        while (dst < dst_end) {
+            refillForward(ptr_f, bits_f, bitpos_f);
+            *dst++ = decodeOneSymbol(lut, state0, bits_f, bitpos_f, lut_mask);
+            if (dst >= dst_end) break;
+            *dst++ = decodeOneSymbol(lut, state1, bits_f, bitpos_f, lut_mask);
+            if (dst >= dst_end) break;
+            refillForward(ptr_f, bits_f, bitpos_f);
+            *dst++ = decodeOneSymbol(lut, state2, bits_f, bitpos_f, lut_mask);
+            if (dst >= dst_end) break;
+            *dst++ = decodeOneSymbol(lut, state3, bits_f, bitpos_f, lut_mask);
+            if (dst >= dst_end) break;
+            refillForward(ptr_f, bits_f, bitpos_f);
+            *dst++ = decodeOneSymbol(lut, state4, bits_f, bitpos_f, lut_mask);
+            if (dst >= dst_end) break;
+            refillBackward(ptr_b, bits_b, bitpos_b);
+            *dst++ = decodeOneSymbol(lut, state0, bits_b, bitpos_b, lut_mask);
+            if (dst >= dst_end) break;
+            *dst++ = decodeOneSymbol(lut, state1, bits_b, bitpos_b, lut_mask);
+            if (dst >= dst_end) break;
+            refillBackward(ptr_b, bits_b, bitpos_b);
+            *dst++ = decodeOneSymbol(lut, state2, bits_b, bitpos_b, lut_mask);
+            if (dst >= dst_end) break;
+            *dst++ = decodeOneSymbol(lut, state3, bits_b, bitpos_b, lut_mask);
+            if (dst >= dst_end) break;
+            refillBackward(ptr_b, bits_b, bitpos_b);
+            *dst++ = decodeOneSymbol(lut, state4, bits_b, bitpos_b, lut_mask);
+        }
     }
 
 done:
