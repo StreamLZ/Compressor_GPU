@@ -943,6 +943,8 @@ fn runBenchDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
     var total_ns: u64 = 0;
     var best_kern_ns: i64 = std.math.maxInt(i64);
     var total_kern_ns: i64 = 0;
+    var best_tans_ns: i64 = std.math.maxInt(i64);
+    var total_tans_ns: i64 = 0;
     var run_i: u32 = 0;
     while (run_i < runs) : (run_i += 1) {
         const timer_start = std.Io.Clock.awake.now(io);
@@ -957,6 +959,11 @@ fn runBenchDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
             if (kns > 0) {
                 if (kns < best_kern_ns) best_kern_ns = kns;
                 total_kern_ns += kns;
+            }
+            const tns = gpu.last_tans_kernel_ns;
+            if (tns > 0) {
+                if (tns < best_tans_ns) best_tans_ns = tns;
+                total_tans_ns += tns;
             }
         }
     }
@@ -993,6 +1000,19 @@ fn runBenchDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
             mean_kern_ms,
             mb * 1000.0 / mean_kern_ms,
         });
+        if (best_tans_ns < std.math.maxInt(i64)) {
+            const mean_tans_ns = @divTrunc(total_tans_ns, @as(i64, @intCast(runs)));
+            const best_tans_ms: f64 = @as(f64, @floatFromInt(best_tans_ns)) / 1_000_000.0;
+            const mean_tans_ms: f64 = @as(f64, @floatFromInt(mean_tans_ns)) / 1_000_000.0;
+            try w.print("  tans kernel best: {d:.3} ms  ({d:.0} MB/s)\n", .{
+                best_tans_ms,
+                mb * 1000.0 / best_tans_ms,
+            });
+            try w.print("  tans kernel mean: {d:.3} ms  ({d:.0} MB/s)\n", .{
+                mean_tans_ms,
+                mb * 1000.0 / mean_tans_ms,
+            });
+        }
     }
 }
 
