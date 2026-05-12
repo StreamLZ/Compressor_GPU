@@ -176,22 +176,46 @@ var d_tans_tok_descs_persist_size: usize = 0;
 var d_tans_tok_status_persist: CUdeviceptr = 0;
 var d_tans_tok_status_persist_size: usize = 0;
 
-// Off16 scratch (pre-interleaved u16 pairs, CPU-decoded and uploaded)
+// Off16 scratch (hi bytes at chunk_idx*65536, lo bytes at chunk_idx*65536+32768)
 var d_tans_off16_scratch: CUdeviceptr = 0;
 var d_tans_off16_scratch_size: usize = 0;
+
+// Off16 hi/lo tANS scratch + descriptors
+var d_tans_off16hi_descs: CUdeviceptr = 0;
+var d_tans_off16hi_descs_size: usize = 0;
+var d_tans_off16hi_status: CUdeviceptr = 0;
+var d_tans_off16hi_status_size: usize = 0;
+var d_tans_off16lo_descs: CUdeviceptr = 0;
+var d_tans_off16lo_descs_size: usize = 0;
+var d_tans_off16lo_status: CUdeviceptr = 0;
+var d_tans_off16lo_status_size: usize = 0;
 
 // Host-side tANS descriptor buffers (avoids 64KB stack allocations)
 var tans_host_buf: [4096]TansDecChunkDesc = undefined;
 var tans_tok_host_buf: [4096]TansDecChunkDesc = undefined;
+var tans_off16hi_host_buf: [4096]TansDecChunkDesc = undefined;
+var tans_off16lo_host_buf: [4096]TansDecChunkDesc = undefined;
+var raw_off16_buf: [8192]RawOff16Desc = undefined;
 
 // ── tANS header scanning ───────────────────────────────────────
-// Scans the host-side compressed data to find tANS literal and token
-// headers and builds TansDecChunkDesc descriptors for the tANS kernel.
-// Off16 entropy streams are decoded on the CPU side (not here).
+// Scans the host-side compressed data to find tANS literal, token,
+// and off16 hi/lo headers. Builds TansDecChunkDesc descriptors for
+// the tANS kernel. Raw (type 0) off16 sub-streams are recorded
+// for direct H2D copy.
+
+// Describes a raw (type 0 memcpy) off16 sub-stream that needs H2D copy
+const RawOff16Desc = struct {
+    src_offset: u32, // offset of raw bytes in compressed buffer
+    size: u32, // number of bytes
+    gpu_offset: u32, // offset in d_tans_off16_scratch
+};
 
 const ScanResult = struct {
     num_lit: u32,
     num_tok: u32,
+    num_off16hi: u32,
+    num_off16lo: u32,
+    num_raw_off16: u32,
 };
 
 fn scanForTansChunks(
@@ -200,10 +224,16 @@ fn scanForTansChunks(
     sub_chunk_cap: u32,
     tans_lit_descs: []TansDecChunkDesc,
     tans_tok_descs: []TansDecChunkDesc,
+    tans_off16hi_descs: []TansDecChunkDesc,
+    tans_off16lo_descs: []TansDecChunkDesc,
+    raw_off16_descs: []RawOff16Desc,
 ) ScanResult {
     _ = sub_chunk_cap;
     var num_lit: u32 = 0;
     var num_tok: u32 = 0;
+    var num_off16hi: u32 = 0;
+    var num_off16lo: u32 = 0;
+    var num_raw: u32 = 0;
 
     for (chunk_descs, 0..) |ch, chunk_idx| {
         // Skip non-LZ chunks
@@ -246,11 +276,89 @@ fn scanForTansChunks(
         if (tok_type == 1) {
             _ = parseTansHeader(chunk_src, pos, ch.src_offset, chunk_idx, tans_tok_descs, &num_tok);
         }
-        // No need to skip past tokens for off16 scanning here;
-        // off16 is decoded on the CPU side.
+        const tok_next = skipStreamHeader(chunk_src, pos);
+        if (tok_next == null) continue;
+        pos = tok_next.?;
+
+        if (pos >= chunk_src.len) continue;
+
+        // Skip cmd_stream2_offset if sub-chunk > 64KB
+        if (ch.decomp_size > 0x10000) {
+            if (pos + 2 > chunk_src.len) continue;
+            pos += 2;
+        }
+
+        // ── Off16 stream ──
+        if (pos + 2 > chunk_src.len) continue;
+        const off16_count: u32 = @as(u32, chunk_src[pos]) | (@as(u32, chunk_src[pos + 1]) << 8);
+        if (off16_count != 0xFFFF) continue; // not entropy-coded
+        pos += 2;
+
+        // Entropy-coded off16: two sub-streams (hi bytes, lo bytes)
+        if (pos >= chunk_src.len) continue;
+
+        // ── Off16 hi stream ──
+        const hi_first = chunk_src[pos];
+        const hi_type = (hi_first >> 4) & 0x7;
+        if (hi_type == 1) {
+            // tANS-encoded hi stream: dst goes to chunk_idx * 65536 (first half)
+            _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, chunk_idx * 65536, tans_off16hi_descs, &num_off16hi);
+        } else if (hi_type == 0) {
+            // Raw memcpy hi stream: record for H2D copy
+            const raw_info = parseType0StreamInfo(chunk_src, pos);
+            if (raw_info.data_offset != 0 and num_raw < raw_off16_descs.len) {
+                raw_off16_descs[num_raw] = .{
+                    .src_offset = ch.src_offset + raw_info.data_offset,
+                    .size = raw_info.size,
+                    .gpu_offset = @intCast(chunk_idx * 65536),
+                };
+                num_raw += 1;
+            }
+        }
+        const hi_next = skipStreamHeader(chunk_src, pos);
+        if (hi_next == null) continue;
+        pos = hi_next.?;
+
+        if (pos >= chunk_src.len) continue;
+
+        // ── Off16 lo stream ──
+        const lo_first = chunk_src[pos];
+        const lo_type = (lo_first >> 4) & 0x7;
+        if (lo_type == 1) {
+            // tANS-encoded lo stream: dst goes to chunk_idx * 65536 + 32768 (second half)
+            _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, chunk_idx * 65536 + 32768, tans_off16lo_descs, &num_off16lo);
+        } else if (lo_type == 0) {
+            // Raw memcpy lo stream: record for H2D copy
+            const raw_info = parseType0StreamInfo(chunk_src, pos);
+            if (raw_info.data_offset != 0 and num_raw < raw_off16_descs.len) {
+                raw_off16_descs[num_raw] = .{
+                    .src_offset = ch.src_offset + raw_info.data_offset,
+                    .size = raw_info.size,
+                    .gpu_offset = @intCast(chunk_idx * 65536 + 32768),
+                };
+                num_raw += 1;
+            }
+        }
     }
 
-    return .{ .num_lit = num_lit, .num_tok = num_tok };
+    return .{ .num_lit = num_lit, .num_tok = num_tok, .num_off16hi = num_off16hi, .num_off16lo = num_off16lo, .num_raw_off16 = num_raw };
+}
+
+/// Parse a type 0 (memcpy) stream header, returning the data offset
+/// (relative to chunk start) and the raw byte count.
+const Type0Info = struct { data_offset: u32, size: u32 };
+fn parseType0StreamInfo(chunk_src: []const u8, pos: u32) Type0Info {
+    if (pos >= chunk_src.len) return .{ .data_offset = 0, .size = 0 };
+    const first_byte = chunk_src[pos];
+    if (first_byte >= 0x80) {
+        if (pos + 2 > chunk_src.len) return .{ .data_offset = 0, .size = 0 };
+        const sz: u32 = ((@as(u32, chunk_src[pos]) << 8) | @as(u32, chunk_src[pos + 1])) & 0xFFF;
+        return .{ .data_offset = pos + 2, .size = sz };
+    } else {
+        if (pos + 3 > chunk_src.len) return .{ .data_offset = 0, .size = 0 };
+        const sz: u32 = (@as(u32, chunk_src[pos]) << 16) | (@as(u32, chunk_src[pos + 1]) << 8) | @as(u32, chunk_src[pos + 2]);
+        return .{ .data_offset = pos + 3, .size = sz };
+    }
 }
 
 /// Skip past an entropy-coded stream header + payload, returning
@@ -286,6 +394,60 @@ fn skipStreamHeader(chunk_src: []const u8, pos: u32) ?u32 {
         }
     }
     return null;
+}
+
+fn parseTansHeaderWithDstOffset(
+    chunk_src: []const u8,
+    lit_off: u32,
+    src_offset_base: u32,
+    dst_offset: usize,
+    tans_descs_out: []TansDecChunkDesc,
+    num_tans: *u32,
+) bool {
+    if (lit_off >= chunk_src.len) return false;
+    const first_byte = chunk_src[lit_off];
+
+    if (first_byte >= 0x80) {
+        if (lit_off + 3 > chunk_src.len) return false;
+        const hdr3: u32 = (@as(u32, chunk_src[lit_off]) << 16) |
+            (@as(u32, chunk_src[lit_off + 1]) << 8) |
+            @as(u32, chunk_src[lit_off + 2]);
+        const tans_comp_size = hdr3 & 0x3FF;
+        const tans_dst_size = tans_comp_size + ((hdr3 >> 10) & 0x3FF) + 1;
+        const tans_payload_off = src_offset_base + lit_off + 3;
+
+        if (num_tans.* < tans_descs_out.len) {
+            tans_descs_out[num_tans.*] = .{
+                .src_offset = @intCast(tans_payload_off),
+                .src_size = @intCast(tans_comp_size),
+                .dst_offset = @intCast(dst_offset),
+                .dst_size = @intCast(tans_dst_size),
+            };
+            num_tans.* += 1;
+            return true;
+        }
+    } else {
+        if (lit_off + 5 > chunk_src.len) return false;
+        const bits: u32 = (@as(u32, chunk_src[lit_off + 1]) << 24) |
+            (@as(u32, chunk_src[lit_off + 2]) << 16) |
+            (@as(u32, chunk_src[lit_off + 3]) << 8) |
+            @as(u32, chunk_src[lit_off + 4]);
+        const tans_comp_size = bits & 0x3FFFF;
+        const tans_dst_size = (((bits >> 18) | (@as(u32, chunk_src[lit_off]) << 14)) & 0x3FFFF) + 1;
+        const tans_payload_off = src_offset_base + lit_off + 5;
+
+        if (num_tans.* < tans_descs_out.len) {
+            tans_descs_out[num_tans.*] = .{
+                .src_offset = @intCast(tans_payload_off),
+                .src_size = @intCast(tans_comp_size),
+                .dst_offset = @intCast(dst_offset),
+                .dst_size = @intCast(tans_dst_size),
+            };
+            num_tans.* += 1;
+            return true;
+        }
+    }
+    return false;
 }
 
 fn parseTansHeader(
@@ -387,7 +549,7 @@ pub fn fullGpuLaunch(
 
     const t_before_kern = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
 
-    // ── Pass 1: tANS decode (literals + tokens) ───────────────
+    // ── Pass 1: tANS decode (literals + tokens + off16) ─────────
     if (tans_kernel_fn != 0) {
         const max_tans = @min(chunk_descs.len, tans_host_buf.len);
 
@@ -397,6 +559,9 @@ pub fn fullGpuLaunch(
             sub_chunk_cap,
             tans_host_buf[0..max_tans],
             tans_tok_host_buf[0..max_tans],
+            tans_off16hi_host_buf[0..max_tans],
+            tans_off16lo_host_buf[0..max_tans],
+            &raw_off16_buf,
         );
 
         // ── Pass 1a: tANS literal decode ──
@@ -414,12 +579,34 @@ pub fn fullGpuLaunch(
                 &d_tans_tok_descs_persist, &d_tans_tok_descs_persist_size,
                 &d_tans_tok_status_persist, &d_tans_tok_status_persist_size) catch return error.BadMode;
         }
-    }
 
-    // ── Pass 1c: CPU decode entropy-coded off16 streams ───────
-    // For each chunk with entropy-coded off16 (0xFFFF marker),
-    // decode hi+lo on CPU, interleave into u16 pairs, upload to GPU.
-    cpuDecodeOff16Streams(chunk_descs, compressed_block, h2d_fn, sync_fn) catch {};
+        // ── Pass 1c: tANS off16 hi decode ──
+        if (scan.num_off16hi > 0) {
+            launchTansKernel(h2d_fn, launch_fn, sync_fn, scan.num_off16hi,
+                &tans_off16hi_host_buf, d_tans_off16_scratch,
+                &d_tans_off16hi_descs, &d_tans_off16hi_descs_size,
+                &d_tans_off16hi_status, &d_tans_off16hi_status_size) catch return error.BadMode;
+        }
+
+        // ── Pass 1d: tANS off16 lo decode ──
+        if (scan.num_off16lo > 0) {
+            launchTansKernel(h2d_fn, launch_fn, sync_fn, scan.num_off16lo,
+                &tans_off16lo_host_buf, d_tans_off16_scratch,
+                &d_tans_off16lo_descs, &d_tans_off16lo_descs_size,
+                &d_tans_off16lo_status, &d_tans_off16lo_status_size) catch return error.BadMode;
+        }
+
+        // ── Pass 1e: Upload raw (type 0) off16 sub-streams to GPU ──
+        for (0..scan.num_raw_off16) |ri| {
+            const rd = raw_off16_buf[ri];
+            if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len) {
+                _ = h2d_fn(d_tans_off16_scratch + rd.gpu_offset, @ptrCast(compressed_block.ptr + rd.src_offset), rd.size);
+            }
+        }
+
+        // Single sync after all tANS launches + raw uploads
+        if (sync_fn() != CUDA_SUCCESS) return error.BadMode;
+    }
 
     if (io) |io_val| {
         if (t_before_kern) |t_start| {
@@ -468,10 +655,12 @@ pub fn fullGpuLaunch(
 }
 
 // ── Helper: launch tANS kernel for a set of descriptors ───────
+// When skip_post_sync is true, the kernel is launched without a trailing
+// cuCtxSynchronize — the caller must sync before reading results.
 fn launchTansKernel(
     h2d_fn: FnMemcpyHtoD,
     launch_fn: FnLaunchKernel,
-    sync_fn: FnCtxSync,
+    _: FnCtxSync,
     num_descs: u32,
     host_descs: *[4096]TansDecChunkDesc,
     dst_scratch: CUdeviceptr,
@@ -493,7 +682,6 @@ fn launchTansKernel(
     if (cuMemsetD8_fn) |memset_fn| {
         _ = memset_fn(d_status.*, 0, status_bytes);
     }
-    _ = sync_fn();
 
     var tp_comp = d_comp_persist;
     var tp_scratch = dst_scratch;
@@ -512,8 +700,6 @@ fn launchTansKernel(
 
     if (launch_fn(tans_kernel_fn, num_descs, 1, 1, 32, 1, 1, 0, 0, &tans_params, &tans_extra) != CUDA_SUCCESS)
         return error.BadMode;
-
-    if (sync_fn() != CUDA_SUCCESS) return error.BadMode;
 }
 
 // ── CPU off16 entropy decode + GPU upload ─────────────────────

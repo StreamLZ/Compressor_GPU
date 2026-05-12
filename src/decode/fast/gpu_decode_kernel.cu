@@ -69,6 +69,8 @@ __device__ void decodeSubChunkL1(
     const uint8_t* __restrict__ cmd, uint32_t cmd_size,
     const uint8_t* __restrict__ lit, uint32_t lit_size,
     const uint8_t* __restrict__ off16_raw, uint32_t off16_count,
+    const uint8_t* __restrict__ off16_hi, const uint8_t* __restrict__ off16_lo,
+    uint32_t off16_split,
     const uint8_t* __restrict__ len_data, uint32_t len_avail,
     uint8_t* __restrict__ dst, uint32_t dst_size,
     uint32_t initial_copy,
@@ -99,7 +101,12 @@ __device__ void decodeSubChunkL1(
                 match_len = (token >> 3) & 0xF;
                 use_recent = (token >> 7) & 1;
                 if (!use_recent && off16_pos < off16_count) {
-                    uint16_t v; memcpy(&v, off16_raw + off16_pos * 2, 2);
+                    uint16_t v;
+                    if (off16_split) {
+                        v = (uint16_t)off16_lo[off16_pos] | ((uint16_t)off16_hi[off16_pos] << 8);
+                    } else {
+                        memcpy(&v, off16_raw + off16_pos * 2, 2);
+                    }
                     match_offset = -(int32_t)v;
                     off16_pos++;
                 }
@@ -109,7 +116,12 @@ __device__ void decodeSubChunkL1(
             } else if (token == TOKEN_LONG_NEAR) {
                 match_len = readLength(len_data, len_off, len_avail) + LONG_NEAR_BASE;
                 if (off16_pos < off16_count) {
-                    uint16_t v; memcpy(&v, off16_raw + off16_pos * 2, 2);
+                    uint16_t v;
+                    if (off16_split) {
+                        v = (uint16_t)off16_lo[off16_pos] | ((uint16_t)off16_hi[off16_pos] << 8);
+                    } else {
+                        memcpy(&v, off16_raw + off16_pos * 2, 2);
+                    }
                     match_offset = -(int32_t)v; off16_pos++;
                 }
             }
@@ -168,6 +180,8 @@ __device__ void decodeSubChunk(
     const uint8_t* __restrict__ cmd, uint32_t cmd_size,
     const uint8_t* __restrict__ lit, uint32_t lit_size,
     const uint8_t* __restrict__ off16_raw, uint32_t off16_count,
+    const uint8_t* __restrict__ off16_hi, const uint8_t* __restrict__ off16_lo,
+    uint32_t off16_split,
     const uint8_t* __restrict__ off32_raw1, uint32_t off32_count1,
     const uint8_t* __restrict__ off32_raw2, uint32_t off32_count2,
     const uint8_t* __restrict__ len_data, uint32_t len_avail,
@@ -212,7 +226,12 @@ __device__ void decodeSubChunk(
                 match_len = (token >> 3) & 0xF;
                 use_recent = (token >> 7) & 1;
                 if (!use_recent && off16_pos < off16_count) {
-                    uint16_t v; memcpy(&v, off16_raw + off16_pos * 2, 2);
+                    uint16_t v;
+                    if (off16_split) {
+                        v = (uint16_t)off16_lo[off16_pos] | ((uint16_t)off16_hi[off16_pos] << 8);
+                    } else {
+                        memcpy(&v, off16_raw + off16_pos * 2, 2);
+                    }
                     match_offset = -(int32_t)v;
                     off16_pos++;
                 }
@@ -223,7 +242,12 @@ __device__ void decodeSubChunk(
                 token_type = 2;
                 match_len = readLength(len_data, len_off, len_avail) + LONG_NEAR_BASE;
                 if (off16_pos < off16_count) {
-                    uint16_t v; memcpy(&v, off16_raw + off16_pos * 2, 2);
+                    uint16_t v;
+                    if (off16_split) {
+                        v = (uint16_t)off16_lo[off16_pos] | ((uint16_t)off16_hi[off16_pos] << 8);
+                    } else {
+                        memcpy(&v, off16_raw + off16_pos * 2, 2);
+                    }
                     match_offset = -(int32_t)v; off16_pos++;
                 }
                 use_recent = 0;
@@ -374,12 +398,15 @@ struct ParsedStreams {
     const uint8_t* lit_ptr;
     const uint8_t* cmd_ptr;
     const uint8_t* off16_raw;
+    const uint8_t* off16_hi;
+    const uint8_t* off16_lo;
     const uint8_t* off32_raw1;
     const uint8_t* off32_raw2;
     const uint8_t* len_stream;
     uint32_t lit_size;
     uint32_t cmd_size;
     uint32_t off16_count;
+    uint32_t off16_split;  // 1 = hi/lo split format from GPU tANS, 0 = interleaved u16
     uint32_t off32_count1;
     uint32_t off32_count2;
     uint32_t len_avail;
@@ -562,21 +589,28 @@ __device__ __noinline__ void parseSubChunkHeaders(
 
     // Off16 stream
     const uint8_t* off16_raw;
+    const uint8_t* off16_hi_ptr = nullptr;
+    const uint8_t* off16_lo_ptr = nullptr;
     uint32_t off16_count = 0;
     uint32_t off16_is_entropy = 0;
+    uint32_t off16_is_split = 0;
     if (lane == 0) {
         uint16_t cnt; memcpy(&cnt, src, 2);
         if (cnt == 0xFFFF && tans_off16_scratch_chunk != nullptr) {
             // Entropy-coded off16: skip the two encoded sub-streams,
-            // read pre-decoded interleaved u16 pairs from scratch
+            // read pre-decoded hi/lo bytes from GPU tANS scratch
             src += 2;
             uint32_t hi_size = skipEntropyStream(src);
             uint32_t lo_size = skipEntropyStream(src);
             // hi_size and lo_size should be equal; use hi_size as count
             off16_count = hi_size;
-            off16_raw = tans_off16_scratch_chunk;
+            if (lo_size != hi_size) off16_count = (lo_size < hi_size) ? lo_size : hi_size;
+            // GPU tANS layout: hi bytes at offset 0, lo bytes at offset 32768
+            off16_hi_ptr = tans_off16_scratch_chunk;
+            off16_lo_ptr = tans_off16_scratch_chunk + 32768;
+            off16_raw = nullptr;
             off16_is_entropy = 1;
-            if (lo_size != hi_size) off16_count = lo_size; // use smaller if mismatch
+            off16_is_split = 1;
         } else {
             off16_count = cnt;
             off16_raw = src + 2;
@@ -585,15 +619,24 @@ __device__ __noinline__ void parseSubChunkHeaders(
     }
     off16_count = __shfl_sync(0xFFFFFFFF, off16_count, 0);
     off16_is_entropy = __shfl_sync(0xFFFFFFFF, off16_is_entropy, 0);
+    off16_is_split = __shfl_sync(0xFFFFFFFF, off16_is_split, 0);
     {
         uint32_t so = (uint32_t)((uintptr_t)src - (uintptr_t)sc_src);
         so = __shfl_sync(0xFFFFFFFF, so, 0);
         src = sc_src + so;
-        if (off16_is_entropy) off16_raw = tans_off16_scratch_chunk;
-        else off16_raw = src - off16_count * 2;
+        if (off16_is_entropy) {
+            off16_hi_ptr = tans_off16_scratch_chunk;
+            off16_lo_ptr = tans_off16_scratch_chunk + 32768;
+            off16_raw = nullptr;
+        } else {
+            off16_raw = src - off16_count * 2;
+        }
     }
     ps.off16_raw = off16_raw;
+    ps.off16_hi = off16_hi_ptr;
+    ps.off16_lo = off16_lo_ptr;
     ps.off16_count = off16_count;
+    ps.off16_split = off16_is_split;
 
     // Off32 stream sizes
     uint32_t off32_count1 = 0, off32_count2 = 0;
@@ -663,6 +706,7 @@ __device__ void parseAndDecodeSubChunk(
             ps.cmd_ptr, ps.cmd_size,
             ps.lit_ptr, ps.lit_size,
             ps.off16_raw, ps.off16_count,
+            ps.off16_hi, ps.off16_lo, ps.off16_split,
             ps.len_stream, ps.len_avail,
             dst, sc_decomp_size, ps.initial_copy,
             dst_offset
@@ -672,6 +716,7 @@ __device__ void parseAndDecodeSubChunk(
             ps.cmd_ptr, ps.cmd_size,
             ps.lit_ptr, ps.lit_size,
             ps.off16_raw, ps.off16_count,
+            ps.off16_hi, ps.off16_lo, ps.off16_split,
             ps.off32_raw1, ps.off32_count1,
             ps.off32_raw2, ps.off32_count2,
             ps.len_stream, ps.len_avail,
