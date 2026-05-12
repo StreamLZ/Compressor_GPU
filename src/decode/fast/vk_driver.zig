@@ -333,6 +333,11 @@ pub fn init() bool {
     if (initialized) return vk_ok;
     initialized = true;
 
+    {
+        const c = @cImport({ @cInclude("stdlib.h"); });
+        if (c.getenv("SLZ_NO_VK") != null) return false;
+    }
+
     lib = win32.LoadLibraryA("vulkan-1.dll");
     if (lib == null) return false;
     const raw = win32.GetProcAddress(lib.?, "vkGetInstanceProcAddr") orelse return false;

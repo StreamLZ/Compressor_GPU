@@ -356,64 +356,67 @@ __device__ uint32_t parseType0Header(const uint8_t* &src) {
     }
 }
 
-// ── Sub-chunk header parser + decoder dispatch ─────────────────
-// GPU-side readLzTable + decode for one sub-chunk.
-// Parses Type 0 (memcpy) or Type 1 (tANS, pre-decoded) entropy
-// headers to locate streams, then dispatches to decodeSubChunkL1
-// (fast path) or decodeSubChunk (general path).
-//
-// Two-pass architecture: tANS literals are decoded by a separate
-// kernel (slzTansDecodeKernel) before this kernel runs. When we
-// encounter a Type 1 header, we skip the compressed tANS data in
-// the stream and read the already-decoded literals from tans_scratch.
-__device__ void parseAndDecodeSubChunk(
+// ── Parsed sub-chunk streams — passed from header parser to decoder ──
+struct ParsedStreams {
+    const uint8_t* lit_ptr;
+    const uint8_t* cmd_ptr;
+    const uint8_t* off16_raw;
+    const uint8_t* off32_raw1;
+    const uint8_t* off32_raw2;
+    const uint8_t* len_stream;
+    uint32_t lit_size;
+    uint32_t cmd_size;
+    uint32_t off16_count;
+    uint32_t off32_count1;
+    uint32_t off32_count2;
+    uint32_t len_avail;
+    uint32_t cmd_stream2_offset;
+    uint32_t initial_copy;
+};
+
+// ── Sub-chunk header parser — __noinline__ to free registers ────
+// Parses all stream headers, returns pointers/sizes in ParsedStreams.
+// Registers used here are freed before the decode hot loop runs.
+__device__ __noinline__ void parseSubChunkHeaders(
     const uint8_t* sc_src,
     uint32_t sc_comp_size,
     uint32_t sc_decomp_size,
     uint8_t* dst,
     uint32_t dst_offset,
     uint32_t base_offset,
-    uint32_t mode,
-    uint8_t* tans_scratch_chunk
+    uint8_t* tans_scratch_chunk,
+    ParsedStreams& ps
 ) {
     const int lane = threadIdx.x & 31;
     const uint8_t* src = sc_src;
     const uint8_t* src_end = sc_src + sc_comp_size;
 
-    uint32_t initial_copy = 0;
+    ps.initial_copy = 0;
     if (base_offset == 0) {
-        // First 8 bytes are raw literals — copy directly to output
         if (lane < 8) dst[dst_offset + lane] = src[lane];
         __syncwarp();
         src += 8;
-        initial_copy = 8;
+        ps.initial_copy = 8;
     }
 
-    // Parse each stream header on lane 0, then broadcast the src offset
-    // to all lanes so every lane can compute derived pointers.
-
-    // Literal stream — detect Type 0 (memcpy) vs Type 1 (tANS pre-decoded)
+    // Literal stream
     const uint8_t* lit_ptr = src;
     uint32_t lit_size = 0;
     uint32_t lit_is_tans = 0;
     if (lane == 0) {
         uint32_t chunk_type = (src[0] >> 4) & 0x7;
         if (chunk_type == 0) {
-            // Type 0: memcpy literals
             lit_size = parseType0Header(src);
             lit_ptr = src;
             src += lit_size;
         } else if (chunk_type == 1 && tans_scratch_chunk != nullptr) {
-            // Type 1: tANS — skip compressed data, read from pre-decoded buffer
             uint32_t tans_comp_size, tans_dst_size;
             if (src[0] >= 0x80) {
-                // Compact 3-byte header
                 uint32_t bits = ((uint32_t)src[0] << 16) | ((uint32_t)src[1] << 8) | src[2];
                 tans_comp_size = bits & 0x3FF;
                 tans_dst_size = tans_comp_size + ((bits >> 10) & 0x3FF) + 1;
                 src += 3 + tans_comp_size;
             } else {
-                // Non-compact 5-byte header
                 uint32_t bits = ((uint32_t)src[1] << 24) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 8) | src[4];
                 tans_comp_size = bits & 0x3FFFF;
                 tans_dst_size = ((((bits >> 18) | ((uint32_t)src[0] << 14)) & 0x3FFFF)) + 1;
@@ -423,7 +426,6 @@ __device__ void parseAndDecodeSubChunk(
             lit_size = tans_dst_size;
             lit_is_tans = 1;
         } else {
-            // Unknown type — treat as zero literals
             lit_size = 0;
             lit_ptr = src;
         }
@@ -434,15 +436,13 @@ __device__ void parseAndDecodeSubChunk(
         uint32_t so = (uint32_t)((uintptr_t)src - (uintptr_t)sc_src);
         so = __shfl_sync(0xFFFFFFFF, so, 0);
         src = sc_src + so;
-        if (lit_is_tans) {
-            // tANS: lit_ptr already points to tans_scratch_chunk (same for all lanes)
-            lit_ptr = tans_scratch_chunk;
-        } else {
-            lit_ptr = src - lit_size;
-        }
+        if (lit_is_tans) lit_ptr = tans_scratch_chunk;
+        else lit_ptr = src - lit_size;
     }
+    ps.lit_ptr = lit_ptr;
+    ps.lit_size = lit_size;
 
-    // Command stream (Type 0)
+    // Command stream
     const uint8_t* cmd_ptr;
     uint32_t cmd_size = 0;
     if (lane == 0) {
@@ -457,6 +457,8 @@ __device__ void parseAndDecodeSubChunk(
         src = sc_src + so;
         cmd_ptr = src - cmd_size;
     }
+    ps.cmd_ptr = cmd_ptr;
+    ps.cmd_size = cmd_size;
 
     // cmd_stream2_offset
     uint32_t cmd_stream2_offset = cmd_size;
@@ -471,6 +473,7 @@ __device__ void parseAndDecodeSubChunk(
         so = __shfl_sync(0xFFFFFFFF, so, 0);
         src = sc_src + so;
     }
+    ps.cmd_stream2_offset = cmd_stream2_offset;
 
     // Off16 stream
     const uint8_t* off16_raw;
@@ -488,12 +491,13 @@ __device__ void parseAndDecodeSubChunk(
         src = sc_src + so;
         off16_raw = src - off16_count * 2;
     }
+    ps.off16_raw = off16_raw;
+    ps.off16_count = off16_count;
 
     // Off32 stream sizes
     uint32_t off32_count1 = 0, off32_count2 = 0;
     const uint8_t* off32_raw1;
     const uint8_t* off32_raw2;
-    const uint8_t* len_stream;
     uint32_t len_avail = 0;
 
     if (lane == 0) {
@@ -512,7 +516,6 @@ __device__ void parseAndDecodeSubChunk(
             off32_raw1 = src;
             off32_raw2 = src;
         }
-        len_stream = src;
         len_avail = (uint32_t)((uintptr_t)src_end - (uintptr_t)src);
     }
     off32_count1 = __shfl_sync(0xFFFFFFFF, off32_count1, 0);
@@ -522,29 +525,53 @@ __device__ void parseAndDecodeSubChunk(
         uint32_t so = (uint32_t)((uintptr_t)src - (uintptr_t)sc_src);
         so = __shfl_sync(0xFFFFFFFF, so, 0);
         src = sc_src + so;
-        len_stream = src;
         off32_raw2 = src - off32_count2 * 3;
         off32_raw1 = off32_raw2 - off32_count1 * 3;
     }
+    ps.off32_raw1 = off32_raw1;
+    ps.off32_raw2 = off32_raw2;
+    ps.off32_count1 = off32_count1;
+    ps.off32_count2 = off32_count2;
+    ps.len_stream = src;
+    ps.len_avail = len_avail;
+}
 
-    if (mode == 1 && off32_count1 == 0 && off32_count2 == 0) {
+// ── Sub-chunk decoder dispatch ────────────────────────────────
+// Calls parseSubChunkHeaders (__noinline__) then dispatches to
+// decodeSubChunkL1 or decodeSubChunk. The header parser's registers
+// are freed before the decode hot loop runs.
+__device__ void parseAndDecodeSubChunk(
+    const uint8_t* sc_src,
+    uint32_t sc_comp_size,
+    uint32_t sc_decomp_size,
+    uint8_t* dst,
+    uint32_t dst_offset,
+    uint32_t base_offset,
+    uint32_t mode,
+    uint8_t* tans_scratch_chunk
+) {
+    ParsedStreams ps;
+    parseSubChunkHeaders(sc_src, sc_comp_size, sc_decomp_size, dst,
+                         dst_offset, base_offset, tans_scratch_chunk, ps);
+
+    if (mode == 1 && ps.off32_count1 == 0 && ps.off32_count2 == 0) {
         decodeSubChunkL1(
-            cmd_ptr, cmd_size,
-            lit_ptr, lit_size,
-            off16_raw, off16_count,
-            len_stream, len_avail,
-            dst, sc_decomp_size, initial_copy,
+            ps.cmd_ptr, ps.cmd_size,
+            ps.lit_ptr, ps.lit_size,
+            ps.off16_raw, ps.off16_count,
+            ps.len_stream, ps.len_avail,
+            dst, sc_decomp_size, ps.initial_copy,
             dst_offset
         );
     } else {
         decodeSubChunk(
-            cmd_ptr, cmd_size,
-            lit_ptr, lit_size,
-            off16_raw, off16_count,
-            off32_raw1, off32_count1,
-            off32_raw2, off32_count2,
-            len_stream, len_avail,
-            dst, sc_decomp_size, initial_copy, cmd_stream2_offset,
+            ps.cmd_ptr, ps.cmd_size,
+            ps.lit_ptr, ps.lit_size,
+            ps.off16_raw, ps.off16_count,
+            ps.off32_raw1, ps.off32_count1,
+            ps.off32_raw2, ps.off32_count2,
+            ps.len_stream, ps.len_avail,
+            dst, sc_decomp_size, ps.initial_copy, ps.cmd_stream2_offset,
             dst_offset, mode
         );
     }
