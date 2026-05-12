@@ -1023,24 +1023,28 @@ __device__ __noinline__ void setupDecode(
 // Each warp has its own LUT (16KB × 2 = 32KB shared, fits in 48KB).
 // Grid = ceil(num_chunks / 2).
 
-extern "C" __global__ void __launch_bounds__(64, 1) slzTansDecodeKernel(
+// LUT in global memory: each stream gets 2048 entries at lut_buf[chunk_id * 2048].
+// Eliminates 32KB shared memory constraint, allowing higher occupancy.
+// L1 cache (92% hit rate) handles the random LUT accesses.
+extern "C" __global__ void __launch_bounds__(64, 4) slzTansDecodeKernel(
     const uint8_t* __restrict__ src_buf,
     uint8_t*       __restrict__ dst_buf,
     const TansDecChunkDesc* __restrict__ descs,
     uint32_t*      __restrict__ out_status,
-    uint32_t       num_chunks
+    uint32_t       num_chunks,
+    TansLutEnt*    __restrict__ lut_buf      // global LUT: num_chunks * 2048 entries
 ) {
     const uint32_t warp_id = threadIdx.y;
     const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
     if (chunk_id >= num_chunks) return;
 
-    __shared__ TansLutEnt s_lut[2][2048];
+    TansLutEnt* my_lut = lut_buf + (uint64_t)chunk_id * 2048;
 
     const int lane = threadIdx.x & 31;
 
     // Phase 1: table parse + LUT build (__noinline__, lane 0)
     DecodeState ds;
-    if (lane == 0) setupDecode(src_buf, descs[chunk_id], s_lut[warp_id], ds);
+    if (lane == 0) setupDecode(src_buf, descs[chunk_id], my_lut, ds);
 
     uint32_t err = __shfl_sync(0xFFFFFFFF, ds.error, 0);
     if (err != TANS_OK) {
@@ -1049,7 +1053,7 @@ extern "C" __global__ void __launch_bounds__(64, 1) slzTansDecodeKernel(
     }
 
     // Phase 2: decode + coalesced output
-    TansLutEnt* my_lut = s_lut[warp_id];
+    // my_lut already set from global lut_buf above
     uint32_t total_syms = __shfl_sync(0xFFFFFFFF, ds.total_syms, 0);
     uint32_t dst_offset = __shfl_sync(0xFFFFFFFF, descs[chunk_id].dst_offset, 0);
     uint8_t* dst_base = dst_buf + dst_offset;

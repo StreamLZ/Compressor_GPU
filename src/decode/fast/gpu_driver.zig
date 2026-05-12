@@ -190,6 +190,10 @@ var d_tans_off16lo_descs_size: usize = 0;
 var d_tans_off16lo_status: CUdeviceptr = 0;
 var d_tans_off16lo_status_size: usize = 0;
 
+// Global LUT buffer for tANS decode (replaces shared memory)
+var d_tans_lut: CUdeviceptr = 0;
+var d_tans_lut_size: usize = 0;
+
 // Host-side tANS descriptor buffers (avoids 64KB stack allocations)
 var tans_host_buf: [4096]TansDecChunkDesc = undefined;
 var tans_tok_host_buf: [4096]TansDecChunkDesc = undefined;
@@ -546,6 +550,11 @@ pub fn fullGpuLaunch(
     d_tans_tok_scratch = d_tans_scratch + tok_offset;
     d_tans_off16_scratch = d_tans_scratch + off16_offset;
 
+    // Global LUT buffer: max_descs * 2048 entries * 8 bytes
+    const max_tans_descs = chunk_descs.len * 4; // up to 4 streams per chunk
+    const lut_bytes = max_tans_descs * 2048 * 8;
+    if (!ensureDeviceBuf(&d_tans_lut, &d_tans_lut_size, lut_bytes)) return error.BadMode;
+
     if (compressed_block.len > 0)
         _ = h2d_fn(d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len);
     _ = h2d_fn(d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes);
@@ -649,9 +658,11 @@ pub fn fullGpuLaunch(
             var tp_descs = d_tans_descs_persist;
             var tp_status = d_tans_status_persist;
             var tp_num = tans_count;
+            var tp_lut = d_tans_lut;
             var tans_params = [_]?*anyopaque{
                 @ptrCast(&tp_comp), @ptrCast(&tp_scratch),
                 @ptrCast(&tp_descs), @ptrCast(&tp_status), @ptrCast(&tp_num),
+                @ptrCast(&tp_lut),
             };
             var tans_extra = [_]?*anyopaque{null};
             const tans_grid = (tans_count + 1) / 2;
