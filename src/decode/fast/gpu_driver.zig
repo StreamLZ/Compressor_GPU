@@ -551,8 +551,6 @@ pub fn fullGpuLaunch(
     _ = h2d_fn(d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes);
     _ = sync_fn();
 
-    const t_before_kern = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
-
     // ── Pass 1: tANS decode (literals + tokens + off16) ─────────
     if (tans_kernel_fn != 0) {
         const max_tans = @min(chunk_descs.len, tans_host_buf.len);
@@ -597,15 +595,38 @@ pub fn fullGpuLaunch(
             merged_count += 1;
         }
 
-        // Single tANS kernel launch for all stream types
+        // Dump descriptors + compressed data for standalone profiling
         if (merged_count > 0) {
-            launchTansKernel(h2d_fn, launch_fn, sync_fn, merged_count,
-                @as([*]TansDecChunkDesc, &merged_buf), d_tans_scratch,
-                &d_tans_descs_persist, &d_tans_descs_persist_size,
-                &d_tans_status_persist, &d_tans_status_persist_size) catch return error.BadMode;
+            const dump_c = @cImport({ @cInclude("stdlib.h"); });
+            if (dump_c.getenv("SLZ_DUMP_TANS") != null) {
+                const cio = @cImport({ @cInclude("stdio.h"); });
+                const fd = cio.fopen("c:\\tmp\\tans_descs.bin", "wb");
+                if (fd != null) {
+                    _ = cio.fwrite(&merged_buf, @sizeOf(TansDecChunkDesc), merged_count, fd);
+                    _ = cio.fclose(fd);
+                }
+                const fc = cio.fopen("c:\\tmp\\tans_compressed.bin", "wb");
+                if (fc != null) {
+                    _ = cio.fwrite(compressed_block.ptr, 1, compressed_block.len, fc);
+                    _ = cio.fclose(fc);
+                }
+                std.debug.print("Dumped {} tANS descs + {} bytes compressed to c:\\tmp\n", .{ merged_count, compressed_block.len });
+            }
         }
 
-        // Upload raw (type 0) off16 sub-streams to GPU scratch
+        // Upload tANS descriptors to GPU (before timer)
+        if (merged_count > 0) {
+            const mdesc_bytes = merged_count * @sizeOf(TansDecChunkDesc);
+            const mstatus_bytes = merged_count * @sizeOf(u32);
+            if (!ensureDeviceBuf(&d_tans_descs_persist, &d_tans_descs_persist_size, mdesc_bytes))
+                return error.BadMode;
+            if (!ensureDeviceBuf(&d_tans_status_persist, &d_tans_status_persist_size, mstatus_bytes))
+                return error.BadMode;
+            _ = h2d_fn(d_tans_descs_persist, @ptrCast(@as([*]TansDecChunkDesc, &merged_buf)), mdesc_bytes);
+            if (cuMemsetD8_fn) |memset_fn| _ = memset_fn(d_tans_status_persist, 0, mstatus_bytes);
+        }
+
+        // Upload raw (type 0) off16 sub-streams to GPU (before timer)
         for (0..scan.num_raw_off16) |ri| {
             const rd = raw_off16_buf[ri];
             if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len) {
@@ -613,9 +634,33 @@ pub fn fullGpuLaunch(
             }
         }
 
-        // Sync
-        if (sync_fn() != CUDA_SUCCESS) return error.BadMode;
+        _ = sync_fn();
     }
+
+    // ── KERNEL TIMER: only pure GPU kernel time from here ──
+    const t_before_kern = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
+
+    // Launch tANS kernel
+    if (tans_kernel_fn != 0 and d_tans_descs_persist_size > 0) {
+        const tans_count = @as(u32, @intCast(d_tans_descs_persist_size / @sizeOf(TansDecChunkDesc)));
+        if (tans_count > 0) {
+            var tp_comp = d_comp_persist;
+            var tp_scratch = d_tans_scratch;
+            var tp_descs = d_tans_descs_persist;
+            var tp_status = d_tans_status_persist;
+            var tp_num = tans_count;
+            var tans_params = [_]?*anyopaque{
+                @ptrCast(&tp_comp), @ptrCast(&tp_scratch),
+                @ptrCast(&tp_descs), @ptrCast(&tp_status), @ptrCast(&tp_num),
+            };
+            var tans_extra = [_]?*anyopaque{null};
+            const tans_grid = (tans_count + 1) / 2;
+            if (launch_fn(tans_kernel_fn, tans_grid, 1, 1, 32, 2, 1, 0, 0, &tans_params, &tans_extra) != CUDA_SUCCESS)
+                return error.BadMode;
+        }
+    }
+
+    if (sync_fn() != CUDA_SUCCESS) return error.BadMode;
 
     if (io) |io_val| {
         if (t_before_kern) |t_start| {
