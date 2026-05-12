@@ -387,6 +387,48 @@ struct ParsedStreams {
     uint32_t initial_copy;
 };
 
+// ── Helper: skip an entropy-coded stream header + payload ──────
+// Reads the type-0 or type-1 header at *src, advances src past the
+// header + payload, and returns the decompressed size.
+__device__ uint32_t skipEntropyStream(const uint8_t* &src) {
+    uint32_t ct = (src[0] >> 4) & 0x7;
+    if (ct == 0) {
+        uint32_t sz = parseType0Header(src);
+        src += sz;
+        return sz;
+    } else if (ct == 1) {
+        // tANS header
+        uint32_t tans_comp_size, tans_dst_size;
+        if (src[0] >= 0x80) {
+            uint32_t bits = ((uint32_t)src[0] << 16) | ((uint32_t)src[1] << 8) | src[2];
+            tans_comp_size = bits & 0x3FF;
+            tans_dst_size = tans_comp_size + ((bits >> 10) & 0x3FF) + 1;
+            src += 3 + tans_comp_size;
+        } else {
+            uint32_t bits = ((uint32_t)src[1] << 24) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 8) | src[4];
+            tans_comp_size = bits & 0x3FFFF;
+            tans_dst_size = ((((bits >> 18) | ((uint32_t)src[0] << 14)) & 0x3FFFF)) + 1;
+            src += 5 + tans_comp_size;
+        }
+        return tans_dst_size;
+    } else {
+        // Huffman type 2/4 — parse header to skip
+        uint32_t comp_size, dst_size;
+        if (src[0] >= 0x80) {
+            uint32_t bits = ((uint32_t)src[0] << 16) | ((uint32_t)src[1] << 8) | src[2];
+            comp_size = bits & 0x3FF;
+            dst_size = comp_size + ((bits >> 10) & 0x3FF) + 1;
+            src += 3 + comp_size;
+        } else {
+            uint32_t bits = ((uint32_t)src[1] << 24) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 8) | src[4];
+            comp_size = bits & 0x3FFFF;
+            dst_size = ((((bits >> 18) | ((uint32_t)src[0] << 14)) & 0x3FFFF)) + 1;
+            src += 5 + comp_size;
+        }
+        return dst_size;
+    }
+}
+
 // ── Sub-chunk header parser — __noinline__ to free registers ────
 // Parses all stream headers, returns pointers/sizes in ParsedStreams.
 // Registers used here are freed before the decode hot loop runs.
@@ -398,6 +440,8 @@ __device__ __noinline__ void parseSubChunkHeaders(
     uint32_t dst_offset,
     uint32_t base_offset,
     uint8_t* tans_scratch_chunk,
+    uint8_t* tans_tok_scratch_chunk,
+    uint8_t* tans_off16_scratch_chunk,
     ParsedStreams& ps
 ) {
     const int lane = threadIdx.x & 31;
@@ -455,20 +499,48 @@ __device__ __noinline__ void parseSubChunkHeaders(
     ps.lit_ptr = lit_ptr;
     ps.lit_size = lit_size;
 
-    // Command stream
+    // Command stream (tokens)
     const uint8_t* cmd_ptr;
     uint32_t cmd_size = 0;
+    uint32_t cmd_is_tans = 0;
     if (lane == 0) {
-        cmd_size = parseType0Header(src);
-        cmd_ptr = src;
-        src += cmd_size;
+        uint32_t ct = (src[0] >> 4) & 0x7;
+        if (ct == 0) {
+            cmd_size = parseType0Header(src);
+            cmd_ptr = src;
+            src += cmd_size;
+        } else if (ct == 1 && tans_tok_scratch_chunk != nullptr) {
+            // tANS-encoded token stream: skip compressed data, use pre-decoded buffer
+            uint32_t tans_comp_size, tans_dst_size;
+            if (src[0] >= 0x80) {
+                uint32_t bits = ((uint32_t)src[0] << 16) | ((uint32_t)src[1] << 8) | src[2];
+                tans_comp_size = bits & 0x3FF;
+                tans_dst_size = tans_comp_size + ((bits >> 10) & 0x3FF) + 1;
+                src += 3 + tans_comp_size;
+            } else {
+                uint32_t bits = ((uint32_t)src[1] << 24) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 8) | src[4];
+                tans_comp_size = bits & 0x3FFFF;
+                tans_dst_size = ((((bits >> 18) | ((uint32_t)src[0] << 14)) & 0x3FFFF)) + 1;
+                src += 5 + tans_comp_size;
+            }
+            cmd_ptr = tans_tok_scratch_chunk;
+            cmd_size = tans_dst_size;
+            cmd_is_tans = 1;
+        } else {
+            // Huffman or other — skip the stream, zero out cmd_size
+            cmd_size = skipEntropyStream(src);
+            cmd_ptr = src - cmd_size; // won't be used but keep safe
+            cmd_size = 0; // can't decode this
+        }
     }
     cmd_size = __shfl_sync(0xFFFFFFFF, cmd_size, 0);
+    cmd_is_tans = __shfl_sync(0xFFFFFFFF, cmd_is_tans, 0);
     {
         uint32_t so = (uint32_t)((uintptr_t)src - (uintptr_t)sc_src);
         so = __shfl_sync(0xFFFFFFFF, so, 0);
         src = sc_src + so;
-        cmd_ptr = src - cmd_size;
+        if (cmd_is_tans) cmd_ptr = tans_tok_scratch_chunk;
+        else cmd_ptr = src - cmd_size;
     }
     ps.cmd_ptr = cmd_ptr;
     ps.cmd_size = cmd_size;
@@ -491,18 +563,34 @@ __device__ __noinline__ void parseSubChunkHeaders(
     // Off16 stream
     const uint8_t* off16_raw;
     uint32_t off16_count = 0;
+    uint32_t off16_is_entropy = 0;
     if (lane == 0) {
         uint16_t cnt; memcpy(&cnt, src, 2);
-        off16_count = cnt;
-        off16_raw = src + 2;
-        src += 2 + off16_count * 2;
+        if (cnt == 0xFFFF && tans_off16_scratch_chunk != nullptr) {
+            // Entropy-coded off16: skip the two encoded sub-streams,
+            // read pre-decoded interleaved u16 pairs from scratch
+            src += 2;
+            uint32_t hi_size = skipEntropyStream(src);
+            uint32_t lo_size = skipEntropyStream(src);
+            // hi_size and lo_size should be equal; use hi_size as count
+            off16_count = hi_size;
+            off16_raw = tans_off16_scratch_chunk;
+            off16_is_entropy = 1;
+            if (lo_size != hi_size) off16_count = lo_size; // use smaller if mismatch
+        } else {
+            off16_count = cnt;
+            off16_raw = src + 2;
+            src += 2 + off16_count * 2;
+        }
     }
     off16_count = __shfl_sync(0xFFFFFFFF, off16_count, 0);
+    off16_is_entropy = __shfl_sync(0xFFFFFFFF, off16_is_entropy, 0);
     {
         uint32_t so = (uint32_t)((uintptr_t)src - (uintptr_t)sc_src);
         so = __shfl_sync(0xFFFFFFFF, so, 0);
         src = sc_src + so;
-        off16_raw = src - off16_count * 2;
+        if (off16_is_entropy) off16_raw = tans_off16_scratch_chunk;
+        else off16_raw = src - off16_count * 2;
     }
     ps.off16_raw = off16_raw;
     ps.off16_count = off16_count;
@@ -561,11 +649,14 @@ __device__ void parseAndDecodeSubChunk(
     uint32_t dst_offset,
     uint32_t base_offset,
     uint32_t mode,
-    uint8_t* tans_scratch_chunk
+    uint8_t* tans_scratch_chunk,
+    uint8_t* tans_tok_scratch_chunk,
+    uint8_t* tans_off16_scratch_chunk
 ) {
     ParsedStreams ps;
     parseSubChunkHeaders(sc_src, sc_comp_size, sc_decomp_size, dst,
-                         dst_offset, base_offset, tans_scratch_chunk, ps);
+                         dst_offset, base_offset, tans_scratch_chunk,
+                         tans_tok_scratch_chunk, tans_off16_scratch_chunk, ps);
 
     if (mode == 1 && ps.off32_count1 == 0 && ps.off32_count2 == 0) {
         decodeSubChunkL1(
@@ -602,7 +693,9 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
     uint32_t chunks_per_group,
     uint32_t total_chunks,
     uint32_t sub_chunk_cap,
-    uint8_t* __restrict__ tans_scratch
+    uint8_t* __restrict__ tans_scratch,
+    uint8_t* __restrict__ tans_tok_scratch,
+    uint8_t* __restrict__ tans_off16_scratch
 ) {
     // 2 warps per block: warp 0 = threadIdx.y==0, warp 1 = threadIdx.y==1
     const uint32_t warp_id = threadIdx.y;
@@ -640,6 +733,8 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
         uint32_t sc_dst_off = ch.dst_offset;
         uint32_t sc_remaining = ch.decomp_size;
         uint8_t* chunk_tans_scratch = tans_scratch ? (tans_scratch + chunk_idx * 65536) : nullptr;
+        uint8_t* chunk_tok_scratch = tans_tok_scratch ? (tans_tok_scratch + chunk_idx * 65536) : nullptr;
+        uint8_t* chunk_off16_scratch = tans_off16_scratch ? (tans_off16_scratch + chunk_idx * 65536) : nullptr;
 
         while (sc_remaining > 0) {
             uint32_t sc_size = sc_remaining;
@@ -668,7 +763,7 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
                 parseAndDecodeSubChunk(
                     sc_payload, sc_comp_size, sc_size,
                     dst, sc_dst_off, base_offset_val, sc_mode,
-                    chunk_tans_scratch
+                    chunk_tans_scratch, chunk_tok_scratch, chunk_off16_scratch
                 );
             } else {
                 // Uncompressed sub-chunk: copy
