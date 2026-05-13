@@ -26,6 +26,8 @@ var tans_module: usize = 0;
 var tans_kernel_fn: usize = 0;
 var tans_build_fn: usize = 0;
 var tans32_kernel_fn: usize = 0;
+var tans_parse_fn: usize = 0;
+var tans_initlut_fn: usize = 0;
 var initialized = false;
 
 // ── Driver API function signatures ──────────────────────────────
@@ -123,6 +125,8 @@ pub fn init() bool {
         _ = get_fn(&tans_kernel_fn, tans_module, "slzTansDecodeKernel");
         _ = get_fn(&tans_build_fn, tans_module, "slzTansBuildTablesKernel");
         _ = get_fn(&tans32_kernel_fn, tans_module, "slzTans32DecodeKernel");
+        _ = get_fn(&tans_parse_fn, tans_module, "slzTansParseTablesKernel");
+        _ = get_fn(&tans_initlut_fn, tans_module, "slzTansInitLutKernel");
     }
 
     // Create persistent pipeline streams (CU_STREAM_NON_BLOCKING = 1)
@@ -201,6 +205,10 @@ var d_tans_scratch_size: usize = 0;
 var d_shared_lut: CUdeviceptr = 0;
 var d_shared_lut_size: usize = 0;
 var shared_lut_log_bits: u32 = 0;
+var d_build_timing: CUdeviceptr = 0;
+var d_build_timing_size: usize = 0;
+var d_parsed_weights: CUdeviceptr = 0;
+var d_parsed_weights_size: usize = 0;
 var d_tans_descs_persist: CUdeviceptr = 0;
 var d_tans_descs_persist_size: usize = 0;
 var d_tans_status_persist: CUdeviceptr = 0;
@@ -743,6 +751,15 @@ pub fn fullGpuLaunch(
             if (!ensureDeviceBuf(&d_tans_meta, &d_tans_meta_size, meta_bytes)) return error.BadMode;
         }
 
+        // Allocate build timing buffer if SLZ_BUILD_TIMING env var is set
+        const want_timing = std.c.getenv("SLZ_BUILD_TIMING") != null;
+        if (want_timing and merged_count > 0) {
+            const timing_bytes = @as(usize, merged_count) * 16; // 4 x u32 per stream
+            if (!ensureDeviceBuf(&d_build_timing, &d_build_timing_size, timing_bytes)) return error.BadMode;
+        } else {
+            d_build_timing = 0; // nullptr = no timing
+        }
+
         _ = sync_fn();
 
         // ── KERNEL TIMER: only pure GPU kernel time from here ──
@@ -771,21 +788,43 @@ pub fn fullGpuLaunch(
                 var bp_lut = d_tans_lut + @as(u64, ts) * 2048 * 8;
                 var bp_meta = d_tans_meta + @as(u64, ts) * 16;
                 var bp_num = tc;
-                var build_params = [_]?*anyopaque{
-                    @ptrCast(&bp_comp), @ptrCast(&bp_descs),
-                    @ptrCast(&bp_lut), @ptrCast(&bp_meta), @ptrCast(&bp_num),
-                };
-                // Always launch build kernel first (parses table, builds LUT)
-                {
+
+                // Use split parse+initlut kernels when available, else legacy combined
+                if (scan.use_tans32 and tans_parse_fn != 0 and tans_initlut_fn != 0) {
+                    // TansParsedWeights = TansData(1288B) + u32(4B) = 1292B per stream
+                    const weights_bytes = @as(usize, tc) * 1296; // round up to 16B alignment
+                    if (!ensureDeviceBuf(&d_parsed_weights, &d_parsed_weights_size, weights_bytes))
+                        return error.BadMode;
+                    var bp_weights = d_parsed_weights;
+
+                    // Kernel A: parse tables (lane 0 only)
+                    var parse_params = [_]?*anyopaque{
+                        @ptrCast(&bp_comp), @ptrCast(&bp_descs),
+                        @ptrCast(&bp_weights), @ptrCast(&bp_meta), @ptrCast(&bp_num),
+                    };
+                    var parse_extra = [_]?*anyopaque{null};
+                    if (launch_fn(tans_parse_fn, tans_grid, 1, 1, 32, 2, 1, 0, stream, &parse_params, &parse_extra) != CUDA_SUCCESS)
+                        return error.BadMode;
+
+                    // Kernel B: build LUTs (all 32 lanes, fully parallel)
+                    var lut_params = [_]?*anyopaque{
+                        @ptrCast(&bp_weights), @ptrCast(&bp_meta),
+                        @ptrCast(&bp_lut), @ptrCast(&bp_num),
+                    };
+                    var lut_extra = [_]?*anyopaque{null};
+                    if (launch_fn(tans_initlut_fn, tans_grid, 1, 1, 32, 2, 1, 0, stream, &lut_params, &lut_extra) != CUDA_SUCCESS)
+                        return error.BadMode;
+                } else {
+                    // Legacy combined build kernel
+                    var bp_timing: CUdeviceptr = d_build_timing;
+                    var build_params = [_]?*anyopaque{
+                        @ptrCast(&bp_comp), @ptrCast(&bp_descs),
+                        @ptrCast(&bp_lut), @ptrCast(&bp_meta), @ptrCast(&bp_num),
+                        @ptrCast(&bp_timing),
+                    };
                     var build_extra = [_]?*anyopaque{null};
                     if (launch_fn(tans_build_fn, tans_grid, 1, 1, 32, 2, 1, 0, stream, &build_params, &build_extra) != CUDA_SUCCESS)
                         return error.BadMode;
-                    // Sync to check build kernel errors before decode
-                    const bsync = stream_sync_fn(stream);
-                    if (bsync != CUDA_SUCCESS) {
-                        std.debug.print("BUILD kernel FAILED rc={d}\n", .{bsync});
-                        return error.BadMode;
-                    }
                 }
 
                 if (scan.use_tans32 and tans32_kernel_fn != 0) {
@@ -866,6 +905,45 @@ pub fn fullGpuLaunch(
             if (sync_rc != CUDA_SUCCESS) {
                 std.debug.print("GPU pipe[{d}]: stream sync FAILED rc={d}\n", .{ g, sync_rc });
                 return error.BadMode;
+            }
+        }
+
+        // Read back build timing if requested
+        if (want_timing and d_build_timing != 0 and merged_count > 0) {
+            const n_read = @min(@as(usize, merged_count), 8192);
+            var timing_static: [8192 * 4]u32 = undefined;
+            const th = timing_static[0 .. n_read * 4];
+            {
+                _ = d2h_fn(@ptrCast(th.ptr), d_build_timing, n_read * 16);
+                _ = sync_fn();
+
+                var sum_parse: u64 = 0;
+                var sum_initlut: u64 = 0;
+                var sum_pack: u64 = 0;
+                var sum_total: u64 = 0;
+                var count: u32 = 0;
+                for (0..n_read) |i| {
+                    const parse = th[i * 4 + 0];
+                    const initlut = th[i * 4 + 1];
+                    const pack = th[i * 4 + 2];
+                    const total = th[i * 4 + 3];
+                    if (total > 0) {
+                        sum_parse += parse;
+                        sum_initlut += initlut;
+                        sum_pack += pack;
+                        sum_total += total;
+                        count += 1;
+                    }
+                }
+                if (count > 0) {
+                    const cf: f64 = @floatFromInt(count);
+                    const freq: f64 = 2230.0; // SM freq MHz from profile
+                    std.debug.print("BUILD TIMING ({d} streams):\n", .{count});
+                    std.debug.print("  parseTable:  avg {d:.0} cycles ({d:.2} us)\n", .{ @as(f64, @floatFromInt(sum_parse)) / cf, @as(f64, @floatFromInt(sum_parse)) / cf / freq });
+                    std.debug.print("  initLut:     avg {d:.0} cycles ({d:.2} us)\n", .{ @as(f64, @floatFromInt(sum_initlut)) / cf, @as(f64, @floatFromInt(sum_initlut)) / cf / freq });
+                    std.debug.print("  pack:        avg {d:.0} cycles ({d:.2} us)\n", .{ @as(f64, @floatFromInt(sum_pack)) / cf, @as(f64, @floatFromInt(sum_pack)) / cf / freq });
+                    std.debug.print("  total:       avg {d:.0} cycles ({d:.2} us)\n", .{ @as(f64, @floatFromInt(sum_total)) / cf, @as(f64, @floatFromInt(sum_total)) / cf / freq });
+                }
             }
         }
 

@@ -990,7 +990,7 @@ struct TableParseResult {
 };
 
 // Phase 1a: parse the tANS frequency table (lane 0 only, serial)
-__device__ __noinline__ void parseTable(
+__device__ void parseTable(
     const uint8_t* __restrict__ src_buf,
     const TansDecChunkDesc& desc,
     TableParseResult& tp
@@ -1085,12 +1085,109 @@ __device__ void initDecodeStates(
 // All 32 lanes cooperate on initLut writes.
 // Writes TansTableMeta for the decode kernel to read.
 
-extern "C" __global__ void __launch_bounds__(64, 4) slzTansBuildTablesKernel(
+// Optional timing output: 4 x uint32 per chunk = [parse_cycles, initlut_cycles, pack_cycles, total_cycles]
+// ══════════════════════════════════════════════════════════════════
+//  Split build: Kernel A parses tables, Kernel B builds LUTs
+// ══════════════════════════════════════════════════════════════════
+
+// Per-stream parsed table data stored in global memory between kernels
+struct TansParsedWeights {
+    TansData td;
+    uint32_t log_table_bits;
+};
+
+// Kernel A: parse Golomb-Rice table headers (lane 0 only, serial)
+// Lightweight: no LUT construction, low register pressure
+extern "C" __global__ void slzTansParseTablesKernel(
+    const uint8_t* __restrict__ src_buf,
+    const TansDecChunkDesc* __restrict__ descs,
+    TansParsedWeights* __restrict__ weights_buf,  // [num_chunks]
+    TansTableMeta* __restrict__ meta_buf,
+    uint32_t       num_chunks
+) {
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
+    if (chunk_id >= num_chunks) return;
+    const int lane = threadIdx.x & 31;
+    if (lane != 0) return;
+
+    TableParseResult tp;
+    parseTable(src_buf, descs[chunk_id], tp);
+
+    if (tp.error != TANS_OK) {
+        meta_buf[chunk_id].error = tp.error;
+        return;
+    }
+
+    // Validate weights
+    int32_t L = 1 << tp.log_table_bits;
+    int32_t a_used_i = (int32_t)tp.td.a_used;
+    int32_t b_used_i = (int32_t)tp.td.b_used;
+    if (a_used_i < 0 || a_used_i > L || b_used_i < 0 || b_used_i > 256) {
+        meta_buf[chunk_id].error = TANS_ERR_BAD_WEIGHTS; return;
+    }
+    int32_t w_sum = a_used_i;
+    for (uint32_t i = 0; i < tp.td.b_used; i++) {
+        int32_t w = (int32_t)(tp.td.b[i] & 0xFFFF);
+        if (w < 2 || w > L) { meta_buf[chunk_id].error = TANS_ERR_BAD_WEIGHTS; return; }
+        w_sum += w;
+    }
+    if (w_sum != L) { meta_buf[chunk_id].error = TANS_ERR_BAD_WEIGHTS; return; }
+
+    // Write parsed weights + metadata
+    weights_buf[chunk_id].td = tp.td;
+    weights_buf[chunk_id].log_table_bits = tp.log_table_bits;
+
+    meta_buf[chunk_id].error = TANS_OK;
+    meta_buf[chunk_id].src_after_table_off = (uint32_t)((uintptr_t)tp.src_after_table - (uintptr_t)src_buf);
+    meta_buf[chunk_id].src_end_off = (uint32_t)((uintptr_t)tp.src_end_orig - (uintptr_t)src_buf);
+    meta_buf[chunk_id].log_table_bits = tp.log_table_bits;
+}
+
+// Kernel B: build + pack LUTs from parsed weights (all 32 lanes, fully parallel)
+// No serial phase, no syncwarp stalls, low register pressure
+extern "C" __global__ void slzTansInitLutKernel(
+    const TansParsedWeights* __restrict__ weights_buf,
+    const TansTableMeta* __restrict__ meta_buf,
+    TansLutEnt*    __restrict__ lut_buf,
+    uint32_t       num_chunks
+) {
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
+    if (chunk_id >= num_chunks) return;
+    const int lane = threadIdx.x & 31;
+
+    if (meta_buf[chunk_id].error != TANS_OK) return;
+
+    TansLutEnt* my_lut = lut_buf + (uint64_t)chunk_id * 2048;
+    uint32_t log_table_bits = weights_buf[chunk_id].log_table_bits;
+
+    // Build 8-byte LUT entries
+    uint32_t err = initLut(weights_buf[chunk_id].td, log_table_bits, my_lut);
+    __syncwarp();
+
+    // Pack to 4-byte entries in-place
+    if (err == TANS_OK) {
+        uint32_t L = 1u << log_table_bits;
+        uint32_t* pk = (uint32_t*)my_lut;
+        for (uint32_t i = lane; i < L; i += 32)
+            pk[i] = packLutEntry(my_lut[i]);
+    }
+
+    if (lane == 0 && err != TANS_OK) {
+        // Overwrite meta error if initLut failed (shouldn't happen after weight validation)
+        ((TansTableMeta*)meta_buf)[chunk_id].error = err;
+    }
+}
+
+// Legacy combined kernel (kept for backward compat with type-1 5-state path)
+extern "C" __global__ void __launch_bounds__(64) slzTansBuildTablesKernel(
     const uint8_t* __restrict__ src_buf,
     const TansDecChunkDesc* __restrict__ descs,
     TansLutEnt*    __restrict__ lut_buf,
     TansTableMeta* __restrict__ meta_buf,
-    uint32_t       num_chunks
+    uint32_t       num_chunks,
+    uint32_t*      __restrict__ timing_buf
 ) {
     const uint32_t warp_id = threadIdx.y;
     const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
@@ -1099,32 +1196,26 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTansBuildTablesKernel(
     TansLutEnt* my_lut = lut_buf + (uint64_t)chunk_id * 2048;
     const int lane = threadIdx.x & 31;
 
-    // Lane 0: parse table header
     __shared__ TableParseResult s_tp[2];
     if (lane == 0) parseTable(src_buf, descs[chunk_id], s_tp[warp_id]);
     __syncwarp();
 
     if (s_tp[warp_id].error != TANS_OK) {
-        if (lane == 0) {
-            meta_buf[chunk_id].error = s_tp[warp_id].error;
-        }
+        if (lane == 0) meta_buf[chunk_id].error = s_tp[warp_id].error;
         return;
     }
 
-    // All 32 lanes: build 8-byte LUT, then pack to 4-byte
     uint32_t err = initLut(s_tp[warp_id].td, s_tp[warp_id].log_table_bits, my_lut);
     __syncwarp();
 
-    // Pack 8-byte entries to 4-byte in-place (all 32 lanes)
     if (err == TANS_OK) {
         uint32_t L = 1u << s_tp[warp_id].log_table_bits;
-        uint32_t* packed = (uint32_t*)my_lut; // reuse same buffer, 4B entries fit in first half
+        uint32_t* packed = (uint32_t*)my_lut;
         for (uint32_t i = lane; i < L; i += 32)
             packed[i] = packLutEntry(my_lut[i]);
         __syncwarp();
     }
 
-    // Lane 0: write metadata for decode kernel
     if (lane == 0) {
         meta_buf[chunk_id].error = err;
         if (err == TANS_OK) {
