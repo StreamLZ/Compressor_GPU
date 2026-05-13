@@ -263,9 +263,6 @@ const ScanResult = struct {
     num_off16lo: u32,
     num_raw_off16: u32,
     use_tans32: bool = false,
-    shared_lut_offset: u32 = 0, // offset in compressed_block to the first type-6 LUT
-    shared_lut_log_bits: u32 = 0,
-    shared_lut_count: u32 = 0,
 };
 
 fn scanForTansChunks(
@@ -285,9 +282,6 @@ fn scanForTansChunks(
     var num_off16lo: u32 = 0;
     var num_raw: u32 = 0;
     var use_tans32: bool = false;
-    var shared_lut_offset: u32 = 0;
-    var shared_lut_log_bits_val: u32 = 0;
-    var shared_lut_count_val: u32 = 0;
 
     for (chunk_descs, 0..) |ch, chunk_idx| {
         // Skip non-LZ chunks
@@ -320,19 +314,9 @@ fn scanForTansChunks(
             _ = parseTansHeader(chunk_src, pos, ch.src_offset, chunk_idx, tans_lit_descs, &num_lit);
             if (lit_type == 6) {
                 use_tans32 = true;
-                // First type-6 lit: read shared LUT info from its payload
-                if (lit_before == 0 and num_lit > 0) {
-                    const desc = tans_lit_descs[0];
-                    const payload_off = desc.src_offset;
-                    if (payload_off + 131 < compressed_block.len) {
-                        const lut_count_val = @as(u32, compressed_block[payload_off + 128]) | (@as(u32, compressed_block[payload_off + 129]) << 8);
-                        const ltb = compressed_block[payload_off + 130];
-                        if (ltb >= 8 and ltb <= 11 and lut_count_val == (@as(u32, 1) << @intCast(ltb))) {
-                            shared_lut_offset = payload_off + 131;
-                            shared_lut_log_bits_val = ltb;
-                            shared_lut_count_val = lut_count_val;
-                        }
-                    }
+                if (num_lit > lit_before) {
+                    tans_lit_descs[num_lit - 1].src_offset += 128;
+                    tans_lit_descs[num_lit - 1].src_size -|= 128;
                 }
             }
         }
@@ -346,8 +330,13 @@ fn scanForTansChunks(
         const tok_first = chunk_src[pos];
         const tok_type = (tok_first >> 4) & 0x7;
         if (tok_type == 6) {
+            const tok_before = num_tok;
             _ = parseTansHeader(chunk_src, pos, ch.src_offset, chunk_idx, tans_tok_descs, &num_tok);
             use_tans32 = true;
+            if (num_tok > tok_before) {
+                tans_tok_descs[num_tok - 1].src_offset += 128;
+                tans_tok_descs[num_tok - 1].src_size -|= 128;
+            }
         } else if (tok_type == 1 and !use_tans32) {
             _ = parseTansHeader(chunk_src, pos, ch.src_offset, chunk_idx, tans_tok_descs, &num_tok);
         }
@@ -376,8 +365,15 @@ fn scanForTansChunks(
         const hi_first = chunk_src[pos];
         const hi_type = (hi_first >> 4) & 0x7;
         if (hi_type == 1 or hi_type == 6) {
+            const hi_before = num_off16hi;
             _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, chunk_idx * 65536, tans_off16hi_descs, &num_off16hi);
-            if (hi_type == 6) use_tans32 = true;
+            if (hi_type == 6) {
+                use_tans32 = true;
+                if (num_off16hi > hi_before) {
+                    tans_off16hi_descs[num_off16hi - 1].src_offset += 128;
+                    tans_off16hi_descs[num_off16hi - 1].src_size -|= 128;
+                }
+            }
         } else if (hi_type == 0) {
             // Raw memcpy hi stream: record for H2D copy
             const raw_info = parseType0StreamInfo(chunk_src, pos);
@@ -400,8 +396,15 @@ fn scanForTansChunks(
         const lo_first = chunk_src[pos];
         const lo_type = (lo_first >> 4) & 0x7;
         if (lo_type == 1 or lo_type == 6) {
+            const lo_before = num_off16lo;
             _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, chunk_idx * 65536 + 32768, tans_off16lo_descs, &num_off16lo);
-            if (lo_type == 6) use_tans32 = true;
+            if (lo_type == 6) {
+                use_tans32 = true;
+                if (num_off16lo > lo_before) {
+                    tans_off16lo_descs[num_off16lo - 1].src_offset += 128;
+                    tans_off16lo_descs[num_off16lo - 1].src_size -|= 128;
+                }
+            }
         } else if (lo_type == 0) {
             // Raw memcpy lo stream: record for H2D copy
             const raw_info = parseType0StreamInfo(chunk_src, pos);
@@ -419,8 +422,6 @@ fn scanForTansChunks(
     return .{
         .num_lit = num_lit, .num_tok = num_tok, .num_off16hi = num_off16hi,
         .num_off16lo = num_off16lo, .num_raw_off16 = num_raw, .use_tans32 = use_tans32,
-        .shared_lut_offset = shared_lut_offset, .shared_lut_log_bits = shared_lut_log_bits_val,
-        .shared_lut_count = shared_lut_count_val,
     };
 }
 
@@ -742,14 +743,6 @@ pub fn fullGpuLaunch(
             if (!ensureDeviceBuf(&d_tans_meta, &d_tans_meta_size, meta_bytes)) return error.BadMode;
         }
 
-        // Upload shared LUT for tANS32 (one 4-8KB transfer)
-        if (scan.use_tans32 and scan.shared_lut_count > 0) {
-            const shared_lut_bytes = scan.shared_lut_count * 4;
-            if (!ensureDeviceBuf(&d_shared_lut, &d_shared_lut_size, shared_lut_bytes)) return error.BadMode;
-            _ = h2d_fn(d_shared_lut, @ptrCast(compressed_block.ptr + scan.shared_lut_offset), shared_lut_bytes);
-            shared_lut_log_bits = scan.shared_lut_log_bits;
-        }
-
         _ = sync_fn();
 
         // ── KERNEL TIMER: only pure GPU kernel time from here ──
@@ -782,29 +775,38 @@ pub fn fullGpuLaunch(
                     @ptrCast(&bp_comp), @ptrCast(&bp_descs),
                     @ptrCast(&bp_lut), @ptrCast(&bp_meta), @ptrCast(&bp_num),
                 };
+                // Always launch build kernel first (parses table, builds LUT)
+                {
+                    var build_extra = [_]?*anyopaque{null};
+                    if (launch_fn(tans_build_fn, tans_grid, 1, 1, 32, 2, 1, 0, stream, &build_params, &build_extra) != CUDA_SUCCESS)
+                        return error.BadMode;
+                    // Sync to check build kernel errors before decode
+                    const bsync = stream_sync_fn(stream);
+                    if (bsync != CUDA_SUCCESS) {
+                        std.debug.print("BUILD kernel FAILED rc={d}\n", .{bsync});
+                        return error.BadMode;
+                    }
+                }
+
                 if (scan.use_tans32 and tans32_kernel_fn != 0) {
-                    // 32-lane tANS with shared LUT
+                    // 32-lane tANS decode with per-stream LUT from build kernel
                     var tp_comp = d_comp_persist;
                     var tp_scratch = d_tans_scratch;
                     var tp_descs = bp_descs;
                     var tp_status = d_tans_status_persist + @as(u64, ts) * @sizeOf(u32);
                     var tp_num = tc;
-                    var tp_shared_lut: CUdeviceptr = if (scan.shared_lut_count > 0) d_shared_lut else 0;
-                    var tp_shared_ltb: u32 = shared_lut_log_bits;
+                    var tp_lut = bp_lut;
+                    var tp_meta = bp_meta;
                     var tans32_params = [_]?*anyopaque{
                         @ptrCast(&tp_comp), @ptrCast(&tp_scratch),
                         @ptrCast(&tp_descs), @ptrCast(&tp_status), @ptrCast(&tp_num),
-                        @ptrCast(&tp_shared_lut), @ptrCast(&tp_shared_ltb),
+                        @ptrCast(&tp_lut), @ptrCast(&tp_meta),
                     };
                     var tans32_extra = [_]?*anyopaque{null};
                     if (launch_fn(tans32_kernel_fn, tans_grid, 1, 1, 32, 2, 1, 0, stream, &tans32_params, &tans32_extra) != CUDA_SUCCESS)
                         return error.BadMode;
                 } else {
-                    // 5-state tANS: build tables then decode
-                    var build_extra = [_]?*anyopaque{null};
-                    if (launch_fn(tans_build_fn, tans_grid, 1, 1, 32, 2, 1, 0, stream, &build_params, &build_extra) != CUDA_SUCCESS)
-                        return error.BadMode;
-
+                    // 5-state tANS decode (build kernel already launched above)
                     var tp_comp = d_comp_persist;
                     var tp_scratch = d_tans_scratch;
                     var tp_descs = bp_descs;

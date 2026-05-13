@@ -1382,8 +1382,8 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
     const TansDecChunkDesc* __restrict__ descs,
     uint32_t*      __restrict__ out_status,
     uint32_t       num_chunks,
-    const uint32_t* __restrict__ shared_lut,  // shared packed LUT (nullptr = per-stream embedded)
-    uint32_t       shared_log_table_bits      // log2(shared LUT size), ignored if shared_lut==nullptr
+    TansLutEnt*    __restrict__ lut_buf,           // per-stream packed LUTs from build kernel
+    const TansTableMeta* __restrict__ meta_buf     // per-stream metadata from build kernel
 ) {
     const uint32_t warp_id = threadIdx.y;
     const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
@@ -1391,32 +1391,23 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
 
     const int lane = threadIdx.x & 31;
 
-    // Layout: [sizes 64B][states 64B][u16 L][u8 ltb][L×u32 packed LUT][sub-streams]
-    // src_offset points to start of payload (sizes)
-    const uint8_t* payload = src_buf + descs[chunk_id].src_offset;
+    // src_offset was adjusted +128 by the scan (for the build kernel to see the table).
+    // The sizes+states header is at src_offset - 128.
+    const uint8_t* header = src_buf + descs[chunk_id].src_offset - 128;
     uint32_t dst_size = descs[chunk_id].dst_size;
 
     // Read sizes and states from fixed 128-byte header
-    uint16_t my_sub_size = (uint16_t)payload[lane * 2] | ((uint16_t)payload[lane * 2 + 1] << 8);
-    uint16_t my_init_state = (uint16_t)payload[64 + lane * 2] | ((uint16_t)payload[64 + lane * 2 + 1] << 8);
+    uint16_t my_sub_size = (uint16_t)header[lane * 2] | ((uint16_t)header[lane * 2 + 1] << 8);
+    uint16_t my_init_state = (uint16_t)header[64 + lane * 2] | ((uint16_t)header[64 + lane * 2 + 1] << 8);
 
-    const uint32_t* packed_lut;
-    uint32_t lut_mask;
-    const uint8_t* sub_data_start;
+    // Per-stream packed LUT from build kernel
+    const uint32_t* packed_lut = (const uint32_t*)((uint8_t*)lut_buf + (uint64_t)chunk_id * 2048 * sizeof(TansLutEnt));
+    uint32_t log_table_bits = meta_buf[chunk_id].log_table_bits;
+    uint32_t lut_mask = (1u << log_table_bits) - 1;
 
-    if (shared_lut != nullptr) {
-        // Shared LUT: payload = [sizes 64B][states 64B][sub-streams]
-        packed_lut = shared_lut;
-        lut_mask = (1u << shared_log_table_bits) - 1;
-        sub_data_start = payload + 128;
-    } else {
-        // Embedded LUT: payload = [sizes 64B][states 64B][u16 L][u8 ltb][L×u32 LUT][sub-streams]
-        uint16_t lut_count = (uint16_t)payload[128] | ((uint16_t)payload[129] << 8);
-        uint32_t log_table_bits = payload[130];
-        lut_mask = (1u << log_table_bits) - 1;
-        packed_lut = (const uint32_t*)(payload + 131);
-        sub_data_start = payload + 131 + (uint32_t)lut_count * 4;
-    }
+    // Sub-streams follow immediately after sizes+states (128 bytes)
+    // The Golomb-Rice table is in the compressed data but was already parsed by build kernel
+    const uint8_t* sub_data_start = src_buf + meta_buf[chunk_id].src_after_table_off;
 
     // Compute sub-stream start offset via warp prefix sum
     uint32_t my_size32 = (uint32_t)my_sub_size;

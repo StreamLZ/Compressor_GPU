@@ -1080,63 +1080,46 @@ pub fn encodeArrayU8Tans32(
     shared_ctx: ?*const Tans32SharedCtx,
 ) EncodeError!usize {
     _ = speed_tradeoff;
+    _ = shared_ctx;
     if (src.len < 64) return error.TansNotBeneficial;
 
-    // Use shared context if provided, otherwise build per-stream
-    var local_te: [256]TansEncEntry = undefined;
-    var local_te_data: [2048]u16 = undefined;
-    var local_packed_lut: [2048]u32 = undefined;
-    var log_table_bits: u32 = undefined;
-    var L: u32 = undefined;
+    // Choose log table bits
+    const raw_log: i32 = @as(i32, @intCast(ilog2Round(@intCast(src.len)))) - 2;
+    const clamped: i32 = @max(@min(raw_log, 11), 8);
+    const log_table_bits: u32 = @intCast(clamped);
 
-    var te_ptr: *const [256]TansEncEntry = &local_te;
-    var te_data_ptr: [*]const u16 = &local_te_data;
-    var packed_lut_ptr: [*]const u32 = &local_packed_lut;
+    var num_symbols: usize = 256;
+    while (num_symbols > 0 and histo.count[num_symbols - 1] == 0) num_symbols -= 1;
+    if (num_symbols == 0) return error.TooFewSymbols;
 
-    if (shared_ctx) |ctx| {
-        log_table_bits = ctx.log_table_bits;
-        L = ctx.L;
-        te_ptr = &ctx.te;
-        te_data_ptr = &ctx.te_data;
-        packed_lut_ptr = &ctx.packed_lut;
-    } else {
-        const raw_log: i32 = @as(i32, @intCast(ilog2Round(@intCast(src.len)))) - 2;
-        const clamped: i32 = @max(@min(raw_log, 11), 8);
-        log_table_bits = @intCast(clamped);
-        L = @as(u32, 1) << @intCast(log_table_bits);
+    var weights: [256]u32 = @splat(0);
+    const used_symbols = tansNormalizeCounts(
+        &weights,
+        @as(u32, 1) << @intCast(log_table_bits),
+        histo,
+        @intCast(src.len),
+        num_symbols,
+    );
+    if (used_symbols <= 1) return error.TooFewSymbols;
 
-        var num_symbols: usize = 256;
-        while (num_symbols > 0 and histo.count[num_symbols - 1] == 0) num_symbols -= 1;
-        if (num_symbols == 0) return error.TooFewSymbols;
+    // Emit Golomb-Rice table header (same as type 1, ~100 bytes)
+    var table_buf: [512]u8 = @splat(0);
+    var bw = BitWriter64Forward.initBounded(&table_buf, table_buf.len);
+    bw.writeNoFlush(log_table_bits - 8, 3);
+    tansEncodeTable(&bw, log_table_bits, &weights, num_symbols, used_symbols);
+    bw.flush();
+    const table_final_ptr = bw.getFinalPtr();
+    const table_bytes: usize = @intFromPtr(table_final_ptr) - @intFromPtr(&table_buf[0]);
 
-        var weights: [256]u32 = @splat(0);
-        const used_symbols = tansNormalizeCounts(&weights, L, histo, @intCast(src.len), num_symbols);
-        if (used_symbols <= 1) return error.TooFewSymbols;
+    // Build encoding table
+    var te: [256]TansEncEntry = undefined;
+    var te_data: [2048]u16 = undefined;
+    tansInitTable(&te, &te_data, &weights, num_symbols, log_table_bits);
 
-        tansInitTable(&local_te, &local_te_data, &weights, num_symbols, log_table_bits);
+    const L: u32 = @as(u32, 1) << @intCast(log_table_bits);
 
-        const tans_dec = @import("../../decode/entropy/tans_decoder.zig");
-        var tans_data: tans_dec.TansData = .{};
-        for (0..num_symbols) |i| {
-            if (weights[i] == 1) { tans_data.a[tans_data.a_used] = @intCast(i); tans_data.a_used += 1; }
-            else if (weights[i] >= 2) { tans_data.b[tans_data.b_used] = (@as(u32, @intCast(i)) << 16) | weights[i]; tans_data.b_used += 1; }
-        }
-        var lut_entries: [2048]tans_dec.TansLutEnt = undefined;
-        tans_dec.initLut(&tans_data, log_table_bits, &lut_entries) catch return error.TansNotBeneficial;
-
-        for (0..L) |i| {
-            local_packed_lut[i] = (@as(u32, lut_entries[i].bits_x) << 24) |
-                (@as(u32, lut_entries[i].symbol) << 16) |
-                @as(u32, lut_entries[i].w);
-        }
-    }
-
-    const lut_is_shared = shared_ctx != null;
-    const lut_data_bytes: usize = if (lut_is_shared) 0 else L * 4;
-    const lut_header_bytes: usize = if (lut_is_shared) 0 else 3;
-
-    // Encode 32 sub-streams. Each lane gets symbols at stride 32.
-    const header_size: usize = 128 + lut_header_bytes + lut_data_bytes;
+    // Layout: [sizes 64B][states 64B][table][sub-streams]
+    const header_size: usize = 128 + table_bytes;
     var sub_sizes: [32]u16 = @splat(0);
     var sub_states: [32]u16 = @splat(0);
 
@@ -1181,8 +1164,8 @@ pub fn encodeArrayU8Tans32(
             const sym_idx = ri * 32 + lane;
             if (sym_idx >= src.len) continue;
             const sym = src[sym_idx];
-            const entry = &te_ptr[sym];
-            const ns_nb = nextState(te_data_ptr[0..L], entry, state);
+            const entry = &te[sym];
+            const ns_nb = nextState(&te_data, entry, state);
             const nb: u32 = ns_nb[1];
             const mask: u32 = if (nb >= 32) 0xFFFF_FFFF else ((@as(u32, 1) << @as(u5, @intCast(nb))) - 1);
 
@@ -1244,17 +1227,9 @@ pub fn encodeArrayU8Tans32(
         wp += 2;
     }
 
-    // LUT: skip if shared, embed if per-stream
-    if (!lut_is_shared) {
-        std.mem.writeInt(u16, dst[wp..][0..2], @intCast(L), .little);
-        wp += 2;
-        dst[wp] = @intCast(log_table_bits);
-        wp += 1;
-        for (0..L) |i| {
-            std.mem.writeInt(u32, dst[wp..][0..4], packed_lut_ptr[i], .little);
-            wp += 4;
-        }
-    }
+    // Golomb-Rice table header
+    @memcpy(dst[wp..][0..table_bytes], table_buf[0..table_bytes]);
+    wp += table_bytes;
 
     // Sub-stream data
     for (0..32) |lane| {
