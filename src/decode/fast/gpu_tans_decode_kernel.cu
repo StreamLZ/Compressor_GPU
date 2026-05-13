@@ -40,7 +40,7 @@ __device__ __forceinline__ uint8_t decodeOneSymbolPacked(
     const uint32_t* lut, uint32_t& state, uint64_t& bits,
     int32_t& bitpos, uint32_t lut_mask
 ) {
-    uint32_t packed = lut[state];
+    uint32_t packed = __ldg(&lut[state]);
     uint32_t bits_x = packed >> 24;
     uint8_t sym = (uint8_t)((packed >> 16) & 0xFF);
     uint32_t w = packed & 0xFFFF;
