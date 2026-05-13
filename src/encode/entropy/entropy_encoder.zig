@@ -181,10 +181,10 @@ fn encodeArrayU8CoreWithHisto(
 
     const memcpy_cost: f32 = @floatFromInt(src.len + 3);
 
-    // Try 32-lane tANS if allowed (GPU-optimized, chunk_type=3).
+    // Try 32-lane tANS if allowed (GPU-optimized, chunk_type=6).
     if (options.allow_tans32 and dst.len > 5 + 128) {
         var tans32_cost: f32 = memcpy_cost;
-        const tans32_n = tans.encodeArrayU8Tans32(allocator, dst[5..], src, histo, speed_tradeoff, &tans32_cost) catch |err| switch (err) {
+        const tans32_n = tans.encodeArrayU8Tans32(allocator, dst[5..], src, histo, speed_tradeoff, &tans32_cost, null) catch |err| switch (err) {
             error.TansNotBeneficial, error.TooFewSymbols, error.DestinationTooSmall => null,
             error.BadParameters => return error.DestinationTooSmall,
             error.OutOfMemory => return error.OutOfMemory,
@@ -235,6 +235,32 @@ pub fn encodeArrayU8CompactHeader(
 ) EncodeError!usize {
     const n = try encodeArrayU8(allocator, dst, src, options, speed_tradeoff, cost_out, level, histo_out);
     return makeCompactChunkHdr(dst, n, cost_out);
+}
+
+/// Encode with a pre-built shared tANS32 context. Produces chunk_type 6
+/// WITHOUT embedded LUT — the GPU decoder uses a separate shared LUT upload.
+/// Encode with a pre-built shared tANS32 context. Produces chunk_type 6.
+/// Uses shared encode table (consistent across all streams in the frame).
+/// LUT is NOT embedded — the GPU decoder uses a separately-uploaded shared LUT.
+pub fn encodeArrayU8Tans32Shared(
+    allocator: std.mem.Allocator,
+    dst: []u8,
+    src: []const u8,
+    shared_ctx: *const tans.Tans32SharedCtx,
+) EncodeError!usize {
+    if (src.len < 64 or dst.len < 5 + 128) return encodeArrayU8Memcpy(dst, src);
+
+    var histo: ByteHistogram = .{};
+    histo.countBytes(src);
+    var tans_cost: f32 = @floatFromInt(src.len + 3);
+    const n = tans.encodeArrayU8Tans32(allocator, dst[5..], src, &histo, 0.0, &tans_cost, shared_ctx) catch {
+        return encodeArrayU8Memcpy(dst, src);
+    };
+    if (n > 0 and n < src.len) {
+        writeNonCompactChunkHeader(dst, 6, @intCast(n), @intCast(src.len));
+        return 5 + n;
+    }
+    return encodeArrayU8Memcpy(dst, src);
 }
 
 // ────────────────────────────────────────────────────────────

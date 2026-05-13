@@ -1024,6 +1024,52 @@ pub fn encodeArrayU8Tans(
 ///   [sub-stream 0 data] [sub-stream 1 data] ... [sub-stream 31 data]
 ///
 /// Returns the total bytes written (not including the outer 5-byte chunk header).
+/// Pre-built shared tANS32 context — one per frame, shared across all streams.
+pub const Tans32SharedCtx = struct {
+    te: [256]TansEncEntry,
+    te_data: [2048]u16,
+    packed_lut: [2048]u32,
+    log_table_bits: u32,
+    L: u32,
+};
+
+/// Build a shared tANS32 context from a global histogram (all streams combined).
+pub fn buildTans32SharedCtx(global_histo: *ByteHistogram, total_count: u32) ?Tans32SharedCtx {
+    var num_symbols: usize = 256;
+    while (num_symbols > 0 and global_histo.count[num_symbols - 1] == 0) num_symbols -= 1;
+    if (num_symbols <= 1) return null;
+
+    const raw_log: i32 = @as(i32, @intCast(ilog2Round(total_count))) - 2;
+    const clamped: i32 = @max(@min(raw_log, 11), 8);
+    const log_table_bits: u32 = @intCast(clamped);
+    const L: u32 = @as(u32, 1) << @intCast(log_table_bits);
+
+    var weights: [256]u32 = @splat(0);
+    const used_symbols = tansNormalizeCounts(&weights, L, global_histo, total_count, num_symbols);
+    if (used_symbols <= 1) return null;
+
+    var ctx: Tans32SharedCtx = undefined;
+    ctx.log_table_bits = log_table_bits;
+    ctx.L = L;
+    tansInitTable(&ctx.te, &ctx.te_data, &weights, num_symbols, log_table_bits);
+
+    const tans_dec = @import("../../decode/entropy/tans_decoder.zig");
+    var tans_data: tans_dec.TansData = .{};
+    for (0..num_symbols) |i| {
+        if (weights[i] == 1) { tans_data.a[tans_data.a_used] = @intCast(i); tans_data.a_used += 1; }
+        else if (weights[i] >= 2) { tans_data.b[tans_data.b_used] = (@as(u32, @intCast(i)) << 16) | weights[i]; tans_data.b_used += 1; }
+    }
+    var lut_entries: [2048]tans_dec.TansLutEnt = undefined;
+    tans_dec.initLut(&tans_data, log_table_bits, &lut_entries) catch return null;
+
+    for (0..L) |i| {
+        ctx.packed_lut[i] = (@as(u32, lut_entries[i].bits_x) << 24) |
+            (@as(u32, lut_entries[i].symbol) << 16) |
+            @as(u32, lut_entries[i].w);
+    }
+    return ctx;
+}
+
 pub fn encodeArrayU8Tans32(
     allocator: std.mem.Allocator,
     dst: []u8,
@@ -1031,87 +1077,66 @@ pub fn encodeArrayU8Tans32(
     histo: *ByteHistogram,
     speed_tradeoff: f32,
     cost_out: *f32,
+    shared_ctx: ?*const Tans32SharedCtx,
 ) EncodeError!usize {
+    _ = speed_tradeoff;
     if (src.len < 64) return error.TansNotBeneficial;
 
-    // Choose log table bits based on source size.
-    const raw_log: i32 = @as(i32, @intCast(ilog2Round(@intCast(src.len)))) - 2;
-    const clamped: i32 = @max(@min(raw_log, 11), 8);
-    const log_table_bits: u32 = @intCast(clamped);
+    // Use shared context if provided, otherwise build per-stream
+    var local_te: [256]TansEncEntry = undefined;
+    var local_te_data: [2048]u16 = undefined;
+    var local_packed_lut: [2048]u32 = undefined;
+    var log_table_bits: u32 = undefined;
+    var L: u32 = undefined;
 
-    // Determine used range of the histogram.
-    var num_symbols: usize = 256;
-    while (num_symbols > 0 and histo.count[num_symbols - 1] == 0) num_symbols -= 1;
-    if (num_symbols == 0) return error.TooFewSymbols;
+    var te_ptr: *const [256]TansEncEntry = &local_te;
+    var te_data_ptr: [*]const u16 = &local_te_data;
+    var packed_lut_ptr: [*]const u32 = &local_packed_lut;
 
-    var weights: [256]u32 = @splat(0);
-    const used_symbols = tansNormalizeCounts(
-        &weights,
-        @as(u32, 1) << @intCast(log_table_bits),
-        histo,
-        @intCast(src.len),
-        num_symbols,
-    );
-    if (used_symbols <= 1) return error.TooFewSymbols;
+    if (shared_ctx) |ctx| {
+        log_table_bits = ctx.log_table_bits;
+        L = ctx.L;
+        te_ptr = &ctx.te;
+        te_data_ptr = &ctx.te_data;
+        packed_lut_ptr = &ctx.packed_lut;
+    } else {
+        const raw_log: i32 = @as(i32, @intCast(ilog2Round(@intCast(src.len)))) - 2;
+        const clamped: i32 = @max(@min(raw_log, 11), 8);
+        log_table_bits = @intCast(clamped);
+        L = @as(u32, 1) << @intCast(log_table_bits);
 
-    // Speed-adjusted cost estimate.
-    const src_len_f: f32 = @floatFromInt(src.len);
-    const used_sym_f: f32 = @floatFromInt(used_symbols);
-    const table_entries_f: f32 = @floatFromInt(@as(u32, 1) << @intCast(log_table_bits));
-    const cost: f32 = (cost_coeffs.tans_base +
-        src_len_f * cost_coeffs.tans_per_src_byte +
-        used_sym_f * cost_coeffs.tans_per_used_symbol +
-        table_entries_f * cost_coeffs.tans_per_table_entry) *
-        speed_tradeoff;
+        var num_symbols: usize = 256;
+        while (num_symbols > 0 and histo.count[num_symbols - 1] == 0) num_symbols -= 1;
+        if (num_symbols == 0) return error.TooFewSymbols;
 
-    const cost_left_f: f32 = cost_out.* - cost;
-    const max_i32_f: f32 = @floatFromInt(std.math.maxInt(i32));
-    const min_i32_f: f32 = @floatFromInt(std.math.minInt(i32));
-    const cost_left: i32 = if (cost_left_f >= max_i32_f)
-        std.math.maxInt(i32)
-    else if (cost_left_f <= min_i32_f)
-        std.math.minInt(i32)
-    else
-        @intFromFloat(cost_left_f);
-    if (cost_left < 4) return error.TansNotBeneficial;
+        var weights: [256]u32 = @splat(0);
+        const used_symbols = tansNormalizeCounts(&weights, L, histo, @intCast(src.len), num_symbols);
+        if (used_symbols <= 1) return error.TooFewSymbols;
 
-    // Build encoding table.
-    var te: [256]TansEncEntry = undefined;
-    var te_data: [2048]u16 = undefined;
-    tansInitTable(&te, &te_data, &weights, num_symbols, log_table_bits);
+        tansInitTable(&local_te, &local_te_data, &weights, num_symbols, log_table_bits);
 
-    const L: u32 = @as(u32, 1) << @intCast(log_table_bits);
+        const tans_dec = @import("../../decode/entropy/tans_decoder.zig");
+        var tans_data: tans_dec.TansData = .{};
+        for (0..num_symbols) |i| {
+            if (weights[i] == 1) { tans_data.a[tans_data.a_used] = @intCast(i); tans_data.a_used += 1; }
+            else if (weights[i] >= 2) { tans_data.b[tans_data.b_used] = (@as(u32, @intCast(i)) << 16) | weights[i]; tans_data.b_used += 1; }
+        }
+        var lut_entries: [2048]tans_dec.TansLutEnt = undefined;
+        tans_dec.initLut(&tans_data, log_table_bits, &lut_entries) catch return error.TansNotBeneficial;
 
-    // Build decode LUT from weights, then pack to 4-byte entries.
-    // This embeds the pre-built LUT in the compressed data so the GPU
-    // skips table parsing + LUT construction entirely.
-    const tans_dec = @import("../../decode/entropy/tans_decoder.zig");
-    var tans_data: tans_dec.TansData = .{};
-    for (0..num_symbols) |i| {
-        if (weights[i] == 1) {
-            tans_data.a[tans_data.a_used] = @intCast(i);
-            tans_data.a_used += 1;
-        } else if (weights[i] >= 2) {
-            tans_data.b[tans_data.b_used] = (@as(u32, @intCast(i)) << 16) | weights[i];
-            tans_data.b_used += 1;
+        for (0..L) |i| {
+            local_packed_lut[i] = (@as(u32, lut_entries[i].bits_x) << 24) |
+                (@as(u32, lut_entries[i].symbol) << 16) |
+                @as(u32, lut_entries[i].w);
         }
     }
-    var lut_entries: [2048]tans_dec.TansLutEnt = undefined;
-    tans_dec.initLut(&tans_data, log_table_bits, &lut_entries) catch return error.TansNotBeneficial;
 
-    // Pack to 4-byte: (bits_x << 24) | (symbol << 16) | w
-    var packed_lut: [2048]u32 = undefined;
-    for (0..L) |i| {
-        packed_lut[i] = (@as(u32, lut_entries[i].bits_x) << 24) |
-            (@as(u32, lut_entries[i].symbol) << 16) |
-            @as(u32, lut_entries[i].w);
-    }
-
-    const lut_data_bytes: usize = L * 4; // packed LUT size
-    const lut_header_bytes: usize = 3; // u16 lut_entries + u8 log_table_bits
+    const lut_is_shared = shared_ctx != null;
+    const lut_data_bytes: usize = if (lut_is_shared) 0 else L * 4;
+    const lut_header_bytes: usize = if (lut_is_shared) 0 else 3;
 
     // Encode 32 sub-streams. Each lane gets symbols at stride 32.
-    const header_size: usize = 128 + lut_header_bytes + lut_data_bytes; // sizes(64) + states(64) + lut_header(3) + lut_data
+    const header_size: usize = 128 + lut_header_bytes + lut_data_bytes;
     var sub_sizes: [32]u16 = @splat(0);
     var sub_states: [32]u16 = @splat(0);
 
@@ -1156,8 +1181,8 @@ pub fn encodeArrayU8Tans32(
             const sym_idx = ri * 32 + lane;
             if (sym_idx >= src.len) continue;
             const sym = src[sym_idx];
-            const entry = &te[sym];
-            const ns_nb = nextState(&te_data, entry, state);
+            const entry = &te_ptr[sym];
+            const ns_nb = nextState(te_data_ptr[0..L], entry, state);
             const nb: u32 = ns_nb[1];
             const mask: u32 = if (nb >= 32) 0xFFFF_FFFF else ((@as(u32, 1) << @as(u5, @intCast(nb))) - 1);
 
@@ -1200,8 +1225,7 @@ pub fn encodeArrayU8Tans32(
 
     const total_size: usize = header_size + total_compressed;
     if (total_size + 8 > dst.len) return error.DestinationTooSmall;
-    if (@as(i32, @intCast(total_size)) >= cost_left) return error.TansNotBeneficial;
-    if (@as(f32, @floatFromInt(total_size)) + cost >= cost_out.*) return error.TansNotBeneficial;
+    if (total_size >= src.len) return error.TansNotBeneficial;
 
     // Assemble output: [32×u16 sizes][32×u16 states][table][sub-streams]
     // Sizes+states go FIRST (fixed 128 bytes) so the 32-lane kernel can read
@@ -1220,16 +1244,16 @@ pub fn encodeArrayU8Tans32(
         wp += 2;
     }
 
-    // LUT header: u16 LE entry count + u8 log_table_bits
-    std.mem.writeInt(u16, dst[wp..][0..2], @intCast(L), .little);
-    wp += 2;
-    dst[wp] = @intCast(log_table_bits);
-    wp += 1;
-
-    // Packed LUT: L × u32 LE
-    for (0..L) |i| {
-        std.mem.writeInt(u32, dst[wp..][0..4], packed_lut[i], .little);
-        wp += 4;
+    // LUT: skip if shared, embed if per-stream
+    if (!lut_is_shared) {
+        std.mem.writeInt(u16, dst[wp..][0..2], @intCast(L), .little);
+        wp += 2;
+        dst[wp] = @intCast(log_table_bits);
+        wp += 1;
+        for (0..L) |i| {
+            std.mem.writeInt(u32, dst[wp..][0..4], packed_lut_ptr[i], .little);
+            wp += 4;
+        }
     }
 
     // Sub-stream data
@@ -1242,7 +1266,7 @@ pub fn encodeArrayU8Tans32(
         }
     }
 
-    cost_out.* = cost + @as(f32, @floatFromInt(total_size));
+    cost_out.* = @floatFromInt(total_size);
     return total_size;
 }
 

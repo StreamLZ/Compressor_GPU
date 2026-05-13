@@ -1381,7 +1381,9 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
     uint8_t*       __restrict__ dst_buf,
     const TansDecChunkDesc* __restrict__ descs,
     uint32_t*      __restrict__ out_status,
-    uint32_t       num_chunks
+    uint32_t       num_chunks,
+    const uint32_t* __restrict__ shared_lut,  // shared packed LUT (nullptr = per-stream embedded)
+    uint32_t       shared_log_table_bits      // log2(shared LUT size), ignored if shared_lut==nullptr
 ) {
     const uint32_t warp_id = threadIdx.y;
     const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
@@ -1398,17 +1400,23 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
     uint16_t my_sub_size = (uint16_t)payload[lane * 2] | ((uint16_t)payload[lane * 2 + 1] << 8);
     uint16_t my_init_state = (uint16_t)payload[64 + lane * 2] | ((uint16_t)payload[64 + lane * 2 + 1] << 8);
 
-    // Read LUT header
-    uint16_t lut_count = (uint16_t)payload[128] | ((uint16_t)payload[129] << 8);
-    uint32_t log_table_bits = payload[130];
-    uint32_t lut_mask = (1u << log_table_bits) - 1;
+    const uint32_t* packed_lut;
+    uint32_t lut_mask;
+    const uint8_t* sub_data_start;
 
-    // Packed LUT is at payload + 131, L×4 bytes
-    const uint32_t* packed_lut = (const uint32_t*)(payload + 131);
-    // Unaligned — use __ldg which handles misalignment
-
-    // Sub-streams follow the LUT
-    const uint8_t* sub_data_start = payload + 131 + (uint32_t)lut_count * 4;
+    if (shared_lut != nullptr) {
+        // Shared LUT: payload = [sizes 64B][states 64B][sub-streams]
+        packed_lut = shared_lut;
+        lut_mask = (1u << shared_log_table_bits) - 1;
+        sub_data_start = payload + 128;
+    } else {
+        // Embedded LUT: payload = [sizes 64B][states 64B][u16 L][u8 ltb][L×u32 LUT][sub-streams]
+        uint16_t lut_count = (uint16_t)payload[128] | ((uint16_t)payload[129] << 8);
+        uint32_t log_table_bits = payload[130];
+        lut_mask = (1u << log_table_bits) - 1;
+        packed_lut = (const uint32_t*)(payload + 131);
+        sub_data_start = payload + 131 + (uint32_t)lut_count * 4;
+    }
 
     // Compute sub-stream start offset via warp prefix sum
     uint32_t my_size32 = (uint32_t)my_sub_size;

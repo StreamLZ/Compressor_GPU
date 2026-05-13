@@ -18,6 +18,7 @@ const FastMatchHasher = @import("fast/fast_match_hasher.zig").FastMatchHasher;
 const match_hasher = @import("match_hasher.zig");
 const fast_enc = @import("fast/fast_lz_encoder.zig");
 const entropy_enc = @import("entropy/entropy_encoder.zig");
+const tans_enc = @import("entropy/tans_encoder.zig");
 const cost_coeffs = @import("cost_coefficients.zig");
 const EntropyOptions = entropy_enc.EntropyOptions;
 
@@ -43,6 +44,8 @@ fn reencodeGpuWithEntropy(
     initial_bytes: usize,
     src_size: usize,
     tans_encoded_lits: ?[]const u8,
+    shared_tans_ctx: ?*const tans_enc.Tans32SharedCtx,
+    is_first_subchunk: bool,
 ) !usize {
     var rp: usize = 0;
     var wp: usize = 0;
@@ -125,10 +128,11 @@ fn reencodeGpuWithEntropy(
 
     // Encode to dst
 
-    // Literals: when tans32 is enabled, encode via encodeArrayU8 (produces type 6).
-    // Otherwise use GPU tANS (type 1) if provided and smaller, else memcpy.
+    // Literals: first sub-chunk embeds LUT (per-stream), others use shared (no LUT)
     const lit_n = blk: {
-        if (options.allow_tans32) {
+        if (options.allow_tans32 and shared_tans_ctx != null and !is_first_subchunk) {
+            break :blk entropy_enc.encodeArrayU8Tans32Shared(allocator, dst[wp..], literals, shared_tans_ctx.?) catch 0;
+        } else if (options.allow_tans32) {
             break :blk entropy_enc.encodeArrayU8(allocator, dst[wp..], literals, options, speed_tradeoff, null, 0, null) catch 0;
         }
         if (tans_encoded_lits) |tans_data| {
@@ -812,6 +816,15 @@ pub fn compressFramedOne(
         if (!gpu_enc.gpuCompress(effective_src, gpu_out, descs, comp_sizes, io, opts.level))
             break :gpu_compress;
 
+        // Build frame-level shared tANS32 context (one LUT for all streams)
+        const frame_shared_tans_ctx: ?tans_enc.Tans32SharedCtx = if (opts.level >= 3) blk_fctx: {
+            const ByteHistogram = @import("entropy/byte_histogram.zig").ByteHistogram;
+            var global_histo: ByteHistogram = .{};
+            global_histo.countBytes(effective_src[0..data_src.len]);
+            break :blk_fctx tans_enc.buildTans32SharedCtx(&global_histo, @intCast(data_src.len));
+        } else null;
+        var is_first_tans32_in_frame: bool = true;
+
         // tANS entropy handled by GPU kernel — no CPU-side re-encoding needed
 
         // Assemble frame from GPU-compressed sub-chunks grouped into chunks
@@ -849,6 +862,9 @@ pub fn compressFramedOne(
                 if (pos + 4 > dst.len) return error.DestinationTooSmall;
                 const chunk_hdr_pos = pos;
                 pos += 4;
+
+                // Use frame-level shared tANS32 context (built once before chunk loop)
+                const shared_tans_ctx = frame_shared_tans_ctx;
 
                 // Write each sub-chunk, splicing GPU tANS literal data when beneficial
                 for (0..n_subs) |si| {
@@ -896,6 +912,8 @@ pub fn compressFramedOne(
                             0.0, // minimize size, not speed
                             init_bytes, sub_size,
                             if (tans_lits) |t| t else null,
+                            if (shared_tans_ctx) |*ctx| ctx else null,
+                            is_first_tans32_in_frame,
                         ) catch break :blk_reencode false;
                         if (enc_n == 0 or enc_n >= raw_cs) break :blk_reencode false;
 
@@ -907,6 +925,7 @@ pub fn compressFramedOne(
                         pos += 3;
                         @memcpy(dst[pos..][0..enc_n], enc_buf[0..enc_n]);
                         pos += enc_n;
+                        is_first_tans32_in_frame = false;
                         break :blk_reencode true;
                     };
                     if (!reencode_ok) {

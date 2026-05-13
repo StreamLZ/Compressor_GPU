@@ -198,6 +198,9 @@ const TansDecChunkDesc = extern struct {
 
 var d_tans_scratch: CUdeviceptr = 0;
 var d_tans_scratch_size: usize = 0;
+var d_shared_lut: CUdeviceptr = 0;
+var d_shared_lut_size: usize = 0;
+var shared_lut_log_bits: u32 = 0;
 var d_tans_descs_persist: CUdeviceptr = 0;
 var d_tans_descs_persist_size: usize = 0;
 var d_tans_status_persist: CUdeviceptr = 0;
@@ -259,7 +262,10 @@ const ScanResult = struct {
     num_off16hi: u32,
     num_off16lo: u32,
     num_raw_off16: u32,
-    use_tans32: bool = false, // chunk_type 6 detected — use 32-lane kernel
+    use_tans32: bool = false,
+    shared_lut_offset: u32 = 0, // offset in compressed_block to the first type-6 LUT
+    shared_lut_log_bits: u32 = 0,
+    shared_lut_count: u32 = 0,
 };
 
 fn scanForTansChunks(
@@ -279,6 +285,9 @@ fn scanForTansChunks(
     var num_off16lo: u32 = 0;
     var num_raw: u32 = 0;
     var use_tans32: bool = false;
+    var shared_lut_offset: u32 = 0;
+    var shared_lut_log_bits_val: u32 = 0;
+    var shared_lut_count_val: u32 = 0;
 
     for (chunk_descs, 0..) |ch, chunk_idx| {
         // Skip non-LZ chunks
@@ -307,8 +316,25 @@ fn scanForTansChunks(
         const lit_first = chunk_src[pos];
         const lit_type = (lit_first >> 4) & 0x7;
         if (lit_type == 1 or lit_type == 6) {
+            const lit_before = num_lit;
             _ = parseTansHeader(chunk_src, pos, ch.src_offset, chunk_idx, tans_lit_descs, &num_lit);
-            if (lit_type == 6) use_tans32 = true;
+            if (lit_type == 6) {
+                use_tans32 = true;
+                // First type-6 lit: read shared LUT info from its payload
+                if (lit_before == 0 and num_lit > 0) {
+                    const desc = tans_lit_descs[0];
+                    const payload_off = desc.src_offset;
+                    if (payload_off + 131 < compressed_block.len) {
+                        const lut_count_val = @as(u32, compressed_block[payload_off + 128]) | (@as(u32, compressed_block[payload_off + 129]) << 8);
+                        const ltb = compressed_block[payload_off + 130];
+                        if (ltb >= 8 and ltb <= 11 and lut_count_val == (@as(u32, 1) << @intCast(ltb))) {
+                            shared_lut_offset = payload_off + 131;
+                            shared_lut_log_bits_val = ltb;
+                            shared_lut_count_val = lut_count_val;
+                        }
+                    }
+                }
+            }
         }
         const lit_next = skipStreamHeader(chunk_src, pos);
         if (lit_next == null) continue;
@@ -390,7 +416,12 @@ fn scanForTansChunks(
         }
     }
 
-    return .{ .num_lit = num_lit, .num_tok = num_tok, .num_off16hi = num_off16hi, .num_off16lo = num_off16lo, .num_raw_off16 = num_raw, .use_tans32 = use_tans32 };
+    return .{
+        .num_lit = num_lit, .num_tok = num_tok, .num_off16hi = num_off16hi,
+        .num_off16lo = num_off16lo, .num_raw_off16 = num_raw, .use_tans32 = use_tans32,
+        .shared_lut_offset = shared_lut_offset, .shared_lut_log_bits = shared_lut_log_bits_val,
+        .shared_lut_count = shared_lut_count_val,
+    };
 }
 
 /// Parse a type 0 (memcpy) stream header, returning the data offset
@@ -711,6 +742,14 @@ pub fn fullGpuLaunch(
             if (!ensureDeviceBuf(&d_tans_meta, &d_tans_meta_size, meta_bytes)) return error.BadMode;
         }
 
+        // Upload shared LUT for tANS32 (one 4-8KB transfer)
+        if (scan.use_tans32 and scan.shared_lut_count > 0) {
+            const shared_lut_bytes = scan.shared_lut_count * 4;
+            if (!ensureDeviceBuf(&d_shared_lut, &d_shared_lut_size, shared_lut_bytes)) return error.BadMode;
+            _ = h2d_fn(d_shared_lut, @ptrCast(compressed_block.ptr + scan.shared_lut_offset), shared_lut_bytes);
+            shared_lut_log_bits = scan.shared_lut_log_bits;
+        }
+
         _ = sync_fn();
 
         // ── KERNEL TIMER: only pure GPU kernel time from here ──
@@ -744,15 +783,18 @@ pub fn fullGpuLaunch(
                     @ptrCast(&bp_lut), @ptrCast(&bp_meta), @ptrCast(&bp_num),
                 };
                 if (scan.use_tans32 and tans32_kernel_fn != 0) {
-                    // 32-lane tANS: LUT embedded in payload, no build kernel needed
+                    // 32-lane tANS with shared LUT
                     var tp_comp = d_comp_persist;
                     var tp_scratch = d_tans_scratch;
                     var tp_descs = bp_descs;
                     var tp_status = d_tans_status_persist + @as(u64, ts) * @sizeOf(u32);
                     var tp_num = tc;
+                    var tp_shared_lut: CUdeviceptr = if (scan.shared_lut_count > 0) d_shared_lut else 0;
+                    var tp_shared_ltb: u32 = shared_lut_log_bits;
                     var tans32_params = [_]?*anyopaque{
                         @ptrCast(&tp_comp), @ptrCast(&tp_scratch),
                         @ptrCast(&tp_descs), @ptrCast(&tp_status), @ptrCast(&tp_num),
+                        @ptrCast(&tp_shared_lut), @ptrCast(&tp_shared_ltb),
                     };
                     var tans32_extra = [_]?*anyopaque{null};
                     if (launch_fn(tans32_kernel_fn, tans_grid, 1, 1, 32, 2, 1, 0, stream, &tans32_params, &tans32_extra) != CUDA_SUCCESS)
