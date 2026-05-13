@@ -178,6 +178,7 @@ fn highDecodeBytesInternal(
             scratch_end,
             max_depth,
         ),
+        6 => return error.BadChunkHeader,
         else => return error.BadChunkHeader,
     }
 

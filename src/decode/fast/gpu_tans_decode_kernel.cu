@@ -1149,7 +1149,8 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTansDecodeKernel(
     uint32_t*      __restrict__ out_status,
     uint32_t       num_chunks,
     TansLutEnt*    __restrict__ lut_buf,
-    const TansTableMeta* __restrict__ meta_buf  // pre-built table metadata (or nullptr)
+    const TansTableMeta* __restrict__ meta_buf,  // pre-built table metadata (or nullptr)
+    uint32_t*      __restrict__ chunk_ready       // per-LZ-chunk ready counter (or nullptr)
 ) {
     const uint32_t warp_id = threadIdx.y;
     const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
@@ -1358,4 +1359,141 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTansDecodeKernel(
         dst_base[total_syms + 4] = (uint8_t)st4;
         out_status[chunk_id] = TANS_OK;
     }
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  32-lane parallel tANS decode kernel (chunk_type = 3)
+// ══════════════════════════════════════════════════════════════════
+//
+// Wire format after table:
+//   [32 × u16 LE sub-stream sizes]   (64 bytes)
+//   [32 × u8 final states]           (32 bytes)
+//   [sub-stream 0] [sub-stream 1] ... [sub-stream 31]
+//
+// All 32 lanes decode in parallel. Each lane maintains its own state
+// and reads from its own sub-stream. Output is interleaved:
+//   dst[i*32 + lane] = symbol_i_from_lane
+//
+// The LUT is shared (same table, built once by slzTansBuildTablesKernel).
+
+extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
+    const uint8_t* __restrict__ src_buf,
+    uint8_t*       __restrict__ dst_buf,
+    const TansDecChunkDesc* __restrict__ descs,
+    uint32_t*      __restrict__ out_status,
+    uint32_t       num_chunks,
+    TansLutEnt*    __restrict__ lut_buf,
+    const TansTableMeta* __restrict__ meta_buf
+) {
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
+    if (chunk_id >= num_chunks) return;
+
+    const uint32_t* packed_lut = (const uint32_t*)((uint8_t*)lut_buf + (uint64_t)chunk_id * 2048 * sizeof(TansLutEnt));
+    TansLutEnt* my_lut = lut_buf + (uint64_t)chunk_id * 2048;
+    const int lane = threadIdx.x & 31;
+
+    // Table must be pre-built by slzTansBuildTablesKernel
+    if (meta_buf == nullptr) {
+        if (lane == 0) out_status[chunk_id] = TANS_ERR_BAD_TABLE;
+        return;
+    }
+
+    uint32_t err = meta_buf[chunk_id].error;
+    if (err != TANS_OK) {
+        if (lane == 0) out_status[chunk_id] = err;
+        return;
+    }
+
+    uint32_t log_table_bits = meta_buf[chunk_id].log_table_bits;
+    uint32_t lut_mask = (1u << log_table_bits) - 1;
+    uint32_t dst_size = descs[chunk_id].dst_size;
+
+    // Layout: [32×u16 sizes (64B)][32×u16 states (64B)][table][sub-streams]
+    // src_offset points past the 128-byte header to the table (for the build kernel).
+    // Sizes+states are at src_offset - 128.
+    const uint8_t* payload_start = src_buf + descs[chunk_id].src_offset - 128;
+
+    // Read sizes and states from the fixed 128-byte header
+    uint16_t my_sub_size = (uint16_t)payload_start[lane * 2] | ((uint16_t)payload_start[lane * 2 + 1] << 8);
+    uint16_t my_init_state = (uint16_t)payload_start[64 + lane * 2] | ((uint16_t)payload_start[64 + lane * 2 + 1] << 8);
+
+    // Sub-stream data follows the table. Use src_after_table_off from build kernel.
+    const uint8_t* sub_data_start = src_buf + meta_buf[chunk_id].src_after_table_off;
+
+    // Compute sub-stream start offset: sum of sizes for lanes 0..lane-1
+    uint32_t my_size32 = (uint32_t)my_sub_size;
+    uint32_t prefix_sum = my_size32;
+    for (int d = 1; d < 32; d <<= 1) {
+        uint32_t n = __shfl_up_sync(0xFFFFFFFF, prefix_sum, d);
+        if (lane >= d) prefix_sum += n;
+    }
+    uint32_t my_offset = prefix_sum - my_size32;
+
+    const uint8_t* my_src = sub_data_start + my_offset;
+
+    uint32_t total_syms = dst_size;
+    uint32_t my_sym_count = total_syms / 32;
+    if ((uint32_t)lane < (total_syms % 32)) my_sym_count++;
+
+    uint8_t* dst_base = dst_buf + descs[chunk_id].dst_offset;
+
+    if (my_sym_count == 0 || my_sub_size < 4) {
+        __syncwarp();
+        if (lane == 0) out_status[chunk_id] = TANS_OK;
+        return;
+    }
+
+    uint32_t state = (uint32_t)my_init_state & lut_mask;
+    uint32_t bits = readLE32(my_src);
+    int32_t bitpos = 32;
+    const uint8_t* ptr = my_src + 4;
+    const uint8_t* ptr_end = my_src + my_sub_size;
+
+    // Debug: first chunk, lane 0, first 3 symbols
+    if (chunk_id == 0 && lane == 0) {
+        printf("T32 GPU lane0: init_state=%u ltb=%u lut_mask=%u sub_size=%u sym_count=%u\n",
+               my_init_state, log_table_bits, lut_mask, my_sub_size, my_sym_count);
+        printf("T32 GPU lane0: first 8 src bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+               my_src[0], my_src[1], my_src[2], my_src[3], my_src[4], my_src[5], my_src[6], my_src[7]);
+        printf("T32 GPU lane0: bits=0x%08x bitpos=%d\n", bits, bitpos);
+    }
+
+    // Decode loop: each lane decodes its symbols, writing interleaved
+    for (uint32_t i = 0; i < my_sym_count; i++) {
+        // Refill when low on bits
+        if (bitpos < 16) {
+            if (ptr + 4 <= ptr_end) {
+                bits |= readLE32(ptr) << bitpos;
+                ptr += (31 - bitpos) >> 3;
+                bitpos |= 24;
+            } else {
+                while (bitpos < 24 && ptr < ptr_end) {
+                    bits |= (uint32_t)(*ptr) << bitpos;
+                    ptr++;
+                    bitpos += 8;
+                }
+            }
+        }
+
+        uint32_t packed = __ldg(&packed_lut[state]);
+        uint32_t bits_x = packed >> 24;
+        uint8_t sym = (uint8_t)((packed >> 16) & 0xFF);
+        uint32_t w = packed & 0xFFFF;
+        uint32_t x = (1u << bits_x) - 1;
+        state = ((uint32_t)(bits & (uint64_t)x) + w) & lut_mask;
+        bits >>= bits_x;
+        bitpos -= (int32_t)bits_x;
+
+        if (chunk_id == 0 && lane == 0 && i < 3) {
+            printf("T32 GPU lane0 sym[%u]: state_in=%u packed=0x%08x bits_x=%u sym=%u('%c') w=%u read_bits=%u new_state=%u\n",
+                   i, (i==0) ? (uint32_t)my_init_state & lut_mask : state, packed, bits_x, sym, sym, w, (uint32_t)(bits & x), state);
+        }
+
+        // Write interleaved: position i*32 + lane
+        dst_base[i * 32 + lane] = sym;
+    }
+
+    __syncwarp();
+    if (lane == 0) out_status[chunk_id] = TANS_OK;
 }

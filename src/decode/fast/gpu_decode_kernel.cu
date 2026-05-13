@@ -493,7 +493,7 @@ __device__ __noinline__ void parseSubChunkHeaders(
             lit_size = parseType0Header(src);
             lit_ptr = src;
             src += lit_size;
-        } else if (chunk_type == 1 && tans_scratch_chunk != nullptr) {
+        } else if ((chunk_type == 1 || chunk_type == 6) && tans_scratch_chunk != nullptr) {
             uint32_t tans_comp_size, tans_dst_size;
             if (src[0] >= 0x80) {
                 uint32_t bits = ((uint32_t)src[0] << 16) | ((uint32_t)src[1] << 8) | src[2];
@@ -536,7 +536,7 @@ __device__ __noinline__ void parseSubChunkHeaders(
             cmd_size = parseType0Header(src);
             cmd_ptr = src;
             src += cmd_size;
-        } else if (ct == 1 && tans_tok_scratch_chunk != nullptr) {
+        } else if ((ct == 1 || ct == 6) && tans_tok_scratch_chunk != nullptr) {
             // tANS-encoded token stream: skip compressed data, use pre-decoded buffer
             uint32_t tans_comp_size, tans_dst_size;
             if (src[0] >= 0x80) {

@@ -1009,6 +1009,235 @@ pub fn encodeArrayU8Tans(
     return table_bytes + payload_bytes;
 }
 
+// ────────────────────────────────────────────────────────────
+//  32-lane interleaved tANS encoder (chunk_type = 3)
+// ────────────────────────────────────────────────────────────
+
+/// Encodes `src` using 32 independent single-state tANS sub-streams with a
+/// shared frequency table. Symbols are distributed round-robin across lanes:
+/// lane i gets src[i], src[i+32], src[i+64], ...
+///
+/// Wire format (written to `dst`):
+///   [table_bytes]                     — same Golomb-Rice/sparse table as type 1
+///   [32 × u16 LE sub-stream sizes]   — 64 bytes
+///   [32 × u8 final states]           — 32 bytes
+///   [sub-stream 0 data] [sub-stream 1 data] ... [sub-stream 31 data]
+///
+/// Returns the total bytes written (not including the outer 5-byte chunk header).
+pub fn encodeArrayU8Tans32(
+    allocator: std.mem.Allocator,
+    dst: []u8,
+    src: []const u8,
+    histo: *ByteHistogram,
+    speed_tradeoff: f32,
+    cost_out: *f32,
+) EncodeError!usize {
+    if (src.len < 64) return error.TansNotBeneficial;
+
+    // Choose log table bits based on source size.
+    const raw_log: i32 = @as(i32, @intCast(ilog2Round(@intCast(src.len)))) - 2;
+    const clamped: i32 = @max(@min(raw_log, 11), 8);
+    const log_table_bits: u32 = @intCast(clamped);
+
+    // Determine used range of the histogram.
+    var num_symbols: usize = 256;
+    while (num_symbols > 0 and histo.count[num_symbols - 1] == 0) num_symbols -= 1;
+    if (num_symbols == 0) return error.TooFewSymbols;
+
+    var weights: [256]u32 = @splat(0);
+    const used_symbols = tansNormalizeCounts(
+        &weights,
+        @as(u32, 1) << @intCast(log_table_bits),
+        histo,
+        @intCast(src.len),
+        num_symbols,
+    );
+    if (used_symbols <= 1) return error.TooFewSymbols;
+
+    // Speed-adjusted cost estimate.
+    const src_len_f: f32 = @floatFromInt(src.len);
+    const used_sym_f: f32 = @floatFromInt(used_symbols);
+    const table_entries_f: f32 = @floatFromInt(@as(u32, 1) << @intCast(log_table_bits));
+    const cost: f32 = (cost_coeffs.tans_base +
+        src_len_f * cost_coeffs.tans_per_src_byte +
+        used_sym_f * cost_coeffs.tans_per_used_symbol +
+        table_entries_f * cost_coeffs.tans_per_table_entry) *
+        speed_tradeoff;
+
+    const cost_left_f: f32 = cost_out.* - cost;
+    const max_i32_f: f32 = @floatFromInt(std.math.maxInt(i32));
+    const min_i32_f: f32 = @floatFromInt(std.math.minInt(i32));
+    const cost_left: i32 = if (cost_left_f >= max_i32_f)
+        std.math.maxInt(i32)
+    else if (cost_left_f <= min_i32_f)
+        std.math.minInt(i32)
+    else
+        @intFromFloat(cost_left_f);
+    if (cost_left < 4) return error.TansNotBeneficial;
+
+    // Emit table header.
+    var table_buf: [512]u8 = @splat(0);
+    var bw = BitWriter64Forward.initBounded(&table_buf, table_buf.len);
+    bw.writeNoFlush(log_table_bits - 8, 3);
+    tansEncodeTable(&bw, log_table_bits, &weights, num_symbols, used_symbols);
+    bw.flush();
+    const table_final_ptr = bw.getFinalPtr();
+    const table_bytes: usize = @intFromPtr(table_final_ptr) - @intFromPtr(&table_buf[0]);
+
+    // Debug: print table_bytes for first few encodes
+    {
+        const S = struct { var count: u32 = 0; };
+        if (S.count < 3) {
+            std.debug.print("TANS32 ENC: table_bytes={d} ltb={d} used_syms={d}\n", .{ table_bytes, log_table_bits, used_symbols });
+            S.count += 1;
+        }
+    }
+
+    // Build encoding table.
+    var te: [256]TansEncEntry = undefined;
+    var te_data: [2048]u16 = undefined;
+    tansInitTable(&te, &te_data, &weights, num_symbols, log_table_bits);
+
+    const L: u32 = @as(u32, 1) << @intCast(log_table_bits);
+
+    // Encode 32 sub-streams. Each lane gets symbols at stride 32.
+    const header_size: usize = 128 + table_bytes; // 32×u16 sizes (64) + 32×u16 states (64) + table
+    var sub_sizes: [32]u16 = @splat(0);
+    var sub_states: [32]u16 = @splat(0);
+
+    // Allocate scratch for all 32 sub-streams
+    const max_sub_len = src.len / 32 + 1;
+    const sub_scratch_size = max_sub_len + 64; // extra for bit writer overshoot
+    const total_scratch = sub_scratch_size * 32;
+    const scratch = try allocator.alloc(u8, total_scratch);
+    defer allocator.free(scratch);
+    @memset(scratch, 0);
+
+    var total_compressed: usize = 0;
+    for (0..32) |lane| {
+        // Count symbols for this lane
+        var lane_count: usize = 0;
+        var idx = lane;
+        while (idx < src.len) : (idx += 32) lane_count += 1;
+
+        if (lane_count == 0) {
+            sub_sizes[lane] = 0;
+            sub_states[lane] = 0;
+            continue;
+        }
+
+        // Encode in reverse, buffer (nb, bits) pairs, then pack LSB-first in reverse
+        const sub_buf = scratch[lane * sub_scratch_size ..][0..sub_scratch_size];
+
+        // Phase 1: encode in reverse, collect bit outputs
+        const enc_nb_alloc = try allocator.alloc(u5, lane_count);
+        defer allocator.free(enc_nb_alloc);
+        const enc_bits_alloc = try allocator.alloc(u32, lane_count);
+        defer allocator.free(enc_bits_alloc);
+        const enc_nb = enc_nb_alloc;
+        const enc_bits = enc_bits_alloc;
+        var enc_count: usize = 0;
+
+        var state: u32 = L;
+
+        var ri: usize = lane_count;
+        while (ri > 0) {
+            ri -= 1;
+            const sym_idx = ri * 32 + lane;
+            if (sym_idx >= src.len) continue;
+            const sym = src[sym_idx];
+            const entry = &te[sym];
+            const ns_nb = nextState(&te_data, entry, state);
+            const nb: u32 = ns_nb[1];
+            const mask: u32 = if (nb >= 32) 0xFFFF_FFFF else ((@as(u32, 1) << @as(u5, @intCast(nb))) - 1);
+
+            enc_nb[enc_count] = @intCast(nb);
+            enc_bits[enc_count] = state & mask;
+            enc_count += 1;
+
+            state = ns_nb[0];
+        }
+
+        // Phase 2: pack bits LSB-first in REVERSE order (last encoded = first in stream)
+        var bit_buf: u64 = 0;
+        var bit_count: u32 = 0;
+        var wp_local: usize = 0;
+
+        var ei: usize = enc_count;
+        while (ei > 0) {
+            ei -= 1;
+            bit_buf |= @as(u64, enc_bits[ei]) << @intCast(bit_count);
+            bit_count += enc_nb[ei];
+            while (bit_count >= 8) {
+                sub_buf[wp_local] = @intCast(bit_buf & 0xFF);
+                bit_buf >>= 8;
+                bit_count -= 8;
+                wp_local += 1;
+            }
+        }
+
+        if (bit_count > 0) {
+            sub_buf[wp_local] = @intCast(bit_buf & 0xFF);
+            wp_local += 1;
+        }
+
+        if (wp_local > 0xFFFF) return error.TansNotBeneficial;
+        sub_sizes[lane] = @intCast(wp_local);
+        sub_states[lane] = @intCast(state & (L - 1));
+        total_compressed += wp_local;
+
+        // Debug first encode, lanes around the problem area
+        {
+            const S = struct { var call_count: u32 = 0; };
+            if (S.call_count == 0 and (lane >= 24 and lane <= 28)) {
+                std.debug.print("ENC lane{d}: state={d} masked={d} sub_size={d} lane_count={d} first_sym={d}('{c}')\n", .{
+                    lane, state, state & (L - 1), wp_local, lane_count, src[lane], src[lane],
+                });
+            }
+            if (lane == 31) S.call_count += 1;
+        }
+    }
+
+    const total_size: usize = header_size + total_compressed;
+    if (total_size + 8 > dst.len) return error.DestinationTooSmall;
+    if (@as(i32, @intCast(total_size)) >= cost_left) return error.TansNotBeneficial;
+    if (@as(f32, @floatFromInt(total_size)) + cost >= cost_out.*) return error.TansNotBeneficial;
+
+    // Assemble output: [32×u16 sizes][32×u16 states][table][sub-streams]
+    // Sizes+states go FIRST (fixed 128 bytes) so the 32-lane kernel can read
+    // them at known offsets regardless of table parse overshoot.
+    var wp: usize = 0;
+
+    // 32 × u16 LE sub-stream sizes
+    for (0..32) |lane| {
+        std.mem.writeInt(u16, dst[wp..][0..2], sub_sizes[lane], .little);
+        wp += 2;
+    }
+
+    // 32 × u16 LE initial decode states
+    for (0..32) |lane| {
+        std.mem.writeInt(u16, dst[wp..][0..2], sub_states[lane], .little);
+        wp += 2;
+    }
+
+    // Table
+    @memcpy(dst[wp..][0..table_bytes], table_buf[0..table_bytes]);
+    wp += table_bytes;
+
+    // Sub-stream data
+    for (0..32) |lane| {
+        const sz: usize = sub_sizes[lane];
+        if (sz > 0) {
+            const sub_buf = scratch[lane * sub_scratch_size ..][0..sz];
+            @memcpy(dst[wp..][0..sz], sub_buf);
+            wp += sz;
+        }
+    }
+
+    cost_out.* = cost + @as(f32, @floatFromInt(total_size));
+    return total_size;
+}
+
 inline fn bitsUp(bits: u32) usize {
     return @intCast((bits + 7) >> 3);
 }
@@ -1224,6 +1453,93 @@ test "tANS roundtrip: silesia first 64 KB (binary-ish)" {
     if (read != src.len) return error.SkipZigTest;
 
     try tansRoundtripChunk(allocator, src);
+}
+
+test "tANS32 roundtrip: 10000 bytes repeating pattern (forces ltb=11)" {
+    const tans_dec = @import("../../decode/entropy/tans_decoder.zig");
+    const pattern = "The quick brown fox jumps over the lazy dog. ";
+    var src: [10000]u8 = undefined;
+    for (0..src.len) |i| src[i] = pattern[i % pattern.len];
+
+    var histo: ByteHistogram = .{};
+    histo.countBytes(&src);
+
+    const dst = try testing.allocator.alloc(u8, 20000);
+    defer testing.allocator.free(dst);
+    @memset(dst, 0);
+    var cost: f32 = std.math.inf(f32);
+    const n = encodeArrayU8Tans32(testing.allocator, dst, &src, &histo, 1.0, &cost) catch |err| {
+        std.debug.print("tANS32 encode error: {}\n", .{err});
+        return;
+    };
+    try testing.expect(n > 0);
+
+    const decoded = try testing.allocator.alloc(u8, 10000);
+    defer testing.allocator.free(decoded);
+    @memset(decoded, 0xAA);
+    var scratch_buf: [64 * 1024]u8 align(16) = undefined;
+    _ = try tans_dec.highDecodeTans32(
+        dst.ptr,
+        n,
+        decoded.ptr,
+        src.len,
+        scratch_buf[0..].ptr,
+        scratch_buf[0..].ptr + scratch_buf.len,
+    );
+
+    var mismatches: usize = 0;
+    for (0..src.len) |i| {
+        if (decoded[i] != src[i]) {
+            if (mismatches < 5) std.debug.print("Mismatch at {d}: exp={d} got={d}\n", .{ i, src[i], decoded[i] });
+            mismatches += 1;
+        }
+    }
+    if (mismatches > 0) std.debug.print("Total mismatches: {d} / {d}\n", .{ mismatches, src.len });
+    try testing.expectEqual(@as(usize, 0), mismatches);
+}
+
+test "tANS32 roundtrip: 1024 bytes repeating pattern" {
+    const tans_dec = @import("../../decode/entropy/tans_decoder.zig");
+    const pattern = "The quick brown fox jumps over the lazy dog. ";
+    var src: [1024]u8 = undefined;
+    for (0..src.len) |i| src[i] = pattern[i % pattern.len];
+
+    var histo: ByteHistogram = .{};
+    histo.countBytes(&src);
+
+    var dst: [4096]u8 = @splat(0);
+    var cost: f32 = std.math.inf(f32);
+    const n = encodeArrayU8Tans32(testing.allocator, &dst, &src, &histo, 1.0, &cost) catch |err| {
+        std.debug.print("tANS32 encode error: {}\n", .{err});
+        return;
+    };
+    try testing.expect(n > 0);
+
+    var decoded: [1024]u8 = @splat(0xAA);
+    var scratch: [64 * 1024]u8 align(16) = undefined;
+    _ = try tans_dec.highDecodeTans32(
+        dst[0..].ptr,
+        n,
+        decoded[0..].ptr,
+        src.len,
+        scratch[0..].ptr,
+        scratch[0..].ptr + scratch.len,
+    );
+
+    // Check bytes with position detail
+    var mismatches: usize = 0;
+    for (0..src.len) |i| {
+        if (decoded[i] != src[i]) {
+            if (mismatches < 10) {
+                std.debug.print("Mismatch at byte {d} (lane={d}, sym_idx={d}): expected {d} got {d}\n", .{ i, i % 32, i / 32, src[i], decoded[i] });
+            }
+            mismatches += 1;
+        }
+    }
+    if (mismatches > 0) {
+        std.debug.print("Total mismatches: {d} / {d}\n", .{ mismatches, src.len });
+    }
+    try testing.expectEqualSlices(u8, &src, &decoded);
 }
 
 test "tANS roundtrip: silesia 128 KB at offset 2 MB" {

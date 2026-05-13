@@ -125,15 +125,18 @@ fn reencodeGpuWithEntropy(
 
     // Encode to dst
 
-    // Literals: use GPU tANS if provided and smaller, else raw memcpy
+    // Literals: when tans32 is enabled, encode via encodeArrayU8 (produces type 6).
+    // Otherwise use GPU tANS (type 1) if provided and smaller, else memcpy.
     const lit_n = blk: {
+        if (options.allow_tans32) {
+            break :blk entropy_enc.encodeArrayU8(allocator, dst[wp..], literals, options, speed_tradeoff, null, 0, null) catch 0;
+        }
         if (tans_encoded_lits) |tans_data| {
             if (tans_data.len > 0 and tans_data.len + 5 < literals.len + 3) {
-                // Write as tANS-encoded block: 5-byte non-compact header (chunk_type=1) + data
                 if (wp + 5 + tans_data.len > dst.len) break :blk @as(usize, 0);
                 entropy_enc.writeNonCompactChunkHeader(
                     dst[wp..],
-                    1, // chunk_type = tANS
+                    1,
                     @intCast(tans_data.len),
                     @intCast(literals.len),
                 );
@@ -885,6 +888,7 @@ pub fn compressFramedOne(
                         const sub_size = @min(gpu_block, chunk_size - si * gpu_block);
                         var entropy_options = entropyOptionsForLevel(opts.level);
                         entropy_options.allow_tans = true;
+                        entropy_options.allow_tans32 = true;
                         const enc_buf = allocator.alloc(u8, raw_cs + 4096) catch break :blk_reencode false;
                         defer allocator.free(enc_buf);
                         const enc_n = reencodeGpuWithEntropy(

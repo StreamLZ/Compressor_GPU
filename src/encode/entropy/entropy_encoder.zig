@@ -26,7 +26,7 @@ pub const EntropyOptions = packed struct(u8) {
     allow_rle: bool = false,
     allow_multi_array: bool = false,
     supports_new_huffman: bool = false,
-    allow_multi_array_advanced: bool = false,
+    allow_tans32: bool = false,
     supports_short_memset: bool = false,
 
     pub fn raw(self: EntropyOptions) u8 {
@@ -181,8 +181,25 @@ fn encodeArrayU8CoreWithHisto(
 
     const memcpy_cost: f32 = @floatFromInt(src.len + 3);
 
-    // Try tANS if allowed.
-    if (options.allow_tans and dst.len > 5 + 8) {
+    // Try 32-lane tANS if allowed (GPU-optimized, chunk_type=3).
+    if (options.allow_tans32 and dst.len > 5 + 128) {
+        var tans32_cost: f32 = memcpy_cost;
+        const tans32_n = tans.encodeArrayU8Tans32(allocator, dst[5..], src, histo, speed_tradeoff, &tans32_cost) catch |err| switch (err) {
+            error.TansNotBeneficial, error.TooFewSymbols, error.DestinationTooSmall => null,
+            error.BadParameters => return error.DestinationTooSmall,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        if (tans32_n) |n| {
+            if (n > 0 and n < src.len and tans32_cost < memcpy_cost) {
+                writeNonCompactChunkHeader(dst, 6, @intCast(n), @intCast(src.len));
+                if (cost_out) |c| c.* = tans32_cost;
+                return 5 + n;
+            }
+        }
+    }
+
+    // Try tANS if allowed (5-state interleaved, chunk_type=1).
+    if (options.allow_tans and !options.allow_tans32 and dst.len > 5 + 8) {
         var tans_cost: f32 = memcpy_cost;
         const tans_n = tans.encodeArrayU8Tans(allocator, dst[5..], src, histo, speed_tradeoff, &tans_cost) catch |err| switch (err) {
             error.TansNotBeneficial, error.TooFewSymbols, error.DestinationTooSmall => {

@@ -303,19 +303,22 @@ fn decompressOneFrame(
         // since the GPU LZ kernel can't handle entropy-coded literal streams.
         if (use_gpu and hdr.sc_group_size <= 1.0) gpu_frame: {
             const gpu = @import("fast/gpu_driver.zig");
-            if (!gpu.isAvailable()) break :gpu_frame;
-            if (block_src.len < 2) break :gpu_frame;
-            const peek = block_header.parseBlockHeader(block_src) catch break :gpu_frame;
+            if (!gpu.isAvailable()) { std.debug.print("GPU skip: not available\n", .{}); break :gpu_frame; }
+            if (block_src.len < 2) { std.debug.print("GPU skip: block too small\n", .{}); break :gpu_frame; }
+            const peek = block_header.parseBlockHeader(block_src) catch { std.debug.print("GPU skip: header parse\n", .{}); break :gpu_frame; };
             const is_fast = peek.decoder_type == .fast or peek.decoder_type == .turbo;
-            if (!is_fast) break :gpu_frame;
-            if (block_hdr.decompressed_size <= constants.chunk_size) break :gpu_frame;
+            if (!is_fast) { std.debug.print("GPU skip: not fast ({any})\n", .{peek.decoder_type}); break :gpu_frame; }
+            if (block_hdr.decompressed_size <= constants.chunk_size) { std.debug.print("GPU skip: single chunk\n", .{}); break :gpu_frame; }
 
             const eff_cs_gpu = @min(frame.scGroupSizeToBytes(hdr.sc_group_size), constants.chunk_size);
             const num_chunks_est = (block_hdr.decompressed_size + eff_cs_gpu - 1) / eff_cs_gpu;
             const prefix_sz: usize = if (peek.self_contained and num_chunks_est > 1) (num_chunks_est - 1) * 8 else 0;
             const block_payload = block_src[0 .. block_src.len - prefix_sz];
 
-            gpuBatchDecode(block_payload, dst, dst_off, block_hdr.decompressed_size, hdr.sc_group_size, &scratch, io_opt) catch break :gpu_frame;
+            gpuBatchDecode(block_payload, dst, dst_off, block_hdr.decompressed_size, hdr.sc_group_size, &scratch, io_opt) catch |err| {
+                std.debug.print("GPU decode FAILED (NO FALLBACK): {s}\n", .{@errorName(err)});
+                return error.BadMode;
+            };
             dst_off += block_hdr.decompressed_size;
 
             if (prefix_sz != 0) {
