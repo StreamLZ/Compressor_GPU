@@ -307,16 +307,8 @@ fn scanForTansChunks(
         const lit_first = chunk_src[pos];
         const lit_type = (lit_first >> 4) & 0x7;
         if (lit_type == 1 or lit_type == 6) {
-            const before = num_lit;
             _ = parseTansHeader(chunk_src, pos, ch.src_offset, chunk_idx, tans_lit_descs, &num_lit);
-            if (lit_type == 6) {
-                use_tans32 = true;
-                if (num_lit > before) {
-                    const idx = num_lit - 1;
-                    tans_lit_descs[idx].src_offset += 128;
-                    tans_lit_descs[idx].src_size -|= 128;
-                }
-            }
+            if (lit_type == 6) use_tans32 = true;
         }
         const lit_next = skipStreamHeader(chunk_src, pos);
         if (lit_next == null) continue;
@@ -328,14 +320,8 @@ fn scanForTansChunks(
         const tok_first = chunk_src[pos];
         const tok_type = (tok_first >> 4) & 0x7;
         if (tok_type == 6) {
-            const tok_before = num_tok;
             _ = parseTansHeader(chunk_src, pos, ch.src_offset, chunk_idx, tans_tok_descs, &num_tok);
-            if (num_tok > tok_before) {
-                use_tans32 = true;
-                const tidx = num_tok - 1;
-                tans_tok_descs[tidx].src_offset += 128;
-                tans_tok_descs[tidx].src_size -|= 128;
-            }
+            use_tans32 = true;
         } else if (tok_type == 1 and !use_tans32) {
             _ = parseTansHeader(chunk_src, pos, ch.src_offset, chunk_idx, tans_tok_descs, &num_tok);
         }
@@ -364,14 +350,8 @@ fn scanForTansChunks(
         const hi_first = chunk_src[pos];
         const hi_type = (hi_first >> 4) & 0x7;
         if (hi_type == 1 or hi_type == 6) {
-            const hi_before = num_off16hi;
             _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, chunk_idx * 65536, tans_off16hi_descs, &num_off16hi);
-            if (hi_type == 6 and num_off16hi > hi_before) {
-                use_tans32 = true;
-                const hidx = num_off16hi - 1;
-                tans_off16hi_descs[hidx].src_offset += 128;
-                tans_off16hi_descs[hidx].src_size -|= 128;
-            }
+            if (hi_type == 6) use_tans32 = true;
         } else if (hi_type == 0) {
             // Raw memcpy hi stream: record for H2D copy
             const raw_info = parseType0StreamInfo(chunk_src, pos);
@@ -394,14 +374,8 @@ fn scanForTansChunks(
         const lo_first = chunk_src[pos];
         const lo_type = (lo_first >> 4) & 0x7;
         if (lo_type == 1 or lo_type == 6) {
-            const lo_before = num_off16lo;
             _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, chunk_idx * 65536 + 32768, tans_off16lo_descs, &num_off16lo);
-            if (lo_type == 6 and num_off16lo > lo_before) {
-                use_tans32 = true;
-                const loidx = num_off16lo - 1;
-                tans_off16lo_descs[loidx].src_offset += 128;
-                tans_off16lo_descs[loidx].src_size -|= 128;
-            }
+            if (lo_type == 6) use_tans32 = true;
         } else if (lo_type == 0) {
             // Raw memcpy lo stream: record for H2D copy
             const raw_info = parseType0StreamInfo(chunk_src, pos);
@@ -769,41 +743,41 @@ pub fn fullGpuLaunch(
                     @ptrCast(&bp_comp), @ptrCast(&bp_descs),
                     @ptrCast(&bp_lut), @ptrCast(&bp_meta), @ptrCast(&bp_num),
                 };
-                var build_extra = [_]?*anyopaque{null};
-                const build_rc = launch_fn(tans_build_fn, tans_grid, 1, 1, 32, 2, 1, 0, stream, &build_params, &build_extra);
-                if (build_rc != CUDA_SUCCESS) {
-                    std.debug.print("GPU pipe[{d}]: BUILD launch FAILED rc={d}\n", .{ g, build_rc });
-                    return error.BadMode;
-                }
-
-                // Sync after build to check for errors before decode
-                if (g == 0) {
-                    const build_sync = stream_sync_fn(stream);
-                    if (build_sync != CUDA_SUCCESS) {
-                        std.debug.print("GPU pipe[0]: BUILD sync FAILED rc={d}\n", .{build_sync});
+                if (scan.use_tans32 and tans32_kernel_fn != 0) {
+                    // 32-lane tANS: LUT embedded in payload, no build kernel needed
+                    var tp_comp = d_comp_persist;
+                    var tp_scratch = d_tans_scratch;
+                    var tp_descs = bp_descs;
+                    var tp_status = d_tans_status_persist + @as(u64, ts) * @sizeOf(u32);
+                    var tp_num = tc;
+                    var tans32_params = [_]?*anyopaque{
+                        @ptrCast(&tp_comp), @ptrCast(&tp_scratch),
+                        @ptrCast(&tp_descs), @ptrCast(&tp_status), @ptrCast(&tp_num),
+                    };
+                    var tans32_extra = [_]?*anyopaque{null};
+                    if (launch_fn(tans32_kernel_fn, tans_grid, 1, 1, 32, 2, 1, 0, stream, &tans32_params, &tans32_extra) != CUDA_SUCCESS)
                         return error.BadMode;
-                    }
-                }
+                } else {
+                    // 5-state tANS: build tables then decode
+                    var build_extra = [_]?*anyopaque{null};
+                    if (launch_fn(tans_build_fn, tans_grid, 1, 1, 32, 2, 1, 0, stream, &build_params, &build_extra) != CUDA_SUCCESS)
+                        return error.BadMode;
 
-                // tANS decode
-                var tp_comp = d_comp_persist;
-                var tp_scratch = d_tans_scratch;
-                var tp_descs = bp_descs;
-                var tp_status = d_tans_status_persist + @as(u64, ts) * @sizeOf(u32);
-                var tp_num = tc;
-                var tp_lut = bp_lut;
-                var tp_meta = bp_meta;
-                var tans_params = [_]?*anyopaque{
-                    @ptrCast(&tp_comp), @ptrCast(&tp_scratch),
-                    @ptrCast(&tp_descs), @ptrCast(&tp_status), @ptrCast(&tp_num),
-                    @ptrCast(&tp_lut), @ptrCast(&tp_meta),
-                };
-                var tans_extra = [_]?*anyopaque{null};
-                const pipe_decode_fn: usize = if (scan.use_tans32 and tans32_kernel_fn != 0) tans32_kernel_fn else tans_kernel_fn;
-                const tans_launch_rc = launch_fn(pipe_decode_fn, tans_grid, 1, 1, 32, 2, 1, 0, stream, &tans_params, &tans_extra);
-                if (tans_launch_rc != CUDA_SUCCESS) {
-                    std.debug.print("GPU pipe[{d}]: tANS decode launch FAILED rc={d}\n", .{ g, tans_launch_rc });
-                    return error.BadMode;
+                    var tp_comp = d_comp_persist;
+                    var tp_scratch = d_tans_scratch;
+                    var tp_descs = bp_descs;
+                    var tp_status = d_tans_status_persist + @as(u64, ts) * @sizeOf(u32);
+                    var tp_num = tc;
+                    var tp_lut = bp_lut;
+                    var tp_meta = bp_meta;
+                    var tans_params = [_]?*anyopaque{
+                        @ptrCast(&tp_comp), @ptrCast(&tp_scratch),
+                        @ptrCast(&tp_descs), @ptrCast(&tp_status), @ptrCast(&tp_num),
+                        @ptrCast(&tp_lut), @ptrCast(&tp_meta),
+                    };
+                    var tans_extra = [_]?*anyopaque{null};
+                    if (launch_fn(tans_kernel_fn, tans_grid, 1, 1, 32, 2, 1, 0, stream, &tans_params, &tans_extra) != CUDA_SUCCESS)
+                        return error.BadMode;
                 }
             }
 

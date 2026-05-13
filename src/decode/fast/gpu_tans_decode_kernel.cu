@@ -1381,47 +1381,36 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
     uint8_t*       __restrict__ dst_buf,
     const TansDecChunkDesc* __restrict__ descs,
     uint32_t*      __restrict__ out_status,
-    uint32_t       num_chunks,
-    TansLutEnt*    __restrict__ lut_buf,
-    const TansTableMeta* __restrict__ meta_buf
+    uint32_t       num_chunks
 ) {
     const uint32_t warp_id = threadIdx.y;
     const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
     if (chunk_id >= num_chunks) return;
 
-    const uint32_t* packed_lut = (const uint32_t*)((uint8_t*)lut_buf + (uint64_t)chunk_id * 2048 * sizeof(TansLutEnt));
-    TansLutEnt* my_lut = lut_buf + (uint64_t)chunk_id * 2048;
     const int lane = threadIdx.x & 31;
 
-    // Table must be pre-built by slzTansBuildTablesKernel
-    if (meta_buf == nullptr) {
-        if (lane == 0) out_status[chunk_id] = TANS_ERR_BAD_TABLE;
-        return;
-    }
-
-    uint32_t err = meta_buf[chunk_id].error;
-    if (err != TANS_OK) {
-        if (lane == 0) out_status[chunk_id] = err;
-        return;
-    }
-
-    uint32_t log_table_bits = meta_buf[chunk_id].log_table_bits;
-    uint32_t lut_mask = (1u << log_table_bits) - 1;
+    // Layout: [sizes 64B][states 64B][u16 L][u8 ltb][L×u32 packed LUT][sub-streams]
+    // src_offset points to start of payload (sizes)
+    const uint8_t* payload = src_buf + descs[chunk_id].src_offset;
     uint32_t dst_size = descs[chunk_id].dst_size;
 
-    // Layout: [32×u16 sizes (64B)][32×u16 states (64B)][table][sub-streams]
-    // src_offset points past the 128-byte header to the table (for the build kernel).
-    // Sizes+states are at src_offset - 128.
-    const uint8_t* payload_start = src_buf + descs[chunk_id].src_offset - 128;
+    // Read sizes and states from fixed 128-byte header
+    uint16_t my_sub_size = (uint16_t)payload[lane * 2] | ((uint16_t)payload[lane * 2 + 1] << 8);
+    uint16_t my_init_state = (uint16_t)payload[64 + lane * 2] | ((uint16_t)payload[64 + lane * 2 + 1] << 8);
 
-    // Read sizes and states from the fixed 128-byte header
-    uint16_t my_sub_size = (uint16_t)payload_start[lane * 2] | ((uint16_t)payload_start[lane * 2 + 1] << 8);
-    uint16_t my_init_state = (uint16_t)payload_start[64 + lane * 2] | ((uint16_t)payload_start[64 + lane * 2 + 1] << 8);
+    // Read LUT header
+    uint16_t lut_count = (uint16_t)payload[128] | ((uint16_t)payload[129] << 8);
+    uint32_t log_table_bits = payload[130];
+    uint32_t lut_mask = (1u << log_table_bits) - 1;
 
-    // Sub-stream data follows the table. Use src_after_table_off from build kernel.
-    const uint8_t* sub_data_start = src_buf + meta_buf[chunk_id].src_after_table_off;
+    // Packed LUT is at payload + 131, L×4 bytes
+    const uint32_t* packed_lut = (const uint32_t*)(payload + 131);
+    // Unaligned — use __ldg which handles misalignment
 
-    // Compute sub-stream start offset: sum of sizes for lanes 0..lane-1
+    // Sub-streams follow the LUT
+    const uint8_t* sub_data_start = payload + 131 + (uint32_t)lut_count * 4;
+
+    // Compute sub-stream start offset via warp prefix sum
     uint32_t my_size32 = (uint32_t)my_sub_size;
     uint32_t prefix_sum = my_size32;
     for (int d = 1; d < 32; d <<= 1) {

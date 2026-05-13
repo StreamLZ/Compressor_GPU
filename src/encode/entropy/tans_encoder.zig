@@ -1075,15 +1075,6 @@ pub fn encodeArrayU8Tans32(
         @intFromFloat(cost_left_f);
     if (cost_left < 4) return error.TansNotBeneficial;
 
-    // Emit table header.
-    var table_buf: [512]u8 = @splat(0);
-    var bw = BitWriter64Forward.initBounded(&table_buf, table_buf.len);
-    bw.writeNoFlush(log_table_bits - 8, 3);
-    tansEncodeTable(&bw, log_table_bits, &weights, num_symbols, used_symbols);
-    bw.flush();
-    const table_final_ptr = bw.getFinalPtr();
-    const table_bytes: usize = @intFromPtr(table_final_ptr) - @intFromPtr(&table_buf[0]);
-
     // Build encoding table.
     var te: [256]TansEncEntry = undefined;
     var te_data: [2048]u16 = undefined;
@@ -1091,8 +1082,36 @@ pub fn encodeArrayU8Tans32(
 
     const L: u32 = @as(u32, 1) << @intCast(log_table_bits);
 
+    // Build decode LUT from weights, then pack to 4-byte entries.
+    // This embeds the pre-built LUT in the compressed data so the GPU
+    // skips table parsing + LUT construction entirely.
+    const tans_dec = @import("../../decode/entropy/tans_decoder.zig");
+    var tans_data: tans_dec.TansData = .{};
+    for (0..num_symbols) |i| {
+        if (weights[i] == 1) {
+            tans_data.a[tans_data.a_used] = @intCast(i);
+            tans_data.a_used += 1;
+        } else if (weights[i] >= 2) {
+            tans_data.b[tans_data.b_used] = (@as(u32, @intCast(i)) << 16) | weights[i];
+            tans_data.b_used += 1;
+        }
+    }
+    var lut_entries: [2048]tans_dec.TansLutEnt = undefined;
+    tans_dec.initLut(&tans_data, log_table_bits, &lut_entries) catch return error.TansNotBeneficial;
+
+    // Pack to 4-byte: (bits_x << 24) | (symbol << 16) | w
+    var packed_lut: [2048]u32 = undefined;
+    for (0..L) |i| {
+        packed_lut[i] = (@as(u32, lut_entries[i].bits_x) << 24) |
+            (@as(u32, lut_entries[i].symbol) << 16) |
+            @as(u32, lut_entries[i].w);
+    }
+
+    const lut_data_bytes: usize = L * 4; // packed LUT size
+    const lut_header_bytes: usize = 3; // u16 lut_entries + u8 log_table_bits
+
     // Encode 32 sub-streams. Each lane gets symbols at stride 32.
-    const header_size: usize = 128 + table_bytes; // 32×u16 sizes (64) + 32×u16 states (64) + table
+    const header_size: usize = 128 + lut_header_bytes + lut_data_bytes; // sizes(64) + states(64) + lut_header(3) + lut_data
     var sub_sizes: [32]u16 = @splat(0);
     var sub_states: [32]u16 = @splat(0);
 
@@ -1201,9 +1220,17 @@ pub fn encodeArrayU8Tans32(
         wp += 2;
     }
 
-    // Table
-    @memcpy(dst[wp..][0..table_bytes], table_buf[0..table_bytes]);
-    wp += table_bytes;
+    // LUT header: u16 LE entry count + u8 log_table_bits
+    std.mem.writeInt(u16, dst[wp..][0..2], @intCast(L), .little);
+    wp += 2;
+    dst[wp] = @intCast(log_table_bits);
+    wp += 1;
+
+    // Packed LUT: L × u32 LE
+    for (0..L) |i| {
+        std.mem.writeInt(u32, dst[wp..][0..4], packed_lut[i], .little);
+        wp += 4;
+    }
 
     // Sub-stream data
     for (0..32) |lane| {

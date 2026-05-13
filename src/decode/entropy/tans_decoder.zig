@@ -789,70 +789,56 @@ pub fn highDecodeTans32(
 ) DecodeError!usize {
     if (src_size < 100 or dst_size < 32) return error.SourceTruncated;
 
-    const src_end_orig: [*]const u8 = src_in + src_size;
+    // Layout: [sizes 64B][states 64B][u16 L][u8 ltb][L×u32 packed LUT][sub-streams]
+    if (src_size < 131) return error.SourceTruncated;
 
-    // Layout: [32×u16 sizes (64B)][32×u16 states (64B)][table][sub-streams]
-    if (src_size < 132) return error.SourceTruncated;
-
-    // Sizes and states are at the start
     const sizes_ptr: [*]const u8 = src_in;
     const states_ptr: [*]const u8 = src_in + 64;
-    const table_start: [*]const u8 = src_in + 128;
 
-    var br: brl.BitReaderState = .{
-        .p = table_start,
-        .p_end = src_end_orig,
-        .bits = 0,
-        .bit_pos = 24,
-    };
-    brl.bitReaderRefill(&br);
-    if (brl.bitReaderReadBitNoRefill(&br) != 0) return error.BadTableFormat;
-    const log_table_bits: u32 = brl.bitReaderReadBitsNoRefill(&br, 2) + 8;
-
-    var tans_data: TansData = .{};
-    try decodeTable(&br, log_table_bits, &tans_data);
-
-    // Sub-streams follow the table. Use the bit reader's post-table position.
-    const post_table: [*]const u8 = br.p - @as(usize, @intCast(@divTrunc(24 - br.bit_pos, 8)));
-
-    // Validate table weights
+    // Read LUT header
+    const lut_count: u32 = @as(u32, src_in[128]) | (@as(u32, src_in[129]) << 8);
+    const log_table_bits: u32 = src_in[130];
+    if (log_table_bits < 8 or log_table_bits > 11) return error.BadTableFormat;
     const l_int: i32 = @as(i32, 1) << @intCast(log_table_bits);
-    const a_used: i32 = @intCast(tans_data.a_used);
-    const b_used: i32 = @intCast(tans_data.b_used);
-    if (a_used < 0 or a_used > l_int or b_used < 0 or b_used > 256) return error.BadTableWeights;
-    var weight_sum: i32 = a_used;
-    for (0..tans_data.b_used) |i| {
-        const w: i32 = @intCast(tans_data.b[i] & 0xFFFF);
-        if (w < 2 or w > l_int) return error.BadTableWeights;
-        weight_sum += w;
-    }
-    if (weight_sum != l_int) return error.BadTableWeights;
+    if (lut_count != @as(u32, @intCast(l_int))) return error.BadTableWeights;
 
-    // Build LUT in scratch
+    // Read packed LUT and unpack to TansLutEnt
+    const packed_lut_ptr: [*]const u8 = src_in + 131;
+    const lut_data_bytes: usize = lut_count * 4;
+    if (131 + lut_data_bytes > src_size) return error.SourceTruncated;
+
+    // Sub-streams follow the packed LUT
+    const sub_data_base: [*]const u8 = packed_lut_ptr + lut_data_bytes;
+
+    // Unpack LUT into scratch
     const lut_required: usize = @as(usize, @intCast(l_int)) * @sizeOf(TansLutEnt);
     const scratch_addr = @intFromPtr(scratch);
     const aligned_addr = (scratch_addr + 15) & ~@as(usize, 15);
     if (aligned_addr + lut_required > @intFromPtr(scratch_end)) return error.SourceTruncated;
     const aligned_lut: [*]TansLutEnt = @ptrFromInt(aligned_addr);
 
-    try initLut(&tans_data, log_table_bits, aligned_lut);
+    // Unpack packed u32 entries to TansLutEnt
+    for (0..@as(usize, lut_count)) |i| {
+        const pval = std.mem.readInt(u32, (packed_lut_ptr + i * 4)[0..4], .little);
+        aligned_lut[i] = .{
+            .bits_x = @intCast((pval >> 24) & 0xFF),
+            .symbol = @intCast((pval >> 16) & 0xFF),
+            .w = @intCast(pval & 0xFFFF),
+            .x = (@as(u32, 1) << @intCast((pval >> 24) & 0x1F)) - 1,
+        };
+    }
 
     const l_mask: u32 = (@as(u32, 1) << @intCast(log_table_bits)) - 1;
 
-    // Read 32×u16 sub-stream sizes from fixed header at start
     var sub_sizes: [32]u16 = undefined;
     for (0..32) |lane| {
         sub_sizes[lane] = std.mem.readInt(u16, (sizes_ptr + lane * 2)[0..2], .little);
     }
 
-    // Read 32×u16 initial decode states from fixed header
     var sub_states: [32]u16 = undefined;
     for (0..32) |lane| {
         sub_states[lane] = std.mem.readInt(u16, (states_ptr + lane * 2)[0..2], .little);
     }
-
-    // Sub-streams start after table (use bit reader's post-table position)
-    const sub_data_base: [*]const u8 = post_table;
 
     // Compute sub-stream offsets
     var sub_offsets: [32]usize = undefined;
