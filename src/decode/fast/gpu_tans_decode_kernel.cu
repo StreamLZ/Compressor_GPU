@@ -1450,15 +1450,6 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
     const uint8_t* ptr = my_src + 4;
     const uint8_t* ptr_end = my_src + my_sub_size;
 
-    // Debug: first chunk, lane 0, first 3 symbols
-    if (chunk_id == 0 && lane == 0) {
-        printf("T32 GPU lane0: init_state=%u ltb=%u lut_mask=%u sub_size=%u sym_count=%u\n",
-               my_init_state, log_table_bits, lut_mask, my_sub_size, my_sym_count);
-        printf("T32 GPU lane0: first 8 src bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-               my_src[0], my_src[1], my_src[2], my_src[3], my_src[4], my_src[5], my_src[6], my_src[7]);
-        printf("T32 GPU lane0: bits=0x%08x bitpos=%d\n", bits, bitpos);
-    }
-
     // Decode loop: each lane decodes its symbols, writing interleaved
     for (uint32_t i = 0; i < my_sym_count; i++) {
         // Refill when low on bits
@@ -1484,11 +1475,6 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
         state = ((uint32_t)(bits & (uint64_t)x) + w) & lut_mask;
         bits >>= bits_x;
         bitpos -= (int32_t)bits_x;
-
-        if (chunk_id == 0 && lane == 0 && i < 3) {
-            printf("T32 GPU lane0 sym[%u]: state_in=%u packed=0x%08x bits_x=%u sym=%u('%c') w=%u read_bits=%u new_state=%u\n",
-                   i, (i==0) ? (uint32_t)my_init_state & lut_mask : state, packed, bits_x, sym, sym, w, (uint32_t)(bits & x), state);
-        }
 
         // Write interleaved: position i*32 + lane
         dst_base[i * 32 + lane] = sym;

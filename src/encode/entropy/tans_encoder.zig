@@ -1084,15 +1084,6 @@ pub fn encodeArrayU8Tans32(
     const table_final_ptr = bw.getFinalPtr();
     const table_bytes: usize = @intFromPtr(table_final_ptr) - @intFromPtr(&table_buf[0]);
 
-    // Debug: print table_bytes for first few encodes
-    {
-        const S = struct { var count: u32 = 0; };
-        if (S.count < 3) {
-            std.debug.print("TANS32 ENC: table_bytes={d} ltb={d} used_syms={d}\n", .{ table_bytes, log_table_bits, used_symbols });
-            S.count += 1;
-        }
-    }
-
     // Build encoding table.
     var te: [256]TansEncEntry = undefined;
     var te_data: [2048]u16 = undefined;
@@ -1186,16 +1177,6 @@ pub fn encodeArrayU8Tans32(
         sub_states[lane] = @intCast(state & (L - 1));
         total_compressed += wp_local;
 
-        // Debug first encode, lanes around the problem area
-        {
-            const S = struct { var call_count: u32 = 0; };
-            if (S.call_count == 0 and (lane >= 24 and lane <= 28)) {
-                std.debug.print("ENC lane{d}: state={d} masked={d} sub_size={d} lane_count={d} first_sym={d}('{c}')\n", .{
-                    lane, state, state & (L - 1), wp_local, lane_count, src[lane], src[lane],
-                });
-            }
-            if (lane == 31) S.call_count += 1;
-        }
     }
 
     const total_size: usize = header_size + total_compressed;

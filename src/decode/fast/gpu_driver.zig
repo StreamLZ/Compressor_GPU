@@ -364,9 +364,14 @@ fn scanForTansChunks(
         const hi_first = chunk_src[pos];
         const hi_type = (hi_first >> 4) & 0x7;
         if (hi_type == 1 or hi_type == 6) {
-            if (hi_type == 6) use_tans32 = true;
-            // tANS-encoded hi stream: dst goes to chunk_idx * 65536 (first half)
+            const hi_before = num_off16hi;
             _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, chunk_idx * 65536, tans_off16hi_descs, &num_off16hi);
+            if (hi_type == 6 and num_off16hi > hi_before) {
+                use_tans32 = true;
+                const hidx = num_off16hi - 1;
+                tans_off16hi_descs[hidx].src_offset += 128;
+                tans_off16hi_descs[hidx].src_size -|= 128;
+            }
         } else if (hi_type == 0) {
             // Raw memcpy hi stream: record for H2D copy
             const raw_info = parseType0StreamInfo(chunk_src, pos);
@@ -389,8 +394,14 @@ fn scanForTansChunks(
         const lo_first = chunk_src[pos];
         const lo_type = (lo_first >> 4) & 0x7;
         if (lo_type == 1 or lo_type == 6) {
-            if (lo_type == 6) use_tans32 = true;
+            const lo_before = num_off16lo;
             _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, chunk_idx * 65536 + 32768, tans_off16lo_descs, &num_off16lo);
+            if (lo_type == 6 and num_off16lo > lo_before) {
+                use_tans32 = true;
+                const loidx = num_off16lo - 1;
+                tans_off16lo_descs[loidx].src_offset += 128;
+                tans_off16lo_descs[loidx].src_size -|= 128;
+            }
         } else if (lo_type == 0) {
             // Raw memcpy lo stream: record for H2D copy
             const raw_info = parseType0StreamInfo(chunk_src, pos);
@@ -443,7 +454,7 @@ fn skipStreamHeader(chunk_src: []const u8, pos: u32) ?u32 {
             const sz: u32 = (@as(u32, chunk_src[pos]) << 16) | (@as(u32, chunk_src[pos + 1]) << 8) | @as(u32, chunk_src[pos + 2]);
             return pos + 3 + sz;
         }
-    } else if (ct == 1 or ct == 2 or ct == 4) {
+    } else if (ct == 1 or ct == 2 or ct == 4 or ct == 6) {
         // tANS (1) or Huffman (2, 4): 3 or 5 byte header + compressed payload
         if (first_byte >= 0x80) {
             if (pos + 3 > chunk_src.len) return null;
@@ -624,9 +635,6 @@ pub fn fullGpuLaunch(
     var merged_count: u32 = 0;
     var scan: ScanResult = .{ .num_lit = 0, .num_tok = 0, .num_off16hi = 0, .num_off16lo = 0, .num_raw_off16 = 0 };
 
-    std.debug.print("GPU: fullGpuLaunch chunks={d} comp={d} decomp={d} groups={d} cpg={d} sc_cap={d}\n", .{ chunk_descs.len, compressed_block.len, decompressed_size, num_groups, chunks_per_group, sub_chunk_cap });
-    std.debug.print("GPU: tans_kernel_fn={d} tans_build_fn={d} tans32_kernel_fn={d} kernel_fn={d}\n", .{ tans_kernel_fn, tans_build_fn, tans32_kernel_fn, kernel_fn });
-
     if (tans_kernel_fn != 0) {
         const max_tans = @min(chunk_descs.len, tans_host_buf.len);
 
@@ -641,9 +649,6 @@ pub fn fullGpuLaunch(
             &raw_off16_buf,
         );
 
-        std.debug.print("GPU scan: lit={d} tok={d} off16hi={d} off16lo={d} raw={d} tans32={}\n", .{ scan.num_lit, scan.num_tok, scan.num_off16hi, scan.num_off16lo, scan.num_raw_off16, scan.use_tans32 });
-        if (scan.num_lit > 0) std.debug.print("GPU scan: lit[0].src_off={d} src_size={d}\n", .{ tans_host_buf[0].src_offset, tans_host_buf[0].src_size });
-
         // Upload raw (type 0) off16 sub-streams to GPU (before timer)
         for (0..scan.num_raw_off16) |ri| {
             const rd = raw_off16_buf[ri];
@@ -656,8 +661,6 @@ pub fn fullGpuLaunch(
     // ── Pipeline: split into N groups, overlap tANS with LZ ───
     const total_chunks: u32 = @intCast(chunk_descs.len);
     const use_pipeline = pipeline_streams_created and tans_kernel_fn != 0 and tans_build_fn != 0 and total_chunks >= NUM_PIPELINE_STREAMS;
-    std.debug.print("GPU: use_pipeline={} total_chunks={d} merged_tans={d}\n", .{ use_pipeline, total_chunks, merged_count });
-
     if (use_pipeline) {
         // Merge tANS descriptors grouped by pipeline stage
         // Pipeline group g handles chunks [g*pipe_chunk_count .. (g+1)*pipe_chunk_count)
@@ -714,19 +717,6 @@ pub fn fullGpuLaunch(
             }
 
             group_tans_count[g] = merged_count - group_tans_start[g];
-        }
-
-        std.debug.print("GPU pipeline: merged_count={d} groups=[{d},{d},{d},{d}]\n", .{ merged_count, group_tans_count[0], group_tans_count[1], group_tans_count[2], group_tans_count[3] });
-
-        // Dump first 3 merged descriptors
-        for (0..@min(merged_count, 3)) |di| {
-            const d = merged_buf[di];
-            std.debug.print("  desc[{d}]: src_off={d} src_size={d} dst_off={d} dst_size={d}\n", .{ di, d.src_offset, d.src_size, d.dst_offset, d.dst_size });
-            // Show what's at src_offset in the compressed block
-            if (d.src_offset + 16 <= compressed_block.len) {
-                const p = compressed_block[d.src_offset..];
-                std.debug.print("  data@src: {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{ p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15] });
-            }
         }
 
         // Upload ALL merged tANS descriptors at once (single H2D before timer)
@@ -793,7 +783,6 @@ pub fn fullGpuLaunch(
                         std.debug.print("GPU pipe[0]: BUILD sync FAILED rc={d}\n", .{build_sync});
                         return error.BadMode;
                     }
-                    std.debug.print("GPU pipe[0]: BUILD sync OK, launching decode\n", .{});
                 }
 
                 // tANS decode
@@ -860,40 +849,6 @@ pub fn fullGpuLaunch(
                 std.debug.print("GPU pipe[{d}]: stream sync FAILED rc={d}\n", .{ g, sync_rc });
                 return error.BadMode;
             }
-        }
-
-        // Debug: read back tANS metadata for first descriptor
-        if (d_tans_meta != 0) {
-            var meta_peek: [4]u32 = undefined;
-            _ = d2h_fn(@ptrCast(&meta_peek), d_tans_meta, 16);
-            _ = sync_fn();
-            std.debug.print("GPU meta[0]: after_table_off={d} src_end_off={d} ltb={d} err={d}\n", .{ meta_peek[0], meta_peek[1], meta_peek[2], meta_peek[3] });
-        }
-
-        // Debug: read back tANS status + first decoded bytes from scratch
-        if (merged_count > 0 and d_tans_status_persist != 0) {
-            var status_peek: [8]u32 = undefined;
-            const peek_count: usize = @min(@as(usize, merged_count), 8);
-            _ = d2h_fn(@ptrCast(&status_peek), d_tans_status_persist, peek_count * 4);
-            _ = sync_fn();
-            std.debug.print("GPU tANS status[0..{d}]: ", .{peek_count});
-            for (0..peek_count) |si| std.debug.print("{d} ", .{status_peek[si]});
-            std.debug.print("\n", .{});
-
-            // Read first 32 bytes of tANS scratch (decoded literals for chunk 0)
-            var scratch_peek: [32]u8 = undefined;
-            _ = d2h_fn(@ptrCast(&scratch_peek), d_tans_scratch, 32);
-            _ = sync_fn();
-            std.debug.print("GPU scratch[0..32]: ", .{});
-            for (0..32) |si| std.debug.print("{x:0>2} ", .{scratch_peek[si]});
-            std.debug.print("\n", .{});
-            // Show as ASCII
-            std.debug.print("GPU scratch ASCII: ", .{});
-            for (0..32) |si| {
-                const c = scratch_peek[si];
-                if (c >= 32 and c < 127) std.debug.print("{c}", .{c}) else std.debug.print(".", .{});
-            }
-            std.debug.print("\n", .{});
         }
 
         if (t_before_kern) |t_start| {
@@ -992,7 +947,6 @@ pub fn fullGpuLaunch(
                     };
                     var tans_extra = [_]?*anyopaque{null};
                     const decode_fn_to_use: usize = if (scan.use_tans32 and tans32_kernel_fn != 0) tans32_kernel_fn else tans_kernel_fn;
-                    std.debug.print("GPU tANS: {d} descs, grid={d}, use_tans32={}, tans32_fn={d}\n", .{ tans_count, tans_grid, scan.use_tans32, tans32_kernel_fn });
                     if (launch_fn(decode_fn_to_use, tans_grid, 1, 1, 32, 2, 1, 0, 0, &tans_params, &tans_extra) != CUDA_SUCCESS)
                         return error.BadMode;
                 }
