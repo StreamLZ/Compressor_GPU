@@ -64,8 +64,8 @@ var cuMemcpyHtoDAsync_fn: ?FnMemcpyHtoDAsync = null;
 var cuMemsetD8Async_fn: ?FnMemsetD8Async = null;
 
 // Pipeline streams (persistent, created once in init)
-const NUM_PIPELINE_STREAMS = 4;
-var pipeline_streams: [NUM_PIPELINE_STREAMS]usize = .{ 0, 0, 0, 0 };
+const NUM_PIPELINE_STREAMS = 1;
+var pipeline_streams: [16]usize = .{0} ** 16;
 var pipeline_streams_created = false;
 
 fn getProc(comptime T: type, name: [*:0]const u8) ?T {
@@ -667,8 +667,8 @@ pub fn fullGpuLaunch(
         const pipe_chunk_count = (total_chunks + NUM_PIPELINE_STREAMS - 1) / NUM_PIPELINE_STREAMS;
 
         var merged_buf: [4096 * 4]TansDecChunkDesc = undefined;
-        var group_tans_start: [NUM_PIPELINE_STREAMS]u32 = .{ 0, 0, 0, 0 };
-        var group_tans_count: [NUM_PIPELINE_STREAMS]u32 = .{ 0, 0, 0, 0 };
+        var group_tans_start: [16]u32 = .{0} ** 16;
+        var group_tans_count: [16]u32 = .{0} ** 16;
         merged_count = 0;
 
         // For each pipeline group, collect all tANS descriptors belonging to its chunks
