@@ -740,14 +740,15 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
     uint32_t sub_chunk_cap,
     uint8_t* __restrict__ tans_scratch,
     uint8_t* __restrict__ tans_tok_scratch,
-    uint8_t* __restrict__ tans_off16_scratch
+    uint8_t* __restrict__ tans_off16_scratch,
+    uint32_t chunk_base
 ) {
     // 2 warps per block: warp 0 = threadIdx.y==0, warp 1 = threadIdx.y==1
     const uint32_t warp_id = threadIdx.y;
     const uint32_t group_id = blockIdx.x * 2 + warp_id;
     const int lane = threadIdx.x & 31;
     if (group_id >= (total_chunks + chunks_per_group - 1) / chunks_per_group) return;
-    const uint32_t base_chunk = group_id * chunks_per_group;
+    const uint32_t base_chunk = chunk_base + group_id * chunks_per_group;
 
     for (uint32_t c = 0; c < chunks_per_group; c++) {
         uint32_t chunk_idx = base_chunk + c;
