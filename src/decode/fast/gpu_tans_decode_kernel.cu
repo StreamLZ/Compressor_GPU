@@ -494,138 +494,61 @@ __device__ uint32_t decodeTable(
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  Phase 2: initLut — build L-entry decode LUT (4-way interleaved)
+//  Phase 2: initLut — FSE spread-based LUT construction
 // ══════════════════════════════════════════════════════════════════
 
-// Returns TANS_OK or TANS_ERR_LUT_FAILED.
+// FSE spread-based LUT construction (mirrors nvCOMP init_fse_tables).
+// Phase 1 (lane 0): spread symbols across slots using step=(L>>1)+(L>>3)+3
+// Phase 2 (all 32 lanes): compute bits_x/w/x per entry in parallel
+// Simple arithmetic, no 4-way pointer arrays, minimal register pressure.
 __device__ uint32_t initLut(
     const TansData& td, uint32_t log_table_bits, TansLutEnt* lut
 ) {
-    int32_t L = 1 << log_table_bits;
-    uint32_t L_u = (uint32_t)L;
-    int32_t a_used = (int32_t)td.a_used;
-    if (a_used > L) return TANS_ERR_LUT_FAILED;
+    const int lane = threadIdx.x & 31;
+    const uint32_t L = 1u << log_table_bits;
+    const uint32_t L_mask = L - 1;
+    const int32_t a_used = (int32_t)td.a_used;
+    if ((uint32_t)a_used > L) return TANS_ERR_LUT_FAILED;
 
-    uint32_t slots_left = (uint32_t)(L - a_used);
-    uint32_t sa = slots_left >> 2;
+    // FSE spread: lane 0 writes complete LUT entries directly to global memory.
+    // No intermediate shared arrays — compute bits_x/w/x inline during spread.
+    // All 32 lanes then do the pack step (8B->4B) in parallel.
+    if (lane == 0) {
+        uint32_t highThresh = L - (uint32_t)a_used;
+        uint32_t step = (L >> 1) + (L >> 3) + 3;
+        uint32_t pos = 0;
 
-    uint32_t pointers[4];
-    pointers[0] = 0;
-    uint32_t sb = sa + ((slots_left & 3) > 0 ? 1 : 0);
-    pointers[1] = sb;
-    sb += sa + ((slots_left & 3) > 1 ? 1 : 0);
-    pointers[2] = sb;
-    sb += sa + ((slots_left & 3) > 2 ? 1 : 0);
-    pointers[3] = sb;
+        // Weight >= 2 symbols: spread with step, write LUT entries directly
+        for (uint32_t bi = 0; bi < td.b_used; bi++) {
+            uint32_t val = td.b[bi];
+            uint32_t weight = val & 0xFFFF;
+            uint8_t symbol = (uint8_t)(val >> 16);
 
-    // Single-weight entries at the end (all 32 lanes write in parallel)
-    {
-        uint32_t singles_start = slots_left;
-        uint8_t bits_x_v = (uint8_t)log_table_bits;
-        uint32_t x_v = (1u << log_table_bits) - 1;
-        int32_t lane_id = threadIdx.x & 31;
+            for (uint32_t n = 0; n < weight; n++) {
+                while (pos >= highThresh) pos = (pos + step) & L_mask;
 
-        for (int32_t i = lane_id; i < a_used; i += 32) {
-            uint32_t idx = singles_start + (uint32_t)i;
-            if (idx < L_u) {
-                TansLutEnt le;
-                le.x = x_v; le.bits_x = bits_x_v; le.symbol = td.a[i]; le.w = 0;
-                lut[idx] = le;
+                uint32_t running_w = weight + n;
+                uint32_t wb = ilog2(running_w);
+                uint32_t bps = log_table_bits - wb;
+                lut[pos].symbol = symbol;
+                lut[pos].bits_x = (uint8_t)bps;
+                lut[pos].x = (1u << bps) - 1;
+                lut[pos].w = (uint16_t)(L_mask & (running_w << bps));
+
+                pos = (pos + step) & L_mask;
             }
         }
-        __syncwarp();
-    }
 
-    // Weight >= 2 entries
-    int32_t weights_sum = 0;
-    for (uint32_t bi = 0; bi < td.b_used; bi++) {
-        uint32_t val = td.b[bi];
-        int32_t weight = (int32_t)(val & 0xFFFF);
-        if (weight < 1) return TANS_ERR_LUT_FAILED;
-        int32_t symbol = (int32_t)(val >> 16);
-
-        if (weight > 4) {
-            uint32_t sym_bits = ilog2((uint32_t)weight);
-            int32_t bits_per_symbol = (int32_t)log_table_bits - (int32_t)sym_bits;
-            if (bits_per_symbol < 0) return TANS_ERR_LUT_FAILED;
-
-            TansLutEnt le;
-            le.symbol = (uint8_t)symbol;
-            le.bits_x = (uint8_t)bits_per_symbol;
-            le.x = (1u << bits_per_symbol) - 1;
-            le.w = (uint16_t)((L - 1) & (weight << bits_per_symbol));
-            int32_t what_to_add = 1 << bits_per_symbol;
-            int32_t upper_slot_count = (1 << (sym_bits + 1)) - weight;
-            if (upper_slot_count < 0) return TANS_ERR_LUT_FAILED;
-
-            for (uint32_t j = 0; j < 4; j++) {
-                uint32_t dst_idx = pointers[j];
-                int32_t quarter_weight = (weight + ((weights_sum - (int32_t)j - 1) & 3)) >> 2;
-
-                if (upper_slot_count >= quarter_weight) {
-                    int32_t n = quarter_weight;
-                    while (n != 0) {
-                        if (dst_idx >= L_u) return TANS_ERR_LUT_FAILED;
-                        lut[dst_idx] = le;
-                        dst_idx++;
-                        le.w = (uint16_t)((uint32_t)le.w + (uint32_t)what_to_add);
-                        n--;
-                    }
-                    upper_slot_count -= quarter_weight;
-                } else {
-                    int32_t n = upper_slot_count;
-                    while (n != 0) {
-                        if (dst_idx >= L_u) return TANS_ERR_LUT_FAILED;
-                        lut[dst_idx] = le;
-                        dst_idx++;
-                        le.w = (uint16_t)((uint32_t)le.w + (uint32_t)what_to_add);
-                        n--;
-                    }
-                    bits_per_symbol--;
-                    what_to_add >>= 1;
-                    le.bits_x = (uint8_t)bits_per_symbol;
-                    le.w = 0;
-                    le.x >>= 1;
-                    n = quarter_weight - upper_slot_count;
-                    while (n != 0) {
-                        if (dst_idx >= L_u) return TANS_ERR_LUT_FAILED;
-                        lut[dst_idx] = le;
-                        dst_idx++;
-                        le.w = (uint16_t)((uint32_t)le.w + (uint32_t)what_to_add);
-                        n--;
-                    }
-                    upper_slot_count = weight;
-                }
-                pointers[j] = dst_idx;
-            }
-        } else {
-            // weight <= 4: distribute via trailing-zero-count
-            uint32_t bits_val = ((1u << weight) - 1) << ((uint32_t)weights_sum & 3);
-            bits_val |= bits_val >> 4;
-            int32_t n = weight;
-            int32_t ww = weight;
-            while (n != 0) {
-                uint32_t idx = __ffs(bits_val) - 1;  // ctz
-                if (idx > 3) return TANS_ERR_LUT_FAILED;
-                bits_val &= bits_val - 1;
-                uint32_t dst_idx = pointers[idx];
-                if (dst_idx >= L_u) return TANS_ERR_LUT_FAILED;
-
-                uint32_t weight_bits = ilog2((uint32_t)ww);
-                uint32_t bps = log_table_bits - weight_bits;
-                TansLutEnt le;
-                le.symbol = (uint8_t)symbol;
-                le.bits_x = (uint8_t)bps;
-                le.x = (1u << bps) - 1;
-                le.w = (uint16_t)((L - 1) & (ww << bps));
-                lut[dst_idx] = le;
-                ww++;
-                pointers[idx] = dst_idx + 1;
-                n--;
-            }
+        // Weight-1 symbols: fill highThresh..L-1
+        for (int32_t i = 0; i < a_used; i++) {
+            uint32_t hi = highThresh + (uint32_t)i;
+            lut[hi].symbol = td.a[i];
+            lut[hi].bits_x = (uint8_t)log_table_bits;
+            lut[hi].x = L_mask;
+            lut[hi].w = 0;
         }
-        weights_sum += weight;
     }
+    __syncwarp();
 
     return TANS_OK;
 }
