@@ -373,6 +373,108 @@ pub fn tansInitTable(
     }
 }
 
+/// FSE spread version of tansInitTable. Uses the same slot distribution as
+/// the GPU's initLut (step = (L>>1) + (L>>3) + 3), so encoder and decoder
+/// agree on the table layout. Used for type-6 GPU streams.
+pub fn tansInitTableFseSpread(
+    te: *[256]TansEncEntry,
+    te_data: []u16,
+    weights: []const u32,
+    num_symbols: usize,
+    log_table_bits: u32,
+) void {
+    std.debug.assert(num_symbols <= 256);
+    const L: u32 = @as(u32, 1) << @intCast(log_table_bits);
+    const L_mask: u32 = L - 1;
+    std.debug.assert(te_data.len >= L);
+
+    // Count weight-1 symbols
+    var ones: u32 = 0;
+    for (0..num_symbols) |i| {
+        if (weights[i] == 1) ones += 1;
+    }
+
+    const high_threshold: u32 = L - ones;
+    const step: u32 = (L >> 1) + (L >> 3) + 3;
+
+    // Phase 1: Build slot_to_decode_state mapping using FSE spread.
+    // For each slot position, compute the decode state = L + slot_position.
+    // The te_data array maps (symbol's cumulative index) → decode state.
+
+    // First, spread symbols to get position → symbol mapping
+    var slot_symbol: [2048]u8 = undefined;
+    var slot_state_pos: [2048]u16 = undefined; // running position within symbol
+    var pos: u32 = 0;
+
+    // Weight >= 2 symbols: spread using step function
+    for (0..num_symbols) |i| {
+        const w = weights[i];
+        if (w <= 1) continue;
+        var n: u32 = 0;
+        while (n < w) : (n += 1) {
+            while (pos >= high_threshold) pos = (pos +% step) & L_mask;
+            slot_symbol[pos] = @intCast(i);
+            slot_state_pos[pos] = @intCast(n);
+            pos = (pos +% step) & L_mask;
+        }
+    }
+
+    // Weight-1 symbols fill highThreshold..L-1
+    var hi_pos: u32 = high_threshold;
+    for (0..num_symbols) |i| {
+        if (weights[i] == 1) {
+            slot_symbol[hi_pos] = @intCast(i);
+            slot_state_pos[hi_pos] = 0;
+            hi_pos += 1;
+        }
+    }
+
+    // Phase 2: Build encode table from the spread.
+    // For each symbol, te_data[cumulative_offset + state_pos] = decode_state
+    // where decode_state = L + slot_position.
+
+    // Compute te entries and cumulative start offsets per symbol.
+    // te_data_start[sym] = index in te_data where this symbol's entries begin.
+    var te_data_start: [256]u32 = @splat(0);
+    var running: u32 = 0;
+    for (0..num_symbols) |i| {
+        const w = weights[i];
+        if (w == 0) {
+            te[i].base_offset = 0;
+            te[i].thres = 0;
+            te[i].num_bits = 0;
+            continue;
+        }
+        te_data_start[i] = running;
+        if (w == 1) {
+            te[i].num_bits = @intCast(log_table_bits);
+            te[i].thres = @intCast(2 * L);
+            // base_offset set below after filling te_data
+        } else {
+            const w_minus_1: u32 = w - 1;
+            const num_bits_high: u32 = 31 - @clz(w_minus_1) + 1;
+            te[i].num_bits = @intCast(log_table_bits - num_bits_high);
+            te[i].thres = @intCast((2 * w) << @intCast(log_table_bits - num_bits_high));
+            te[i].base_offset = @as(i32, @intCast(running)) - @as(i32, @intCast(w));
+        }
+        running += w;
+    }
+
+    // Fill te_data from the spread positions.
+    // For each slot, te_data[start + state_pos] = L + slot.
+    for (0..L) |slot| {
+        const sym = slot_symbol[slot];
+        const state_pos = slot_state_pos[slot];
+        const w = weights[sym];
+        const idx: usize = te_data_start[sym] + state_pos;
+        te_data[idx] = @intCast(L + @as(u32, @intCast(slot)));
+
+        if (w == 1) {
+            te[sym].base_offset = @intCast(@as(i64, @intCast(idx)) - 1);
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────
 //  Encode bit-count dry run
 // ────────────────────────────────────────────────────────────
@@ -1165,7 +1267,8 @@ pub fn encodeArrayU8Tans32(
     // Build encoding table
     var te: [256]TansEncEntry = undefined;
     var te_data: [2048]u16 = undefined;
-    tansInitTable(&te, &te_data, &weights, num_symbols, log_table_bits);
+    // Use FSE spread distribution to match GPU decoder's initLut
+    tansInitTableFseSpread(&te, &te_data, &weights, num_symbols, log_table_bits);
 
     const L: u32 = @as(u32, 1) << @intCast(log_table_bits);
 
