@@ -494,6 +494,90 @@ __device__ uint32_t decodeTable(
 }
 
 // ══════════════════════════════════════════════════════════════════
+//  FSE-style probability decoder (type 6 only)
+//  Reads: [u8 log_table_bits] [bit-packed probabilities]
+//  No arrays needed — streaming decode, ~10 registers.
+// ══════════════════════════════════════════════════════════════════
+
+__device__ uint32_t decodeFseTable(
+    const uint8_t* src, uint32_t src_size,
+    TansData& td, uint32_t& log_table_bits_out,
+    const uint8_t*& src_after_table
+) {
+    if (src_size < 2) return TANS_ERR_SRC_TRUNCATED;
+
+    uint32_t log_table_bits = src[0];
+    if (log_table_bits < 8 || log_table_bits > 11)
+        return TANS_ERR_BAD_LOG_BITS;
+    log_table_bits_out = log_table_bits;
+
+    int32_t L = 1 << log_table_bits;
+    int32_t remaining = L;
+
+    td.a_used = 0;
+    td.b_used = 0;
+
+    // Read bit-packed probabilities starting at byte 1
+    const uint8_t* data = src + 1;
+    uint32_t bit_offset = 0;
+    uint32_t sym = 0;
+
+    while (remaining > 0 && sym < 256) {
+        // Variable-width code: num_bits = floor(log2(remaining+1)) + 1
+        uint32_t rem1 = (uint32_t)(remaining + 1);
+        uint32_t log2_rem = (rem1 > 1) ? (31 - __clz(rem1)) : 0;
+        uint32_t nb = log2_rem + 1;
+        uint32_t threshold = (1u << nb) - 1 - (uint32_t)remaining;
+
+        // Read nb bits from bitstream (with bounds check)
+        uint32_t byte_idx = bit_offset >> 3;
+        uint32_t bit_idx = bit_offset & 7;
+        if (byte_idx + 3 > src_size) return TANS_ERR_SRC_TRUNCATED;
+        uint32_t val = (uint32_t)data[byte_idx];
+        if (bit_idx + nb > 8)
+            val |= (uint32_t)data[byte_idx + 1] << 8;
+        if (bit_idx + nb > 16)
+            val |= (uint32_t)data[byte_idx + 2] << 16;
+        val >>= bit_idx;
+
+        uint32_t full_val = val & ((1u << nb) - 1);
+        uint32_t short_val = val & ((1u << (nb - 1)) - 1);
+
+        int32_t prob;
+        if (short_val < threshold) {
+            prob = (int32_t)short_val - 1;
+            bit_offset += nb - 1;
+        } else {
+            prob = (int32_t)full_val - (int32_t)threshold - 1;
+            bit_offset += nb;
+        }
+
+        if (prob > 0) {
+            if (prob == 1) {
+                td.a[td.a_used] = (uint8_t)sym;
+                td.a_used++;
+            } else {
+                td.b[td.b_used] = (sym << 16) | (uint32_t)prob;
+                td.b_used++;
+            }
+            remaining -= prob;
+        }
+        // prob == 0: skip symbol
+        // prob == -1: weight=1 (special "less than 1" in FSE)
+        // For our tANS, prob == -1 doesn't apply; weights are >= 0
+
+        sym++;
+    }
+
+    // Compute bytes consumed
+    uint32_t bits_consumed = bit_offset;
+    uint32_t bytes_consumed = (bits_consumed + 7) / 8;
+    src_after_table = src + 1 + bytes_consumed;
+
+    return TANS_OK;
+}
+
+// ══════════════════════════════════════════════════════════════════
 //  Phase 2: initLut — FSE spread-based LUT construction
 // ══════════════════════════════════════════════════════════════════
 
@@ -1103,6 +1187,65 @@ extern "C" __global__ void slzTansInitLutKernel(
     }
 }
 
+// FSE-style build kernel for type-6 streams. No Golomb-Rice, no stack arrays.
+// Reads FSE probability header, builds LUT using FSE spread, packs to 4-byte.
+extern "C" __global__ void __launch_bounds__(64) slzTansFseBuildKernel(
+    const uint8_t* __restrict__ src_buf,
+    const TansDecChunkDesc* __restrict__ descs,
+    TansLutEnt*    __restrict__ lut_buf,
+    TansTableMeta* __restrict__ meta_buf,
+    uint32_t       num_chunks
+) {
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
+    if (chunk_id >= num_chunks) return;
+
+    TansLutEnt* my_lut = lut_buf + (uint64_t)chunk_id * 2048;
+    const int lane = threadIdx.x & 31;
+
+    __shared__ TansData s_td[2];
+    uint32_t log_table_bits = 0;
+    uint32_t err = TANS_OK;
+
+    if (lane == 0) {
+        s_td[warp_id].a_used = 0;
+        s_td[warp_id].b_used = 0;
+        const uint8_t* src = src_buf + descs[chunk_id].src_offset;
+        uint32_t src_size = descs[chunk_id].src_size;
+        const uint8_t* after_table = nullptr;
+
+        err = decodeFseTable(src, src_size, s_td[warp_id], log_table_bits, after_table);
+
+        if (err == TANS_OK) {
+            meta_buf[chunk_id].src_after_table_off = (uint32_t)((uintptr_t)after_table - (uintptr_t)src_buf);
+            meta_buf[chunk_id].src_end_off = (uint32_t)((uintptr_t)(src + src_size) - (uintptr_t)src_buf);
+            meta_buf[chunk_id].log_table_bits = log_table_bits;
+        }
+        meta_buf[chunk_id].error = err;
+    }
+
+    // Broadcast error and log_table_bits from lane 0
+    err = __shfl_sync(0xFFFFFFFF, err, 0);
+    if (err != TANS_OK) return;
+    log_table_bits = __shfl_sync(0xFFFFFFFF, log_table_bits, 0);
+
+    // Build LUT using FSE spread (all lanes participate)
+    err = initLut(s_td[warp_id], log_table_bits, my_lut);
+    __syncwarp();
+
+    // Pack 8-byte entries to 4-byte
+    if (err == TANS_OK) {
+        uint32_t L = 1u << log_table_bits;
+        uint32_t* pk = (uint32_t*)my_lut;
+        for (uint32_t i = lane; i < L; i += 32)
+            pk[i] = packLutEntry(my_lut[i]);
+    }
+
+    if (lane == 0 && err != TANS_OK) {
+        meta_buf[chunk_id].error = err;
+    }
+}
+
 // Legacy combined kernel (kept for backward compat with type-1 5-state path)
 extern "C" __global__ void __launch_bounds__(64) slzTansBuildTablesKernel(
     const uint8_t* __restrict__ src_buf,
@@ -1480,6 +1623,155 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
 
         // Write interleaved: position i*32 + lane
         dst_base[i * 32 + lane] = sym;
+    }
+
+    __syncwarp();
+    if (lane == 0) out_status[chunk_id] = TANS_OK;
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  Fused build+decode kernel: parse table → build LUT in shared →
+//  32-lane decode from shared. No global LUT memory traffic.
+//  One kernel launch instead of build + decode.
+// ══════════════════════════════════════════════════════════════════
+
+extern "C" __global__ void __launch_bounds__(64, 2) slzTans32FusedKernel(
+    const uint8_t* __restrict__ src_buf,
+    uint8_t*       __restrict__ dst_buf,
+    const TansDecChunkDesc* __restrict__ descs,
+    uint32_t*      __restrict__ out_status,
+    uint32_t       num_chunks
+) {
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
+    if (chunk_id >= num_chunks) return;
+
+    const int lane = threadIdx.x & 31;
+
+    // ── Phase 1: Parse table (lane 0) ────────────────────────────
+    __shared__ TableParseResult s_tp[2];
+    if (lane == 0) parseTable(src_buf, descs[chunk_id], s_tp[warp_id]);
+    __syncwarp();
+
+    if (s_tp[warp_id].error != TANS_OK) {
+        if (lane == 0) out_status[chunk_id] = s_tp[warp_id].error;
+        return;
+    }
+
+    // ── Phase 2: Build LUT in shared memory (all lanes) ──────────
+    // 2048 packed u32 entries = 8KB per warp, 16KB total
+    __shared__ uint32_t s_packed_lut[2][2048];
+
+    // First build 8-byte entries in a temp area, then pack
+    // Reuse the global lut buffer temporarily... no, we want shared only.
+    // Build directly: use the FSE spread to write packed entries to shared.
+    {
+        uint32_t log_table_bits = s_tp[warp_id].log_table_bits;
+        uint32_t L = 1u << log_table_bits;
+        uint32_t L_mask = L - 1;
+        const TansData& td = s_tp[warp_id].td;
+        int32_t a_used = (int32_t)td.a_used;
+
+        // Lane 0: spread symbols and write packed entries to shared
+        if (lane == 0) {
+            uint32_t highThresh = L - (uint32_t)a_used;
+            uint32_t step = (L >> 1) + (L >> 3) + 3;
+            uint32_t pos = 0;
+
+            // Weight >= 2 symbols
+            for (uint32_t bi = 0; bi < td.b_used; bi++) {
+                uint32_t val = td.b[bi];
+                uint32_t weight = val & 0xFFFF;
+                uint8_t symbol = (uint8_t)(val >> 16);
+
+                for (uint32_t n = 0; n < weight; n++) {
+                    while (pos >= highThresh) pos = (pos + step) & L_mask;
+                    uint32_t running_w = weight + n;
+                    uint32_t wb = ilog2(running_w);
+                    uint32_t bps = log_table_bits - wb;
+                    s_packed_lut[warp_id][pos] =
+                        (bps << 24) | ((uint32_t)symbol << 16) |
+                        (uint16_t)(L_mask & (running_w << bps));
+                    pos = (pos + step) & L_mask;
+                }
+            }
+
+            // Weight-1 symbols at highThresh..L-1
+            for (int32_t i = 0; i < a_used; i++) {
+                uint32_t hi = highThresh + (uint32_t)i;
+                s_packed_lut[warp_id][hi] =
+                    (log_table_bits << 24) | ((uint32_t)td.a[i] << 16) | 0;
+            }
+        }
+        __syncwarp();
+
+        // ── Phase 3: 32-lane decode from shared LUT ──────────────
+        const uint32_t* packed_lut = s_packed_lut[warp_id];
+        uint32_t lut_mask = L_mask;
+        uint32_t dst_size = descs[chunk_id].dst_size;
+
+        // Read sizes and states from 128-byte header
+        const uint8_t* header = src_buf + descs[chunk_id].src_offset - 128;
+        uint16_t my_sub_size = (uint16_t)header[lane * 2] | ((uint16_t)header[lane * 2 + 1] << 8);
+        uint16_t my_init_state = (uint16_t)header[64 + lane * 2] | ((uint16_t)header[64 + lane * 2 + 1] << 8);
+
+        // Sub-streams after table
+        const uint8_t* sub_data_start = s_tp[warp_id].src_after_table;
+
+        // Warp prefix sum for sub-stream offsets
+        uint32_t my_size32 = (uint32_t)my_sub_size;
+        uint32_t prefix_sum = my_size32;
+        for (int d = 1; d < 32; d <<= 1) {
+            uint32_t n = __shfl_up_sync(0xFFFFFFFF, prefix_sum, d);
+            if (lane >= d) prefix_sum += n;
+        }
+        uint32_t my_offset = prefix_sum - my_size32;
+        const uint8_t* my_src = sub_data_start + my_offset;
+
+        uint32_t total_syms = dst_size;
+        uint32_t my_sym_count = total_syms / 32;
+        if ((uint32_t)lane < (total_syms % 32)) my_sym_count++;
+
+        uint8_t* dst_base = dst_buf + descs[chunk_id].dst_offset;
+
+        if (my_sym_count == 0 || my_sub_size < 4) {
+            __syncwarp();
+            if (lane == 0) out_status[chunk_id] = TANS_OK;
+            return;
+        }
+
+        uint32_t state = (uint32_t)my_init_state & lut_mask;
+        uint32_t bits_val = readLE32(my_src);
+        int32_t bitpos = 32;
+        const uint8_t* ptr = my_src + 4;
+        const uint8_t* ptr_end = my_src + my_sub_size;
+
+        for (uint32_t i = 0; i < my_sym_count; i++) {
+            if (bitpos < 16) {
+                if (ptr + 4 <= ptr_end) {
+                    bits_val |= readLE32(ptr) << bitpos;
+                    ptr += (31 - bitpos) >> 3;
+                    bitpos |= 24;
+                } else {
+                    while (bitpos < 24 && ptr < ptr_end) {
+                        bits_val |= (uint32_t)(*ptr) << bitpos;
+                        ptr++;
+                        bitpos += 8;
+                    }
+                }
+            }
+
+            uint32_t packed = packed_lut[state]; // shared memory read — no cache miss
+            uint32_t bits_x = packed >> 24;
+            uint8_t sym = (uint8_t)((packed >> 16) & 0xFF);
+            uint32_t w = packed & 0xFFFF;
+            uint32_t x = (1u << bits_x) - 1;
+            state = ((uint32_t)(bits_val & (uint64_t)x) + w) & lut_mask;
+            bits_val >>= bits_x;
+            bitpos -= (int32_t)bits_x;
+
+            dst_base[i * 32 + lane] = sym;
+        }
     }
 
     __syncwarp();

@@ -14,7 +14,8 @@
       "Bash(nvcc --version)",
       "Bash(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader)",
       "PowerShell(.\\\\zig-out\\\\bin\\\\streamlz.exe -d -t 1 -r 5 c:\\\\tmp\\\\enwik8_gpu.slz -o c:\\\\tmp\\\\enwik8_batch_out.bin 2>&1)",
-      "PowerShell(zig build -Doptimize=ReleaseFast -Dgpu=true 2>&1)"
+      "PowerShell(zig build -Doptimize=ReleaseFast -Dgpu=true 2>&1)",
+      "PowerShell(.\\\\zig-out\\\\bin\\\\streamlz.exe -d -t 1 c:\\\\tmp\\\\test_fse_enc.slz -o c:\\\\tmp\\\\test_fse_enc.bin 2>&1)"
     ],
     "additionalDirectories": [
       "c:\\Users\\james.JAMESWORK2025\\.claude\\projects\\c--Users-james-JAMESWORK2025-Repos-StreamLZ-native\\memory"

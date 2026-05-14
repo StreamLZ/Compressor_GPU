@@ -1102,14 +1102,65 @@ pub fn encodeArrayU8Tans32(
     );
     if (used_symbols <= 1) return error.TooFewSymbols;
 
-    // Emit Golomb-Rice table header (same as type 1, ~100 bytes)
+    // Emit FSE-style probability table header (simple bit-packed, GPU-friendly)
+    // Format: [u8 log_table_bits] [bit-packed probabilities]
+    // Each probability: value = weight + 1 (0 = prob -1, 1 = prob 0/skip, 2+ = prob 1+)
+    // Uses variable-width codes based on remaining probability mass.
     var table_buf: [512]u8 = @splat(0);
-    var bw = BitWriter64Forward.initBounded(&table_buf, table_buf.len);
-    bw.writeNoFlush(log_table_bits - 8, 3);
-    tansEncodeTable(&bw, log_table_bits, &weights, num_symbols, used_symbols);
-    bw.flush();
-    const table_final_ptr = bw.getFinalPtr();
-    const table_bytes: usize = @intFromPtr(table_final_ptr) - @intFromPtr(&table_buf[0]);
+    var wp_tbl: usize = 0;
+
+    // Byte 0: log_table_bits
+    table_buf[0] = @intCast(log_table_bits);
+    wp_tbl = 1;
+
+    // Bit-pack probabilities using FSE/zstd-style encoding
+    var tbl_bits: u64 = 0;
+    var tbl_bit_count: u32 = 0;
+    var remaining: i32 = @as(i32, 1) << @intCast(log_table_bits);
+    var tbl_sym: usize = 0;
+
+    while (remaining > 0 and tbl_sym < num_symbols) {
+        const w: i32 = @intCast(weights[tbl_sym]);
+        const value: u32 = @intCast(w + 1); // +1 so prob=-1 maps to 0, prob=0 maps to 1
+
+        // Compute variable-length code width
+        const rem_plus_1: u32 = @intCast(remaining + 1);
+        const log2_rem: u32 = if (rem_plus_1 > 1) (31 - @clz(rem_plus_1)) else 0;
+        const nb: u32 = log2_rem + 1;
+        const threshold: u32 = (@as(u32, 1) << @intCast(nb)) - 1 - @as(u32, @intCast(remaining));
+
+        if (value < threshold) {
+            tbl_bits |= @as(u64, value) << @intCast(tbl_bit_count);
+            tbl_bit_count += nb - 1;
+        } else {
+            const adjusted = value + threshold;
+            tbl_bits |= @as(u64, adjusted) << @intCast(tbl_bit_count);
+            tbl_bit_count += nb;
+        }
+
+        while (tbl_bit_count >= 8) {
+            table_buf[wp_tbl] = @intCast(tbl_bits & 0xFF);
+            tbl_bits >>= 8;
+            tbl_bit_count -= 8;
+            wp_tbl += 1;
+        }
+
+        if (w > 0) {
+            remaining -= w;
+        } else if (w == 0) {
+            // skip symbol
+        }
+        // w == -1 not possible since weights are >= 0 from normalization
+        tbl_sym += 1;
+    }
+
+    // Flush remaining bits
+    if (tbl_bit_count > 0) {
+        table_buf[wp_tbl] = @intCast(tbl_bits & 0xFF);
+        wp_tbl += 1;
+    }
+
+    const table_bytes: usize = wp_tbl;
 
     // Build encoding table
     var te: [256]TansEncEntry = undefined;

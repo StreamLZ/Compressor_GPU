@@ -28,6 +28,8 @@ var tans_build_fn: usize = 0;
 var tans32_kernel_fn: usize = 0;
 var tans_parse_fn: usize = 0;
 var tans_initlut_fn: usize = 0;
+var tans_fused_fn: usize = 0;
+var tans_fse_build_fn: usize = 0;
 var initialized = false;
 
 // ── Driver API function signatures ──────────────────────────────
@@ -127,6 +129,8 @@ pub fn init() bool {
         _ = get_fn(&tans32_kernel_fn, tans_module, "slzTans32DecodeKernel");
         _ = get_fn(&tans_parse_fn, tans_module, "slzTansParseTablesKernel");
         _ = get_fn(&tans_initlut_fn, tans_module, "slzTansInitLutKernel");
+        _ = get_fn(&tans_fused_fn, tans_module, "slzTans32FusedKernel");
+        _ = get_fn(&tans_fse_build_fn, tans_module, "slzTansFseBuildKernel");
     }
 
     // Create persistent pipeline streams (CU_STREAM_NON_BLOCKING = 1)
@@ -790,7 +794,39 @@ pub fn fullGpuLaunch(
                 var bp_num = tc;
 
                 // Use split parse+initlut kernels when available, else legacy combined
-                if (scan.use_tans32 and tans_parse_fn != 0 and tans_initlut_fn != 0) {
+                if (scan.use_tans32 and tans_fse_build_fn != 0 and tans32_kernel_fn != 0) {
+                    // FSE-style build kernel: zero spills, then separate 32-lane decode
+                    var fse_build_params = [_]?*anyopaque{
+                        @ptrCast(&bp_comp), @ptrCast(&bp_descs),
+                        @ptrCast(&bp_lut), @ptrCast(&bp_meta), @ptrCast(&bp_num),
+                    };
+                    var fse_build_extra = [_]?*anyopaque{null};
+                    if (launch_fn(tans_fse_build_fn, tans_grid, 1, 1, 32, 2, 1, 0, stream, &fse_build_params, &fse_build_extra) != CUDA_SUCCESS)
+                        return error.BadMode;
+                    // Sync to check FSE build kernel for errors
+                    const fse_sync = stream_sync_fn(stream);
+                    if (fse_sync != CUDA_SUCCESS) {
+                        std.debug.print("FSE BUILD kernel FAILED rc={d}\n", .{fse_sync});
+                        return error.BadMode;
+                    }
+
+                    // Then 32-lane decode (same as before)
+                    var tp_comp2 = d_comp_persist;
+                    var tp_scratch2 = d_tans_scratch;
+                    var tp_descs2 = bp_descs;
+                    var tp_status2 = d_tans_status_persist + @as(u64, ts) * @sizeOf(u32);
+                    var tp_num2 = tc;
+                    var tp_lut2 = bp_lut;
+                    var tp_meta2 = bp_meta;
+                    var tans32_params = [_]?*anyopaque{
+                        @ptrCast(&tp_comp2), @ptrCast(&tp_scratch2),
+                        @ptrCast(&tp_descs2), @ptrCast(&tp_status2), @ptrCast(&tp_num2),
+                        @ptrCast(&tp_lut2), @ptrCast(&tp_meta2),
+                    };
+                    var tans32_extra = [_]?*anyopaque{null};
+                    if (launch_fn(tans32_kernel_fn, tans_grid, 1, 1, 32, 2, 1, 0, stream, &tans32_params, &tans32_extra) != CUDA_SUCCESS)
+                        return error.BadMode;
+                } else if (scan.use_tans32 and tans_parse_fn != 0 and tans_initlut_fn != 0) {
                     // TansParsedWeights = TansData(1288B) + u32(4B) = 1292B per stream
                     const weights_bytes = @as(usize, tc) * 1296; // round up to 16B alignment
                     if (!ensureDeviceBuf(&d_parsed_weights, &d_parsed_weights_size, weights_bytes))
