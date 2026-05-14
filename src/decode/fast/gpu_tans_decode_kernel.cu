@@ -522,14 +522,19 @@ __device__ uint32_t decodeFseTable(
     uint32_t bit_offset = 0;
     uint32_t sym = 0;
 
+    // Truncated binary decode matching zstd FSE_readNCount.
+    // value = weight + 1, range [0, remaining+1], decoded as count.
+    // half = 2^(nb-1), max_val = 2^nb - 1 - remaining.
+    // Short: lower (nb-1) bits < max_val → count = lower bits, consume nb-1 bits.
+    // Long: lower (nb-1) bits >= max_val → read nb bits as f.
+    //       if f >= half: count = f - max_val. else: count = f.
     while (remaining > 0 && sym < 256) {
-        // Variable-width code: num_bits = floor(log2(remaining+1)) + 1
         uint32_t rem1 = (uint32_t)(remaining + 1);
         uint32_t log2_rem = (rem1 > 1) ? (31 - __clz(rem1)) : 0;
         uint32_t nb = log2_rem + 1;
-        uint32_t threshold = (1u << nb) - 1 - (uint32_t)remaining;
+        uint32_t half = 1u << (nb - 1);
+        uint32_t max_val = (half << 1) - (uint32_t)remaining - 2;
 
-        // Read nb bits from bitstream (with bounds check)
         uint32_t byte_idx = bit_offset >> 3;
         uint32_t bit_idx = bit_offset & 7;
         if (byte_idx + 3 > src_size) return TANS_ERR_SRC_TRUNCATED;
@@ -540,17 +545,22 @@ __device__ uint32_t decodeFseTable(
             val |= (uint32_t)data[byte_idx + 2] << 16;
         val >>= bit_idx;
 
-        uint32_t full_val = val & ((1u << nb) - 1);
-        uint32_t short_val = val & ((1u << (nb - 1)) - 1);
+        uint32_t short_val = val & (half - 1);
+        uint32_t full_val = val & ((half << 1) - 1);
 
-        int32_t prob;
-        if (short_val < threshold) {
-            prob = (int32_t)short_val - 1;
+        int32_t count;
+        if (short_val < max_val) {
+            count = (int32_t)short_val;
             bit_offset += nb - 1;
         } else {
-            prob = (int32_t)full_val - (int32_t)threshold - 1;
+            if (full_val >= half)
+                count = (int32_t)(full_val - max_val);
+            else
+                count = (int32_t)full_val;
             bit_offset += nb;
         }
+
+        int32_t prob = count - 1;
 
         if (prob > 0) {
             if (prob == 1) {
@@ -562,9 +572,6 @@ __device__ uint32_t decodeFseTable(
             }
             remaining -= prob;
         }
-        // prob == 0: skip symbol
-        // prob == -1: weight=1 (special "less than 1" in FSE)
-        // For our tANS, prob == -1 doesn't apply; weights are >= 0
 
         sym++;
     }
@@ -578,13 +585,12 @@ __device__ uint32_t decodeFseTable(
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  Phase 2: initLut — FSE spread-based LUT construction
+//  Phase 2: initLut — 4-way interleaved LUT construction
 // ══════════════════════════════════════════════════════════════════
 
-// FSE spread-based LUT construction (mirrors nvCOMP init_fse_tables).
-// Phase 1 (lane 0): spread symbols across slots using step=(L>>1)+(L>>3)+3
-// Phase 2 (all 32 lanes): compute bits_x/w/x per entry in parallel
-// Simple arithmetic, no 4-way pointer arrays, minimal register pressure.
+// 4-way interleaved distribution matching CPU tansInitTable.
+// Splits L slots into 4 quarter-segments and distributes each symbol's
+// entries evenly across them. Weight-1 symbols fill the tail.
 __device__ uint32_t initLut(
     const TansData& td, uint32_t log_table_bits, TansLutEnt* lut
 ) {
@@ -594,42 +600,52 @@ __device__ uint32_t initLut(
     const int32_t a_used = (int32_t)td.a_used;
     if ((uint32_t)a_used > L) return TANS_ERR_LUT_FAILED;
 
-    // FSE spread: lane 0 writes complete LUT entries directly to global memory.
-    // No intermediate shared arrays — compute bits_x/w/x inline during spread.
-    // All 32 lanes then do the pack step (8B->4B) in parallel.
     if (lane == 0) {
-        uint32_t highThresh = L - (uint32_t)a_used;
-        uint32_t step = (L >> 1) + (L >> 3) + 3;
-        uint32_t pos = 0;
+        uint32_t ones = (uint32_t)a_used;
+        uint32_t slots_left = L - ones;
+        uint32_t sa = slots_left >> 2;
 
-        // Weight >= 2 symbols: spread with step, write LUT entries directly
+        uint32_t ptrs[4];
+        ptrs[0] = 0;
+        uint32_t sb = sa + ((slots_left & 3) > 0 ? 1 : 0);
+        ptrs[1] = sb;
+        sb += sa + ((slots_left & 3) > 1 ? 1 : 0);
+        ptrs[2] = sb;
+        sb += sa + ((slots_left & 3) > 2 ? 1 : 0);
+        ptrs[3] = sb;
+
+        int32_t weights_sum = 0;
         for (uint32_t bi = 0; bi < td.b_used; bi++) {
             uint32_t val = td.b[bi];
             uint32_t weight = val & 0xFFFF;
             uint8_t symbol = (uint8_t)(val >> 16);
 
-            for (uint32_t n = 0; n < weight; n++) {
-                while (pos >= highThresh) pos = (pos + step) & L_mask;
-
-                uint32_t running_w = weight + n;
-                uint32_t wb = ilog2(running_w);
-                uint32_t bps = log_table_bits - wb;
-                lut[pos].symbol = symbol;
-                lut[pos].bits_x = (uint8_t)bps;
-                lut[pos].x = (1u << bps) - 1;
-                lut[pos].w = (uint16_t)(L_mask & (running_w << bps));
-
-                pos = (pos + step) & L_mask;
+            int32_t ptr_cursor = weights_sum;
+            for (uint32_t j = 0; j < 4; j++) {
+                int32_t y = ((int32_t)weight + ((weights_sum - (int32_t)j - 1) & 3)) >> 2;
+                for (int32_t k = 0; k < y; k++) {
+                    uint32_t slot = ptrs[j];
+                    uint32_t running_w = weight + (uint32_t)(ptr_cursor - weights_sum);
+                    uint32_t wb = ilog2(running_w);
+                    uint32_t bps = log_table_bits - wb;
+                    lut[slot].symbol = symbol;
+                    lut[slot].bits_x = (uint8_t)bps;
+                    lut[slot].x = (1u << bps) - 1;
+                    lut[slot].w = (uint16_t)(L_mask & (running_w << bps));
+                    ptrs[j]++;
+                    ptr_cursor++;
+                }
             }
+            weights_sum += (int32_t)weight;
         }
 
-        // Weight-1 symbols: fill highThresh..L-1
+        // Weight-1 symbols fill slots_left..L-1
         for (int32_t i = 0; i < a_used; i++) {
-            uint32_t hi = highThresh + (uint32_t)i;
-            lut[hi].symbol = td.a[i];
-            lut[hi].bits_x = (uint8_t)log_table_bits;
-            lut[hi].x = L_mask;
-            lut[hi].w = 0;
+            uint32_t pos = slots_left + (uint32_t)i;
+            lut[pos].symbol = td.a[i];
+            lut[pos].bits_x = (uint8_t)log_table_bits;
+            lut[pos].x = L_mask;
+            lut[pos].w = 0;
         }
     }
     __syncwarp();
@@ -1187,62 +1203,186 @@ extern "C" __global__ void slzTansInitLutKernel(
     }
 }
 
-// FSE-style build kernel for type-6 streams. No Golomb-Rice, no stack arrays.
-// Reads FSE probability header, builds LUT using FSE spread, packs to 4-byte.
+// ── FSE probability decoder → weights array (no TansData intermediate) ──
+// Fills uint16_t weights[256] directly. Returns log_table_bits and src_after_table.
+__device__ uint32_t decodeFseWeights(
+    const uint8_t* src, uint32_t src_size,
+    uint16_t* weights, uint32_t& log_table_bits_out,
+    const uint8_t*& src_after_table
+) {
+    if (src_size < 2) return TANS_ERR_SRC_TRUNCATED;
+
+    uint32_t log_table_bits = src[0];
+    if (log_table_bits < 8 || log_table_bits > 11)
+        return TANS_ERR_BAD_LOG_BITS;
+    log_table_bits_out = log_table_bits;
+
+    int32_t L = 1 << log_table_bits;
+    int32_t remaining = L;
+
+    for (int i = 0; i < 256; i++) weights[i] = 0;
+
+    const uint8_t* data = src + 1;
+    uint32_t bit_offset = 0;
+    uint32_t sym = 0;
+
+    while (remaining > 0 && sym < 256) {
+        uint32_t rem1 = (uint32_t)(remaining + 1);
+        uint32_t log2_rem = (rem1 > 1) ? (31 - __clz(rem1)) : 0;
+        uint32_t nb = log2_rem + 1;
+        uint32_t half = 1u << (nb - 1);
+        uint32_t max_val = (half << 1) - (uint32_t)remaining - 2;
+
+        uint32_t byte_idx = bit_offset >> 3;
+        uint32_t bit_idx = bit_offset & 7;
+        if (byte_idx + 3 > src_size) return TANS_ERR_SRC_TRUNCATED;
+        uint32_t val = (uint32_t)data[byte_idx];
+        if (bit_idx + nb > 8)
+            val |= (uint32_t)data[byte_idx + 1] << 8;
+        if (bit_idx + nb > 16)
+            val |= (uint32_t)data[byte_idx + 2] << 16;
+        val >>= bit_idx;
+
+        uint32_t short_val = val & (half - 1);
+        uint32_t full_val = val & ((half << 1) - 1);
+
+        int32_t count;
+        if (short_val < max_val) {
+            count = (int32_t)short_val;
+            bit_offset += nb - 1;
+        } else {
+            if (full_val >= half)
+                count = (int32_t)(full_val - max_val);
+            else
+                count = (int32_t)full_val;
+            bit_offset += nb;
+        }
+
+        int32_t prob = count - 1;
+        if (prob > 0) {
+            weights[sym] = (uint16_t)prob;
+            remaining -= prob;
+        }
+        sym++;
+    }
+
+    uint32_t bytes_consumed = (bit_offset + 7) / 8;
+    src_after_table = src + 1 + bytes_consumed;
+    return TANS_OK;
+}
+
+// ── Build packed 4-byte LUT: 4-way interleaved, lane 0 direct global writes ──
+// Lane 0 only. High occupancy hides global store latency.
+__device__ void buildPackedLut4Way(
+    const uint16_t* weights, uint32_t log_table_bits, uint32_t* lut
+) {
+    const uint32_t L = 1u << log_table_bits;
+    const uint32_t L_mask = L - 1;
+
+    uint32_t ones = 0;
+    for (uint32_t s = 0; s < 256; s++)
+        if (weights[s] == 1) ones++;
+
+    uint32_t slots_left = L - ones;
+    uint32_t sa = slots_left >> 2;
+    uint32_t ptrs[4];
+    ptrs[0] = 0;
+    uint32_t sb = sa + ((slots_left & 3) > 0 ? 1 : 0);
+    ptrs[1] = sb;
+    sb += sa + ((slots_left & 3) > 1 ? 1 : 0);
+    ptrs[2] = sb;
+    sb += sa + ((slots_left & 3) > 2 ? 1 : 0);
+    ptrs[3] = sb;
+
+    int32_t weights_sum = 0;
+    for (uint32_t sym = 0; sym < 256; sym++) {
+        uint32_t w = weights[sym];
+        if (w <= 1) continue;
+
+        int32_t ptr_cursor = weights_sum;
+        for (uint32_t j = 0; j < 4; j++) {
+            int32_t y = ((int32_t)w + ((weights_sum - (int32_t)j - 1) & 3)) >> 2;
+            for (int32_t k = 0; k < y; k++) {
+                uint32_t slot = ptrs[j];
+                uint32_t running_w = w + (uint32_t)(ptr_cursor - weights_sum);
+                uint32_t wb = ilog2(running_w);
+                uint32_t bps = log_table_bits - wb;
+                lut[slot] = (bps << 24) | (sym << 16) |
+                            (uint16_t)(L_mask & (running_w << bps));
+                ptrs[j]++;
+                ptr_cursor++;
+            }
+        }
+        weights_sum += (int32_t)w;
+    }
+
+    uint32_t pos = slots_left;
+    for (uint32_t sym = 0; sym < 256; sym++) {
+        if (weights[sym] == 1) {
+            lut[pos] = (log_table_bits << 24) | (sym << 16) | 0;
+            pos++;
+        }
+    }
+}
+
+// FSE build kernel: persistent grid with atomicAdd work claiming.
+// Lane 0 parses FSE probs + does 4-way spread to shared memory LUT.
+// All 32 lanes do coalesced copy from shared to global.
 extern "C" __global__ void __launch_bounds__(64) slzTansFseBuildKernel(
     const uint8_t* __restrict__ src_buf,
     const TansDecChunkDesc* __restrict__ descs,
     TansLutEnt*    __restrict__ lut_buf,
     TansTableMeta* __restrict__ meta_buf,
-    uint32_t       num_chunks
+    uint32_t       num_chunks,
+    uint32_t*      __restrict__ work_counter
 ) {
-    const uint32_t warp_id = threadIdx.y;
-    const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
-    if (chunk_id >= num_chunks) return;
-
-    TansLutEnt* my_lut = lut_buf + (uint64_t)chunk_id * 2048;
     const int lane = threadIdx.x & 31;
+    const uint32_t warp_id = threadIdx.y;
 
-    __shared__ TansData s_td[2];
-    uint32_t log_table_bits = 0;
-    uint32_t err = TANS_OK;
+    __shared__ uint16_t s_weights[2][256];
 
-    if (lane == 0) {
-        s_td[warp_id].a_used = 0;
-        s_td[warp_id].b_used = 0;
-        const uint8_t* src = src_buf + descs[chunk_id].src_offset;
-        uint32_t src_size = descs[chunk_id].src_size;
-        const uint8_t* after_table = nullptr;
-
-        err = decodeFseTable(src, src_size, s_td[warp_id], log_table_bits, after_table);
-
-        if (err == TANS_OK) {
-            meta_buf[chunk_id].src_after_table_off = (uint32_t)((uintptr_t)after_table - (uintptr_t)src_buf);
-            meta_buf[chunk_id].src_end_off = (uint32_t)((uintptr_t)(src + src_size) - (uintptr_t)src_buf);
-            meta_buf[chunk_id].log_table_bits = log_table_bits;
+    for (;;) {
+        // atomicAdd work claiming (nvCOMP pattern)
+        uint32_t chunk_id;
+        if (lane == 0) {
+            chunk_id = atomicAdd(work_counter, 1);
         }
-        meta_buf[chunk_id].error = err;
-    }
+        chunk_id = __shfl_sync(0xFFFFFFFF, chunk_id, 0);
+        if (chunk_id >= num_chunks) return;
 
-    // Broadcast error and log_table_bits from lane 0
-    err = __shfl_sync(0xFFFFFFFF, err, 0);
-    if (err != TANS_OK) return;
-    log_table_bits = __shfl_sync(0xFFFFFFFF, log_table_bits, 0);
+        uint32_t log_table_bits = 0;
+        uint32_t err = TANS_OK;
 
-    // Build LUT using FSE spread (all lanes participate)
-    err = initLut(s_td[warp_id], log_table_bits, my_lut);
-    __syncwarp();
+        // Lane 0: parse FSE probability table → weights in shared mem
+        if (lane == 0) {
+            const uint8_t* src = src_buf + descs[chunk_id].src_offset;
+            uint32_t src_size = descs[chunk_id].src_size;
+            const uint8_t* after_table = nullptr;
 
-    // Pack 8-byte entries to 4-byte
-    if (err == TANS_OK) {
-        uint32_t L = 1u << log_table_bits;
-        uint32_t* pk = (uint32_t*)my_lut;
-        for (uint32_t i = lane; i < L; i += 32)
-            pk[i] = packLutEntry(my_lut[i]);
-    }
+            err = decodeFseWeights(src, src_size, s_weights[warp_id],
+                                   log_table_bits, after_table);
 
-    if (lane == 0 && err != TANS_OK) {
-        meta_buf[chunk_id].error = err;
+            if (err == TANS_OK) {
+                meta_buf[chunk_id].src_after_table_off =
+                    (uint32_t)((uintptr_t)after_table - (uintptr_t)src_buf);
+                meta_buf[chunk_id].src_end_off =
+                    (uint32_t)((uintptr_t)(src + src_size) - (uintptr_t)src_buf);
+                meta_buf[chunk_id].log_table_bits = log_table_bits;
+            }
+            meta_buf[chunk_id].error = err;
+        }
+
+        err = __shfl_sync(0xFFFFFFFF, err, 0);
+        if (err != TANS_OK) continue;  // skip bad stream, claim next
+        log_table_bits = __shfl_sync(0xFFFFFFFF, log_table_bits, 0);
+
+        // Lane 0: spread + write packed entries directly to global
+        uint32_t* glut = (uint32_t*)((uint8_t*)lut_buf +
+                         (uint64_t)chunk_id * 2048 * sizeof(TansLutEnt));
+        if (lane == 0) {
+            buildPackedLut4Way(s_weights[warp_id], log_table_bits, glut);
+        }
+        __syncwarp();
     }
 }
 
@@ -1662,9 +1802,7 @@ extern "C" __global__ void __launch_bounds__(64, 2) slzTans32FusedKernel(
     // 2048 packed u32 entries = 8KB per warp, 16KB total
     __shared__ uint32_t s_packed_lut[2][2048];
 
-    // First build 8-byte entries in a temp area, then pack
-    // Reuse the global lut buffer temporarily... no, we want shared only.
-    // Build directly: use the FSE spread to write packed entries to shared.
+    // Build packed LUT using 4-way interleaved distribution (matches CPU tansInitTable)
     {
         uint32_t log_table_bits = s_tp[warp_id].log_table_bits;
         uint32_t L = 1u << log_table_bits;
@@ -1672,34 +1810,46 @@ extern "C" __global__ void __launch_bounds__(64, 2) slzTans32FusedKernel(
         const TansData& td = s_tp[warp_id].td;
         int32_t a_used = (int32_t)td.a_used;
 
-        // Lane 0: spread symbols and write packed entries to shared
         if (lane == 0) {
-            uint32_t highThresh = L - (uint32_t)a_used;
-            uint32_t step = (L >> 1) + (L >> 3) + 3;
-            uint32_t pos = 0;
+            uint32_t ones = (uint32_t)a_used;
+            uint32_t slots_left = L - ones;
+            uint32_t sa = slots_left >> 2;
+            uint32_t ptrs[4];
+            ptrs[0] = 0;
+            uint32_t sb = sa + ((slots_left & 3) > 0 ? 1 : 0);
+            ptrs[1] = sb;
+            sb += sa + ((slots_left & 3) > 1 ? 1 : 0);
+            ptrs[2] = sb;
+            sb += sa + ((slots_left & 3) > 2 ? 1 : 0);
+            ptrs[3] = sb;
 
-            // Weight >= 2 symbols
+            int32_t weights_sum = 0;
             for (uint32_t bi = 0; bi < td.b_used; bi++) {
                 uint32_t val = td.b[bi];
                 uint32_t weight = val & 0xFFFF;
                 uint8_t symbol = (uint8_t)(val >> 16);
-
-                for (uint32_t n = 0; n < weight; n++) {
-                    while (pos >= highThresh) pos = (pos + step) & L_mask;
-                    uint32_t running_w = weight + n;
-                    uint32_t wb = ilog2(running_w);
-                    uint32_t bps = log_table_bits - wb;
-                    s_packed_lut[warp_id][pos] =
-                        (bps << 24) | ((uint32_t)symbol << 16) |
-                        (uint16_t)(L_mask & (running_w << bps));
-                    pos = (pos + step) & L_mask;
+                int32_t ptr_cursor = weights_sum;
+                for (uint32_t j = 0; j < 4; j++) {
+                    int32_t y = ((int32_t)weight + ((weights_sum - (int32_t)j - 1) & 3)) >> 2;
+                    for (int32_t k = 0; k < y; k++) {
+                        uint32_t slot = ptrs[j];
+                        uint32_t running_w = weight + (uint32_t)(ptr_cursor - weights_sum);
+                        uint32_t wb = ilog2(running_w);
+                        uint32_t bps = log_table_bits - wb;
+                        s_packed_lut[warp_id][slot] =
+                            (bps << 24) | ((uint32_t)symbol << 16) |
+                            (uint16_t)(L_mask & (running_w << bps));
+                        ptrs[j]++;
+                        ptr_cursor++;
+                    }
                 }
+                weights_sum += (int32_t)weight;
             }
 
-            // Weight-1 symbols at highThresh..L-1
+            // Weight-1 symbols fill slots_left..L-1
             for (int32_t i = 0; i < a_used; i++) {
-                uint32_t hi = highThresh + (uint32_t)i;
-                s_packed_lut[warp_id][hi] =
+                uint32_t pos = slots_left + (uint32_t)i;
+                s_packed_lut[warp_id][pos] =
                     (log_table_bits << 24) | ((uint32_t)td.a[i] << 16) | 0;
             }
         }

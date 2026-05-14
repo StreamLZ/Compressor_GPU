@@ -49,6 +49,8 @@ const FnStreamCreate = *const fn (*usize, c_uint) callconv(.c) CUresult;
 const FnStreamSync = *const fn (usize) callconv(.c) CUresult;
 const FnMemcpyHtoDAsync = *const fn (CUdeviceptr, *const anyopaque, usize, usize) callconv(.c) CUresult;
 const FnMemsetD8Async = *const fn (CUdeviceptr, u8, usize, usize) callconv(.c) CUresult;
+const FnMemAllocHost = *const fn (*?*anyopaque, usize) callconv(.c) CUresult;
+const FnMemFreeHost = *const fn (*anyopaque) callconv(.c) CUresult;
 
 var cuInit_fn: ?FnInit = null;
 var cuDeviceGet_fn: ?FnDeviceGet = null;
@@ -66,6 +68,8 @@ var cuStreamCreate_fn: ?FnStreamCreate = null;
 var cuStreamSync_fn: ?FnStreamSync = null;
 var cuMemcpyHtoDAsync_fn: ?FnMemcpyHtoDAsync = null;
 var cuMemsetD8Async_fn: ?FnMemsetD8Async = null;
+var cuMemAllocHost_fn: ?FnMemAllocHost = null;
+var cuMemFreeHost_fn: ?FnMemFreeHost = null;
 
 // Pipeline streams (persistent, created once in init)
 const NUM_PIPELINE_STREAMS = 1;
@@ -103,6 +107,8 @@ pub fn init() bool {
     cuStreamSync_fn = getProc(FnStreamSync, "cuStreamSynchronize_v2") orelse getProc(FnStreamSync, "cuStreamSynchronize");
     cuMemcpyHtoDAsync_fn = getProc(FnMemcpyHtoDAsync, "cuMemcpyHtoDAsync_v2");
     cuMemsetD8Async_fn = getProc(FnMemsetD8Async, "cuMemsetD8Async");
+    cuMemAllocHost_fn = getProc(FnMemAllocHost, "cuMemAllocHost_v2");
+    cuMemFreeHost_fn = getProc(FnMemFreeHost, "cuMemFreeHost");
 
     if ((cuInit_fn orelse return false)(0) != CUDA_SUCCESS) return false;
 
@@ -213,6 +219,10 @@ var d_build_timing: CUdeviceptr = 0;
 var d_build_timing_size: usize = 0;
 var d_parsed_weights: CUdeviceptr = 0;
 var d_parsed_weights_size: usize = 0;
+var d_work_counter: CUdeviceptr = 0;
+var d_work_counter_size: usize = 0;
+var h_pinned_output: ?[*]u8 = null;
+var h_pinned_output_size: usize = 0;
 var d_tans_descs_persist: CUdeviceptr = 0;
 var d_tans_descs_persist_size: usize = 0;
 var d_tans_status_persist: CUdeviceptr = 0;
@@ -795,13 +805,19 @@ pub fn fullGpuLaunch(
 
                 // Use split parse+initlut kernels when available, else legacy combined
                 if (scan.use_tans32 and tans_fse_build_fn != 0 and tans32_kernel_fn != 0) {
-                    // FSE-style build kernel: zero spills, then separate 32-lane decode
+                    // FSE build kernel with atomicAdd work claiming
+                    if (!ensureDeviceBuf(&d_work_counter, &d_work_counter_size, 4)) return error.BadMode;
+                    if (cuMemsetD8_fn) |memset_fn| _ = memset_fn(d_work_counter, 0, 4);
+                    var bp_wc = d_work_counter;
                     var fse_build_params = [_]?*anyopaque{
                         @ptrCast(&bp_comp), @ptrCast(&bp_descs),
                         @ptrCast(&bp_lut), @ptrCast(&bp_meta), @ptrCast(&bp_num),
+                        @ptrCast(&bp_wc),
                     };
                     var fse_build_extra = [_]?*anyopaque{null};
-                    if (launch_fn(tans_fse_build_fn, tans_grid, 1, 1, 32, 2, 1, 0, stream, &fse_build_params, &fse_build_extra) != CUDA_SUCCESS)
+                    // Persistent grid: fill GPU (24 blocks/SM × 34 SMs ≈ 816)
+                    const fse_grid = @min(tans_grid, 1024);
+                    if (launch_fn(tans_fse_build_fn, fse_grid, 1, 1, 32, 2, 1, 0, stream, &fse_build_params, &fse_build_extra) != CUDA_SUCCESS)
                         return error.BadMode;
                     // Sync to check FSE build kernel for errors
                     const fse_sync = stream_sync_fn(stream);

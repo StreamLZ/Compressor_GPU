@@ -1215,7 +1215,12 @@ pub fn encodeArrayU8Tans32(
     table_buf[0] = @intCast(log_table_bits);
     wp_tbl = 1;
 
-    // Bit-pack probabilities using FSE/zstd-style encoding
+    // Bit-pack probabilities using truncated binary (matches zstd FSE_writeNCount).
+    // value = weight + 1, range [0, remaining+1], N = remaining+2 values.
+    // half = 2^(nb-1), max_val = 2^nb - 1 - remaining.
+    // Short: value < max_val → write value in (nb-1) bits.
+    // Long below half: max_val <= value < half → write value in nb bits.
+    // Long above half: value >= half → write (value + max_val) in nb bits.
     var tbl_bits: u64 = 0;
     var tbl_bit_count: u32 = 0;
     var remaining: i32 = @as(i32, 1) << @intCast(log_table_bits);
@@ -1223,20 +1228,22 @@ pub fn encodeArrayU8Tans32(
 
     while (remaining > 0 and tbl_sym < num_symbols) {
         const w: i32 = @intCast(weights[tbl_sym]);
-        const value: u32 = @intCast(w + 1); // +1 so prob=-1 maps to 0, prob=0 maps to 1
+        const value: u32 = @intCast(w + 1);
 
-        // Compute variable-length code width
         const rem_plus_1: u32 = @intCast(remaining + 1);
         const log2_rem: u32 = if (rem_plus_1 > 1) (31 - @clz(rem_plus_1)) else 0;
         const nb: u32 = log2_rem + 1;
-        const threshold: u32 = (@as(u32, 1) << @intCast(nb)) - 1 - @as(u32, @intCast(remaining));
+        const half: u32 = @as(u32, 1) << @intCast(nb - 1);
+        const max_val: u32 = (half << 1) - @as(u32, @intCast(remaining)) - 2;
 
-        if (value < threshold) {
+        if (value < max_val) {
             tbl_bits |= @as(u64, value) << @intCast(tbl_bit_count);
             tbl_bit_count += nb - 1;
+        } else if (value < half) {
+            tbl_bits |= @as(u64, value) << @intCast(tbl_bit_count);
+            tbl_bit_count += nb;
         } else {
-            const adjusted = value + threshold;
-            tbl_bits |= @as(u64, adjusted) << @intCast(tbl_bit_count);
+            tbl_bits |= @as(u64, value + max_val) << @intCast(tbl_bit_count);
             tbl_bit_count += nb;
         }
 
@@ -1249,10 +1256,7 @@ pub fn encodeArrayU8Tans32(
 
         if (w > 0) {
             remaining -= w;
-        } else if (w == 0) {
-            // skip symbol
         }
-        // w == -1 not possible since weights are >= 0 from normalization
         tbl_sym += 1;
     }
 
@@ -1267,8 +1271,7 @@ pub fn encodeArrayU8Tans32(
     // Build encoding table
     var te: [256]TansEncEntry = undefined;
     var te_data: [2048]u16 = undefined;
-    // Use FSE spread distribution to match GPU decoder's initLut
-    tansInitTableFseSpread(&te, &te_data, &weights, num_symbols, log_table_bits);
+    tansInitTable(&te, &te_data, &weights, num_symbols, log_table_bits);
 
     const L: u32 = @as(u32, 1) << @intCast(log_table_bits);
 
