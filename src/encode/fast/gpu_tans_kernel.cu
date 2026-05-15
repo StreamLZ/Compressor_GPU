@@ -1371,3 +1371,193 @@ extern "C" __global__ void __launch_bounds__(32, 4) slzTans32EncodeKernel(
         my_dst[i] = lane_buf[i];
     }
 }
+
+// ══════════════════════════════════════════════════════════════════
+//  Phase 2: frame-wide shared probability tables
+// ══════════════════════════════════════════════════════════════════
+//
+// slzTans32EncodeSharedKernel — same algorithm as slzTans32EncodeKernel
+// but takes 4 pre-built encoding tables (one per stream type) in
+// global memory. Each block reads its descriptor's lut_id and uses
+// that table. No histogram / normalise / probability-table-emit work.
+//
+// Output layout per descriptor (chunk_type=3 body — driver wraps with
+// a 5-byte non-compact chunk header):
+//   [0]       1 byte lut_id (0=lit, 1=tok, 2=hi, 3=lo)
+//   [1..65)   64B sub_sizes (32 × u16 LE)
+//   [65..129) 64B sub_states (32 × u16 LE)
+//   [129..)   32 concatenated sub-streams
+//
+// Raw-fallback sentinel in sizes_out semantics unchanged.
+
+struct Tans32EncSharedDesc {
+    uint32_t src_offset;
+    uint32_t src_size;
+    uint32_t src_stride;
+    uint32_t dst_offset;
+    uint32_t dst_capacity;
+    uint32_t lut_id; // 0..3
+};
+
+// Matches Tans32EncodeTable in gpu_shared_luts.zig (extern struct).
+struct Tans32EncodeTableGpu {
+    uint8_t  te_packed[256 * 8];
+    uint16_t te_data[2048];
+    uint32_t log_table_bits;
+    uint32_t used_symbols;
+    uint32_t _pad;
+};
+
+extern "C" __global__ void __launch_bounds__(32, 4) slzTans32EncodeSharedKernel(
+    const uint8_t* __restrict__ src_buf,
+    uint8_t*       __restrict__ dst_buf,
+    const Tans32EncSharedDesc* __restrict__ descs,
+    uint32_t*      __restrict__ sizes_out,
+    uint32_t       num_descs,
+    const Tans32EncodeTableGpu* __restrict__ tables
+) {
+    const uint32_t did = blockIdx.x;
+    if (did >= num_descs) return;
+    const int lane = (int)(threadIdx.x & 31);
+
+    Tans32EncSharedDesc d = descs[did];
+    if (d.src_size < 64) {
+        if (lane == 0) sizes_out[did] = d.src_size | 0x80000000u;
+        return;
+    }
+
+    const uint8_t* src = src_buf + d.src_offset;
+    uint8_t* dst = dst_buf + d.dst_offset;
+
+    // ── Load shared tables into block shared memory ───────────────
+    __shared__ TansEncEntry te[256];
+    __shared__ uint16_t te_data[2048];
+    __shared__ uint32_t s_log_table_bits;
+    __shared__ uint16_t sub_sizes[32];
+    __shared__ uint16_t sub_states[32];
+
+    const Tans32EncodeTableGpu* tbl = &tables[d.lut_id];
+    // Each lane copies 32 te entries (256 / 32 = 8 entries per lane via stride).
+    // TansEncEntry has 4B base_offset, 2B thres, 1B num_bits + 1B pad.
+    for (int i = lane; i < 256; i += 32) {
+        const uint8_t* p = &tbl->te_packed[i * 8];
+        // Read each field; we know the layout from gpu_shared_luts.zig pack.
+        int32_t base_offset =
+            (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+        uint16_t thres = (uint16_t)p[4] | ((uint16_t)p[5] << 8);
+        uint8_t  num_bits = p[6];
+        te[i].base_offset = base_offset;
+        te[i].thres = thres;
+        te[i].num_bits = num_bits;
+    }
+    // te_data: 2048 u16 entries. 32 lanes copy 64 entries each.
+    for (int i = lane; i < 2048; i += 32) {
+        te_data[i] = tbl->te_data[i];
+    }
+    if (lane == 0) s_log_table_bits = tbl->log_table_bits;
+    __syncwarp();
+
+    const uint32_t log_table_bits = s_log_table_bits;
+    const uint32_t L = 1u << log_table_bits;
+
+    // ── Phase 1: lane-local reverse encode, collect (nb, bits) ────
+    const uint32_t src_size = d.src_size;
+    const uint32_t stride = d.src_stride;
+
+    int32_t signed_count = (int32_t)src_size - lane;
+    uint32_t lane_count = (signed_count > 0) ? (uint32_t)((signed_count + 31) / 32) : 0u;
+
+    uint8_t  enc_nb[TANS32_MAX_LANE_COUNT];
+    uint32_t enc_bits[TANS32_MAX_LANE_COUNT];
+
+    uint32_t lane_state = L;
+    uint32_t enc_count = 0;
+
+    if (lane_count > 0) {
+        uint32_t cap = (lane_count <= TANS32_MAX_LANE_COUNT) ? lane_count : TANS32_MAX_LANE_COUNT;
+        for (uint32_t ri = cap; ri > 0; ) {
+            ri--;
+            uint32_t sym_idx = ri * 32u + (uint32_t)lane;
+            uint8_t sym = src[sym_idx * stride];
+            const TansEncEntry* entry = &te[sym];
+
+            uint32_t new_state;
+            uint32_t nb;
+            nextState(te_data, entry, lane_state, new_state, nb);
+
+            uint32_t mask = (nb >= 32) ? 0xFFFFFFFFu : ((1u << nb) - 1u);
+            enc_nb[enc_count]   = (uint8_t)nb;
+            enc_bits[enc_count] = lane_state & mask;
+            enc_count++;
+            lane_state = new_state;
+        }
+    }
+
+    // ── Phase 2: pack bits LSB-first in REVERSE (write to lane scratch) ──
+    uint8_t lane_buf[TANS32_MAX_LANE_COUNT + 64];
+
+    uint64_t bit_buf = 0;
+    uint32_t bit_count = 0;
+    uint32_t wp_local = 0;
+
+    for (uint32_t ei = enc_count; ei > 0; ) {
+        ei--;
+        bit_buf |= (uint64_t)enc_bits[ei] << bit_count;
+        bit_count += enc_nb[ei];
+        while (bit_count >= 8) {
+            lane_buf[wp_local++] = (uint8_t)(bit_buf & 0xFF);
+            bit_buf >>= 8;
+            bit_count -= 8;
+        }
+    }
+    if (bit_count > 0) {
+        lane_buf[wp_local++] = (uint8_t)(bit_buf & 0xFF);
+    }
+
+    if (wp_local > 0xFFFF) {
+        if (lane == 0) sizes_out[did] = d.src_size | 0x80000000u;
+        return;
+    }
+
+    sub_sizes[lane]  = (uint16_t)wp_local;
+    sub_states[lane] = (uint16_t)(lane_state & (L - 1));
+    __syncwarp();
+
+    // ── Prefix sum of sub_sizes ────────────────────────────────────
+    uint32_t my_size = (uint32_t)sub_sizes[lane];
+    uint32_t scan = my_size;
+    for (int o = 1; o < 32; o <<= 1) {
+        uint32_t n = __shfl_up_sync(0xFFFFFFFF, scan, o);
+        if (lane >= o) scan += n;
+    }
+    uint32_t my_offset = scan - my_size;
+    uint32_t total_compressed = __shfl_sync(0xFFFFFFFF, scan, 31);
+
+    // Body layout: [1B lut_id][128B sizes+states][sub-streams].
+    const uint32_t header_size = 1u + 128u;
+    const uint32_t total_size = header_size + total_compressed;
+
+    if (total_size + 8 > d.dst_capacity || total_size >= d.src_size) {
+        if (lane == 0) sizes_out[did] = d.src_size | 0x80000000u;
+        return;
+    }
+
+    if (lane == 0) {
+        dst[0] = (uint8_t)d.lut_id;
+        for (int i = 0; i < 32; i++) {
+            dst[1 + i * 2]     = (uint8_t)(sub_sizes[i] & 0xFF);
+            dst[1 + i * 2 + 1] = (uint8_t)((sub_sizes[i] >> 8) & 0xFF);
+        }
+        for (int i = 0; i < 32; i++) {
+            dst[1 + 64 + i * 2]     = (uint8_t)(sub_states[i] & 0xFF);
+            dst[1 + 64 + i * 2 + 1] = (uint8_t)((sub_states[i] >> 8) & 0xFF);
+        }
+        sizes_out[did] = total_size;
+    }
+    __syncwarp();
+
+    uint8_t* my_dst = dst + header_size + my_offset;
+    for (uint32_t i = 0; i < wp_local; i++) {
+        my_dst[i] = lane_buf[i];
+    }
+}

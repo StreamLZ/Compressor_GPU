@@ -145,6 +145,16 @@ fn reencodeGpuWithEntropy(
     /// side using the supplied body sizes.
     tans_encoded_off16_hi: ?[]const u8,
     tans_encoded_off16_lo: ?[]const u8,
+    /// Phase 2 — shared-LUT (chunk_type=3) pre-encoded bodies. When
+    /// non-null, the assembler emits chunk_type=3 streams (with the
+    /// kernel's 1-byte lut_id prefix already inside the body) instead
+    /// of chunk_type=6. Takes precedence over the type-6 paths above.
+    /// All four are expected to be non-null together; partial fill
+    /// drops back to type-6 / CPU paths per stream.
+    shared_lit: ?[]const u8,
+    shared_tok: ?[]const u8,
+    shared_off16_hi: ?[]const u8,
+    shared_off16_lo: ?[]const u8,
     shared_tans_ctx: ?*const tans_enc.Tans32SharedCtx,
     is_first_subchunk: bool,
     lit_override: LitOverride,
@@ -260,6 +270,17 @@ fn reencodeGpuWithEntropy(
             },
             .none => {},
         }
+        // Phase 2 shared-LUT path (chunk_type=3). Body already
+        // contains the 1-byte lut_id prefix from the kernel.
+        if (shared_lit) |pre| {
+            if (pre.len > 0 and pre.len + 5 < literals.len + 3) {
+                if (wp + 5 + pre.len > dst.len) break :blk @as(usize, 0);
+                entropy_enc.writeNonCompactChunkHeader(dst[wp..], 3, @intCast(pre.len), @intCast(literals.len));
+                @memcpy(dst[wp + 5 ..][0..pre.len], pre);
+                break :blk 5 + pre.len;
+            }
+            break :blk entropy_enc.encodeArrayU8Memcpy(dst[wp..], literals) catch 0;
+        }
         // GPU 32-lane pre-encoded literals (type-6). Mirrors the
         // CPU `encodeArrayU8Tans32` output, body only — caller adds
         // the 5-byte non-compact chunk header.
@@ -320,6 +341,16 @@ fn reencodeGpuWithEntropy(
                 break :blk_tok 7;
             },
             .none => {},
+        }
+        // Phase 2 shared-LUT path (chunk_type=3).
+        if (shared_tok) |pre| {
+            if (pre.len > 0 and pre.len + 5 < tokens.len + 3) {
+                if (wp + 5 + pre.len > dst.len) return 0;
+                entropy_enc.writeNonCompactChunkHeader(dst[wp..], 3, @intCast(pre.len), @intCast(tokens.len));
+                @memcpy(dst[wp + 5 ..][0..pre.len], pre);
+                break :blk_tok 5 + pre.len;
+            }
+            break :blk_tok entropy_enc.encodeArrayU8Memcpy(dst[wp..], tokens) catch return 0;
         }
         // GPU-pre-encoded token stream (32-lane tANS). The kernel
         // outputs `[128B sizes+states][prob table][32 sub-streams]`
@@ -391,10 +422,35 @@ fn reencodeGpuWithEntropy(
         const lo_n = entropy_enc.encodeArrayU8(allocator, dst[wp..], lo_bytes, options, speed_tradeoff, null, 0, null) catch return 0;
         wp += lo_n;
     } else if (off16_count >= 32) {
-        // GPU-pre-encoded fast path: both hi and lo must be present
-        // (raw-fallback for either drops us back to CPU encode).
-        const use_gpu_off16: bool = tans_encoded_off16_hi != null and tans_encoded_off16_lo != null;
-        if (use_gpu_off16) {
+        // Phase 2 shared-LUT path (chunk_type=3) takes priority when
+        // both hi and lo were shared-encoded.
+        const use_shared_off16: bool = shared_off16_hi != null and shared_off16_lo != null;
+        // Phase 1 GPU type-6 path falls back to here if shared not in
+        // play but per-stream pre-encoded data is present.
+        const use_gpu_off16: bool = (!use_shared_off16) and
+            tans_encoded_off16_hi != null and tans_encoded_off16_lo != null;
+        if (use_shared_off16) {
+            const pre_hi = shared_off16_hi.?;
+            const pre_lo = shared_off16_lo.?;
+            const split_total: usize = pre_hi.len + pre_lo.len + 10;
+            if (split_total < off16_bytes) {
+                if (wp + 2 + split_total > dst.len) return 0;
+                std.mem.writeInt(u16, dst[wp..][0..2], fast_constants.entropy_coded_16_marker, .little);
+                wp += 2;
+                entropy_enc.writeNonCompactChunkHeader(dst[wp..], 3, @intCast(pre_hi.len), @intCast(off16_count));
+                @memcpy(dst[wp + 5 ..][0..pre_hi.len], pre_hi);
+                wp += 5 + pre_hi.len;
+                entropy_enc.writeNonCompactChunkHeader(dst[wp..], 3, @intCast(pre_lo.len), @intCast(off16_count));
+                @memcpy(dst[wp + 5 ..][0..pre_lo.len], pre_lo);
+                wp += 5 + pre_lo.len;
+            } else {
+                if (wp + 2 + off16_bytes > dst.len) return 0;
+                std.mem.writeInt(u16, dst[wp..][0..2], @intCast(off16_count), .little);
+                wp += 2;
+                @memcpy(dst[wp..][0..off16_bytes], off16_data);
+                wp += off16_bytes;
+            }
+        } else if (use_gpu_off16) {
             const pre_hi = tans_encoded_off16_hi.?;
             const pre_lo = tans_encoded_off16_lo.?;
             // 5-byte type-6 chunk header per stream → split_total = pre_hi + pre_lo + 10.
@@ -1073,10 +1129,60 @@ pub fn compressFramedOne(
         if (!gpu_enc.gpuCompress(effective_src, gpu_out, descs, comp_sizes, io, opts.level))
             break :gpu_compress;
 
+        // ── Phase 2: frame-wide shared probability tables ─────────
+        // Build 4 shared LUTs (lit/tok/off16-hi/off16-lo) from the
+        // raw GPU output. When all 4 are buildable AND the shared
+        // encode kernel succeeds, the assembly loop emits chunk_type=3
+        // sub-chunks (no per-stream prob tables) — the decoder builds
+        // 4 LUTs once per frame instead of thousands.
+        const shared_luts_mod = @import("fast/gpu_shared_luts.zig");
+        var built_lit: ?shared_luts_mod.SharedLutBuildResult = null;
+        var built_tok: ?shared_luts_mod.SharedLutBuildResult = null;
+        var built_hi:  ?shared_luts_mod.SharedLutBuildResult = null;
+        var built_lo:  ?shared_luts_mod.SharedLutBuildResult = null;
+        defer {
+            if (built_lit) |b| allocator.free(b.table_bytes);
+            if (built_tok) |b| allocator.free(b.table_bytes);
+            if (built_hi)  |b| allocator.free(b.table_bytes);
+            if (built_lo)  |b| allocator.free(b.table_bytes);
+        }
+        const use_shared_luts: bool = blk_shared_build: {
+            if (opts.level < 3) break :blk_shared_build false;
+            if (gpu_enc.tans32_shared_kernel_fn == 0) break :blk_shared_build false;
+            // Gated behind SLZ_GPU_SHARED_LUTS=1 until the decoder lands.
+            if (std.c.getenv("SLZ_GPU_SHARED_LUTS") == null) break :blk_shared_build false;
+            const fh = shared_luts_mod.buildFrameHistograms(gpu_out, descs, comp_sizes);
+            built_lit = shared_luts_mod.buildSharedLut(allocator, &fh.lit, fh.lit_total);
+            built_tok = shared_luts_mod.buildSharedLut(allocator, &fh.tok, fh.tok_total);
+            built_hi  = shared_luts_mod.buildSharedLut(allocator, &fh.off16_hi, fh.off16_total);
+            built_lo  = shared_luts_mod.buildSharedLut(allocator, &fh.off16_lo, fh.off16_total);
+            if (built_lit == null or built_tok == null or built_hi == null or built_lo == null)
+                break :blk_shared_build false;
+
+            // Run the shared kernel.
+            const tables = [_]shared_luts_mod.Tans32EncodeTable{
+                built_lit.?.enc_table,
+                built_tok.?.enc_table,
+                built_hi.?.enc_table,
+                built_lo.?.enc_table,
+            };
+            const ok = gpu_enc.gpuEncodeAllSharedTans32(allocator, gpu_out, descs, comp_sizes, tables);
+            break :blk_shared_build ok;
+        };
+        defer if (use_shared_luts) {
+            if (gpu_enc.tans32_shared_sizes)   |s| allocator.free(s);
+            if (gpu_enc.tans32_shared_data)    |d| allocator.free(d);
+            if (gpu_enc.tans32_shared_offsets) |o| allocator.free(o);
+            gpu_enc.tans32_shared_sizes = null;
+            gpu_enc.tans32_shared_data = null;
+            gpu_enc.tans32_shared_offsets = null;
+        };
+
         // ── GPU 32-lane tANS encode of TOKEN + off16 streams ────
         // For L3+ only (matches the reencode entropy gate). Populates
         // gpu_enc.tans32_tok_* and gpu_enc.tans32_off16{hi,lo}_*.
-        const gpu_tok_pre_encoded: bool = if (opts.level >= 3)
+        // Skipped when Phase 2 shared-LUT mode is active.
+        const gpu_tok_pre_encoded: bool = if (opts.level >= 3 and !use_shared_luts)
             gpu_enc.gpuEncodeTokensTans32(allocator, gpu_out, descs, comp_sizes)
         else
             false;
@@ -1088,7 +1194,7 @@ pub fn compressFramedOne(
             gpu_enc.tans32_tok_data = null;
             gpu_enc.tans32_tok_offsets = null;
         };
-        const gpu_lit_pre_encoded: bool = if (opts.level >= 3)
+        const gpu_lit_pre_encoded: bool = if (opts.level >= 3 and !use_shared_luts)
             gpu_enc.gpuEncodeLiteralsTans32(allocator, gpu_out, descs, comp_sizes)
         else
             false;
@@ -1100,7 +1206,7 @@ pub fn compressFramedOne(
             gpu_enc.tans32_lit_data = null;
             gpu_enc.tans32_lit_offsets = null;
         };
-        const gpu_off16_pre_encoded: bool = if (opts.level >= 3)
+        const gpu_off16_pre_encoded: bool = if (opts.level >= 3 and !use_shared_luts)
             gpu_enc.gpuEncodeOff16Tans32(allocator, gpu_out, descs, comp_sizes)
         else
             false;
@@ -1357,6 +1463,61 @@ pub fn compressFramedOne(
                             if (off + sz > data.len) break :blk_lo null;
                             break :blk_lo data[off..][0..sz];
                         };
+                        // Phase 2 shared-LUT slices for this sub-chunk
+                        // (kernel output: [1B lut_id][128B sizes+states][sub-streams]).
+                        const N_shared: u32 = gpu_enc.tans32_shared_n_per_stream;
+                        const shared_lit_slice: ?[]const u8 = blk_sl: {
+                            if (!use_shared_luts) break :blk_sl null;
+                            const sizes = gpu_enc.tans32_shared_sizes orelse break :blk_sl null;
+                            const data = gpu_enc.tans32_shared_data orelse break :blk_sl null;
+                            const offs = gpu_enc.tans32_shared_offsets orelse break :blk_sl null;
+                            const idx: usize = 0 * @as(usize, N_shared) + gpu_bi_idx;
+                            if (idx >= sizes.len) break :blk_sl null;
+                            const sz = sizes[idx];
+                            if ((sz & 0x80000000) != 0 or sz == 0) break :blk_sl null;
+                            const off = offs[idx];
+                            if (off + sz > data.len) break :blk_sl null;
+                            break :blk_sl data[off..][0..sz];
+                        };
+                        const shared_tok_slice: ?[]const u8 = blk_ss: {
+                            if (!use_shared_luts) break :blk_ss null;
+                            const sizes = gpu_enc.tans32_shared_sizes orelse break :blk_ss null;
+                            const data = gpu_enc.tans32_shared_data orelse break :blk_ss null;
+                            const offs = gpu_enc.tans32_shared_offsets orelse break :blk_ss null;
+                            const idx: usize = 1 * @as(usize, N_shared) + gpu_bi_idx;
+                            if (idx >= sizes.len) break :blk_ss null;
+                            const sz = sizes[idx];
+                            if ((sz & 0x80000000) != 0 or sz == 0) break :blk_ss null;
+                            const off = offs[idx];
+                            if (off + sz > data.len) break :blk_ss null;
+                            break :blk_ss data[off..][0..sz];
+                        };
+                        const shared_hi_slice: ?[]const u8 = blk_sh: {
+                            if (!use_shared_luts) break :blk_sh null;
+                            const sizes = gpu_enc.tans32_shared_sizes orelse break :blk_sh null;
+                            const data = gpu_enc.tans32_shared_data orelse break :blk_sh null;
+                            const offs = gpu_enc.tans32_shared_offsets orelse break :blk_sh null;
+                            const idx: usize = 2 * @as(usize, N_shared) + gpu_bi_idx;
+                            if (idx >= sizes.len) break :blk_sh null;
+                            const sz = sizes[idx];
+                            if ((sz & 0x80000000) != 0 or sz == 0) break :blk_sh null;
+                            const off = offs[idx];
+                            if (off + sz > data.len) break :blk_sh null;
+                            break :blk_sh data[off..][0..sz];
+                        };
+                        const shared_lo_slice: ?[]const u8 = blk_sllo: {
+                            if (!use_shared_luts) break :blk_sllo null;
+                            const sizes = gpu_enc.tans32_shared_sizes orelse break :blk_sllo null;
+                            const data = gpu_enc.tans32_shared_data orelse break :blk_sllo null;
+                            const offs = gpu_enc.tans32_shared_offsets orelse break :blk_sllo null;
+                            const idx: usize = 3 * @as(usize, N_shared) + gpu_bi_idx;
+                            if (idx >= sizes.len) break :blk_sllo null;
+                            const sz = sizes[idx];
+                            if ((sz & 0x80000000) != 0 or sz == 0) break :blk_sllo null;
+                            const off = offs[idx];
+                            if (off + sz > data.len) break :blk_sllo null;
+                            break :blk_sllo data[off..][0..sz];
+                        };
                         const enc_n = reencodeGpuWithEntropy(
                             allocator, raw_payload, enc_buf, entropy_options,
                             0.0, // minimize size, not speed
@@ -1366,6 +1527,10 @@ pub fn compressFramedOne(
                             gpu_tok_pre,
                             gpu_off16hi_pre,
                             gpu_off16lo_pre,
+                            shared_lit_slice,
+                            shared_tok_slice,
+                            shared_hi_slice,
+                            shared_lo_slice,
                             if (shared_tans_ctx) |*ctx| ctx else null,
                             is_first_tans32_in_frame,
                             lit_ov,
@@ -1440,6 +1605,35 @@ pub fn compressFramedOne(
             .uncompressed = false,
             .parallel_decode_metadata = false,
         });
+
+        // ── Phase 2: insert shared-LUT section into the frame header ────
+        // After encoding the body we know the actual 4 shared probability
+        // tables. We memmove the body right by the section size and write
+        // the section between the frame header (offset hdr_len) and the
+        // frame block header.
+        if (use_shared_luts) {
+            const lit_t = built_lit.?.table_bytes;
+            const tok_t = built_tok.?.table_bytes;
+            const hi_t  = built_hi.?.table_bytes;
+            const lo_t  = built_lo.?.table_bytes;
+            const lut_section_size: usize =
+                2 + lit_t.len + 2 + tok_t.len + 2 + hi_t.len + 2 + lo_t.len;
+            if (pos + lut_section_size + 4 > dst.len) return error.DestinationTooSmall;
+            // Shift body right.
+            std.mem.copyBackwards(u8, dst[hdr_len + lut_section_size .. pos + lut_section_size], dst[hdr_len..pos]);
+            // Write LUT section.
+            var sp: usize = hdr_len;
+            const tables = [_][]const u8{ lit_t, tok_t, hi_t, lo_t };
+            for (tables) |t| {
+                std.mem.writeInt(u16, dst[sp..][0..2], @intCast(t.len), .little);
+                sp += 2;
+                @memcpy(dst[sp..][0..t.len], t);
+                sp += t.len;
+            }
+            // Set gpu_shared_luts_present flag bit (bit 5 of flags byte at dst[5]).
+            dst[5] |= 0x20;
+            pos += lut_section_size;
+        }
 
         // End mark
         if (pos + 4 > dst.len) return error.DestinationTooSmall;

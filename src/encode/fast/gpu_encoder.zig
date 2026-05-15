@@ -23,6 +23,7 @@ var kernel_fn: usize = 0;
 var tans_module: usize = 0;
 var tans_kernel_fn: usize = 0;
 var tans32_kernel_fn: usize = 0;
+pub var tans32_shared_kernel_fn: usize = 0;
 var initialized = false;
 
 const FnInit = *const fn (c_uint) callconv(.c) CUresult;
@@ -91,6 +92,9 @@ pub fn init() bool {
     // 32-lane tANS encoder (chunk_type=6). Loaded lazily — kernel symbol must
     // exist in PTX or this returns failure. Driver falls back to CPU path.
     _ = get_fn(&tans32_kernel_fn, tans_module, "slzTans32EncodeKernel");
+    // 32-lane tANS encoder with frame-wide shared probability tables
+    // (chunk_type=3). Phase 2 specialisation; optional.
+    _ = get_fn(&tans32_shared_kernel_fn, tans_module, "slzTans32EncodeSharedKernel");
 
     return true;
 }
@@ -151,6 +155,18 @@ pub const Tans32EncDesc = extern struct {
     dst_capacity: u32,
 };
 
+/// Phase 2 shared-LUT encode descriptor — matches `Tans32EncSharedDesc`
+/// in gpu_tans_kernel.cu. The extra `lut_id` picks which of the 4
+/// frame-wide encoding tables to use (0=lit, 1=tok, 2=hi, 3=lo).
+pub const Tans32EncSharedDesc = extern struct {
+    src_offset: u32,
+    src_size: u32,
+    src_stride: u32,
+    dst_offset: u32,
+    dst_capacity: u32,
+    lut_id: u32,
+};
+
 // Persistent buffers for the 32-lane tANS pass.
 var d_tans32_descs_persist: CUdeviceptr = 0;
 var d_tans32_descs_size: usize = 0;
@@ -158,6 +174,9 @@ var d_tans32_out_persist: CUdeviceptr = 0;
 var d_tans32_out_size: usize = 0;
 var d_tans32_sizes_persist: CUdeviceptr = 0;
 var d_tans32_sizes_size: usize = 0;
+// Phase 2 shared encode tables — 4 × Tans32EncodeTable in device memory.
+var d_tans32_shared_tables: CUdeviceptr = 0;
+var d_tans32_shared_tables_size: usize = 0;
 
 /// Launch the 32-lane tANS encoder on a batch of streams already
 /// resident in device memory (`d_input_persist` from the LZ encode
@@ -281,6 +300,19 @@ pub var tans32_off16hi_offsets: ?[]u32 = null;
 pub var tans32_off16lo_sizes: ?[]u32 = null;
 pub var tans32_off16lo_data: ?[]u8 = null;
 pub var tans32_off16lo_offsets: ?[]u32 = null;
+
+// Phase 2 shared-LUT encoded streams. Single descriptor array layout:
+//   descs[0..N]     → literals (lut_id=0)
+//   descs[N..2N]    → tokens   (lut_id=1)
+//   descs[2N..3N]   → off16-hi (lut_id=2)
+//   descs[3N..4N]   → off16-lo (lut_id=3)
+// `tans32_shared_n_per_stream` records N. The body at offset O has
+// length sizes[i]; the body starts with a 1-byte lut_id followed by
+// [128B sizes+states][32 sub-streams].
+pub var tans32_shared_sizes: ?[]u32 = null;
+pub var tans32_shared_data: ?[]u8 = null;
+pub var tans32_shared_offsets: ?[]u32 = null;
+pub var tans32_shared_n_per_stream: u32 = 0;
 
 /// Build literal descriptors and run the 32-lane tANS encoder.
 /// Output is a per-sub-chunk encoded body (no chunk header). Caller
@@ -597,6 +629,211 @@ pub fn gpuEncodeOff16Tans32(
     tans32_off16lo_sizes = lo_sizes;
     tans32_off16lo_data = bytes; // SAME pointer — only one of {hi,lo} should free it
     tans32_off16lo_offsets = lo_offsets;
+    return true;
+}
+
+const shared_luts_mod = @import("gpu_shared_luts.zig");
+
+/// Phase 2: encode all four stream types across all sub-chunks using
+/// the four pre-built frame-wide encoding tables. One kernel launch,
+/// 4*N descriptors. Populates `tans32_shared_*` pub vars on success.
+pub fn gpuEncodeAllSharedTans32(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes: []const u32,
+    tables: [4]shared_luts_mod.Tans32EncodeTable,
+) bool {
+    if (!init()) return false;
+    if (tans32_shared_kernel_fn == 0) return false;
+    const n: u32 = @intCast(chunk_descs.len);
+    if (n == 0) return false;
+
+    const num_descs = @as(usize, n) * 4;
+
+    var descs = allocator.alloc(Tans32EncSharedDesc, num_descs) catch return false;
+    defer allocator.free(descs);
+    var offsets = allocator.alloc(u32, num_descs) catch return false;
+    errdefer allocator.free(offsets);
+
+    var total: u32 = 0;
+
+    // Helper: parse one sub-chunk's stream offsets/sizes once and fill in
+    // each of the four descriptor slots.
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const cs = comp_sizes[i];
+        const base: u32 = chunk_descs[i].dst_offset;
+        const init_b: u32 = if (chunk_descs[i].is_first != 0) 8 else 0;
+
+        // Default empty for all four streams.
+        inline for ([_]u32{ 0, 1, 2, 3 }) |sid| {
+            descs[sid * n + i] = .{
+                .src_offset = 0,
+                .src_size = 0,
+                .src_stride = 1,
+                .dst_offset = total,
+                .dst_capacity = 0,
+                .lut_id = sid,
+            };
+            offsets[sid * n + i] = total;
+        }
+
+        if (cs < init_b + 3) continue;
+
+        const lit_hdr: u32 = base + init_b;
+        const lit_count: u32 =
+            (@as(u32, output[lit_hdr]) << 16) |
+            (@as(u32, output[lit_hdr + 1]) << 8) |
+            @as(u32, output[lit_hdr + 2]);
+        const lit_src: u32 = lit_hdr + 3;
+        if (lit_count > 0 and lit_src + lit_count <= base + cs) {
+            const cap: u32 = lit_count + 512;
+            descs[0 * n + i] = .{
+                .src_offset = lit_src,
+                .src_size = lit_count,
+                .src_stride = 1,
+                .dst_offset = total,
+                .dst_capacity = cap,
+                .lut_id = 0,
+            };
+            offsets[0 * n + i] = total;
+            total += cap;
+        }
+
+        const tok_hdr: u32 = lit_src + lit_count;
+        if (tok_hdr + 3 > base + cs) continue;
+        const tok_count: u32 =
+            (@as(u32, output[tok_hdr]) << 16) |
+            (@as(u32, output[tok_hdr + 1]) << 8) |
+            @as(u32, output[tok_hdr + 2]);
+        const tok_src: u32 = tok_hdr + 3;
+        if (tok_count > 0 and tok_src + tok_count <= base + cs) {
+            const cap: u32 = tok_count + 512;
+            descs[1 * n + i] = .{
+                .src_offset = tok_src,
+                .src_size = tok_count,
+                .src_stride = 1,
+                .dst_offset = total,
+                .dst_capacity = cap,
+                .lut_id = 1,
+            };
+            offsets[1 * n + i] = total;
+            total += cap;
+        }
+
+        // off16 — same parse as gpuEncodeOff16Tans32
+        const cmd2_size: u32 = if (chunk_descs[i].src_size > 0x10000) 2 else 0;
+        const off16_hdr: u32 = tok_src + tok_count + cmd2_size;
+        if (off16_hdr + 2 > base + cs) continue;
+        const off16_count: u32 =
+            @as(u32, output[off16_hdr]) | (@as(u32, output[off16_hdr + 1]) << 8);
+        if (off16_count < 32) continue;
+        const off16_data: u32 = off16_hdr + 2;
+        if (off16_data + off16_count * 2 > base + cs) continue;
+
+        const hi_cap: u32 = off16_count + 512;
+        descs[2 * n + i] = .{
+            .src_offset = off16_data + 1,
+            .src_size = off16_count,
+            .src_stride = 2,
+            .dst_offset = total,
+            .dst_capacity = hi_cap,
+            .lut_id = 2,
+        };
+        offsets[2 * n + i] = total;
+        total += hi_cap;
+
+        const lo_cap: u32 = off16_count + 512;
+        descs[3 * n + i] = .{
+            .src_offset = off16_data,
+            .src_size = off16_count,
+            .src_stride = 2,
+            .dst_offset = total,
+            .dst_capacity = lo_cap,
+            .lut_id = 3,
+        };
+        offsets[3 * n + i] = total;
+        total += lo_cap;
+    }
+
+    if (total == 0) {
+        allocator.free(offsets);
+        return false;
+    }
+
+    const sizes = allocator.alloc(u32, num_descs) catch {
+        allocator.free(offsets);
+        return false;
+    };
+    errdefer allocator.free(sizes);
+    const bytes = allocator.alloc(u8, total) catch {
+        allocator.free(offsets);
+        allocator.free(sizes);
+        return false;
+    };
+    errdefer allocator.free(bytes);
+
+    // ── Upload 4 encoding tables ─────────────────────────────────
+    const tables_bytes = @sizeOf(shared_luts_mod.Tans32EncodeTable) * 4;
+    if (!ensureBuf(&d_tans32_shared_tables, &d_tans32_shared_tables_size, tables_bytes)) {
+        allocator.free(offsets); allocator.free(sizes); allocator.free(bytes);
+        return false;
+    }
+
+    const h2d_fn = cuMemcpyHtoD_fn orelse return false;
+    const d2h_fn = cuMemcpyDtoH_fn orelse return false;
+    const launch_fn = cuLaunchKernel_fn orelse return false;
+    const sync_fn = cuCtxSynchronize_fn orelse return false;
+    const memset_fn = cuMemsetD8_fn orelse return false;
+
+    var tables_copy = tables;
+    _ = h2d_fn(d_tans32_shared_tables, @ptrCast(&tables_copy), tables_bytes);
+
+    // ── Allocate device buffers ───────────────────────────────────
+    const desc_bytes_dev: usize = num_descs * @sizeOf(Tans32EncSharedDesc);
+    const sizes_bytes_dev: usize = num_descs * 4;
+    if (!ensureBuf(&d_tans32_descs_persist, &d_tans32_descs_size, desc_bytes_dev) or
+        !ensureBuf(&d_tans32_out_persist, &d_tans32_out_size, total) or
+        !ensureBuf(&d_tans32_sizes_persist, &d_tans32_sizes_size, sizes_bytes_dev))
+    {
+        allocator.free(offsets); allocator.free(sizes); allocator.free(bytes);
+        return false;
+    }
+
+    _ = h2d_fn(d_tans32_descs_persist, @ptrCast(descs.ptr), desc_bytes_dev);
+    _ = memset_fn(d_tans32_sizes_persist, 0, sizes_bytes_dev);
+    _ = sync_fn();
+
+    var p_src = d_output_persist;
+    var p_dst = d_tans32_out_persist;
+    var p_descs_dev = d_tans32_descs_persist;
+    var p_sizes_dev = d_tans32_sizes_persist;
+    var p_n: u32 = @intCast(num_descs);
+    var p_tables = d_tans32_shared_tables;
+
+    var params = [_]?*anyopaque{
+        @ptrCast(&p_src), @ptrCast(&p_dst), @ptrCast(&p_descs_dev),
+        @ptrCast(&p_sizes_dev), @ptrCast(&p_n), @ptrCast(&p_tables),
+    };
+    var extra = [_]?*anyopaque{null};
+
+    if (launch_fn(tans32_shared_kernel_fn, @intCast(num_descs), 1, 1, 32, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) {
+        allocator.free(offsets); allocator.free(sizes); allocator.free(bytes);
+        return false;
+    }
+    if (sync_fn() != CUDA_SUCCESS) {
+        allocator.free(offsets); allocator.free(sizes); allocator.free(bytes);
+        return false;
+    }
+
+    _ = d2h_fn(@ptrCast(sizes.ptr), d_tans32_sizes_persist, sizes_bytes_dev);
+    _ = d2h_fn(@ptrCast(bytes.ptr), d_tans32_out_persist, total);
+
+    tans32_shared_sizes = sizes;
+    tans32_shared_data = bytes;
+    tans32_shared_offsets = offsets;
+    tans32_shared_n_per_stream = n;
     return true;
 }
 
