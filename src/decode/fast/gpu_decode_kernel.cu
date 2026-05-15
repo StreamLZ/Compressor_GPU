@@ -877,13 +877,14 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
             const uint8_t* sc_payload = chunk_src + 3;
 
             if (sc_comp_size < sc_size) {
-                // base_offset is the relative offset within the chunk
-                // (0 for the first sub-chunk, triggers initial 8-byte copy)
-                uint32_t base_offset_val = sc_dst_off - ch.dst_offset;
-
+                // Match Vulkan convention: pass absolute sc_dst_off as
+                // base_offset, so only sub-chunk at output offset 0 (i.e.
+                // the very first sub-chunk in the frame) triggers the
+                // 8-byte initial copy. Per-chunk init copies are restored
+                // by the host-side SC prefix table post-pass instead.
                 parseAndDecodeSubChunk(
                     sc_payload, sc_comp_size, sc_size,
-                    dst, sc_dst_off, base_offset_val, sc_mode,
+                    dst, sc_dst_off, sc_dst_off, sc_mode,
                     chunk_tans_scratch, chunk_tok_scratch, chunk_off16_scratch
                 );
             } else {

@@ -88,6 +88,8 @@ pub fn init() bool {
     if (initialized) return kernel_fn != 0;
     initialized = true;
 
+    if (std.c.getenv("SLZ_NO_CUDA") != null) return false;
+
     lib = win32.LoadLibraryA("nvcuda.dll");
     if (lib == null) return false;
 
@@ -353,7 +355,11 @@ fn scanForTansChunks(
             const sub_idx: u32 = chunk_first_sub + sub_local_idx;
             const sub_dst_off: usize = @as(usize, sub_idx) * 131072;
 
-            const init_b: u32 = if (first_sub) 8 else 0;
+            // 8 init bytes only on the very first sub-chunk of the FRAME
+            // (sub_idx == 0). All later sub-chunks (including each chunk's
+            // own first sub-chunk) get their first 8 bytes restored from
+            // the SC prefix table post-decode, not from the stream.
+            const init_b: u32 = if (sub_idx == 0) 8 else 0;
             var pos: u32 = sub_pos + 3 + init_b;
             const sub_payload_end: u32 = sub_end;
 

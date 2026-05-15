@@ -980,12 +980,16 @@ pub fn compressFramedOne(
             for (0..n_subs) |si| {
                 const sub_start = chunk_start + si * gpu_block;
                 const sub_size = @min(gpu_block, data_src.len - sub_start);
+                // Only the VERY FIRST sub-chunk of the frame writes 8 raw
+                // init bytes (matches CPU encoder + Vulkan decoder convention).
+                // For chunks 1..N-1, the SC prefix table appended at the end
+                // of the block carries those bytes and is applied post-decode.
                 descs[bi] = .{
                     .src_offset = @intCast(dict_len + sub_start),
                     .src_size = @intCast(sub_size),
                     .dst_offset = @intCast(bi * per_block_cap),
                     .dst_capacity = @intCast(per_block_cap),
-                    .is_first = if (si == 0 and (opts.level >= 3 or dict_len == 0)) @as(u32, 1) else 0,
+                    .is_first = if (bi == 0 and dict_len == 0) @as(u32, 1) else 0,
                 };
                 bi += 1;
             }
@@ -1110,8 +1114,10 @@ pub fn compressFramedOne(
                 for (0..n_subs) |si| {
                     const raw_cs = comp_sizes[gpu_bi + si];
                     const raw_payload = gpu_out[(gpu_bi + si) * per_block_cap ..][0..raw_cs];
-                    const init_bytes: usize = if (si == 0 and (opts.level >= 3 or dict_len == 0)) 8 else 0;
                     const gpu_bi_idx = gpu_bi + si;
+                    // Only the very first sub-chunk of the frame has 8 raw init
+                    // bytes in its payload (matches CPU encoder convention).
+                    const init_bytes: usize = if (gpu_bi_idx == 0 and dict_len == 0) 8 else 0;
 
                     // Check if GPU tANS produced smaller literal encoding
                     const tans_lits: ?[]const u8 = if (gpu_enc.tans_lit_sizes) |tsizes| blk: {
