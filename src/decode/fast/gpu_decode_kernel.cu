@@ -438,26 +438,8 @@ __device__ uint32_t skipEntropyStream(const uint8_t* &src) {
             src += 5 + tans_comp_size;
         }
         return tans_dst_size;
-    } else if (ct == 7) {
-        // Paired-primary: [0x70][countA:u24][inner type-6 stream]. Returns
-        // this unit's count (countA); advances past the whole marker+stream.
-        uint32_t count_a = ((uint32_t)src[1] << 16) | ((uint32_t)src[2] << 8) | src[3];
-        const uint8_t* inner = src + 4;
-        if (inner[0] >= 0x80) {
-            uint32_t bits = ((uint32_t)inner[0] << 16) | ((uint32_t)inner[1] << 8) | inner[2];
-            src = inner + 3 + (bits & 0x3FF);
-        } else {
-            uint32_t bits = ((uint32_t)inner[1] << 24) | ((uint32_t)inner[2] << 16) | ((uint32_t)inner[3] << 8) | inner[4];
-            src = inner + 5 + (bits & 0x3FFFF);
-        }
-        return count_a;
-    } else if (ct == 5) {
-        // Paired-secondary: [0x50][countA:u24][countB:u24], no payload.
-        uint32_t count_b = ((uint32_t)src[4] << 16) | ((uint32_t)src[5] << 8) | src[6];
-        src += 7;
-        return count_b;
     } else {
-        // Huffman type 2/4 or tANS32 type 6 — parse header to skip
+        // Huffman type 2/4 — parse header to skip
         uint32_t comp_size, dst_size;
         if (src[0] >= 0x80) {
             uint32_t bits = ((uint32_t)src[0] << 16) | ((uint32_t)src[1] << 8) | src[2];
@@ -595,27 +577,6 @@ __device__ __noinline__ void parseSubChunkHeaders(
             }
             cmd_ptr = tans_tok_scratch_chunk;
             cmd_size = tans_dst_size;
-            cmd_is_tans = 1;
-        } else if (ct == 7 && tans_tok_scratch_chunk != nullptr) {
-            // Paired-primary token stream: [0x70][countA:u24][inner type-6 stream]
-            uint32_t count_a = ((uint32_t)src[1] << 16) | ((uint32_t)src[2] << 8) | src[3];
-            const uint8_t* inner = src + 4;
-            if (inner[0] >= 0x80) {
-                uint32_t bits = ((uint32_t)inner[0] << 16) | ((uint32_t)inner[1] << 8) | inner[2];
-                src = inner + 3 + (bits & 0x3FF);
-            } else {
-                uint32_t bits = ((uint32_t)inner[1] << 24) | ((uint32_t)inner[2] << 16) | ((uint32_t)inner[3] << 8) | inner[4];
-                src = inner + 5 + (bits & 0x3FFFF);
-            }
-            cmd_ptr = tans_tok_scratch_chunk;
-            cmd_size = count_a;
-            cmd_is_tans = 1;
-        } else if (ct == 5 && tans_tok_scratch_chunk != nullptr) {
-            // Paired-secondary token stream: [0x50][countA:u24][countB:u24]
-            uint32_t count_b = ((uint32_t)src[4] << 16) | ((uint32_t)src[5] << 8) | src[6];
-            src += 7;
-            cmd_ptr = tans_tok_scratch_chunk;
-            cmd_size = count_b;
             cmd_is_tans = 1;
         } else {
             // Huffman or other — skip the stream, zero out cmd_size
