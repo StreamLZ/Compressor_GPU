@@ -509,31 +509,6 @@ __device__ __noinline__ void parseSubChunkHeaders(
             lit_ptr = tans_scratch_chunk;
             lit_size = tans_dst_size;
             lit_is_tans = 1;
-        } else if (chunk_type == 7 && tans_scratch_chunk != nullptr) {
-            // Paired-primary: [0x70][countA:u24 BE][inner type-6 tANS stream].
-            // This unit's literals are countA symbols at the start of the
-            // decoded combined buffer (the tANS kernel split-wrote them here).
-            uint32_t count_a = ((uint32_t)src[1] << 16) | ((uint32_t)src[2] << 8) | src[3];
-            const uint8_t* inner = src + 4;
-            if (inner[0] >= 0x80) {
-                uint32_t bits = ((uint32_t)inner[0] << 16) | ((uint32_t)inner[1] << 8) | inner[2];
-                src = inner + 3 + (bits & 0x3FF);
-            } else {
-                uint32_t bits = ((uint32_t)inner[1] << 24) | ((uint32_t)inner[2] << 16) | ((uint32_t)inner[3] << 8) | inner[4];
-                src = inner + 5 + (bits & 0x3FFFF);
-            }
-            lit_ptr = tans_scratch_chunk;
-            lit_size = count_a;
-            lit_is_tans = 1;
-        } else if (chunk_type == 5 && tans_scratch_chunk != nullptr) {
-            // Paired-secondary: [0x50][countA:u24 BE][countB:u24 BE], no payload.
-            // This unit's literals are countB symbols, split-written by the
-            // tANS kernel into this chunk's region (dst_offset_b).
-            uint32_t count_b = ((uint32_t)src[4] << 16) | ((uint32_t)src[5] << 8) | src[6];
-            src += 7;
-            lit_ptr = tans_scratch_chunk;
-            lit_size = count_b;
-            lit_is_tans = 1;
         } else {
             lit_size = 0;
             lit_ptr = src;

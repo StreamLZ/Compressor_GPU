@@ -206,10 +206,8 @@ pub const ChunkDesc = extern struct {
 const TansDecChunkDesc = extern struct {
     src_offset: u32, // offset of tANS payload in compressed buffer
     src_size: u32, // tANS compressed size
-    dst_offset: u32, // offset in tans_scratch for symbols [0, split_count)
-    dst_size: u32, // total decompressed symbol count (countA + countB for paired)
-    dst_offset_b: u32, // offset for symbols [split_count, dst_size) — paired unit B
-    split_count: u32, // symbols < this go to dst_offset, rest to dst_offset_b
+    dst_offset: u32, // offset in tans_scratch (chunk_idx * 65536)
+    dst_size: u32, // expected decompressed literal count
 };
 
 var d_tans_scratch: CUdeviceptr = 0;
@@ -333,20 +331,7 @@ fn scanForTansChunks(
         // ── Stream 1: Literals ──
         const lit_first = chunk_src[pos];
         const lit_type = (lit_first >> 4) & 0x7;
-        if (lit_type == 7) {
-            // Paired-primary: one combined tANS stream covering this + next unit
-            const lit_before = num_lit;
-            _ = parseTansHeaderPaired(chunk_src, pos, ch.src_offset, chunk_idx, tans_lit_descs, &num_lit);
-            use_tans32 = true;
-            if (num_lit > lit_before) {
-                // embedded stream is type-6: skip 128-byte sizes+states header
-                tans_lit_descs[num_lit - 1].src_offset += 128;
-                tans_lit_descs[num_lit - 1].src_size -|= 128;
-            }
-        } else if (lit_type == 5) {
-            // Paired-secondary: literals decoded by the paired unit's combined stream
-            use_tans32 = true;
-        } else if (lit_type == 1 or lit_type == 6) {
+        if (lit_type == 1 or lit_type == 6) {
             const lit_before = num_lit;
             _ = parseTansHeader(chunk_src, pos, ch.src_offset, chunk_idx, tans_lit_descs, &num_lit);
             if (lit_type == 6) {
@@ -510,14 +495,6 @@ fn skipStreamHeader(chunk_src: []const u8, pos: u32) ?u32 {
             const comp_size = bits & 0x3FFFF;
             return pos + 5 + comp_size;
         }
-    } else if (ct == 5) {
-        // Paired-secondary marker: [0x50][countA:u24][countB:u24] = 7 bytes
-        if (pos + 7 > chunk_src.len) return null;
-        return pos + 7;
-    } else if (ct == 7) {
-        // Paired-primary marker: [0x70][countA:u24][embedded type-6 stream]
-        if (pos + 4 > chunk_src.len) return null;
-        return skipStreamHeader(chunk_src, pos + 4);
     }
     return null;
 }
@@ -548,8 +525,6 @@ fn parseTansHeaderWithDstOffset(
                 .src_size = @intCast(tans_comp_size),
                 .dst_offset = @intCast(dst_offset),
                 .dst_size = @intCast(tans_dst_size),
-                .dst_offset_b = @intCast(dst_offset),
-                .split_count = @intCast(tans_dst_size),
             };
             num_tans.* += 1;
             return true;
@@ -570,8 +545,6 @@ fn parseTansHeaderWithDstOffset(
                 .src_size = @intCast(tans_comp_size),
                 .dst_offset = @intCast(dst_offset),
                 .dst_size = @intCast(tans_dst_size),
-                .dst_offset_b = @intCast(dst_offset),
-                .split_count = @intCast(tans_dst_size),
             };
             num_tans.* += 1;
             return true;
@@ -607,8 +580,6 @@ fn parseTansHeader(
                 .src_size = @intCast(tans_comp_size),
                 .dst_offset = @intCast(chunk_idx * 65536),
                 .dst_size = @intCast(tans_dst_size),
-                .dst_offset_b = @intCast(chunk_idx * 65536),
-                .split_count = @intCast(tans_dst_size),
             };
             num_tans.* += 1;
             return true;
@@ -630,69 +601,10 @@ fn parseTansHeader(
                 .src_size = @intCast(tans_comp_size),
                 .dst_offset = @intCast(chunk_idx * 65536),
                 .dst_size = @intCast(tans_dst_size),
-                .dst_offset_b = @intCast(chunk_idx * 65536),
-                .split_count = @intCast(tans_dst_size),
             };
             num_tans.* += 1;
             return true;
         }
-    }
-    return false;
-}
-
-/// Parse a type-7 paired-primary literal marker:
-///   [0x70][countA:u24 BE][embedded type-6 chunk stream]
-/// Creates ONE descriptor: symbols [0,countA) → unit A's region (chunk_idx),
-/// symbols [countA,countA+countB) → unit B's region (chunk_idx+1).
-fn parseTansHeaderPaired(
-    chunk_src: []const u8,
-    marker_off: u32,
-    src_offset_base: u32,
-    chunk_idx: usize,
-    tans_descs_out: []TansDecChunkDesc,
-    num_tans: *u32,
-) bool {
-    if (marker_off + 4 > chunk_src.len) return false;
-    const count_a: u32 = (@as(u32, chunk_src[marker_off + 1]) << 16) |
-        (@as(u32, chunk_src[marker_off + 2]) << 8) |
-        @as(u32, chunk_src[marker_off + 3]);
-    const inner_off = marker_off + 4;
-    if (inner_off >= chunk_src.len) return false;
-    const inner_first = chunk_src[inner_off];
-
-    var tans_comp_size: u32 = undefined;
-    var tans_dst_size: u32 = undefined;
-    var tans_payload_off: u32 = undefined;
-    if (inner_first >= 0x80) {
-        if (inner_off + 3 > chunk_src.len) return false;
-        const hdr3: u32 = (@as(u32, chunk_src[inner_off]) << 16) |
-            (@as(u32, chunk_src[inner_off + 1]) << 8) |
-            @as(u32, chunk_src[inner_off + 2]);
-        tans_comp_size = hdr3 & 0x3FF;
-        tans_dst_size = tans_comp_size + ((hdr3 >> 10) & 0x3FF) + 1;
-        tans_payload_off = src_offset_base + inner_off + 3;
-    } else {
-        if (inner_off + 5 > chunk_src.len) return false;
-        const bits: u32 = (@as(u32, chunk_src[inner_off + 1]) << 24) |
-            (@as(u32, chunk_src[inner_off + 2]) << 16) |
-            (@as(u32, chunk_src[inner_off + 3]) << 8) |
-            @as(u32, chunk_src[inner_off + 4]);
-        tans_comp_size = bits & 0x3FFFF;
-        tans_dst_size = (((bits >> 18) | (@as(u32, chunk_src[inner_off]) << 14)) & 0x3FFFF) + 1;
-        tans_payload_off = src_offset_base + inner_off + 5;
-    }
-
-    if (num_tans.* < tans_descs_out.len) {
-        tans_descs_out[num_tans.*] = .{
-            .src_offset = tans_payload_off,
-            .src_size = tans_comp_size,
-            .dst_offset = @intCast(chunk_idx * 65536),
-            .dst_size = tans_dst_size,
-            .dst_offset_b = @intCast((chunk_idx + 1) * 65536),
-            .split_count = count_a,
-        };
-        num_tans.* += 1;
-        return true;
     }
     return false;
 }
@@ -764,9 +676,6 @@ pub fn fullGpuLaunch(
             tans_off16lo_host_buf[0..max_tans],
             &raw_off16_buf,
         );
-
-        merged_count = scan.num_lit + scan.num_tok + scan.num_off16hi + scan.num_off16lo;
-        std.debug.print("tANS streams: lit={d} tok={d} hi={d} lo={d} total={d}\n", .{ scan.num_lit, scan.num_tok, scan.num_off16hi, scan.num_off16lo, merged_count });
 
         // Upload raw (type 0) off16 sub-streams to GPU (before timer)
         for (0..scan.num_raw_off16) |ri| {
