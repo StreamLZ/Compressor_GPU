@@ -438,8 +438,26 @@ __device__ uint32_t skipEntropyStream(const uint8_t* &src) {
             src += 5 + tans_comp_size;
         }
         return tans_dst_size;
+    } else if (ct == 7) {
+        // Paired-primary: [0x70][countA:u24][inner type-6 stream]. Returns
+        // this unit's count (countA); advances past the whole marker+stream.
+        uint32_t count_a = ((uint32_t)src[1] << 16) | ((uint32_t)src[2] << 8) | src[3];
+        const uint8_t* inner = src + 4;
+        if (inner[0] >= 0x80) {
+            uint32_t bits = ((uint32_t)inner[0] << 16) | ((uint32_t)inner[1] << 8) | inner[2];
+            src = inner + 3 + (bits & 0x3FF);
+        } else {
+            uint32_t bits = ((uint32_t)inner[1] << 24) | ((uint32_t)inner[2] << 16) | ((uint32_t)inner[3] << 8) | inner[4];
+            src = inner + 5 + (bits & 0x3FFFF);
+        }
+        return count_a;
+    } else if (ct == 5) {
+        // Paired-secondary: [0x50][countA:u24][countB:u24], no payload.
+        uint32_t count_b = ((uint32_t)src[4] << 16) | ((uint32_t)src[5] << 8) | src[6];
+        src += 7;
+        return count_b;
     } else {
-        // Huffman type 2/4 — parse header to skip
+        // Huffman type 2/4 or tANS32 type 6 — parse header to skip
         uint32_t comp_size, dst_size;
         if (src[0] >= 0x80) {
             uint32_t bits = ((uint32_t)src[0] << 16) | ((uint32_t)src[1] << 8) | src[2];
@@ -509,6 +527,31 @@ __device__ __noinline__ void parseSubChunkHeaders(
             lit_ptr = tans_scratch_chunk;
             lit_size = tans_dst_size;
             lit_is_tans = 1;
+        } else if (chunk_type == 7 && tans_scratch_chunk != nullptr) {
+            // Paired-primary: [0x70][countA:u24 BE][inner type-6 tANS stream].
+            // This unit's literals are countA symbols at the start of the
+            // decoded combined buffer (the tANS kernel split-wrote them here).
+            uint32_t count_a = ((uint32_t)src[1] << 16) | ((uint32_t)src[2] << 8) | src[3];
+            const uint8_t* inner = src + 4;
+            if (inner[0] >= 0x80) {
+                uint32_t bits = ((uint32_t)inner[0] << 16) | ((uint32_t)inner[1] << 8) | inner[2];
+                src = inner + 3 + (bits & 0x3FF);
+            } else {
+                uint32_t bits = ((uint32_t)inner[1] << 24) | ((uint32_t)inner[2] << 16) | ((uint32_t)inner[3] << 8) | inner[4];
+                src = inner + 5 + (bits & 0x3FFFF);
+            }
+            lit_ptr = tans_scratch_chunk;
+            lit_size = count_a;
+            lit_is_tans = 1;
+        } else if (chunk_type == 5 && tans_scratch_chunk != nullptr) {
+            // Paired-secondary: [0x50][countA:u24 BE][countB:u24 BE], no payload.
+            // This unit's literals are countB symbols, split-written by the
+            // tANS kernel into this chunk's region (dst_offset_b).
+            uint32_t count_b = ((uint32_t)src[4] << 16) | ((uint32_t)src[5] << 8) | src[6];
+            src += 7;
+            lit_ptr = tans_scratch_chunk;
+            lit_size = count_b;
+            lit_is_tans = 1;
         } else {
             lit_size = 0;
             lit_ptr = src;
@@ -552,6 +595,27 @@ __device__ __noinline__ void parseSubChunkHeaders(
             }
             cmd_ptr = tans_tok_scratch_chunk;
             cmd_size = tans_dst_size;
+            cmd_is_tans = 1;
+        } else if (ct == 7 && tans_tok_scratch_chunk != nullptr) {
+            // Paired-primary token stream: [0x70][countA:u24][inner type-6 stream]
+            uint32_t count_a = ((uint32_t)src[1] << 16) | ((uint32_t)src[2] << 8) | src[3];
+            const uint8_t* inner = src + 4;
+            if (inner[0] >= 0x80) {
+                uint32_t bits = ((uint32_t)inner[0] << 16) | ((uint32_t)inner[1] << 8) | inner[2];
+                src = inner + 3 + (bits & 0x3FF);
+            } else {
+                uint32_t bits = ((uint32_t)inner[1] << 24) | ((uint32_t)inner[2] << 16) | ((uint32_t)inner[3] << 8) | inner[4];
+                src = inner + 5 + (bits & 0x3FFFF);
+            }
+            cmd_ptr = tans_tok_scratch_chunk;
+            cmd_size = count_a;
+            cmd_is_tans = 1;
+        } else if (ct == 5 && tans_tok_scratch_chunk != nullptr) {
+            // Paired-secondary token stream: [0x50][countA:u24][countB:u24]
+            uint32_t count_b = ((uint32_t)src[4] << 16) | ((uint32_t)src[5] << 8) | src[6];
+            src += 7;
+            cmd_ptr = tans_tok_scratch_chunk;
+            cmd_size = count_b;
             cmd_is_tans = 1;
         } else {
             // Huffman or other — skip the stream, zero out cmd_size
@@ -741,7 +805,11 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
     uint8_t* __restrict__ tans_scratch,
     uint8_t* __restrict__ tans_tok_scratch,
     uint8_t* __restrict__ tans_off16_scratch,
-    uint32_t chunk_base
+    uint32_t chunk_base,
+    // first_subchunk_idx[chunk_idx] = global sub-chunk index for sub-chunk 0
+    // of this chunk. Each successive sub-chunk in the chunk uses the next
+    // global index. nullptr → fall back to chunk_idx (legacy single-sub-chunk).
+    const uint32_t* __restrict__ first_subchunk_idx
 ) {
     // 2 warps per block: warp 0 = threadIdx.y==0, warp 1 = threadIdx.y==1
     const uint32_t warp_id = threadIdx.y;
@@ -774,13 +842,17 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
             continue;
         }
 
-        // LZ-compressed chunk: iterate sub-chunks
+        // LZ-compressed chunk: iterate sub-chunks. Each sub-chunk gets its
+        // own slot in the tANS scratch buffers (indexed by global sub-chunk
+        // index). When first_subchunk_idx is nullptr (legacy / no tANS),
+        // fall back to chunk_idx for backward compatibility.
         const uint8_t* chunk_src = compressed + ch.src_offset;
         uint32_t sc_dst_off = ch.dst_offset;
         uint32_t sc_remaining = ch.decomp_size;
-        uint8_t* chunk_tans_scratch = tans_scratch ? (tans_scratch + chunk_idx * 65536) : nullptr;
-        uint8_t* chunk_tok_scratch = tans_tok_scratch ? (tans_tok_scratch + chunk_idx * 65536) : nullptr;
-        uint8_t* chunk_off16_scratch = tans_off16_scratch ? (tans_off16_scratch + chunk_idx * 65536) : nullptr;
+        uint32_t global_sub_idx = first_subchunk_idx ? first_subchunk_idx[chunk_idx] : chunk_idx;
+        uint8_t* chunk_tans_scratch = tans_scratch ? (tans_scratch + (uint64_t)global_sub_idx * 65536) : nullptr;
+        uint8_t* chunk_tok_scratch = tans_tok_scratch ? (tans_tok_scratch + (uint64_t)global_sub_idx * 65536) : nullptr;
+        uint8_t* chunk_off16_scratch = tans_off16_scratch ? (tans_off16_scratch + (uint64_t)global_sub_idx * 65536) : nullptr;
 
         while (sc_remaining > 0) {
             uint32_t sc_size = sc_remaining;
@@ -821,6 +893,10 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
             chunk_src += 3 + sc_comp_size;
             sc_dst_off += sc_size;
             sc_remaining -= sc_size;
+            // Advance scratch pointers to next sub-chunk's slot
+            if (chunk_tans_scratch) chunk_tans_scratch += 65536;
+            if (chunk_tok_scratch) chunk_tok_scratch += 65536;
+            if (chunk_off16_scratch) chunk_off16_scratch += 65536;
         }
     }
 }

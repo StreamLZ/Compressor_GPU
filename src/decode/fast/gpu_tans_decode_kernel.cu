@@ -18,8 +18,10 @@
 struct TansDecChunkDesc {
     uint32_t src_offset;   // offset into compressed buffer
     uint32_t src_size;     // compressed size in bytes
-    uint32_t dst_offset;   // offset into output buffer
-    uint32_t dst_size;     // expected decompressed size in bytes
+    uint32_t dst_offset;   // offset for symbols [0, split_count)
+    uint32_t dst_size;     // total decompressed symbol count
+    uint32_t dst_offset_b; // offset for symbols [split_count, dst_size)
+    uint32_t split_count;  // symbols < this go to dst_offset, rest to dst_offset_b
 };
 
 // ── LUT entry — 8 bytes (used for table build, matches CPU TansLutEnt)
@@ -1271,10 +1273,13 @@ __device__ uint32_t decodeFseWeights(
     return TANS_OK;
 }
 
-// ── Build packed 4-byte LUT: 4-way interleaved, lane 0 direct global writes ──
-// Lane 0 only. High occupancy hides global store latency.
+// ── Build packed 4-byte LUT: 4-way interleaved, all-lane lockstep writes ──
+// All 32 lanes run the spread loop (redundant ALU, same control flow).
+// Only the lane matching (slot & 31) writes — no sync needed during spread.
+// Matches nvCOMP pattern: zero syncwarps in the hot loop.
 __device__ void buildPackedLut4Way(
-    const uint16_t* weights, uint32_t log_table_bits, uint32_t* lut
+    const uint16_t* weights, uint32_t log_table_bits, uint32_t* lut,
+    int lane
 ) {
     const uint32_t L = 1u << log_table_bits;
     const uint32_t L_mask = L - 1;
@@ -1299,15 +1304,21 @@ __device__ void buildPackedLut4Way(
         uint32_t w = weights[sym];
         if (w <= 1) continue;
 
+        uint32_t wb_lo = ilog2(w);
+        uint32_t bps_lo = log_table_bits - wb_lo;
+        uint32_t bps_hi = bps_lo - 1;
+        uint32_t crossover = (1u << (wb_lo + 1)) - w;
+        uint32_t sym_shifted = sym << 16;
+
         int32_t ptr_cursor = weights_sum;
         for (uint32_t j = 0; j < 4; j++) {
             int32_t y = ((int32_t)w + ((weights_sum - (int32_t)j - 1) & 3)) >> 2;
             for (int32_t k = 0; k < y; k++) {
                 uint32_t slot = ptrs[j];
-                uint32_t running_w = w + (uint32_t)(ptr_cursor - weights_sum);
-                uint32_t wb = ilog2(running_w);
-                uint32_t bps = log_table_bits - wb;
-                lut[slot] = (bps << 24) | (sym << 16) |
+                uint32_t offset = (uint32_t)(ptr_cursor - weights_sum);
+                uint32_t running_w = w + offset;
+                uint32_t bps = (offset < crossover) ? bps_lo : bps_hi;
+                lut[slot] = (bps << 24) | sym_shifted |
                             (uint16_t)(L_mask & (running_w << bps));
                 ptrs[j]++;
                 ptr_cursor++;
@@ -1317,17 +1328,17 @@ __device__ void buildPackedLut4Way(
     }
 
     uint32_t pos = slots_left;
+    uint32_t ones_packed_base = (log_table_bits << 24);
     for (uint32_t sym = 0; sym < 256; sym++) {
         if (weights[sym] == 1) {
-            lut[pos] = (log_table_bits << 24) | (sym << 16) | 0;
+            lut[pos] = ones_packed_base | (sym << 16);
             pos++;
         }
     }
 }
 
-// FSE build kernel: persistent grid with atomicAdd work claiming.
-// Lane 0 parses FSE probs + does 4-way spread to shared memory LUT.
-// All 32 lanes do coalesced copy from shared to global.
+// FSE build kernel: grid-stride loop over streams.
+// All 32 lanes run spread in lockstep, matching lane writes.
 extern "C" __global__ void __launch_bounds__(64) slzTansFseBuildKernel(
     const uint8_t* __restrict__ src_buf,
     const TansDecChunkDesc* __restrict__ descs,
@@ -1338,17 +1349,12 @@ extern "C" __global__ void __launch_bounds__(64) slzTansFseBuildKernel(
 ) {
     const int lane = threadIdx.x & 31;
     const uint32_t warp_id = threadIdx.y;
+    const uint32_t warp_global = blockIdx.x * 2 + warp_id;
+    const uint32_t total_warps = gridDim.x * 2;
 
     __shared__ uint16_t s_weights[2][256];
 
-    for (;;) {
-        // atomicAdd work claiming (nvCOMP pattern)
-        uint32_t chunk_id;
-        if (lane == 0) {
-            chunk_id = atomicAdd(work_counter, 1);
-        }
-        chunk_id = __shfl_sync(0xFFFFFFFF, chunk_id, 0);
-        if (chunk_id >= num_chunks) return;
+    for (uint32_t chunk_id = warp_global; chunk_id < num_chunks; chunk_id += total_warps) {
 
         uint32_t log_table_bits = 0;
         uint32_t err = TANS_OK;
@@ -1376,13 +1382,10 @@ extern "C" __global__ void __launch_bounds__(64) slzTansFseBuildKernel(
         if (err != TANS_OK) continue;  // skip bad stream, claim next
         log_table_bits = __shfl_sync(0xFFFFFFFF, log_table_bits, 0);
 
-        // Lane 0: spread + write packed entries directly to global
+        // All 32 lanes: lockstep spread, matching lane writes (no sync in loop)
         uint32_t* glut = (uint32_t*)((uint8_t*)lut_buf +
                          (uint64_t)chunk_id * 2048 * sizeof(TansLutEnt));
-        if (lane == 0) {
-            buildPackedLut4Way(s_weights[warp_id], log_table_bits, glut);
-        }
-        __syncwarp();
+        buildPackedLut4Way(s_weights[warp_id], log_table_bits, glut, lane);
     }
 }
 
@@ -1721,7 +1724,12 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
     uint32_t my_sym_count = total_syms / 32;
     if ((uint32_t)lane < (total_syms % 32)) my_sym_count++;
 
-    uint8_t* dst_base = dst_buf + descs[chunk_id].dst_offset;
+    // Split-write destinations: symbols [0, split_count) → dst_a (unit A),
+    // symbols [split_count, dst_size) → dst_b (unit B). For non-paired
+    // streams split_count == dst_size so everything goes to dst_a.
+    uint8_t* dst_a = dst_buf + descs[chunk_id].dst_offset;
+    uint8_t* dst_b = dst_buf + descs[chunk_id].dst_offset_b;
+    uint32_t split_count = descs[chunk_id].split_count;
 
     if (my_sym_count == 0 || my_sub_size < 4) {
         __syncwarp();
@@ -1761,8 +1769,13 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
         bits >>= bits_x;
         bitpos -= (int32_t)bits_x;
 
-        // Write interleaved: position i*32 + lane
-        dst_base[i * 32 + lane] = sym;
+        // Write interleaved at output position p, split between unit A and B
+        uint32_t p = i * 32 + lane;
+        if (p < split_count) {
+            dst_a[p] = sym;
+        } else {
+            dst_b[p - split_count] = sym;
+        }
     }
 
     __syncwarp();

@@ -31,6 +31,90 @@ const resolveParams = encoder.resolveParams;
 const entropyOptionsForLevel = encoder.entropyOptionsForLevel;
 const compressBound = encoder.compressBound;
 
+/// Extract literal/token/off16 byte slices from a raw GPU sub-chunk payload.
+fn extractRawStreams(raw: []const u8, init_bytes: usize) ?struct {
+    literals: []const u8,
+    tokens: []const u8,
+    off16_data: []const u8, // raw interleaved u16 pairs (lo, hi, lo, hi, ...)
+    off16_count: usize,
+} {
+    var rp: usize = init_bytes;
+    if (rp + 3 > raw.len) return null;
+    const lit_count: usize = (@as(usize, raw[rp]) << 16) | (@as(usize, raw[rp + 1]) << 8) | raw[rp + 2];
+    rp += 3;
+    if (rp + lit_count > raw.len) return null;
+    const literals = raw[rp..][0..lit_count];
+    rp += lit_count;
+
+    if (rp + 3 > raw.len) return null;
+    const token_count: usize = (@as(usize, raw[rp]) << 16) | (@as(usize, raw[rp + 1]) << 8) | raw[rp + 2];
+    rp += 3;
+    if (rp + token_count > raw.len) return null;
+    const tokens = raw[rp..][0..token_count];
+    rp += token_count;
+
+    // cmd_stream2_offset is present only for sub-chunks > 64KB. With
+    // sc_group=0.25 every unit is exactly 64KB so it is never present.
+
+    // Off16 stream: 2-byte count then off16_count*2 raw bytes.
+    if (rp + 2 > raw.len) return null;
+    const off16_count: usize = @as(usize, std.mem.readInt(u16, raw[rp..][0..2], .little));
+    rp += 2;
+    if (off16_count == fast_constants.entropy_coded_16_marker) {
+        // Already entropy-coded in the raw payload (shouldn't happen for the
+        // raw GPU output, but be safe) — no pairable raw off16.
+        return .{ .literals = literals, .tokens = tokens, .off16_data = &.{}, .off16_count = 0 };
+    }
+    const off16_bytes = off16_count * 2;
+    if (rp + off16_bytes > raw.len) return null;
+    const off16_data = raw[rp..][0..off16_bytes];
+    return .{ .literals = literals, .tokens = tokens, .off16_data = off16_data, .off16_count = off16_count };
+}
+
+/// Concatenate two byte slices and tANS32-encode them as ONE combined
+/// stream wrapped in a 5-byte non-compact type-6 chunk header. Returns
+/// the owned encoded buffer (caller frees) and count_a (= a.len), or
+/// null if either slice is empty or encoding isn't beneficial.
+fn encodeCombinedTans32(
+    allocator: std.mem.Allocator,
+    a: []const u8,
+    b: []const u8,
+) ?struct { stream: []u8, count_a: u32 } {
+    if (a.len < 32 or b.len < 32) return null;
+    if (a.len + b.len > 0xFFFFFF) return null; // count_a / count_b are u24
+    const ByteHist = @import("entropy/byte_histogram.zig").ByteHistogram;
+    const combined = allocator.alloc(u8, a.len + b.len) catch return null;
+    defer allocator.free(combined);
+    @memcpy(combined[0..a.len], a);
+    @memcpy(combined[a.len..], b);
+    var h: ByteHist = .{};
+    h.countBytes(combined);
+    var cost: f32 = std.math.inf(f32);
+    const enc = allocator.alloc(u8, combined.len + 256) catch return null;
+    const n = tans_enc.encodeArrayU8Tans32(allocator, enc[5..], combined, &h, 0.0, &cost, null) catch {
+        allocator.free(enc);
+        return null;
+    };
+    if (n == 0 or n + 5 >= combined.len) {
+        allocator.free(enc);
+        return null;
+    }
+    entropy_enc.writeNonCompactChunkHeader(enc, 6, @intCast(n), @intCast(combined.len));
+    return .{ .stream = enc[0 .. 5 + n], .count_a = @intCast(a.len) };
+}
+
+/// Paired-literal override. When pairing two adjacent 64KB units, the literal
+/// streams of unit A and unit B are concatenated and tANS-encoded as ONE stream.
+/// - `.primary`: this unit (A) carries the combined stream. Written as a type-7
+///   marker: [0x70][countA:u24 BE][combined tANS stream].
+/// - `.secondary`: this unit (B) has no literal data of its own. Written as a
+///   type-5 marker: [0x50][countA:u24 BE][countB:u24 BE].
+const LitOverride = union(enum) {
+    none,
+    primary: struct { combined_stream: []const u8, count_a: u32 },
+    secondary: struct { count_a: u32 },
+};
+
 /// Re-encode a raw GPU sub-chunk payload with entropy (tANS).
 /// Parses the raw format (lit/token/off16/off32/length streams),
 /// applies encodeArrayU8 to token and off16 hi/lo, writes entropy output to dst.
@@ -46,6 +130,9 @@ fn reencodeGpuWithEntropy(
     tans_encoded_lits: ?[]const u8,
     shared_tans_ctx: ?*const tans_enc.Tans32SharedCtx,
     is_first_subchunk: bool,
+    lit_override: LitOverride,
+    tok_override: LitOverride,
+    off16hi_override: LitOverride,
 ) !usize {
     var rp: usize = 0;
     var wp: usize = 0;
@@ -128,8 +215,34 @@ fn reencodeGpuWithEntropy(
 
     // Encode to dst
 
-    // Literals: first sub-chunk embeds LUT (per-stream), others use shared (no LUT)
+    // Literals: paired override, first sub-chunk embeds LUT, others shared
     const lit_n = blk: {
+        switch (lit_override) {
+            .primary => |p| {
+                // type-7 marker: [0x70][countA:u24 BE][combined tANS stream]
+                if (wp + 4 + p.combined_stream.len > dst.len) break :blk @as(usize, 0);
+                dst[wp] = 0x70;
+                dst[wp + 1] = @intCast((p.count_a >> 16) & 0xFF);
+                dst[wp + 2] = @intCast((p.count_a >> 8) & 0xFF);
+                dst[wp + 3] = @intCast(p.count_a & 0xFF);
+                @memcpy(dst[wp + 4 ..][0..p.combined_stream.len], p.combined_stream);
+                break :blk 4 + p.combined_stream.len;
+            },
+            .secondary => |s| {
+                // type-5 marker: [0x50][countA:u24 BE][countB:u24 BE]
+                if (wp + 7 > dst.len) break :blk @as(usize, 0);
+                const count_b: u32 = @intCast(literals.len);
+                dst[wp] = 0x50;
+                dst[wp + 1] = @intCast((s.count_a >> 16) & 0xFF);
+                dst[wp + 2] = @intCast((s.count_a >> 8) & 0xFF);
+                dst[wp + 3] = @intCast(s.count_a & 0xFF);
+                dst[wp + 4] = @intCast((count_b >> 16) & 0xFF);
+                dst[wp + 5] = @intCast((count_b >> 8) & 0xFF);
+                dst[wp + 6] = @intCast(count_b & 0xFF);
+                break :blk 7;
+            },
+            .none => {},
+        }
         if (options.allow_tans32 and shared_tans_ctx != null and !is_first_subchunk) {
             break :blk entropy_enc.encodeArrayU8Tans32Shared(allocator, dst[wp..], literals, shared_tans_ctx.?) catch 0;
         } else if (options.allow_tans32) {
@@ -152,7 +265,34 @@ fn reencodeGpuWithEntropy(
     };
     wp += lit_n;
 
-    const tok_n = entropy_enc.encodeArrayU8(allocator, dst[wp..], tokens, options, speed_tradeoff, null, 0, null) catch return 0;
+    // Tokens: paired override (type-7 primary / type-5 secondary) or normal
+    const tok_n = blk_tok: {
+        switch (tok_override) {
+            .primary => |p| {
+                if (wp + 4 + p.combined_stream.len > dst.len) return 0;
+                dst[wp] = 0x70;
+                dst[wp + 1] = @intCast((p.count_a >> 16) & 0xFF);
+                dst[wp + 2] = @intCast((p.count_a >> 8) & 0xFF);
+                dst[wp + 3] = @intCast(p.count_a & 0xFF);
+                @memcpy(dst[wp + 4 ..][0..p.combined_stream.len], p.combined_stream);
+                break :blk_tok 4 + p.combined_stream.len;
+            },
+            .secondary => |s| {
+                if (wp + 7 > dst.len) return 0;
+                const count_b: u32 = @intCast(tokens.len);
+                dst[wp] = 0x50;
+                dst[wp + 1] = @intCast((s.count_a >> 16) & 0xFF);
+                dst[wp + 2] = @intCast((s.count_a >> 8) & 0xFF);
+                dst[wp + 3] = @intCast(s.count_a & 0xFF);
+                dst[wp + 4] = @intCast((count_b >> 16) & 0xFF);
+                dst[wp + 5] = @intCast((count_b >> 8) & 0xFF);
+                dst[wp + 6] = @intCast(count_b & 0xFF);
+                break :blk_tok 7;
+            },
+            .none => {},
+        }
+        break :blk_tok entropy_enc.encodeArrayU8(allocator, dst[wp..], tokens, options, speed_tradeoff, null, 0, null) catch return 0;
+    };
     wp += tok_n;
 
     // Write cmd_stream2_offset if present
@@ -164,7 +304,45 @@ fn reencodeGpuWithEntropy(
     }
 
     // Off16: split hi/lo, entropy encode each half
-    if (off16_count >= 32) {
+    if (off16hi_override != .none) {
+        // Paired off16-hi: the hi stream is the combined paired stream; the
+        // lo stream stays per-unit. The pre-pass guarantees off16_count >= 32.
+        const lo_bytes = allocator.alloc(u8, off16_count) catch return 0;
+        defer allocator.free(lo_bytes);
+        for (0..off16_count) |i| lo_bytes[i] = off16_data[i * 2];
+        // entropy_coded_16 marker
+        if (wp + 2 > dst.len) return 0;
+        std.mem.writeInt(u16, dst[wp..][0..2], fast_constants.entropy_coded_16_marker, .little);
+        wp += 2;
+        // hi stream: type-7 primary (carries combined stream) or type-5 secondary
+        switch (off16hi_override) {
+            .primary => |p| {
+                if (wp + 4 + p.combined_stream.len > dst.len) return 0;
+                dst[wp] = 0x70;
+                dst[wp + 1] = @intCast((p.count_a >> 16) & 0xFF);
+                dst[wp + 2] = @intCast((p.count_a >> 8) & 0xFF);
+                dst[wp + 3] = @intCast(p.count_a & 0xFF);
+                @memcpy(dst[wp + 4 ..][0..p.combined_stream.len], p.combined_stream);
+                wp += 4 + p.combined_stream.len;
+            },
+            .secondary => |s| {
+                if (wp + 7 > dst.len) return 0;
+                const count_b: u32 = @intCast(off16_count);
+                dst[wp] = 0x50;
+                dst[wp + 1] = @intCast((s.count_a >> 16) & 0xFF);
+                dst[wp + 2] = @intCast((s.count_a >> 8) & 0xFF);
+                dst[wp + 3] = @intCast(s.count_a & 0xFF);
+                dst[wp + 4] = @intCast((count_b >> 16) & 0xFF);
+                dst[wp + 5] = @intCast((count_b >> 8) & 0xFF);
+                dst[wp + 6] = @intCast(count_b & 0xFF);
+                wp += 7;
+            },
+            .none => unreachable,
+        }
+        // lo stream: encode per-unit as normal
+        const lo_n = entropy_enc.encodeArrayU8(allocator, dst[wp..], lo_bytes, options, speed_tradeoff, null, 0, null) catch return 0;
+        wp += lo_n;
+    } else if (off16_count >= 32) {
         const split_buf = allocator.alloc(u8, off16_count * 2) catch return 0;
         defer allocator.free(split_buf);
         const lo_bytes = split_buf[0..off16_count];
@@ -816,14 +994,70 @@ pub fn compressFramedOne(
         if (!gpu_enc.gpuCompress(effective_src, gpu_out, descs, comp_sizes, io, opts.level))
             break :gpu_compress;
 
-        // Build frame-level shared tANS32 context (one LUT for all streams)
-        const frame_shared_tans_ctx: ?tans_enc.Tans32SharedCtx = if (opts.level >= 3) blk_fctx: {
-            const ByteHistogram = @import("entropy/byte_histogram.zig").ByteHistogram;
-            var global_histo: ByteHistogram = .{};
-            global_histo.countBytes(effective_src[0..data_src.len]);
-            break :blk_fctx tans_enc.buildTans32SharedCtx(&global_histo, @intCast(data_src.len));
-        } else null;
         var is_first_tans32_in_frame: bool = true;
+
+        // ── Paired-literal pre-pass ──────────────────────────────────
+        // When every chunk is exactly one 64KB sub-chunk (sc_group=0.25),
+        // pair adjacent chunks: concatenate their literals and tANS-encode
+        // as ONE stream. Halves the literal tANS stream count.
+        const PairStream = struct {
+            combined_stream: []const u8 = &.{},
+            count_a: u32 = 0,
+            paired: bool = false,
+        };
+        const PairInfo = struct {
+            lit: PairStream = .{},
+            tok: PairStream = .{},
+            off16hi: PairStream = .{},
+        };
+        const can_pair = (n_gpu_blocks == n_chunks) and opts.gpu_mode;
+        var pair_infos: []PairInfo = allocator.alloc(PairInfo, n_chunks) catch &[_]PairInfo{};
+        defer {
+            for (pair_infos) |pinf| {
+                if (pinf.lit.combined_stream.len > 0) allocator.free(pinf.lit.combined_stream);
+                if (pinf.tok.combined_stream.len > 0) allocator.free(pinf.tok.combined_stream);
+                if (pinf.off16hi.combined_stream.len > 0) allocator.free(pinf.off16hi.combined_stream);
+            }
+            if (pair_infos.len > 0) allocator.free(pair_infos);
+        }
+        for (pair_infos) |*pinf| pinf.* = .{};
+        if (can_pair and pair_infos.len == n_chunks) {
+            var ppi: usize = 0;
+            while (ppi + 1 < n_chunks) : (ppi += 2) {
+                const csa = comp_sizes[ppi];
+                const csb = comp_sizes[ppi + 1];
+                const sza = @min(eff_chunk, data_src.len - ppi * eff_chunk);
+                const szb = @min(eff_chunk, data_src.len - (ppi + 1) * eff_chunk);
+                if (csa >= sza or csb >= szb) continue; // not both compressible
+                const init_b: usize = if (opts.level >= 3 or dict_len == 0) 8 else 0;
+                const sa = extractRawStreams(gpu_out[ppi * per_block_cap ..][0..csa], init_b) orelse continue;
+                const sb = extractRawStreams(gpu_out[(ppi + 1) * per_block_cap ..][0..csb], init_b) orelse continue;
+                // Literal streams
+                if (encodeCombinedTans32(allocator, sa.literals, sb.literals)) |r| {
+                    pair_infos[ppi].lit = .{ .combined_stream = r.stream, .count_a = r.count_a, .paired = true };
+                    pair_infos[ppi + 1].lit = .{ .combined_stream = &.{}, .count_a = r.count_a, .paired = true };
+                }
+                // Token streams
+                if (encodeCombinedTans32(allocator, sa.tokens, sb.tokens)) |r| {
+                    pair_infos[ppi].tok = .{ .combined_stream = r.stream, .count_a = r.count_a, .paired = true };
+                    pair_infos[ppi + 1].tok = .{ .combined_stream = &.{}, .count_a = r.count_a, .paired = true };
+                }
+                // Off16-hi streams: only when BOTH units have an entropy-coded
+                // off16 stream (off16_count >= 32). Extract hi bytes and pair.
+                if (sa.off16_count >= 32 and sb.off16_count >= 32) {
+                    const hi_a = allocator.alloc(u8, sa.off16_count) catch continue;
+                    defer allocator.free(hi_a);
+                    const hi_b = allocator.alloc(u8, sb.off16_count) catch continue;
+                    defer allocator.free(hi_b);
+                    for (0..sa.off16_count) |i| hi_a[i] = sa.off16_data[i * 2 + 1];
+                    for (0..sb.off16_count) |i| hi_b[i] = sb.off16_data[i * 2 + 1];
+                    if (encodeCombinedTans32(allocator, hi_a, hi_b)) |r| {
+                        pair_infos[ppi].off16hi = .{ .combined_stream = r.stream, .count_a = r.count_a, .paired = true };
+                        pair_infos[ppi + 1].off16hi = .{ .combined_stream = &.{}, .count_a = r.count_a, .paired = true };
+                    }
+                }
+            }
+        }
 
         // tANS entropy handled by GPU kernel ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no CPU-side re-encoding needed
 
@@ -863,8 +1097,14 @@ pub fn compressFramedOne(
                 const chunk_hdr_pos = pos;
                 pos += 4;
 
-                // Use frame-level shared tANS32 context (built once before chunk loop)
-                const shared_tans_ctx = frame_shared_tans_ctx;
+                // Build chunk-level shared tANS32 context (tighter than frame-level)
+                const chunk_src_data = effective_src[soff..][0..chunk_size];
+                const ByteHistogram2 = @import("entropy/byte_histogram.zig").ByteHistogram;
+                var chunk_histo: ByteHistogram2 = .{};
+                chunk_histo.countBytes(chunk_src_data);
+                const chunk_tans_ctx: ?tans_enc.Tans32SharedCtx =
+                    tans_enc.buildTans32SharedCtx(&chunk_histo, @intCast(chunk_size));
+                const shared_tans_ctx = chunk_tans_ctx;
 
                 // Write each sub-chunk, splicing GPU tANS literal data when beneficial
                 for (0..n_subs) |si| {
@@ -898,14 +1138,45 @@ pub fn compressFramedOne(
                         break :blk null;
                     } else null;
 
-                    // Re-encode all streams with CPU entropy (tANS literals + Huffman tokens/off16)
+                    // Re-encode all streams with CPU entropy (tANS literals + Huffman tokens/off16).
+                    // tANS is only usable when each chunk is exactly one sub-chunk —
+                    // the GPU scan and per-chunk tANS scratch layout assume that. At
+                    // higher sc_group_size each chunk has multiple sub-chunks, so we
+                    // fall back to raw streams (worse ratio, but correct).
+                    const single_subchunk_per_chunk = (n_gpu_blocks == n_chunks);
                     const reencode_ok: bool = blk_reencode: {
                         if (opts.level < 3) break :blk_reencode false;
+                        if (!single_subchunk_per_chunk) break :blk_reencode false;
                         const sub_size = @min(gpu_block, chunk_size - si * gpu_block);
                         var entropy_options = entropyOptionsForLevel(opts.level);
                         entropy_options.allow_tans = true;
                         entropy_options.allow_tans32 = true;
-                        const enc_buf = allocator.alloc(u8, raw_cs + 4096) catch break :blk_reencode false;
+                        // Derive a per-stream LitOverride from a PairStream entry.
+                        const ovFor = struct {
+                            fn f(ps: anytype, idx: usize) LitOverride {
+                                if (!ps.paired) return .none;
+                                if (idx % 2 == 0) {
+                                    return .{ .primary = .{ .combined_stream = ps.combined_stream, .count_a = ps.count_a } };
+                                } else {
+                                    return .{ .secondary = .{ .count_a = ps.count_a } };
+                                }
+                            }
+                        }.f;
+                        const has_pi = gpu_bi_idx < pair_infos.len;
+                        const lit_ov: LitOverride = if (has_pi) ovFor(pair_infos[gpu_bi_idx].lit, gpu_bi_idx) else .none;
+                        const tok_ov: LitOverride = if (has_pi) ovFor(pair_infos[gpu_bi_idx].tok, gpu_bi_idx) else .none;
+                        const off16hi_ov: LitOverride = if (has_pi) ovFor(pair_infos[gpu_bi_idx].off16hi, gpu_bi_idx) else .none;
+                        const is_paired = has_pi and
+                            (pair_infos[gpu_bi_idx].lit.paired or pair_infos[gpu_bi_idx].tok.paired or
+                            pair_infos[gpu_bi_idx].off16hi.paired);
+                        // A paired primary embeds BOTH units' streams — size the
+                        // scratch buffer to hold the combined streams plus this
+                        // unit's own off32/length output.
+                        var enc_buf_sz: usize = raw_cs + 4096;
+                        if (lit_ov == .primary) enc_buf_sz += lit_ov.primary.combined_stream.len;
+                        if (tok_ov == .primary) enc_buf_sz += tok_ov.primary.combined_stream.len;
+                        if (off16hi_ov == .primary) enc_buf_sz += off16hi_ov.primary.combined_stream.len;
+                        const enc_buf = allocator.alloc(u8, enc_buf_sz) catch break :blk_reencode false;
                         defer allocator.free(enc_buf);
                         const enc_n = reencodeGpuWithEntropy(
                             allocator, raw_payload, enc_buf, entropy_options,
@@ -914,10 +1185,20 @@ pub fn compressFramedOne(
                             if (tans_lits) |t| t else null,
                             if (shared_tans_ctx) |*ctx| ctx else null,
                             is_first_tans32_in_frame,
+                            lit_ov,
+                            tok_ov,
+                            off16hi_ov,
                         ) catch break :blk_reencode false;
-                        if (enc_n == 0 or enc_n >= raw_cs) break :blk_reencode false;
-
-                        if (pos + 3 + enc_n > dst.len) break :blk_reencode false;
+                        if (enc_n == 0) break :blk_reencode false;
+                        // A paired primary legitimately holds BOTH units' data,
+                        // so it can exceed raw_cs — skip the size-rejection for paired.
+                        if (!is_paired and enc_n >= raw_cs) break :blk_reencode false;
+                        // Paired units must never fall back to raw (would break the
+                        // primary/secondary contract). Out of buffer = hard error.
+                        if (pos + 3 + enc_n > dst.len) {
+                            if (is_paired) return error.DestinationTooSmall;
+                            break :blk_reencode false;
+                        }
                         const sc_hdr: u32 = @as(u32, @intCast(enc_n)) |
                             (@as(u32, 1) << lz_constants.sub_chunk_type_shift) |
                             lz_constants.chunk_header_compressed_flag;
@@ -929,6 +1210,12 @@ pub fn compressFramedOne(
                         break :blk_reencode true;
                     };
                     if (!reencode_ok) {
+                        // A paired unit must never fall back to raw — that would
+                        // break the primary/secondary contract with its partner.
+                        if (gpu_bi_idx < pair_infos.len and
+                            (pair_infos[gpu_bi_idx].lit.paired or pair_infos[gpu_bi_idx].tok.paired or
+                            pair_infos[gpu_bi_idx].off16hi.paired))
+                            return error.DestinationTooSmall;
                         // Use raw sub-chunk as-is
                         if (pos + 3 + raw_cs > dst.len) return error.DestinationTooSmall;
                         const sc_hdr: u32 = @as(u32, @intCast(raw_cs)) |

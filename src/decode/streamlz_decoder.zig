@@ -298,10 +298,10 @@ fn decompressOneFrame(
         const block_src = src[pos .. pos + block_hdr.compressed_size];
         var dispatched_parallel: bool = false;
 
-        // GPU batch path: only for per-chunk independent data (sc_group <= 1)
-        // Skip GPU/Vulkan LZ decode for L3+ with fractional SC (GPU-encoded with tANS)
-        // since the GPU LZ kernel can't handle entropy-coded literal streams.
-        if (use_gpu and hdr.sc_group_size <= 1.0) gpu_frame: {
+        // GPU batch path: GPU LZ kernel iterates sub-chunks within each chunk,
+        // so it handles any sc_group_size. At sc>0.5 the encoder gates off tANS
+        // (raw streams only) so the per-chunk tANS scratch isn't needed there.
+        if (use_gpu) gpu_frame: {
             const gpu = @import("fast/gpu_driver.zig");
             if (!gpu.isAvailable()) break :gpu_frame;
             if (block_src.len < 2) break :gpu_frame;
