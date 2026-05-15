@@ -1077,3 +1077,297 @@ extern "C" __global__ void slzTansEncodeKernel(
 
     out_sizes[chunk_id] = total_size;
 }
+
+// ══════════════════════════════════════════════════════════════════
+//  32-lane tANS encoder (chunk_type=6) — mirrors CPU encodeArrayU8Tans32
+// ══════════════════════════════════════════════════════════════════
+//
+// One warp per descriptor. Each lane k encodes the symbols at logical
+// indices k, k+32, k+64, ... in REVERSE, then bit-packs LSB-first
+// in REVERSE so the decoder reads forward.
+//
+// Logical symbols are extracted from the source buffer using:
+//     src[d.src_offset + (k + j*32) * stride]
+// where stride=1 for lit/tok streams and stride=2 (with src_offset
+// shifted by 0 or 1) for off16-lo/off16-hi byte-plane extraction.
+//
+// Output layout per descriptor (matches CPU + GPU decode kernel):
+//   [0..64)     32 × u16 LE sub_sizes
+//   [64..128)   32 × u16 LE sub_states (initial decode state)
+//   [128..)     bit-packed FSE-style probability table
+//   [...)       32 concatenated sub-streams
+//
+// sizes_out[i] is the encoded byte count. If tANS did not beat raw
+// (or any error path), the MSB is set as a fallback signal:
+//   sizes_out[i] = src_size | 0x80000000  → driver writes type-0
+// In that case the output slot is left untouched.
+
+struct Tans32EncDesc {
+    uint32_t src_offset;   // offset into d_input
+    uint32_t src_size;     // logical symbol count (post-stride)
+    uint32_t src_stride;   // 1 for lit/tok, 2 for off16 byte planes
+    uint32_t dst_offset;   // offset into d_output
+    uint32_t dst_capacity; // max bytes at dst_offset
+};
+
+// FSE-style probability table emitter (truncated binary, matches CPU
+// loop at tans_encoder.zig:1218-1267). Returns table byte count.
+__device__ uint32_t emitTans32ProbabilityTable(
+    uint8_t* table_buf,
+    const uint32_t* weights,
+    uint32_t num_symbols,
+    uint32_t log_table_bits
+) {
+    uint32_t wp = 0;
+    table_buf[wp++] = (uint8_t)log_table_bits;
+
+    uint64_t tbl_bits = 0;
+    uint32_t tbl_bit_count = 0;
+    int32_t  remaining = (int32_t)(1u << log_table_bits);
+
+    for (uint32_t tbl_sym = 0; remaining > 0 && tbl_sym < num_symbols; tbl_sym++) {
+        int32_t w = (int32_t)weights[tbl_sym];
+        uint32_t value = (uint32_t)(w + 1);
+
+        uint32_t rem_plus_1 = (uint32_t)(remaining + 1);
+        uint32_t log2_rem = (rem_plus_1 > 1) ? (31u - __clz(rem_plus_1)) : 0u;
+        uint32_t nb = log2_rem + 1;
+        uint32_t half = 1u << (nb - 1);
+        uint32_t max_val = (half << 1) - (uint32_t)remaining - 2;
+
+        if (value < max_val) {
+            tbl_bits |= (uint64_t)value << tbl_bit_count;
+            tbl_bit_count += nb - 1;
+        } else if (value < half) {
+            tbl_bits |= (uint64_t)value << tbl_bit_count;
+            tbl_bit_count += nb;
+        } else {
+            tbl_bits |= (uint64_t)(value + max_val) << tbl_bit_count;
+            tbl_bit_count += nb;
+        }
+
+        while (tbl_bit_count >= 8) {
+            table_buf[wp++] = (uint8_t)(tbl_bits & 0xFF);
+            tbl_bits >>= 8;
+            tbl_bit_count -= 8;
+        }
+
+        if (w > 0) remaining -= w;
+    }
+
+    if (tbl_bit_count > 0) {
+        table_buf[wp++] = (uint8_t)(tbl_bits & 0xFF);
+    }
+    return wp;
+}
+
+// Maximum per-lane logical symbol count we'll support in one descriptor.
+// 64KB sub-chunk / 32 lanes = 2048; 128KB / 32 = 4096. Pad a bit.
+#define TANS32_MAX_LANE_COUNT 4128
+
+extern "C" __global__ void __launch_bounds__(32, 4) slzTans32EncodeKernel(
+    const uint8_t* __restrict__ src_buf,
+    uint8_t*       __restrict__ dst_buf,
+    const Tans32EncDesc* __restrict__ descs,
+    uint32_t*      __restrict__ sizes_out,
+    uint32_t       num_descs
+) {
+    const uint32_t did = blockIdx.x;
+    if (did >= num_descs) return;
+    const int lane = (int)(threadIdx.x & 31);
+
+    // ── Load descriptor + early-out for tiny streams ─────────────────
+    Tans32EncDesc d = descs[did];
+    if (d.src_size < 64) {
+        // CPU returns error.TansNotBeneficial; signal raw-fallback.
+        if (lane == 0) sizes_out[did] = d.src_size | 0x80000000u;
+        return;
+    }
+
+    const uint8_t* src = src_buf + d.src_offset;
+    uint8_t* dst = dst_buf + d.dst_offset;
+
+    // ── log_table_bits = clamp(ilog2Round(src_size) - 2, 8, 11) ──────
+    __shared__ uint32_t s_log_table_bits;
+    __shared__ uint32_t s_num_symbols;
+    __shared__ uint32_t s_used_symbols;
+    __shared__ uint32_t s_table_bytes;
+    __shared__ uint32_t s_abort;
+    __shared__ uint32_t histo[256];
+    __shared__ uint32_t weights[256];
+    __shared__ TansEncEntry te[256];
+    __shared__ uint16_t te_data[2048];
+    __shared__ uint8_t  table_buf[512];
+    __shared__ uint16_t sub_sizes[32];
+    __shared__ uint16_t sub_states[32];
+
+    if (lane == 0) {
+        int raw_log = (int)ilog2Round(d.src_size) - 2;
+        if (raw_log > 11) raw_log = 11;
+        if (raw_log < 8) raw_log = 8;
+        s_log_table_bits = (uint32_t)raw_log;
+        s_abort = 0;
+    }
+
+    // ── Zero histogram (256 entries = 8 per lane) ────────────────────
+    for (int i = 0; i < 8; i++) histo[lane * 8 + i] = 0;
+    __syncwarp();
+
+    // ── Histogram pass: each lane counts its stride ──────────────────
+    const uint32_t src_size = d.src_size;
+    const uint32_t stride = d.src_stride;
+    if (stride == 1) {
+        for (uint32_t j = (uint32_t)lane; j < src_size; j += 32) {
+            atomicAdd_block(&histo[src[j]], 1);
+        }
+    } else {
+        for (uint32_t j = (uint32_t)lane; j < src_size; j += 32) {
+            atomicAdd_block(&histo[src[j * stride]], 1);
+        }
+    }
+    __syncwarp();
+
+    // ── Lane 0: find num_symbols, normalize, build encoding table ────
+    if (lane == 0) {
+        uint32_t num_symbols = 256;
+        while (num_symbols > 0 && histo[num_symbols - 1] == 0) num_symbols--;
+        s_num_symbols = num_symbols;
+        if (num_symbols == 0) {
+            sizes_out[did] = d.src_size | 0x80000000u;
+            s_abort = 1;
+        } else {
+            uint32_t L = 1u << s_log_table_bits;
+            uint32_t used = tansNormalizeCounts(weights, L, histo, d.src_size, (int)num_symbols);
+            s_used_symbols = used;
+            if (used <= 1) {
+                sizes_out[did] = d.src_size | 0x80000000u;
+                s_abort = 1;
+            } else {
+                tansInitTable(te, te_data, weights, (int)num_symbols, s_log_table_bits);
+                s_table_bytes = emitTans32ProbabilityTable(table_buf, weights, num_symbols, s_log_table_bits);
+            }
+        }
+    }
+    __syncwarp();
+    if (s_abort != 0) return;
+
+    const uint32_t log_table_bits = s_log_table_bits;
+    const uint32_t L = 1u << log_table_bits;
+    const uint32_t table_bytes = s_table_bytes;
+
+    // ── Phase 1: lane-local encode in REVERSE, collect (nb, bits) ────
+    // lane_count = ceil((src_size - lane) / 32)
+    int32_t signed_count = (int32_t)src_size - lane;
+    uint32_t lane_count = (signed_count > 0) ? (uint32_t)((signed_count + 31) / 32) : 0u;
+
+    // Per-lane local arrays (spill to local memory; ~12 KB per lane worst case)
+    uint8_t  enc_nb[TANS32_MAX_LANE_COUNT];
+    uint32_t enc_bits[TANS32_MAX_LANE_COUNT];
+
+    uint32_t lane_state = L;
+    uint32_t enc_count = 0;
+
+    if (lane_count > 0) {
+        // ri walks from (lane_count-1) down to 0; symbol index = ri*32 + lane.
+        // We bail early if lane_count > TANS32_MAX_LANE_COUNT (caller's bug).
+        uint32_t cap = (lane_count <= TANS32_MAX_LANE_COUNT) ? lane_count : TANS32_MAX_LANE_COUNT;
+        for (uint32_t ri = cap; ri > 0; ) {
+            ri--;
+            uint32_t sym_idx = ri * 32u + (uint32_t)lane;
+            // sym_idx is always < src_size because lane_count was computed to ensure that.
+            uint8_t sym = src[sym_idx * stride];
+            const TansEncEntry* entry = &te[sym];
+
+            uint32_t new_state;
+            uint32_t nb;
+            nextState(te_data, entry, lane_state, new_state, nb);
+
+            uint32_t mask = (nb >= 32) ? 0xFFFFFFFFu : ((1u << nb) - 1u);
+            enc_nb[enc_count]   = (uint8_t)nb;
+            enc_bits[enc_count] = lane_state & mask;
+            enc_count++;
+            lane_state = new_state;
+        }
+    }
+
+    // ── Phase 2: pack bits LSB-first in REVERSE (write to lane scratch) ──
+    // We pack into a small per-lane byte buffer in local memory, then memcpy
+    // out to dst once sub-stream offsets are known via prefix-sum.
+    // Worst case: src_size/32 + 8 bytes per lane (~520B for 4KB stream).
+    // Use 4144 = TANS32_MAX_LANE_COUNT + slack so 4-byte bursts can overshoot.
+    uint8_t lane_buf[TANS32_MAX_LANE_COUNT + 64];
+
+    uint64_t bit_buf = 0;
+    uint32_t bit_count = 0;
+    uint32_t wp_local = 0;
+
+    for (uint32_t ei = enc_count; ei > 0; ) {
+        ei--;
+        bit_buf |= (uint64_t)enc_bits[ei] << bit_count;
+        bit_count += enc_nb[ei];
+        while (bit_count >= 8) {
+            lane_buf[wp_local++] = (uint8_t)(bit_buf & 0xFF);
+            bit_buf >>= 8;
+            bit_count -= 8;
+        }
+    }
+    if (bit_count > 0) {
+        lane_buf[wp_local++] = (uint8_t)(bit_buf & 0xFF);
+    }
+
+    if (wp_local > 0xFFFF) {
+        // CPU returns error.TansNotBeneficial when a single lane's sub-stream
+        // exceeds u16 range. Signal raw-fallback (only lane 0 writes).
+        if (lane == 0) sizes_out[did] = d.src_size | 0x80000000u;
+        return;
+    }
+
+    sub_sizes[lane]  = (uint16_t)wp_local;
+    sub_states[lane] = (uint16_t)(lane_state & (L - 1));
+    __syncwarp();
+
+    // ── Prefix sum of sub_sizes (intra-warp scan) ────────────────────
+    uint32_t my_size = (uint32_t)sub_sizes[lane];
+    uint32_t scan = my_size;
+    for (int o = 1; o < 32; o <<= 1) {
+        uint32_t n = __shfl_up_sync(0xFFFFFFFF, scan, o);
+        if (lane >= o) scan += n;
+    }
+    uint32_t my_offset = scan - my_size;
+    uint32_t total_compressed = __shfl_sync(0xFFFFFFFF, scan, 31);
+
+    const uint32_t header_size = 128u + table_bytes;
+    const uint32_t total_size = header_size + total_compressed;
+
+    // ── Reject if tANS didn't beat raw OR overflows dst capacity ─────
+    if (total_size + 8 > d.dst_capacity || total_size >= d.src_size) {
+        if (lane == 0) sizes_out[did] = d.src_size | 0x80000000u;
+        return;
+    }
+
+    // ── Lane 0: write sizes+states header + probability table ────────
+    if (lane == 0) {
+        // 32 × u16 LE sizes
+        for (int i = 0; i < 32; i++) {
+            dst[i * 2]     = (uint8_t)(sub_sizes[i] & 0xFF);
+            dst[i * 2 + 1] = (uint8_t)((sub_sizes[i] >> 8) & 0xFF);
+        }
+        // 32 × u16 LE states
+        for (int i = 0; i < 32; i++) {
+            dst[64 + i * 2]     = (uint8_t)(sub_states[i] & 0xFF);
+            dst[64 + i * 2 + 1] = (uint8_t)((sub_states[i] >> 8) & 0xFF);
+        }
+        // probability table
+        for (uint32_t i = 0; i < table_bytes; i++) {
+            dst[128 + i] = table_buf[i];
+        }
+        sizes_out[did] = total_size;
+    }
+    __syncwarp();
+
+    // ── Each lane writes its sub-stream to dst ──────────────────────
+    uint8_t* my_dst = dst + header_size + my_offset;
+    for (uint32_t i = 0; i < wp_local; i++) {
+        my_dst[i] = lane_buf[i];
+    }
+}

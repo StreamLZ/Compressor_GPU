@@ -22,6 +22,7 @@ var module: usize = 0;
 var kernel_fn: usize = 0;
 var tans_module: usize = 0;
 var tans_kernel_fn: usize = 0;
+var tans32_kernel_fn: usize = 0;
 var initialized = false;
 
 const FnInit = *const fn (c_uint) callconv(.c) CUresult;
@@ -83,10 +84,13 @@ pub fn init() bool {
     const get_fn = cuModuleGetFunction_fn orelse return false;
     if (get_fn(&kernel_fn, module, "slzCompressL1Kernel") != CUDA_SUCCESS) return false;
 
-    // Load tANS entropy kernel
+    // Load tANS entropy kernel (5-state + 32-lane)
     const tans_ptx = @embedFile("gpu_tans_kernel.ptx") ++ "\x00";
     if ((cuModuleLoadData_fn orelse return false)(&tans_module, tans_ptx.ptr) != CUDA_SUCCESS) return false;
     if (get_fn(&tans_kernel_fn, tans_module, "slzTansEncodeKernel") != CUDA_SUCCESS) return false;
+    // 32-lane tANS encoder (chunk_type=6). Loaded lazily — kernel symbol must
+    // exist in PTX or this returns failure. Driver falls back to CPU path.
+    _ = get_fn(&tans32_kernel_fn, tans_module, "slzTans32EncodeKernel");
 
     return true;
 }
@@ -135,6 +139,89 @@ pub const TansChunkDesc = extern struct {
     dst_capacity: u32,
 };
 
+/// 32-lane tANS encode descriptor — matches `Tans32EncDesc` in
+/// gpu_tans_kernel.cu. `src_stride` is 1 for byte streams (literals,
+/// tokens) and 2 for off16 byte-plane extraction (combined with a
+/// `src_offset` adjusted by +0 for lo plane or +1 for hi plane).
+pub const Tans32EncDesc = extern struct {
+    src_offset: u32,
+    src_size: u32,    // logical symbol count after stride extraction
+    src_stride: u32,  // 1 or 2
+    dst_offset: u32,
+    dst_capacity: u32,
+};
+
+// Persistent buffers for the 32-lane tANS pass.
+var d_tans32_descs_persist: CUdeviceptr = 0;
+var d_tans32_descs_size: usize = 0;
+var d_tans32_out_persist: CUdeviceptr = 0;
+var d_tans32_out_size: usize = 0;
+var d_tans32_sizes_persist: CUdeviceptr = 0;
+var d_tans32_sizes_size: usize = 0;
+
+/// Launch the 32-lane tANS encoder on a batch of streams already
+/// resident in device memory (`d_input_persist` from the LZ encode
+/// pass). Writes encoded bytes to a fresh device buffer and downloads
+/// both the encoded data and the per-stream sizes.
+///
+/// `sizes_out[i]` semantics: low 31 bits = encoded byte count; if MSB
+/// is set, tANS did not beat raw — caller should write a type-0 stream
+/// using the source bytes instead.
+///
+/// Returns true on success. Caller owns the returned slices.
+pub fn gpuEncodeTans32(
+    allocator: std.mem.Allocator,
+    descs: []const Tans32EncDesc,
+    total_dst_bytes: usize,
+    out_sizes: []u32,
+    out_bytes: []u8,
+) bool {
+    if (!init()) return false;
+    if (tans32_kernel_fn == 0) return false;
+
+    const h2d_fn = cuMemcpyHtoD_fn orelse return false;
+    const d2h_fn = cuMemcpyDtoH_fn orelse return false;
+    const launch_fn = cuLaunchKernel_fn orelse return false;
+    const sync_fn = cuCtxSynchronize_fn orelse return false;
+    const memset_fn = cuMemsetD8_fn orelse return false;
+    _ = allocator;
+
+    const n: u32 = @intCast(descs.len);
+    if (n == 0) return true;
+
+    const desc_bytes: usize = descs.len * @sizeOf(Tans32EncDesc);
+    const sizes_bytes: usize = descs.len * 4;
+
+    if (!ensureBuf(&d_tans32_descs_persist, &d_tans32_descs_size, desc_bytes)) return false;
+    if (!ensureBuf(&d_tans32_out_persist, &d_tans32_out_size, total_dst_bytes)) return false;
+    if (!ensureBuf(&d_tans32_sizes_persist, &d_tans32_sizes_size, sizes_bytes)) return false;
+
+    _ = h2d_fn(d_tans32_descs_persist, @ptrCast(descs.ptr), desc_bytes);
+    _ = memset_fn(d_tans32_sizes_persist, 0, sizes_bytes);
+    _ = sync_fn();
+
+    // Source streams (literals, tokens, off16) live in the LZ-encode
+    // OUTPUT buffer (d_output_persist) where the LZ kernel wrote them.
+    var p_src = d_output_persist;
+    var p_dst = d_tans32_out_persist;
+    var p_descs = d_tans32_descs_persist;
+    var p_sizes = d_tans32_sizes_persist;
+    var p_n: u32 = n;
+    var params = [_]?*anyopaque{
+        @ptrCast(&p_src), @ptrCast(&p_dst), @ptrCast(&p_descs),
+        @ptrCast(&p_sizes), @ptrCast(&p_n),
+    };
+    var extra = [_]?*anyopaque{null};
+
+    // 1 warp (32 threads) per descriptor, 1 block per descriptor.
+    if (launch_fn(tans32_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return false;
+    if (sync_fn() != CUDA_SUCCESS) return false;
+
+    _ = d2h_fn(@ptrCast(out_sizes.ptr), d_tans32_sizes_persist, sizes_bytes);
+    _ = d2h_fn(@ptrCast(out_bytes.ptr), d_tans32_out_persist, total_dst_bytes);
+    return true;
+}
+
 // ── Persistent device buffers ──────────────────────────────────
 var d_input_persist: CUdeviceptr = 0;
 var d_input_size: usize = 0;
@@ -169,6 +256,111 @@ fn ensureBuf(ptr: *CUdeviceptr, cur: *usize, needed: usize) bool {
 pub var tans_lit_sizes: ?[]u32 = null;
 pub var tans_lit_data: ?[]u8 = null;
 pub var tans_lit_offsets: ?[]u32 = null;
+
+// ── 32-lane tANS pre-encoded streams (per sub-chunk) ───────────────
+// sizes[i]:
+//   if MSB set → tANS not beneficial; use raw bytes / memcpy.
+//   else      → encoded byte count at data[offsets[i] .. offsets[i] + size].
+// The encoded payload is the kernel's raw output: [128B sizes+states]
+// [prob table][32 sub-streams]. The caller prepends a 5-byte type-6
+// non-compact chunk header when writing to the final frame.
+pub var tans32_tok_sizes: ?[]u32 = null;
+pub var tans32_tok_data: ?[]u8 = null;
+pub var tans32_tok_offsets: ?[]u32 = null;
+
+/// Build token descriptors from the downloaded GPU raw output and run
+/// the 32-lane tANS encoder over all token streams in one launch.
+/// Populates `tans32_tok_*` pub vars on success. Returns false (and
+/// leaves the pub vars nulled) when the kernel is unavailable or any
+/// step fails — caller falls back to CPU re-encode in that case.
+pub fn gpuEncodeTokensTans32(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes: []const u32,
+) bool {
+    if (!init()) return false;
+    if (tans32_kernel_fn == 0) return false;
+    const n = chunk_descs.len;
+    if (n == 0) return false;
+
+    var descs = allocator.alloc(Tans32EncDesc, n) catch return false;
+    defer allocator.free(descs);
+    var offsets = allocator.alloc(u32, n) catch return false;
+    errdefer allocator.free(offsets);
+
+    var total: u32 = 0;
+    for (0..n) |i| {
+        const cs = comp_sizes[i];
+        const base: u32 = chunk_descs[i].dst_offset;
+        const init_b: u32 = if (chunk_descs[i].is_first != 0) 8 else 0;
+        offsets[i] = total;
+        descs[i] = .{
+            .src_offset = 0,
+            .src_size = 0,
+            .src_stride = 1,
+            .dst_offset = total,
+            .dst_capacity = 0,
+        };
+
+        if (cs < init_b + 6) continue;
+        const lit_hdr: u32 = base + init_b;
+        const lit_count: u32 =
+            (@as(u32, output[lit_hdr]) << 16) |
+            (@as(u32, output[lit_hdr + 1]) << 8) |
+            @as(u32, output[lit_hdr + 2]);
+        const tok_hdr: u32 = lit_hdr + 3 + lit_count;
+        if (tok_hdr + 3 > base + cs) continue;
+        const tok_count: u32 =
+            (@as(u32, output[tok_hdr]) << 16) |
+            (@as(u32, output[tok_hdr + 1]) << 8) |
+            @as(u32, output[tok_hdr + 2]);
+        if (tok_count == 0) continue;
+        const tok_src: u32 = tok_hdr + 3;
+
+        // Capacity bound: 128B header + ~200B prob table + worst-case
+        // bitstream (≤ src_size on success — we always fail-safe to raw
+        // when total >= src_size). 512B headroom for table + padding.
+        const dst_cap: u32 = tok_count + 512;
+        descs[i] = .{
+            .src_offset = tok_src,
+            .src_size = tok_count,
+            .src_stride = 1,
+            .dst_offset = total,
+            .dst_capacity = dst_cap,
+        };
+        total += dst_cap;
+    }
+
+    if (total == 0) {
+        allocator.free(offsets);
+        return false;
+    }
+
+    const sizes = allocator.alloc(u32, n) catch {
+        allocator.free(offsets);
+        return false;
+    };
+    errdefer allocator.free(sizes);
+    const bytes = allocator.alloc(u8, total) catch {
+        allocator.free(offsets);
+        allocator.free(sizes);
+        return false;
+    };
+    errdefer allocator.free(bytes);
+
+    if (!gpuEncodeTans32(allocator, descs, total, sizes, bytes)) {
+        allocator.free(offsets);
+        allocator.free(sizes);
+        allocator.free(bytes);
+        return false;
+    }
+
+    tans32_tok_sizes = sizes;
+    tans32_tok_data = bytes;
+    tans32_tok_offsets = offsets;
+    return true;
+}
 
 pub fn gpuCompress(
     input: []const u8,

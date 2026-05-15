@@ -128,6 +128,12 @@ fn reencodeGpuWithEntropy(
     initial_bytes: usize,
     src_size: usize,
     tans_encoded_lits: ?[]const u8,
+    /// GPU-side pre-encoded tokens (32-lane tANS payload, body only
+    /// — no chunk header). When non-null, replaces the CPU entropy
+    /// encode for the token stream. Caller passes `null` to use the
+    /// CPU path. `tans_encoded_tokens_dst_size` carries the source
+    /// token count so we can write the type-6 chunk header.
+    tans_encoded_tokens: ?[]const u8,
     shared_tans_ctx: ?*const tans_enc.Tans32SharedCtx,
     is_first_subchunk: bool,
     lit_override: LitOverride,
@@ -290,6 +296,24 @@ fn reencodeGpuWithEntropy(
                 break :blk_tok 7;
             },
             .none => {},
+        }
+        // GPU-pre-encoded token stream (32-lane tANS). The kernel
+        // outputs `[128B sizes+states][prob table][32 sub-streams]`
+        // with no chunk header — we prepend the 5-byte type-6 header.
+        if (tans_encoded_tokens) |pre| {
+            if (pre.len > 0 and pre.len + 5 < tokens.len + 3) {
+                if (wp + 5 + pre.len > dst.len) return 0;
+                entropy_enc.writeNonCompactChunkHeader(
+                    dst[wp..],
+                    6,
+                    @intCast(pre.len),
+                    @intCast(tokens.len),
+                );
+                @memcpy(dst[wp + 5 ..][0..pre.len], pre);
+                break :blk_tok 5 + pre.len;
+            }
+            // Pre-encoded didn't beat raw — fall through to memcpy.
+            break :blk_tok entropy_enc.encodeArrayU8Memcpy(dst[wp..], tokens) catch return 0;
         }
         break :blk_tok entropy_enc.encodeArrayU8(allocator, dst[wp..], tokens, options, speed_tradeoff, null, 0, null) catch return 0;
     };
@@ -998,6 +1022,22 @@ pub fn compressFramedOne(
         if (!gpu_enc.gpuCompress(effective_src, gpu_out, descs, comp_sizes, io, opts.level))
             break :gpu_compress;
 
+        // ── GPU 32-lane tANS encode of TOKEN streams ─────────────
+        // For L3+ only (matches the reencode entropy gate). Populates
+        // gpu_enc.tans32_tok_{sizes,data,offsets} on success.
+        const gpu_tok_pre_encoded: bool = if (opts.level >= 3)
+            gpu_enc.gpuEncodeTokensTans32(allocator, gpu_out, descs, comp_sizes)
+        else
+            false;
+        defer if (gpu_tok_pre_encoded) {
+            if (gpu_enc.tans32_tok_sizes) |s| allocator.free(s);
+            if (gpu_enc.tans32_tok_data) |d| allocator.free(d);
+            if (gpu_enc.tans32_tok_offsets) |o| allocator.free(o);
+            gpu_enc.tans32_tok_sizes = null;
+            gpu_enc.tans32_tok_data = null;
+            gpu_enc.tans32_tok_offsets = null;
+        };
+
         var is_first_tans32_in_frame: bool = true;
 
         // ── Paired-literal pre-pass ──────────────────────────────────
@@ -1181,11 +1221,27 @@ pub fn compressFramedOne(
                         if (off16hi_ov == .primary) enc_buf_sz += off16hi_ov.primary.combined_stream.len;
                         const enc_buf = allocator.alloc(u8, enc_buf_sz) catch break :blk_reencode false;
                         defer allocator.free(enc_buf);
+                        // GPU-pre-encoded tokens (32-lane tANS) — body only.
+                        // sizes[gpu_bi_idx] MSB set → raw fallback (skip).
+                        const gpu_tok_pre: ?[]const u8 = blk_gpu_tok: {
+                            if (!gpu_tok_pre_encoded) break :blk_gpu_tok null;
+                            const sizes = gpu_enc.tans32_tok_sizes orelse break :blk_gpu_tok null;
+                            const data = gpu_enc.tans32_tok_data orelse break :blk_gpu_tok null;
+                            const offs = gpu_enc.tans32_tok_offsets orelse break :blk_gpu_tok null;
+                            if (gpu_bi_idx >= sizes.len) break :blk_gpu_tok null;
+                            const sz = sizes[gpu_bi_idx];
+                            if ((sz & 0x80000000) != 0) break :blk_gpu_tok null;
+                            if (sz == 0) break :blk_gpu_tok null;
+                            const off = offs[gpu_bi_idx];
+                            if (off + sz > data.len) break :blk_gpu_tok null;
+                            break :blk_gpu_tok data[off..][0..sz];
+                        };
                         const enc_n = reencodeGpuWithEntropy(
                             allocator, raw_payload, enc_buf, entropy_options,
                             0.0, // minimize size, not speed
                             init_bytes, sub_size,
                             if (tans_lits) |t| t else null,
+                            gpu_tok_pre,
                             if (shared_tans_ctx) |*ctx| ctx else null,
                             is_first_tans32_in_frame,
                             lit_ov,
