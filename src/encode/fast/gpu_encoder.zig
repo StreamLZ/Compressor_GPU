@@ -268,6 +268,16 @@ pub var tans32_tok_sizes: ?[]u32 = null;
 pub var tans32_tok_data: ?[]u8 = null;
 pub var tans32_tok_offsets: ?[]u32 = null;
 
+// Off16 hi/lo byte-plane streams. Both planes share one device output
+// buffer and one descriptor array (hi descs first, then lo descs) but
+// expose separate (sizes, data, offsets) host-side for clarity.
+pub var tans32_off16hi_sizes: ?[]u32 = null;
+pub var tans32_off16hi_data: ?[]u8 = null;
+pub var tans32_off16hi_offsets: ?[]u32 = null;
+pub var tans32_off16lo_sizes: ?[]u32 = null;
+pub var tans32_off16lo_data: ?[]u8 = null;
+pub var tans32_off16lo_offsets: ?[]u32 = null;
+
 /// Build token descriptors from the downloaded GPU raw output and run
 /// the 32-lane tANS encoder over all token streams in one launch.
 /// Populates `tans32_tok_*` pub vars on success. Returns false (and
@@ -359,6 +369,151 @@ pub fn gpuEncodeTokensTans32(
     tans32_tok_sizes = sizes;
     tans32_tok_data = bytes;
     tans32_tok_offsets = offsets;
+    return true;
+}
+
+/// Same as gpuEncodeTokensTans32 but for the off16 byte planes. The
+/// off16 stream layout in the raw GPU output is `[2B count][2*count
+/// interleaved lo/hi bytes]`, so we use stride=2 and shift src_offset
+/// by 0 (lo) or 1 (hi). Both planes run through one kernel launch.
+///
+/// The CPU re-encode only entropy-codes off16 when count >= 32; sub-
+/// chunks below that threshold get an empty descriptor (src_size=0)
+/// so the kernel returns a raw-fallback marker and the caller writes
+/// the raw off16 stream verbatim.
+pub fn gpuEncodeOff16Tans32(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes: []const u32,
+) bool {
+    if (!init()) return false;
+    if (tans32_kernel_fn == 0) return false;
+    const n = chunk_descs.len;
+    if (n == 0) return false;
+
+    const num_descs = n * 2;
+    var descs = allocator.alloc(Tans32EncDesc, num_descs) catch return false;
+    defer allocator.free(descs);
+    var hi_offsets = allocator.alloc(u32, n) catch return false;
+    errdefer allocator.free(hi_offsets);
+    var lo_offsets = allocator.alloc(u32, n) catch return false;
+    errdefer allocator.free(lo_offsets);
+
+    var total: u32 = 0;
+    for (0..n) |i| {
+        const cs = comp_sizes[i];
+        const base: u32 = chunk_descs[i].dst_offset;
+        const init_b: u32 = if (chunk_descs[i].is_first != 0) 8 else 0;
+
+        // Default to empty (no entropy coding for this sub-chunk).
+        hi_offsets[i] = total;
+        lo_offsets[i] = total;
+        descs[i] = .{ .src_offset = 0, .src_size = 0, .src_stride = 2, .dst_offset = total, .dst_capacity = 0 };
+        descs[n + i] = .{ .src_offset = 0, .src_size = 0, .src_stride = 2, .dst_offset = total, .dst_capacity = 0 };
+
+        if (cs < init_b + 6) continue;
+        const lit_hdr: u32 = base + init_b;
+        const lit_count: u32 =
+            (@as(u32, output[lit_hdr]) << 16) |
+            (@as(u32, output[lit_hdr + 1]) << 8) |
+            @as(u32, output[lit_hdr + 2]);
+        const tok_hdr: u32 = lit_hdr + 3 + lit_count;
+        if (tok_hdr + 3 > base + cs) continue;
+        const tok_count: u32 =
+            (@as(u32, output[tok_hdr]) << 16) |
+            (@as(u32, output[tok_hdr + 1]) << 8) |
+            @as(u32, output[tok_hdr + 2]);
+
+        // cmd_stream2_offset (2 bytes) is present when sub-chunk > 64KB.
+        const after_tok: u32 = tok_hdr + 3 + tok_count;
+        const cmd2_size: u32 = if (chunk_descs[i].src_size > 0x10000) 2 else 0;
+        const off16_hdr: u32 = after_tok + cmd2_size;
+        if (off16_hdr + 2 > base + cs) continue;
+
+        const off16_count: u32 =
+            @as(u32, output[off16_hdr]) |
+            (@as(u32, output[off16_hdr + 1]) << 8);
+        if (off16_count < 32) continue; // matches CPU `>= 32` gate
+        const off16_data: u32 = off16_hdr + 2;
+
+        // hi descriptor: stride=2, src_offset shifted by 1
+        const hi_cap: u32 = off16_count + 512;
+        descs[i] = .{
+            .src_offset = off16_data + 1,
+            .src_size = off16_count,
+            .src_stride = 2,
+            .dst_offset = total,
+            .dst_capacity = hi_cap,
+        };
+        hi_offsets[i] = total;
+        total += hi_cap;
+
+        // lo descriptor: stride=2, src_offset unshifted
+        const lo_cap: u32 = off16_count + 512;
+        descs[n + i] = .{
+            .src_offset = off16_data,
+            .src_size = off16_count,
+            .src_stride = 2,
+            .dst_offset = total,
+            .dst_capacity = lo_cap,
+        };
+        lo_offsets[i] = total;
+        total += lo_cap;
+    }
+
+    if (total == 0) {
+        allocator.free(hi_offsets);
+        allocator.free(lo_offsets);
+        return false;
+    }
+
+    const all_sizes = allocator.alloc(u32, num_descs) catch {
+        allocator.free(hi_offsets);
+        allocator.free(lo_offsets);
+        return false;
+    };
+    errdefer allocator.free(all_sizes);
+    const bytes = allocator.alloc(u8, total) catch {
+        allocator.free(hi_offsets);
+        allocator.free(lo_offsets);
+        allocator.free(all_sizes);
+        return false;
+    };
+    errdefer allocator.free(bytes);
+
+    if (!gpuEncodeTans32(allocator, descs, total, all_sizes, bytes)) {
+        allocator.free(hi_offsets);
+        allocator.free(lo_offsets);
+        allocator.free(all_sizes);
+        allocator.free(bytes);
+        return false;
+    }
+
+    // Split sizes into hi (first n) and lo (next n). Reuse all_sizes
+    // as backing store for both halves by aliasing — but lifetimes
+    // make that messy. Just allocate two arrays and copy.
+    const hi_sizes = allocator.alloc(u32, n) catch {
+        allocator.free(hi_offsets); allocator.free(lo_offsets);
+        allocator.free(all_sizes); allocator.free(bytes);
+        return false;
+    };
+    const lo_sizes = allocator.alloc(u32, n) catch {
+        allocator.free(hi_offsets); allocator.free(lo_offsets);
+        allocator.free(hi_sizes);
+        allocator.free(all_sizes); allocator.free(bytes);
+        return false;
+    };
+    @memcpy(hi_sizes, all_sizes[0..n]);
+    @memcpy(lo_sizes, all_sizes[n..]);
+    allocator.free(all_sizes);
+
+    tans32_off16hi_sizes = hi_sizes;
+    tans32_off16hi_data = bytes; // shared buffer; both hi and lo offsets index into it
+    tans32_off16hi_offsets = hi_offsets;
+    tans32_off16lo_sizes = lo_sizes;
+    tans32_off16lo_data = bytes; // SAME pointer — only one of {hi,lo} should free it
+    tans32_off16lo_offsets = lo_offsets;
     return true;
 }
 

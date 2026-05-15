@@ -134,6 +134,12 @@ fn reencodeGpuWithEntropy(
     /// CPU path. `tans_encoded_tokens_dst_size` carries the source
     /// token count so we can write the type-6 chunk header.
     tans_encoded_tokens: ?[]const u8,
+    /// GPU-side pre-encoded off16 byte planes. Both must be non-null
+    /// to engage the GPU path; either-null falls back to CPU. The
+    /// `entropy_coded_16_marker` decision is computed on the CPU
+    /// side using the supplied body sizes.
+    tans_encoded_off16_hi: ?[]const u8,
+    tans_encoded_off16_lo: ?[]const u8,
     shared_tans_ctx: ?*const tans_enc.Tans32SharedCtx,
     is_first_subchunk: bool,
     lit_override: LitOverride,
@@ -367,31 +373,58 @@ fn reencodeGpuWithEntropy(
         const lo_n = entropy_enc.encodeArrayU8(allocator, dst[wp..], lo_bytes, options, speed_tradeoff, null, 0, null) catch return 0;
         wp += lo_n;
     } else if (off16_count >= 32) {
-        const split_buf = allocator.alloc(u8, off16_count * 2) catch return 0;
-        defer allocator.free(split_buf);
-        const lo_bytes = split_buf[0..off16_count];
-        const hi_bytes = split_buf[off16_count..][0..off16_count];
-        for (0..off16_count) |i| {
-            lo_bytes[i] = off16_data[i * 2];
-            hi_bytes[i] = off16_data[i * 2 + 1];
-        }
-        const split_enc = allocator.alloc(u8, off16_bytes + 512) catch return 0;
-        defer allocator.free(split_enc);
-        const hi_n = entropy_enc.encodeArrayU8(allocator, split_enc, hi_bytes, options, speed_tradeoff, null, 0, null) catch return 0;
-        const lo_n = entropy_enc.encodeArrayU8(allocator, split_enc[hi_n..], lo_bytes, options, speed_tradeoff, null, 0, null) catch return 0;
-        const split_total = hi_n + lo_n;
-        if (split_total < off16_bytes) {
-            if (wp + 2 + split_total > dst.len) return 0;
-            std.mem.writeInt(u16, dst[wp..][0..2], fast_constants.entropy_coded_16_marker, .little);
-            wp += 2;
-            @memcpy(dst[wp..][0..split_total], split_enc[0..split_total]);
-            wp += split_total;
+        // GPU-pre-encoded fast path: both hi and lo must be present
+        // (raw-fallback for either drops us back to CPU encode).
+        const use_gpu_off16: bool = tans_encoded_off16_hi != null and tans_encoded_off16_lo != null;
+        if (use_gpu_off16) {
+            const pre_hi = tans_encoded_off16_hi.?;
+            const pre_lo = tans_encoded_off16_lo.?;
+            // 5-byte type-6 chunk header per stream → split_total = pre_hi + pre_lo + 10.
+            const split_total: usize = pre_hi.len + pre_lo.len + 10;
+            if (split_total < off16_bytes) {
+                if (wp + 2 + split_total > dst.len) return 0;
+                std.mem.writeInt(u16, dst[wp..][0..2], fast_constants.entropy_coded_16_marker, .little);
+                wp += 2;
+                entropy_enc.writeNonCompactChunkHeader(dst[wp..], 6, @intCast(pre_hi.len), @intCast(off16_count));
+                @memcpy(dst[wp + 5 ..][0..pre_hi.len], pre_hi);
+                wp += 5 + pre_hi.len;
+                entropy_enc.writeNonCompactChunkHeader(dst[wp..], 6, @intCast(pre_lo.len), @intCast(off16_count));
+                @memcpy(dst[wp + 5 ..][0..pre_lo.len], pre_lo);
+                wp += 5 + pre_lo.len;
+            } else {
+                if (wp + 2 + off16_bytes > dst.len) return 0;
+                std.mem.writeInt(u16, dst[wp..][0..2], @intCast(off16_count), .little);
+                wp += 2;
+                @memcpy(dst[wp..][0..off16_bytes], off16_data);
+                wp += off16_bytes;
+            }
         } else {
-            if (wp + 2 + off16_bytes > dst.len) return 0;
-            std.mem.writeInt(u16, dst[wp..][0..2], @intCast(off16_count), .little);
-            wp += 2;
-            @memcpy(dst[wp..][0..off16_bytes], off16_data);
-            wp += off16_bytes;
+            const split_buf = allocator.alloc(u8, off16_count * 2) catch return 0;
+            defer allocator.free(split_buf);
+            const lo_bytes = split_buf[0..off16_count];
+            const hi_bytes = split_buf[off16_count..][0..off16_count];
+            for (0..off16_count) |i| {
+                lo_bytes[i] = off16_data[i * 2];
+                hi_bytes[i] = off16_data[i * 2 + 1];
+            }
+            const split_enc = allocator.alloc(u8, off16_bytes + 512) catch return 0;
+            defer allocator.free(split_enc);
+            const hi_n = entropy_enc.encodeArrayU8(allocator, split_enc, hi_bytes, options, speed_tradeoff, null, 0, null) catch return 0;
+            const lo_n = entropy_enc.encodeArrayU8(allocator, split_enc[hi_n..], lo_bytes, options, speed_tradeoff, null, 0, null) catch return 0;
+            const split_total = hi_n + lo_n;
+            if (split_total < off16_bytes) {
+                if (wp + 2 + split_total > dst.len) return 0;
+                std.mem.writeInt(u16, dst[wp..][0..2], fast_constants.entropy_coded_16_marker, .little);
+                wp += 2;
+                @memcpy(dst[wp..][0..split_total], split_enc[0..split_total]);
+                wp += split_total;
+            } else {
+                if (wp + 2 + off16_bytes > dst.len) return 0;
+                std.mem.writeInt(u16, dst[wp..][0..2], @intCast(off16_count), .little);
+                wp += 2;
+                @memcpy(dst[wp..][0..off16_bytes], off16_data);
+                wp += off16_bytes;
+            }
         }
     } else {
         if (wp + 2 + off16_bytes > dst.len) return 0;
@@ -1022,9 +1055,9 @@ pub fn compressFramedOne(
         if (!gpu_enc.gpuCompress(effective_src, gpu_out, descs, comp_sizes, io, opts.level))
             break :gpu_compress;
 
-        // ── GPU 32-lane tANS encode of TOKEN streams ─────────────
+        // ── GPU 32-lane tANS encode of TOKEN + off16 streams ────
         // For L3+ only (matches the reencode entropy gate). Populates
-        // gpu_enc.tans32_tok_{sizes,data,offsets} on success.
+        // gpu_enc.tans32_tok_* and gpu_enc.tans32_off16{hi,lo}_*.
         const gpu_tok_pre_encoded: bool = if (opts.level >= 3)
             gpu_enc.gpuEncodeTokensTans32(allocator, gpu_out, descs, comp_sizes)
         else
@@ -1036,6 +1069,24 @@ pub fn compressFramedOne(
             gpu_enc.tans32_tok_sizes = null;
             gpu_enc.tans32_tok_data = null;
             gpu_enc.tans32_tok_offsets = null;
+        };
+        const gpu_off16_pre_encoded: bool = if (opts.level >= 3)
+            gpu_enc.gpuEncodeOff16Tans32(allocator, gpu_out, descs, comp_sizes)
+        else
+            false;
+        defer if (gpu_off16_pre_encoded) {
+            // hi_data and lo_data share the same backing buffer; free once.
+            if (gpu_enc.tans32_off16hi_sizes) |s| allocator.free(s);
+            if (gpu_enc.tans32_off16lo_sizes) |s| allocator.free(s);
+            if (gpu_enc.tans32_off16hi_offsets) |o| allocator.free(o);
+            if (gpu_enc.tans32_off16lo_offsets) |o| allocator.free(o);
+            if (gpu_enc.tans32_off16hi_data) |d| allocator.free(d);
+            gpu_enc.tans32_off16hi_sizes = null;
+            gpu_enc.tans32_off16hi_data = null;
+            gpu_enc.tans32_off16hi_offsets = null;
+            gpu_enc.tans32_off16lo_sizes = null;
+            gpu_enc.tans32_off16lo_data = null;
+            gpu_enc.tans32_off16lo_offsets = null;
         };
 
         var is_first_tans32_in_frame: bool = true;
@@ -1236,12 +1287,40 @@ pub fn compressFramedOne(
                             if (off + sz > data.len) break :blk_gpu_tok null;
                             break :blk_gpu_tok data[off..][0..sz];
                         };
+                        const gpu_off16hi_pre: ?[]const u8 = blk_hi: {
+                            if (!gpu_off16_pre_encoded) break :blk_hi null;
+                            const sizes = gpu_enc.tans32_off16hi_sizes orelse break :blk_hi null;
+                            const data = gpu_enc.tans32_off16hi_data orelse break :blk_hi null;
+                            const offs = gpu_enc.tans32_off16hi_offsets orelse break :blk_hi null;
+                            if (gpu_bi_idx >= sizes.len) break :blk_hi null;
+                            const sz = sizes[gpu_bi_idx];
+                            if ((sz & 0x80000000) != 0) break :blk_hi null;
+                            if (sz == 0) break :blk_hi null;
+                            const off = offs[gpu_bi_idx];
+                            if (off + sz > data.len) break :blk_hi null;
+                            break :blk_hi data[off..][0..sz];
+                        };
+                        const gpu_off16lo_pre: ?[]const u8 = blk_lo: {
+                            if (!gpu_off16_pre_encoded) break :blk_lo null;
+                            const sizes = gpu_enc.tans32_off16lo_sizes orelse break :blk_lo null;
+                            const data = gpu_enc.tans32_off16lo_data orelse break :blk_lo null;
+                            const offs = gpu_enc.tans32_off16lo_offsets orelse break :blk_lo null;
+                            if (gpu_bi_idx >= sizes.len) break :blk_lo null;
+                            const sz = sizes[gpu_bi_idx];
+                            if ((sz & 0x80000000) != 0) break :blk_lo null;
+                            if (sz == 0) break :blk_lo null;
+                            const off = offs[gpu_bi_idx];
+                            if (off + sz > data.len) break :blk_lo null;
+                            break :blk_lo data[off..][0..sz];
+                        };
                         const enc_n = reencodeGpuWithEntropy(
                             allocator, raw_payload, enc_buf, entropy_options,
                             0.0, // minimize size, not speed
                             init_bytes, sub_size,
                             if (tans_lits) |t| t else null,
                             gpu_tok_pre,
+                            gpu_off16hi_pre,
+                            gpu_off16lo_pre,
                             if (shared_tans_ctx) |*ctx| ctx else null,
                             is_first_tans32_in_frame,
                             lit_ov,
