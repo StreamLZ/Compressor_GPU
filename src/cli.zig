@@ -48,6 +48,7 @@ const Args = struct {
     no_dict: bool = false, // --no-dict disables auto-detection
     report_mem: bool = false, // -mem: print peak commit at exit
     gpu: bool = false, // -gpu: encode for GPU decode (sc_group=0.25, raw mode)
+    sc_group: ?f32 = null, // --sc <float>: override sc_group_size
     engine: Engine = .slz, // --zstd or --lz4 to use external compressor
 };
 
@@ -160,6 +161,14 @@ fn parseArgs(raw: []const []const u8, w: *std.Io.Writer) Args {
         }
         if (eql(arg, "-gpu")) {
             result.gpu = true;
+            continue;
+        }
+        if (eql(arg, "--sc")) {
+            if (i + 1 >= raw.len) die(w, "error: --sc requires a value\n");
+            i += 1;
+            result.sc_group = std.fmt.parseFloat(f32, raw[i]) catch {
+                die(w, "error: --sc value must be a float\n");
+            };
             continue;
         }
         if (eql(arg, "--zstd")) {
@@ -537,6 +546,7 @@ fn runCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
         .dictionary = dict_data,
         .dictionary_id = dict_id,
         .gpu_mode = args.gpu,
+        .sc_group_size_override = args.sc_group,
     }) catch |err| {
         out_map.unmap();
         try w.print("error: compression failed: {s}\n", .{@errorName(err)});

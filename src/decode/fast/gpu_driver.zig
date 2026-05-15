@@ -305,16 +305,25 @@ fn scanForTansChunks(
     tans_off16lo_descs: []TansDecChunkDesc,
     raw_off16_descs: []RawOff16Desc,
 ) ScanResult {
-    _ = sub_chunk_cap;
     var num_lit: u32 = 0;
     var num_tok: u32 = 0;
     var num_off16hi: u32 = 0;
     var num_off16lo: u32 = 0;
     var num_raw: u32 = 0;
     var use_tans32: bool = false;
+    var cur_sub_idx: u32 = 0; // global sub-chunk index — mirrors driver prefix sum
+    const cap_safe: u32 = if (sub_chunk_cap == 0) 65536 else sub_chunk_cap;
 
-    for (chunk_descs, 0..) |ch, chunk_idx| {
-        // Skip non-LZ chunks
+    for (chunk_descs) |ch| {
+        // Compute expected n_subs for this chunk so cur_sub_idx stays in sync
+        // with the driver's first_subchunk_idx prefix sum even if we skip.
+        const n_subs_expected: u32 = if (ch.flags != 0 or ch.decomp_size == 0) 1
+            else (ch.decomp_size + cap_safe - 1) / cap_safe;
+        const chunk_first_sub: u32 = cur_sub_idx;
+        // Default: advance by full expected count (we'll override only if we
+        // successfully walk every sub-chunk).
+        defer cur_sub_idx = chunk_first_sub + n_subs_expected;
+
         if (ch.flags != 0) continue;
         if (ch.decomp_size == 0) continue;
         if (ch.src_offset >= compressed_block.len) continue;
@@ -323,168 +332,181 @@ fn scanForTansChunks(
         const chunk_src = compressed_block[ch.src_offset..chunk_end];
         if (chunk_src.len < 3) continue;
 
-        // Parse first sub-chunk header (3-byte big-endian)
-        const chunkhdr: u32 = (@as(u32, chunk_src[0]) << 16) |
-            (@as(u32, chunk_src[1]) << 8) |
-            @as(u32, chunk_src[2]);
+        // Walk all sub-chunks within this chunk.
+        var sub_pos: u32 = 0;
+        var first_sub: bool = true;
+        var remaining_decomp: u32 = ch.decomp_size;
+        var sub_local_idx: u32 = 0;
+        while (remaining_decomp > 0 and sub_pos + 3 <= chunk_src.len) {
+            const sub_hdr: u32 = (@as(u32, chunk_src[sub_pos]) << 16) |
+                (@as(u32, chunk_src[sub_pos + 1]) << 8) |
+                @as(u32, chunk_src[sub_pos + 2]);
+            if ((sub_hdr & 0x800000) == 0) break; // not LZ
+            const sc_comp_size: u32 = sub_hdr & 0x7FFFF;
+            const sub_end = sub_pos + 3 + sc_comp_size;
+            if (sub_end > chunk_src.len) break;
+            const sub_decomp: u32 = @min(remaining_decomp, cap_safe);
 
-        if ((chunkhdr & 0x800000) == 0) continue; // non-LZ
+            // Global sub-chunk index for this sub-chunk's tANS descriptors.
+            // Slot size = 131072 (sub_chunk_cap) so the largest sub-chunk's
+            // literal/token streams fit. off16-lo lives at +65536 within slot.
+            const sub_idx: u32 = chunk_first_sub + sub_local_idx;
+            const sub_dst_off: usize = @as(usize, sub_idx) * 131072;
 
-        // Walk streams: first sub-chunk always has base_offset == 0 → 8 init bytes
-        const init_bytes: u32 = 8;
-        var pos: u32 = 3 + init_bytes;
+            const init_b: u32 = if (first_sub) 8 else 0;
+            var pos: u32 = sub_pos + 3 + init_b;
+            const sub_payload_end: u32 = sub_end;
 
-        if (pos >= chunk_src.len) continue;
+            walk: {
+                if (pos >= sub_payload_end) break :walk;
 
-        // ── Stream 1: Literals ──
-        const lit_first = chunk_src[pos];
-        const lit_type = (lit_first >> 4) & 0x7;
-        if (lit_type == 7) {
-            // Paired-primary: one combined tANS stream covering this + next unit
-            const lit_before = num_lit;
-            _ = parseTansHeaderPaired(chunk_src, pos, ch.src_offset, chunk_idx, tans_lit_descs, &num_lit);
-            use_tans32 = true;
-            if (num_lit > lit_before) {
-                // embedded stream is type-6: skip 128-byte sizes+states header
-                tans_lit_descs[num_lit - 1].src_offset += 128;
-                tans_lit_descs[num_lit - 1].src_size -|= 128;
-            }
-        } else if (lit_type == 5) {
-            // Paired-secondary: literals decoded by the paired unit's combined stream
-            use_tans32 = true;
-        } else if (lit_type == 1 or lit_type == 6) {
-            const lit_before = num_lit;
-            _ = parseTansHeader(chunk_src, pos, ch.src_offset, chunk_idx, tans_lit_descs, &num_lit);
-            if (lit_type == 6) {
-                use_tans32 = true;
-                if (num_lit > lit_before) {
-                    tans_lit_descs[num_lit - 1].src_offset += 128;
-                    tans_lit_descs[num_lit - 1].src_size -|= 128;
+                // ── Stream 1: Literals ──
+                const lit_first = chunk_src[pos];
+                const lit_type = (lit_first >> 4) & 0x7;
+                if (lit_type == 7) {
+                    const lit_before = num_lit;
+                    _ = parseTansHeaderPaired(chunk_src, pos, ch.src_offset, sub_idx, tans_lit_descs, &num_lit);
+                    use_tans32 = true;
+                    if (num_lit > lit_before) {
+                        tans_lit_descs[num_lit - 1].src_offset += 128;
+                        tans_lit_descs[num_lit - 1].src_size -|= 128;
+                    }
+                } else if (lit_type == 5) {
+                    use_tans32 = true;
+                } else if (lit_type == 1 or lit_type == 6) {
+                    const lit_before = num_lit;
+                    _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, sub_dst_off, tans_lit_descs, &num_lit);
+                    if (lit_type == 6) {
+                        use_tans32 = true;
+                        if (num_lit > lit_before) {
+                            tans_lit_descs[num_lit - 1].src_offset += 128;
+                            tans_lit_descs[num_lit - 1].src_size -|= 128;
+                        }
+                    }
                 }
-            }
-        }
-        const lit_next = skipStreamHeader(chunk_src, pos);
-        if (lit_next == null) continue;
-        pos = lit_next.?;
+                const lit_next = skipStreamHeader(chunk_src, pos);
+                if (lit_next == null) break :walk;
+                pos = lit_next.?;
 
-        if (pos >= chunk_src.len) continue;
+                if (pos >= sub_payload_end) break :walk;
 
-        // ── Stream 2: Tokens (command stream) ──
-        const tok_first = chunk_src[pos];
-        const tok_type = (tok_first >> 4) & 0x7;
-        if (tok_type == 7) {
-            // Paired-primary token stream: one combined tANS stream for this + next unit
-            const tok_before = num_tok;
-            _ = parseTansHeaderPaired(chunk_src, pos, ch.src_offset, chunk_idx, tans_tok_descs, &num_tok);
-            use_tans32 = true;
-            if (num_tok > tok_before) {
-                tans_tok_descs[num_tok - 1].src_offset += 128;
-                tans_tok_descs[num_tok - 1].src_size -|= 128;
-            }
-        } else if (tok_type == 5) {
-            // Paired-secondary: tokens decoded by the paired unit's combined stream
-            use_tans32 = true;
-        } else if (tok_type == 6) {
-            const tok_before = num_tok;
-            _ = parseTansHeader(chunk_src, pos, ch.src_offset, chunk_idx, tans_tok_descs, &num_tok);
-            use_tans32 = true;
-            if (num_tok > tok_before) {
-                tans_tok_descs[num_tok - 1].src_offset += 128;
-                tans_tok_descs[num_tok - 1].src_size -|= 128;
-            }
-        } else if (tok_type == 1 and !use_tans32) {
-            _ = parseTansHeader(chunk_src, pos, ch.src_offset, chunk_idx, tans_tok_descs, &num_tok);
-        }
-        const tok_next = skipStreamHeader(chunk_src, pos);
-        if (tok_next == null) continue;
-        pos = tok_next.?;
-
-        if (pos >= chunk_src.len) continue;
-
-        // Skip cmd_stream2_offset if sub-chunk > 64KB
-        if (ch.decomp_size > 0x10000) {
-            if (pos + 2 > chunk_src.len) continue;
-            pos += 2;
-        }
-
-        // ── Off16 stream ──
-        if (pos + 2 > chunk_src.len) continue;
-        const off16_count: u32 = @as(u32, chunk_src[pos]) | (@as(u32, chunk_src[pos + 1]) << 8);
-        if (off16_count != 0xFFFF) continue; // not entropy-coded
-        pos += 2;
-
-        // Entropy-coded off16: two sub-streams (hi bytes, lo bytes)
-        if (pos >= chunk_src.len) continue;
-
-        // ── Off16 hi stream ──
-        const hi_first = chunk_src[pos];
-        const hi_type = (hi_first >> 4) & 0x7;
-        if (hi_type == 7) {
-            // Paired-primary off16-hi: one combined tANS stream for this + next unit
-            const hi_before = num_off16hi;
-            _ = parseTansHeaderPaired(chunk_src, pos, ch.src_offset, chunk_idx, tans_off16hi_descs, &num_off16hi);
-            use_tans32 = true;
-            if (num_off16hi > hi_before) {
-                tans_off16hi_descs[num_off16hi - 1].src_offset += 128;
-                tans_off16hi_descs[num_off16hi - 1].src_size -|= 128;
-            }
-        } else if (hi_type == 5) {
-            // Paired-secondary: off16-hi decoded by the paired unit's combined stream
-            use_tans32 = true;
-        } else if (hi_type == 1 or hi_type == 6) {
-            const hi_before = num_off16hi;
-            _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, chunk_idx * 65536, tans_off16hi_descs, &num_off16hi);
-            if (hi_type == 6) {
-                use_tans32 = true;
-                if (num_off16hi > hi_before) {
-                    tans_off16hi_descs[num_off16hi - 1].src_offset += 128;
-                    tans_off16hi_descs[num_off16hi - 1].src_size -|= 128;
+                // ── Stream 2: Tokens (command stream) ──
+                const tok_first = chunk_src[pos];
+                const tok_type = (tok_first >> 4) & 0x7;
+                if (tok_type == 7) {
+                    const tok_before = num_tok;
+                    _ = parseTansHeaderPaired(chunk_src, pos, ch.src_offset, sub_idx, tans_tok_descs, &num_tok);
+                    use_tans32 = true;
+                    if (num_tok > tok_before) {
+                        tans_tok_descs[num_tok - 1].src_offset += 128;
+                        tans_tok_descs[num_tok - 1].src_size -|= 128;
+                    }
+                } else if (tok_type == 5) {
+                    use_tans32 = true;
+                } else if (tok_type == 6) {
+                    const tok_before = num_tok;
+                    _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, sub_dst_off, tans_tok_descs, &num_tok);
+                    use_tans32 = true;
+                    if (num_tok > tok_before) {
+                        tans_tok_descs[num_tok - 1].src_offset += 128;
+                        tans_tok_descs[num_tok - 1].src_size -|= 128;
+                    }
+                } else if (tok_type == 1 and !use_tans32) {
+                    _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, sub_dst_off, tans_tok_descs, &num_tok);
                 }
-            }
-        } else if (hi_type == 0) {
-            // Raw memcpy hi stream: record for H2D copy
-            const raw_info = parseType0StreamInfo(chunk_src, pos);
-            if (raw_info.data_offset != 0 and num_raw < raw_off16_descs.len) {
-                raw_off16_descs[num_raw] = .{
-                    .src_offset = ch.src_offset + raw_info.data_offset,
-                    .size = raw_info.size,
-                    .gpu_offset = @intCast(chunk_idx * 65536),
-                };
-                num_raw += 1;
-            }
-        }
-        const hi_next = skipStreamHeader(chunk_src, pos);
-        if (hi_next == null) continue;
-        pos = hi_next.?;
+                const tok_next = skipStreamHeader(chunk_src, pos);
+                if (tok_next == null) break :walk;
+                pos = tok_next.?;
 
-        if (pos >= chunk_src.len) continue;
+                if (pos >= sub_payload_end) break :walk;
 
-        // ── Off16 lo stream ──
-        const lo_first = chunk_src[pos];
-        const lo_type = (lo_first >> 4) & 0x7;
-        if (lo_type == 1 or lo_type == 6) {
-            const lo_before = num_off16lo;
-            _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, chunk_idx * 65536 + 32768, tans_off16lo_descs, &num_off16lo);
-            if (lo_type == 6) {
-                use_tans32 = true;
-                if (num_off16lo > lo_before) {
-                    tans_off16lo_descs[num_off16lo - 1].src_offset += 128;
-                    tans_off16lo_descs[num_off16lo - 1].src_size -|= 128;
+                // Skip cmd_stream2_offset if sub-chunk > 64KB
+                if (sub_decomp > 0x10000) {
+                    if (pos + 2 > sub_payload_end) break :walk;
+                    pos += 2;
                 }
-            }
-        } else if (lo_type == 0) {
-            // Raw memcpy lo stream: record for H2D copy
-            const raw_info = parseType0StreamInfo(chunk_src, pos);
-            if (raw_info.data_offset != 0 and num_raw < raw_off16_descs.len) {
-                raw_off16_descs[num_raw] = .{
-                    .src_offset = ch.src_offset + raw_info.data_offset,
-                    .size = raw_info.size,
-                    .gpu_offset = @intCast(chunk_idx * 65536 + 32768),
-                };
-                num_raw += 1;
-            }
-        }
-    }
+
+                // ── Off16 stream ──
+                if (pos + 2 > sub_payload_end) break :walk;
+                const off16_count: u32 = @as(u32, chunk_src[pos]) | (@as(u32, chunk_src[pos + 1]) << 8);
+                if (off16_count != 0xFFFF) break :walk; // not entropy-coded
+                pos += 2;
+
+                if (pos >= sub_payload_end) break :walk;
+
+                // ── Off16 hi stream ──
+                const hi_first = chunk_src[pos];
+                const hi_type = (hi_first >> 4) & 0x7;
+                if (hi_type == 7) {
+                    const hi_before = num_off16hi;
+                    _ = parseTansHeaderPaired(chunk_src, pos, ch.src_offset, sub_idx, tans_off16hi_descs, &num_off16hi);
+                    use_tans32 = true;
+                    if (num_off16hi > hi_before) {
+                        tans_off16hi_descs[num_off16hi - 1].src_offset += 128;
+                        tans_off16hi_descs[num_off16hi - 1].src_size -|= 128;
+                    }
+                } else if (hi_type == 5) {
+                    use_tans32 = true;
+                } else if (hi_type == 1 or hi_type == 6) {
+                    const hi_before = num_off16hi;
+                    _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, sub_dst_off, tans_off16hi_descs, &num_off16hi);
+                    if (hi_type == 6) {
+                        use_tans32 = true;
+                        if (num_off16hi > hi_before) {
+                            tans_off16hi_descs[num_off16hi - 1].src_offset += 128;
+                            tans_off16hi_descs[num_off16hi - 1].src_size -|= 128;
+                        }
+                    }
+                } else if (hi_type == 0) {
+                    const raw_info = parseType0StreamInfo(chunk_src, pos);
+                    if (raw_info.data_offset != 0 and num_raw < raw_off16_descs.len) {
+                        raw_off16_descs[num_raw] = .{
+                            .src_offset = ch.src_offset + raw_info.data_offset,
+                            .size = raw_info.size,
+                            .gpu_offset = @intCast(sub_dst_off),
+                        };
+                        num_raw += 1;
+                    }
+                }
+                const hi_next = skipStreamHeader(chunk_src, pos);
+                if (hi_next == null) break :walk;
+                pos = hi_next.?;
+
+                if (pos >= sub_payload_end) break :walk;
+
+                // ── Off16 lo stream ──
+                const lo_first = chunk_src[pos];
+                const lo_type = (lo_first >> 4) & 0x7;
+                if (lo_type == 1 or lo_type == 6) {
+                    const lo_before = num_off16lo;
+                    _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, sub_dst_off + 65536, tans_off16lo_descs, &num_off16lo);
+                    if (lo_type == 6) {
+                        use_tans32 = true;
+                        if (num_off16lo > lo_before) {
+                            tans_off16lo_descs[num_off16lo - 1].src_offset += 128;
+                            tans_off16lo_descs[num_off16lo - 1].src_size -|= 128;
+                        }
+                    }
+                } else if (lo_type == 0) {
+                    const raw_info = parseType0StreamInfo(chunk_src, pos);
+                    if (raw_info.data_offset != 0 and num_raw < raw_off16_descs.len) {
+                        raw_off16_descs[num_raw] = .{
+                            .src_offset = ch.src_offset + raw_info.data_offset,
+                            .size = raw_info.size,
+                            .gpu_offset = @intCast(sub_dst_off + 65536),
+                        };
+                        num_raw += 1;
+                    }
+                }
+            } // walk
+
+            // Advance to the next sub-chunk
+            sub_pos = sub_end;
+            remaining_decomp -= sub_decomp;
+            sub_local_idx += 1;
+            first_sub = false;
+        } // while sub-chunks
+    } // for chunks
 
     return .{
         .num_lit = num_lit, .num_tok = num_tok, .num_off16hi = num_off16hi,
@@ -716,9 +738,9 @@ fn parseTansHeaderPaired(
         tans_descs_out[num_tans.*] = .{
             .src_offset = tans_payload_off,
             .src_size = tans_comp_size,
-            .dst_offset = @intCast(chunk_idx * 65536),
+            .dst_offset = @intCast(chunk_idx * 131072),
             .dst_size = tans_dst_size,
-            .dst_offset_b = @intCast((chunk_idx + 1) * 65536),
+            .dst_offset_b = @intCast((chunk_idx + 1) * 131072),
             .split_count = count_a,
         };
         num_tans.* += 1;
@@ -774,8 +796,10 @@ pub fn fullGpuLaunch(
         }
     }
     // Allocate scratch sized for total sub-chunks across all stream types.
-    // Layout: [lit: total*64K] [tok: total*64K] [off16: total*64K]
-    const per_subchunk_scratch: usize = 65536;
+    // Slot size = 131072 (sub_chunk_cap) to fit the largest sub-chunk's lit/tok
+    // streams; off16-hi at +0, off16-lo at +65536 within each slot.
+    // Layout: [lit: total*128K] [tok: total*128K] [off16: total*128K]
+    const per_subchunk_scratch: usize = 131072;
     const tans_scratch_bytes = @as(usize, total_subchunks) * per_subchunk_scratch * 3;
     if (!ensureDeviceBuf(&d_tans_scratch, &d_tans_scratch_size, tans_scratch_bytes)) return error.BadMode;
     const tok_offset = @as(usize, total_subchunks) * per_subchunk_scratch;
@@ -794,7 +818,8 @@ pub fn fullGpuLaunch(
     }
 
     // Global LUT buffer: max_descs * 2048 entries * 8 bytes
-    const max_tans_descs = chunk_descs.len * 4; // up to 4 streams per chunk
+    // At sc>=1.0 each chunk has multiple sub-chunks; size by total sub-chunks.
+    const max_tans_descs = @as(usize, total_subchunks) * 4; // up to 4 streams per sub-chunk
     const lut_bytes = max_tans_descs * 2048 * 8;
     if (!ensureDeviceBuf(&d_tans_lut, &d_tans_lut_size, lut_bytes)) return error.BadMode;
 
@@ -808,7 +833,10 @@ pub fn fullGpuLaunch(
     var scan: ScanResult = .{ .num_lit = 0, .num_tok = 0, .num_off16hi = 0, .num_off16lo = 0, .num_raw_off16 = 0 };
 
     if (tans_kernel_fn != 0) {
-        const max_tans = @min(chunk_descs.len, tans_host_buf.len);
+        // Cap by total_subchunks (each sub-chunk can contribute one descriptor per
+        // stream type), not chunk_descs.len, because at sc>=1.0 a chunk has
+        // multiple sub-chunks and each gets its own tANS stream.
+        const max_tans = @min(@as(usize, total_subchunks), tans_host_buf.len);
 
         scan = scanForTansChunks(
             chunk_descs,
@@ -822,7 +850,6 @@ pub fn fullGpuLaunch(
         );
 
         merged_count = scan.num_lit + scan.num_tok + scan.num_off16hi + scan.num_off16lo;
-        std.debug.print("tANS streams: lit={d} tok={d} hi={d} lo={d} total={d}\n", .{ scan.num_lit, scan.num_tok, scan.num_off16hi, scan.num_off16lo, merged_count });
 
         // Upload raw (type 0) off16 sub-streams to GPU (before timer)
         for (0..scan.num_raw_off16) |ri| {
@@ -846,25 +873,35 @@ pub fn fullGpuLaunch(
         var group_tans_count: [16]u32 = .{0} ** 16;
         merged_count = 0;
 
-        // For each pipeline group, collect all tANS descriptors belonging to its chunks
+        // For each pipeline group, collect all tANS descriptors belonging to its chunks.
+        // Descriptor dst_offset is in sub-chunk space (sub_idx * per_subchunk_scratch),
+        // so convert pipeline group boundaries (chunk-space) to sub-chunk-space.
         for (0..NUM_PIPELINE_STREAMS) |g| {
             const chunk_start = @as(u32, @intCast(g)) * pipe_chunk_count;
             const chunk_end = @min(chunk_start + pipe_chunk_count, total_chunks);
+            const sub_start: u32 = if (chunk_start < first_subchunk_idx_buf.len and chunk_start < total_chunks)
+                first_subchunk_idx_buf[chunk_start]
+            else
+                total_subchunks;
+            const sub_end: u32 = if (chunk_end < first_subchunk_idx_buf.len and chunk_end < total_chunks)
+                first_subchunk_idx_buf[chunk_end]
+            else
+                total_subchunks;
             group_tans_start[g] = merged_count;
 
-            // Lit descriptors: dst_offset = chunk_idx * 65536
+            const slot: u32 = @intCast(per_subchunk_scratch);
+            // Lit descriptors: dst_offset = sub_idx * slot
             for (0..scan.num_lit) |i| {
-                const cidx = tans_host_buf[i].dst_offset / 65536;
-                if (cidx >= chunk_start and cidx < chunk_end) {
+                const sidx: u32 = @intCast(tans_host_buf[i].dst_offset / slot);
+                if (sidx >= sub_start and sidx < sub_end) {
                     merged_buf[merged_count] = tans_host_buf[i];
                     merged_count += 1;
                 }
             }
-            // Tok descriptors: dst_offset = chunk_idx * 65536 (before tok_offset add)
-            // dst_offset_b also needs the tok_offset shift (paired streams).
+            // Tok descriptors: dst_offset = sub_idx * slot (before tok_offset add)
             for (0..scan.num_tok) |i| {
-                const cidx = tans_tok_host_buf[i].dst_offset / 65536;
-                if (cidx >= chunk_start and cidx < chunk_end) {
+                const sidx: u32 = @intCast(tans_tok_host_buf[i].dst_offset / slot);
+                if (sidx >= sub_start and sidx < sub_end) {
                     var d = tans_tok_host_buf[i];
                     d.dst_offset += @intCast(tok_offset);
                     d.dst_offset_b += @intCast(tok_offset);
@@ -872,10 +909,10 @@ pub fn fullGpuLaunch(
                     merged_count += 1;
                 }
             }
-            // Off16hi descriptors: dst_offset = chunk_idx * 65536
+            // Off16hi descriptors: dst_offset = sub_idx * slot
             for (0..scan.num_off16hi) |i| {
-                const cidx = tans_off16hi_host_buf[i].dst_offset / 65536;
-                if (cidx >= chunk_start and cidx < chunk_end) {
+                const sidx: u32 = @intCast(tans_off16hi_host_buf[i].dst_offset / slot);
+                if (sidx >= sub_start and sidx < sub_end) {
                     var d = tans_off16hi_host_buf[i];
                     d.dst_offset += @intCast(off16_offset);
                     d.dst_offset_b += @intCast(off16_offset);
@@ -883,10 +920,10 @@ pub fn fullGpuLaunch(
                     merged_count += 1;
                 }
             }
-            // Off16lo descriptors: dst_offset = chunk_idx * 65536 + 32768
+            // Off16lo descriptors: dst_offset = sub_idx * slot + 65536
             for (0..scan.num_off16lo) |i| {
-                const cidx = (tans_off16lo_host_buf[i].dst_offset -| 32768) / 65536;
-                if (cidx >= chunk_start and cidx < chunk_end) {
+                const sidx: u32 = @intCast((tans_off16lo_host_buf[i].dst_offset -| 65536) / slot);
+                if (sidx >= sub_start and sidx < sub_end) {
                     var d = tans_off16lo_host_buf[i];
                     d.dst_offset += @intCast(off16_offset);
                     d.dst_offset_b += @intCast(off16_offset);

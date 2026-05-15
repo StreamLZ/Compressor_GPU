@@ -909,7 +909,7 @@ $L__BB0_82:
 
 $L__BB0_94:
 	min.u32 	%r409, %r408, %r406;
-	add.s64 	%rd315, %rd318, 32768;
+	add.s64 	%rd315, %rd318, 65536;
 	mov.u32 	%r410, 1;
 	mov.u64 	%rd316, %rd318;
 
@@ -924,7 +924,7 @@ $L__BB0_95:
 	setp.eq.s32 	%p78, %r369, 0;
 	@%p78 bra 	$L__BB0_97;
 
-	add.s64 	%rd315, %rd318, 32768;
+	add.s64 	%rd315, %rd318, 65536;
 	mov.u64 	%rd319, 0;
 	bra.uni 	$L__BB0_98;
 
@@ -1170,14 +1170,14 @@ $L__BB1_17:
 	mov.u64 	%rd216, %rd215;
 	@%p26 bra 	$L__BB1_19;
 
-	mul.wide.u32 	%rd67, %r621, 65536;
+	mul.wide.u32 	%rd67, %r621, 131072;
 	add.s64 	%rd216, %rd47, %rd67;
 
 $L__BB1_19:
 	setp.eq.s64 	%p27, %rd48, 0;
 	@%p27 bra 	$L__BB1_21;
 
-	mul.wide.u32 	%rd69, %r621, 65536;
+	mul.wide.u32 	%rd69, %r621, 131072;
 	add.s64 	%rd215, %rd48, %rd69;
 
 $L__BB1_21:
@@ -1185,7 +1185,7 @@ $L__BB1_21:
 	mov.u64 	%rd214, 0;
 	@%p28 bra 	$L__BB1_23;
 
-	mul.wide.u32 	%rd71, %r621, 65536;
+	mul.wide.u32 	%rd71, %r621, 131072;
 	add.s64 	%rd214, %rd49, %rd71;
 
 $L__BB1_23:
@@ -2489,13 +2489,13 @@ $L__BB1_201:
 	add.s64 	%rd217, %rd217, %rd193;
 	add.s32 	%r623, %r544, %r623;
 	sub.s32 	%r622, %r622, %r544;
-	add.s64 	%rd194, %rd216, 65536;
+	add.s64 	%rd194, %rd216, 131072;
 	setp.eq.s64 	%p181, %rd216, 0;
 	selp.b64 	%rd216, 0, %rd194, %p181;
-	add.s64 	%rd195, %rd215, 65536;
+	add.s64 	%rd195, %rd215, 131072;
 	setp.eq.s64 	%p182, %rd215, 0;
 	selp.b64 	%rd215, 0, %rd195, %p182;
-	add.s64 	%rd196, %rd214, 65536;
+	add.s64 	%rd196, %rd214, 131072;
 	setp.eq.s64 	%p183, %rd214, 0;
 	selp.b64 	%rd214, 0, %rd196, %p183;
 	setp.ne.s32 	%p184, %r622, 0;

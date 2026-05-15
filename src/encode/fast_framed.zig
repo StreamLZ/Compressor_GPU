@@ -751,7 +751,7 @@ pub fn compressFramedOne(
         else => unreachable,
     };
     var pos: usize = 0;
-    const sc_grp: f32 = if (opts.gpu_mode) 0.25 else if (opts.sc_group_size_override) |ov| ov else switch (opts.level) {
+    const sc_grp: f32 = if (opts.sc_group_size_override) |ov| ov else if (opts.gpu_mode) 0.25 else switch (opts.level) {
         1 => @as(f32, @floatFromInt(lz_constants.default_sc_group_size)),
         2, 3, 4 => @floatFromInt(@min(high_framed.computeAdaptiveGroupSize(src.len), 16)),
         5 => @floatFromInt(high_framed.computeAdaptiveGroupSize(src.len)),
@@ -1139,14 +1139,11 @@ pub fn compressFramedOne(
                     } else null;
 
                     // Re-encode all streams with CPU entropy (tANS literals + Huffman tokens/off16).
-                    // tANS is only usable when each chunk is exactly one sub-chunk —
-                    // the GPU scan and per-chunk tANS scratch layout assume that. At
-                    // higher sc_group_size each chunk has multiple sub-chunks, so we
-                    // fall back to raw streams (worse ratio, but correct).
-                    const single_subchunk_per_chunk = (n_gpu_blocks == n_chunks);
+                    // The GPU scan walks every sub-chunk per chunk and the LZ kernel
+                    // advances per-sub-chunk tANS scratch pointers, so tANS works at
+                    // any sc_group_size.
                     const reencode_ok: bool = blk_reencode: {
                         if (opts.level < 3) break :blk_reencode false;
-                        if (!single_subchunk_per_chunk) break :blk_reencode false;
                         const sub_size = @min(gpu_block, chunk_size - si * gpu_block);
                         var entropy_options = entropyOptionsForLevel(opts.level);
                         entropy_options.allow_tans = true;

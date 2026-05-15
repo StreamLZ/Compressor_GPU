@@ -671,7 +671,7 @@ __device__ __noinline__ void parseSubChunkHeaders(
             if (lo_size != hi_size) off16_count = (lo_size < hi_size) ? lo_size : hi_size;
             // GPU tANS layout: hi bytes at offset 0, lo bytes at offset 32768
             off16_hi_ptr = tans_off16_scratch_chunk;
-            off16_lo_ptr = tans_off16_scratch_chunk + 32768;
+            off16_lo_ptr = tans_off16_scratch_chunk + 65536;
             off16_raw = nullptr;
             off16_is_entropy = 1;
             off16_is_split = 1;
@@ -690,7 +690,7 @@ __device__ __noinline__ void parseSubChunkHeaders(
         src = sc_src + so;
         if (off16_is_entropy) {
             off16_hi_ptr = tans_off16_scratch_chunk;
-            off16_lo_ptr = tans_off16_scratch_chunk + 32768;
+            off16_lo_ptr = tans_off16_scratch_chunk + 65536;
             off16_raw = nullptr;
         } else {
             off16_raw = src - off16_count * 2;
@@ -849,10 +849,13 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
         const uint8_t* chunk_src = compressed + ch.src_offset;
         uint32_t sc_dst_off = ch.dst_offset;
         uint32_t sc_remaining = ch.decomp_size;
+        // Per-sub-chunk slot size = 131072 (= sub_chunk_cap, large enough for
+        // the biggest sub-chunk's lit/tok streams). off16-hi at offset 0,
+        // off16-lo at offset 65536 within each slot.
         uint32_t global_sub_idx = first_subchunk_idx ? first_subchunk_idx[chunk_idx] : chunk_idx;
-        uint8_t* chunk_tans_scratch = tans_scratch ? (tans_scratch + (uint64_t)global_sub_idx * 65536) : nullptr;
-        uint8_t* chunk_tok_scratch = tans_tok_scratch ? (tans_tok_scratch + (uint64_t)global_sub_idx * 65536) : nullptr;
-        uint8_t* chunk_off16_scratch = tans_off16_scratch ? (tans_off16_scratch + (uint64_t)global_sub_idx * 65536) : nullptr;
+        uint8_t* chunk_tans_scratch = tans_scratch ? (tans_scratch + (uint64_t)global_sub_idx * 131072) : nullptr;
+        uint8_t* chunk_tok_scratch = tans_tok_scratch ? (tans_tok_scratch + (uint64_t)global_sub_idx * 131072) : nullptr;
+        uint8_t* chunk_off16_scratch = tans_off16_scratch ? (tans_off16_scratch + (uint64_t)global_sub_idx * 131072) : nullptr;
 
         while (sc_remaining > 0) {
             uint32_t sc_size = sc_remaining;
@@ -893,10 +896,10 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
             chunk_src += 3 + sc_comp_size;
             sc_dst_off += sc_size;
             sc_remaining -= sc_size;
-            // Advance scratch pointers to next sub-chunk's slot
-            if (chunk_tans_scratch) chunk_tans_scratch += 65536;
-            if (chunk_tok_scratch) chunk_tok_scratch += 65536;
-            if (chunk_off16_scratch) chunk_off16_scratch += 65536;
+            // Advance scratch pointers to next sub-chunk's slot (128KB stride)
+            if (chunk_tans_scratch) chunk_tans_scratch += 131072;
+            if (chunk_tok_scratch) chunk_tok_scratch += 131072;
+            if (chunk_off16_scratch) chunk_off16_scratch += 131072;
         }
     }
 }
