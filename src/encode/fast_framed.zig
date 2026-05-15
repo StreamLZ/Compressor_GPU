@@ -127,6 +127,11 @@ fn reencodeGpuWithEntropy(
     speed_tradeoff: f32,
     initial_bytes: usize,
     src_size: usize,
+    /// GPU 32-lane tANS literal body. When non-null, replaces the
+    /// CPU `encodeArrayU8` / `encodeArrayU8Tans32Shared` call for the
+    /// non-paired literal stream. Caller passes the 5-state legacy
+    /// body in `tans_encoded_lits` for backwards-compat (deprecated).
+    tans_encoded_lits_32: ?[]const u8,
     tans_encoded_lits: ?[]const u8,
     /// GPU-side pre-encoded tokens (32-lane tANS payload, body only
     /// — no chunk header). When non-null, replaces the CPU entropy
@@ -254,6 +259,19 @@ fn reencodeGpuWithEntropy(
                 break :blk 7;
             },
             .none => {},
+        }
+        // GPU 32-lane pre-encoded literals (type-6). Mirrors the
+        // CPU `encodeArrayU8Tans32` output, body only — caller adds
+        // the 5-byte non-compact chunk header.
+        if (tans_encoded_lits_32) |pre| {
+            if (pre.len > 0 and pre.len + 5 < literals.len + 3) {
+                if (wp + 5 + pre.len > dst.len) break :blk @as(usize, 0);
+                entropy_enc.writeNonCompactChunkHeader(dst[wp..], 6, @intCast(pre.len), @intCast(literals.len));
+                @memcpy(dst[wp + 5 ..][0..pre.len], pre);
+                break :blk 5 + pre.len;
+            }
+            // GPU raw-fallback (or didn't beat raw) — drop through to memcpy.
+            break :blk entropy_enc.encodeArrayU8Memcpy(dst[wp..], literals) catch 0;
         }
         if (options.allow_tans32 and shared_tans_ctx != null and !is_first_subchunk) {
             break :blk entropy_enc.encodeArrayU8Tans32Shared(allocator, dst[wp..], literals, shared_tans_ctx.?) catch 0;
@@ -1070,6 +1088,18 @@ pub fn compressFramedOne(
             gpu_enc.tans32_tok_data = null;
             gpu_enc.tans32_tok_offsets = null;
         };
+        const gpu_lit_pre_encoded: bool = if (opts.level >= 3)
+            gpu_enc.gpuEncodeLiteralsTans32(allocator, gpu_out, descs, comp_sizes)
+        else
+            false;
+        defer if (gpu_lit_pre_encoded) {
+            if (gpu_enc.tans32_lit_sizes) |s| allocator.free(s);
+            if (gpu_enc.tans32_lit_data) |d| allocator.free(d);
+            if (gpu_enc.tans32_lit_offsets) |o| allocator.free(o);
+            gpu_enc.tans32_lit_sizes = null;
+            gpu_enc.tans32_lit_data = null;
+            gpu_enc.tans32_lit_offsets = null;
+        };
         const gpu_off16_pre_encoded: bool = if (opts.level >= 3)
             gpu_enc.gpuEncodeOff16Tans32(allocator, gpu_out, descs, comp_sizes)
         else
@@ -1272,6 +1302,20 @@ pub fn compressFramedOne(
                         if (off16hi_ov == .primary) enc_buf_sz += off16hi_ov.primary.combined_stream.len;
                         const enc_buf = allocator.alloc(u8, enc_buf_sz) catch break :blk_reencode false;
                         defer allocator.free(enc_buf);
+                        // GPU-pre-encoded literals (32-lane tANS) — body only.
+                        const gpu_lit_pre: ?[]const u8 = blk_gpu_lit: {
+                            if (!gpu_lit_pre_encoded) break :blk_gpu_lit null;
+                            const sizes = gpu_enc.tans32_lit_sizes orelse break :blk_gpu_lit null;
+                            const data = gpu_enc.tans32_lit_data orelse break :blk_gpu_lit null;
+                            const offs = gpu_enc.tans32_lit_offsets orelse break :blk_gpu_lit null;
+                            if (gpu_bi_idx >= sizes.len) break :blk_gpu_lit null;
+                            const sz = sizes[gpu_bi_idx];
+                            if ((sz & 0x80000000) != 0) break :blk_gpu_lit null;
+                            if (sz == 0) break :blk_gpu_lit null;
+                            const off = offs[gpu_bi_idx];
+                            if (off + sz > data.len) break :blk_gpu_lit null;
+                            break :blk_gpu_lit data[off..][0..sz];
+                        };
                         // GPU-pre-encoded tokens (32-lane tANS) — body only.
                         // sizes[gpu_bi_idx] MSB set → raw fallback (skip).
                         const gpu_tok_pre: ?[]const u8 = blk_gpu_tok: {
@@ -1317,6 +1361,7 @@ pub fn compressFramedOne(
                             allocator, raw_payload, enc_buf, entropy_options,
                             0.0, // minimize size, not speed
                             init_bytes, sub_size,
+                            gpu_lit_pre,
                             if (tans_lits) |t| t else null,
                             gpu_tok_pre,
                             gpu_off16hi_pre,
