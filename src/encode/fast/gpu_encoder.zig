@@ -131,7 +131,14 @@ fn useGlobalHash(level: u8) bool {
 }
 
 fn useChainParser(level: u8) bool {
-    return level >= 5;
+    // Chain parser produces wrong output on certain content (silesia
+    // chunk 129 minimal repro: 153608-byte slice mismatches at output
+    // byte 153597 with 6 single-byte errors). Force greedy parser for
+    // all levels until the chain-parser bug is found. See
+    // [[gpu-silesia-l5-bug]]. Costs L5 some ratio (~1-2pp) but matches
+    // L4 in correctness.
+    _ = level;
+    return false;
 }
 
 pub var last_kernel_ns: i64 = 0;
