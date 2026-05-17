@@ -254,10 +254,15 @@ __device__ void emitWithLiteral1(
         int32_t back = (int32_t)p + ro;
         if (back >= 0 && src[p] == src[(uint32_t)back]) {
             if (i != last) {
+                // New recorded match: register the gap and advance last
+                // past the matched byte. Subsequent consecutive matches
+                // (i == last on next iter) are FOLDED into this entry —
+                // they must NOT update `last`, otherwise the fold loop
+                // below emits a recent-offset match at a non-matching
+                // position. (CPU equivalent: only updates last when
+                // adding to found[].)
                 found[found_count] = i - last;
                 found_count++;
-                last = i + 1;
-            } else {
                 last = i + 1;
             }
             if (found_count >= 32) break;
@@ -651,14 +656,17 @@ __device__ void scanBlockChain(
                 pos++;
                 match = lazy1;
             } else {
-                // Lazy-2 disabled: produces wrong output on silesia chunk
-                // 129 minimum repro (153608 bytes, 6 single-byte errors
-                // 0x00 → 0x02). Root cause unidentified; lazy-1 + greedy
-                // alone are correct. Re-enabling lazy-2 needs to either
-                // find the kernel bug or carry an equivalent of the CPU's
-                // engine_level <= 3 gate that's known to work.
-                // See [[gpu-silesia-l5-bug]].
-                break;
+                // Lazy-2: check pos+2 (only if current match length > 2)
+                if (pos + 7 >= end_pos || match.length == 2) break;
+                ChainMatch lazy2 = findMatchChain(src, src_size, pos + 2, recent_offset,
+                                                  first_hash, long_hash, next_hash,
+                                                  hash_bits, hash_mask, end_pos, cur_lit_run + 2);
+                if (lazy2.length >= 2 && isLazyMatchBetter(lazy2, match, 1)) {
+                    pos += 2;
+                    match = lazy2;
+                } else {
+                    break;
+                }
             }
         }
 
