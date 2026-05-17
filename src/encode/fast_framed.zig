@@ -422,12 +422,16 @@ fn reencodeGpuWithEntropy(
         const lo_n = entropy_enc.encodeArrayU8(allocator, dst[wp..], lo_bytes, options, speed_tradeoff, null, 0, null) catch return 0;
         wp += lo_n;
     } else if (off16_count >= 32) {
-        // In Phase 2 shared mode, off16 must be EITHER shared-entropy
-        // (both hi+lo) OR raw. The CPU split path would emit type-6/0
-        // streams that the shared-mode decoder can't service (no
-        // per-stream LUTs available). Detect that and force raw.
-        const force_raw_off16: bool = (shared_lit != null or shared_tok != null) and
-            (shared_off16_hi == null or shared_off16_lo == null);
+        // Force raw off16 in GPU mode unless Phase 2 shared off16 is
+        // active. The GPU off16 decode kernel (per-stream tANS into
+        // tans_off16_scratch + LZ kernel consumption) produces wrong
+        // bytes on certain content (silesia chunk 102 minimal repro at
+        // 6886 bytes, mismatch at output byte 2932). Works for both
+        // chunk_type=1 and =6, so the bug is in the off16 split decode
+        // pipeline rather than the entropy format. Costs ~5pp ratio
+        // until the underlying bug is found. See [[gpu-silesia-off16-bug]].
+        const shared_off16_both = shared_off16_hi != null and shared_off16_lo != null;
+        const force_raw_off16: bool = !shared_off16_both;
         if (force_raw_off16) {
             if (wp + 2 + off16_bytes > dst.len) return 0;
             std.mem.writeInt(u16, dst[wp..][0..2], @intCast(off16_count), .little);
