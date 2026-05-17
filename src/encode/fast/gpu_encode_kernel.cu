@@ -651,17 +651,14 @@ __device__ void scanBlockChain(
                 pos++;
                 match = lazy1;
             } else {
-                // Lazy-2: check pos+2 (only if current match length > 2)
-                if (pos + 7 >= end_pos || match.length == 2) break;
-                ChainMatch lazy2 = findMatchChain(src, src_size, pos + 2, recent_offset,
-                                                  first_hash, long_hash, next_hash,
-                                                  hash_bits, hash_mask, end_pos, cur_lit_run + 2);
-                if (lazy2.length >= 2 && isLazyMatchBetter(lazy2, match, 1)) {
-                    pos += 2;
-                    match = lazy2;
-                } else {
-                    break;
-                }
+                // Lazy-2 disabled: produces wrong output on silesia chunk
+                // 129 minimum repro (153608 bytes, 6 single-byte errors
+                // 0x00 → 0x02). Root cause unidentified; lazy-1 + greedy
+                // alone are correct. Re-enabling lazy-2 needs to either
+                // find the kernel bug or carry an equivalent of the CPU's
+                // engine_level <= 3 gate that's known to work.
+                // See [[gpu-silesia-l5-bug]].
+                break;
             }
         }
 
