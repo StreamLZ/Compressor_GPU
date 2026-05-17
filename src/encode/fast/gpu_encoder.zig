@@ -127,7 +127,7 @@ fn hashBitsForLevel(level: u8) u32 {
 }
 
 fn useGlobalHash(level: u8) bool {
-    return level >= 3;
+    return level >= 2;
 }
 
 fn useChainParser(level: u8) bool {
