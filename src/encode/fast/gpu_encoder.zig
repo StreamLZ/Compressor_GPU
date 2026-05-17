@@ -116,8 +116,11 @@ pub const CompressChunkDesc = extern struct {
 /// larger tables don't help ratio but waste VRAM and slow down init.
 /// L1-L2 use shared memory; L3+ use global memory.
 fn hashBitsForLevel(level: u8) u32 {
+    // L1 was 11 (2K shared-mem entries) — far too many collisions; GPU
+    // L1 ratio was 64% vs CPU 53-58%. Bumped to 14 (same as L2). Global
+    // hash needed since 14 bits → 64KB per block exceeds shared-mem.
     return switch (level) {
-        1 => 11,
+        1 => 14,
         2 => 14,
         3 => 17,
         4 => 18,
@@ -127,7 +130,11 @@ fn hashBitsForLevel(level: u8) u32 {
 }
 
 fn useGlobalHash(level: u8) bool {
-    return level >= 2;
+    // All levels use global hash. L1's larger hash table (16-bit) needs
+    // more than CUDA shared-mem allows; using global also dodges the
+    // shared-mem-hash corruption bug seen at L2 sc>=0.5.
+    _ = level;
+    return true;
 }
 
 fn useChainParser(level: u8) bool {
