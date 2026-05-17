@@ -22,6 +22,9 @@ struct TansDecChunkDesc {
     uint32_t dst_size;     // total decompressed symbol count
     uint32_t dst_offset_b; // offset for symbols [split_count, dst_size)
     uint32_t split_count;  // symbols < this go to dst_offset, rest to dst_offset_b
+    // Phase 2: LUT slot to use. Per-stream mode sets lut_id == chunk_id;
+    // shared-LUT mode (chunk_type=3) sets lut_id ∈ {0,1,2,3}.
+    uint32_t lut_id;
 };
 
 // ── LUT entry — 8 bytes (used for table build, matches CPU TansLutEnt)
@@ -1682,8 +1685,9 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
     const TansDecChunkDesc* __restrict__ descs,
     uint32_t*      __restrict__ out_status,
     uint32_t       num_chunks,
-    TansLutEnt*    __restrict__ lut_buf,           // per-stream packed LUTs from build kernel
-    const TansTableMeta* __restrict__ meta_buf     // per-stream metadata from build kernel
+    TansLutEnt*    __restrict__ lut_buf,           // packed LUTs (per-stream OR shared at slots 0-3)
+    const TansTableMeta* __restrict__ meta_buf,    // metadata indexed by lut_id
+    uint32_t       shared_mode                     // 0 = per-stream (legacy), 1 = shared LUT slots 0-3
 ) {
     const uint32_t warp_id = threadIdx.y;
     const uint32_t chunk_id = blockIdx.x * 2 + warp_id;
@@ -1700,14 +1704,22 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
     uint16_t my_sub_size = (uint16_t)header[lane * 2] | ((uint16_t)header[lane * 2 + 1] << 8);
     uint16_t my_init_state = (uint16_t)header[64 + lane * 2] | ((uint16_t)header[64 + lane * 2 + 1] << 8);
 
-    // Per-stream packed LUT from build kernel
-    const uint32_t* packed_lut = (const uint32_t*)((uint8_t*)lut_buf + (uint64_t)chunk_id * 2048 * sizeof(TansLutEnt));
-    uint32_t log_table_bits = meta_buf[chunk_id].log_table_bits;
+    // LUT slot:
+    //   shared mode  → desc.lut_id ∈ {0..3} picks one of the 4 frame-wide LUTs
+    //   per-stream   → chunk_id (kernel-local) picks the per-descriptor LUT
+    //                  built by slzTansFseBuildKernel at that same slot
+    uint32_t lut_id = (shared_mode != 0) ? descs[chunk_id].lut_id : chunk_id;
+    const uint32_t* packed_lut = (const uint32_t*)((uint8_t*)lut_buf + (uint64_t)lut_id * 2048 * sizeof(TansLutEnt));
+    uint32_t log_table_bits = meta_buf[lut_id].log_table_bits;
     uint32_t lut_mask = (1u << log_table_bits) - 1;
 
-    // Sub-streams follow immediately after sizes+states (128 bytes)
-    // The Golomb-Rice table is in the compressed data but was already parsed by build kernel
-    const uint8_t* sub_data_start = src_buf + meta_buf[chunk_id].src_after_table_off;
+    // Sub-stream start:
+    //   shared mode → scan set src_offset to the first sub-stream byte
+    //   per-stream  → build kernel set src_after_table_off past the embedded
+    //                 prob table
+    const uint8_t* sub_data_start = (shared_mode != 0)
+        ? (src_buf + descs[chunk_id].src_offset)
+        : (src_buf + meta_buf[lut_id].src_after_table_off);
 
     // Compute sub-stream start offset via warp prefix sum
     uint32_t my_size32 = (uint32_t)my_sub_size;

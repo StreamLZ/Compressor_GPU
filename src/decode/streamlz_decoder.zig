@@ -315,7 +315,7 @@ fn decompressOneFrame(
             const prefix_sz: usize = if (peek.self_contained and num_chunks_est > 1) (num_chunks_est - 1) * 8 else 0;
             const block_payload = block_src[0 .. block_src.len - prefix_sz];
 
-            gpuBatchDecode(block_payload, dst, dst_off, block_hdr.decompressed_size, hdr.sc_group_size, &scratch, io_opt) catch |err| {
+            gpuBatchDecode(block_payload, dst, dst_off, block_hdr.decompressed_size, hdr.sc_group_size, hdr.gpu_shared_luts, &scratch, io_opt) catch |err| {
                 std.debug.print("GPU decode FAILED (NO FALLBACK): {s}\n", .{@errorName(err)});
                 return error.BadMode;
             };
@@ -707,7 +707,7 @@ fn decompressCompressedBlock(
     if (use_gpu and sc_group_size <= 1.0) gpu_batch: {
         const gpu = @import("fast/gpu_driver.zig");
         if (!gpu.isAvailable()) break :gpu_batch;
-        gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, sc_group_size, scratch, null) catch {
+        gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, sc_group_size, null, scratch, null) catch {
             break :gpu_batch;
         };
         dst_off_inout.* = sc_start_dst_off + decompressed_size;
@@ -909,6 +909,7 @@ fn gpuBatchDecode(
     dst_start_off: usize,
     decompressed_size: usize,
     sc_group_size_in: f32,
+    gpu_shared_luts: ?frame.GpuSharedLuts,
     scratch: []u8,
     io_opt: ?std.Io,
 ) DecompressError!void {
@@ -1036,6 +1037,7 @@ fn gpuBatchDecode(
         num_groups,
         chunks_per_group,
         eff_sc_cap,
+        gpu_shared_luts,
         io_opt,
     );
 }

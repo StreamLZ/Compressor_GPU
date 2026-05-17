@@ -422,6 +422,35 @@ fn reencodeGpuWithEntropy(
         const lo_n = entropy_enc.encodeArrayU8(allocator, dst[wp..], lo_bytes, options, speed_tradeoff, null, 0, null) catch return 0;
         wp += lo_n;
     } else if (off16_count >= 32) {
+        // In Phase 2 shared mode, off16 must be EITHER shared-entropy
+        // (both hi+lo) OR raw. The CPU split path would emit type-6/0
+        // streams that the shared-mode decoder can't service (no
+        // per-stream LUTs available). Detect that and force raw.
+        const force_raw_off16: bool = (shared_lit != null or shared_tok != null) and
+            (shared_off16_hi == null or shared_off16_lo == null);
+        if (force_raw_off16) {
+            if (wp + 2 + off16_bytes > dst.len) return 0;
+            std.mem.writeInt(u16, dst[wp..][0..2], @intCast(off16_count), .little);
+            wp += 2;
+            @memcpy(dst[wp..][0..off16_bytes], off16_data);
+            wp += off16_bytes;
+            // skip to off32 by jumping past the if/else chain
+            if (wp + 3 + off32_extra + off32_byte_count > dst.len) return 0;
+            @memcpy(dst[wp..][0..3], off32_hdr);
+            wp += 3;
+            if (off32_extra > 0) {
+                @memcpy(dst[wp..][0..off32_extra], raw[rp - off32_byte_count - off32_extra ..][0..off32_extra]);
+                wp += off32_extra;
+            }
+            if (off32_byte_count > 0) {
+                @memcpy(dst[wp..][0..off32_byte_count], raw[rp - off32_byte_count ..][0..off32_byte_count]);
+                wp += off32_byte_count;
+            }
+            if (wp + length_data.len > dst.len) return 0;
+            @memcpy(dst[wp..][0..length_data.len], length_data);
+            wp += length_data.len;
+            return wp;
+        }
         // Phase 2 shared-LUT path (chunk_type=3) takes priority when
         // both hi and lo were shared-encoded.
         const use_shared_off16: bool = shared_off16_hi != null and shared_off16_lo != null;
