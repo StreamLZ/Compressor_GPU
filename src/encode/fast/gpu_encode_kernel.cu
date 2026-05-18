@@ -774,46 +774,54 @@ __device__ void scanBlock(
         bool is_active = (lane < active_count);
 
         uint32_t h = hashKey(key4, hash_bits, hash_mask);
+
+        // ── Simulate CPU's serial hash-write order within the warp ─────
+        // CPU at position P does: read ht[h(P)] (returns LAST write to
+        // bucket h(P) before P), then write ht[h(P)] = P. So for each lane
+        // K, the value CPU would have seen at ht[h(K)] is:
+        //   - if any lower active lane K' < K has h(K') == h(K), then
+        //     K' (most recent intra-warp same-bucket lane) overwrote the
+        //     pre-warp value. The HIGHEST such K' is what CPU sees.
+        //     Content match: only if K'.key4 == K.key4 (and K-K' >= 8).
+        //   - otherwise, pre-warp ht[h(K)] is what CPU sees.
+        //
+        // All warp-wide intrinsics here are unconditional with full mask
+        // 0xFFFFFFFF; per-lane logic uses purely-local mask arithmetic.
+        uint32_t bucket_same = __match_any_sync(0xFFFFFFFF, h);
+        uint32_t key_same    = __match_any_sync(0xFFFFFFFF, key4);
+        uint32_t active_mask = __ballot_sync(0xFFFFFFFF, is_active);
+        uint32_t lower_same_bucket = bucket_same & active_mask & ((1u << lane) - 1);
+
         bool hash_match = false;
         uint32_t hash_ref = 0;
 
         if (is_active) {
-            uint32_t ref_val = ht[h];
-            // CPU L1 requires offset >= 8 (MIN_FAR_OFFSET) and uses the
-            // adaptive min_match_length_table to gate matches at distant
-            // offsets. No GPU-only `<= 0xFFFF` cap (within an L1 sub-chunk
-            // all offsets are <= 64K anyway, so the cap was dead code).
-            if (ref_val != HASH_EMPTY && ref_val + 8 <= my_pos) {
-                uint32_t rk = (uint32_t)src[ref_val] |
-                             ((uint32_t)src[ref_val+1] << 8) |
-                             ((uint32_t)src[ref_val+2] << 16) |
-                             ((uint32_t)src[ref_val+3] << 24);
-                if (rk == key4) {
+            if (lower_same_bucket != 0) {
+                // CPU would see the highest lower same-bucket lane's pos.
+                // That lane's key4 is "same as me" iff its bit is in key_same.
+                uint32_t highest_lower = 31u - __clz(lower_same_bucket);
+                bool same_key = (key_same & (1u << highest_lower)) != 0;
+                uint32_t their_pos = pos + highest_lower;
+                if (same_key && their_pos + 8 <= my_pos) {
                     hash_match = true;
-                    hash_ref = ref_val;
+                    hash_ref = their_pos;
+                }
+                // else: CPU's content check fails (different key OR
+                // offset < 8) — no match.
+            } else {
+                // No intra-warp overwrite — pre-warp ht[h] is what CPU sees.
+                uint32_t ref_val = ht[h];
+                if (ref_val != HASH_EMPTY && ref_val + 8 <= my_pos) {
+                    uint32_t rk = (uint32_t)src[ref_val] |
+                                 ((uint32_t)src[ref_val+1] << 8) |
+                                 ((uint32_t)src[ref_val+2] << 16) |
+                                 ((uint32_t)src[ref_val+3] << 24);
+                    if (rk == key4) {
+                        hash_match = true;
+                        hash_ref = ref_val;
+                    }
                 }
             }
-        }
-
-        // ── Intra-warp bucket-collision suppression ────────────────────
-        // CPU processes positions sequentially: at K2, the hash bucket
-        // contains the most recent earlier write. If a lower lane K1 < K2
-        // hashed to the same bucket with a DIFFERENT key4, CPU at K2 reads
-        // K1's pos (different content → match rejected). GPU's parallel
-        // scan reads the pre-warp value, which might coincidentally have
-        // K2's key → GPU finds a "match" CPU would have rejected.
-        //
-        // Suppress hash_match when a lower active lane has the same hash
-        // bucket but DIFFERENT key4 (collision case). Same-bucket-same-key
-        // is handled separately by the intra-warp same-key logic below.
-        uint32_t bucket_same = __match_any_sync(0xFFFFFFFF, h);
-        uint32_t key_same   = __match_any_sync(0xFFFFFFFF, key4);
-        uint32_t am_for_collide = __ballot_sync(0xFFFFFFFF, is_active);
-        uint32_t lower_bucket = bucket_same & am_for_collide & ((1u << lane) - 1);
-        uint32_t lower_diff_key = lower_bucket & ~key_same;
-        if (lower_diff_key != 0) {
-            hash_match = false;
-            hash_ref = 0;
         }
 
         // ── CPU secondary match attempts ──────────────────────────────
@@ -856,44 +864,18 @@ __device__ void scanBlock(
             if (eight_word == key4) eight_match = true;
         }
 
-        // ── Intra-warp same-key match (mirrors CPU serial behavior) ────
-        // CPU processes positions sequentially. When two positions within
-        // a 32-byte window have the same 4-byte key, the SECOND position's
-        // hash lookup sees the FIRST position's bucket write — yielding
-        // a same-key match with offset = K2-K1. GPU's warp-parallel scan
-        // reads all buckets BEFORE any writes, so this serial dependency
-        // is invisible unless we simulate it.
-        // __match_any_sync(key4) returns lanes with identical key4. The
-        // highest lower-lane with the same key4 is what K2 would have seen
-        // at its bucket if it ran after K1. Use that as a hash reference.
-        uint32_t warp_match = __match_any_sync(0xFFFFFFFF, key4);
-        uint32_t active_mask = __ballot_sync(0xFFFFFFFF, is_active);
-        warp_match &= active_mask;
-        uint32_t lower_mask = warp_match & ((1u << lane) - 1);
-        bool intra_match = false;
-        uint32_t intra_ref = 0;
-        if (is_active && !hash_match && lower_mask != 0) {
-            // CPU's offset >= 8 filter applied here too.
-            uint32_t highest_lower = 31u - __clz(lower_mask);
-            uint32_t candidate_ref = pos + highest_lower;
-            if (candidate_ref + 8 <= my_pos) {
-                intra_match = true;
-                intra_ref = candidate_ref;
-            }
-        }
-
-        bool has_match = hash_match || intra_match || xor_match || eight_match;
+        bool has_match = hash_match || xor_match || eight_match;
         // Match type for dispatch:
         //   0 = hash    (hash_ref)
         //   1 = xor     (cursor+1, offset=recent)
         //   2 = eight   (offset=8)
-        //   3 = intra   (same-key within warp)
+        // (Intra-warp same-key cases are folded into hash_match by the
+        // unified serial-order simulation above.)
         uint32_t my_match_type = hash_match  ? 0u
-                               : intra_match ? 3u
                                : xor_match   ? 1u
                                : eight_match ? 2u
                                : 0u;
-        uint32_t my_ref = hash_match ? hash_ref : intra_ref;
+        uint32_t my_ref = hash_ref;
         uint32_t match_ballot = __ballot_sync(0xFFFFFFFF, has_match);
 
         // CPU runGreedyParser advances by an adaptive step on no match:
@@ -934,9 +916,8 @@ __device__ void scanBlock(
         uint32_t match_ref;
         uint32_t min_match_len;
 
-        if (winning_type == 0 || winning_type == 3) {
-            // Hash match OR intra-warp same-key: starts at first_lane,
-            // ref comes from my_ref (hash_ref or intra_ref).
+        if (winning_type == 0) {
+            // Hash match (includes intra-warp same-key — unified above).
             match_pos = pos + first_lane;
             match_ref = __shfl_sync(0xFFFFFFFF, my_ref, first_lane);
             min_match_len = MIN_MATCH;
