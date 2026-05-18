@@ -40,27 +40,36 @@ __device__ __forceinline__ uint32_t decode_stream_one_lane(
     const uint16_t* __restrict__ lut,
     uint8_t* __restrict__ out, uint32_t out_size)
 {
+    // Top-aligned bit buffer: bits [63 .. 64-bit_count] are valid, lower
+    // are zero. Allows 8-byte big-endian refill when bit_count == 0.
     uint64_t bit_buf = 0;
     int bit_count = 0;
     uint32_t in_pos = 0;
     uint32_t out_pos = 0;
 
     while (out_pos < out_size) {
-        // Refill: keep ≥ MAX_CODE_LEN bits in buffer.
+        // 4-byte fast refill: fires when ≤ 32 bits remain AND ≥ 4 input bytes available.
+        if (bit_count <= 32 && in_pos + 4 <= in_size) {
+            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
+                       | ((uint32_t)in[in_pos + 1] << 16)
+                       | ((uint32_t)in[in_pos + 2] <<  8)
+                       | ((uint32_t)in[in_pos + 3]);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            in_pos += 4;
+        }
+        // Byte-trickle for trailing bytes.
         while (bit_count < MAX_CODE_LEN && in_pos < in_size) {
-            bit_buf = (bit_buf << 8) | (uint64_t)in[in_pos++];
+            bit_buf |= ((uint64_t)in[in_pos++]) << (56 - bit_count);
             bit_count += 8;
         }
-        if (bit_count < MAX_CODE_LEN) {
-            // Pad with zeros for trailing partial codewords.
-            bit_buf <<= (MAX_CODE_LEN - bit_count);
-            bit_count = MAX_CODE_LEN;
-        }
-        uint32_t idx = (uint32_t)((bit_buf >> (bit_count - MAX_CODE_LEN)) & (LUT_SIZE - 1));
+        if (bit_count < MAX_CODE_LEN) bit_count = MAX_CODE_LEN;
+        uint32_t idx = (uint32_t)(bit_buf >> (64 - MAX_CODE_LEN));
         uint16_t entry = lut[idx];
         int len = entry >> 8;
-        if (len == 0) return 0;  // invalid stream
+        if (len == 0) return 0;
         out[out_pos++] = (uint8_t)(entry & 0xFF);
+        bit_buf <<= len;
         bit_count -= len;
     }
     return out_pos;
@@ -172,6 +181,144 @@ extern "C" __global__ void huffEncode4StreamKernel(
 
         out_sizes[block_id] = 9 + s0 + s1 + s2 + s3;
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 32-STREAM VARIANT — all 32 lanes active, one stream per lane
+// ══════════════════════════════════════════════════════════════════════
+//
+// Format:
+//   [93-byte header: 31 × u24 LE stream sizes; stream 31 size derived]
+//   [stream 0 bits | stream 1 | ... | stream 31]
+//
+// Same MSB-first per-byte bit order as the 4-stream version. Each lane
+// (0..31) decodes/encodes its own quarter (= 1/32 of output). For 16 KB
+// literal streams, each lane handles 512 bytes.
+
+static constexpr int N_STREAMS_32 = 32;
+static constexpr int HUFF_32S_HDR_BYTES = (N_STREAMS_32 - 1) * 3;  // 93
+
+// ── Encoder kernel: 1 block per Huffman block, 32 active lanes ───────
+extern "C" __global__ void huffEncode32StreamKernel(
+    const uint8_t* __restrict__ input,
+    const HuffBlockDesc* __restrict__ descs_in,
+    const uint8_t* __restrict__ code_lengths,
+    const uint32_t* __restrict__ codes,
+    uint8_t* __restrict__ scratch,
+    uint8_t* __restrict__ output,
+    uint32_t* __restrict__ out_sizes,
+    const uint32_t* __restrict__ out_offsets,
+    uint32_t scratch_per_stream,
+    uint32_t tables_stride,
+    uint32_t n_blocks)
+{
+    const uint32_t block_id = blockIdx.x;
+    if (block_id >= n_blocks) return;
+    const int lane = threadIdx.x & 31;
+    const HuffBlockDesc d = descs_in[block_id];
+
+    // Per-lane quarter (32-way split).
+    uint32_t q = d.in_size / 32;
+    uint32_t my_in_start = (lane < 31) ? (lane * q) : (31 * q);
+    uint32_t my_in_size  = (lane < 31) ? q : (d.in_size - 31 * q);
+    const uint8_t* my_in = input + d.in_offset + my_in_start;
+
+    uint8_t* my_scratch = scratch + ((uint64_t)block_id * 32 + lane) * scratch_per_stream;
+    const uint8_t*  my_cl = code_lengths + (uint64_t)block_id * tables_stride;
+    const uint32_t* my_cd = codes        + (uint64_t)block_id * tables_stride;
+
+    uint32_t bytes = encode_stream_one_lane(my_in, my_in_size, my_cl, my_cd, my_scratch);
+
+    __syncwarp();
+
+    // Gather all 32 stream sizes into every lane (32 shuffles, convergent).
+    uint32_t all_sizes[N_STREAMS_32];
+    #pragma unroll
+    for (int s = 0; s < N_STREAMS_32; s++) {
+        all_sizes[s] = __shfl_sync(0xFFFFFFFF, bytes, s);
+    }
+
+    // Lane 0 writes header + concatenates payload.
+    if (lane == 0) {
+        uint8_t* out = output + out_offsets[block_id];
+        uint8_t* hdr = out;
+        uint32_t total = HUFF_32S_HDR_BYTES;
+        for (int s = 0; s < N_STREAMS_32 - 1; s++) {
+            uint32_t sz = all_sizes[s];
+            hdr[s*3 + 0] = (uint8_t)(sz & 0xFF);
+            hdr[s*3 + 1] = (uint8_t)((sz >> 8) & 0xFF);
+            hdr[s*3 + 2] = (uint8_t)((sz >> 16) & 0xFF);
+            total += sz;
+        }
+        total += all_sizes[N_STREAMS_32 - 1];
+
+        uint8_t* dst = out + HUFF_32S_HDR_BYTES;
+        for (int s = 0; s < N_STREAMS_32; s++) {
+            uint32_t sz = all_sizes[s];
+            uint8_t* src = scratch + ((uint64_t)block_id * 32 + s) * scratch_per_stream;
+            for (uint32_t i = 0; i < sz; i++) dst[i] = src[i];
+            dst += sz;
+        }
+        out_sizes[block_id] = total;
+    }
+}
+
+// ── Decoder kernel: 1 block per Huffman block, 32 active lanes ───────
+extern "C" __global__ void huffDecode32StreamKernel(
+    const uint8_t* __restrict__ comp,
+    const HuffBlockDesc* __restrict__ descs,
+    const uint16_t* __restrict__ luts,
+    uint8_t* __restrict__ output,
+    uint32_t n_blocks)
+{
+    const uint32_t block_id = blockIdx.x;
+    if (block_id >= n_blocks) return;
+    const int lane = threadIdx.x & 31;
+    const HuffBlockDesc desc = descs[block_id];
+
+    // Cooperative LUT load.
+    extern __shared__ uint16_t shared_lut[];
+    const uint16_t* src_lut = luts + desc.lut_offset;
+    for (int i = lane; i < LUT_SIZE; i += 32) shared_lut[i] = src_lut[i];
+    __syncwarp();
+
+    // Parse header: 31 × u24 LE sizes + derive stream 31 size.
+    const uint8_t* hdr = comp + desc.in_offset;
+    uint32_t my_size;
+    if (lane < N_STREAMS_32 - 1) {
+        my_size = (uint32_t)hdr[lane*3 + 0]
+                | ((uint32_t)hdr[lane*3 + 1] << 8)
+                | ((uint32_t)hdr[lane*3 + 2] << 16);
+    } else {
+        my_size = 0;  // computed via warp reduce below
+    }
+    // Warp reduce sum of sizes[0..30] to derive size[31].
+    uint32_t sum = my_size;
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xFFFFFFFF, sum, off);
+    if (lane == N_STREAMS_32 - 1) {
+        my_size = (desc.in_size - HUFF_32S_HDR_BYTES) - sum;
+    }
+    __syncwarp();
+
+    // Compute per-lane input offset via prefix-sum (exclusive scan).
+    uint32_t in_off = my_size;
+    for (int off = 1; off < 32; off <<= 1) {
+        uint32_t v = __shfl_up_sync(0xFFFFFFFF, in_off, off);
+        if (lane >= off) in_off += v;
+    }
+    in_off -= my_size;  // exclusive
+
+    const uint8_t* my_in = hdr + HUFF_32S_HDR_BYTES + in_off;
+
+    // Per-lane output region.
+    uint32_t q = desc.out_size / 32;
+    uint32_t my_out_start = (lane < 31) ? (lane * q) : (31 * q);
+    uint32_t my_out_size  = (lane < 31) ? q : (desc.out_size - 31 * q);
+    uint8_t* my_out = output + desc.out_offset + my_out_start;
+
+    uint32_t written = decode_stream_one_lane(my_in, my_size, shared_lut,
+                                              my_out, my_out_size);
+    (void)written;
 }
 
 // ── Decoder kernel: 1 block per Huffman block, 4 active lanes ────────

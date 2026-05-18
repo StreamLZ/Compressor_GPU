@@ -338,6 +338,166 @@ static int test_gpu_encode_decode(const char *name, const uint8_t *src, size_t n
     return fails;
 }
 
+// ── 32-stream variant: full GPU roundtrip + bench ─────────────────────
+static int test_gpu_encode_decode_32s(const char *name, const uint8_t *src, size_t n) {
+    uint32_t hist[256] = {0};
+    for (size_t i = 0; i < n; i++) hist[src[i]]++;
+    uint8_t code_lengths[256] = {0};
+    uint32_t codes[256] = {0};
+    uint16_t *lut = (uint16_t*)malloc(LUT_BYTES);
+    int max_len = build_code_lengths(hist, code_lengths);
+    if (max_len > MAX_CODE_LEN) height_limit(hist, code_lengths, MAX_CODE_LEN);
+    assign_canonical_codes(code_lengths, codes);
+    build_decode_lut(code_lengths, codes, lut);
+
+    uint8_t *d_input, *d_scratch, *d_enc_out, *d_dec_out;
+    uint16_t *d_lut;
+    uint32_t *d_codes;
+    uint8_t  *d_code_lengths;
+    HuffBlockDesc *d_descs_enc, *d_descs_dec;
+    uint32_t *d_out_sizes, *d_out_offsets;
+
+    size_t scratch_per_stream = (n / 32 + 64) * 2;
+    size_t enc_cap = n * 2 + 256;
+
+    CK(cudaMalloc(&d_input, n));
+    CK(cudaMalloc(&d_scratch, scratch_per_stream * 32));
+    CK(cudaMalloc(&d_enc_out, enc_cap));
+    CK(cudaMalloc(&d_dec_out, n));
+    CK(cudaMalloc(&d_lut, LUT_BYTES));
+    CK(cudaMalloc(&d_codes, 256 * sizeof(uint32_t)));
+    CK(cudaMalloc(&d_code_lengths, 256));
+    CK(cudaMalloc(&d_descs_enc, sizeof(HuffBlockDesc)));
+    CK(cudaMalloc(&d_descs_dec, sizeof(HuffBlockDesc)));
+    CK(cudaMalloc(&d_out_sizes, sizeof(uint32_t)));
+    CK(cudaMalloc(&d_out_offsets, sizeof(uint32_t)));
+
+    CK(cudaMemcpy(d_input, src, n, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_lut, lut, LUT_BYTES, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_codes, codes, 256 * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_code_lengths, code_lengths, 256, cudaMemcpyHostToDevice));
+
+    HuffBlockDesc enc_desc = {0, (uint32_t)n, 0, 0, 0};
+    CK(cudaMemcpy(d_descs_enc, &enc_desc, sizeof(enc_desc), cudaMemcpyHostToDevice));
+    uint32_t out_off = 0;
+    CK(cudaMemcpy(d_out_offsets, &out_off, sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    huffEncode32StreamKernel<<<1, 32>>>(
+        d_input, d_descs_enc, d_code_lengths, d_codes,
+        d_scratch, d_enc_out, d_out_sizes, d_out_offsets,
+        (uint32_t)scratch_per_stream, 256, 1);
+    CK(cudaDeviceSynchronize());
+
+    uint32_t enc_bytes = 0;
+    CK(cudaMemcpy(&enc_bytes, d_out_sizes, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    HuffBlockDesc dec_desc = {0, enc_bytes, 0, (uint32_t)n, 0};
+    CK(cudaMemcpy(d_descs_dec, &dec_desc, sizeof(dec_desc), cudaMemcpyHostToDevice));
+    huffDecode32StreamKernel<<<1, 32, LUT_BYTES>>>(d_enc_out, d_descs_dec, d_lut, d_dec_out, 1);
+    CK(cudaDeviceSynchronize());
+
+    uint8_t *gpu_out = (uint8_t*)malloc(n);
+    CK(cudaMemcpy(gpu_out, d_dec_out, n, cudaMemcpyDeviceToHost));
+
+    int fails = 0;
+    if (memcmp(src, gpu_out, n) != 0) {
+        printf("[%s/GPU-RT-32s] FAIL\n", name);
+        for (size_t i = 0; i < n; i++) {
+            if (src[i] != gpu_out[i]) {
+                printf("  first diff at %zu: src=0x%02x gpu=0x%02x\n", i, src[i], gpu_out[i]);
+                break;
+            }
+        }
+        fails = 1;
+    } else {
+        printf("[%s/GPU-RT-32s] OK n=%zu enc=%u (%.1f%%) max_len=%d\n",
+               name, n, enc_bytes, 100.0 * enc_bytes / (double)n, max_len);
+    }
+
+    cudaFree(d_input); cudaFree(d_scratch); cudaFree(d_enc_out); cudaFree(d_dec_out);
+    cudaFree(d_lut); cudaFree(d_codes); cudaFree(d_code_lengths);
+    cudaFree(d_descs_enc); cudaFree(d_descs_dec);
+    cudaFree(d_out_sizes); cudaFree(d_out_offsets);
+    free(lut); free(gpu_out);
+    return fails;
+}
+
+static void bench_gpu_decode_32s_parallel(const uint8_t *src, size_t n_per_block, int n_blocks) {
+    uint32_t hist[256] = {0};
+    for (size_t i = 0; i < n_per_block; i++) hist[src[i]]++;
+    uint8_t code_lengths[256] = {0};
+    uint32_t codes[256] = {0};
+    uint16_t *lut = (uint16_t*)malloc(LUT_BYTES);
+    int max_len = build_code_lengths(hist, code_lengths);
+    if (max_len > MAX_CODE_LEN) height_limit(hist, code_lengths, MAX_CODE_LEN);
+    assign_canonical_codes(code_lengths, codes);
+    build_decode_lut(code_lengths, codes, lut);
+
+    // Encode one block CPU-side (32-stream) using CPU ref oracle.
+    size_t enc_cap_per = n_per_block * 2 + 256;
+    uint8_t *enc_one = (uint8_t*)malloc(enc_cap_per);
+    int enc_bytes_per = huff_encode_ns(32, src, n_per_block, code_lengths, codes, enc_one, enc_cap_per);
+
+    size_t total_comp = (size_t)enc_bytes_per * n_blocks;
+    size_t total_out = n_per_block * n_blocks;
+    uint8_t *comp_buf = (uint8_t*)malloc(total_comp);
+    for (int b = 0; b < n_blocks; b++) memcpy(comp_buf + b * enc_bytes_per, enc_one, enc_bytes_per);
+
+    std::vector<HuffBlockDesc> descs(n_blocks);
+    for (int b = 0; b < n_blocks; b++) {
+        descs[b].in_offset = b * enc_bytes_per;
+        descs[b].in_size = enc_bytes_per;
+        descs[b].out_offset = b * n_per_block;
+        descs[b].out_size = (uint32_t)n_per_block;
+        descs[b].lut_offset = 0;
+    }
+
+    uint8_t *d_comp, *d_out;
+    uint16_t *d_lut;
+    HuffBlockDesc *d_descs;
+    CK(cudaMalloc(&d_comp, total_comp));
+    CK(cudaMalloc(&d_out, total_out));
+    CK(cudaMalloc(&d_lut, LUT_BYTES));
+    CK(cudaMalloc(&d_descs, sizeof(HuffBlockDesc) * n_blocks));
+    CK(cudaMemcpy(d_comp, comp_buf, total_comp, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_lut, lut, LUT_BYTES, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_descs, descs.data(), sizeof(HuffBlockDesc) * n_blocks, cudaMemcpyHostToDevice));
+
+    huffDecode32StreamKernel<<<n_blocks, 32, LUT_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+    CK(cudaDeviceSynchronize());
+
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    const int N_RUNS = 50;
+    float best_ms = 1e9f;
+    for (int r = 0; r < N_RUNS; r++) {
+        cudaEventRecord(e0);
+        huffDecode32StreamKernel<<<n_blocks, 32, LUT_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+        if (ms < best_ms) best_ms = ms;
+    }
+
+    uint8_t *gpu_out = (uint8_t*)malloc(total_out);
+    CK(cudaMemcpy(gpu_out, d_out, total_out, cudaMemcpyDeviceToHost));
+    int verify_fail = 0;
+    for (int b = 0; b < n_blocks; b++) {
+        if (memcmp(src, gpu_out + b * n_per_block, n_per_block) != 0) {
+            verify_fail++;
+            if (verify_fail >= 3) break;
+        }
+    }
+    double gb_per_s = (double)total_out / (best_ms * 1e6);
+    printf("[bench-dec-32s] %d blocks × %zu B = %.1f MB → best %.3f ms = %.1f GB/s%s\n",
+           n_blocks, n_per_block, total_out / 1e6, best_ms, gb_per_s,
+           verify_fail ? " [VERIFY FAIL]" : "");
+    (void)max_len;
+
+    cudaFree(d_comp); cudaFree(d_out); cudaFree(d_lut); cudaFree(d_descs);
+    free(comp_buf); free(enc_one); free(lut); free(gpu_out);
+}
+
 int main(int argc, char **argv) {
     int fails = 0;
 
@@ -393,9 +553,22 @@ int main(int argc, char **argv) {
             fails += test_gpu_decode_one("real-64KB", buf, cap);
             fails += test_gpu_encode_decode("real-64KB", buf, cap);
             // Bench with 1500 blocks (simulates ~100MB of literals)
+            // 32-stream variant: roundtrip + bench
+            fails += test_gpu_encode_decode_32s("real-64KB", buf, cap);
             if (fails == 0) {
+                printf("\n--- 4-stream ---\n");
                 bench_gpu_encode_parallel(buf, cap, 1500);
                 bench_gpu_decode_parallel(buf, cap, 1500);
+                printf("\n--- 32-stream ---\n");
+                bench_gpu_decode_32s_parallel(buf, cap, 1500);
+                printf("\n--- block-count sweep (32-stream) ---\n");
+                for (int b : {32, 128, 512, 1500, 6000, 24000}) {
+                    bench_gpu_decode_32s_parallel(buf, cap, b);
+                }
+                printf("\n--- block-count sweep (4-stream) ---\n");
+                for (int b : {32, 128, 512, 1500, 6000, 24000}) {
+                    bench_gpu_decode_parallel(buf, cap, b);
+                }
             }
             free(buf);
         }

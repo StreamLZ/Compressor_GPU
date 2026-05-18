@@ -351,6 +351,75 @@ static int huff_decode_4s(const uint8_t *in, size_t in_bytes,
     return (int)expected_out_bytes;
 }
 
+// ─── N-stream split (parameterized) ─────────────────────────────────────
+// Generalizes the 4-stream layout to N streams. Each stream gets a
+// contiguous quarter (= n/N bytes; stream N-1 absorbs the remainder).
+// Header: (N-1) × u24 LE sizes (stream N-1 size derived).
+
+static int huff_encode_ns(int N,
+                          const uint8_t *in, size_t n,
+                          const uint8_t code_lengths[256],
+                          const uint32_t codes[256],
+                          uint8_t *out, size_t out_cap) {
+    size_t hdr_bytes = (size_t)(N - 1) * 3;
+    if (out_cap < hdr_bytes) return -1;
+    size_t q = n / (size_t)N;
+    size_t written = hdr_bytes;
+    uint32_t sizes[64];  // supports up to 64 streams
+    if (N > 64) return -1;
+
+    for (int s = 0; s < N; s++) {
+        size_t start = (size_t)s * q;
+        size_t end   = (s == N - 1) ? n : (size_t)(s + 1) * q;
+        int sz = huff_encode(in + start, end - start,
+                             code_lengths, codes,
+                             out + written, out_cap - written);
+        if (sz < 0) return -1;
+        if (sz >= (1 << 24)) return -1;
+        sizes[s] = (uint32_t)sz;
+        written += (size_t)sz;
+    }
+
+    for (int s = 0; s < N - 1; s++) {
+        out[s*3 + 0] = (uint8_t)(sizes[s] & 0xFF);
+        out[s*3 + 1] = (uint8_t)((sizes[s] >> 8) & 0xFF);
+        out[s*3 + 2] = (uint8_t)((sizes[s] >> 16) & 0xFF);
+    }
+    return (int)written;
+}
+
+static int huff_decode_ns(int N,
+                          const uint8_t *in, size_t in_bytes,
+                          const uint16_t lut[LUT_SIZE],
+                          uint8_t *out, size_t expected_out_bytes) {
+    size_t hdr_bytes = (size_t)(N - 1) * 3;
+    if (in_bytes < hdr_bytes) return -1;
+    uint32_t sizes[64];
+    if (N > 64) return -1;
+
+    uint32_t sum = 0;
+    for (int s = 0; s < N - 1; s++) {
+        sizes[s] = (uint32_t)in[s*3 + 0]
+                 | ((uint32_t)in[s*3 + 1] << 8)
+                 | ((uint32_t)in[s*3 + 2] << 16);
+        sum += sizes[s];
+    }
+    uint32_t total_streams = (uint32_t)(in_bytes - hdr_bytes);
+    if (sum > total_streams) return -1;
+    sizes[N - 1] = total_streams - sum;
+
+    size_t q = expected_out_bytes / (size_t)N;
+    const uint8_t *stream_ptr = in + hdr_bytes;
+    for (int s = 0; s < N; s++) {
+        size_t start = (size_t)s * q;
+        size_t end   = (s == N - 1) ? expected_out_bytes : (size_t)(s + 1) * q;
+        int dec = huff_decode(stream_ptr, sizes[s], lut, out + start, end - start);
+        if (dec != (int)(end - start)) return -1;
+        stream_ptr += sizes[s];
+    }
+    return (int)expected_out_bytes;
+}
+
 // ─── Roundtrip test ─────────────────────────────────────────────────────
 static int roundtrip_test(const char *name, const uint8_t *src, size_t n) {
     uint32_t hist[256] = {0};
