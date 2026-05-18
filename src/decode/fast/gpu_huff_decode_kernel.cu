@@ -23,9 +23,12 @@ static constexpr int MAX_CODE_LEN = 11;
 static constexpr int LUT_SIZE     = 1 << MAX_CODE_LEN;  // 2048
 
 // ── Descriptor — matches Zig HuffDecChunkDesc in gpu_driver.zig ─────
+// Unified: in_offset/in_size cover the FULL payload (128 B weights +
+// 9 B sub-header + 4 stream payloads). Build kernel reads the leading
+// 128 B; decode kernel skips them and works on the remainder.
 struct HuffDecChunkDesc {
     uint32_t in_offset;     // byte offset in compressed buffer (points at 128 B weights)
-    uint32_t in_size;       // total payload bytes (128 weights + 9 header + 4 streams)
+    uint32_t in_size;       // FULL payload bytes (128 + 9 + sum(streams))
     uint32_t out_offset;    // byte offset in literal scratch
     uint32_t out_size;      // expected decompressed bytes
     uint32_t lut_offset;    // entry index into luts[] (LUT_SIZE entries per block)
@@ -225,9 +228,8 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
 //   [9 B sub-header: 3 × u24 LE stream sizes; stream3 = total - sum]
 //   [stream 0 | stream 1 | stream 2 | stream 3]
 //
-// Note: `in_offset` in the descriptor points at the 9-byte sub-header
-// (i.e. AFTER the 128-byte weights; the driver pre-adds 128). The LUT
-// build kernel uses a SEPARATE descriptor that points AT the weights.
+// `in_offset` points at the 128 B weights (full payload start); the
+// decode kernel skips them internally to reach the 9 B sub-header.
 extern "C" __global__ void slzHuffDecode4StreamKernel(
     const uint8_t* __restrict__ comp,
     const HuffDecChunkDesc* __restrict__ descs,
@@ -249,8 +251,8 @@ extern "C" __global__ void slzHuffDecode4StreamKernel(
 
     if (lane >= 4) return;
 
-    // Parse 9-byte sub-header.
-    const uint8_t* hdr = comp + desc.in_offset;
+    // Skip the 128 B weights to reach the 9 B sub-header.
+    const uint8_t* hdr = comp + desc.in_offset + 128;
     uint32_t stream_sizes[4];
     #pragma unroll
     for (int s = 0; s < 3; s++) {
@@ -258,7 +260,7 @@ extern "C" __global__ void slzHuffDecode4StreamKernel(
                         | ((uint32_t)hdr[s*3 + 1] << 8)
                         | ((uint32_t)hdr[s*3 + 2] << 16);
     }
-    uint32_t total_streams = desc.in_size - 9;
+    uint32_t total_streams = desc.in_size - 128 - 9;
     stream_sizes[3] = total_streams - stream_sizes[0] - stream_sizes[1] - stream_sizes[2];
 
     // This lane's input pointer (exclusive prefix sum of sizes).

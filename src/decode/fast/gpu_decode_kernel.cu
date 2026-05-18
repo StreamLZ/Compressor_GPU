@@ -550,6 +550,25 @@ __device__ __noinline__ void parseSubChunkHeaders(
             lit_ptr = tans_scratch_chunk;
             lit_size = count_b;
             lit_is_tans = 1;
+        } else if (chunk_type == 4 && tans_scratch_chunk != nullptr) {
+            // Huffman: same 3/5-byte header convention as type 1/6 tANS;
+            // payload is [128 B weights][9 B sub-header][4 streams].
+            // Pre-decoded into tans_scratch_chunk by slzHuffDecode4StreamKernel.
+            uint32_t huff_comp_size, huff_dst_size;
+            if (src[0] >= 0x80) {
+                uint32_t bits = ((uint32_t)src[0] << 16) | ((uint32_t)src[1] << 8) | src[2];
+                huff_comp_size = bits & 0x3FF;
+                huff_dst_size = huff_comp_size + ((bits >> 10) & 0x3FF) + 1;
+                src += 3 + huff_comp_size;
+            } else {
+                uint32_t bits = ((uint32_t)src[1] << 24) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 8) | src[4];
+                huff_comp_size = bits & 0x3FFFF;
+                huff_dst_size = ((((bits >> 18) | ((uint32_t)src[0] << 14)) & 0x3FFFF)) + 1;
+                src += 5 + huff_comp_size;
+            }
+            lit_ptr = tans_scratch_chunk;
+            lit_size = huff_dst_size;
+            lit_is_tans = 1;  // reuses the lit_is_tans → lit_ptr=scratch redirection
         } else {
             lit_size = 0;
             lit_ptr = src;

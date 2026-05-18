@@ -652,29 +652,29 @@ $L__BB1_2:
 	@%p3 bra 	$L__BB1_34;
 
 	add.s64 	%rd49, %rd2, %rd4;
-	ld.global.nc.u8 	%rs1, [%rd49];
+	ld.global.nc.u8 	%rs1, [%rd49+128];
 	cvt.u32.u8 	%r87, %rs1;
 	mov.u64 	%rd163, 0;
-	ld.global.nc.u8 	%rs2, [%rd49+1];
+	ld.global.nc.u8 	%rs2, [%rd49+129];
 	cvt.u32.u8 	%r88, %rs2;
 	prmt.b32 	%r89, %r88, %r87, 30212;
-	ld.global.nc.u8 	%rs3, [%rd49+2];
+	ld.global.nc.u8 	%rs3, [%rd49+130];
 	cvt.u32.u8 	%r90, %rs3;
-	ld.global.nc.u8 	%rs4, [%rd49+3];
+	ld.global.nc.u8 	%rs4, [%rd49+131];
 	cvt.u32.u8 	%r91, %rs4;
-	ld.global.nc.u8 	%rs5, [%rd49+4];
+	ld.global.nc.u8 	%rs5, [%rd49+132];
 	cvt.u32.u8 	%r92, %rs5;
 	prmt.b32 	%r93, %r92, %r91, 30212;
-	ld.global.nc.u8 	%rs6, [%rd49+5];
+	ld.global.nc.u8 	%rs6, [%rd49+133];
 	cvt.u32.u8 	%r94, %rs6;
-	ld.global.nc.u8 	%rs7, [%rd49+6];
+	ld.global.nc.u8 	%rs7, [%rd49+134];
 	cvt.u32.u8 	%r95, %rs7;
-	ld.global.nc.u8 	%rs8, [%rd49+7];
+	ld.global.nc.u8 	%rs8, [%rd49+135];
 	cvt.u32.u8 	%r96, %rs8;
 	prmt.b32 	%r97, %r96, %r95, 30212;
-	ld.global.nc.u8 	%rs9, [%rd49+8];
+	ld.global.nc.u8 	%rs9, [%rd49+136];
 	cvt.u32.u8 	%r98, %rs9;
-	add.s32 	%r99, %r4, -9;
+	add.s32 	%r99, %r4, -137;
 	prmt.b32 	%r100, %r90, %r89, 28756;
 	sub.s32 	%r101, %r99, %r100;
 	prmt.b32 	%r102, %r94, %r93, 28756;
@@ -730,7 +730,7 @@ $L__BB1_11:
 
 $L__BB1_12:
 	add.s64 	%rd54, %rd4, %rd154;
-	add.s64 	%rd14, %rd54, 9;
+	add.s64 	%rd14, %rd54, 137;
 	mul.wide.u32 	%rd55, %r3, 4;
 	add.s64 	%rd56, %rd3, %rd55;
 	ld.local.u32 	%r28, [%rd56];

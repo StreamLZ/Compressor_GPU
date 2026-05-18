@@ -31,6 +31,9 @@ var tans_parse_fn: usize = 0;
 var tans_initlut_fn: usize = 0;
 var tans_fused_fn: usize = 0;
 var tans_fse_build_fn: usize = 0;
+var huff_module: usize = 0;
+var huff_build_fn: usize = 0;
+var huff_decode_fn: usize = 0;
 var initialized = false;
 
 // ── Driver API function signatures ──────────────────────────────
@@ -143,6 +146,13 @@ pub fn init() bool {
         _ = get_fn(&tans_initlut_fn, tans_module, "slzTansInitLutKernel");
         _ = get_fn(&tans_fused_fn, tans_module, "slzTans32FusedKernel");
         _ = get_fn(&tans_fse_build_fn, tans_module, "slzTansFseBuildKernel");
+    }
+
+    // Load Huffman decode kernels (Pass 1.5, for chunk_type=4 literals)
+    const huff_ptx = @embedFile("gpu_huff_decode_kernel.ptx") ++ "\x00";
+    if (load_fn(&huff_module, huff_ptx.ptr) == CUDA_SUCCESS) {
+        _ = get_fn(&huff_build_fn, huff_module, "slzHuffBuildLutKernel");
+        _ = get_fn(&huff_decode_fn, huff_module, "slzHuffDecode4StreamKernel");
     }
 
     // Create persistent pipeline streams (CU_STREAM_NON_BLOCKING = 1)
@@ -286,6 +296,24 @@ var tans_off16hi_host_buf: [4096]TansDecChunkDesc = undefined;
 var tans_off16lo_host_buf: [4096]TansDecChunkDesc = undefined;
 var raw_off16_buf: [8192]RawOff16Desc = undefined;
 
+// Huffman literal descriptors — matches gpu_huff_decode_kernel.cu HuffDecChunkDesc.
+// in_offset/in_size cover the FULL payload (128 B weights + 9 B sub-header +
+// 4 stream payloads). Build kernel reads first 128 B; decode kernel skips 128.
+const HuffDecChunkDesc = extern struct {
+    in_offset: u32,
+    in_size: u32,
+    out_offset: u32,
+    out_size: u32,
+    lut_offset: u32,
+};
+
+var d_huff_descs: CUdeviceptr = 0;
+var d_huff_descs_size: usize = 0;
+var d_huff_lut: CUdeviceptr = 0;
+var d_huff_lut_size: usize = 0;
+var huff_host_buf: [4096]HuffDecChunkDesc = undefined;
+const HUFF_LUT_ENTRIES: usize = 2048; // matches MAX_CODE_LEN=11 in kernel
+
 // ── tANS header scanning ───────────────────────────────────────
 // Scans the host-side compressed data to find tANS literal, token,
 // and off16 hi/lo headers. Builds TansDecChunkDesc descriptors for
@@ -305,6 +333,7 @@ const ScanResult = struct {
     num_off16hi: u32,
     num_off16lo: u32,
     num_raw_off16: u32,
+    num_huff_lit: u32 = 0,
     use_tans32: bool = false,
 };
 
@@ -317,12 +346,14 @@ fn scanForTansChunks(
     tans_off16hi_descs: []TansDecChunkDesc,
     tans_off16lo_descs: []TansDecChunkDesc,
     raw_off16_descs: []RawOff16Desc,
+    huff_lit_descs: []HuffDecChunkDesc,
 ) ScanResult {
     var num_lit: u32 = 0;
     var num_tok: u32 = 0;
     var num_off16hi: u32 = 0;
     var num_off16lo: u32 = 0;
     var num_raw: u32 = 0;
+    var num_huff: u32 = 0;
     var use_tans32: bool = false;
     var cur_sub_idx: u32 = 0; // global sub-chunk index — mirrors driver prefix sum
     const cap_safe: u32 = if (sub_chunk_cap == 0) 65536 else sub_chunk_cap;
@@ -414,6 +445,12 @@ fn scanForTansChunks(
                         tans_lit_descs[num_lit - 1].src_offset += 129;
                         tans_lit_descs[num_lit - 1].src_size -|= 129;
                     }
+                } else if (lit_type == 4) {
+                    // Huffman literal stream — parse 3 or 5 byte header
+                    // (same convention as tANS type 1/6). Payload after the
+                    // header is [128 B weights][9 B sub-header][4 streams].
+                    parseHuffHeader(chunk_src, pos, ch.src_offset, sub_dst_off,
+                                    huff_lit_descs, &num_huff);
                 }
                 const lit_next = skipStreamHeader(chunk_src, pos);
                 if (lit_next == null) break :walk;
@@ -575,8 +612,55 @@ fn scanForTansChunks(
 
     return .{
         .num_lit = num_lit, .num_tok = num_tok, .num_off16hi = num_off16hi,
-        .num_off16lo = num_off16lo, .num_raw_off16 = num_raw, .use_tans32 = use_tans32,
+        .num_off16lo = num_off16lo, .num_raw_off16 = num_raw,
+        .num_huff_lit = num_huff, .use_tans32 = use_tans32,
     };
+}
+
+/// Parse a chunk_type=4 Huffman literal header at `lit_off` within chunk_src.
+/// Writes a HuffDecChunkDesc whose in_offset points at the FULL payload
+/// (128 B weights + 9 B sub-header + 4 streams). lut_offset is assigned by
+/// index — each descriptor owns 2048 contiguous LUT entries.
+fn parseHuffHeader(
+    chunk_src: []const u8,
+    lit_off: u32,
+    src_offset_base: u32,
+    dst_offset: usize,
+    huff_descs_out: []HuffDecChunkDesc,
+    num_huff: *u32,
+) void {
+    if (lit_off >= chunk_src.len) return;
+    const first_byte = chunk_src[lit_off];
+    var comp_size: u32 = 0;
+    var dst_size: u32 = 0;
+    var payload_off: u32 = 0;
+    if (first_byte >= 0x80) {
+        if (lit_off + 3 > chunk_src.len) return;
+        const bits: u32 = (@as(u32, chunk_src[lit_off]) << 16) |
+            (@as(u32, chunk_src[lit_off + 1]) << 8) |
+            @as(u32, chunk_src[lit_off + 2]);
+        comp_size = bits & 0x3FF;
+        dst_size = comp_size + ((bits >> 10) & 0x3FF) + 1;
+        payload_off = src_offset_base + lit_off + 3;
+    } else {
+        if (lit_off + 5 > chunk_src.len) return;
+        const bits: u32 = (@as(u32, chunk_src[lit_off + 1]) << 24) |
+            (@as(u32, chunk_src[lit_off + 2]) << 16) |
+            (@as(u32, chunk_src[lit_off + 3]) << 8) |
+            @as(u32, chunk_src[lit_off + 4]);
+        comp_size = bits & 0x3FFFF;
+        dst_size = (((bits >> 18) | (@as(u32, chunk_src[lit_off]) << 14)) & 0x3FFFF) + 1;
+        payload_off = src_offset_base + lit_off + 5;
+    }
+    if (num_huff.* >= huff_descs_out.len) return;
+    huff_descs_out[num_huff.*] = .{
+        .in_offset = payload_off,
+        .in_size = comp_size,
+        .out_offset = @intCast(dst_offset),
+        .out_size = dst_size,
+        .lut_offset = num_huff.* * @as(u32, @intCast(HUFF_LUT_ENTRIES)),
+    };
+    num_huff.* += 1;
 }
 
 /// Parse a type 0 (memcpy) stream header, returning the data offset
@@ -996,6 +1080,7 @@ pub fn fullGpuLaunch(
             tans_off16hi_host_buf[0..max_tans],
             tans_off16lo_host_buf[0..max_tans],
             &raw_off16_buf,
+            &huff_host_buf,
         );
 
         merged_count = scan.num_lit + scan.num_tok + scan.num_off16hi + scan.num_off16lo;
@@ -1007,6 +1092,53 @@ pub fn fullGpuLaunch(
                 _ = h2d_fn(d_tans_off16_scratch + rd.gpu_offset, @ptrCast(compressed_block.ptr + rd.src_offset), rd.size);
             }
         }
+    }
+
+    // ── Huffman literals (Pass 1.5) ──────────────────────────
+    // Run build-LUT + decode-4-stream kernels before LZ kernel so the LZ
+    // kernel can read pre-decoded literals from d_tans_scratch (same slot
+    // layout as tANS literals; out_offset is in sub-chunk-slot space).
+    if (scan.num_huff_lit > 0 and huff_build_fn != 0 and huff_decode_fn != 0) {
+        const n_huff = scan.num_huff_lit;
+        const huff_desc_bytes = @as(usize, n_huff) * @sizeOf(HuffDecChunkDesc);
+        const huff_lut_bytes = @as(usize, n_huff) * HUFF_LUT_ENTRIES * @sizeOf(u32);
+        if (!ensureDeviceBuf(&d_huff_descs, &d_huff_descs_size, huff_desc_bytes)) return error.BadMode;
+        if (!ensureDeviceBuf(&d_huff_lut, &d_huff_lut_size, huff_lut_bytes)) return error.BadMode;
+
+        _ = h2d_fn(d_huff_descs, @ptrCast(&huff_host_buf), huff_desc_bytes);
+        _ = sync_fn();
+
+        // Build LUT — 1 warp per block, 1408 B shared mem (code_lengths, codes, bl_count, next_code).
+        {
+            var p_comp = d_comp_persist;
+            var p_descs = d_huff_descs;
+            var p_lut = d_huff_lut;
+            var p_n = n_huff;
+            var params = [_]?*anyopaque{
+                @ptrCast(&p_comp), @ptrCast(&p_descs),
+                @ptrCast(&p_lut), @ptrCast(&p_n),
+            };
+            var extra = [_]?*anyopaque{null};
+            if (launch_fn(huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS)
+                return error.BadMode;
+        }
+        // Decode — 1 warp per block, 8 KB shared LUT.
+        {
+            var p_comp = d_comp_persist;
+            var p_descs = d_huff_descs;
+            var p_lut = d_huff_lut;
+            var p_out = d_tans_scratch;
+            var p_n = n_huff;
+            var params = [_]?*anyopaque{
+                @ptrCast(&p_comp), @ptrCast(&p_descs),
+                @ptrCast(&p_lut), @ptrCast(&p_out), @ptrCast(&p_n),
+            };
+            var extra = [_]?*anyopaque{null};
+            const shared_bytes: c_uint = HUFF_LUT_ENTRIES * @sizeOf(u32);
+            if (launch_fn(huff_decode_fn, n_huff, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra) != CUDA_SUCCESS)
+                return error.BadMode;
+        }
+        // Don't sync here — the LZ kernel sync below picks it up.
     }
 
     // ── Pipeline: split into N groups, overlap tANS with LZ ───
@@ -1288,7 +1420,8 @@ pub fn fullGpuLaunch(
             const lz_grid_x = (lz_groups_in_pipe + 1) / 2;
 
             // Fast path: no entropy in this scan → use lean L1/L2 raw kernel.
-            const use_raw_kernel = merged_count == 0 and kernel_raw_fn != 0;
+            // Huffman literals also require the general kernel (it reads tans_scratch).
+            const use_raw_kernel = merged_count == 0 and scan.num_huff_lit == 0 and kernel_raw_fn != 0;
 
             if (use_raw_kernel) {
                 var p_comp = d_comp_persist;
@@ -1503,7 +1636,7 @@ pub fn fullGpuLaunch(
         // ── Pass 2: LZ decode ──────────────────────────────────────
         // Fast path: when there's no entropy work (L1/L2 inputs), use the
         // dedicated 6-param kernel — same shape as the May-9 22 GB/s era.
-        const no_entropy = merged_count == 0;
+        const no_entropy = merged_count == 0 and scan.num_huff_lit == 0;
         const use_raw_kernel = no_entropy and kernel_raw_fn != 0;
 
         const grid_x = (num_groups + 1) / 2;
