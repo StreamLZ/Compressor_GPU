@@ -86,10 +86,6 @@ __device__ void decodeSubChunkL1(
     int32_t recent_offset = -8;
     uint32_t len_off = 0;
 
-    // Prefetch first token
-    uint32_t next_token = 0;
-    if (lane == 0 && cmd_pos < cmd_size) next_token = cmd[cmd_pos];
-
     while (cmd_pos < cmd_size) {
         uint32_t lit_len = 0, match_len = 0;
         int32_t match_offset = recent_offset;
@@ -97,9 +93,7 @@ __device__ void decodeSubChunkL1(
 
         // ── Token parse (lane 0 only) ──
         if (lane == 0) {
-            uint32_t token = next_token;
-            // Prefetch next token while processing this one
-            if (cmd_pos + 1 < cmd_size) next_token = cmd[cmd_pos + 1];
+            uint32_t token = cmd[cmd_pos];
             if (token >= TOKEN_SHORT_MIN) {
                 lit_len = token & 7;
                 match_len = (token >> 3) & 0xF;
