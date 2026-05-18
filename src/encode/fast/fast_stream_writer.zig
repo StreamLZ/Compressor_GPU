@@ -48,6 +48,8 @@ pub const FastStreamWriter = struct {
     off32_cursor: [*]u8,
     length_start: [*]u8,
     length_cursor: [*]u8,
+    il_start: [*]u8,
+    il_cursor: [*]u8,
 
     // ── Bookkeeping (cold path) ─────────────────────────────────────────
     source_ptr: [*]const u8,
@@ -98,9 +100,11 @@ pub const FastStreamWriter = struct {
         const off32_size: usize = source_length / 8 + 8; // number of 4-byte slots
         const length_size: usize = source_length / 29 + 16;
 
-        // Layout: [token_stream][off16_stream (aligned 2)][off32_stream][length_stream][delta?][literal?]
+        // Layout: [token_stream][off16_stream (aligned 2)][off32_stream][length_stream][il_region][delta?][literal?]
         const literal_in_scratch = raw_literals_dst == null;
+        const il_size: usize = (source_length / 4 + 16) * 11;
         const total_size: usize = token_size + (off16_size * 2) + (off32_size * 4) + length_size +
+            il_size +
             (if (literal_in_scratch) literal_size else 0) +
             (if (use_delta_literals) literal_size else 0) + 64;
 
@@ -117,6 +121,8 @@ pub const FastStreamWriter = struct {
         p += off32_size * 4;
         const length_ptr: [*]u8 = scratch.ptr + p;
         p += length_size;
+        const il_ptr: [*]u8 = scratch.ptr + p;
+        p += il_size;
 
         var delta_literal_ptr: ?[*]u8 = null;
         if (use_delta_literals) {
@@ -148,6 +154,8 @@ pub const FastStreamWriter = struct {
             .off32_cursor = off32_ptr,
             .length_start = length_ptr,
             .length_cursor = length_ptr,
+            .il_start = il_ptr,
+            .il_cursor = il_ptr,
             .source_ptr = source_ptr,
             .source_length = source_length,
             .block2_start_offset = 0,

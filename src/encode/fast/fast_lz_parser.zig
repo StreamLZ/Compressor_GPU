@@ -181,6 +181,7 @@ pub fn runGreedyParser(
         if (@intFromPtr(source_cursor) + 5 >= @intFromPtr(safe_source_end)) break :outer;
     }
 
+    token_writer.compactIl(w);
     token_writer.copyTrailingLiterals(w, literal_start, source_end, recent_offset);
     recent_offset_inout.* = recent_offset;
 }

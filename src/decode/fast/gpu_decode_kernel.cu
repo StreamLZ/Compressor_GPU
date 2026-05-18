@@ -816,9 +816,11 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
     uint32_t total_chunks,
     uint32_t sub_chunk_cap,
     uint8_t* __restrict__ tans_scratch,
-    uint8_t* __restrict__ tans_tok_scratch,
-    uint8_t* __restrict__ tans_off16_scratch,
-    uint32_t chunk_base,
+    // Stride in BYTES between the lit, tok, and off16 sub-slots of
+    // tans_scratch. Layout: [lit:stride | tok:stride | off16:stride].
+    // 0 when no tANS scratch is in use. Driver computes
+    // total_subchunks * 131072 once.
+    uint64_t tans_slot_stride,
     // first_subchunk_idx[chunk_idx] = global sub-chunk index for sub-chunk 0
     // of this chunk. Each successive sub-chunk in the chunk uses the next
     // global index. nullptr → fall back to chunk_idx (legacy single-sub-chunk).
@@ -829,7 +831,7 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
     const uint32_t group_id = blockIdx.x * 2 + warp_id;
     const int lane = threadIdx.x & 31;
     if (group_id >= (total_chunks + chunks_per_group - 1) / chunks_per_group) return;
-    const uint32_t base_chunk = chunk_base + group_id * chunks_per_group;
+    const uint32_t base_chunk = group_id * chunks_per_group;
 
     for (uint32_t c = 0; c < chunks_per_group; c++) {
         uint32_t chunk_idx = base_chunk + c;
@@ -864,11 +866,10 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
         uint32_t sc_remaining = ch.decomp_size;
         // Per-sub-chunk slot size = 131072 (= sub_chunk_cap, large enough for
         // the biggest sub-chunk's lit/tok streams). off16-hi at offset 0,
-        // off16-lo at offset 65536 within each slot.
+        // off16-lo at offset 65536 within each slot. tok and off16 sub-buffers
+        // live at +tans_slot_stride and +2*tans_slot_stride from the lit slot.
         uint32_t global_sub_idx = first_subchunk_idx ? first_subchunk_idx[chunk_idx] : chunk_idx;
         uint8_t* chunk_tans_scratch = tans_scratch ? (tans_scratch + (uint64_t)global_sub_idx * 131072) : nullptr;
-        uint8_t* chunk_tok_scratch = tans_tok_scratch ? (tans_tok_scratch + (uint64_t)global_sub_idx * 131072) : nullptr;
-        uint8_t* chunk_off16_scratch = tans_off16_scratch ? (tans_off16_scratch + (uint64_t)global_sub_idx * 131072) : nullptr;
 
         while (sc_remaining > 0) {
             uint32_t sc_size = sc_remaining;
@@ -890,6 +891,10 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
             const uint8_t* sc_payload = chunk_src + 3;
 
             if (sc_comp_size < sc_size) {
+                // Derive tok/off16 sub-slots on demand from base + stride
+                // — keeps the loop-carried state to just the lit slot.
+                uint8_t* tok_slot = chunk_tans_scratch ? (chunk_tans_scratch + tans_slot_stride) : nullptr;
+                uint8_t* off16_slot = chunk_tans_scratch ? (chunk_tans_scratch + 2 * tans_slot_stride) : nullptr;
                 // Match Vulkan convention: pass absolute sc_dst_off as
                 // base_offset, so only sub-chunk at output offset 0 (i.e.
                 // the very first sub-chunk in the frame) triggers the
@@ -898,7 +903,7 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
                 parseAndDecodeSubChunk(
                     sc_payload, sc_comp_size, sc_size,
                     dst, sc_dst_off, sc_dst_off, sc_mode,
-                    chunk_tans_scratch, chunk_tok_scratch, chunk_off16_scratch
+                    chunk_tans_scratch, tok_slot, off16_slot
                 );
             } else {
                 // Uncompressed sub-chunk: copy
@@ -910,10 +915,10 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
             chunk_src += 3 + sc_comp_size;
             sc_dst_off += sc_size;
             sc_remaining -= sc_size;
-            // Advance scratch pointers to next sub-chunk's slot (128KB stride)
+            // Advance lit-slot pointer to next sub-chunk's slot (128KB stride).
+            // tok/off16 slots are derived from this each iteration so no
+            // separate tracking needed.
             if (chunk_tans_scratch) chunk_tans_scratch += 131072;
-            if (chunk_tok_scratch) chunk_tok_scratch += 131072;
-            if (chunk_off16_scratch) chunk_off16_scratch += 131072;
         }
     }
 }

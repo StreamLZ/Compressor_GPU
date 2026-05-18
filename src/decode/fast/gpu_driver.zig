@@ -1283,17 +1283,20 @@ pub fn fullGpuLaunch(
             const lz_groups_in_pipe = (group_chunks + chunks_per_group - 1) / chunks_per_group;
             const lz_grid_x = (lz_groups_in_pipe + 1) / 2;
 
+            // Drop chunk_base / tans_tok_scratch / tans_off16_scratch
+            // from the kernel signature — kernel derives tok/off16 from
+            // tans_scratch + slot_stride, and we pre-shift the desc
+            // pointer here. Net 11 → 9 params at the kernel.
             var p_comp = d_comp_persist;
-            var p_descs_dev = d_descs_persist;
+            var p_descs_dev = d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc);
             var p_dst = d_output;
             var p_cpg = chunks_per_group;
-            var p_total = chunk_end;
+            var p_total = chunk_end - chunk_start;
             var p_sc_cap = sub_chunk_cap;
             var p_tans_scratch = d_tans_scratch;
-            var p_tans_tok_scratch: CUdeviceptr = if (scan.num_tok > 0) d_tans_tok_scratch else 0;
-            var p_tans_off16_scratch: CUdeviceptr = if (scan.num_off16hi > 0 or scan.num_off16lo > 0) d_tans_off16_scratch else 0;
-            var p_chunk_base = chunk_start;
-            var p_first_sub_idx: CUdeviceptr = d_first_subchunk_idx;
+            var p_tans_slot_stride: u64 = @as(u64, total_subchunks) * 131072;
+            var p_first_sub_idx: CUdeviceptr = d_first_subchunk_idx +
+                if (d_first_subchunk_idx != 0) @as(u64, chunk_start) * @sizeOf(u32) else 0;
 
             var lz_params = [_]?*anyopaque{
                 @ptrCast(&p_comp),
@@ -1303,9 +1306,7 @@ pub fn fullGpuLaunch(
                 @ptrCast(&p_total),
                 @ptrCast(&p_sc_cap),
                 @ptrCast(&p_tans_scratch),
-                @ptrCast(&p_tans_tok_scratch),
-                @ptrCast(&p_tans_off16_scratch),
-                @ptrCast(&p_chunk_base),
+                @ptrCast(&p_tans_slot_stride),
                 @ptrCast(&p_first_sub_idx),
             };
             var lz_extra = [_]?*anyopaque{null};
@@ -1481,9 +1482,7 @@ pub fn fullGpuLaunch(
         var p_total: u32 = total_chunks;
         var p_sc_cap = sub_chunk_cap;
         var p_tans_scratch = d_tans_scratch;
-        var p_tans_tok_scratch = d_tans_tok_scratch;
-        var p_tans_off16_scratch = d_tans_off16_scratch;
-        var p_chunk_base: u32 = 0;
+        var p_tans_slot_stride: u64 = @as(u64, total_subchunks) * 131072;
         var p_first_sub_idx: CUdeviceptr = d_first_subchunk_idx;
 
         var params = [_]?*anyopaque{
@@ -1494,9 +1493,7 @@ pub fn fullGpuLaunch(
             @ptrCast(&p_total),
             @ptrCast(&p_sc_cap),
             @ptrCast(&p_tans_scratch),
-            @ptrCast(&p_tans_tok_scratch),
-            @ptrCast(&p_tans_off16_scratch),
-            @ptrCast(&p_chunk_base),
+            @ptrCast(&p_tans_slot_stride),
             @ptrCast(&p_first_sub_idx),
         };
         var extra = [_]?*anyopaque{null};
