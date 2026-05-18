@@ -43,6 +43,17 @@ __device__ uint32_t hashKey(uint32_t key, uint32_t hash_bits, uint32_t hash_mask
     return (key >> (32 - hash_bits)) & hash_mask;
 }
 
+// k=6 hash: matches CPU FastMatchHasher.init for hasher_k=6.
+// CPU's mult is fibonacci_hash_multiplier << ((8-6)*8) = 0x9E3779B97F4A7C15ULL << 16.
+// Effective value (u64 wrap): 0x79B97F4A7C150000ULL.
+// Then index = (word *% mult) >> (64 - hash_bits).
+// Text inputs use k=6 to reduce hash collisions (groups 6-byte sequences,
+// not just 4-byte). Same buckets as CPU runGreedyParser on text data.
+__device__ uint32_t hashKey6(uint64_t key, uint32_t hash_bits, uint32_t hash_mask) {
+    uint64_t product = key * 0x79B97F4A7C150000ULL;
+    return (uint32_t)(product >> (64 - hash_bits)) & hash_mask;
+}
+
 // Read up to 8 bytes at p, zero-padding if fewer than 8 remain.
 __device__ uint64_t read8safe(const uint8_t* p, uint32_t pos, uint32_t src_size) {
     uint64_t v = 0;
@@ -761,19 +772,33 @@ __device__ void scanBlock(
         uint32_t my_pos = pos + lane;
         uint32_t my_byte = (my_pos < src_size) ? (uint32_t)src[my_pos] : 0u;
 
+        // 8-byte lookahead via shfl_down. Matches CPU's runGreedyParser
+        // which reads a u64 word for hashing. Note key4 = low 32 bits.
         uint32_t b1 = __shfl_down_sync(0xFFFFFFFF, my_byte, 1);
         uint32_t b2 = __shfl_down_sync(0xFFFFFFFF, my_byte, 2);
         uint32_t b3 = __shfl_down_sync(0xFFFFFFFF, my_byte, 3);
+        uint32_t b4 = __shfl_down_sync(0xFFFFFFFF, my_byte, 4);
+        uint32_t b5 = __shfl_down_sync(0xFFFFFFFF, my_byte, 5);
+        uint32_t b6 = __shfl_down_sync(0xFFFFFFFF, my_byte, 6);
+        uint32_t b7 = __shfl_down_sync(0xFFFFFFFF, my_byte, 7);
         uint32_t key4 = my_byte | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        uint64_t key8 = (uint64_t)key4
+                      | ((uint64_t)b4 << 32) | ((uint64_t)b5 << 40)
+                      | ((uint64_t)b6 << 48) | ((uint64_t)b7 << 56);
 
         uint32_t remaining = end_pos - pos;
         uint32_t active_count;
-        if (remaining >= 32) active_count = 29;
-        else if (remaining >= 4) active_count = remaining - 3;
+        // 8-byte hash needs 7-byte lookahead (lane K needs lanes K+1..K+7).
+        if (remaining >= 32) active_count = 25;
+        else if (remaining >= 8) active_count = remaining - 7;
         else active_count = 0;
         bool is_active = (lane < active_count);
 
-        uint32_t h = hashKey(key4, hash_bits, hash_mask);
+        // CPU uses k=6 hash on text inputs (the common case for -gpu L1).
+        // Hashes 8 bytes with Fibonacci multiplier << 16, picking buckets
+        // by 6-byte sequences instead of 4-byte. Lower collision rate on
+        // text → fewer false-positive hash hits that only extend 4 bytes.
+        uint32_t h = hashKey6(key8, hash_bits, hash_mask);
 
         // ── Simulate CPU's serial hash-write order within the warp ─────
         // CPU at position P does: read ht[h(P)] (returns LAST write to
