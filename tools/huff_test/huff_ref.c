@@ -217,22 +217,58 @@ static void assign_canonical_codes(const uint8_t code_lengths[256],
     }
 }
 
-// ─── Build decode LUT ───────────────────────────────────────────────────
-// LUT entry: low 8 bits = symbol, high 8 bits = code length.
+// ─── Build decode LUT (X2 dual-symbol when both fit in MAX_CODE_LEN) ───
+// LUT entry (uint32_t):
+//   bits  0-7  : sym1
+//   bits  8-15 : sym2 (valid iff num_syms == 2)
+//   bits 16-23 : total_len (= L1 if num_syms==1, else L1+L2)
+//   bits 24-31 : num_syms (1 or 2)
+//
+// Build:
+//   1. Fill all entries with single-symbol info (sym1, L1, 1).
+//   2. For each pair (S1, S2) where L1 + L2 ≤ MAX_CODE_LEN, overwrite
+//      the entries whose prefix is C1<<...|C2<<... with (sym1, sym2,
+//      L1+L2, 2). Pass 2 takes precedence over pass 1 for those entries.
+static inline uint32_t pack_lut_entry(uint8_t sym1, uint8_t sym2,
+                                      uint8_t total_len, uint8_t num_syms) {
+    return ((uint32_t)num_syms << 24)
+         | ((uint32_t)total_len << 16)
+         | ((uint32_t)sym2 << 8)
+         | ((uint32_t)sym1);
+}
+
 static void build_decode_lut(const uint8_t code_lengths[256],
                              const uint32_t codes[256],
-                             uint16_t lut[LUT_SIZE]) {
-    memset(lut, 0, LUT_SIZE * sizeof(uint16_t));
+                             uint32_t lut[LUT_SIZE]) {
+    memset(lut, 0, LUT_SIZE * sizeof(uint32_t));
+
+    // Pass 1: single-symbol entries.
     for (int s = 0; s < 256; s++) {
         int len = code_lengths[s];
         if (len == 0) continue;
-        uint32_t code = codes[s];
-        // Left-align code to MAX_CODE_LEN bits.
-        uint32_t aligned = code << (MAX_CODE_LEN - len);
+        uint32_t aligned = codes[s] << (MAX_CODE_LEN - len);
         uint32_t span = 1u << (MAX_CODE_LEN - len);
-        uint16_t entry = (uint16_t)(((uint16_t)len << 8) | (uint16_t)s);
-        for (uint32_t i = 0; i < span; i++) {
-            lut[aligned + i] = entry;
+        uint32_t entry = pack_lut_entry((uint8_t)s, 0, (uint8_t)len, 1);
+        for (uint32_t i = 0; i < span; i++) lut[aligned + i] = entry;
+    }
+
+    // Pass 2: dual-symbol entries — overwrite when (L1 + L2) ≤ MAX_CODE_LEN.
+    for (int s1 = 0; s1 < 256; s1++) {
+        int L1 = code_lengths[s1];
+        if (L1 == 0 || L1 >= MAX_CODE_LEN) continue;
+        uint32_t C1 = codes[s1];
+        for (int s2 = 0; s2 < 256; s2++) {
+            int L2 = code_lengths[s2];
+            if (L2 == 0) continue;
+            int total = L1 + L2;
+            if (total > MAX_CODE_LEN) continue;
+            uint32_t C2 = codes[s2];
+            // Compose the prefix: C1 in top L1 bits, C2 in next L2 bits.
+            uint32_t aligned = (C1 << (MAX_CODE_LEN - L1))
+                             | (C2 << (MAX_CODE_LEN - L1 - L2));
+            uint32_t span = 1u << (MAX_CODE_LEN - total);
+            uint32_t entry = pack_lut_entry((uint8_t)s1, (uint8_t)s2, (uint8_t)total, 2);
+            for (uint32_t i = 0; i < span; i++) lut[aligned + i] = entry;
         }
     }
 }
@@ -254,7 +290,7 @@ static int huff_encode(const uint8_t *in, size_t n,
 
 // ─── Decode ─────────────────────────────────────────────────────────────
 static int huff_decode(const uint8_t *in, size_t in_bytes,
-                       const uint16_t lut[LUT_SIZE],
+                       const uint32_t lut[LUT_SIZE],
                        uint8_t *out, size_t expected_out_bytes) {
     uint64_t bit_buf = 0;
     int bit_count = 0;
@@ -262,22 +298,35 @@ static int huff_decode(const uint8_t *in, size_t in_bytes,
     size_t out_pos = 0;
 
     while (out_pos < expected_out_bytes) {
-        // Refill: ensure at least MAX_CODE_LEN bits in buffer.
         while (bit_count < MAX_CODE_LEN && in_pos < in_bytes) {
             bit_buf = (bit_buf << 8) | (uint64_t)in[in_pos++];
             bit_count += 8;
         }
         if (bit_count < MAX_CODE_LEN) {
-            // Pad with zeros (last codeword may need padding).
             bit_buf <<= (MAX_CODE_LEN - bit_count);
             bit_count = MAX_CODE_LEN;
         }
         uint32_t idx = (uint32_t)((bit_buf >> (bit_count - MAX_CODE_LEN)) & (LUT_SIZE - 1));
-        uint16_t entry = lut[idx];
-        int len = entry >> 8;
-        if (len == 0) return -1;  // invalid stream
+        uint32_t entry = lut[idx];
+        int total_len = (entry >> 16) & 0xFF;
+        int num_syms  = (entry >> 24) & 0xFF;
+        if (total_len == 0) return -1;
         out[out_pos++] = (uint8_t)(entry & 0xFF);
-        bit_count -= len;
+        // Second symbol only if room and entry is dual.
+        if (num_syms == 2 && out_pos < expected_out_bytes) {
+            out[out_pos++] = (uint8_t)((entry >> 8) & 0xFF);
+            bit_count -= total_len;
+        } else if (num_syms == 2) {
+            // Dual entry but only 1 byte of output left — fall back to L1 only.
+            // L1 = total_len - L2. We don't store L1 separately; instead the
+            // single-symbol entry for the same prefix would have consumed L1.
+            // For simplicity: re-lookup using a smaller window. But cheaper:
+            // since this only happens at most once (last position), accept the
+            // cost of consuming total_len bits and assert no underflow.
+            bit_count -= total_len;
+        } else {
+            bit_count -= total_len;
+        }
     }
     return (int)out_pos;
 }
@@ -324,7 +373,7 @@ static int huff_encode_4s(const uint8_t *in, size_t n,
 }
 
 static int huff_decode_4s(const uint8_t *in, size_t in_bytes,
-                          const uint16_t lut[LUT_SIZE],
+                          const uint32_t lut[LUT_SIZE],
                           uint8_t *out, size_t expected_out_bytes) {
     if (in_bytes < HUFF_4S_HDR_BYTES) return -1;
     uint32_t sizes[4];
@@ -390,7 +439,7 @@ static int huff_encode_ns(int N,
 
 static int huff_decode_ns(int N,
                           const uint8_t *in, size_t in_bytes,
-                          const uint16_t lut[LUT_SIZE],
+                          const uint32_t lut[LUT_SIZE],
                           uint8_t *out, size_t expected_out_bytes) {
     size_t hdr_bytes = (size_t)(N - 1) * 3;
     if (in_bytes < hdr_bytes) return -1;
@@ -427,7 +476,7 @@ static int roundtrip_test(const char *name, const uint8_t *src, size_t n) {
 
     uint8_t  code_lengths[256] = {0};
     uint32_t codes[256] = {0};
-    uint16_t *lut = (uint16_t*)malloc(LUT_SIZE * sizeof(uint16_t));
+    uint32_t *lut = (uint32_t*)malloc(LUT_SIZE * sizeof(uint32_t));
     if (!lut) { printf("[%s] alloc failed\n", name); return 1; }
 
     int max_len = build_code_lengths(hist, code_lengths);

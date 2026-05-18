@@ -20,7 +20,7 @@
 
 static constexpr int MAX_CODE_LEN = 11;
 static constexpr int LUT_SIZE     = 1 << MAX_CODE_LEN;  // 2048
-static constexpr int LUT_BYTES    = LUT_SIZE * sizeof(uint16_t);  // 4096
+static constexpr int LUT_BYTES    = LUT_SIZE * sizeof(uint32_t);  // 4096
 
 struct HuffBlockDesc {
     uint32_t in_offset;     // byte offset in compressed buffer (points at 9-byte header)
@@ -37,7 +37,7 @@ struct HuffBlockDesc {
 // internal error).
 __device__ __forceinline__ uint32_t decode_stream_one_lane(
     const uint8_t* __restrict__ in, uint32_t in_size,
-    const uint16_t* __restrict__ lut,
+    const uint32_t* __restrict__ lut,
     uint8_t* __restrict__ out, uint32_t out_size)
 {
     // Top-aligned bit buffer: bits [63 .. 64-bit_count] are valid, lower
@@ -47,13 +47,13 @@ __device__ __forceinline__ uint32_t decode_stream_one_lane(
     uint32_t in_pos = 0;
     uint32_t out_pos = 0;
 
-    // ── Hot loop: 2 symbols per iter ──
-    // N=2 requires up to 2 × MAX_CODE_LEN = 22 bits per iter. A 4-byte
-    // refill from bit_count=0 yields 32 bits — comfortably > 22, so the
-    // refill can fire when bit_count drops below 22 with no underflow.
+    // ── Hot loop: 1 LUT lookup per iter, but it emits 1 OR 2 symbols ──
+    // Each lookup consumes up to MAX_CODE_LEN bits (max 11). A 4-byte
+    // refill from bit_count=0 yields 32 bits — comfortably > 11.
+    // We require enough output room for 2 symbols (the lookup may emit 2).
     while (out_pos + 2 <= out_size) {
-        if (bit_count < 22) {
-            if (in_pos + 4 > in_size) break;  // drop to tail
+        if (bit_count < MAX_CODE_LEN) {
+            if (in_pos + 4 > in_size) break;
             uint32_t v = ((uint32_t)in[in_pos    ] << 24)
                        | ((uint32_t)in[in_pos + 1] << 16)
                        | ((uint32_t)in[in_pos + 2] <<  8)
@@ -62,22 +62,21 @@ __device__ __forceinline__ uint32_t decode_stream_one_lane(
             bit_count += 32;
             in_pos += 4;
         }
-        uint16_t e0 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
-        int len0 = e0 >> 8;
-        if (len0 == 0) return 0;
-        bit_buf <<= len0; bit_count -= len0;
-
-        uint16_t e1 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
-        int len1 = e1 >> 8;
-        if (len1 == 0) return 0;
-        bit_buf <<= len1; bit_count -= len1;
-
-        out[out_pos    ] = (uint8_t)(e0 & 0xFF);
-        out[out_pos + 1] = (uint8_t)(e1 & 0xFF);
-        out_pos += 2;
+        uint32_t e = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int total_len = (e >> 16) & 0xFF;
+        int num_syms  = (e >> 24) & 0xFF;
+        if (total_len == 0) return 0;
+        // Always write both bytes — sym2 is harmless when num_syms==1 because
+        // the next iteration overwrites out[out_pos+1] with its own sym1.
+        // Guard at end-of-buffer handled by the outer condition (out_pos + 2 <= out_size).
+        out[out_pos]     = (uint8_t)(e & 0xFF);
+        out[out_pos + 1] = (uint8_t)((e >> 8) & 0xFF);
+        out_pos += num_syms;
+        bit_buf <<= total_len;
+        bit_count -= total_len;
     }
 
-    // ── Tail loop: 1 symbol per iter ──
+    // ── Tail loop: handles last 1-2 bytes; clamps dual entries to single ──
     while (out_pos < out_size) {
         if (bit_count <= 32 && in_pos + 4 <= in_size) {
             uint32_t v = ((uint32_t)in[in_pos    ] << 24)
@@ -93,13 +92,18 @@ __device__ __forceinline__ uint32_t decode_stream_one_lane(
             bit_count += 8;
         }
         if (bit_count < MAX_CODE_LEN) bit_count = MAX_CODE_LEN;
-        uint32_t idx = (uint32_t)(bit_buf >> (64 - MAX_CODE_LEN));
-        uint16_t entry = lut[idx];
-        int len = entry >> 8;
-        if (len == 0) return 0;
-        out[out_pos++] = (uint8_t)(entry & 0xFF);
-        bit_buf <<= len;
-        bit_count -= len;
+        uint32_t e = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int total_len = (e >> 16) & 0xFF;
+        int num_syms  = (e >> 24) & 0xFF;
+        if (total_len == 0) return 0;
+        out[out_pos++] = (uint8_t)(e & 0xFF);
+        if (num_syms == 2 && out_pos < out_size) {
+            out[out_pos++] = (uint8_t)((e >> 8) & 0xFF);
+        }
+        // Even if we clamped to single output, we still consumed total_len
+        // bits — see CPU reference rationale (only happens at end-of-stream).
+        bit_buf <<= total_len;
+        bit_count -= total_len;
     }
     return out_pos;
 }
@@ -296,7 +300,7 @@ extern "C" __global__ void huffEncode32StreamKernel(
 extern "C" __global__ void huffDecode32StreamKernel(
     const uint8_t* __restrict__ comp,
     const HuffBlockDesc* __restrict__ descs,
-    const uint16_t* __restrict__ luts,
+    const uint32_t* __restrict__ luts,
     uint8_t* __restrict__ output,
     uint32_t n_blocks)
 {
@@ -306,8 +310,8 @@ extern "C" __global__ void huffDecode32StreamKernel(
     const HuffBlockDesc desc = descs[block_id];
 
     // Cooperative LUT load.
-    extern __shared__ uint16_t shared_lut[];
-    const uint16_t* src_lut = luts + desc.lut_offset;
+    extern __shared__ uint32_t shared_lut[];
+    const uint32_t* src_lut = luts + desc.lut_offset;
     for (int i = lane; i < LUT_SIZE; i += 32) shared_lut[i] = src_lut[i];
     __syncwarp();
 
@@ -360,7 +364,7 @@ extern "C" __global__ void huffDecode32StreamKernel(
 extern "C" __global__ void huffDecode4StreamKernel(
     const uint8_t* __restrict__ comp,
     const HuffBlockDesc* __restrict__ descs,
-    const uint16_t* __restrict__ luts,
+    const uint32_t* __restrict__ luts,
     uint8_t* __restrict__ output,
     uint32_t n_blocks)
 {
@@ -371,8 +375,8 @@ extern "C" __global__ void huffDecode4StreamKernel(
     const HuffBlockDesc desc = descs[block_id];
 
     // Load LUT cooperatively into shared memory (2048 × 2 = 4096 bytes).
-    extern __shared__ uint16_t shared_lut[];
-    const uint16_t* src_lut = luts + desc.lut_offset;
+    extern __shared__ uint32_t shared_lut[];
+    const uint32_t* src_lut = luts + desc.lut_offset;
     for (int i = lane; i < LUT_SIZE; i += 32) {
         shared_lut[i] = src_lut[i];
     }

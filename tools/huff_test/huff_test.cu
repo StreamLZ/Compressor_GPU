@@ -27,7 +27,7 @@ static int test_gpu_decode_one(const char *name, const uint8_t *src, size_t n) {
 
     uint8_t code_lengths[256] = {0};
     uint32_t codes[256] = {0};
-    uint16_t *lut = (uint16_t*)malloc(LUT_SIZE * sizeof(uint16_t));
+    uint32_t *lut = (uint32_t*)malloc(LUT_SIZE * sizeof(uint32_t));
 
     int max_len = build_code_lengths(hist, code_lengths);
     if (max_len > MAX_CODE_LEN) {
@@ -46,7 +46,7 @@ static int test_gpu_decode_one(const char *name, const uint8_t *src, size_t n) {
 
     // GPU buffers
     uint8_t *d_comp, *d_out;
-    uint16_t *d_lut;
+    uint32_t *d_lut;
     HuffBlockDesc *d_descs;
     CK(cudaMalloc(&d_comp, enc_bytes));
     CK(cudaMalloc(&d_out, n));
@@ -94,7 +94,7 @@ static void bench_gpu_decode_parallel(const uint8_t *src, size_t n_per_block, in
 
     uint8_t code_lengths[256] = {0};
     uint32_t codes[256] = {0};
-    uint16_t *lut = (uint16_t*)malloc(LUT_SIZE * sizeof(uint16_t));
+    uint32_t *lut = (uint32_t*)malloc(LUT_SIZE * sizeof(uint32_t));
 
     int max_len = build_code_lengths(hist, code_lengths);
     if (max_len > MAX_CODE_LEN) height_limit(hist, code_lengths, MAX_CODE_LEN);
@@ -120,7 +120,7 @@ static void bench_gpu_decode_parallel(const uint8_t *src, size_t n_per_block, in
     }
 
     uint8_t *d_comp, *d_out;
-    uint16_t *d_lut;
+    uint32_t *d_lut;
     HuffBlockDesc *d_descs;
     CK(cudaMalloc(&d_comp, total_comp));
     CK(cudaMalloc(&d_out, total_out));
@@ -188,7 +188,7 @@ static void bench_gpu_encode_parallel(const uint8_t *src, size_t n_per_block, in
     size_t total_enc = enc_cap_per * n_blocks;
 
     uint8_t *d_input, *d_scratch, *d_enc_out;
-    uint16_t *d_lut_unused;
+    uint32_t *d_lut_unused;
     uint32_t *d_codes;
     uint8_t  *d_code_lengths;
     HuffBlockDesc *d_descs;
@@ -257,7 +257,7 @@ static int test_gpu_encode_decode(const char *name, const uint8_t *src, size_t n
     for (size_t i = 0; i < n; i++) hist[src[i]]++;
     uint8_t code_lengths[256] = {0};
     uint32_t codes[256] = {0};
-    uint16_t *lut = (uint16_t*)malloc(LUT_BYTES);
+    uint32_t *lut = (uint32_t*)malloc(LUT_BYTES);
     int max_len = build_code_lengths(hist, code_lengths);
     if (max_len > MAX_CODE_LEN) height_limit(hist, code_lengths, MAX_CODE_LEN);
     assign_canonical_codes(code_lengths, codes);
@@ -265,7 +265,7 @@ static int test_gpu_encode_decode(const char *name, const uint8_t *src, size_t n
 
     // GPU buffers.
     uint8_t  *d_input, *d_scratch, *d_enc_out, *d_dec_out;
-    uint16_t *d_lut;
+    uint32_t *d_lut;
     uint32_t *d_codes;
     uint8_t  *d_code_lengths;
     HuffBlockDesc *d_descs_enc, *d_descs_dec;
@@ -344,14 +344,14 @@ static int test_gpu_encode_decode_32s(const char *name, const uint8_t *src, size
     for (size_t i = 0; i < n; i++) hist[src[i]]++;
     uint8_t code_lengths[256] = {0};
     uint32_t codes[256] = {0};
-    uint16_t *lut = (uint16_t*)malloc(LUT_BYTES);
+    uint32_t *lut = (uint32_t*)malloc(LUT_BYTES);
     int max_len = build_code_lengths(hist, code_lengths);
     if (max_len > MAX_CODE_LEN) height_limit(hist, code_lengths, MAX_CODE_LEN);
     assign_canonical_codes(code_lengths, codes);
     build_decode_lut(code_lengths, codes, lut);
 
     uint8_t *d_input, *d_scratch, *d_enc_out, *d_dec_out;
-    uint16_t *d_lut;
+    uint32_t *d_lut;
     uint32_t *d_codes;
     uint8_t  *d_code_lengths;
     HuffBlockDesc *d_descs_enc, *d_descs_dec;
@@ -427,7 +427,7 @@ static void bench_gpu_decode_32s_parallel(const uint8_t *src, size_t n_per_block
     for (size_t i = 0; i < n_per_block; i++) hist[src[i]]++;
     uint8_t code_lengths[256] = {0};
     uint32_t codes[256] = {0};
-    uint16_t *lut = (uint16_t*)malloc(LUT_BYTES);
+    uint32_t *lut = (uint32_t*)malloc(LUT_BYTES);
     int max_len = build_code_lengths(hist, code_lengths);
     if (max_len > MAX_CODE_LEN) height_limit(hist, code_lengths, MAX_CODE_LEN);
     assign_canonical_codes(code_lengths, codes);
@@ -453,7 +453,7 @@ static void bench_gpu_decode_32s_parallel(const uint8_t *src, size_t n_per_block
     }
 
     uint8_t *d_comp, *d_out;
-    uint16_t *d_lut;
+    uint32_t *d_lut;
     HuffBlockDesc *d_descs;
     CK(cudaMalloc(&d_comp, total_comp));
     CK(cudaMalloc(&d_out, total_out));
