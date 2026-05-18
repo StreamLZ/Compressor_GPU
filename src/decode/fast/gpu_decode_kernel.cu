@@ -65,12 +65,16 @@ __device__ uint32_t readLength(const uint8_t* len_data, uint32_t &len_off, uint3
 // No off32, no delta, no block split — fastest path for L1 data.
 // Register-optimized: uses uint32 offsets instead of 64-bit pointers,
 // removes redundant bounds checks and shuffles.
+// Templated on OFF16_SPLIT so the compiler dead-code-eliminates the
+// unused branch and the unused off16_hi/lo pointer params for raw L1
+// input. Restores the register pressure that crept in when
+// entropy-coded off16 split-streams were added.
+template <bool OFF16_SPLIT>
 __device__ void decodeSubChunkL1(
     const uint8_t* __restrict__ cmd, uint32_t cmd_size,
     const uint8_t* __restrict__ lit, uint32_t lit_size,
     const uint8_t* __restrict__ off16_raw, uint32_t off16_count,
     const uint8_t* __restrict__ off16_hi, const uint8_t* __restrict__ off16_lo,
-    uint32_t off16_split,
     const uint8_t* __restrict__ len_data, uint32_t len_avail,
     uint8_t* __restrict__ dst, uint32_t dst_size,
     uint32_t initial_copy,
@@ -102,7 +106,7 @@ __device__ void decodeSubChunkL1(
                 use_recent = (token >> 7) & 1;
                 if (!use_recent && off16_pos < off16_count) {
                     uint16_t v;
-                    if (off16_split) {
+                    if (OFF16_SPLIT) {
                         v = (uint16_t)off16_lo[off16_pos] | ((uint16_t)off16_hi[off16_pos] << 8);
                     } else {
                         memcpy(&v, off16_raw + off16_pos * 2, 2);
@@ -117,7 +121,7 @@ __device__ void decodeSubChunkL1(
                 match_len = readLength(len_data, len_off, len_avail) + LONG_NEAR_BASE;
                 if (off16_pos < off16_count) {
                     uint16_t v;
-                    if (off16_split) {
+                    if (OFF16_SPLIT) {
                         v = (uint16_t)off16_lo[off16_pos] | ((uint16_t)off16_hi[off16_pos] << 8);
                     } else {
                         memcpy(&v, off16_raw + off16_pos * 2, 2);
@@ -766,15 +770,30 @@ __device__ void parseAndDecodeSubChunk(
                          tans_tok_scratch_chunk, tans_off16_scratch_chunk, ps);
 
     if (mode == 1 && ps.off32_count1 == 0 && ps.off32_count2 == 0) {
-        decodeSubChunkL1(
-            ps.cmd_ptr, ps.cmd_size,
-            ps.lit_ptr, ps.lit_size,
-            ps.off16_raw, ps.off16_count,
-            ps.off16_hi, ps.off16_lo, ps.off16_split,
-            ps.len_stream, ps.len_avail,
-            dst, sc_decomp_size, ps.initial_copy,
-            dst_offset
-        );
+        // Compile-time dispatch on off16_split: lets the compiler
+        // eliminate the unused branch + the unused pointer params for
+        // the raw-off16 case (the common L1 path).
+        if (ps.off16_split) {
+            decodeSubChunkL1<true>(
+                ps.cmd_ptr, ps.cmd_size,
+                ps.lit_ptr, ps.lit_size,
+                ps.off16_raw, ps.off16_count,
+                ps.off16_hi, ps.off16_lo,
+                ps.len_stream, ps.len_avail,
+                dst, sc_decomp_size, ps.initial_copy,
+                dst_offset
+            );
+        } else {
+            decodeSubChunkL1<false>(
+                ps.cmd_ptr, ps.cmd_size,
+                ps.lit_ptr, ps.lit_size,
+                ps.off16_raw, ps.off16_count,
+                ps.off16_hi, ps.off16_lo,
+                ps.len_stream, ps.len_avail,
+                dst, sc_decomp_size, ps.initial_copy,
+                dst_offset
+            );
+        }
     } else {
         decodeSubChunk(
             ps.cmd_ptr, ps.cmd_size,
