@@ -253,7 +253,9 @@ __device__ void decodeSubChunk(
                 token_type = 4;
                 match_len = readLength(len_data, len_off, len_avail) + LONG_FAR_BASE;
                 if (off32_pos < off32_count_cur) {
-                    uint32_t v; memcpy(&v, off32_cur + off32_pos * 4, 4);
+                    // off32 entries are 3 bytes each (encoder writes byte triples).
+                    const uint8_t* p = off32_cur + off32_pos * 3;
+                    uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
                     match_offset = (int32_t)block_dst_start - (int32_t)v - (int32_t)dst_pos;
                     off32_pos++;
                 }
@@ -262,7 +264,9 @@ __device__ void decodeSubChunk(
                 token_type = 3;
                 match_len = token + SHORT_FAR_BASE;
                 if (off32_pos < off32_count_cur) {
-                    uint32_t v; memcpy(&v, off32_cur + off32_pos * 4, 4);
+                    // off32 entries are 3 bytes each (encoder writes byte triples).
+                    const uint8_t* p = off32_cur + off32_pos * 3;
+                    uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
                     match_offset = (int32_t)block_dst_start - (int32_t)v - (int32_t)dst_pos;
                     off32_pos++;
                 }
