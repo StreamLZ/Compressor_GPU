@@ -112,19 +112,22 @@ pub const CompressChunkDesc = extern struct {
     is_first: u32,
 };
 
-/// Hash bits per level. Sized for 64KB blocks (sc_group=0.25):
-/// larger tables don't help ratio but waste VRAM and slow down init.
-/// L1-L2 use shared memory; L3+ use global memory.
+/// Hash bits per level. Mirrors CPU `fast_framed.zig:955-963` engine-level
+/// cap so GPU L1/L2/L3/L4/L5 produce hash distributions equivalent to CPU
+/// L1/L2/L3/L4/L5 (modulo warp-parallel scan).
+///
+/// User L1 -> engine -2 -> cap 17
+/// User L2 -> engine -1 -> cap 18
+/// User L3 -> engine  1 -> cap 19
+/// User L4 -> engine  2 -> cap 20
+/// User L5 -> engine  4 -> 20 (no cap from engine; matches CPU practical)
 fn hashBitsForLevel(level: u8) u32 {
-    // L1 was 11 (2K shared-mem entries) — far too many collisions; GPU
-    // L1 ratio was 64% vs CPU 53-58%. Bumped to 14 (same as L2). Global
-    // hash needed since 14 bits → 64KB per block exceeds shared-mem.
     return switch (level) {
-        1 => 14,
-        2 => 14,
-        3 => 17,
-        4 => 18,
-        5 => 18,
+        1 => 17,
+        2 => 18,
+        3 => 19,
+        4 => 20,
+        5 => 20,
         else => 11,
     };
 }
