@@ -779,7 +779,11 @@ __device__ void scanBlock(
 
         if (is_active) {
             uint32_t ref_val = ht[h];
-            if (ref_val != HASH_EMPTY && ref_val < my_pos && (my_pos - ref_val) <= 0xFFFF) {
+            // CPU L1 requires offset >= 8 (MIN_FAR_OFFSET) and uses the
+            // adaptive min_match_length_table to gate matches at distant
+            // offsets. No GPU-only `<= 0xFFFF` cap (within an L1 sub-chunk
+            // all offsets are <= 64K anyway, so the cap was dead code).
+            if (ref_val != HASH_EMPTY && ref_val + 8 <= my_pos) {
                 uint32_t rk = (uint32_t)src[ref_val] |
                              ((uint32_t)src[ref_val+1] << 8) |
                              ((uint32_t)src[ref_val+2] << 16) |
@@ -791,43 +795,113 @@ __device__ void scanBlock(
             }
         }
 
-        uint32_t warp_match = __match_any_sync(0xFFFFFFFF, key4);
-        uint32_t active_mask = __ballot_sync(0xFFFFFFFF, is_active);
-        warp_match &= active_mask;
-        uint32_t lower_mask = warp_match & ((1u << lane) - 1);
-
-        bool has_match = hash_match;
-        uint32_t my_ref = hash_ref;
-
-        if (is_active && lower_mask != 0) {
-            uint32_t intra_lane = __ffs(lower_mask) - 1;
-            has_match = true;
-            my_ref = pos + intra_lane;
+        // ── CPU secondary match attempts ──────────────────────────────
+        // After a hash miss, CPU runGreedyParser tries (in order):
+        //   (1) 1-byte XOR pattern: if bytes 1..3 of cursor match bytes 1..3
+        //       of cursor + recent_offset → match at cursor+1 with len ≥ 3,
+        //       offset = recent_offset (use_recent flag at decode).
+        //   (2) -8 fixed offset: if 4 bytes at cursor match 4 bytes at
+        //       cursor - 8 → match at cursor with offset = 8.
+        // Each lane checks both independently. Match-type is tracked so we
+        // can dispatch correctly when a lane wins the ballot.
+        // Encoding for my_match_type: 0 = hash, 1 = xor (cursor+1), 2 = -8.
+        bool xor_match = false;
+        bool eight_match = false;
+        if (is_active && !hash_match && recent_offset < 0) {
+            uint32_t ro_dist = (uint32_t)(-recent_offset);
+            if (my_pos >= ro_dist) {
+                uint32_t ref = my_pos - ro_dist;
+                uint32_t recent_word = (uint32_t)src[ref] |
+                                      ((uint32_t)src[ref+1] << 8) |
+                                      ((uint32_t)src[ref+2] << 16) |
+                                      ((uint32_t)src[ref+3] << 24);
+                uint32_t xor_v = key4 ^ recent_word;
+                if ((xor_v & 0xFFFFFF00u) == 0) {
+                    // Bytes 1..3 of cursor == bytes 1..3 of cursor+recent_offset.
+                    // Match starts at cursor+1, length ≥ 3, offset = recent.
+                    // Also need cursor+1+3 ≤ end_pos to safely read the match.
+                    if (my_pos + 1 + 3 <= end_pos) {
+                        xor_match = true;
+                    }
+                }
+            }
+        }
+        if (is_active && !hash_match && !xor_match && my_pos >= 8) {
+            uint32_t eight_ref = my_pos - 8;
+            uint32_t eight_word = (uint32_t)src[eight_ref] |
+                                 ((uint32_t)src[eight_ref+1] << 8) |
+                                 ((uint32_t)src[eight_ref+2] << 16) |
+                                 ((uint32_t)src[eight_ref+3] << 24);
+            if (eight_word == key4) eight_match = true;
         }
 
+        bool has_match = hash_match || xor_match || eight_match;
+        // Pack match type into my_ref's upper bits when needed below.
+        // 0 = hash (hash_ref), 1 = xor, 2 = eight
+        uint32_t my_match_type = hash_match ? 0u : (xor_match ? 1u : (eight_match ? 2u : 0u));
+        uint32_t my_ref = hash_ref;
         uint32_t match_ballot = __ballot_sync(0xFFFFFFFF, has_match);
 
+        // CPU runGreedyParser advances by an adaptive step on no match:
+        //   step = (dist < 128) ? 1 : min((dist >> 7) + 1, 16)
+        // where dist = source_cursor - literal_start. When matches happen,
+        // step is always 1 (every position gets a hash probe). Only when
+        // no match is found does CPU stride forward, accelerating when
+        // the literal run is already long.
+        uint32_t no_match_step = 1;
+        if (match_ballot == 0) {
+            uint32_t dist = pos - anchor;
+            if (dist >= 128) {
+                uint32_t s = (dist >> 7) + 1;
+                no_match_step = (s > 16) ? 16 : s;
+            }
+        }
+
+        // Hash-table writes mirror CPU: write the bucket for every position
+        // CPU would have visited (= lane positions up to and including the
+        // first-match lane, or up to no_match_step-1 if no match).
         {
             uint32_t write_limit = (match_ballot != 0)
-                ? (uint32_t)(__ffs(match_ballot) - 1) : active_count;
+                ? (uint32_t)(__ffs(match_ballot) - 1)
+                : (no_match_step - 1);
             if (is_active && lane <= write_limit) {
                 ht[h] = my_pos;
             }
         }
 
         if (match_ballot == 0) {
-            pos += active_count;
+            pos += no_match_step;
             continue;
         }
 
         uint32_t first_lane = __ffs(match_ballot) - 1;
-        uint32_t match_pos = pos + first_lane;
-        uint32_t match_ref = __shfl_sync(0xFFFFFFFF, my_ref, first_lane);
+        uint32_t winning_type = __shfl_sync(0xFFFFFFFF, my_match_type, first_lane);
+        uint32_t match_pos;
+        uint32_t match_ref;
+        uint32_t min_match_len;
 
-        // Match extension capped at end_pos (block boundary)
-        uint32_t match_len = MIN_MATCH;
+        if (winning_type == 0) {
+            // Hash match: starts at first_lane, ref from hash table.
+            match_pos = pos + first_lane;
+            match_ref = __shfl_sync(0xFFFFFFFF, my_ref, first_lane);
+            min_match_len = MIN_MATCH;
+        } else if (winning_type == 1) {
+            // XOR recent-offset: match starts at first_lane + 1,
+            // ref at match_pos + recent_offset (= match_pos - |recent_offset|).
+            match_pos = pos + first_lane + 1;
+            match_ref = match_pos - (uint32_t)(-recent_offset);
+            min_match_len = 3;  // 3 bytes guaranteed by xor check
+        } else {
+            // -8 fixed offset: match starts at first_lane with offset 8.
+            match_pos = pos + first_lane;
+            match_ref = match_pos - 8;
+            min_match_len = MIN_MATCH;
+        }
+
+        // Match extension from min_match_len, capped at end_pos.
+        uint32_t match_len = min_match_len;
         uint32_t max_match = end_pos - match_pos;
-        for (uint32_t ext = MIN_MATCH; ext < max_match; ext += 32) {
+        for (uint32_t ext = min_match_len; ext < max_match; ext += 32) {
             uint32_t check = ext + lane;
             bool mm;
             if (check >= max_match)
@@ -856,6 +930,27 @@ __device__ void scanBlock(
                 pos = match_pos + 1;
                 continue;
             }
+
+            // ── Backward extension ──
+            // Walk match_pos / match_ref backward while bytes still equal.
+            // Reduces literal-run length and grows the match, often
+            // collapsing two tokens (literal-bearing + match) into one.
+            // Lane-0 serial; cheap because matches typically extend
+            // back only a few bytes.
+            uint32_t bw_steps = 0;
+            if (lane == 0) {
+                uint32_t mp = match_pos;
+                uint32_t mr = match_ref;
+                while (mp > anchor && mr > 0 && src[mp - 1] == src[mr - 1]) {
+                    mp--;
+                    mr--;
+                    bw_steps++;
+                }
+            }
+            bw_steps = __shfl_sync(0xFFFFFFFF, bw_steps, 0);
+            match_pos -= bw_steps;
+            match_ref -= bw_steps;
+            match_len += bw_steps;
 
             uint32_t lit_len = match_pos - anchor;
             for (uint32_t i = lane; i < lit_len; i += 32)
