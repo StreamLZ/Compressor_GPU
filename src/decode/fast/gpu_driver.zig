@@ -189,6 +189,10 @@ var d_descs_persist_size: usize = 0;
 
 pub var last_kernel_ns: i64 = 0;
 pub var last_tans_kernel_ns: i64 = 0;
+/// Set when SLZ_SPLIT_TIMER=1 — separated Pass 1 (tANS pre-decode) vs
+/// Pass 2 (LZ kernel) wall time. last_tans_kernel_ns = tANS only,
+/// last_lz_kernel_ns = LZ only. Costs a stream sync between them.
+pub var last_lz_kernel_ns: i64 = 0;
 
 fn ensureDeviceBuf(ptr: *CUdeviceptr, current_size: *usize, needed: usize) bool {
     if (current_size.* >= needed) return true;
@@ -1260,12 +1264,24 @@ pub fn fullGpuLaunch(
         // Operations within a stream are ordered; across streams they can overlap
         const stream_sync_fn = cuStreamSync_fn orelse return error.BadMode;
 
+        // SLZ_SPLIT_TIMER=1: sync between tANS Pass-1 and LZ Pass-2 in each
+        // pipeline group so we can measure them separately. Costs a stream
+        // sync per group but exposes the tANS-vs-LZ time breakdown.
+        const split_timer = std.c.getenv("SLZ_SPLIT_TIMER") != null;
+        var split_tans_ns: i64 = 0;
+        var split_lz_ns: i64 = 0;
+
         for (0..NUM_PIPELINE_STREAMS) |g| {
             const stream = pipeline_streams[g];
             const chunk_start = @as(u32, @intCast(g)) * pipe_chunk_count;
             const chunk_end = @min(chunk_start + pipe_chunk_count, total_chunks);
             const group_chunks = chunk_end - chunk_start;
             if (group_chunks == 0) continue;
+
+            const t_tans_start = if (split_timer)
+                if (io) |io_val| std.Io.Clock.awake.now(io_val) else null
+            else
+                null;
 
             // tANS build + decode for this group's descriptors
             const tc = group_tans_count[g];
@@ -1413,6 +1429,21 @@ pub fn fullGpuLaunch(
                 }
             }
 
+            // Split timer: sync after tANS so we can attribute time to Pass 1.
+            if (split_timer) {
+                _ = stream_sync_fn(stream);
+                if (t_tans_start) |ts_start| {
+                    if (io) |io_val| {
+                        split_tans_ns += @intCast(ts_start.untilNow(io_val, .awake).toNanoseconds());
+                    }
+                }
+            }
+
+            const t_lz_start = if (split_timer)
+                if (io) |io_val| std.Io.Clock.awake.now(io_val) else null
+            else
+                null;
+
             // LZ decode for this group's chunks
             // chunks pointer = full array (NOT offset), chunk_base = chunk_start
             // total = chunk_end so the kernel's bounds check (chunk_idx >= total) works
@@ -1473,6 +1504,15 @@ pub fn fullGpuLaunch(
                 if (launch_fn(kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra) != CUDA_SUCCESS)
                     return error.BadMode;
             }
+
+            if (split_timer) {
+                _ = stream_sync_fn(stream);
+                if (t_lz_start) |ts_start| {
+                    if (io) |io_val| {
+                        split_lz_ns += @intCast(ts_start.untilNow(io_val, .awake).toNanoseconds());
+                    }
+                }
+            }
         }
 
         // Sync all pipeline streams
@@ -1526,7 +1566,13 @@ pub fn fullGpuLaunch(
         if (t_before_kern) |t_start| {
             if (io) |io_val| {
                 last_kernel_ns = @intCast(t_start.untilNow(io_val, .awake).toNanoseconds());
-                last_tans_kernel_ns = last_kernel_ns; // pipelined, report combined time
+                if (split_timer) {
+                    last_tans_kernel_ns = split_tans_ns;
+                    last_lz_kernel_ns = split_lz_ns;
+                } else {
+                    last_tans_kernel_ns = last_kernel_ns; // pipelined, report combined time
+                    last_lz_kernel_ns = 0;
+                }
             }
         }
     } else {
