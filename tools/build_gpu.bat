@@ -11,6 +11,16 @@ echo Also generating PTX...
 nvcc -ptx -o "%OUT%.ptx" "%SRC%" -arch=sm_89 -O3
 
 echo.
+echo Compiling GPU Huffman decode kernel...
+set HUFF_SRC=%~dp0..\src\decode\fast\gpu_huff_decode_kernel.cu
+set HUFF_OUT=%~dp0..\src\decode\fast\gpu_huff_decode_kernel
+nvcc -cubin -o "%HUFF_OUT%.cubin" "%HUFF_SRC%" -arch=sm_89 -O3
+echo NVCC Huff exit code: %ERRORLEVEL%
+cuobjdump -res-usage "%HUFF_OUT%.cubin"
+nvcc -ptx -o "%HUFF_OUT%.ptx" "%HUFF_SRC%" -arch=sm_89 -O3
+echo Huff PTX exit code: %ERRORLEVEL%
+
+echo.
 echo Compiling Vulkan SPIR-V...
 set COMP=%~dp0..\src\decode\fast\gpu_decode_kernel.comp
 set SPV=%~dp0..\src\decode\fast\gpu_decode_kernel.spv
