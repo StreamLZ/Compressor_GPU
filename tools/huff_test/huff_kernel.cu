@@ -47,8 +47,38 @@ __device__ __forceinline__ uint32_t decode_stream_one_lane(
     uint32_t in_pos = 0;
     uint32_t out_pos = 0;
 
+    // ── Hot loop: 2 symbols per iter ──
+    // N=2 requires up to 2 × MAX_CODE_LEN = 22 bits per iter. A 4-byte
+    // refill from bit_count=0 yields 32 bits — comfortably > 22, so the
+    // refill can fire when bit_count drops below 22 with no underflow.
+    while (out_pos + 2 <= out_size) {
+        if (bit_count < 22) {
+            if (in_pos + 4 > in_size) break;  // drop to tail
+            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
+                       | ((uint32_t)in[in_pos + 1] << 16)
+                       | ((uint32_t)in[in_pos + 2] <<  8)
+                       | ((uint32_t)in[in_pos + 3]);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            in_pos += 4;
+        }
+        uint16_t e0 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len0 = e0 >> 8;
+        if (len0 == 0) return 0;
+        bit_buf <<= len0; bit_count -= len0;
+
+        uint16_t e1 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len1 = e1 >> 8;
+        if (len1 == 0) return 0;
+        bit_buf <<= len1; bit_count -= len1;
+
+        out[out_pos    ] = (uint8_t)(e0 & 0xFF);
+        out[out_pos + 1] = (uint8_t)(e1 & 0xFF);
+        out_pos += 2;
+    }
+
+    // ── Tail loop: 1 symbol per iter ──
     while (out_pos < out_size) {
-        // 4-byte fast refill: fires when ≤ 32 bits remain AND ≥ 4 input bytes available.
         if (bit_count <= 32 && in_pos + 4 <= in_size) {
             uint32_t v = ((uint32_t)in[in_pos    ] << 24)
                        | ((uint32_t)in[in_pos + 1] << 16)
@@ -58,7 +88,6 @@ __device__ __forceinline__ uint32_t decode_stream_one_lane(
             bit_count += 32;
             in_pos += 4;
         }
-        // Byte-trickle for trailing bytes.
         while (bit_count < MAX_CODE_LEN && in_pos < in_size) {
             bit_buf |= ((uint64_t)in[in_pos++]) << (56 - bit_count);
             bit_count += 8;
