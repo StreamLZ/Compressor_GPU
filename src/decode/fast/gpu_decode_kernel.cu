@@ -70,7 +70,7 @@ __device__ uint32_t readLength(const uint8_t* len_data, uint32_t &len_off, uint3
 // input. Restores the register pressure that crept in when
 // entropy-coded off16 split-streams were added.
 template <bool OFF16_SPLIT>
-__device__ void decodeSubChunkL1(
+__device__ __noinline__ void decodeSubChunkL1(
     const uint8_t* __restrict__ cmd, uint32_t cmd_size,
     const uint8_t* __restrict__ lit, uint32_t lit_size,
     const uint8_t* __restrict__ off16_raw, uint32_t off16_count,
@@ -742,7 +742,164 @@ __device__ __noinline__ void parseSubChunkHeaders(
     ps.len_avail = len_avail;
 }
 
+// ── Fast path: raw L1/L2 sub-chunk (chunk_type 0 only) ────────
+// Mirrors the May-9 23 GB/s era parseAndDecodeSubChunk shape: parse
+// inline (no struct, no chunk_type dispatch, no off16 entropy
+// branch). All parsed values flow as locals → registers, never
+// materialized to a ParsedStreams struct on the stack. Called from
+// the kernel when sc_mode == 1 (raw literals); the general
+// parseAndDecodeSubChunk handles modes 0, 2-15 (entropy).
+__device__ void parseAndDecodeSubChunkRaw(
+    const uint8_t* sc_src,
+    uint32_t sc_comp_size,
+    uint32_t sc_decomp_size,
+    uint8_t* dst,
+    uint32_t dst_offset,
+    uint32_t base_offset
+) {
+    const int lane = threadIdx.x & 31;
+    const uint8_t* src = sc_src;
+    const uint8_t* src_end = sc_src + sc_comp_size;
+
+    uint32_t initial_copy = 0;
+    if (base_offset == 0) {
+        // First 8 bytes are raw literals — copy directly to output.
+        if (lane < 8) dst[dst_offset + lane] = src[lane];
+        __syncwarp();
+        src += 8;
+        initial_copy = 8;
+    }
+
+    // Literal stream (Type 0, assumed).
+    const uint8_t* lit_ptr = src;
+    uint32_t lit_size = 0;
+    if (lane == 0) {
+        lit_size = parseType0Header(src);
+        lit_ptr = src;
+        src += lit_size;
+    }
+    lit_size = __shfl_sync(0xFFFFFFFF, lit_size, 0);
+    {
+        uint32_t so = (uint32_t)((uintptr_t)src - (uintptr_t)sc_src);
+        so = __shfl_sync(0xFFFFFFFF, so, 0);
+        src = sc_src + so;
+        lit_ptr = src - lit_size;
+    }
+
+    // Command stream (Type 0, assumed).
+    const uint8_t* cmd_ptr;
+    uint32_t cmd_size = 0;
+    if (lane == 0) {
+        cmd_size = parseType0Header(src);
+        cmd_ptr = src;
+        src += cmd_size;
+    }
+    cmd_size = __shfl_sync(0xFFFFFFFF, cmd_size, 0);
+    {
+        uint32_t so = (uint32_t)((uintptr_t)src - (uintptr_t)sc_src);
+        so = __shfl_sync(0xFFFFFFFF, so, 0);
+        src = sc_src + so;
+        cmd_ptr = src - cmd_size;
+    }
+
+    // cmd_stream2_offset present only for sub-chunks > 64KB.
+    uint32_t cmd_stream2_offset = cmd_size;
+    if (lane == 0 && sc_decomp_size > 0x10000) {
+        uint16_t v; memcpy(&v, src, 2);
+        cmd_stream2_offset = v;
+        src += 2;
+    }
+    cmd_stream2_offset = __shfl_sync(0xFFFFFFFF, cmd_stream2_offset, 0);
+    {
+        uint32_t so = (uint32_t)((uintptr_t)src - (uintptr_t)sc_src);
+        so = __shfl_sync(0xFFFFFFFF, so, 0);
+        src = sc_src + so;
+    }
+
+    // Off16 stream (raw — no entropy 0xFFFF marker handling on this path).
+    const uint8_t* off16_raw;
+    uint32_t off16_count = 0;
+    if (lane == 0) {
+        uint16_t cnt; memcpy(&cnt, src, 2);
+        off16_count = cnt;
+        off16_raw = src + 2;
+        src += 2 + off16_count * 2;
+    }
+    off16_count = __shfl_sync(0xFFFFFFFF, off16_count, 0);
+    {
+        uint32_t so = (uint32_t)((uintptr_t)src - (uintptr_t)sc_src);
+        so = __shfl_sync(0xFFFFFFFF, so, 0);
+        src = sc_src + so;
+        off16_raw = src - off16_count * 2;
+    }
+
+    // Off32 stream sizes (may be empty at sc<=0.25 with 64KB sub-chunks).
+    uint32_t off32_count1 = 0, off32_count2 = 0;
+    const uint8_t* off32_raw1;
+    const uint8_t* off32_raw2;
+    const uint8_t* len_stream;
+    uint32_t len_avail = 0;
+
+    if (lane == 0) {
+        uint32_t tmp = (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16);
+        src += 3;
+        if (tmp != 0) {
+            off32_count1 = tmp >> 12;
+            off32_count2 = tmp & 0xFFF;
+            if (off32_count1 == 4095) { uint16_t v; memcpy(&v, src, 2); off32_count1 = v; src += 2; }
+            if (off32_count2 == 4095) { uint16_t v; memcpy(&v, src, 2); off32_count2 = v; src += 2; }
+            off32_raw1 = src;
+            src += off32_count1 * 3;
+            off32_raw2 = src;
+            src += off32_count2 * 3;
+        } else {
+            off32_raw1 = src;
+            off32_raw2 = src;
+        }
+        len_stream = src;
+        len_avail = (uint32_t)((uintptr_t)src_end - (uintptr_t)src);
+    }
+    off32_count1 = __shfl_sync(0xFFFFFFFF, off32_count1, 0);
+    off32_count2 = __shfl_sync(0xFFFFFFFF, off32_count2, 0);
+    len_avail = __shfl_sync(0xFFFFFFFF, len_avail, 0);
+    {
+        uint32_t so = (uint32_t)((uintptr_t)src - (uintptr_t)sc_src);
+        so = __shfl_sync(0xFFFFFFFF, so, 0);
+        src = sc_src + so;
+        len_stream = src;
+        off32_raw2 = src - off32_count2 * 3;
+        off32_raw1 = off32_raw2 - off32_count1 * 3;
+    }
+
+    if (off32_count1 == 0 && off32_count2 == 0) {
+        // OFF16_SPLIT=false: raw-off16 path is the only one in raw L1/L2.
+        decodeSubChunkL1<false>(
+            cmd_ptr, cmd_size,
+            lit_ptr, lit_size,
+            off16_raw, off16_count,
+            nullptr, nullptr,  // off16_hi/lo unused at OFF16_SPLIT=false
+            len_stream, len_avail,
+            dst, sc_decomp_size, initial_copy,
+            dst_offset
+        );
+    } else {
+        decodeSubChunk(
+            cmd_ptr, cmd_size,
+            lit_ptr, lit_size,
+            off16_raw, off16_count,
+            nullptr, nullptr, 0,  // off16_hi/lo/split unused for raw
+            off32_raw1, off32_count1,
+            off32_raw2, off32_count2,
+            len_stream, len_avail,
+            dst, sc_decomp_size, initial_copy, cmd_stream2_offset,
+            dst_offset, /*mode=*/1
+        );
+    }
+}
+
 // ── Sub-chunk decoder dispatch ────────────────────────────────
+// General entropy-capable path (used by slzFullDecompressL1Kernel only;
+// the slzFullDecompressL1KernelRaw fast path uses parseAndDecodeSubChunkRaw).
 // Calls parseSubChunkHeaders (__noinline__) then dispatches to
 // decodeSubChunkL1 or decodeSubChunk. The header parser's registers
 // are freed before the decode hot loop runs.
@@ -891,8 +1048,7 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
             const uint8_t* sc_payload = chunk_src + 3;
 
             if (sc_comp_size < sc_size) {
-                // Derive tok/off16 sub-slots on demand from base + stride
-                // — keeps the loop-carried state to just the lit slot.
+                // Derive tok/off16 sub-slots on demand from base + stride.
                 uint8_t* tok_slot = chunk_tans_scratch ? (chunk_tans_scratch + tans_slot_stride) : nullptr;
                 uint8_t* off16_slot = chunk_tans_scratch ? (chunk_tans_scratch + 2 * tans_slot_stride) : nullptr;
                 // Match Vulkan convention: pass absolute sc_dst_off as
@@ -919,6 +1075,86 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1Kernel(
             // tok/off16 slots are derived from this each iteration so no
             // separate tracking needed.
             if (chunk_tans_scratch) chunk_tans_scratch += 131072;
+        }
+    }
+}
+
+// ── L1/L2 raw fast-path kernel ────────────────────────────────
+// Dedicated extern "C" __global__ for raw L1/L2 input (no tANS, no
+// entropy, all chunk_type 0). Matches the May-9 era kernel shape: lean
+// parameter list, single parsing path, all parsed values flow in
+// registers (no ParsedStreams struct, no chunk_type dispatch).
+//
+// Driver picks this when scan.use_tans32 == false. Slower general
+// kernel handles L3+ entropy.
+extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1KernelRaw(
+    const uint8_t* __restrict__ compressed,
+    const SlzChunkDesc* __restrict__ chunks,
+    uint8_t* __restrict__ dst,
+    uint32_t chunks_per_group,
+    uint32_t total_chunks,
+    uint32_t sub_chunk_cap
+) {
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t group_id = blockIdx.x * 2 + warp_id;
+    const int lane = threadIdx.x & 31;
+    if (group_id >= (total_chunks + chunks_per_group - 1) / chunks_per_group) return;
+    const uint32_t base_chunk = group_id * chunks_per_group;
+
+    for (uint32_t c = 0; c < chunks_per_group; c++) {
+        uint32_t chunk_idx = base_chunk + c;
+        if (chunk_idx >= total_chunks) return;
+
+        const SlzChunkDesc& ch = chunks[chunk_idx];
+        if (ch.decomp_size == 0) continue;
+
+        if (ch.flags & 1) {
+            const uint8_t* src = compressed + ch.src_offset;
+            for (uint32_t i = lane; i < ch.decomp_size; i += 32)
+                dst[ch.dst_offset + i] = src[i];
+            __syncwarp();
+            continue;
+        }
+
+        if (ch.flags & 2) {
+            for (uint32_t i = lane; i < ch.decomp_size; i += 32)
+                dst[ch.dst_offset + i] = ch.memset_fill;
+            __syncwarp();
+            continue;
+        }
+
+        const uint8_t* chunk_src = compressed + ch.src_offset;
+        uint32_t sc_dst_off = ch.dst_offset;
+        uint32_t sc_remaining = ch.decomp_size;
+
+        while (sc_remaining > 0) {
+            uint32_t sc_size = sc_remaining;
+            if (sc_size > sub_chunk_cap) sc_size = sub_chunk_cap;
+
+            uint32_t chunkhdr = 0;
+            if (lane == 0)
+                chunkhdr = ((uint32_t)chunk_src[0] << 16) | ((uint32_t)chunk_src[1] << 8) | chunk_src[2];
+            chunkhdr = __shfl_sync(0xFFFFFFFF, chunkhdr, 0);
+
+            if (!(chunkhdr & 0x800000)) break;
+
+            uint32_t sc_comp_size = chunkhdr & 0x7FFFF;
+            const uint8_t* sc_payload = chunk_src + 3;
+
+            if (sc_comp_size < sc_size) {
+                parseAndDecodeSubChunkRaw(
+                    sc_payload, sc_comp_size, sc_size,
+                    dst, sc_dst_off, sc_dst_off
+                );
+            } else {
+                for (uint32_t i = lane; i < sc_size; i += 32)
+                    dst[sc_dst_off + i] = sc_payload[i];
+            }
+            __syncwarp();
+
+            chunk_src += 3 + sc_comp_size;
+            sc_dst_off += sc_size;
+            sc_remaining -= sc_size;
         }
     }
 }

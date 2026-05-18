@@ -22,6 +22,7 @@ var lib: ?*anyopaque = null;
 var ctx: usize = 0;
 var module: usize = 0;
 var kernel_fn: usize = 0;
+var kernel_raw_fn: usize = 0;
 var tans_module: usize = 0;
 var tans_kernel_fn: usize = 0;
 var tans_build_fn: usize = 0;
@@ -128,6 +129,9 @@ pub fn init() bool {
     const ptx = @embedFile("gpu_decode_kernel.ptx") ++ "\x00";
     if (load_fn(&module, ptx.ptr) != CUDA_SUCCESS) return false;
     if (get_fn(&kernel_fn, module, "slzFullDecompressL1Kernel") != CUDA_SUCCESS) return false;
+    // Optional lean L1/L2-raw kernel — driver routes to it when no entropy
+    // is present. Failing to load is fine; falls back to general kernel.
+    _ = get_fn(&kernel_raw_fn, module, "slzFullDecompressL1KernelRaw");
 
     // Load tANS decode kernel (Pass 1)
     const tans_ptx = @embedFile("gpu_tans_decode_kernel.ptx") ++ "\x00";
@@ -1283,36 +1287,59 @@ pub fn fullGpuLaunch(
             const lz_groups_in_pipe = (group_chunks + chunks_per_group - 1) / chunks_per_group;
             const lz_grid_x = (lz_groups_in_pipe + 1) / 2;
 
-            // Drop chunk_base / tans_tok_scratch / tans_off16_scratch
-            // from the kernel signature — kernel derives tok/off16 from
-            // tans_scratch + slot_stride, and we pre-shift the desc
-            // pointer here. Net 11 → 9 params at the kernel.
-            var p_comp = d_comp_persist;
-            var p_descs_dev = d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc);
-            var p_dst = d_output;
-            var p_cpg = chunks_per_group;
-            var p_total = chunk_end - chunk_start;
-            var p_sc_cap = sub_chunk_cap;
-            var p_tans_scratch = d_tans_scratch;
-            var p_tans_slot_stride: u64 = @as(u64, total_subchunks) * 131072;
-            var p_first_sub_idx: CUdeviceptr = d_first_subchunk_idx +
-                if (d_first_subchunk_idx != 0) @as(u64, chunk_start) * @sizeOf(u32) else 0;
+            // Fast path: no entropy in this scan → use lean L1/L2 raw kernel.
+            const use_raw_kernel = merged_count == 0 and kernel_raw_fn != 0;
 
-            var lz_params = [_]?*anyopaque{
-                @ptrCast(&p_comp),
-                @ptrCast(&p_descs_dev),
-                @ptrCast(&p_dst),
-                @ptrCast(&p_cpg),
-                @ptrCast(&p_total),
-                @ptrCast(&p_sc_cap),
-                @ptrCast(&p_tans_scratch),
-                @ptrCast(&p_tans_slot_stride),
-                @ptrCast(&p_first_sub_idx),
-            };
-            var lz_extra = [_]?*anyopaque{null};
+            if (use_raw_kernel) {
+                var p_comp = d_comp_persist;
+                var p_descs_dev = d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc);
+                var p_dst = d_output;
+                var p_cpg = chunks_per_group;
+                var p_total = chunk_end - chunk_start;
+                var p_sc_cap = sub_chunk_cap;
+                var raw_params = [_]?*anyopaque{
+                    @ptrCast(&p_comp),
+                    @ptrCast(&p_descs_dev),
+                    @ptrCast(&p_dst),
+                    @ptrCast(&p_cpg),
+                    @ptrCast(&p_total),
+                    @ptrCast(&p_sc_cap),
+                };
+                var raw_extra = [_]?*anyopaque{null};
+                if (launch_fn(kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra) != CUDA_SUCCESS)
+                    return error.BadMode;
+            } else {
+                // Drop chunk_base / tans_tok_scratch / tans_off16_scratch
+                // from the kernel signature — kernel derives tok/off16 from
+                // tans_scratch + slot_stride, and we pre-shift the desc
+                // pointer here. Net 11 → 9 params at the kernel.
+                var p_comp = d_comp_persist;
+                var p_descs_dev = d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc);
+                var p_dst = d_output;
+                var p_cpg = chunks_per_group;
+                var p_total = chunk_end - chunk_start;
+                var p_sc_cap = sub_chunk_cap;
+                var p_tans_scratch = d_tans_scratch;
+                var p_tans_slot_stride: u64 = @as(u64, total_subchunks) * 131072;
+                var p_first_sub_idx: CUdeviceptr = d_first_subchunk_idx +
+                    if (d_first_subchunk_idx != 0) @as(u64, chunk_start) * @sizeOf(u32) else 0;
 
-            if (launch_fn(kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra) != CUDA_SUCCESS)
-                return error.BadMode;
+                var lz_params = [_]?*anyopaque{
+                    @ptrCast(&p_comp),
+                    @ptrCast(&p_descs_dev),
+                    @ptrCast(&p_dst),
+                    @ptrCast(&p_cpg),
+                    @ptrCast(&p_total),
+                    @ptrCast(&p_sc_cap),
+                    @ptrCast(&p_tans_scratch),
+                    @ptrCast(&p_tans_slot_stride),
+                    @ptrCast(&p_first_sub_idx),
+                };
+                var lz_extra = [_]?*anyopaque{null};
+
+                if (launch_fn(kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra) != CUDA_SUCCESS)
+                    return error.BadMode;
+            }
         }
 
         // Sync all pipeline streams
@@ -1474,33 +1501,57 @@ pub fn fullGpuLaunch(
         }
 
         // ── Pass 2: LZ decode ──────────────────────────────────────
-
-        var p_comp = d_comp_persist;
-        var p_descs_dev = d_descs_persist;
-        var p_dst = d_output;
-        var p_cpg = chunks_per_group;
-        var p_total: u32 = total_chunks;
-        var p_sc_cap = sub_chunk_cap;
-        var p_tans_scratch = d_tans_scratch;
-        var p_tans_slot_stride: u64 = @as(u64, total_subchunks) * 131072;
-        var p_first_sub_idx: CUdeviceptr = d_first_subchunk_idx;
-
-        var params = [_]?*anyopaque{
-            @ptrCast(&p_comp),
-            @ptrCast(&p_descs_dev),
-            @ptrCast(&p_dst),
-            @ptrCast(&p_cpg),
-            @ptrCast(&p_total),
-            @ptrCast(&p_sc_cap),
-            @ptrCast(&p_tans_scratch),
-            @ptrCast(&p_tans_slot_stride),
-            @ptrCast(&p_first_sub_idx),
-        };
-        var extra = [_]?*anyopaque{null};
+        // Fast path: when there's no entropy work (L1/L2 inputs), use the
+        // dedicated 6-param kernel — same shape as the May-9 22 GB/s era.
+        const no_entropy = merged_count == 0;
+        const use_raw_kernel = no_entropy and kernel_raw_fn != 0;
 
         const grid_x = (num_groups + 1) / 2;
-        if (launch_fn(kernel_fn, grid_x, 1, 1, 32, 2, 1, 0, 0, &params, &extra) != CUDA_SUCCESS)
-            return error.BadMode;
+
+        if (use_raw_kernel) {
+            var p_comp = d_comp_persist;
+            var p_descs_dev = d_descs_persist;
+            var p_dst = d_output;
+            var p_cpg = chunks_per_group;
+            var p_total: u32 = total_chunks;
+            var p_sc_cap = sub_chunk_cap;
+            var raw_params = [_]?*anyopaque{
+                @ptrCast(&p_comp),
+                @ptrCast(&p_descs_dev),
+                @ptrCast(&p_dst),
+                @ptrCast(&p_cpg),
+                @ptrCast(&p_total),
+                @ptrCast(&p_sc_cap),
+            };
+            var raw_extra = [_]?*anyopaque{null};
+            if (launch_fn(kernel_raw_fn, grid_x, 1, 1, 32, 2, 1, 0, 0, &raw_params, &raw_extra) != CUDA_SUCCESS)
+                return error.BadMode;
+        } else {
+            var p_comp = d_comp_persist;
+            var p_descs_dev = d_descs_persist;
+            var p_dst = d_output;
+            var p_cpg = chunks_per_group;
+            var p_total: u32 = total_chunks;
+            var p_sc_cap = sub_chunk_cap;
+            var p_tans_scratch = d_tans_scratch;
+            var p_tans_slot_stride: u64 = @as(u64, total_subchunks) * 131072;
+            var p_first_sub_idx: CUdeviceptr = d_first_subchunk_idx;
+
+            var params = [_]?*anyopaque{
+                @ptrCast(&p_comp),
+                @ptrCast(&p_descs_dev),
+                @ptrCast(&p_dst),
+                @ptrCast(&p_cpg),
+                @ptrCast(&p_total),
+                @ptrCast(&p_sc_cap),
+                @ptrCast(&p_tans_scratch),
+                @ptrCast(&p_tans_slot_stride),
+                @ptrCast(&p_first_sub_idx),
+            };
+            var extra = [_]?*anyopaque{null};
+            if (launch_fn(kernel_fn, grid_x, 1, 1, 32, 2, 1, 0, 0, &params, &extra) != CUDA_SUCCESS)
+                return error.BadMode;
+        }
 
         if (sync_fn() != CUDA_SUCCESS) return error.BadMode;
 
