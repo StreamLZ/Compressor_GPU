@@ -1950,7 +1950,12 @@ pub fn compressFramedOne(
     // on its token layout. L5 decompresses correctly via the serial
     // path; extending parallel-decode support to it is a separate
     // task (probably needs a distinct codepath).
-    if (opts.emit_parallel_decode_metadata and !self_contained and opts.level >= 1 and opts.level <= 5 and can_compress) {
+    // L5 emits the sidecar bit but the parallel L1-L4 decoder can't parse
+    // L5's wire format, so the decoder errors when it dispatches. Restrict
+    // PDM to L1-L4 until a distinct L5 parallel-decode codepath exists
+    // (matches the "L5 decompresses correctly via the serial path" note
+    // immediately above this branch).
+    if (opts.emit_parallel_decode_metadata and !self_contained and opts.level >= 1 and opts.level <= 4 and can_compress) {
         const sidecar_result = if (dict_len > 0)
             cleanness.buildPpocSidecarWithDict(allocator, dst[0..pos], effective_src, dict_len)
         else
