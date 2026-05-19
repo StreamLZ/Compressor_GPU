@@ -100,11 +100,14 @@ pub fn compressFramedHigh(
     const sc_flag_bit: u8 = if (self_contained) 0x10 else 0;
 
     // ── High encoder context ───────────────────────────────────────────
-    // L5+ enables `export_tokens`. Entropy options:
-    // start at 0xFF & ~MultiArrayAdvanced, then re-enable MultiArrayAdvanced
-    // when level >= 7.
-    var entropy_raw: u8 = 0xFF & ~@as(u8, 0b0100_0000); // clear MultiArrayAdvanced
-    if (mapping.codec_level >= 7) entropy_raw |= 0b0100_0000;
+    // L5+ enables `export_tokens`. Entropy options: enable everything
+    // EXCEPT bit 6, which used to be the dead `allow_multi_array_advanced`
+    // placeholder but was repurposed as `allow_tans32` for the GPU
+    // (chunk_type=6, 32-lane tANS). Setting bit 6 from the High codec
+    // accidentally diverted L7-L11 onto the tans32 path and disabled the
+    // standard 5-state tANS fallback, costing +0.6-0.8pp ratio on those
+    // levels. Keep bit 6 clear unconditionally.
+    const entropy_raw: u8 = 0xFF & ~@as(u8, 0b0100_0000);
     // Cross-block stats scratch — symbol statistics + last chunk type.
     // The optimal parser reads these
     // at the start of each block and writes them back on success. Without
