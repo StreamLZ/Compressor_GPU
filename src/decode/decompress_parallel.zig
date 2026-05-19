@@ -301,10 +301,15 @@ fn decodeOneChunk(
 
     switch (block_hdr.decoder_type) {
         .fast, .turbo => {
+            // dst_start = group start so SC groups have base_offset == 0
+            // for the first chunk's first sub-chunk, which matches the
+            // encoder's group-relative `start_position` (see
+            // fast_framed.zig:start_position_for_sub) and fires the
+            // initial 8-byte Copy64.
             const n = try fast.decodeChunkWithSubSize(
                 dst_ptr,
                 dst_end_ptr,
-                dst.ptr,
+                dst[group_dst_start_off..].ptr,
                 src_slice_start,
                 src_slice_end,
                 scratch_ptr,
@@ -380,10 +385,11 @@ fn decodeOneChunkSafe(
 
     switch (block_hdr.decoder_type) {
         .fast, .turbo => {
+            // dst_start = group start; see note in `decodeOneChunk`.
             const n = try fast.decodeChunkSafe(
                 dst_ptr,
                 dst_end_ptr,
-                dst.ptr,
+                dst[group_dst_start_off..].ptr,
                 src_slice_start,
                 src_slice_end,
                 scratch_ptr,

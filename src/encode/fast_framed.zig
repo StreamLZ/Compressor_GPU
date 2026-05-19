@@ -696,7 +696,11 @@ fn fastScWorker(shared: *FastScContext) void {
                 const sub_hdr_pos = wpos;
                 wpos += 3;
                 const sub_payload_start = wpos;
-                const start_pos = src_off + sub_off;
+                // Group-relative position so the encoder's "write 8 init bytes
+                // iff start_pos == 0" check matches the decoder's "skip 8 iff
+                // base_offset == 0" (which is group-local in SC mode). This
+                // function is SC-only, so the gate is unconditional.
+                const start_pos = (src_off + sub_off) - group_start_off;
 
                 const result = switch (shared.level) {
                     5 => fast_enc.encodeSubChunkEntropyChain(4, std.heap.c_allocator, &chain_hasher_local.?, sub_src, window_base_ptr, out[sub_payload_start..], start_pos, shared.entropy_options, shared.parser_config) catch |err| {
@@ -1413,7 +1417,10 @@ pub fn compressFramedOne(
                         const sub_size = @min(gpu_block, chunk_size - si * gpu_block);
                         var entropy_options = entropyOptionsForLevel(opts.level);
                         entropy_options.allow_tans = true;
-                        entropy_options.allow_tans32 = true;
+                        // tans32 is GPU-format only; gate it against dict because the
+                        // GPU pipeline never combines them and the CPU decoder hits
+                        // the SC+dict off-by-8 bug if forced into that path.
+                        entropy_options.allow_tans32 = dict_len == 0;
                         // Derive a per-stream LitOverride from a PairStream entry.
                         const ovFor = struct {
                             fn f(ps: anytype, idx: usize) LitOverride {
@@ -1764,7 +1771,17 @@ pub fn compressFramedOne(
                 pos += 3;
                 const sub_payload_start: usize = pos;
 
-                const start_position_for_sub: usize = src_off + sub_off;
+                // `start_position` gates the 8-byte initial-bytes write inside
+                // encodeSubChunk*: it writes them iff start_position == 0.
+                // The decoder fires the matching 8-byte Copy64 iff `base_offset == 0`,
+                // and `base_offset` is computed group-relative in SC mode and
+                // absolute (post-dict) in non-SC mode. So encoder must mirror:
+                //   SC mode    → position within the current SC group
+                //   non-SC     → absolute source position (dict_len + offset)
+                const start_position_for_sub: usize = if (self_contained)
+                    (src_off + sub_off) - group_start_off
+                else
+                    src_off + sub_off;
                 const entropy_options = entropyOptionsForLevel(opts.level);
                 const result = try if (opts.gpu_mode) switch (opts.level) {
                     1 => fast_enc.encodeSubChunkRaw(-2, u32, allocator, &greedy_hasher_u32.?, sub_src, window_base_ptr, dst[sub_payload_start..], start_position_for_sub, parser_config),
