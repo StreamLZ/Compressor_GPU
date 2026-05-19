@@ -578,6 +578,19 @@ fn runCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
             const kmbps: f64 = @as(f64, @floatFromInt(src.len)) / (1024.0 * 1024.0) * 1e9 / @as(f64, @floatFromInt(gpu_enc.last_kernel_ns));
             try w.print("  GPU kernel: {d:.1}ms ({d:.0} MB/s)\n", .{ kms, kmbps });
         }
+        if (std.c.getenv("SLZ_STREAM_DBG") != null) {
+            const flz = @import("encode/fast/fast_lz_encoder.zig");
+            const total = flz.stream_dbg_lit + flz.stream_dbg_tok + flz.stream_dbg_off16 + flz.stream_dbg_off32 + flz.stream_dbg_len;
+            if (total > 0) {
+                try w.print("  raw stream bytes:\n", .{});
+                try w.print("    literal: {d:>12} ({d:>5.2}%)\n", .{ flz.stream_dbg_lit, 100.0 * @as(f64, @floatFromInt(flz.stream_dbg_lit)) / @as(f64, @floatFromInt(total)) });
+                try w.print("    token:   {d:>12} ({d:>5.2}%)\n", .{ flz.stream_dbg_tok, 100.0 * @as(f64, @floatFromInt(flz.stream_dbg_tok)) / @as(f64, @floatFromInt(total)) });
+                try w.print("    off16:   {d:>12} ({d:>5.2}%)\n", .{ flz.stream_dbg_off16, 100.0 * @as(f64, @floatFromInt(flz.stream_dbg_off16)) / @as(f64, @floatFromInt(total)) });
+                try w.print("    off32:   {d:>12} ({d:>5.2}%)\n", .{ flz.stream_dbg_off32, 100.0 * @as(f64, @floatFromInt(flz.stream_dbg_off32)) / @as(f64, @floatFromInt(total)) });
+                try w.print("    length:  {d:>12} ({d:>5.2}%)\n", .{ flz.stream_dbg_len, 100.0 * @as(f64, @floatFromInt(flz.stream_dbg_len)) / @as(f64, @floatFromInt(total)) });
+                try w.print("    TOTAL:   {d:>12}\n", .{total});
+            }
+        }
     }
 }
 
@@ -957,6 +970,8 @@ fn runBenchDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
     var total_tans_ns: i64 = 0;
     var best_lz_ns: i64 = std.math.maxInt(i64);
     var total_lz_ns: i64 = 0;
+    var best_huff_ns: i64 = std.math.maxInt(i64);
+    var total_huff_ns: i64 = 0;
     var run_i: u32 = 0;
     while (run_i < runs) : (run_i += 1) {
         const timer_start = std.Io.Clock.awake.now(io);
@@ -981,6 +996,11 @@ fn runBenchDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
             if (lns > 0) {
                 if (lns < best_lz_ns) best_lz_ns = lns;
                 total_lz_ns += lns;
+            }
+            const hns = gpu.last_huff_kernel_ns;
+            if (hns > 0) {
+                if (hns < best_huff_ns) best_huff_ns = hns;
+                total_huff_ns += hns;
             }
         }
     }
@@ -1041,6 +1061,19 @@ fn runBenchDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
             try w.print("  lz kernel mean:   {d:.3} ms  ({d:.0} MB/s)\n", .{
                 mean_lz_ms,
                 mb * 1000.0 / mean_lz_ms,
+            });
+        }
+        if (best_huff_ns < std.math.maxInt(i64)) {
+            const mean_huff_ns = @divTrunc(total_huff_ns, @as(i64, @intCast(runs)));
+            const best_huff_ms: f64 = @as(f64, @floatFromInt(best_huff_ns)) / 1_000_000.0;
+            const mean_huff_ms: f64 = @as(f64, @floatFromInt(mean_huff_ns)) / 1_000_000.0;
+            try w.print("  huff kernel best: {d:.3} ms  ({d:.0} MB/s)\n", .{
+                best_huff_ms,
+                mb * 1000.0 / best_huff_ms,
+            });
+            try w.print("  huff kernel mean: {d:.3} ms  ({d:.0} MB/s)\n", .{
+                mean_huff_ms,
+                mb * 1000.0 / mean_huff_ms,
             });
         }
     }

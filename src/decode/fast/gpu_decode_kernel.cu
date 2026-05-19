@@ -638,6 +638,24 @@ __device__ __noinline__ void parseSubChunkHeaders(
             cmd_ptr = tans_tok_scratch_chunk;
             cmd_size = count_b;
             cmd_is_tans = 1;
+        } else if (ct == 4 && tans_tok_scratch_chunk != nullptr) {
+            // Huffman token stream — pre-decoded by slzHuffDecode4StreamKernel
+            // into tans_tok_scratch_chunk. Same wire format as type-1 tANS.
+            uint32_t huff_comp_size, huff_dst_size;
+            if (src[0] >= 0x80) {
+                uint32_t bits = ((uint32_t)src[0] << 16) | ((uint32_t)src[1] << 8) | src[2];
+                huff_comp_size = bits & 0x3FF;
+                huff_dst_size = huff_comp_size + ((bits >> 10) & 0x3FF) + 1;
+                src += 3 + huff_comp_size;
+            } else {
+                uint32_t bits = ((uint32_t)src[1] << 24) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 8) | src[4];
+                huff_comp_size = bits & 0x3FFFF;
+                huff_dst_size = ((((bits >> 18) | ((uint32_t)src[0] << 14)) & 0x3FFFF)) + 1;
+                src += 5 + huff_comp_size;
+            }
+            cmd_ptr = tans_tok_scratch_chunk;
+            cmd_size = huff_dst_size;
+            cmd_is_tans = 1;
         } else {
             // Huffman or other — skip the stream, zero out cmd_size
             cmd_size = skipEntropyStream(src);

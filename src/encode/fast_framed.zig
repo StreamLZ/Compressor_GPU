@@ -164,6 +164,23 @@ fn reencodeGpuWithEntropy(
     var rp: usize = 0;
     var wp: usize = 0;
 
+    // SLZ_HUFF_LIT=1: bypass GPU's pre-encoded tANS bodies for all four
+    // streams so the assembly falls through to encodeArrayU8, which the
+    // entropy_encoder routes to my Huffman wrapper. This gives us an
+    // apples-to-apples GPU-encoder + Huffman vs GPU-encoder + tANS.
+    var lit32_eff = tans_encoded_lits_32;
+    var lit_eff = tans_encoded_lits;
+    var tok_eff = tans_encoded_tokens;
+    var hi_eff = tans_encoded_off16_hi;
+    var lo_eff = tans_encoded_off16_lo;
+    if (std.c.getenv("SLZ_HUFF_LIT") != null) {
+        lit32_eff = null;
+        lit_eff = null;
+        tok_eff = null;
+        hi_eff = null;
+        lo_eff = null;
+    }
+
     // Copy initial bytes (first 8 raw bytes for is_first chunks)
     if (initial_bytes > 0) {
         if (rp + initial_bytes > raw.len) return 0;
@@ -284,7 +301,7 @@ fn reencodeGpuWithEntropy(
         // GPU 32-lane pre-encoded literals (type-6). Mirrors the
         // CPU `encodeArrayU8Tans32` output, body only — caller adds
         // the 5-byte non-compact chunk header.
-        if (tans_encoded_lits_32) |pre| {
+        if (lit32_eff) |pre| {
             if (pre.len > 0 and pre.len + 5 < literals.len + 3) {
                 if (wp + 5 + pre.len > dst.len) break :blk @as(usize, 0);
                 entropy_enc.writeNonCompactChunkHeader(dst[wp..], 6, @intCast(pre.len), @intCast(literals.len));
@@ -294,12 +311,15 @@ fn reencodeGpuWithEntropy(
             // GPU raw-fallback (or didn't beat raw) — drop through to memcpy.
             break :blk entropy_enc.encodeArrayU8Memcpy(dst[wp..], literals) catch 0;
         }
-        if (options.allow_tans32 and shared_tans_ctx != null and !is_first_subchunk) {
+        // SLZ_HUFF_LIT: bypass the shared-tANS path; go through encodeArrayU8
+        // so the per-stream Huffman wrapper fires for every sub-chunk's literals.
+        const huff_bypass = std.c.getenv("SLZ_HUFF_LIT") != null;
+        if (!huff_bypass and options.allow_tans32 and shared_tans_ctx != null and !is_first_subchunk) {
             break :blk entropy_enc.encodeArrayU8Tans32Shared(allocator, dst[wp..], literals, shared_tans_ctx.?) catch 0;
         } else if (options.allow_tans32) {
             break :blk entropy_enc.encodeArrayU8(allocator, dst[wp..], literals, options, speed_tradeoff, null, 0, null) catch 0;
         }
-        if (tans_encoded_lits) |tans_data| {
+        if (lit_eff) |tans_data| {
             if (tans_data.len > 0 and tans_data.len + 5 < literals.len + 3) {
                 if (wp + 5 + tans_data.len > dst.len) break :blk @as(usize, 0);
                 entropy_enc.writeNonCompactChunkHeader(
@@ -355,7 +375,7 @@ fn reencodeGpuWithEntropy(
         // GPU-pre-encoded token stream (32-lane tANS). The kernel
         // outputs `[128B sizes+states][prob table][32 sub-streams]`
         // with no chunk header — we prepend the 5-byte type-6 header.
-        if (tans_encoded_tokens) |pre| {
+        if (tok_eff) |pre| {
             if (pre.len > 0 and pre.len + 5 < tokens.len + 3) {
                 if (wp + 5 + pre.len > dst.len) return 0;
                 entropy_enc.writeNonCompactChunkHeader(
@@ -431,7 +451,10 @@ fn reencodeGpuWithEntropy(
         // pipeline rather than the entropy format. Costs ~5pp ratio
         // until the underlying bug is found. See [[gpu-silesia-off16-bug]].
         const shared_off16_both = shared_off16_hi != null and shared_off16_lo != null;
-        const force_raw_off16: bool = !shared_off16_both;
+        // Temp: SLZ_OFF16_ENTROPY=1 lifts the workaround so we can repro
+        // the bug and find/fix it. Otherwise force_raw_off16 stays on.
+        const lift_workaround = std.c.getenv("SLZ_OFF16_ENTROPY") != null;
+        const force_raw_off16: bool = !shared_off16_both and !lift_workaround;
         if (force_raw_off16) {
             if (wp + 2 + off16_bytes > dst.len) return 0;
             std.mem.writeInt(u16, dst[wp..][0..2], @intCast(off16_count), .little);
@@ -461,7 +484,7 @@ fn reencodeGpuWithEntropy(
         // Phase 1 GPU type-6 path falls back to here if shared not in
         // play but per-stream pre-encoded data is present.
         const use_gpu_off16: bool = (!use_shared_off16) and
-            tans_encoded_off16_hi != null and tans_encoded_off16_lo != null;
+            hi_eff != null and lo_eff != null;
         if (use_shared_off16) {
             const pre_hi = shared_off16_hi.?;
             const pre_lo = shared_off16_lo.?;
@@ -484,8 +507,8 @@ fn reencodeGpuWithEntropy(
                 wp += off16_bytes;
             }
         } else if (use_gpu_off16) {
-            const pre_hi = tans_encoded_off16_hi.?;
-            const pre_lo = tans_encoded_off16_lo.?;
+            const pre_hi = hi_eff.?;
+            const pre_lo = lo_eff.?;
             // 5-byte type-6 chunk header per stream → split_total = pre_hi + pre_lo + 10.
             const split_total: usize = pre_hi.len + pre_lo.len + 10;
             if (split_total < off16_bytes) {

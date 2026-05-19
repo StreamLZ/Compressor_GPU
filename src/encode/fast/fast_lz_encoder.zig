@@ -28,6 +28,26 @@ const entropy_enc = @import("../entropy/entropy_encoder.zig");
 const byte_hist = @import("../entropy/byte_histogram.zig");
 const cost_model = @import("fast_cost_model.zig");
 
+// SLZ_STREAM_DBG=1: tally raw stream byte counts across all sub-chunks.
+pub var stream_dbg_lit: usize = 0;
+pub var stream_dbg_tok: usize = 0;
+pub var stream_dbg_off16: usize = 0;
+pub var stream_dbg_off32: usize = 0;
+pub var stream_dbg_len: usize = 0;
+
+// SLZ_HUFF_LIT: try chunk_type=4 Huffman on the raw literal stream;
+// fall through to memcpy if Huffman doesn't beat raw+3.
+fn writeRawLiterals(dst: []u8, src: []const u8, huff_enabled: bool) entropy_enc.EncodeError!usize {
+    if (huff_enabled and dst.len > 5 + 128 + 9 and src.len >= 32) {
+        const huff = @import("../entropy/huffman_encoder.zig");
+        const h_n = huff.encodeBlock(dst, src) catch null;
+        if (h_n) |n| {
+            if (n < src.len + 3) return n;
+        }
+    }
+    return entropy_enc.encodeArrayU8Memcpy(dst, src);
+}
+
 const MatchHasher2 = match_hasher.MatchHasher2;
 
 const FastStreamWriter = writer_mod.FastStreamWriter;
@@ -456,6 +476,13 @@ fn assembleEntropyOutput(
     const literal_count: usize = w.literalCount();
     const token_count: usize = w.tokenCount();
     const off16_count: usize = w.off16Count();
+    if (std.c.getenv("SLZ_STREAM_DBG") != null) {
+        stream_dbg_lit += literal_count;
+        stream_dbg_tok += token_count;
+        stream_dbg_off16 += off16_count * 2;
+        stream_dbg_len += w.lengthCount();
+        stream_dbg_off32 += w.off32ByteCount();
+    }
 
     var out_cursor: [*]u8 = dst_cursor_in;
     const dst_end: [*]u8 = dst.ptr + dst.len;
@@ -486,6 +513,15 @@ fn assembleEntropyOutput(
         lit_histo.countBytes(w.literal_start[0..literal_count]);
 
         var encoded_literal_bytes: i32 = -1;
+        // SLZ_HUFF_LIT: skip the delta-literal path. The inline-literal token
+        // writers don't fill delta_literal_cursor for inline literals (only
+        // trailing literals get their deltas computed), so dls[0..literal_count]
+        // is partially uninitialized. Baseline tolerates this because the
+        // delta path always loses to memcpy on cost; Huffman would accept it
+        // and write garbage. Easier to bypass delta and just Huff the raw
+        // literal stream below.
+        const huff_lit_enabled = std.c.getenv("SLZ_HUFF_LIT") != null;
+        if (!huff_lit_enabled) {
         if (w.delta_literal_start) |dls| {
             var delta_histo: byte_hist.ByteHistogram = .{};
             delta_histo.countBytes(dls[0..literal_count]);
@@ -527,12 +563,13 @@ fn assembleEntropyOutput(
                 }
             }
         }
+        }
 
         if (encoded_literal_bytes < 0) {
             // Raw literal path (memcpy-framed). `chunk_type = 1` (raw).
             chunk_type = .raw;
             literal_cost = raw_literal_cost;
-            const raw_n = try entropy_enc.encodeArrayU8Memcpy(enc_scratch, w.literal_start[0..literal_count]);
+            const raw_n = try writeRawLiterals(enc_scratch, w.literal_start[0..literal_count], huff_lit_enabled);
             if (@intFromPtr(out_cursor) + raw_n > @intFromPtr(dst_end)) return bail_result;
             @memcpy(out_cursor[0..raw_n], enc_scratch[0..raw_n]);
             out_cursor += raw_n;
@@ -540,7 +577,8 @@ fn assembleEntropyOutput(
     } else {
         chunk_type = .raw;
         literal_cost = raw_literal_cost;
-        const raw_n = try entropy_enc.encodeArrayU8Memcpy(enc_scratch, w.literal_start[0..literal_count]);
+        const huff_lit_enabled = std.c.getenv("SLZ_HUFF_LIT") != null;
+        const raw_n = try writeRawLiterals(enc_scratch, w.literal_start[0..literal_count], huff_lit_enabled);
         if (@intFromPtr(out_cursor) + raw_n > @intFromPtr(dst_end)) return bail_result;
         @memcpy(out_cursor[0..raw_n], enc_scratch[0..raw_n]);
         out_cursor += raw_n;

@@ -181,6 +181,22 @@ fn encodeArrayU8CoreWithHisto(
 
     const memcpy_cost: f32 = @floatFromInt(src.len + 3);
 
+    // SLZ_HUFF_LIT=1 — replace tANS attempts with a Huffman type-4 attempt.
+    // Used as a direct A/B vs tANS on the same stream. Falls back to memcpy
+    // if Huffman doesn't beat raw or the destination is too small.
+    if (std.c.getenv("SLZ_HUFF_LIT") != null and dst.len > 5 + 128 + 9 and src.len >= 32) {
+        const huff = @import("huffman_encoder.zig");
+        const h_n = huff.encodeBlock(dst, src) catch null;
+        if (h_n) |n| {
+            if (n < src.len + 3) {
+                if (cost_out) |c| c.* = @floatFromInt(n);
+                return n;
+            }
+        }
+        if (cost_out) |c| c.* = memcpy_cost;
+        return encodeArrayU8Memcpy(dst, src);
+    }
+
     // Try 32-lane tANS if allowed (GPU-optimized, chunk_type=6).
     if (options.allow_tans32 and dst.len > 5 + 128) {
         var tans32_cost: f32 = memcpy_cost;

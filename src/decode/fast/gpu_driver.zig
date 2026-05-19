@@ -193,6 +193,7 @@ pub var last_tans_kernel_ns: i64 = 0;
 /// Pass 2 (LZ kernel) wall time. last_tans_kernel_ns = tANS only,
 /// last_lz_kernel_ns = LZ only. Costs a stream sync between them.
 pub var last_lz_kernel_ns: i64 = 0;
+pub var last_huff_kernel_ns: i64 = 0;
 
 fn ensureDeviceBuf(ptr: *CUdeviceptr, current_size: *usize, needed: usize) bool {
     if (current_size.* >= needed) return true;
@@ -315,7 +316,12 @@ var d_huff_descs: CUdeviceptr = 0;
 var d_huff_descs_size: usize = 0;
 var d_huff_lut: CUdeviceptr = 0;
 var d_huff_lut_size: usize = 0;
-var huff_host_buf: [4096]HuffDecChunkDesc = undefined;
+// One host buffer per stream type — scanner appends to each; fullGpuLaunch
+// merges them into one device array with per-type out_offset added.
+var huff_lit_host_buf: [4096]HuffDecChunkDesc = undefined;
+var huff_tok_host_buf: [4096]HuffDecChunkDesc = undefined;
+var huff_off16hi_host_buf: [4096]HuffDecChunkDesc = undefined;
+var huff_off16lo_host_buf: [4096]HuffDecChunkDesc = undefined;
 const HUFF_LUT_ENTRIES: usize = 2048; // matches MAX_CODE_LEN=11 in kernel
 
 // ── tANS header scanning ───────────────────────────────────────
@@ -338,6 +344,9 @@ const ScanResult = struct {
     num_off16lo: u32,
     num_raw_off16: u32,
     num_huff_lit: u32 = 0,
+    num_huff_tok: u32 = 0,
+    num_huff_off16hi: u32 = 0,
+    num_huff_off16lo: u32 = 0,
     use_tans32: bool = false,
 };
 
@@ -351,13 +360,19 @@ fn scanForTansChunks(
     tans_off16lo_descs: []TansDecChunkDesc,
     raw_off16_descs: []RawOff16Desc,
     huff_lit_descs: []HuffDecChunkDesc,
+    huff_tok_descs: []HuffDecChunkDesc,
+    huff_off16hi_descs: []HuffDecChunkDesc,
+    huff_off16lo_descs: []HuffDecChunkDesc,
 ) ScanResult {
     var num_lit: u32 = 0;
     var num_tok: u32 = 0;
     var num_off16hi: u32 = 0;
     var num_off16lo: u32 = 0;
     var num_raw: u32 = 0;
-    var num_huff: u32 = 0;
+    var num_huff_lit: u32 = 0;
+    var num_huff_tok: u32 = 0;
+    var num_huff_hi: u32 = 0;
+    var num_huff_lo: u32 = 0;
     var use_tans32: bool = false;
     var cur_sub_idx: u32 = 0; // global sub-chunk index — mirrors driver prefix sum
     const cap_safe: u32 = if (sub_chunk_cap == 0) 65536 else sub_chunk_cap;
@@ -454,7 +469,7 @@ fn scanForTansChunks(
                     // (same convention as tANS type 1/6). Payload after the
                     // header is [128 B weights][9 B sub-header][4 streams].
                     parseHuffHeader(chunk_src, pos, ch.src_offset, sub_dst_off,
-                                    huff_lit_descs, &num_huff);
+                                    huff_lit_descs, &num_huff_lit);
                 }
                 const lit_next = skipStreamHeader(chunk_src, pos);
                 if (lit_next == null) break :walk;
@@ -497,6 +512,11 @@ fn scanForTansChunks(
                         tans_tok_descs[num_tok - 1].src_offset += 129;
                         tans_tok_descs[num_tok - 1].src_size -|= 129;
                     }
+                } else if (tok_type == 4) {
+                    // Huffman token stream — record sub_dst_off; driver adds
+                    // tok_offset later when merging into the unified descriptor array.
+                    parseHuffHeader(chunk_src, pos, ch.src_offset, sub_dst_off,
+                                    huff_tok_descs, &num_huff_tok);
                 }
                 const tok_next = skipStreamHeader(chunk_src, pos);
                 if (tok_next == null) break :walk;
@@ -562,6 +582,9 @@ fn scanForTansChunks(
                         };
                         num_raw += 1;
                     }
+                } else if (hi_type == 4) {
+                    parseHuffHeader(chunk_src, pos, ch.src_offset, sub_dst_off,
+                                    huff_off16hi_descs, &num_huff_hi);
                 }
                 const hi_next = skipStreamHeader(chunk_src, pos);
                 if (hi_next == null) break :walk;
@@ -603,6 +626,11 @@ fn scanForTansChunks(
                         };
                         num_raw += 1;
                     }
+                } else if (lo_type == 4) {
+                    // Huff lo stream → scratch slot + 65536 (lo half of off16 slot).
+                    // Encode sub_dst_off + 65536 here; merge phase adds off16_offset.
+                    parseHuffHeader(chunk_src, pos, ch.src_offset, sub_dst_off + 65536,
+                                    huff_off16lo_descs, &num_huff_lo);
                 }
             } // walk
 
@@ -617,7 +645,11 @@ fn scanForTansChunks(
     return .{
         .num_lit = num_lit, .num_tok = num_tok, .num_off16hi = num_off16hi,
         .num_off16lo = num_off16lo, .num_raw_off16 = num_raw,
-        .num_huff_lit = num_huff, .use_tans32 = use_tans32,
+        .num_huff_lit = num_huff_lit,
+        .num_huff_tok = num_huff_tok,
+        .num_huff_off16hi = num_huff_hi,
+        .num_huff_off16lo = num_huff_lo,
+        .use_tans32 = use_tans32,
     };
 }
 
@@ -1084,7 +1116,10 @@ pub fn fullGpuLaunch(
             tans_off16hi_host_buf[0..max_tans],
             tans_off16lo_host_buf[0..max_tans],
             &raw_off16_buf,
-            &huff_host_buf,
+            &huff_lit_host_buf,
+            &huff_tok_host_buf,
+            &huff_off16hi_host_buf,
+            &huff_off16lo_host_buf,
         );
 
         merged_count = scan.num_lit + scan.num_tok + scan.num_off16hi + scan.num_off16lo;
@@ -1098,51 +1133,48 @@ pub fn fullGpuLaunch(
         }
     }
 
-    // ── Huffman literals (Pass 1.5) ──────────────────────────
-    // Run build-LUT + decode-4-stream kernels before LZ kernel so the LZ
-    // kernel can read pre-decoded literals from d_tans_scratch (same slot
-    // layout as tANS literals; out_offset is in sub-chunk-slot space).
-    if (scan.num_huff_lit > 0 and huff_build_fn != 0 and huff_decode_fn != 0) {
-        const n_huff = scan.num_huff_lit;
-        const huff_desc_bytes = @as(usize, n_huff) * @sizeOf(HuffDecChunkDesc);
-        const huff_lut_bytes = @as(usize, n_huff) * HUFF_LUT_ENTRIES * @sizeOf(u32);
+    // ── Huffman pre-decode (Pass 1.5): merge per-stream-type descriptors
+    // into a single device array with correct out_offsets, then upload.
+    // Scanner left out_offsets in sub-chunk-slot space; here we add the
+    // per-stream-type region offset (tok_offset, off16_offset) and assign
+    // sequential lut_offsets.
+    const n_huff: u32 = scan.num_huff_lit + scan.num_huff_tok +
+        scan.num_huff_off16hi + scan.num_huff_off16lo;
+    if (std.c.getenv("SLZ_HUFF_DBG") != null) {
+        std.debug.print("huff scan: lit={d} tok={d} hi={d} lo={d} total={d}\n", .{ scan.num_huff_lit, scan.num_huff_tok, scan.num_huff_off16hi, scan.num_huff_off16lo, n_huff });
+        std.debug.print("tans scan: lit={d} tok={d} hi={d} lo={d}\n", .{ scan.num_lit, scan.num_tok, scan.num_off16hi, scan.num_off16lo });
+    }
+    const have_huff = n_huff > 0 and huff_build_fn != 0 and huff_decode_fn != 0;
+    if (have_huff) {
+        // Merge into a host scratch then upload. Capacity = 4 buffers × 4096.
+        var merged_huff: [4096 * 4]HuffDecChunkDesc = undefined;
+        var m: u32 = 0;
+        var lut_slot: u32 = 0;
+        const append = struct {
+            fn run(dst: []HuffDecChunkDesc, m_ptr: *u32, lut_ptr: *u32,
+                   src: []const HuffDecChunkDesc, region_off: u32) void {
+                for (src) |s| {
+                    if (m_ptr.* >= dst.len) return;
+                    var d = s;
+                    d.out_offset += region_off;
+                    d.lut_offset = lut_ptr.* * @as(u32, @intCast(HUFF_LUT_ENTRIES));
+                    dst[m_ptr.*] = d;
+                    m_ptr.* += 1;
+                    lut_ptr.* += 1;
+                }
+            }
+        }.run;
+        append(&merged_huff, &m, &lut_slot, huff_lit_host_buf[0..scan.num_huff_lit], 0);
+        append(&merged_huff, &m, &lut_slot, huff_tok_host_buf[0..scan.num_huff_tok], @intCast(tok_offset));
+        append(&merged_huff, &m, &lut_slot, huff_off16hi_host_buf[0..scan.num_huff_off16hi], @intCast(off16_offset));
+        append(&merged_huff, &m, &lut_slot, huff_off16lo_host_buf[0..scan.num_huff_off16lo], @intCast(off16_offset));
+
+        const huff_desc_bytes = @as(usize, m) * @sizeOf(HuffDecChunkDesc);
+        const huff_lut_bytes = @as(usize, m) * HUFF_LUT_ENTRIES * @sizeOf(u32);
         if (!ensureDeviceBuf(&d_huff_descs, &d_huff_descs_size, huff_desc_bytes)) return error.BadMode;
         if (!ensureDeviceBuf(&d_huff_lut, &d_huff_lut_size, huff_lut_bytes)) return error.BadMode;
-
-        _ = h2d_fn(d_huff_descs, @ptrCast(&huff_host_buf), huff_desc_bytes);
+        _ = h2d_fn(d_huff_descs, @ptrCast(&merged_huff), huff_desc_bytes);
         _ = sync_fn();
-
-        // Build LUT — 1 warp per block, 1408 B shared mem (code_lengths, codes, bl_count, next_code).
-        {
-            var p_comp = d_comp_persist;
-            var p_descs = d_huff_descs;
-            var p_lut = d_huff_lut;
-            var p_n = n_huff;
-            var params = [_]?*anyopaque{
-                @ptrCast(&p_comp), @ptrCast(&p_descs),
-                @ptrCast(&p_lut), @ptrCast(&p_n),
-            };
-            var extra = [_]?*anyopaque{null};
-            if (launch_fn(huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS)
-                return error.BadMode;
-        }
-        // Decode — 1 warp per block, 8 KB shared LUT.
-        {
-            var p_comp = d_comp_persist;
-            var p_descs = d_huff_descs;
-            var p_lut = d_huff_lut;
-            var p_out = d_tans_scratch;
-            var p_n = n_huff;
-            var params = [_]?*anyopaque{
-                @ptrCast(&p_comp), @ptrCast(&p_descs),
-                @ptrCast(&p_lut), @ptrCast(&p_out), @ptrCast(&p_n),
-            };
-            var extra = [_]?*anyopaque{null};
-            const shared_bytes: c_uint = HUFF_LUT_ENTRIES * @sizeOf(u32);
-            if (launch_fn(huff_decode_fn, n_huff, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra) != CUDA_SUCCESS)
-                return error.BadMode;
-        }
-        // Don't sync here — the LZ kernel sync below picks it up.
     }
 
     // ── Pipeline: split into N groups, overlap tANS with LZ ───
@@ -1260,16 +1292,66 @@ pub fn fullGpuLaunch(
         // ── KERNEL TIMER: only pure GPU kernel time from here ──
         const t_before_kern = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
 
+        // SLZ_SPLIT_TIMER hoisted above the Huff launches so we can fence
+        // around them too. Without split, Huff time gets pipelined into LZ.
+        const split_timer = std.c.getenv("SLZ_SPLIT_TIMER") != null;
+
+        // Launch Huffman pre-decode (Pass 1.5). On split_timer we sync
+        // after so the Huff time is attributed separately.
+        const t_huff_start = if (split_timer and have_huff)
+            if (io) |io_val| std.Io.Clock.awake.now(io_val) else null
+        else
+            null;
+        if (have_huff) {
+            const huff_stream = pipeline_streams[0];
+            {
+                var p_comp = d_comp_persist;
+                var p_descs = d_huff_descs;
+                var p_lut = d_huff_lut;
+                var p_n = n_huff;
+                var params = [_]?*anyopaque{
+                    @ptrCast(&p_comp), @ptrCast(&p_descs),
+                    @ptrCast(&p_lut), @ptrCast(&p_n),
+                };
+                var extra = [_]?*anyopaque{null};
+                if (launch_fn(huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra) != CUDA_SUCCESS)
+                    return error.BadMode;
+            }
+            {
+                var p_comp = d_comp_persist;
+                var p_descs = d_huff_descs;
+                var p_lut = d_huff_lut;
+                var p_out = d_tans_scratch;
+                var p_n = n_huff;
+                var params = [_]?*anyopaque{
+                    @ptrCast(&p_comp), @ptrCast(&p_descs),
+                    @ptrCast(&p_lut), @ptrCast(&p_out), @ptrCast(&p_n),
+                };
+                var extra = [_]?*anyopaque{null};
+                const shared_bytes: c_uint = HUFF_LUT_ENTRIES * @sizeOf(u32);
+                if (launch_fn(huff_decode_fn, n_huff, 1, 1, 32, 1, 1, shared_bytes, huff_stream, &params, &extra) != CUDA_SUCCESS)
+                    return error.BadMode;
+            }
+        }
+
         // Launch pipelined groups: for each group, launch tANS build → tANS decode → LZ in its own stream
         // Operations within a stream are ordered; across streams they can overlap
         const stream_sync_fn = cuStreamSync_fn orelse return error.BadMode;
 
-        // SLZ_SPLIT_TIMER=1: sync between tANS Pass-1 and LZ Pass-2 in each
-        // pipeline group so we can measure them separately. Costs a stream
-        // sync per group but exposes the tANS-vs-LZ time breakdown.
-        const split_timer = std.c.getenv("SLZ_SPLIT_TIMER") != null;
         var split_tans_ns: i64 = 0;
         var split_lz_ns: i64 = 0;
+        var split_huff_ns: i64 = 0;
+
+        // Close Huff time slice now: sync the pipeline stream so the next
+        // group's tANS_start measurement excludes Huff time.
+        if (split_timer and have_huff) {
+            _ = stream_sync_fn(pipeline_streams[0]);
+            if (t_huff_start) |hs| {
+                if (io) |io_val| {
+                    split_huff_ns = @intCast(hs.untilNow(io_val, .awake).toNanoseconds());
+                }
+            }
+        }
 
         for (0..NUM_PIPELINE_STREAMS) |g| {
             const stream = pipeline_streams[g];
@@ -1452,7 +1534,7 @@ pub fn fullGpuLaunch(
 
             // Fast path: no entropy in this scan → use lean L1/L2 raw kernel.
             // Huffman literals also require the general kernel (it reads tans_scratch).
-            const use_raw_kernel = merged_count == 0 and scan.num_huff_lit == 0 and kernel_raw_fn != 0;
+            const use_raw_kernel = merged_count == 0 and n_huff == 0 and kernel_raw_fn != 0;
 
             if (use_raw_kernel) {
                 var p_comp = d_comp_persist;
@@ -1569,9 +1651,11 @@ pub fn fullGpuLaunch(
                 if (split_timer) {
                     last_tans_kernel_ns = split_tans_ns;
                     last_lz_kernel_ns = split_lz_ns;
+                    last_huff_kernel_ns = split_huff_ns;
                 } else {
                     last_tans_kernel_ns = last_kernel_ns; // pipelined, report combined time
                     last_lz_kernel_ns = 0;
+                    last_huff_kernel_ns = 0;
                 }
             }
         }
@@ -1682,7 +1766,7 @@ pub fn fullGpuLaunch(
         // ── Pass 2: LZ decode ──────────────────────────────────────
         // Fast path: when there's no entropy work (L1/L2 inputs), use the
         // dedicated 6-param kernel — same shape as the May-9 22 GB/s era.
-        const no_entropy = merged_count == 0 and scan.num_huff_lit == 0;
+        const no_entropy = merged_count == 0 and n_huff == 0;
         const use_raw_kernel = no_entropy and kernel_raw_fn != 0;
 
         const grid_x = (num_groups + 1) / 2;
