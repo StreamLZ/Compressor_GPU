@@ -137,48 +137,57 @@ pub fn writeComplexOffset(
     var match_length = initial_match_length;
     var literal_run_length = initial_literal_run_length;
 
-    // Copy literals into il slots. Each 0x87 continuation token gets
-    // its own slot with 8 bytes of literal overcopy.
-    var lit_src = literal_start;
+    // Reads up to 4 bytes past the literal span; the parser's scratch buffer has room.
+    const old_literal = w.literal_cursor;
+    w.literal_cursor = old_literal + literal_run_length;
+    if (literal_run_length > 0) {
+        copyBytesUnsafe(old_literal, literal_start, literal_run_length);
+    }
+    if (w.delta_literal_cursor) |delta_cur| {
+        w.delta_literal_cursor = delta_cur + literal_run_length;
+        if (literal_run_length > 0) {
+            offset_encoder.subtractBytesUnsafe(delta_cur, literal_start, literal_run_length, recent_offset);
+        }
+    }
 
-    // All literal runs use 0x87 continuation slots (7 bytes each).
-    // This keeps all data in il_cursor order for correct compact.
-    while (literal_run_length > 7) {
-        const p = w.il_cursor;
-        p[0] = 0x87;
-        p[1] = 0;
-        p[2] = 0;
-        @as(*align(1) [8]u8, @ptrCast(p + 3)).* = @as(*const align(1) [8]u8, @ptrCast(lit_src)).*;
-        w.il_cursor = p + 11;
-        lit_src += 7;
-        literal_run_length -= 7;
+    if (literal_run_length < 64) {
+        // Split long-ish literal runs into 0x87 continuation tokens
+        // (= "7 literal bytes, new 0 match"). Each emits 7 literals.
+        while (literal_run_length > 7) {
+            w.token_cursor[0] = 0x87;
+            w.token_cursor += 1;
+            literal_run_length -= 7;
+        }
+    } else {
+        // Long literal run: use command 0 with extended length value.
+        writeLengthValue(w, literal_run_length - 64);
+        w.token_cursor[0] = 0x00;
+        w.token_cursor += 1;
+        w.complex_token_count += 1;
+        literal_run_length = 0;
+        if (match_length == 0) return;
     }
 
     if (offset <= 0xFFFF and match_length < constants.near_offset_max_match_length + 1) {
+        // Near-offset match with partial length (first slot) + continuation.
         var current_match_length: u32 = @min(match_length, 15);
         var token: u8 = @intCast(literal_run_length + 8 * current_match_length);
-        const p = w.il_cursor;
         if (offset == 0) {
             token += 0x80;
-            p[1] = 0;
-            p[2] = 0;
         } else {
-            p[1] = @intCast(offset & 0xFF);
-            p[2] = @intCast(offset >> 8);
+            w.off16_cursor[0] = @intCast(offset);
+            w.off16_cursor += 1;
         }
-        p[0] = token;
-        @as(*align(1) [8]u8, @ptrCast(p + 3)).* = @as(*const align(1) [8]u8, @ptrCast(lit_src)).*;
-        w.il_cursor = p + 11;
         match_length -= current_match_length;
+        w.token_cursor[0] = token;
+        w.token_cursor += 1;
 
+        // Continuation chain: each 0x80 + 8*L emits L more match bytes from
+        // the same offset.
         while (match_length != 0) {
             current_match_length = @min(match_length, 15);
-            const q = w.il_cursor;
-            q[0] = @intCast(0x80 + 8 * current_match_length);
-            q[1] = 0;
-            q[2] = 0;
-            @memset((q + 3)[0..8], 0);
-            w.il_cursor = q + 11;
+            w.token_cursor[0] = @intCast(0x80 + 8 * current_match_length);
+            w.token_cursor += 1;
             match_length -= current_match_length;
         }
         return;
@@ -187,14 +196,11 @@ pub fn writeComplexOffset(
     // Long-match and/or far-offset path.
     w.complex_token_count += 1;
     if (literal_run_length != 0) {
-        const p = w.il_cursor;
-        p[0] = @intCast(0x80 + literal_run_length);
-        p[1] = 0;
-        p[2] = 0;
-        @as(*align(1) [8]u8, @ptrCast(p + 3)).* = @as(*const align(1) [8]u8, @ptrCast(lit_src)).*;
-        w.il_cursor = p + 11;
+        w.token_cursor[0] = @intCast(0x80 + literal_run_length);
+        w.token_cursor += 1;
     }
 
+    // "offset == 0" means recent-offset; resolve to the actual recent value.
     var effective_offset: u32 = offset;
     if (effective_offset == 0) {
         const neg_recent: isize = -recent_offset;
@@ -221,32 +227,24 @@ pub fn writeComplexOffset(
         write_length = true;
     }
 
-    {
-        const p = w.il_cursor;
-        p[0] = token_byte;
-        p[1] = 0;
-        p[2] = 0;
-        @memset((p + 3)[0..8], 0);
-        w.il_cursor = p + 11;
-    }
+    w.token_cursor[0] = token_byte;
+    w.token_cursor += 1;
     if (write_length) {
+        // length_value can be 0 here; that's valid and encodes as a single 0 byte.
         const lv: u32 = @intCast(@max(length_value, 0));
         writeLengthValue(w, lv);
     }
 
     if (effective_offset > 0xFFFF) {
         // Offset adjustment: `+ (source_ptr + block2_start_offset - literal_end)`.
-        // Computed from writer state. Uses the ORIGINAL literal-run length
-        // (the loop above decremented the local copy as it drained).
+        // Computed from writer state.
         const literal_end_pos: usize = @intFromPtr(literal_start) + initial_literal_run_length;
         const src_base_plus_block2: usize = @intFromPtr(w.source_ptr) + w.block2_start_offset;
         const adjusted: u32 = effective_offset +% @as(u32, @truncate(src_base_plus_block2 -% literal_end_pos));
         writeOffset32(w, adjusted);
     } else {
-        // Near offset for complex token: write into the LAST emitted slot's off16 area
-        const last_slot: [*]u8 = w.il_cursor - 11;
-        last_slot[1] = @intCast(effective_offset & 0xFF);
-        last_slot[2] = @intCast(effective_offset >> 8);
+        w.off16_cursor[0] = @intCast(effective_offset);
+        w.off16_cursor += 1;
     }
 }
 
@@ -263,66 +261,34 @@ pub inline fn writeOffset(
 ) void {
     if (literal_run_length <= 7 and match_length <= 15 and offset <= 0xFFFF) {
         @branchHint(.likely);
-        // Fixed-stride interleaved write: ONE struct read (il_cursor),
-        // 11 bytes at known offsets, ONE struct write back.
-        // Layout per slot: [cmd:1][off16_lo:1][off16_hi:1][lit:8]
-        const p = w.il_cursor;
+        // Fast path — fixed-stride writes: literal copy, token, offset.
+        // All writes are unconditional; off16 gets a dummy on reuse
+        // that the assembly step skips via the flag bit.
+        copy.copy64(w.literal_cursor, literal_start);
+        w.literal_cursor += literal_run_length;
+        if (w.delta_literal_cursor) |delta_cur| {
+            const V8 = @Vector(8, u8);
+            const a: V8 = literal_start[0..8].*;
+            const back_ptr: [*]const u8 = ptr_math.offsetPtr([*]const u8, literal_start, recent_offset);
+            const b: V8 = back_ptr[0..8].*;
+            const out: V8 = a -% b;
+            delta_cur[0..8].* = out;
+            w.delta_literal_cursor = delta_cur + literal_run_length;
+        }
+
         const use_distance_bit: u8 = if (offset == 0) 0x80 else 0;
-        p[0] = use_distance_bit + @as(u8, @intCast(literal_run_length + 8 * match_length));
-        p[1] = @intCast(offset & 0xFF);
-        p[2] = @intCast(offset >> 8);
-        @as(*align(1) [8]u8, @ptrCast(p + 3)).* = @as(*const align(1) [8]u8, @ptrCast(literal_start)).*;
-        w.il_cursor = p + 11;
+        const token: u8 = @intCast(literal_run_length + 8 * match_length);
+        w.token_cursor[0] = use_distance_bit + token;
+        w.token_cursor += 1;
+
+        // Always write offset — unconditional store eliminates branch.
+        // off16 stream has a dummy value when reuse flag (0x80) is set;
+        // assembly skips these entries by checking the cmd stream flag.
+        w.off16_cursor[0] = @intCast(offset);
+        w.off16_cursor += @as(usize, @intFromBool(offset != 0));
         return;
     }
     writeComplexOffset(w, match_length, literal_run_length, offset, recent_offset, literal_start);
-}
-
-pub fn compactIl(w: *FastStreamWriter) void {
-    var p = w.il_start;
-    const end = w.il_cursor;
-    while (@intFromPtr(p) < @intFromPtr(end)) {
-        const cmd = p[0];
-        w.token_cursor[0] = cmd;
-        w.token_cursor += 1;
-
-        if (cmd >= 24) {
-            // Short token: lit = cmd & 7, off16 if bit 7 clear
-            const lit_len: usize = cmd & 7;
-            if ((cmd & 0x80) == 0) {
-                @as(*align(1) [2]u8, @ptrCast(w.off16_cursor)).* = (p + 1)[0..2].*;
-                w.off16_cursor += 1;
-            }
-            if (lit_len > 0) {
-                @as(*align(1) [8]u8, @ptrCast(w.literal_cursor)).* = @as(*const align(1) [8]u8, @ptrCast(p + 3)).*;
-                w.literal_cursor += lit_len;
-            }
-        } else if (cmd == 0x87) {
-            // 7-literal continuation
-            @as(*align(1) [8]u8, @ptrCast(w.literal_cursor)).* = @as(*const align(1) [8]u8, @ptrCast(p + 3)).*;
-            w.literal_cursor += 7;
-        } else if ((cmd & 0x80) != 0 and cmd != 0x87) {
-            // Match continuation (0x80 + 8*L) or literal-prefix (0x80 + lit):
-            // has literals if (cmd & 7) != 0
-            const lit_len: usize = cmd & 7;
-            if (lit_len > 0) {
-                @as(*align(1) [8]u8, @ptrCast(w.literal_cursor)).* = @as(*const align(1) [8]u8, @ptrCast(p + 3)).*;
-                w.literal_cursor += lit_len;
-            }
-        } else {
-            // cmd 0-23: complex tokens (far match, long near match)
-            // off16 stored in slot if non-zero
-            const off_lo = p[1];
-            const off_hi = p[2];
-            if (off_lo != 0 or off_hi != 0) {
-                @as(*align(1) [2]u8, @ptrCast(w.off16_cursor)).* = (p + 1)[0..2].*;
-                w.off16_cursor += 1;
-            }
-        }
-
-        p += 11;
-    }
-    w.il_cursor = w.il_start;
 }
 
 /// Lazy-parser entry point: scans literal runs in the [8, 63] range for
