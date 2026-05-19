@@ -544,6 +544,7 @@ pub fn runLazyParser(
         }
     }
 
+    token_writer.compactIl(w);
     token_writer.copyTrailingLiterals(w, literal_start, source_end, recent_offset);
     recent_offset_inout.* = recent_offset;
 }
@@ -839,6 +840,7 @@ pub fn runLazyParserChain(
         }
     }
 
+    token_writer.compactIl(w);
     token_writer.copyTrailingLiterals(w, literal_start, source_end, recent_offset);
     recent_offset_inout.* = recent_offset;
 }
