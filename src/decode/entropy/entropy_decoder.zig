@@ -153,8 +153,16 @@ fn highDecodeBytesInternal(
 
     switch (chunk_type) {
         2 => src_used = try huffman.highDecodeBytesType12(payload, dst_buf, dst_size, 1),
-        4 => src_used = try huffman.highDecodeBytesType12(payload, dst_buf, dst_size, 2),
+        4 => src_used = try decodeHuff4(payload, dst_buf, dst_size),
         1 => src_used = try tans.highDecodeTans(
+            payload.ptr,
+            payload.len,
+            dst_buf,
+            dst_size,
+            scratch_ptr,
+            scratch_end,
+        ),
+        6 => src_used = try tans.highDecodeTans32(
             payload.ptr,
             payload.len,
             dst_buf,
@@ -178,7 +186,6 @@ fn highDecodeBytesInternal(
             scratch_end,
             max_depth,
         ),
-        6 => return error.BadChunkHeader,
         else => return error.BadChunkHeader,
     }
 
@@ -193,6 +200,144 @@ fn highDecodeBytesInternal(
 // ────────────────────────────────────────────────────────────
 //  Type 3 — RLE decoder
 // ────────────────────────────────────────────────────────────
+
+/// chunk_type=4 Huffman: 128 B nibble-packed weights + 9 B sub-header
+/// (3 × u24 LE stream sizes) + 4 streams. Matches gpu_huff_decode_kernel.cu
+/// and src/encode/entropy/huffman_encoder.zig.
+fn decodeHuff4(payload: []const u8, dst_buf: [*]u8, dst_size: usize) !usize {
+    const MAX_CODE_LEN: u8 = 11;
+    const LUT_SIZE: usize = 1 << @as(u6, @intCast(MAX_CODE_LEN));
+    const WEIGHTS_BYTES: usize = 128;
+    const SUB_HEADER_BYTES: usize = 9;
+    if (payload.len < WEIGHTS_BYTES + SUB_HEADER_BYTES) return error.SourceTruncated;
+
+    // ── Unpack 128 B → 256 code lengths ──
+    var code_lengths: [256]u8 = @splat(0);
+    for (0..128) |i| {
+        const b = payload[i];
+        code_lengths[i * 2 + 0] = b & 0x0F;
+        code_lengths[i * 2 + 1] = (b >> 4) & 0x0F;
+    }
+
+    // ── Build canonical codes (RFC 1951 style) ──
+    var length_count: [13]u32 = @splat(0);
+    for (0..256) |s| {
+        const L = code_lengths[s];
+        if (L > 0 and L <= MAX_CODE_LEN) length_count[L] += 1;
+    }
+    var next_code: [13]u32 = @splat(0);
+    {
+        var code: u32 = 0;
+        var L: usize = 1;
+        while (L <= MAX_CODE_LEN) : (L += 1) {
+            code = (code + length_count[L - 1]) << 1;
+            next_code[L] = code;
+        }
+    }
+    var codes: [256]u32 = @splat(0);
+    for (0..256) |s| {
+        const L = code_lengths[s];
+        if (L != 0) {
+            codes[s] = next_code[L];
+            next_code[L] += 1;
+        }
+    }
+
+    // ── Build X2 LUT ──
+    var lut: [LUT_SIZE]u32 = @splat(0);
+    // Pass 1: single-symbol entries.
+    for (0..256) |s| {
+        const L = code_lengths[s];
+        if (L == 0) continue;
+        const aligned: u32 = codes[s] << @as(u5, @intCast(MAX_CODE_LEN - L));
+        const span: u32 = @as(u32, 1) << @as(u5, @intCast(MAX_CODE_LEN - L));
+        const entry: u32 = (@as(u32, 1) << 24) | (@as(u32, L) << 16) | @as(u32, @intCast(s));
+        var i: u32 = 0;
+        while (i < span) : (i += 1) lut[aligned + i] = entry;
+    }
+    // Pass 2: dual-symbol entries overwrite where L1+L2 ≤ MAX_CODE_LEN.
+    for (0..256) |s1| {
+        const L1 = code_lengths[s1];
+        if (L1 == 0 or L1 >= MAX_CODE_LEN) continue;
+        const C1 = codes[s1];
+        for (0..256) |s2| {
+            const L2 = code_lengths[s2];
+            if (L2 == 0) continue;
+            const total = L1 + L2;
+            if (total > MAX_CODE_LEN) continue;
+            const C2 = codes[s2];
+            const aligned: u32 = (C1 << @as(u5, @intCast(MAX_CODE_LEN - L1))) |
+                (C2 << @as(u5, @intCast(MAX_CODE_LEN - L1 - L2)));
+            const span: u32 = @as(u32, 1) << @as(u5, @intCast(MAX_CODE_LEN - total));
+            const entry: u32 = (@as(u32, 2) << 24) | (@as(u32, total) << 16) |
+                (@as(u32, @intCast(s2)) << 8) | @as(u32, @intCast(s1));
+            var i: u32 = 0;
+            while (i < span) : (i += 1) lut[aligned + i] = entry;
+        }
+    }
+
+    // ── Parse 9-byte sub-header ──
+    const hdr = payload[WEIGHTS_BYTES..][0..SUB_HEADER_BYTES];
+    var sizes: [4]u32 = @splat(0);
+    for (0..3) |s| {
+        sizes[s] = @as(u32, hdr[s * 3 + 0]) |
+            (@as(u32, hdr[s * 3 + 1]) << 8) |
+            (@as(u32, hdr[s * 3 + 2]) << 16);
+    }
+    const streams_total: u32 = @intCast(payload.len - WEIGHTS_BYTES - SUB_HEADER_BYTES);
+    if (sizes[0] + sizes[1] + sizes[2] > streams_total) return error.SourceTruncated;
+    sizes[3] = streams_total - sizes[0] - sizes[1] - sizes[2];
+
+    // ── Decode 4 streams sequentially on CPU ──
+    const q: usize = dst_size / 4;
+    var stream_off: usize = WEIGHTS_BYTES + SUB_HEADER_BYTES;
+    var stream_i: usize = 0;
+    while (stream_i < 4) : (stream_i += 1) {
+        const out_start = stream_i * q;
+        const out_end = if (stream_i == 3) dst_size else (stream_i + 1) * q;
+        const my_out_size = out_end - out_start;
+        const my_in_size: usize = @intCast(sizes[stream_i]);
+        const in_data = payload[stream_off..][0..my_in_size];
+        try decodeHuff4Stream(in_data, &lut, dst_buf + out_start, my_out_size);
+        stream_off += my_in_size;
+    }
+    return payload.len;
+}
+
+/// Single-stream Huffman decode using the prebuilt X2 LUT.
+fn decodeHuff4Stream(in: []const u8, lut: *const [2048]u32, out: [*]u8, out_size: usize) !void {
+    const MAX_CODE_LEN: u8 = 11;
+    var bit_buf: u64 = 0;
+    var bit_count: i32 = 0;
+    var in_pos: usize = 0;
+    var out_pos: usize = 0;
+
+    while (out_pos < out_size) {
+        // Refill up to ≥ MAX_CODE_LEN bits.
+        while (bit_count < MAX_CODE_LEN and in_pos < in.len) {
+            bit_buf = (bit_buf << 8) | @as(u64, in[in_pos]);
+            in_pos += 1;
+            bit_count += 8;
+        }
+        if (bit_count < MAX_CODE_LEN) {
+            // Pad with zeros to allow final lookup.
+            bit_buf <<= @intCast(MAX_CODE_LEN - bit_count);
+            bit_count = MAX_CODE_LEN;
+        }
+        const idx: u32 = @intCast((bit_buf >> @intCast(bit_count - MAX_CODE_LEN)) & 0x7FF);
+        const entry = lut[idx];
+        const total_len: i32 = @intCast((entry >> 16) & 0xFF);
+        const num_syms: i32 = @intCast((entry >> 24) & 0xFF);
+        if (total_len == 0) return error.BadCodeLengthFormat;
+        out[out_pos] = @intCast(entry & 0xFF);
+        out_pos += 1;
+        if (num_syms == 2 and out_pos < out_size) {
+            out[out_pos] = @intCast((entry >> 8) & 0xFF);
+            out_pos += 1;
+        }
+        bit_count -= total_len;
+    }
+}
 
 /// Run-length decoder. Commands walk backward from the end of the block,
 /// literals forward from `src[1]`. The first byte flags whether the

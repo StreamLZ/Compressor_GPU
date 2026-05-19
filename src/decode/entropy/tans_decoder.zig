@@ -776,9 +776,120 @@ pub fn highDecodeTans(
     return src_size;
 }
 
+/// FSE-style probability table decoder for chunk_type=6 tans32 streams.
+/// Mirrors GPU's `decodeFseWeights` in gpu_tans_decode_kernel.cu.
+/// Format: [u8 log_table_bits][bit-packed probabilities (truncated binary)].
+/// Returns total bytes consumed (includes the log_table_bits byte).
+fn decodeFseWeights(
+    src: []const u8,
+    weights: *[256]u16,
+    log_table_bits_out: *u32,
+) DecodeError!usize {
+    if (src.len < 2) return error.SourceTruncated;
+    const log_table_bits: u32 = src[0];
+    if (log_table_bits < 8 or log_table_bits > 11) return error.BadLogTableBits;
+    log_table_bits_out.* = log_table_bits;
+    const L: i32 = @as(i32, 1) << @intCast(log_table_bits);
+    var remaining: i32 = L;
+    for (weights) |*w| w.* = 0;
+    const data = src[1..];
+    var bit_offset: u32 = 0;
+    var sym: u32 = 0;
+    while (remaining > 0 and sym < 256) {
+        const rem1: u32 = @intCast(remaining + 1);
+        const log2_rem: u32 = if (rem1 > 1) @intCast(31 - @clz(rem1)) else 0;
+        const nb: u32 = log2_rem + 1;
+        const half: u32 = @as(u32, 1) << @intCast(nb - 1);
+        const max_val: u32 = (half << 1) - @as(u32, @intCast(remaining)) - 2;
+        const byte_idx: u32 = bit_offset >> 3;
+        const bit_idx: u32 = bit_offset & 7;
+        if (byte_idx + 3 > data.len) return error.SourceTruncated;
+        var val: u32 = data[byte_idx];
+        if (bit_idx + nb > 8) val |= @as(u32, data[byte_idx + 1]) << 8;
+        if (bit_idx + nb > 16) val |= @as(u32, data[byte_idx + 2]) << 16;
+        val >>= @intCast(bit_idx);
+        const short_val: u32 = val & (half - 1);
+        const full_val: u32 = val & ((half << 1) - 1);
+        var count: i32 = undefined;
+        if (short_val < max_val) {
+            count = @intCast(short_val);
+            bit_offset += nb - 1;
+        } else {
+            if (full_val >= half) count = @intCast(full_val - max_val) else count = @intCast(full_val);
+            bit_offset += nb;
+        }
+        const prob: i32 = count - 1;
+        if (prob > 0) {
+            if (prob > 65535) return error.BadTableWeights;
+            weights[sym] = @intCast(prob);
+            remaining -= prob;
+        }
+        sym += 1;
+    }
+    return 1 + ((bit_offset + 7) / 8);
+}
+
+/// Build packed 4-way interleaved LUT from FSE weights.
+/// Mirrors GPU's `buildPackedLut4Way`. Each LUT entry is u32:
+///   bits 24-31: bps (bits to read for next state)
+///   bits 16-23: symbol
+///   bits  0-15: (running_w << bps) & L_mask
+fn buildPackedLut4Way(weights: *const [256]u16, log_table_bits: u32, lut: [*]u32) void {
+    const L: u32 = @as(u32, 1) << @intCast(log_table_bits);
+    const L_mask: u32 = L - 1;
+    var ones: u32 = 0;
+    for (weights) |w| if (w == 1) {
+        ones += 1;
+    };
+    const slots_left: u32 = L - ones;
+    const sa: u32 = slots_left >> 2;
+    var ptrs: [4]u32 = undefined;
+    ptrs[0] = 0;
+    var sb: u32 = sa + (if ((slots_left & 3) > 0) @as(u32, 1) else 0);
+    ptrs[1] = sb;
+    sb += sa + (if ((slots_left & 3) > 1) @as(u32, 1) else 0);
+    ptrs[2] = sb;
+    sb += sa + (if ((slots_left & 3) > 2) @as(u32, 1) else 0);
+    ptrs[3] = sb;
+    var weights_sum: i32 = 0;
+    for (0..256) |sym| {
+        const w: u32 = weights[sym];
+        if (w <= 1) continue;
+        const wb_lo: u32 = @intCast(31 - @clz(w));
+        const bps_lo: u32 = log_table_bits - wb_lo;
+        const bps_hi: u32 = bps_lo - 1;
+        const crossover: u32 = (@as(u32, 1) << @intCast(wb_lo + 1)) - w;
+        const sym_shifted: u32 = @as(u32, @intCast(sym)) << 16;
+        var ptr_cursor: i32 = weights_sum;
+        for (0..4) |jj| {
+            const j: i32 = @intCast(jj);
+            const y: i32 = (@as(i32, @intCast(w)) + ((weights_sum - j - 1) & 3)) >> 2;
+            var k: i32 = 0;
+            while (k < y) : (k += 1) {
+                const slot: u32 = ptrs[jj];
+                const offset: u32 = @intCast(ptr_cursor - weights_sum);
+                const running_w: u32 = w + offset;
+                const bps: u32 = if (offset < crossover) bps_lo else bps_hi;
+                lut[slot] = (bps << 24) | sym_shifted | (L_mask & (running_w << @intCast(bps)));
+                ptrs[jj] += 1;
+                ptr_cursor += 1;
+            }
+        }
+        weights_sum += @as(i32, @intCast(w));
+    }
+    var pos: u32 = slots_left;
+    const ones_packed_base: u32 = log_table_bits << 24;
+    for (0..256) |sym| {
+        if (weights[sym] == 1) {
+            lut[pos] = ones_packed_base | (@as(u32, @intCast(sym)) << 16);
+            pos += 1;
+        }
+    }
+}
+
 /// Decode 32-lane interleaved tANS (chunk_type 6).
-/// Wire format: [table] [32×u16 LE sub-stream sizes] [32×u8 final states] [sub-streams]
-/// Output is de-interleaved: dst[i] comes from lane (i % 32), symbol (i / 32).
+/// Wire format: [32×u16 LE sub-stream sizes][32×u16 LE init states][FSE table][32 sub-streams].
+/// Output is de-interleaved: dst[i*32 + lane] is lane `lane`'s `i`-th symbol.
 pub fn highDecodeTans32(
     src_in: [*]const u8,
     src_size: usize,
@@ -787,60 +898,41 @@ pub fn highDecodeTans32(
     scratch: [*]u8,
     scratch_end: [*]u8,
 ) DecodeError!usize {
-    if (src_size < 100 or dst_size < 32) return error.SourceTruncated;
-
-    // Layout: [sizes 64B][states 64B][u16 L][u8 ltb][L×u32 packed LUT][sub-streams]
-    if (src_size < 131) return error.SourceTruncated;
+    // Wire format: [32×u16 sizes][32×u16 states][FSE table][32 sub-streams].
+    if (src_size < 128 or dst_size < 32) return error.SourceTruncated;
 
     const sizes_ptr: [*]const u8 = src_in;
     const states_ptr: [*]const u8 = src_in + 64;
 
-    // Read LUT header
-    const lut_count: u32 = @as(u32, src_in[128]) | (@as(u32, src_in[129]) << 8);
-    const log_table_bits: u32 = src_in[130];
-    if (log_table_bits < 8 or log_table_bits > 11) return error.BadTableFormat;
-    const l_int: i32 = @as(i32, 1) << @intCast(log_table_bits);
-    if (lut_count != @as(u32, @intCast(l_int))) return error.BadTableWeights;
+    // Parse FSE-encoded probability table.
+    var weights: [256]u16 = @splat(0);
+    var log_table_bits: u32 = 0;
+    const table_slice = src_in[128 .. @min(src_size, 128 + 512)];
+    const table_bytes = try decodeFseWeights(table_slice, &weights, &log_table_bits);
+    const L: u32 = @as(u32, 1) << @intCast(log_table_bits);
+    const L_mask: u32 = L - 1;
 
-    // Read packed LUT and unpack to TansLutEnt
-    const packed_lut_ptr: [*]const u8 = src_in + 131;
-    const lut_data_bytes: usize = lut_count * 4;
-    if (131 + lut_data_bytes > src_size) return error.SourceTruncated;
-
-    // Sub-streams follow the packed LUT
-    const sub_data_base: [*]const u8 = packed_lut_ptr + lut_data_bytes;
-
-    // Unpack LUT into scratch
-    const lut_required: usize = @as(usize, @intCast(l_int)) * @sizeOf(TansLutEnt);
+    // Build packed LUT into scratch (4-byte entries, L entries).
+    const lut_required: usize = @as(usize, L) * @sizeOf(u32);
     const scratch_addr = @intFromPtr(scratch);
     const aligned_addr = (scratch_addr + 15) & ~@as(usize, 15);
     if (aligned_addr + lut_required > @intFromPtr(scratch_end)) return error.SourceTruncated;
-    const aligned_lut: [*]TansLutEnt = @ptrFromInt(aligned_addr);
+    const packed_lut: [*]u32 = @ptrFromInt(aligned_addr);
+    buildPackedLut4Way(&weights, log_table_bits, packed_lut);
 
-    // Unpack packed u32 entries to TansLutEnt
-    for (0..@as(usize, lut_count)) |i| {
-        const pval = std.mem.readInt(u32, (packed_lut_ptr + i * 4)[0..4], .little);
-        aligned_lut[i] = .{
-            .bits_x = @intCast((pval >> 24) & 0xFF),
-            .symbol = @intCast((pval >> 16) & 0xFF),
-            .w = @intCast(pval & 0xFFFF),
-            .x = (@as(u32, 1) << @intCast((pval >> 24) & 0x1F)) - 1,
-        };
-    }
-
-    const l_mask: u32 = (@as(u32, 1) << @intCast(log_table_bits)) - 1;
+    // Sub-streams follow the FSE table.
+    const sub_data_base: [*]const u8 = src_in + 128 + table_bytes;
+    if (@intFromPtr(sub_data_base) > @intFromPtr(src_in) + src_size) return error.SourceTruncated;
 
     var sub_sizes: [32]u16 = undefined;
     for (0..32) |lane| {
         sub_sizes[lane] = std.mem.readInt(u16, (sizes_ptr + lane * 2)[0..2], .little);
     }
-
     var sub_states: [32]u16 = undefined;
     for (0..32) |lane| {
         sub_states[lane] = std.mem.readInt(u16, (states_ptr + lane * 2)[0..2], .little);
     }
 
-    // Compute sub-stream offsets
     var sub_offsets: [32]usize = undefined;
     var off: usize = 0;
     for (0..32) |lane| {
@@ -848,36 +940,37 @@ pub fn highDecodeTans32(
         off += sub_sizes[lane];
     }
 
-    // Decode each lane sequentially (CPU fallback — no parallelism)
-    // NOTE: decode output may be incorrect (encode/decode state machine bug).
-    // This path exists only to prevent crashes so GPU decode can proceed.
-    const l_usize: usize = @intCast(l_int);
+    // Decode each lane sequentially.
     for (0..32) |lane| {
         const sub_sz: usize = sub_sizes[lane];
-        if (sub_sz < 4) continue;
-
-        const my_src: [*]const u8 = sub_data_base + sub_offsets[lane];
 
         var my_sym_count: usize = dst_size / 32;
         if (lane < dst_size % 32) my_sym_count += 1;
         if (my_sym_count == 0) continue;
 
-        var state: u32 = sub_states[lane];
-        if (state >= l_usize) state = 0;
+        const my_src: [*]const u8 = sub_data_base + sub_offsets[lane];
+        var state: u32 = @intCast(sub_states[lane]);
+        state &= L_mask;
 
-        var bits: u32 = std.mem.readInt(u32, my_src[0..4], .little);
-        var ptr: [*]const u8 = my_src + 4;
+        // Initial bit buffer fill: at most 4 bytes, gracefully handling
+        // sub_sz < 4 (highly-skewed lanes can compress to 1-3 bytes).
+        var bits: u32 = 0;
+        var fill: u32 = 0;
+        while (fill < @min(@as(u32, 4), @as(u32, @intCast(sub_sz)))) : (fill += 1) {
+            bits |= @as(u32, my_src[fill]) << @intCast(fill * 8);
+        }
+        var ptr: [*]const u8 = my_src + fill;
         const ptr_end: [*]const u8 = my_src + sub_sz;
-        var bitpos: i32 = 32;
+        var bitpos: i32 = @intCast(fill * 8);
 
         for (0..my_sym_count) |i| {
+            // Refill when low on bits.
             if (bitpos < 16) {
                 if (@intFromPtr(ptr) + 4 <= @intFromPtr(ptr_end)) {
                     bits |= std.mem.readInt(u32, ptr[0..4], .little) << @intCast(bitpos);
                     ptr += @as(usize, @intCast((31 - bitpos) >> 3));
                     bitpos |= 24;
                 } else {
-                    // Near end: refill byte-by-byte
                     while (bitpos < 24 and @intFromPtr(ptr) < @intFromPtr(ptr_end)) {
                         bits |= @as(u32, ptr[0]) << @intCast(bitpos);
                         ptr += 1;
@@ -886,20 +979,16 @@ pub fn highDecodeTans32(
                 }
             }
 
-            if (state >= l_usize) break;
-            const entry = aligned_lut[state];
-            const nb: u5 = @intCast(entry.bits_x);
-            const new_state = ((bits & entry.x) + entry.w) & l_mask;
+            const packed_entry: u32 = packed_lut[state];
+            const bps: u32 = (packed_entry >> 24) & 0x1F;
+            const sym: u8 = @intCast((packed_entry >> 16) & 0xFF);
+            const w: u32 = packed_entry & 0xFFFF;
+            const x_mask: u32 = (@as(u32, 1) << @intCast(bps)) - 1;
+            state = ((bits & x_mask) + w) & L_mask;
+            bits >>= @intCast(bps);
+            bitpos -= @intCast(bps);
 
-            if (lane == 0 and i < 3) {
-                std.debug.print("DEC lane0 i={d} state={d} sym={d}('{c}') nb={d} read_bits={d} new_state={d} bitpos={d}\n", .{ i, state, entry.symbol, entry.symbol, @as(u32, nb), bits & entry.x, new_state, bitpos });
-            }
-
-            state = new_state;
-            bits >>= nb;
-            bitpos -= @as(i32, nb);
-
-            dst[i * 32 + lane] = entry.symbol;
+            dst[i * 32 + lane] = sym;
         }
     }
 
