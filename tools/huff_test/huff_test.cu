@@ -505,10 +505,10 @@ static void bench_gpu_decode_32s_parallel(const uint8_t *src, size_t n_per_block
 // every block with its own LUT — i.e. exactly what the real pipeline does.
 // Block count is whatever the file yields (enwik8 ~1525, silesia ~3247);
 // no artificial tiling, no unrealistic 24000-block runs.
-static void bench_gpu_decode_realfile(const uint8_t *file, size_t file_size) {
-    const size_t BLK = 65536;
-    int n_blocks = (int)(file_size / BLK);  // whole 64 KB blocks only
-    if (n_blocks < 1) { printf("[realfile] input < 64 KB — skipping\n"); return; }
+static void bench_gpu_decode_realfile(const uint8_t *file, size_t file_size,
+                                      size_t BLK) {
+    int n_blocks = (int)(file_size / BLK);  // whole blocks only
+    if (n_blocks < 1) { printf("[realfile] input < block size — skipping\n"); return; }
 
     uint32_t *lut_buf  = (uint32_t*)malloc((size_t)n_blocks * LUT_SIZE * sizeof(uint32_t));
     uint8_t  *comp_buf = (uint8_t*)malloc(file_size * 2 + (size_t)64 * n_blocks);
@@ -582,9 +582,9 @@ static void bench_gpu_decode_realfile(const uint8_t *file, size_t file_size) {
 
     double gb_per_s = (double)total_out / (best_ms * 1e6);
     double ratio = 100.0 * (double)comp_off / (double)total_out;
-    printf("[realfile] %d distinct 64KB blocks = %.1f MB, per-block LUT, "
+    printf("[realfile] %d blocks x %zu KB (4-stream, %zu B/lane) = %.1f MB, "
            "enc %.1f%% -> best %.3f ms = %.1f GB/s%s\n",
-           n_blocks, total_out / 1e6, ratio, best_ms, gb_per_s,
+           n_blocks, BLK / 1024, BLK / 4, total_out / 1e6, ratio, best_ms, gb_per_s,
            verify_fail ? " [VERIFY FAIL]" : "");
 
     cudaFree(d_comp); cudaFree(d_out); cudaFree(d_lut); cudaFree(d_descs);
@@ -743,13 +743,19 @@ int main(int argc, char **argv) {
             fails += test_gpu_encode_decode_32s("real-64KB", full, cap);
 
             if (fails == 0) {
-                // Realistic decode bench: every 64 KB block is distinct
-                // file content with its own Huffman table + LUT. Block
-                // count is whatever the file yields (enwik8 ~1525,
-                // silesia ~3247) — no tiling, no 24000-block fantasy run.
+                // Realistic decode bench: every block is distinct file
+                // content with its own Huffman table + LUT.
                 printf("\n--- realistic decode bench (per-block LUT, distinct blocks) ---\n");
-                bench_gpu_decode_realfile(full, (size_t)sz);
+                bench_gpu_decode_realfile(full, (size_t)sz, 65536);
                 bench_gpu_decode_realfile_32s(full, (size_t)sz);
+                // Decoupling experiment: 4-stream kernel with smaller
+                // blocks. 16KB block -> 4KB/lane, 8KB block -> 2KB/lane
+                // (same per-lane work as the 32-stream kernel). If these
+                // are also slow, small per-lane streams are the cause,
+                // not the count of active lanes.
+                printf("--- decouple: 4-stream kernel, smaller blocks ---\n");
+                bench_gpu_decode_realfile(full, (size_t)sz, 16384);
+                bench_gpu_decode_realfile(full, (size_t)sz, 8192);
             }
             free(full);
         }
