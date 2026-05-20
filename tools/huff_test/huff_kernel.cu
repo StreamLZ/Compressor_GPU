@@ -1193,6 +1193,14 @@ extern "C" __global__ void slzHuffEncode4StreamKernel(
     const int lane = threadIdx.x & 31;
     const HuffEncDesc d = descs_in[block_id];
 
+    // Empty descriptor → no Huffman body for this sub-chunk (caller uses
+    // the raw fallback). Signalled by out_sizes == 0. d is block-uniform,
+    // so all 32 lanes return together — no shuffle/sync divergence.
+    if (d.src_size == 0) {
+        if (lane == 0) out_sizes[block_id] = 0;
+        return;
+    }
+
     // Lanes 0..3 each encode one of the 4 quarters into scratch.
     uint32_t bytes = 0;
     if (lane < 4) {

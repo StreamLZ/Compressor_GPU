@@ -24,6 +24,9 @@ var tans_module: usize = 0;
 var tans_kernel_fn: usize = 0;
 var tans32_kernel_fn: usize = 0;
 pub var tans32_shared_kernel_fn: usize = 0;
+var huff_module: usize = 0;
+var huff_tables_kernel_fn: usize = 0;
+var huff_encode_kernel_fn: usize = 0;
 var initialized = false;
 
 const FnInit = *const fn (c_uint) callconv(.c) CUresult;
@@ -95,6 +98,15 @@ pub fn init() bool {
     // 32-lane tANS encoder with frame-wide shared probability tables
     // (chunk_type=3). Phase 2 specialisation; optional.
     _ = get_fn(&tans32_shared_kernel_fn, tans_module, "slzTans32EncodeSharedKernel");
+
+    // GPU Huffman encoder (chunk_type=4). Optional — if the module or
+    // either kernel is missing, gpuEncode*Huff returns false and the
+    // caller falls back to the CPU Huffman encoder.
+    const huff_ptx = @embedFile("gpu_huff_kernel.ptx") ++ "\x00";
+    if ((cuModuleLoadData_fn orelse return false)(&huff_module, huff_ptx.ptr) == CUDA_SUCCESS) {
+        _ = get_fn(&huff_tables_kernel_fn, huff_module, "slzHuffBuildTablesKernel");
+        _ = get_fn(&huff_encode_kernel_fn, huff_module, "slzHuffEncode4StreamKernel");
+    }
 
     return true;
 }
@@ -177,6 +189,17 @@ pub const Tans32EncSharedDesc = extern struct {
     lut_id: u32,
 };
 
+/// GPU Huffman encode descriptor — matches `HuffEncDesc` in
+/// gpu_huff_kernel.cu. Same field layout as Tans32EncDesc: `src_stride`
+/// is 1 for a contiguous stream or 2 to encode one off16 byte plane.
+pub const HuffEncDesc = extern struct {
+    src_offset: u32,
+    src_size: u32,
+    src_stride: u32,
+    dst_offset: u32,
+    dst_capacity: u32,
+};
+
 // Persistent buffers for the 32-lane tANS pass.
 var d_tans32_descs_persist: CUdeviceptr = 0;
 var d_tans32_descs_size: usize = 0;
@@ -251,6 +274,111 @@ pub fn gpuEncodeTans32(
     return true;
 }
 
+// ── GPU Huffman encode pass ────────────────────────────────────
+// Persistent device buffers for the two-kernel Huffman encode.
+var d_huff_descs_persist: CUdeviceptr = 0;
+var d_huff_descs_size: usize = 0;
+var d_huff_cl_persist: CUdeviceptr = 0;
+var d_huff_cl_size: usize = 0;
+var d_huff_codes_persist: CUdeviceptr = 0;
+var d_huff_codes_size: usize = 0;
+var d_huff_scratch_persist: CUdeviceptr = 0;
+var d_huff_scratch_size: usize = 0;
+var d_huff_out_persist: CUdeviceptr = 0;
+var d_huff_out_size: usize = 0;
+var d_huff_sizes_persist: CUdeviceptr = 0;
+var d_huff_sizes_size: usize = 0;
+
+/// Run the GPU Huffman encoder on a batch of streams already resident in
+/// the LZ-encode output buffer (`d_output_persist`). Launches the table
+/// builder then the 4-stream encoder, and downloads per-descriptor body
+/// sizes + encoded bytes.
+///
+/// `out_sizes[i]` == 0 marks an empty descriptor (no Huffman body — caller
+/// uses the raw fallback); otherwise it is the chunk_type=4 body length at
+/// `out_bytes[descs[i].dst_offset ..][0..out_sizes[i]]`. The body has no
+/// 5-byte chunk header — the frame assembler prepends it.
+///
+/// Returns true on success. Caller owns the returned slices.
+pub fn gpuEncodeHuff(
+    descs: []const HuffEncDesc,
+    total_dst_bytes: usize,
+    out_sizes: []u32,
+    out_bytes: []u8,
+) bool {
+    if (!init()) return false;
+    if (huff_tables_kernel_fn == 0 or huff_encode_kernel_fn == 0) return false;
+
+    const h2d_fn = cuMemcpyHtoD_fn orelse return false;
+    const d2h_fn = cuMemcpyDtoH_fn orelse return false;
+    const launch_fn = cuLaunchKernel_fn orelse return false;
+    const sync_fn = cuCtxSynchronize_fn orelse return false;
+    const memset_fn = cuMemsetD8_fn orelse return false;
+
+    const n: u32 = @intCast(descs.len);
+    if (n == 0) return true;
+
+    // Per-stream scratch: each 4-way split quarter holds src_size/4 symbols
+    // of ≤ 11 bits; 2 bytes/symbol is a safe bound. Size from the largest
+    // descriptor so one slab fits every block.
+    var max_src: u32 = 0;
+    for (descs) |d| {
+        if (d.src_size > max_src) max_src = d.src_size;
+    }
+    const scratch_per_stream: usize = (@as(usize, max_src) / 4 + 64) * 2;
+
+    const desc_bytes: usize = descs.len * @sizeOf(HuffEncDesc);
+    const sizes_bytes: usize = descs.len * 4;
+    const cl_bytes: usize = descs.len * 256;
+    const codes_bytes: usize = descs.len * 256 * 4;
+    const scratch_bytes: usize = descs.len * 4 * scratch_per_stream;
+
+    if (!ensureBuf(&d_huff_descs_persist, &d_huff_descs_size, desc_bytes)) return false;
+    if (!ensureBuf(&d_huff_cl_persist, &d_huff_cl_size, cl_bytes)) return false;
+    if (!ensureBuf(&d_huff_codes_persist, &d_huff_codes_size, codes_bytes)) return false;
+    if (!ensureBuf(&d_huff_scratch_persist, &d_huff_scratch_size, scratch_bytes)) return false;
+    if (!ensureBuf(&d_huff_out_persist, &d_huff_out_size, total_dst_bytes)) return false;
+    if (!ensureBuf(&d_huff_sizes_persist, &d_huff_sizes_size, sizes_bytes)) return false;
+
+    _ = h2d_fn(d_huff_descs_persist, @ptrCast(descs.ptr), desc_bytes);
+    _ = memset_fn(d_huff_sizes_persist, 0, sizes_bytes);
+    _ = sync_fn();
+
+    // Kernel 1: build per-block Huffman tables from the source streams.
+    var p_src = d_output_persist;
+    var p_descs = d_huff_descs_persist;
+    var p_cl = d_huff_cl_persist;
+    var p_codes = d_huff_codes_persist;
+    var p_stride: u32 = 256;
+    var p_n: u32 = n;
+    var tbl_params = [_]?*anyopaque{
+        @ptrCast(&p_src),   @ptrCast(&p_descs), @ptrCast(&p_cl),
+        @ptrCast(&p_codes), @ptrCast(&p_stride), @ptrCast(&p_n),
+    };
+    var extra = [_]?*anyopaque{null};
+    if (launch_fn(huff_tables_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &tbl_params, &extra) != CUDA_SUCCESS)
+        return false;
+
+    // Kernel 2: pack each sub-chunk into a chunk_type=4 body.
+    var p_scratch = d_huff_scratch_persist;
+    var p_out = d_huff_out_persist;
+    var p_sizes = d_huff_sizes_persist;
+    var p_sps: u32 = @intCast(scratch_per_stream);
+    var enc_params = [_]?*anyopaque{
+        @ptrCast(&p_src),     @ptrCast(&p_descs), @ptrCast(&p_cl),
+        @ptrCast(&p_codes),   @ptrCast(&p_scratch), @ptrCast(&p_out),
+        @ptrCast(&p_sizes),   @ptrCast(&p_sps), @ptrCast(&p_stride),
+        @ptrCast(&p_n),
+    };
+    if (launch_fn(huff_encode_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &enc_params, &extra) != CUDA_SUCCESS)
+        return false;
+    if (sync_fn() != CUDA_SUCCESS) return false;
+
+    _ = d2h_fn(@ptrCast(out_sizes.ptr), d_huff_sizes_persist, sizes_bytes);
+    _ = d2h_fn(@ptrCast(out_bytes.ptr), d_huff_out_persist, total_dst_bytes);
+    return true;
+}
+
 // ── Persistent device buffers ──────────────────────────────────
 var d_input_persist: CUdeviceptr = 0;
 var d_input_size: usize = 0;
@@ -310,6 +438,16 @@ pub var tans32_off16hi_offsets: ?[]u32 = null;
 pub var tans32_off16lo_sizes: ?[]u32 = null;
 pub var tans32_off16lo_data: ?[]u8 = null;
 pub var tans32_off16lo_offsets: ?[]u32 = null;
+
+// GPU-Huffman off16 hi/lo byte-plane streams (chunk_type=4 bodies, no
+// 5-byte chunk header). `sizes[i] == 0` → no Huffman for that sub-chunk.
+// hi and lo share one `data` buffer; `offsets[i]` indexes into it.
+pub var huff_off16hi_sizes: ?[]u32 = null;
+pub var huff_off16hi_data: ?[]u8 = null;
+pub var huff_off16hi_offsets: ?[]u32 = null;
+pub var huff_off16lo_sizes: ?[]u32 = null;
+pub var huff_off16lo_data: ?[]u8 = null;
+pub var huff_off16lo_offsets: ?[]u32 = null;
 
 // Phase 2 shared-LUT encoded streams. Single descriptor array layout:
 //   descs[0..N]     → literals (lut_id=0)
@@ -639,6 +777,145 @@ pub fn gpuEncodeOff16Tans32(
     tans32_off16lo_sizes = lo_sizes;
     tans32_off16lo_data = bytes; // SAME pointer — only one of {hi,lo} should free it
     tans32_off16lo_offsets = lo_offsets;
+    return true;
+}
+
+/// GPU-Huffman counterpart of gpuEncodeOff16Tans32: entropy-codes the
+/// off16 hi/lo byte planes with the GPU Huffman encoder (chunk_type=4).
+/// Same off16 parse + `>= 32` gate as the tANS path. Populates the
+/// `huff_off16{hi,lo}_*` pub vars on success; the bodies carry no 5-byte
+/// chunk header (the frame assembler prepends it).
+pub fn gpuEncodeOff16Huff(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes: []const u32,
+) bool {
+    if (!init()) return false;
+    if (huff_tables_kernel_fn == 0 or huff_encode_kernel_fn == 0) return false;
+    const n = chunk_descs.len;
+    if (n == 0) return false;
+
+    const num_descs = n * 2;
+    var descs = allocator.alloc(HuffEncDesc, num_descs) catch return false;
+    defer allocator.free(descs);
+    var hi_offsets = allocator.alloc(u32, n) catch return false;
+    errdefer allocator.free(hi_offsets);
+    var lo_offsets = allocator.alloc(u32, n) catch return false;
+    errdefer allocator.free(lo_offsets);
+
+    var total: u32 = 0;
+    for (0..n) |i| {
+        const cs = comp_sizes[i];
+        const base: u32 = chunk_descs[i].dst_offset;
+        const init_b: u32 = if (chunk_descs[i].is_first != 0) 8 else 0;
+
+        // Default to empty (no entropy coding for this sub-chunk).
+        hi_offsets[i] = total;
+        lo_offsets[i] = total;
+        descs[i] = .{ .src_offset = 0, .src_size = 0, .src_stride = 2, .dst_offset = total, .dst_capacity = 0 };
+        descs[n + i] = .{ .src_offset = 0, .src_size = 0, .src_stride = 2, .dst_offset = total, .dst_capacity = 0 };
+
+        if (cs < init_b + 6) continue;
+        const lit_hdr: u32 = base + init_b;
+        const lit_count: u32 =
+            (@as(u32, output[lit_hdr]) << 16) |
+            (@as(u32, output[lit_hdr + 1]) << 8) |
+            @as(u32, output[lit_hdr + 2]);
+        const tok_hdr: u32 = lit_hdr + 3 + lit_count;
+        if (tok_hdr + 3 > base + cs) continue;
+        const tok_count: u32 =
+            (@as(u32, output[tok_hdr]) << 16) |
+            (@as(u32, output[tok_hdr + 1]) << 8) |
+            @as(u32, output[tok_hdr + 2]);
+
+        // cmd_stream2_offset (2 bytes) is present when sub-chunk > 64KB.
+        const after_tok: u32 = tok_hdr + 3 + tok_count;
+        const cmd2_size: u32 = if (chunk_descs[i].src_size > 0x10000) 2 else 0;
+        const off16_hdr: u32 = after_tok + cmd2_size;
+        if (off16_hdr + 2 > base + cs) continue;
+
+        const off16_count: u32 =
+            @as(u32, output[off16_hdr]) |
+            (@as(u32, output[off16_hdr + 1]) << 8);
+        if (off16_count < 32) continue; // matches CPU `>= 32` gate
+        const off16_data: u32 = off16_hdr + 2;
+
+        // Huffman body worst case ≈ 137 fixed + count×11/8; count*2 + 256
+        // is a safe capacity bound.
+        const hi_cap: u32 = off16_count * 2 + 256;
+        descs[i] = .{
+            .src_offset = off16_data + 1, // hi plane: odd bytes
+            .src_size = off16_count,
+            .src_stride = 2,
+            .dst_offset = total,
+            .dst_capacity = hi_cap,
+        };
+        hi_offsets[i] = total;
+        total += hi_cap;
+
+        const lo_cap: u32 = off16_count * 2 + 256;
+        descs[n + i] = .{
+            .src_offset = off16_data, // lo plane: even bytes
+            .src_size = off16_count,
+            .src_stride = 2,
+            .dst_offset = total,
+            .dst_capacity = lo_cap,
+        };
+        lo_offsets[i] = total;
+        total += lo_cap;
+    }
+
+    if (total == 0) {
+        allocator.free(hi_offsets);
+        allocator.free(lo_offsets);
+        return false;
+    }
+
+    const all_sizes = allocator.alloc(u32, num_descs) catch {
+        allocator.free(hi_offsets);
+        allocator.free(lo_offsets);
+        return false;
+    };
+    errdefer allocator.free(all_sizes);
+    const bytes = allocator.alloc(u8, total) catch {
+        allocator.free(hi_offsets);
+        allocator.free(lo_offsets);
+        allocator.free(all_sizes);
+        return false;
+    };
+    errdefer allocator.free(bytes);
+
+    if (!gpuEncodeHuff(descs, total, all_sizes, bytes)) {
+        allocator.free(hi_offsets);
+        allocator.free(lo_offsets);
+        allocator.free(all_sizes);
+        allocator.free(bytes);
+        return false;
+    }
+
+    // Split sizes into hi (first n) and lo (next n).
+    const hi_sizes = allocator.alloc(u32, n) catch {
+        allocator.free(hi_offsets); allocator.free(lo_offsets);
+        allocator.free(all_sizes); allocator.free(bytes);
+        return false;
+    };
+    const lo_sizes = allocator.alloc(u32, n) catch {
+        allocator.free(hi_offsets); allocator.free(lo_offsets);
+        allocator.free(hi_sizes);
+        allocator.free(all_sizes); allocator.free(bytes);
+        return false;
+    };
+    @memcpy(hi_sizes, all_sizes[0..n]);
+    @memcpy(lo_sizes, all_sizes[n..]);
+    allocator.free(all_sizes);
+
+    huff_off16hi_sizes = hi_sizes;
+    huff_off16hi_data = bytes; // shared buffer; both hi and lo offsets index into it
+    huff_off16hi_offsets = hi_offsets;
+    huff_off16lo_sizes = lo_sizes;
+    huff_off16lo_data = bytes; // SAME pointer — only one of {hi,lo} should free it
+    huff_off16lo_offsets = lo_offsets;
     return true;
 }
 

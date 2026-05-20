@@ -21,6 +21,16 @@ nvcc -ptx -o "%HUFF_OUT%.ptx" "%HUFF_SRC%" -arch=sm_89 -O3
 echo Huff PTX exit code: %ERRORLEVEL%
 
 echo.
+echo Compiling GPU Huffman encode kernel...
+set HENC_SRC=%~dp0..\src\encode\fast\gpu_huff_kernel.cu
+set HENC_OUT=%~dp0..\src\encode\fast\gpu_huff_kernel
+nvcc -cubin -o "%HENC_OUT%.cubin" "%HENC_SRC%" -arch=sm_89 -O3
+echo NVCC Huff-enc exit code: %ERRORLEVEL%
+cuobjdump -res-usage "%HENC_OUT%.cubin"
+nvcc -ptx -o "%HENC_OUT%.ptx" "%HENC_SRC%" -arch=sm_89 -O3
+echo Huff-enc PTX exit code: %ERRORLEVEL%
+
+echo.
 echo Compiling Vulkan SPIR-V...
 set COMP=%~dp0..\src\decode\fast\gpu_decode_kernel.comp
 set SPV=%~dp0..\src\decode\fast\gpu_decode_kernel.spv
