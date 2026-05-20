@@ -23,6 +23,7 @@ var ctx: usize = 0;
 var module: usize = 0;
 var kernel_fn: usize = 0;
 var kernel_raw_fn: usize = 0;
+var gather_off16_fn: usize = 0;
 var tans_module: usize = 0;
 var tans_kernel_fn: usize = 0;
 var tans_build_fn: usize = 0;
@@ -135,6 +136,9 @@ pub fn init() bool {
     const ptx = @embedFile("gpu_decode_kernel.ptx") ++ "\x00";
     if (load_fn(&module, ptx.ptr) != CUDA_SUCCESS) return false;
     if (get_fn(&kernel_fn, module, "slzFullDecompressL1Kernel") != CUDA_SUCCESS) return false;
+    // Optional raw-off16 gather kernel — driver falls back to D2D copies
+    // if absent.
+    _ = get_fn(&gather_off16_fn, module, "slzGatherRawOff16Kernel");
     // Optional lean L1/L2-raw kernel — driver routes to it when no entropy
     // is present. Failing to load is fine; falls back to general kernel.
     _ = get_fn(&kernel_raw_fn, module, "slzFullDecompressL1KernelRaw");
@@ -294,6 +298,10 @@ var d_tans_tok_status_persist_size: usize = 0;
 // Off16 scratch (hi bytes at chunk_idx*65536, lo bytes at chunk_idx*65536+32768)
 var d_tans_off16_scratch: CUdeviceptr = 0;
 var d_tans_off16_scratch_size: usize = 0;
+
+// Raw off16 gather descriptors (one per raw off16 sub-stream).
+var d_raw_off16_descs: CUdeviceptr = 0;
+var d_raw_off16_descs_size: usize = 0;
 
 // Off16 hi/lo tANS scratch + descriptors
 var d_tans_off16hi_descs: CUdeviceptr = 0;
@@ -1195,24 +1203,46 @@ pub fn fullGpuLaunch(
         };
 
         // Place raw (type 0) off16 sub-streams into the off16 scratch.
-        // The bytes are already on the GPU — the whole compressed blob was
-        // uploaded to d_comp_persist — so copy device-to-device, async, on
-        // the default stream and sync once. This replaces 1526 separate
-        // host-blocking cuMemcpyHtoD calls (~15 ms) with pipelined on-device
-        // copies (~1-2 ms).
-        if (cuMemcpyDtoDAsync_fn) |d2d| {
-            for (0..scan.num_raw_off16) |ri| {
-                const rd = raw_off16_buf[ri];
-                if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len) {
-                    _ = d2d(d_tans_off16_scratch + rd.gpu_offset, d_comp_persist + rd.src_offset, rd.size, 0);
+        // The bytes are already on the GPU (d_comp_persist holds the whole
+        // compressed blob). Preferred: upload the descriptor list in one
+        // H2D and run slzGatherRawOff16Kernel — one launch copies every
+        // stream in parallel. Fallbacks: async device-to-device loop, then
+        // a plain host-upload loop.
+        if (scan.num_raw_off16 > 0) gather_blk: {
+            if (gather_off16_fn != 0) {
+                const ndesc: u32 = scan.num_raw_off16;
+                const dbytes: usize = @as(usize, ndesc) * @sizeOf(RawOff16Desc);
+                if (ensureDeviceBuf(&d_raw_off16_descs, &d_raw_off16_descs_size, dbytes)) {
+                    _ = h2d_fn(d_raw_off16_descs, @ptrCast(&raw_off16_buf), dbytes);
+                    var p_comp = d_comp_persist;
+                    var p_comp_len: u32 = @intCast(compressed_block.len);
+                    var p_scratch = d_tans_off16_scratch;
+                    var p_descs = d_raw_off16_descs;
+                    var p_count = ndesc;
+                    var params = [_]?*anyopaque{
+                        @ptrCast(&p_comp), @ptrCast(&p_comp_len), @ptrCast(&p_scratch),
+                        @ptrCast(&p_descs), @ptrCast(&p_count),
+                    };
+                    var extra = [_]?*anyopaque{null};
+                    if (launch_fn(gather_off16_fn, ndesc, 1, 1, 256, 1, 1, 0, 0, &params, &extra) == CUDA_SUCCESS) {
+                        _ = sync_fn();
+                        break :gather_blk;
+                    }
                 }
             }
-            if (scan.num_raw_off16 > 0) _ = sync_fn();
-        } else {
-            for (0..scan.num_raw_off16) |ri| {
-                const rd = raw_off16_buf[ri];
-                if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len) {
-                    _ = h2d_fn(d_tans_off16_scratch + rd.gpu_offset, @ptrCast(compressed_block.ptr + rd.src_offset), rd.size);
+            // Fallback: async device-to-device, else host upload.
+            if (cuMemcpyDtoDAsync_fn) |d2d| {
+                for (0..scan.num_raw_off16) |ri| {
+                    const rd = raw_off16_buf[ri];
+                    if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len)
+                        _ = d2d(d_tans_off16_scratch + rd.gpu_offset, d_comp_persist + rd.src_offset, rd.size, 0);
+                }
+                _ = sync_fn();
+            } else {
+                for (0..scan.num_raw_off16) |ri| {
+                    const rd = raw_off16_buf[ri];
+                    if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len)
+                        _ = h2d_fn(d_tans_off16_scratch + rd.gpu_offset, @ptrCast(compressed_block.ptr + rd.src_offset), rd.size);
                 }
             }
         }

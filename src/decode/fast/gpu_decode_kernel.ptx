@@ -4218,4 +4218,67 @@ $L__BB4_142:
 	ret;
 
 }
+	// .globl	slzGatherRawOff16Kernel
+.visible .entry slzGatherRawOff16Kernel(
+	.param .u64 slzGatherRawOff16Kernel_param_0,
+	.param .u32 slzGatherRawOff16Kernel_param_1,
+	.param .u64 slzGatherRawOff16Kernel_param_2,
+	.param .u64 slzGatherRawOff16Kernel_param_3,
+	.param .u32 slzGatherRawOff16Kernel_param_4
+)
+{
+	.reg .pred 	%p<7>;
+	.reg .b16 	%rs<3>;
+	.reg .b32 	%r<13>;
+	.reg .b64 	%rd<16>;
+
+
+	ld.param.u64 	%rd6, [slzGatherRawOff16Kernel_param_0];
+	ld.param.u32 	%r8, [slzGatherRawOff16Kernel_param_1];
+	ld.param.u64 	%rd7, [slzGatherRawOff16Kernel_param_2];
+	ld.param.u64 	%rd8, [slzGatherRawOff16Kernel_param_3];
+	ld.param.u32 	%r9, [slzGatherRawOff16Kernel_param_4];
+	mov.u32 	%r1, %ctaid.x;
+	setp.ge.u32 	%p1, %r1, %r9;
+	@%p1 bra 	$L__BB5_5;
+
+	cvta.to.global.u64 	%rd9, %rd8;
+	mul.wide.u32 	%rd10, %r1, 12;
+	add.s64 	%rd1, %rd9, %rd10;
+	ld.global.nc.u32 	%r2, [%rd1];
+	ld.global.nc.u32 	%r3, [%rd1+4];
+	setp.eq.s32 	%p2, %r3, 0;
+	add.s32 	%r10, %r3, %r2;
+	setp.gt.u32 	%p3, %r10, %r8;
+	or.pred  	%p4, %p2, %p3;
+	@%p4 bra 	$L__BB5_5;
+
+	mov.u32 	%r12, %tid.x;
+	setp.ge.u32 	%p5, %r12, %r3;
+	@%p5 bra 	$L__BB5_5;
+
+	ld.global.nc.u32 	%r11, [%rd1+8];
+	cvt.u64.u32 	%rd5, %r11;
+	mov.u32 	%r5, %ntid.x;
+	cvt.u64.u32 	%rd2, %r2;
+	cvta.to.global.u64 	%rd3, %rd6;
+	cvta.to.global.u64 	%rd4, %rd7;
+
+$L__BB5_4:
+	cvt.u64.u32 	%rd11, %r12;
+	add.s64 	%rd12, %rd11, %rd2;
+	add.s64 	%rd13, %rd3, %rd12;
+	ld.global.nc.u8 	%rs1, [%rd13];
+	cvt.u16.u8 	%rs2, %rs1;
+	add.s64 	%rd14, %rd11, %rd5;
+	add.s64 	%rd15, %rd4, %rd14;
+	st.global.u8 	[%rd15], %rs2;
+	add.s32 	%r12, %r12, %r5;
+	setp.lt.u32 	%p6, %r12, %r3;
+	@%p6 bra 	$L__BB5_4;
+
+$L__BB5_5:
+	ret;
+
+}
 

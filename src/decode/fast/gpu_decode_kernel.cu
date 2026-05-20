@@ -1199,3 +1199,32 @@ extern "C" __global__ void __launch_bounds__(64, 24) slzFullDecompressL1KernelRa
         }
     }
 }
+
+// ── Raw off16 gather ────────────────────────────────────────────────
+// Scatters the raw (type-0) off16 sub-streams from the compressed blob
+// into the off16 scratch in a single launch — one block per stream —
+// replacing ~1500 host-issued device-to-device copies (the per-call
+// driver overhead was ~8 ms). Descriptor layout matches the Zig
+// RawOff16Desc {src_offset, size, gpu_offset}.
+struct SlzRawOff16Desc {
+    uint32_t src_offset;   // byte offset into comp_base
+    uint32_t size;         // bytes to copy
+    uint32_t gpu_offset;   // byte offset into scratch_base
+};
+
+extern "C" __global__ void slzGatherRawOff16Kernel(
+    const uint8_t* __restrict__ comp_base,
+    uint32_t comp_len,
+    uint8_t* __restrict__ scratch_base,
+    const SlzRawOff16Desc* __restrict__ descs,
+    uint32_t count
+) {
+    const uint32_t i = blockIdx.x;
+    if (i >= count) return;
+    const SlzRawOff16Desc d = descs[i];
+    if (d.size == 0 || d.src_offset + d.size > comp_len) return;
+    const uint8_t* s = comp_base + d.src_offset;
+    uint8_t* t = scratch_base + d.gpu_offset;
+    for (uint32_t j = threadIdx.x; j < d.size; j += blockDim.x)
+        t[j] = s[j];
+}
