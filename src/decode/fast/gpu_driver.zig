@@ -1971,13 +1971,13 @@ pub fn fullGpuLaunch(
         }.f;
         const preblk_ns = e2e_cum_prescan_ns - e2e_cum_h2d_ns; // shared-LUT block region
         const scanfn_ns = e2e_cum_postscan_ns - e2e_cum_prescan_ns; // scanForTansChunks call
-        const rawh2d_ns = e2e_cum_scan_ns - e2e_cum_postscan_ns; // raw-off16 H2D loop
+        const rawcopy_ns = e2e_cum_scan_ns - e2e_cum_postscan_ns; // raw-off16 device-to-device scatter
         const prep_ns = (e2e_cum_predh_ns - e2e_cum_scan_ns) - last_kernel_ns; // descriptor prep
-        std.debug.print("  [e2e] setup+H2D {d:.3}  preBlk {d:.3}  scanFn {d:.3}  rawH2D {d:.3}  prep {d:.3}  kernels {d:.3}  D2H {d:.3}  total {d:.3} ms\n", .{
+        std.debug.print("  [e2e] setup+H2D {d:.3}  preBlk {d:.3}  scanFn {d:.3}  rawD2D {d:.3}  prep {d:.3}  kernels {d:.3}  D2H {d:.3}  total {d:.3} ms\n", .{
             ms(e2e_cum_h2d_ns),
             ms(preblk_ns),
             ms(scanfn_ns),
-            ms(rawh2d_ns),
+            ms(rawcopy_ns),
             ms(prep_ns),
             ms(last_kernel_ns),
             ms(cum_end_ns - e2e_cum_predh_ns),
