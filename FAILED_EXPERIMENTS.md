@@ -2042,3 +2042,47 @@ hardware scheduler already handles; the staggered-launch behaviour of
 many-small-independent-blocks is a feature, not a bug. The queue code is
 kept in `tools/huff_test/` as a documented dead end; one CUDA block per
 Huffman block remains the launch model.
+
+## Cold-branch escape in the GPU Huffman decoder (2026-05-20)
+
+**Context**: SASS analysis of the cp.async decoder (`decode_stream_one_lane_
+cpasync_esc`, ~29.8 GB/s) showed the length-11 escape path compiled to
+branchless `SEL`s — so ~4 escape-only ops (escape-bit extract, sym2
+shift, two selects) ran on *every* symbol, including the 97%+ that are
+not escapes. The kernel is compute-bound (NCU: 78.7% SOL), so trimming
+hot-loop instructions should convert to speed. Hypothesis: move the
+escape onto a real predicted-cold branch.
+
+**Experiment**: `huff_escape_pick` marked `__noinline__` (a `__noinline__`
+call cannot be predicated-flattened — it forces a real branch), called
+from `decode_stream_one_lane_cpasync_esc_cb` with `__builtin_expect` on
+the common arm. (`__attribute__((cold))` does NOT compile under nvcc with
+the MSVC host toolchain — `__noinline__` is the portable lever.)
+
+**Results** (realistic per-block-LUT bench, distinct 64 KB blocks, enwik8):
+
+| Variant                       | GB/s (run 1) | GB/s (run 2) |
+|--------------------------------|--------------|--------------|
+| cpa (branchless escape)        | 29.8         | 29.9         |
+| cpb (cold-branch escape)       | 29.3         | 29.2         |
+
+Byte-exact, but **~2% slower** — the escape-op trim was outweighed.
+
+**Why the cold branch lost**: forcing the escape onto a `__noinline__`
+call puts a **function call inside the hot loop**. A call site is a hard
+optimisation barrier even when the call is rarely taken — the compiler
+must conservatively assume the loop's live registers (`bit_buf`, `acc`,
+ring state) may be clobbered across it, which constrains register
+allocation and instruction scheduling for the *entire* loop body,
+including the common path. That barrier cost more than the ~4 cheap,
+predictable, divergence-free `SEL`/shift ops it removed.
+
+**Lesson**: the compiler's branchless flatten was already the right call.
+A handful of cheap straight-line ops on a hot path beats a forced
+out-of-line call whose mere presence poisons the loop's optimisation. On
+GPU there is no cheap way to get a *call-free* cold branch for a tiny
+escape body — ptxas predicates small if-bodies regardless of
+`__builtin_expect`, and the only way to force a branch (a call) brings
+the barrier with it. The cpb code is kept in `tools/huff_test/` as a
+documented dead end; `huffDecode4StreamCpAsyncEscKernel` (cpa, 29.8 GB/s
+@ 64.0%) remains the fastest decoder.

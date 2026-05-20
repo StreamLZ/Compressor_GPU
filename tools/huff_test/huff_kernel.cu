@@ -797,6 +797,152 @@ __device__ __forceinline__ uint32_t decode_stream_one_lane_cpasync_esc(
     return out_pos;
 }
 
+// Cold-path helper for length-11 escape codes. __noinline__ forces a
+// real out-of-line call so the common decode path branches around it,
+// instead of the compiler flattening the escape ops inline (which burned
+// ~4 ops/symbol on every non-escape symbol).
+__device__ __noinline__
+uint32_t huff_escape_pick(uint32_t e, uint64_t bit_buf)
+{
+    uint32_t b11 = (uint32_t)((bit_buf >> (63 - MAX_CODE_LEN)) & 1u);
+    return b11 ? ((e >> 8) & 0xFFu) : (e & 0xFFu);
+}
+
+// ── Decode core: cp.async refill + escape on a COLD branch ───────────
+// Identical to decode_stream_one_lane_cpasync_esc, but the length-11
+// escape is a real predicted-cold branch (huff_escape_pick) rather than
+// branchless SELs — keeping ~4 escape-only ops per symbol off the common
+// path. The kernel is compute-bound (NCU: 78.7% SOL), so trimming
+// hot-loop instruction count converts fairly directly to speed.
+__device__ __forceinline__ uint32_t decode_stream_one_lane_cpasync_esc_cb(
+    const uint8_t* __restrict__ in, uint32_t in_size,
+    const uint32_t* __restrict__ lut,
+    uint8_t* __restrict__ out, uint32_t out_size,
+    uint32_t* ring)
+{
+    uint64_t bit_buf = 0;
+    int bit_count = 0;
+    uint32_t out_pos = 0;
+    uint32_t written = 0;
+    uint64_t acc = 0;
+    int pending = 0;
+
+    const uint32_t n_words = in_size >> 2;
+    uint32_t fetch = 0;
+    uint32_t consume = 0;
+
+    #pragma unroll
+    for (int d = 0; d < CPA_DEPTH; d++) {
+        if (fetch < n_words) {
+            __pipeline_memcpy_async(&ring[fetch & (CPA_DEPTH - 1)], in + fetch * 4, 4);
+            fetch++;
+        }
+        __pipeline_commit();
+    }
+
+    while (out_pos + 4 <= out_size) {
+        if (bit_count < 2 * (MAX_CODE_LEN + 1)) {
+            if (consume >= n_words) break;
+            __pipeline_wait_prior(CPA_DEPTH - 1);
+            uint32_t word = ring[consume & (CPA_DEPTH - 1)];
+            uint32_t v = __byte_perm(word, 0, 0x0123);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            consume++;
+            if (fetch < n_words) {
+                __pipeline_memcpy_async(&ring[fetch & (CPA_DEPTH - 1)], in + fetch * 4, 4);
+                fetch++;
+            }
+            __pipeline_commit();
+        }
+        // decode A — common path is the ≤10-bit normal entry.
+        uint32_t e0 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len0 = (e0 >> 16) & 0xFF;
+        if (len0 == 0) return 0;
+        uint32_t bytes0; int app0;
+        if (__builtin_expect(len0 <= MAX_CODE_LEN, 1)) {
+            bytes0 = e0 & 0xFFFF;
+            app0 = (int)(e0 >> 24);
+        } else {
+            bytes0 = huff_escape_pick(e0, bit_buf);
+            app0 = 1;
+        }
+        acc |= (uint64_t)bytes0 << (pending * 8);
+        pending += app0;
+        bit_buf <<= len0;
+        bit_count -= len0;
+        out_pos += app0;
+        if (pending >= 4) {
+            *reinterpret_cast<uint32_t*>(out + written) = (uint32_t)acc;
+            acc >>= 32;
+            pending -= 4;
+            written += 4;
+        }
+        // decode B
+        uint32_t e1 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len1 = (e1 >> 16) & 0xFF;
+        if (len1 == 0) return 0;
+        uint32_t bytes1; int app1;
+        if (__builtin_expect(len1 <= MAX_CODE_LEN, 1)) {
+            bytes1 = e1 & 0xFFFF;
+            app1 = (int)(e1 >> 24);
+        } else {
+            bytes1 = huff_escape_pick(e1, bit_buf);
+            app1 = 1;
+        }
+        acc |= (uint64_t)bytes1 << (pending * 8);
+        pending += app1;
+        bit_buf <<= len1;
+        bit_count -= len1;
+        out_pos += app1;
+        if (pending >= 4) {
+            *reinterpret_cast<uint32_t*>(out + written) = (uint32_t)acc;
+            acc >>= 32;
+            pending -= 4;
+            written += 4;
+        }
+    }
+
+    while (pending > 0) {
+        out[written++] = (uint8_t)(acc & 0xFF);
+        acc >>= 8;
+        pending--;
+    }
+    uint32_t in_pos = consume * 4;
+    while (out_pos < out_size) {
+        if (bit_count <= 32 && in_pos + 4 <= in_size) {
+            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
+                       | ((uint32_t)in[in_pos + 1] << 16)
+                       | ((uint32_t)in[in_pos + 2] <<  8)
+                       | ((uint32_t)in[in_pos + 3]);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            in_pos += 4;
+        }
+        while (bit_count < MAX_CODE_LEN + 1 && in_pos < in_size) {
+            bit_buf |= ((uint64_t)in[in_pos++]) << (56 - bit_count);
+            bit_count += 8;
+        }
+        if (bit_count < MAX_CODE_LEN + 1) bit_count = MAX_CODE_LEN + 1;
+        uint32_t e = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int total_len = (e >> 16) & 0xFF;
+        int num_syms  = (e >> 24) & 0xFF;
+        if (total_len == 0) return 0;
+        if (num_syms == 3) {
+            uint32_t b11 = (uint32_t)((bit_buf >> (63 - MAX_CODE_LEN)) & 1u);
+            out[out_pos++] = (uint8_t)(b11 ? ((e >> 8) & 0xFF) : (e & 0xFF));
+        } else {
+            out[out_pos++] = (uint8_t)(e & 0xFF);
+            if (num_syms == 2 && out_pos < out_size) {
+                out[out_pos++] = (uint8_t)((e >> 8) & 0xFF);
+            }
+        }
+        bit_buf <<= total_len;
+        bit_count -= total_len;
+    }
+    return out_pos;
+}
+
 // ── Single-stream decode core, wide (64-bit) output stores ───────────
 // Like decode_stream_one_lane_wstore but flushes 8 bytes per global
 // store, halving store transactions again vs the 32-bit variant. Each
@@ -1810,6 +1956,57 @@ extern "C" __global__ void huffDecode4StreamCpAsyncEscKernel(
     uint32_t written = decode_stream_one_lane_cpasync_esc(my_in, my_in_size, shared_lut,
                                                           my_out, my_out_size,
                                                           &cpa_ring[lane][0]);
+    (void)written;
+}
+
+// ── Decoder kernel: cp.async refill + cold-branch escape ─────────────
+// Same aligned format / escape LUT as huffDecode4StreamCpAsyncEscKernel,
+// but the length-11 escape is a predicted-cold branch — trimming the
+// common-path instruction count.
+// Launch: <<<n_blocks, 32, LUT_BYTES>>>
+extern "C" __global__ void huffDecode4StreamCpAsyncEscCbKernel(
+    const uint8_t* __restrict__ comp,
+    const HuffBlockDesc* __restrict__ descs,
+    const uint32_t* __restrict__ luts,
+    uint8_t* __restrict__ output,
+    uint32_t n_blocks)
+{
+    const uint32_t block_id = blockIdx.x;
+    if (block_id >= n_blocks) return;
+
+    const int lane = threadIdx.x & 31;
+    const HuffBlockDesc desc = descs[block_id];
+
+    extern __shared__ uint32_t shared_lut[];
+    __shared__ uint32_t cpa_ring[4][CPA_DEPTH];
+    const uint32_t* src_lut = luts + desc.lut_offset;
+    for (int i = lane; i < LUT_SIZE; i += 32) shared_lut[i] = src_lut[i];
+    __syncwarp();
+
+    if (lane >= 4) return;
+
+    const uint8_t* hdr = comp + desc.in_offset;
+    uint32_t stream_sizes[4];
+    #pragma unroll
+    for (int s = 0; s < 4; s++) {
+        stream_sizes[s] = (uint32_t)hdr[s*3 + 0]
+                        | ((uint32_t)hdr[s*3 + 1] << 8)
+                        | ((uint32_t)hdr[s*3 + 2] << 16);
+    }
+
+    uint32_t s_in_off = 0;
+    for (int s = 0; s < lane; s++) s_in_off += (stream_sizes[s] + 3u) & ~3u;
+    const uint8_t* my_in = hdr + HUFF_4SA_HDR_BYTES + s_in_off;
+    uint32_t my_in_size = stream_sizes[lane];
+
+    uint32_t q = desc.out_size / 4;
+    uint32_t my_out_start = (lane < 3) ? (lane * q) : (3 * q);
+    uint32_t my_out_size  = (lane < 3) ? q : (desc.out_size - 3 * q);
+    uint8_t* my_out = output + desc.out_offset + my_out_start;
+
+    uint32_t written = decode_stream_one_lane_cpasync_esc_cb(my_in, my_in_size, shared_lut,
+                                                             my_out, my_out_size,
+                                                             &cpa_ring[lane][0]);
     (void)written;
 }
 
