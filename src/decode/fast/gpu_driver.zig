@@ -385,6 +385,7 @@ fn scanForTansChunks(
     huff_tok_descs: []HuffDecChunkDesc,
     huff_off16hi_descs: []HuffDecChunkDesc,
     huff_off16lo_descs: []HuffDecChunkDesc,
+    io: ?std.Io,
 ) ScanResult {
     var num_lit: u32 = 0;
     var num_tok: u32 = 0;
@@ -398,6 +399,14 @@ fn scanForTansChunks(
     var use_tans32: bool = false;
     var cur_sub_idx: u32 = 0; // global sub-chunk index — mirrors driver prefix sum
     const cap_safe: u32 = if (sub_chunk_cap == 0) 65536 else sub_chunk_cap;
+
+    // SLZ_E2E_TIMER: confirm whether this walk is the ~15 ms cost.
+    const scan_dbg = std.c.getenv("SLZ_E2E_TIMER") != null;
+    const t_scan0 = if (scan_dbg)
+        (if (io) |iv| std.Io.Clock.awake.now(iv) else null)
+    else
+        null;
+    var dbg_subchunks: u32 = 0;
 
     for (chunk_descs) |ch| {
         // Compute expected n_subs for this chunk so cur_sub_idx stays in sync
@@ -661,8 +670,18 @@ fn scanForTansChunks(
             remaining_decomp -= sub_decomp;
             sub_local_idx += 1;
             first_sub = false;
+            dbg_subchunks += 1;
         } // while sub-chunks
     } // for chunks
+
+    if (t_scan0) |t0| if (io) |iv| {
+        const el: i64 = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+        std.debug.print("  [scan] {d} chunks, {d} sub-chunks, {d} raw-off16, {d:.3} ms ({d:.0} ns/sub-chunk)\n", .{
+            chunk_descs.len, dbg_subchunks, num_raw,
+            @as(f64, @floatFromInt(el)) / 1e6,
+            @as(f64, @floatFromInt(el)) / @as(f64, @floatFromInt(@max(dbg_subchunks, 1))),
+        });
+    };
 
     return .{
         .num_lit = num_lit, .num_tok = num_tok, .num_off16hi = num_off16hi,
@@ -1134,6 +1153,12 @@ pub fn fullGpuLaunch(
         }
     };
 
+    var e2e_cum_prescan_ns: i64 = 0;
+    var e2e_cum_postscan_ns: i64 = 0;
+    if (t_e2e0) |t0| if (io) |iv| {
+        e2e_cum_prescan_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+    };
+
     // ── Scan for tANS chunks ──────────────────────────────────
     var merged_count: u32 = 0;
     var scan: ScanResult = .{ .num_lit = 0, .num_tok = 0, .num_off16hi = 0, .num_off16lo = 0, .num_raw_off16 = 0 };
@@ -1157,9 +1182,14 @@ pub fn fullGpuLaunch(
             &huff_tok_host_buf,
             &huff_off16hi_host_buf,
             &huff_off16lo_host_buf,
+            io,
         );
 
         merged_count = scan.num_lit + scan.num_tok + scan.num_off16hi + scan.num_off16lo;
+
+        if (t_e2e0) |t0| if (io) |iv| {
+            e2e_cum_postscan_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+        };
 
         // Upload raw (type 0) off16 sub-streams to GPU (before timer)
         for (0..scan.num_raw_off16) |ri| {
@@ -1921,11 +1951,15 @@ pub fn fullGpuLaunch(
                 return @as(f64, @floatFromInt(ns)) / 1e6;
             }
         }.f;
-        const scan_ns = e2e_cum_scan_ns - e2e_cum_h2d_ns; // host header scan
+        const preblk_ns = e2e_cum_prescan_ns - e2e_cum_h2d_ns; // shared-LUT block region
+        const scanfn_ns = e2e_cum_postscan_ns - e2e_cum_prescan_ns; // scanForTansChunks call
+        const rawh2d_ns = e2e_cum_scan_ns - e2e_cum_postscan_ns; // raw-off16 H2D loop
         const prep_ns = (e2e_cum_predh_ns - e2e_cum_scan_ns) - last_kernel_ns; // descriptor prep
-        std.debug.print("  [e2e] setup+H2D {d:.3}  scan {d:.3}  prep {d:.3}  kernels {d:.3}  D2H {d:.3}  total {d:.3} ms\n", .{
+        std.debug.print("  [e2e] setup+H2D {d:.3}  preBlk {d:.3}  scanFn {d:.3}  rawH2D {d:.3}  prep {d:.3}  kernels {d:.3}  D2H {d:.3}  total {d:.3} ms\n", .{
             ms(e2e_cum_h2d_ns),
-            ms(scan_ns),
+            ms(preblk_ns),
+            ms(scanfn_ns),
+            ms(rawh2d_ns),
             ms(prep_ns),
             ms(last_kernel_ns),
             ms(cum_end_ns - e2e_cum_predh_ns),
