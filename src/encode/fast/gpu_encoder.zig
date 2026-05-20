@@ -449,6 +449,15 @@ pub var huff_off16lo_sizes: ?[]u32 = null;
 pub var huff_off16lo_data: ?[]u8 = null;
 pub var huff_off16lo_offsets: ?[]u32 = null;
 
+// GPU-Huffman literal / token streams (chunk_type=4 bodies, no 5-byte
+// chunk header). `sizes[i] == 0` → no Huffman body for that sub-chunk.
+pub var huff_lit_sizes: ?[]u32 = null;
+pub var huff_lit_data: ?[]u8 = null;
+pub var huff_lit_offsets: ?[]u32 = null;
+pub var huff_tok_sizes: ?[]u32 = null;
+pub var huff_tok_data: ?[]u8 = null;
+pub var huff_tok_offsets: ?[]u32 = null;
+
 // Phase 2 shared-LUT encoded streams. Single descriptor array layout:
 //   descs[0..N]     → literals (lut_id=0)
 //   descs[N..2N]    → tokens   (lut_id=1)
@@ -916,6 +925,170 @@ pub fn gpuEncodeOff16Huff(
     huff_off16lo_sizes = lo_sizes;
     huff_off16lo_data = bytes; // SAME pointer — only one of {hi,lo} should free it
     huff_off16lo_offsets = lo_offsets;
+    return true;
+}
+
+/// GPU-Huffman counterpart of gpuEncodeLiteralsTans32: entropy-codes
+/// each sub-chunk's literal stream with the GPU Huffman encoder
+/// (chunk_type=4). Populates the `huff_lit_*` pub vars on success.
+pub fn gpuEncodeLiteralsHuff(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes: []const u32,
+) bool {
+    if (!init()) return false;
+    if (huff_tables_kernel_fn == 0 or huff_encode_kernel_fn == 0) return false;
+    const n = chunk_descs.len;
+    if (n == 0) return false;
+
+    var descs = allocator.alloc(HuffEncDesc, n) catch return false;
+    defer allocator.free(descs);
+    var offsets = allocator.alloc(u32, n) catch return false;
+    errdefer allocator.free(offsets);
+
+    var total: u32 = 0;
+    for (0..n) |i| {
+        const cs = comp_sizes[i];
+        const base: u32 = chunk_descs[i].dst_offset;
+        const init_b: u32 = if (chunk_descs[i].is_first != 0) 8 else 0;
+        offsets[i] = total;
+        descs[i] = .{ .src_offset = 0, .src_size = 0, .src_stride = 1, .dst_offset = total, .dst_capacity = 0 };
+
+        if (cs < init_b + 3) continue;
+        const lit_hdr: u32 = base + init_b;
+        const lit_count: u32 =
+            (@as(u32, output[lit_hdr]) << 16) |
+            (@as(u32, output[lit_hdr + 1]) << 8) |
+            @as(u32, output[lit_hdr + 2]);
+        if (lit_count == 0) continue;
+        const lit_src: u32 = lit_hdr + 3;
+        if (lit_src + lit_count > base + cs) continue;
+
+        // Huffman body worst case ≈ 137 fixed + count×11/8; count*2 + 256
+        // is a safe capacity bound.
+        const dst_cap: u32 = lit_count * 2 + 256;
+        descs[i] = .{
+            .src_offset = lit_src,
+            .src_size = lit_count,
+            .src_stride = 1,
+            .dst_offset = total,
+            .dst_capacity = dst_cap,
+        };
+        total += dst_cap;
+    }
+
+    if (total == 0) {
+        allocator.free(offsets);
+        return false;
+    }
+
+    const sizes = allocator.alloc(u32, n) catch {
+        allocator.free(offsets);
+        return false;
+    };
+    errdefer allocator.free(sizes);
+    const bytes = allocator.alloc(u8, total) catch {
+        allocator.free(offsets);
+        allocator.free(sizes);
+        return false;
+    };
+    errdefer allocator.free(bytes);
+
+    if (!gpuEncodeHuff(descs, total, sizes, bytes)) {
+        allocator.free(offsets);
+        allocator.free(sizes);
+        allocator.free(bytes);
+        return false;
+    }
+
+    huff_lit_sizes = sizes;
+    huff_lit_data = bytes;
+    huff_lit_offsets = offsets;
+    return true;
+}
+
+/// GPU-Huffman counterpart of gpuEncodeTokensTans32: entropy-codes each
+/// sub-chunk's token stream with the GPU Huffman encoder (chunk_type=4).
+/// Populates the `huff_tok_*` pub vars on success.
+pub fn gpuEncodeTokensHuff(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes: []const u32,
+) bool {
+    if (!init()) return false;
+    if (huff_tables_kernel_fn == 0 or huff_encode_kernel_fn == 0) return false;
+    const n = chunk_descs.len;
+    if (n == 0) return false;
+
+    var descs = allocator.alloc(HuffEncDesc, n) catch return false;
+    defer allocator.free(descs);
+    var offsets = allocator.alloc(u32, n) catch return false;
+    errdefer allocator.free(offsets);
+
+    var total: u32 = 0;
+    for (0..n) |i| {
+        const cs = comp_sizes[i];
+        const base: u32 = chunk_descs[i].dst_offset;
+        const init_b: u32 = if (chunk_descs[i].is_first != 0) 8 else 0;
+        offsets[i] = total;
+        descs[i] = .{ .src_offset = 0, .src_size = 0, .src_stride = 1, .dst_offset = total, .dst_capacity = 0 };
+
+        if (cs < init_b + 6) continue;
+        const lit_hdr: u32 = base + init_b;
+        const lit_count: u32 =
+            (@as(u32, output[lit_hdr]) << 16) |
+            (@as(u32, output[lit_hdr + 1]) << 8) |
+            @as(u32, output[lit_hdr + 2]);
+        const tok_hdr: u32 = lit_hdr + 3 + lit_count;
+        if (tok_hdr + 3 > base + cs) continue;
+        const tok_count: u32 =
+            (@as(u32, output[tok_hdr]) << 16) |
+            (@as(u32, output[tok_hdr + 1]) << 8) |
+            @as(u32, output[tok_hdr + 2]);
+        if (tok_count == 0) continue;
+        const tok_src: u32 = tok_hdr + 3;
+        if (tok_src + tok_count > base + cs) continue;
+
+        const dst_cap: u32 = tok_count * 2 + 256;
+        descs[i] = .{
+            .src_offset = tok_src,
+            .src_size = tok_count,
+            .src_stride = 1,
+            .dst_offset = total,
+            .dst_capacity = dst_cap,
+        };
+        total += dst_cap;
+    }
+
+    if (total == 0) {
+        allocator.free(offsets);
+        return false;
+    }
+
+    const sizes = allocator.alloc(u32, n) catch {
+        allocator.free(offsets);
+        return false;
+    };
+    errdefer allocator.free(sizes);
+    const bytes = allocator.alloc(u8, total) catch {
+        allocator.free(offsets);
+        allocator.free(sizes);
+        return false;
+    };
+    errdefer allocator.free(bytes);
+
+    if (!gpuEncodeHuff(descs, total, sizes, bytes)) {
+        allocator.free(offsets);
+        allocator.free(sizes);
+        allocator.free(bytes);
+        return false;
+    }
+
+    huff_tok_sizes = sizes;
+    huff_tok_data = bytes;
+    huff_tok_offsets = offsets;
     return true;
 }
 
