@@ -682,6 +682,97 @@ static void bench_gpu_decode_realfile_32s(const uint8_t *file, size_t file_size)
     free(comp_buf); free(lut_buf); free(gpu_out);
 }
 
+// ── Realistic bench: 8-lane variant (2 blocks per warp) ────────────────
+// Identical 4-stream wire format and distinct-block / per-block-LUT setup
+// as bench_gpu_decode_realfile, but decodes with huffDecode4Stream2xKernel
+// — one warp handles 2 blocks (8 active lanes). A/B vs the 4-lane kernel:
+// does 2x issue-slot utilization beat the cost of 16KB shared LUT (lower
+// occupancy) and half the warp count?
+static void bench_gpu_decode_realfile_2x(const uint8_t *file, size_t file_size) {
+    const size_t BLK = 65536;
+    int n_blocks = (int)(file_size / BLK);
+    if (n_blocks < 1) { printf("[realfile-2x] input < 64 KB — skipping\n"); return; }
+
+    uint32_t *lut_buf  = (uint32_t*)malloc((size_t)n_blocks * LUT_SIZE * sizeof(uint32_t));
+    uint8_t  *comp_buf = (uint8_t*)malloc(file_size * 2 + (size_t)64 * n_blocks);
+    std::vector<HuffBlockDesc> descs(n_blocks);
+
+    size_t comp_off = 0;
+    uint8_t  code_lengths[256];
+    uint32_t codes[256];
+    for (int b = 0; b < n_blocks; b++) {
+        const uint8_t *src = file + (size_t)b * BLK;
+        uint32_t hist[256] = {0};
+        for (size_t i = 0; i < BLK; i++) hist[src[i]]++;
+        memset(code_lengths, 0, sizeof(code_lengths));
+        int max_len = build_code_lengths(hist, code_lengths);
+        if (max_len > MAX_CODE_LEN) height_limit(hist, code_lengths, MAX_CODE_LEN);
+        memset(codes, 0, sizeof(codes));
+        assign_canonical_codes(code_lengths, codes);
+        build_decode_lut(code_lengths, codes, lut_buf + (size_t)b * LUT_SIZE);
+        int enc_bytes = huff_encode_4s(src, BLK, code_lengths, codes,
+                                       comp_buf + comp_off,
+                                       file_size * 2 + (size_t)64 * n_blocks - comp_off);
+        if (enc_bytes <= 0) { printf("[realfile-2x] block %d encode fail\n", b); return; }
+        descs[b].in_offset  = (uint32_t)comp_off;
+        descs[b].in_size    = (uint32_t)enc_bytes;
+        descs[b].out_offset = (uint32_t)((size_t)b * BLK);
+        descs[b].out_size   = (uint32_t)BLK;
+        descs[b].lut_offset = (uint32_t)((size_t)b * LUT_SIZE);
+        comp_off += enc_bytes;
+    }
+
+    size_t total_out = (size_t)n_blocks * BLK;
+    uint8_t *d_comp, *d_out;
+    uint32_t *d_lut;
+    HuffBlockDesc *d_descs;
+    CK(cudaMalloc(&d_comp, comp_off));
+    CK(cudaMalloc(&d_out, total_out));
+    CK(cudaMalloc(&d_lut, (size_t)n_blocks * LUT_BYTES));
+    CK(cudaMalloc(&d_descs, sizeof(HuffBlockDesc) * n_blocks));
+    CK(cudaMemcpy(d_comp, comp_buf, comp_off, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_lut, lut_buf, (size_t)n_blocks * LUT_BYTES, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_descs, descs.data(), sizeof(HuffBlockDesc) * n_blocks, cudaMemcpyHostToDevice));
+
+    int n_warps = (n_blocks + 1) / 2;             // 2 blocks per warp
+    size_t smem = 2 * (size_t)LUT_BYTES;          // two LUTs
+
+    huffDecode4Stream2xKernel<<<n_warps, 32, smem>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+    CK(cudaDeviceSynchronize());
+
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    const int N_RUNS = 50;
+    float best_ms = 1e9f;
+    for (int r = 0; r < N_RUNS; r++) {
+        cudaEventRecord(e0);
+        huffDecode4Stream2xKernel<<<n_warps, 32, smem>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        if (ms < best_ms) best_ms = ms;
+    }
+
+    uint8_t *gpu_out = (uint8_t*)malloc(total_out);
+    CK(cudaMemcpy(gpu_out, d_out, total_out, cudaMemcpyDeviceToHost));
+    int verify_fail = 0;
+    for (int b = 0; b < n_blocks; b++) {
+        if (memcmp(file + (size_t)b * BLK, gpu_out + (size_t)b * BLK, BLK) != 0) {
+            if (verify_fail < 3) printf("  [realfile-2x] block %d mismatch\n", b);
+            verify_fail++;
+        }
+    }
+
+    double gb_per_s = (double)total_out / (best_ms * 1e6);
+    printf("[realfile-2x] %d blocks, 2/warp (8 lanes), per-block LUT "
+           "-> best %.3f ms = %.1f GB/s%s\n",
+           n_blocks, best_ms, gb_per_s, verify_fail ? " [VERIFY FAIL]" : "");
+
+    cudaFree(d_comp); cudaFree(d_out); cudaFree(d_lut); cudaFree(d_descs);
+    free(comp_buf); free(lut_buf); free(gpu_out);
+}
+
 int main(int argc, char **argv) {
     int fails = 0;
 
@@ -747,6 +838,7 @@ int main(int argc, char **argv) {
                 // content with its own Huffman table + LUT.
                 printf("\n--- realistic decode bench (per-block LUT, distinct blocks) ---\n");
                 bench_gpu_decode_realfile(full, (size_t)sz, 65536);
+                bench_gpu_decode_realfile_2x(full, (size_t)sz);
                 bench_gpu_decode_realfile_32s(full, (size_t)sz);
                 // Decoupling experiment: 4-stream kernel with smaller
                 // blocks. 16KB block -> 4KB/lane, 8KB block -> 2KB/lane

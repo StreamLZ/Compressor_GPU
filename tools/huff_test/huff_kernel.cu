@@ -431,3 +431,70 @@ extern "C" __global__ void huffDecode4StreamKernel(
                                               my_out, my_out_size);
     (void)written;  // future: write per-block error flag if written != my_out_size
 }
+
+// ── Decoder kernel: 2 Huffman blocks per warp, 8 active lanes ─────────
+// Each warp handles a PAIR of blocks: lanes 0-3 decode block (2*pid)'s
+// 4 streams, lanes 4-7 decode block (2*pid+1)'s. 8 active lanes amortize
+// the warp's per-instruction issue slot 2x vs the 4-lane kernel, while
+// staying well below the 32-lane LDS-bank-conflict regime (8 random LUT
+// indices into 32 banks rarely collide). Shared memory holds 2 LUTs.
+// Launch: <<<(n_blocks + 1) / 2, 32, 2 * LUT_BYTES>>>
+extern "C" __global__ void huffDecode4Stream2xKernel(
+    const uint8_t* __restrict__ comp,
+    const HuffBlockDesc* __restrict__ descs,
+    const uint32_t* __restrict__ luts,
+    uint8_t* __restrict__ output,
+    uint32_t n_blocks)
+{
+    const uint32_t pid  = blockIdx.x;
+    const uint32_t bidA = pid * 2;
+    const uint32_t bidB = bidA + 1;
+    if (bidA >= n_blocks) return;
+    const bool haveB = (bidB < n_blocks);
+    const int lane = threadIdx.x & 31;
+
+    // Shared memory holds two LUTs: [0, LUT_SIZE) for block A,
+    // [LUT_SIZE, 2*LUT_SIZE) for block B. All 32 lanes load cooperatively.
+    extern __shared__ uint32_t shared_lut[];
+    const uint32_t* lutA = luts + descs[bidA].lut_offset;
+    for (int i = lane; i < LUT_SIZE; i += 32) shared_lut[i] = lutA[i];
+    if (haveB) {
+        const uint32_t* lutB = luts + descs[bidB].lut_offset;
+        for (int i = lane; i < LUT_SIZE; i += 32) shared_lut[LUT_SIZE + i] = lutB[i];
+    }
+    __syncwarp();
+
+    // Active lanes 0-7: lane>>2 picks the block, lane&3 picks the stream.
+    if (lane >= 8) return;
+    if (lane >= 4 && !haveB) return;
+    const uint32_t sub   = (uint32_t)lane >> 2;   // 0 = block A, 1 = block B
+    const int      slane = lane & 3;              // stream index 0-3
+    const HuffBlockDesc desc = descs[sub ? bidB : bidA];
+    const uint32_t* my_lut = shared_lut + sub * LUT_SIZE;
+
+    // Parse header: 3 × u24 LE sizes; stream 3 derived.
+    const uint8_t* hdr = comp + desc.in_offset;
+    uint32_t stream_sizes[4];
+    #pragma unroll
+    for (int s = 0; s < 3; s++) {
+        stream_sizes[s] = (uint32_t)hdr[s*3 + 0]
+                        | ((uint32_t)hdr[s*3 + 1] << 8)
+                        | ((uint32_t)hdr[s*3 + 2] << 16);
+    }
+    stream_sizes[3] = (desc.in_size - 9)
+                    - stream_sizes[0] - stream_sizes[1] - stream_sizes[2];
+
+    uint32_t s_in_off = 0;
+    for (int s = 0; s < slane; s++) s_in_off += stream_sizes[s];
+    const uint8_t* my_in = hdr + 9 + s_in_off;
+    uint32_t my_in_size  = stream_sizes[slane];
+
+    uint32_t q = desc.out_size / 4;
+    uint32_t my_out_start = (slane < 3) ? (slane * q) : (3 * q);
+    uint32_t my_out_size  = (slane < 3) ? q : (desc.out_size - 3 * q);
+    uint8_t* my_out = output + desc.out_offset + my_out_start;
+
+    uint32_t written = decode_stream_one_lane(my_in, my_in_size, my_lut,
+                                              my_out, my_out_size);
+    (void)written;
+}
