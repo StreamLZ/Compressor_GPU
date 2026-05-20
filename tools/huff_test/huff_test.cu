@@ -1870,6 +1870,254 @@ static void bench_lut_build(const uint8_t *file, size_t file_size) {
     free(cl_all); free(lut_ref); free(h_lut_s); free(h_lut_p);
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// STEP 1 TEST — GPU Huffman table builder vs production-equivalent oracle
+// ══════════════════════════════════════════════════════════════════════
+//
+// The GPU encoder must match the PRODUCTION CPU encoder huffman_encoder.zig
+// (height-limit 11), not huff_ref.c's roundtrip path (height-limit 10).
+// huff_ref.c's build_code_lengths/height_limit are parameterized and reused
+// as-is; only assign_canonical_codes needs an 11-bit-safe array bound.
+static void enc_assign_canonical_codes_11(const uint8_t cl[256],
+                                          uint32_t codes_out[256]) {
+    uint32_t length_count[13] = {0};
+    for (int s = 0; s < 256; s++) length_count[cl[s]]++;
+    length_count[0] = 0;
+    uint32_t next_code[13] = {0};
+    uint32_t code = 0;
+    for (int L = 1; L <= 12; L++) {
+        code = (code + length_count[L - 1]) << 1;
+        next_code[L] = code;
+    }
+    for (int s = 0; s < 256; s++)
+        codes_out[s] = (cl[s] != 0) ? next_code[cl[s]]++ : 0u;
+}
+
+// Production-equivalent table build: histogram -> tree -> height_limit(11)
+// -> canonical codes. Mirrors huffman_encoder.zig encodeBlock's table path.
+static void enc_build_tables(const uint8_t *src, size_t n,
+                             uint8_t cl_out[256], uint32_t codes_out[256]) {
+    uint32_t hist[256] = {0};
+    for (size_t i = 0; i < n; i++) hist[src[i]]++;
+    memset(cl_out, 0, 256);
+    int max_len = build_code_lengths(hist, cl_out);
+    if (max_len > 11) height_limit(hist, cl_out, 11);
+    enc_assign_canonical_codes_11(cl_out, codes_out);
+}
+
+// Produce the chunk_type=4 body [128B weights][9B sub-hdr][4 streams],
+// matching huffman_encoder.zig encodeBlock minus the 5-byte chunk header.
+static int enc_huff_body(const uint8_t *src, size_t n, uint8_t *out, size_t out_cap) {
+    if (out_cap < 137) return -1;
+    uint8_t  cl[256];
+    uint32_t codes[256];
+    enc_build_tables(src, n, cl, codes);
+    for (int i = 0; i < 128; i++)
+        out[i] = (uint8_t)((cl[2*i] & 0x0F) | ((cl[2*i+1] & 0x0F) << 4));
+    int n4 = huff_encode_4s(src, n, cl, codes, out + 128, out_cap - 128);
+    if (n4 < 0) return -1;
+    return 128 + n4;
+}
+
+static int test_slz_huff_build_tables(const uint8_t *file, size_t file_size) {
+    const size_t BLK = 65536;
+    int n_blocks = (int)(file_size / BLK);
+    if (n_blocks < 1) { printf("[build-tables] input < 64KB — skipping\n"); return 0; }
+
+    size_t total_in = (size_t)n_blocks * BLK;
+    uint8_t *d_input, *d_cl;
+    uint32_t *d_codes;
+    HuffBlockDesc *d_descs;
+    CK(cudaMalloc(&d_input, total_in));
+    CK(cudaMalloc(&d_cl, (size_t)n_blocks * 256));
+    CK(cudaMalloc(&d_codes, (size_t)n_blocks * 256 * sizeof(uint32_t)));
+    CK(cudaMalloc(&d_descs, sizeof(HuffBlockDesc) * n_blocks));
+    CK(cudaMemcpy(d_input, file, total_in, cudaMemcpyHostToDevice));
+
+    std::vector<HuffBlockDesc> descs(n_blocks);
+    for (int b = 0; b < n_blocks; b++)
+        descs[b] = { (uint32_t)((size_t)b * BLK), (uint32_t)BLK, 0, 0, 0 };
+    CK(cudaMemcpy(d_descs, descs.data(), sizeof(HuffBlockDesc) * n_blocks,
+                  cudaMemcpyHostToDevice));
+
+    slzHuffBuildTablesKernel<<<n_blocks, 32>>>(d_input, d_descs, d_cl, d_codes,
+                                               256, n_blocks);
+    CK(cudaDeviceSynchronize());
+
+    std::vector<uint8_t>  gpu_cl((size_t)n_blocks * 256);
+    std::vector<uint32_t> gpu_codes((size_t)n_blocks * 256);
+    CK(cudaMemcpy(gpu_cl.data(), d_cl, (size_t)n_blocks * 256,
+                  cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(gpu_codes.data(), d_codes,
+                  (size_t)n_blocks * 256 * sizeof(uint32_t),
+                  cudaMemcpyDeviceToHost));
+
+    int fails = 0;
+    for (int b = 0; b < n_blocks; b++) {
+        uint8_t  cl_ref[256];
+        uint32_t codes_ref[256];
+        enc_build_tables(file + (size_t)b * BLK, BLK, cl_ref, codes_ref);
+        for (int s = 0; s < 256; s++) {
+            uint8_t  gcl = gpu_cl[(size_t)b * 256 + s];
+            uint32_t gcd = gpu_codes[(size_t)b * 256 + s];
+            if (cl_ref[s] != gcl) {
+                if (fails < 8)
+                    printf("  [build-tables] blk %d sym %d: cl ref=%d gpu=%d\n",
+                           b, s, cl_ref[s], gcl);
+                fails++;
+            } else if (codes_ref[s] != gcd) {
+                if (fails < 8)
+                    printf("  [build-tables] blk %d sym %d: code ref=%u gpu=%u (cl=%d)\n",
+                           b, s, codes_ref[s], gcd, cl_ref[s]);
+                fails++;
+            }
+        }
+    }
+    printf("[build-tables] %d blocks x 64KB: %s\n", n_blocks,
+           fails ? "FAIL" : "OK — GPU tables byte-identical to CPU oracle");
+
+    cudaFree(d_input); cudaFree(d_cl); cudaFree(d_codes); cudaFree(d_descs);
+    return fails ? 1 : 0;
+}
+
+// ── STEP 2 TEST — GPU Huffman encode (tables→encode) vs CPU body oracle ──
+static int test_slz_huff_encode(const uint8_t *file, size_t file_size) {
+    const size_t BLK = 65536;
+    int n_blocks = (int)(file_size / BLK);
+    if (n_blocks < 1) { printf("[huff-encode] input < 64KB — skipping\n"); return 0; }
+
+    size_t total_in = (size_t)n_blocks * BLK;
+    size_t scratch_per_stream = (BLK / 4 + 64) * 2;
+    size_t enc_cap_per = BLK * 2 + 256;
+
+    uint8_t  *d_input, *d_scratch, *d_enc_out, *d_cl;
+    uint32_t *d_codes, *d_out_sizes, *d_out_offsets;
+    HuffBlockDesc *d_descs;
+    CK(cudaMalloc(&d_input, total_in));
+    CK(cudaMalloc(&d_scratch, scratch_per_stream * 4 * n_blocks));
+    CK(cudaMalloc(&d_enc_out, enc_cap_per * n_blocks));
+    CK(cudaMalloc(&d_cl, (size_t)n_blocks * 256));
+    CK(cudaMalloc(&d_codes, (size_t)n_blocks * 256 * sizeof(uint32_t)));
+    CK(cudaMalloc(&d_descs, sizeof(HuffBlockDesc) * n_blocks));
+    CK(cudaMalloc(&d_out_sizes, sizeof(uint32_t) * n_blocks));
+    CK(cudaMalloc(&d_out_offsets, sizeof(uint32_t) * n_blocks));
+    CK(cudaMemcpy(d_input, file, total_in, cudaMemcpyHostToDevice));
+
+    std::vector<HuffBlockDesc> descs(n_blocks);
+    std::vector<uint32_t> out_offsets(n_blocks);
+    for (int b = 0; b < n_blocks; b++) {
+        descs[b] = { (uint32_t)((size_t)b * BLK), (uint32_t)BLK, 0, 0, 0 };
+        out_offsets[b] = (uint32_t)((size_t)b * enc_cap_per);
+    }
+    CK(cudaMemcpy(d_descs, descs.data(), sizeof(HuffBlockDesc) * n_blocks, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_out_offsets, out_offsets.data(), sizeof(uint32_t) * n_blocks, cudaMemcpyHostToDevice));
+
+    slzHuffBuildTablesKernel<<<n_blocks, 32>>>(d_input, d_descs, d_cl, d_codes, 256, n_blocks);
+    slzHuffEncode4StreamKernel<<<n_blocks, 32>>>(d_input, d_descs, d_cl, d_codes,
+        d_scratch, d_enc_out, d_out_sizes, d_out_offsets,
+        (uint32_t)scratch_per_stream, 256, n_blocks);
+    CK(cudaDeviceSynchronize());
+
+    std::vector<uint32_t> sizes(n_blocks);
+    CK(cudaMemcpy(sizes.data(), d_out_sizes, sizeof(uint32_t) * n_blocks, cudaMemcpyDeviceToHost));
+    uint8_t *gpu_enc = (uint8_t*)malloc(enc_cap_per * n_blocks);
+    CK(cudaMemcpy(gpu_enc, d_enc_out, enc_cap_per * n_blocks, cudaMemcpyDeviceToHost));
+
+    uint8_t *ref = (uint8_t*)malloc(enc_cap_per);
+    int fails = 0;
+    size_t total_enc = 0;
+    for (int b = 0; b < n_blocks; b++) {
+        int rn = enc_huff_body(file + (size_t)b * BLK, BLK, ref, enc_cap_per);
+        const uint8_t *gp = gpu_enc + (size_t)b * enc_cap_per;
+        if (rn < 0 || (uint32_t)rn != sizes[b] || memcmp(ref, gp, rn) != 0) {
+            if (fails < 8) {
+                printf("  [huff-encode] blk %d: ref=%d gpu=%u", b, rn, sizes[b]);
+                if (rn > 0 && (uint32_t)rn == sizes[b])
+                    for (int i = 0; i < rn; i++)
+                        if (ref[i] != gp[i]) { printf(" first diff @%d ref=0x%02x gpu=0x%02x", i, ref[i], gp[i]); break; }
+                printf("\n");
+            }
+            fails++;
+        }
+        total_enc += sizes[b];
+    }
+    printf("[huff-encode] %d blocks x 64KB: %s  (enc %.1f%%)\n", n_blocks,
+           fails ? "FAIL" : "OK — GPU encode byte-identical to CPU oracle",
+           100.0 * (double)total_enc / (double)total_in);
+
+    free(gpu_enc); free(ref);
+    cudaFree(d_input); cudaFree(d_scratch); cudaFree(d_enc_out); cudaFree(d_cl);
+    cudaFree(d_codes); cudaFree(d_descs); cudaFree(d_out_sizes); cudaFree(d_out_offsets);
+    return fails ? 1 : 0;
+}
+
+// ── STEP 2 BENCH — GPU Huffman encode timing (tables + encode kernels) ──
+static void bench_slz_huff_encode(const uint8_t *file, size_t file_size) {
+    const size_t BLK = 65536;
+    int n_blocks = (int)(file_size / BLK);
+    if (n_blocks < 1) return;
+
+    size_t total_in = (size_t)n_blocks * BLK;
+    size_t scratch_per_stream = (BLK / 4 + 64) * 2;
+    size_t enc_cap_per = BLK * 2 + 256;
+
+    uint8_t  *d_input, *d_scratch, *d_enc_out, *d_cl;
+    uint32_t *d_codes, *d_out_sizes, *d_out_offsets;
+    HuffBlockDesc *d_descs;
+    CK(cudaMalloc(&d_input, total_in));
+    CK(cudaMalloc(&d_scratch, scratch_per_stream * 4 * n_blocks));
+    CK(cudaMalloc(&d_enc_out, enc_cap_per * n_blocks));
+    CK(cudaMalloc(&d_cl, (size_t)n_blocks * 256));
+    CK(cudaMalloc(&d_codes, (size_t)n_blocks * 256 * sizeof(uint32_t)));
+    CK(cudaMalloc(&d_descs, sizeof(HuffBlockDesc) * n_blocks));
+    CK(cudaMalloc(&d_out_sizes, sizeof(uint32_t) * n_blocks));
+    CK(cudaMalloc(&d_out_offsets, sizeof(uint32_t) * n_blocks));
+    CK(cudaMemcpy(d_input, file, total_in, cudaMemcpyHostToDevice));
+
+    std::vector<HuffBlockDesc> descs(n_blocks);
+    std::vector<uint32_t> out_offsets(n_blocks);
+    for (int b = 0; b < n_blocks; b++) {
+        descs[b] = { (uint32_t)((size_t)b * BLK), (uint32_t)BLK, 0, 0, 0 };
+        out_offsets[b] = (uint32_t)((size_t)b * enc_cap_per);
+    }
+    CK(cudaMemcpy(d_descs, descs.data(), sizeof(HuffBlockDesc) * n_blocks, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_out_offsets, out_offsets.data(), sizeof(uint32_t) * n_blocks, cudaMemcpyHostToDevice));
+
+    slzHuffBuildTablesKernel<<<n_blocks, 32>>>(d_input, d_descs, d_cl, d_codes, 256, n_blocks);
+    slzHuffEncode4StreamKernel<<<n_blocks, 32>>>(d_input, d_descs, d_cl, d_codes,
+        d_scratch, d_enc_out, d_out_sizes, d_out_offsets,
+        (uint32_t)scratch_per_stream, 256, n_blocks);
+    CK(cudaDeviceSynchronize());
+
+    cudaEvent_t e0, e1, e2;
+    cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2);
+    const int N_RUNS = 50;
+    float best_tbl = 1e9f, best_enc = 1e9f, best_all = 1e9f;
+    for (int r = 0; r < N_RUNS; r++) {
+        cudaEventRecord(e0);
+        slzHuffBuildTablesKernel<<<n_blocks, 32>>>(d_input, d_descs, d_cl, d_codes, 256, n_blocks);
+        cudaEventRecord(e1);
+        slzHuffEncode4StreamKernel<<<n_blocks, 32>>>(d_input, d_descs, d_cl, d_codes,
+            d_scratch, d_enc_out, d_out_sizes, d_out_offsets,
+            (uint32_t)scratch_per_stream, 256, n_blocks);
+        cudaEventRecord(e2);
+        cudaEventSynchronize(e2);
+        float t1 = 0, t2 = 0;
+        cudaEventElapsedTime(&t1, e0, e1);
+        cudaEventElapsedTime(&t2, e1, e2);
+        if (t1 < best_tbl) best_tbl = t1;
+        if (t2 < best_enc) best_enc = t2;
+        if (t1 + t2 < best_all) best_all = t1 + t2;
+    }
+    printf("[huff-enc-bench] %d blocks x 64KB = %.1f MB: tables %.3f ms + encode %.3f ms "
+           "= %.3f ms = %.1f GB/s\n",
+           n_blocks, total_in / 1e6, best_tbl, best_enc, best_all,
+           (double)total_in / (best_all * 1e6));
+
+    cudaFree(d_input); cudaFree(d_scratch); cudaFree(d_enc_out); cudaFree(d_cl);
+    cudaFree(d_codes); cudaFree(d_descs); cudaFree(d_out_sizes); cudaFree(d_out_offsets);
+}
+
 int main(int argc, char **argv) {
     int fails = 0;
 
@@ -1929,6 +2177,8 @@ int main(int argc, char **argv) {
             fails += test_gpu_decode_one("real-64KB", full, cap);
             fails += test_gpu_encode_decode("real-64KB", full, cap);
             fails += test_gpu_encode_decode_32s("real-64KB", full, cap);
+            fails += test_slz_huff_build_tables(full, (size_t)sz);
+            fails += test_slz_huff_encode(full, (size_t)sz);
 
             if (fails == 0) {
                 // Realistic decode bench: every block is distinct file
@@ -1941,6 +2191,7 @@ int main(int argc, char **argv) {
                 bench_gpu_decode_realfile_cpasync_esc(full, (size_t)sz);
                 bench_gpu_decode_realfile_cpasync_esc_cb(full, (size_t)sz);
                 bench_lut_build(full, (size_t)sz);
+                bench_slz_huff_encode(full, (size_t)sz);
                 bench_gpu_decode_realfile_wstore_aligned_esc_queue(full, (size_t)sz);
                 bench_gpu_decode_realfile_wstore64(full, (size_t)sz);
                 bench_gpu_decode_realfile_lut16(full, (size_t)sz);
