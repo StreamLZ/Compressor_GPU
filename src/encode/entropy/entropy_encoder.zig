@@ -279,6 +279,41 @@ pub fn encodeArrayU8Tans32Shared(
     return encodeArrayU8Memcpy(dst, src);
 }
 
+/// Debug (SLZ_DUMP_STREAMS=1): measure how a raw stream would compress
+/// under Huffman vs tANS-32, appending "<kind>,<raw>,<huff>,<tans>" to
+/// c:\tmp\slz_streams.csv. kind: 0=lit 1=tok 2=off16hi 3=off16lo. All
+/// three sizes include the chunk header; a coder's size falls back to
+/// the raw memcpy size when it isn't beneficial. Inert without the env
+/// var.
+pub fn measureStream(allocator: std.mem.Allocator, kind: u8, src: []const u8) void {
+    if (std.c.getenv("SLZ_DUMP_STREAMS") == null) return;
+    if (src.len < 32) return;
+    const huff = @import("huffman_encoder.zig");
+    const cap = src.len * 2 + 4096;
+    const buf = allocator.alloc(u8, cap) catch return;
+    defer allocator.free(buf);
+
+    var huff_n: usize = src.len + 3;
+    if (huff.encodeBlock(buf, src) catch null) |hn| {
+        if (hn < huff_n) huff_n = hn;
+    }
+
+    var histo: ByteHistogram = .{};
+    histo.countBytes(src);
+    var tcost: f32 = @floatFromInt(src.len + 3);
+    var tans_n: usize = src.len + 3;
+    if (tans.encodeArrayU8Tans32(allocator, buf, src, &histo, 0.0, &tcost, null) catch null) |tn| {
+        if (tn + 5 < tans_n) tans_n = tn + 5;
+    }
+
+    const cio = @cImport({ @cInclude("stdio.h"); });
+    const fp = cio.fopen("c:/tmp/slz_streams.csv", "ab") orelse return;
+    defer _ = cio.fclose(fp);
+    var line: [96]u8 = undefined;
+    const s = std.fmt.bufPrint(&line, "{d},{d},{d},{d}\n", .{ kind, src.len, huff_n, tans_n }) catch return;
+    _ = cio.fwrite(s.ptr, 1, s.len, fp);
+}
+
 // ────────────────────────────────────────────────────────────
 //  Tests
 // ────────────────────────────────────────────────────────────

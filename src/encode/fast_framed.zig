@@ -197,6 +197,7 @@ fn reencodeGpuWithEntropy(
     if (rp + lit_count > raw.len) return 0;
     const literals = raw[rp..][0..lit_count];
     rp += lit_count;
+    entropy_enc.measureStream(allocator, 0, literals);
 
     // Parse token stream
     if (rp + 3 > raw.len) return 0;
@@ -205,6 +206,7 @@ fn reencodeGpuWithEntropy(
     if (rp + token_count > raw.len) return 0;
     const tokens = raw[rp..][0..token_count];
     rp += token_count;
+    entropy_enc.measureStream(allocator, 1, tokens);
 
     // cmd_stream2_offset: present for sub-chunks > 64KB
     var cmd_stream2_data: ?[2]u8 = null;
@@ -439,6 +441,7 @@ fn reencodeGpuWithEntropy(
             .none => unreachable,
         }
         // lo stream: encode per-unit as normal
+        entropy_enc.measureStream(allocator, 3, lo_bytes);
         const lo_n = entropy_enc.encodeArrayU8(allocator, dst[wp..], lo_bytes, options, speed_tradeoff, null, 0, null) catch return 0;
         wp += lo_n;
     } else if (off16_count >= 32) {
@@ -537,6 +540,8 @@ fn reencodeGpuWithEntropy(
                 lo_bytes[i] = off16_data[i * 2];
                 hi_bytes[i] = off16_data[i * 2 + 1];
             }
+            entropy_enc.measureStream(allocator, 2, hi_bytes);
+            entropy_enc.measureStream(allocator, 3, lo_bytes);
             const split_enc = allocator.alloc(u8, off16_bytes + 512) catch return 0;
             defer allocator.free(split_enc);
             const hi_n = entropy_enc.encodeArrayU8(allocator, split_enc, hi_bytes, options, speed_tradeoff, null, 0, null) catch return 0;

@@ -325,7 +325,7 @@ var huff_lit_host_buf: [4096]HuffDecChunkDesc = undefined;
 var huff_tok_host_buf: [4096]HuffDecChunkDesc = undefined;
 var huff_off16hi_host_buf: [4096]HuffDecChunkDesc = undefined;
 var huff_off16lo_host_buf: [4096]HuffDecChunkDesc = undefined;
-const HUFF_LUT_ENTRIES: usize = 2048; // matches MAX_CODE_LEN=11 in kernel
+const HUFF_LUT_ENTRIES: usize = 1024; // matches MAX_CODE_LEN=10 (10-bit escape LUT) in kernel
 
 // ── tANS header scanning ───────────────────────────────────────
 // Scans the host-side compressed data to find tANS literal, token,
@@ -1306,6 +1306,8 @@ pub fn fullGpuLaunch(
             if (io) |io_val| std.Io.Clock.awake.now(io_val) else null
         else
             null;
+        // SLZ_SPLIT_TIMER: build-vs-decode breakdown of the Huff pass.
+        var split_huff_build_ns: i64 = 0;
         if (have_huff) {
             const huff_stream = pipeline_streams[0];
             {
@@ -1320,6 +1322,14 @@ pub fn fullGpuLaunch(
                 var extra = [_]?*anyopaque{null};
                 if (launch_fn(huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra) != CUDA_SUCCESS)
                     return error.BadMode;
+            }
+            // Split fence: time the LUT build separately from the decode.
+            if (split_timer) {
+                if (cuStreamSync_fn) |sf| _ = sf(huff_stream);
+                if (t_huff_start) |hs| {
+                    if (io) |io_val|
+                        split_huff_build_ns = @intCast(hs.untilNow(io_val, .awake).toNanoseconds());
+                }
             }
             {
                 var p_comp = d_comp_persist;
@@ -1355,6 +1365,10 @@ pub fn fullGpuLaunch(
                     split_huff_ns = @intCast(hs.untilNow(io_val, .awake).toNanoseconds());
                 }
             }
+            std.debug.print("  [huff split] build {d:.3} ms  decode {d:.3} ms\n", .{
+                @as(f64, @floatFromInt(split_huff_build_ns)) / 1e6,
+                @as(f64, @floatFromInt(split_huff_ns - split_huff_build_ns)) / 1e6,
+            });
         }
 
         for (0..NUM_PIPELINE_STREAMS) |g| {

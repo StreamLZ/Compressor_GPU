@@ -19,8 +19,12 @@
 
 #include <cstdint>
 
-static constexpr int MAX_CODE_LEN = 11;
-static constexpr int LUT_SIZE     = 1 << MAX_CODE_LEN;  // 2048
+// MAX_CODE_LEN is the fast-LUT *index width* (10). Codes are
+// height-limited to MAX_CODE_LEN+1 = 11; length-11 codes resolve via
+// escape LUT entries (num_syms == 3) — a 1024-entry LUT (4 KB shared)
+// instead of 2048 (8 KB), roughly doubling decode-kernel occupancy.
+static constexpr int MAX_CODE_LEN = 10;
+static constexpr int LUT_SIZE     = 1 << MAX_CODE_LEN;  // 1024
 
 // ── Descriptor — matches Zig HuffDecChunkDesc in gpu_driver.zig ─────
 // Unified: in_offset/in_size cover the FULL payload (128 B weights +
@@ -90,14 +94,14 @@ extern "C" __global__ void slzHuffBuildLutKernel(
     // Histogram lengths into bl_count. Each lane handles a stride of 32 symbols.
     for (int s = lane; s < 256; s += 32) {
         uint8_t L = code_lengths[s];
-        if (L > 0 && L <= MAX_CODE_LEN) atomicAdd(&bl_count[L], 1);
+        if (L > 0 && L <= MAX_CODE_LEN + 1) atomicAdd(&bl_count[L], 1);
     }
     __syncwarp();
     // Lane 0 builds next_code[] (serial — only 16 lengths).
     if (lane == 0) {
         uint32_t code = 0;
         next_code[0] = 0;
-        for (int L = 1; L <= MAX_CODE_LEN; L++) {
+        for (int L = 1; L <= MAX_CODE_LEN + 1; L++) {
             code = (code + bl_count[L - 1]) << 1;
             next_code[L] = code;
         }
@@ -124,7 +128,7 @@ extern "C" __global__ void slzHuffBuildLutKernel(
     if (lane == 0) {
         for (int s = 0; s < 256; s++) {
             int L = code_lengths[s];
-            if (L == 0) continue;
+            if (L == 0 || L > MAX_CODE_LEN) continue;  // length-11 -> escape pass
             uint32_t aligned = codes[s] << (MAX_CODE_LEN - L);
             uint32_t span = 1u << (MAX_CODE_LEN - L);
             uint32_t entry = packLutEntry((uint8_t)s, 0, (uint8_t)L, 1);
@@ -155,6 +159,24 @@ extern "C" __global__ void slzHuffBuildLutKernel(
             }
         }
     }
+    __syncwarp();
+
+    // Pass 3: escape entries for length-(MAX_CODE_LEN+1) codes. A 10-bit
+    // prefix can't resolve an 11-bit code; the entry stores both sibling
+    // symbols (num_syms == 3) and the decoder reads the 11th bit. These
+    // 10-bit prefixes are never touched by passes 1-2 (prefix-free).
+    if (lane == 0) {
+        for (int s = 0; s < 256; s++) {
+            if (code_lengths[s] != MAX_CODE_LEN + 1) continue;
+            uint32_t c = codes[s];
+            uint32_t p = c >> 1;                       // 10-bit prefix = LUT index
+            uint32_t e = lut[p];
+            uint8_t b0 = (uint8_t)(e & 0xFF);
+            uint8_t b1 = (uint8_t)((e >> 8) & 0xFF);
+            if (c & 1u) b1 = (uint8_t)s; else b0 = (uint8_t)s;
+            lut[p] = packLutEntry(b0, b1, (uint8_t)(MAX_CODE_LEN + 1), 3);
+        }
+    }
 }
 
 // ── Single-stream decode core (one lane) ────────────────────────────
@@ -167,11 +189,17 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
     uint64_t bit_buf = 0;
     int bit_count = 0;
     uint32_t in_pos = 0;
-    uint32_t out_pos = 0;
+    uint32_t out_pos = 0;     // total bytes decoded
+    uint32_t written = 0;     // bytes flushed to global
+    uint64_t acc = 0;         // pending decoded bytes (byte 0 = oldest)
+    int pending = 0;
 
-    // Hot loop: each iter emits 1 or 2 symbols. Refill when bit_count < 11.
+    // Hot loop: 1 decode/iter, refill keeps >= 11 bits. Decoded bytes are
+    // accumulated and flushed as 32-bit stores — the first <=3 flushes
+    // byte-store to bring `out + written` to a 4-byte boundary, then the
+    // rest are aligned 32-bit stores (cuts L2 store traffic ~4x).
     while (out_pos + 2 <= out_size) {
-        if (bit_count < MAX_CODE_LEN) {
+        if (bit_count < MAX_CODE_LEN + 1) {
             if (in_pos + 4 > in_size) break;
             uint32_t v = ((uint32_t)in[in_pos    ] << 24)
                        | ((uint32_t)in[in_pos + 1] << 16)
@@ -185,14 +213,41 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
         int total_len = (e >> 16) & 0xFF;
         int num_syms  = (e >> 24) & 0xFF;
         if (total_len == 0) return 0;
-        out[out_pos]     = (uint8_t)(e & 0xFF);
-        out[out_pos + 1] = (uint8_t)((e >> 8) & 0xFF);
-        out_pos += num_syms;
+        if (num_syms == 3) {  // escape: length-11 code, pick by the 11th bit
+            uint32_t b11 = (uint32_t)((bit_buf >> (63 - MAX_CODE_LEN)) & 1u);
+            uint32_t sym = b11 ? ((e >> 8) & 0xFF) : (e & 0xFF);
+            acc |= (uint64_t)sym << (pending * 8);
+            pending += 1;
+            out_pos += 1;
+        } else {
+            acc |= (uint64_t)(e & 0xFFFF) << (pending * 8);
+            pending += num_syms;
+            out_pos += num_syms;
+        }
         bit_buf <<= total_len;
         bit_count -= total_len;
+        while (pending >= 4) {
+            if (((uintptr_t)(out + written) & 3u) == 0u) {
+                *reinterpret_cast<uint32_t*>(out + written) = (uint32_t)acc;
+                acc >>= 32;
+                written += 4;
+                pending -= 4;
+            } else {
+                out[written++] = (uint8_t)(acc & 0xFF);
+                acc >>= 8;
+                pending -= 1;
+            }
+        }
     }
 
-    // Tail: clamp dual entries to single at end-of-stream.
+    // Drain pending bytes; `written` catches up to `out_pos`.
+    while (pending > 0) {
+        out[written++] = (uint8_t)(acc & 0xFF);
+        acc >>= 8;
+        pending -= 1;
+    }
+
+    // Tail: handles the last 0-1 bytes; clamps dual entries to single.
     while (out_pos < out_size) {
         if (bit_count <= 32 && in_pos + 4 <= in_size) {
             uint32_t v = ((uint32_t)in[in_pos    ] << 24)
@@ -203,18 +258,23 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
             bit_count += 32;
             in_pos += 4;
         }
-        while (bit_count < MAX_CODE_LEN && in_pos < in_size) {
+        while (bit_count < MAX_CODE_LEN + 1 && in_pos < in_size) {
             bit_buf |= ((uint64_t)in[in_pos++]) << (56 - bit_count);
             bit_count += 8;
         }
-        if (bit_count < MAX_CODE_LEN) bit_count = MAX_CODE_LEN;
+        if (bit_count < MAX_CODE_LEN + 1) bit_count = MAX_CODE_LEN + 1;
         uint32_t e = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
         int total_len = (e >> 16) & 0xFF;
         int num_syms  = (e >> 24) & 0xFF;
         if (total_len == 0) return 0;
-        out[out_pos++] = (uint8_t)(e & 0xFF);
-        if (num_syms == 2 && out_pos < out_size) {
-            out[out_pos++] = (uint8_t)((e >> 8) & 0xFF);
+        if (num_syms == 3) {
+            uint32_t b11 = (uint32_t)((bit_buf >> (63 - MAX_CODE_LEN)) & 1u);
+            out[out_pos++] = (uint8_t)(b11 ? ((e >> 8) & 0xFF) : (e & 0xFF));
+        } else {
+            out[out_pos++] = (uint8_t)(e & 0xFF);
+            if (num_syms == 2 && out_pos < out_size) {
+                out[out_pos++] = (uint8_t)((e >> 8) & 0xFF);
+            }
         }
         bit_buf <<= total_len;
         bit_count -= total_len;
