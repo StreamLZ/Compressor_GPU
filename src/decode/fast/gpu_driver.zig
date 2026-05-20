@@ -976,6 +976,16 @@ pub fn fullGpuLaunch(
 ) fast_dec.DecodeError!void {
     if (!init() or kernel_fn == 0) return error.BadMode;
 
+    // SLZ_E2E_TIMER: end-to-end decode phase breakdown — setup+H2D /
+    // host scan+prep / kernels / D2H. Off by default.
+    const e2e_timer = std.c.getenv("SLZ_E2E_TIMER") != null;
+    const t_e2e0 = if (e2e_timer)
+        (if (io) |iv| std.Io.Clock.awake.now(iv) else null)
+    else
+        null;
+    var e2e_cum_h2d_ns: i64 = 0;
+    var e2e_cum_predh_ns: i64 = 0;
+
     const h2d_fn = cuMemcpyHtoD_fn orelse return error.BadMode;
     const d2h_fn = cuMemcpyDtoH_fn orelse return error.BadMode;
     const launch_fn = cuLaunchKernel_fn orelse return error.BadMode;
@@ -1042,6 +1052,9 @@ pub fn fullGpuLaunch(
         _ = h2d_fn(d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len);
     _ = h2d_fn(d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes);
     _ = sync_fn();
+    if (t_e2e0) |t0| if (io) |iv| {
+        e2e_cum_h2d_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+    };
 
     // ── Phase 2: build 4 shared LUTs into d_tans_lut[0..3] ─────
     // When the frame carries shared probability tables, run the FSE
@@ -1892,7 +1905,26 @@ pub fn fullGpuLaunch(
         }
     }
 
+    if (t_e2e0) |t0| if (io) |iv| {
+        e2e_cum_predh_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+    };
     _ = d2h_fn(@ptrCast(dst_full + dst_start_off), d_output + dst_start_off, decompressed_size);
+    if (t_e2e0) |t0| if (io) |iv| {
+        const cum_end_ns: i64 = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+        const ms = struct {
+            fn f(ns: i64) f64 {
+                return @as(f64, @floatFromInt(ns)) / 1e6;
+            }
+        }.f;
+        const mid_ns = e2e_cum_predh_ns - e2e_cum_h2d_ns; // scan+prep+kernels
+        std.debug.print("  [e2e] setup+H2D {d:.3}  scan+prep {d:.3}  kernels {d:.3}  D2H {d:.3}  total {d:.3} ms\n", .{
+            ms(e2e_cum_h2d_ns),
+            ms(mid_ns - last_kernel_ns),
+            ms(last_kernel_ns),
+            ms(cum_end_ns - e2e_cum_predh_ns),
+            ms(cum_end_ns),
+        });
+    };
 }
 
 // ── Helper: launch tANS kernel for a set of descriptors ───────
