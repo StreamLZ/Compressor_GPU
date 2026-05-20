@@ -984,6 +984,7 @@ pub fn fullGpuLaunch(
     else
         null;
     var e2e_cum_h2d_ns: i64 = 0;
+    var e2e_cum_scan_ns: i64 = 0;
     var e2e_cum_predh_ns: i64 = 0;
 
     const h2d_fn = cuMemcpyHtoD_fn orelse return error.BadMode;
@@ -1168,6 +1169,10 @@ pub fn fullGpuLaunch(
             }
         }
     }
+
+    if (t_e2e0) |t0| if (io) |iv| {
+        e2e_cum_scan_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+    };
 
     // ── Huffman pre-decode (Pass 1.5): merge per-stream-type descriptors
     // into a single device array with correct out_offsets, then upload.
@@ -1916,10 +1921,12 @@ pub fn fullGpuLaunch(
                 return @as(f64, @floatFromInt(ns)) / 1e6;
             }
         }.f;
-        const mid_ns = e2e_cum_predh_ns - e2e_cum_h2d_ns; // scan+prep+kernels
-        std.debug.print("  [e2e] setup+H2D {d:.3}  scan+prep {d:.3}  kernels {d:.3}  D2H {d:.3}  total {d:.3} ms\n", .{
+        const scan_ns = e2e_cum_scan_ns - e2e_cum_h2d_ns; // host header scan
+        const prep_ns = (e2e_cum_predh_ns - e2e_cum_scan_ns) - last_kernel_ns; // descriptor prep
+        std.debug.print("  [e2e] setup+H2D {d:.3}  scan {d:.3}  prep {d:.3}  kernels {d:.3}  D2H {d:.3}  total {d:.3} ms\n", .{
             ms(e2e_cum_h2d_ns),
-            ms(mid_ns - last_kernel_ns),
+            ms(scan_ns),
+            ms(prep_ns),
             ms(last_kernel_ns),
             ms(cum_end_ns - e2e_cum_predh_ns),
             ms(cum_end_ns),
