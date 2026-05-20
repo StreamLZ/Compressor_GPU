@@ -54,9 +54,10 @@ __device__ __forceinline__ uint32_t packLutEntry(uint8_t sym1, uint8_t sym2,
 // Grid: (n_blocks, 1, 1). Block: (32, 1, 1).
 // One warp per block. Weights[] is 128 bytes; each byte has two
 // nibbles — low nibble = symbol 2*i, high nibble = symbol 2*i+1.
-// Pass 1: single-symbol fan-out (lane 0 serial — 256 symbols, ~256 short loops).
-// Pass 2: dual-symbol overwrite (lane 0 serial — at most 256*256 inner iters,
-// but bounded by L1+L2<=11, which prunes to a small fraction of pairs).
+// Pass 1: single-symbol fan-out (32-lane parallel over symbols).
+// Pass 2: dual-symbol overwrite (32-lane parallel over s1; inner loop
+// bounded by L1+L2<=10). Prefix-free codes give disjoint spans, so both
+// passes are race-free with no atomics. Pass 3 escape stays lane-0.
 //
 // LUT is written to global memory (luts + desc.lut_offset).
 extern "C" __global__ void slzHuffBuildLutKernel(
@@ -123,40 +124,37 @@ extern "C" __global__ void slzHuffBuildLutKernel(
     for (int i = lane; i < LUT_SIZE; i += 32) lut[i] = 0;
     __syncwarp();
 
-    // Pass 1: single-symbol entries. Lane 0 does all writes; pre-aggregated
-    // fan-out is too irregular to parallelize cleanly across 32 lanes.
-    if (lane == 0) {
-        for (int s = 0; s < 256; s++) {
-            int L = code_lengths[s];
-            if (L == 0 || L > MAX_CODE_LEN) continue;  // length-11 -> escape pass
-            uint32_t aligned = codes[s] << (MAX_CODE_LEN - L);
-            uint32_t span = 1u << (MAX_CODE_LEN - L);
-            uint32_t entry = packLutEntry((uint8_t)s, 0, (uint8_t)L, 1);
-            for (uint32_t i = 0; i < span; i++) lut[aligned + i] = entry;
-        }
+    // Pass 1: single-symbol entries — parallel over symbols (32 lanes).
+    // Canonical codes are prefix-free, so distinct symbols fill mutually
+    // disjoint LUT spans — the fan-out is race-free with no atomics.
+    for (int s = lane; s < 256; s += 32) {
+        int L = code_lengths[s];
+        if (L == 0 || L > MAX_CODE_LEN) continue;  // length-11 -> escape pass
+        uint32_t aligned = codes[s] << (MAX_CODE_LEN - L);
+        uint32_t span = 1u << (MAX_CODE_LEN - L);
+        uint32_t entry = packLutEntry((uint8_t)s, 0, (uint8_t)L, 1);
+        for (uint32_t i = 0; i < span; i++) lut[aligned + i] = entry;
     }
     __syncwarp();
 
-    // Pass 2: dual-symbol entries — overwrite where L1+L2 <= MAX_CODE_LEN.
-    // Lane 0 again; the inner loops are short because L1+L2>11 prunes pairs.
-    if (lane == 0) {
-        for (int s1 = 0; s1 < 256; s1++) {
-            int L1 = code_lengths[s1];
-            if (L1 == 0 || L1 >= MAX_CODE_LEN) continue;
-            uint32_t C1 = codes[s1];
-            for (int s2 = 0; s2 < 256; s2++) {
-                int L2 = code_lengths[s2];
-                if (L2 == 0) continue;
-                int total = L1 + L2;
-                if (total > MAX_CODE_LEN) continue;
-                uint32_t C2 = codes[s2];
-                uint32_t aligned = (C1 << (MAX_CODE_LEN - L1))
-                                 | (C2 << (MAX_CODE_LEN - L1 - L2));
-                uint32_t span = 1u << (MAX_CODE_LEN - total);
-                uint32_t entry = packLutEntry((uint8_t)s1, (uint8_t)s2,
-                                               (uint8_t)total, 2);
-                for (uint32_t i = 0; i < span; i++) lut[aligned + i] = entry;
-            }
+    // Pass 2: dual-symbol entries — parallel over s1 (32 lanes). Distinct
+    // s1 prefixes fill disjoint spans, so the fan-out stays race-free.
+    for (int s1 = lane; s1 < 256; s1 += 32) {
+        int L1 = code_lengths[s1];
+        if (L1 == 0 || L1 >= MAX_CODE_LEN) continue;
+        uint32_t C1 = codes[s1];
+        for (int s2 = 0; s2 < 256; s2++) {
+            int L2 = code_lengths[s2];
+            if (L2 == 0) continue;
+            int total = L1 + L2;
+            if (total > MAX_CODE_LEN) continue;
+            uint32_t C2 = codes[s2];
+            uint32_t aligned = (C1 << (MAX_CODE_LEN - L1))
+                             | (C2 << (MAX_CODE_LEN - L1 - L2));
+            uint32_t span = 1u << (MAX_CODE_LEN - total);
+            uint32_t entry = packLutEntry((uint8_t)s1, (uint8_t)s2,
+                                           (uint8_t)total, 2);
+            for (uint32_t i = 0; i < span; i++) lut[aligned + i] = entry;
         }
     }
     __syncwarp();
