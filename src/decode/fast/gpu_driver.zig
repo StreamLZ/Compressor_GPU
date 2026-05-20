@@ -971,7 +971,8 @@ pub fn fullGpuLaunch(
     const comp_bytes = if (compressed_block.len > 0) compressed_block.len else 4;
     const desc_bytes = chunk_descs.len * @sizeOf(ChunkDesc);
 
-    if (!ensureDeviceBuf(&d_comp_persist, &d_comp_persist_size, comp_bytes)) return error.BadMode;
+    // +16 slack: slzTans32DecodeKernel's readLE32_aligned over-reads up to 7B.
+    if (!ensureDeviceBuf(&d_comp_persist, &d_comp_persist_size, comp_bytes + 16)) return error.BadMode;
     if (!ensureDeviceBuf(&d_descs_persist, &d_descs_persist_size, desc_bytes)) return error.BadMode;
 
     // Compute per-chunk first-subchunk index (prefix sum of n_subs_per_chunk).

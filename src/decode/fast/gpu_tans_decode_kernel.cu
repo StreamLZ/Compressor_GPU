@@ -675,6 +675,17 @@ __device__ uint32_t readLE32(const uint8_t* p) {
     return v;
 }
 
+// Aligned readLE32: same value as readLE32(p) for any p, but via two
+// ALIGNED 32-bit loads + a funnel shift instead of four byte loads.
+// Reads up to 8 bytes from (p & ~3) — callers' buffers need >= 7 bytes
+// of slack past the last read position.
+__device__ __forceinline__ uint32_t readLE32_aligned(const uint8_t* p) {
+    uintptr_t a = (uintptr_t)p;
+    const uint32_t* base = (const uint32_t*)(a & ~(uintptr_t)3);
+    uint32_t off = (uint32_t)(a & 3u) * 8u;        // 0, 8, 16, or 24
+    return __funnelshift_r(base[0], base[1], off); // ({hi:lo} >> off) low 32
+}
+
 // Decode one symbol from forward or backward stream.
 // Consumes bits from `bits`, updates `state`, returns the symbol byte.
 __device__ __forceinline__ uint8_t decodeOneSymbol(
@@ -1713,6 +1724,14 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
     uint32_t log_table_bits = meta_buf[lut_id].log_table_bits;
     uint32_t lut_mask = (1u << log_table_bits) - 1;
 
+    // Copy the per-chunk packed LUT global -> shared. The decode loop
+    // reads it ~dst_size/32 times per lane; shared (~30-cycle) vs the
+    // global __ldg (~200-cycle) was 83% of the kernel's stall cycles.
+    __shared__ uint32_t s_lut[2][2048];
+    for (int li = lane; li < 2048; li += 32) s_lut[warp_id][li] = packed_lut[li];
+    __syncwarp();
+    const uint32_t* my_lut = s_lut[warp_id];
+
     // Sub-stream start:
     //   shared mode → scan set src_offset to the first sub-stream byte
     //   per-stream  → build kernel set src_after_table_off past the embedded
@@ -1750,7 +1769,7 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
     }
 
     uint32_t state = (uint32_t)my_init_state & lut_mask;
-    uint32_t bits = readLE32(my_src);
+    uint32_t bits = readLE32_aligned(my_src);
     int32_t bitpos = 32;
     const uint8_t* ptr = my_src + 4;
     const uint8_t* ptr_end = my_src + my_sub_size;
@@ -1760,7 +1779,7 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
         // Refill when low on bits
         if (bitpos < 16) {
             if (ptr + 4 <= ptr_end) {
-                bits |= readLE32(ptr) << bitpos;
+                bits |= readLE32_aligned(ptr) << bitpos;
                 ptr += (31 - bitpos) >> 3;
                 bitpos |= 24;
             } else {
@@ -1772,7 +1791,7 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeKernel(
             }
         }
 
-        uint32_t packed = __ldg(&packed_lut[state]);
+        uint32_t packed = my_lut[state];
         uint32_t bits_x = packed >> 24;
         uint8_t sym = (uint8_t)((packed >> 16) & 0xFF);
         uint32_t w = packed & 0xFFFF;
