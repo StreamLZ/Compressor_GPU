@@ -507,7 +507,13 @@ fn runCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
             try w.flush();
             std.process.exit(2);
         }
-    } else if (!args.no_dict) {
+    } else if (!args.no_dict and !args.gpu) {
+        // GPU mode never uses a dictionary: the GPU encode path produces
+        // self-contained 64KB blocks with no cross-frame back-reference
+        // window, and the L1/L2 GPU encoder mis-sizes its output when a
+        // dict prefix is present (DestinationTooSmall). Auto-detection is
+        // suppressed here so `-gpu` is dict-free regardless of file
+        // extension.
         if (dict_mod.findByExtension(in_path)) |d| {
             dict_data = d.data;
             dict_id = d.id;
