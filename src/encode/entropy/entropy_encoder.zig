@@ -146,6 +146,21 @@ pub fn encodeArrayU8(
     return encodeArrayU8CoreWithHisto(allocator, dst, src, &histo, options, speed_tradeoff, cost_out, level);
 }
 
+/// Encode `src` as a Huffman chunk_type=4 block when that beats a raw
+/// memcpy chunk; otherwise emit a memcpy chunk. Unlike `encodeArrayU8`
+/// this never attempts tANS — used for GPU off16 hi/lo streams, which
+/// the GPU tANS off16 encoder mis-encodes (see the gpu-silesia-off16-bug
+/// note) while CPU Huffman GPU-decodes byte-exact.
+pub fn encodeArrayU8Huffman(dst: []u8, src: []const u8) EncodeError!usize {
+    if (src.len >= 32 and dst.len > 5 + 128 + 9) {
+        const huff = @import("huffman_encoder.zig");
+        if (huff.encodeBlock(dst, src) catch null) |n| {
+            if (n < src.len + 3) return n;
+        }
+    }
+    return encodeArrayU8Memcpy(dst, src);
+}
+
 /// Core encode with pre-computed histogram. Takes the histogram by
 /// value (copies internally so the caller's copy is untouched by any
 /// in-place adjustments the encoders make).

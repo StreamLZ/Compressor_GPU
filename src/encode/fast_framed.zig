@@ -171,14 +171,15 @@ fn reencodeGpuWithEntropy(
     var lit32_eff = tans_encoded_lits_32;
     var lit_eff = tans_encoded_lits;
     var tok_eff = tans_encoded_tokens;
-    var hi_eff = tans_encoded_off16_hi;
-    var lo_eff = tans_encoded_off16_lo;
+    // off16 GPU-encoder bodies are intentionally ignored: the GPU tANS
+    // off16 encoder mis-encodes ~10pp of silesia content
+    // ([[gpu-silesia-off16-bug]]). off16 is CPU-Huffman-encoded below.
+    _ = tans_encoded_off16_hi;
+    _ = tans_encoded_off16_lo;
     if (std.c.getenv("SLZ_HUFF_LIT") != null) {
         lit32_eff = null;
         lit_eff = null;
         tok_eff = null;
-        hi_eff = null;
-        lo_eff = null;
     }
 
     // Copy initial bytes (first 8 raw bytes for is_first chunks)
@@ -445,49 +446,13 @@ fn reencodeGpuWithEntropy(
         const lo_n = entropy_enc.encodeArrayU8(allocator, dst[wp..], lo_bytes, options, speed_tradeoff, null, 0, null) catch return 0;
         wp += lo_n;
     } else if (off16_count >= 32) {
-        // Force raw off16 in GPU mode unless Phase 2 shared off16 is
-        // active. The GPU off16 decode kernel (per-stream tANS into
-        // tans_off16_scratch + LZ kernel consumption) produces wrong
-        // bytes on certain content (silesia chunk 102 minimal repro at
-        // 6886 bytes, mismatch at output byte 2932). Works for both
-        // chunk_type=1 and =6, so the bug is in the off16 split decode
-        // pipeline rather than the entropy format. Costs ~5pp ratio
-        // until the underlying bug is found. See [[gpu-silesia-off16-bug]].
-        const shared_off16_both = shared_off16_hi != null and shared_off16_lo != null;
-        // Temp: SLZ_OFF16_ENTROPY=1 lifts the workaround so we can repro
-        // the bug and find/fix it. Otherwise force_raw_off16 stays on.
-        const lift_workaround = std.c.getenv("SLZ_OFF16_ENTROPY") != null;
-        const force_raw_off16: bool = !shared_off16_both and !lift_workaround;
-        if (force_raw_off16) {
-            if (wp + 2 + off16_bytes > dst.len) return 0;
-            std.mem.writeInt(u16, dst[wp..][0..2], @intCast(off16_count), .little);
-            wp += 2;
-            @memcpy(dst[wp..][0..off16_bytes], off16_data);
-            wp += off16_bytes;
-            // skip to off32 by jumping past the if/else chain
-            if (wp + 3 + off32_extra + off32_byte_count > dst.len) return 0;
-            @memcpy(dst[wp..][0..3], off32_hdr);
-            wp += 3;
-            if (off32_extra > 0) {
-                @memcpy(dst[wp..][0..off32_extra], raw[rp - off32_byte_count - off32_extra ..][0..off32_extra]);
-                wp += off32_extra;
-            }
-            if (off32_byte_count > 0) {
-                @memcpy(dst[wp..][0..off32_byte_count], raw[rp - off32_byte_count ..][0..off32_byte_count]);
-                wp += off32_byte_count;
-            }
-            if (wp + length_data.len > dst.len) return 0;
-            @memcpy(dst[wp..][0..length_data.len], length_data);
-            wp += length_data.len;
-            return wp;
-        }
-        // Phase 2 shared-LUT path (chunk_type=3) takes priority when
-        // both hi and lo were shared-encoded.
+        // off16 hi/lo are entropy-coded with CPU Huffman (chunk_type=4).
+        // The GPU tANS off16 encoder mis-encodes ~10pp of silesia content
+        // (a GPU-encoder bug, see [[gpu-silesia-off16-bug]]), but
+        // CPU-encoded off16 GPU-decodes byte-exact. Phase 2 shared-LUT
+        // off16 (chunk_type=3) is preferred when both planes were shared
+        // and is not subject to the bug.
         const use_shared_off16: bool = shared_off16_hi != null and shared_off16_lo != null;
-        // Phase 1 GPU type-6 path falls back to here if shared not in
-        // play but per-stream pre-encoded data is present.
-        const use_gpu_off16: bool = (!use_shared_off16) and
-            hi_eff != null and lo_eff != null;
         if (use_shared_off16) {
             const pre_hi = shared_off16_hi.?;
             const pre_lo = shared_off16_lo.?;
@@ -509,28 +474,6 @@ fn reencodeGpuWithEntropy(
                 @memcpy(dst[wp..][0..off16_bytes], off16_data);
                 wp += off16_bytes;
             }
-        } else if (use_gpu_off16) {
-            const pre_hi = hi_eff.?;
-            const pre_lo = lo_eff.?;
-            // 5-byte type-6 chunk header per stream → split_total = pre_hi + pre_lo + 10.
-            const split_total: usize = pre_hi.len + pre_lo.len + 10;
-            if (split_total < off16_bytes) {
-                if (wp + 2 + split_total > dst.len) return 0;
-                std.mem.writeInt(u16, dst[wp..][0..2], fast_constants.entropy_coded_16_marker, .little);
-                wp += 2;
-                entropy_enc.writeNonCompactChunkHeader(dst[wp..], 6, @intCast(pre_hi.len), @intCast(off16_count));
-                @memcpy(dst[wp + 5 ..][0..pre_hi.len], pre_hi);
-                wp += 5 + pre_hi.len;
-                entropy_enc.writeNonCompactChunkHeader(dst[wp..], 6, @intCast(pre_lo.len), @intCast(off16_count));
-                @memcpy(dst[wp + 5 ..][0..pre_lo.len], pre_lo);
-                wp += 5 + pre_lo.len;
-            } else {
-                if (wp + 2 + off16_bytes > dst.len) return 0;
-                std.mem.writeInt(u16, dst[wp..][0..2], @intCast(off16_count), .little);
-                wp += 2;
-                @memcpy(dst[wp..][0..off16_bytes], off16_data);
-                wp += off16_bytes;
-            }
         } else {
             const split_buf = allocator.alloc(u8, off16_count * 2) catch return 0;
             defer allocator.free(split_buf);
@@ -540,12 +483,10 @@ fn reencodeGpuWithEntropy(
                 lo_bytes[i] = off16_data[i * 2];
                 hi_bytes[i] = off16_data[i * 2 + 1];
             }
-            entropy_enc.measureStream(allocator, 2, hi_bytes);
-            entropy_enc.measureStream(allocator, 3, lo_bytes);
             const split_enc = allocator.alloc(u8, off16_bytes + 512) catch return 0;
             defer allocator.free(split_enc);
-            const hi_n = entropy_enc.encodeArrayU8(allocator, split_enc, hi_bytes, options, speed_tradeoff, null, 0, null) catch return 0;
-            const lo_n = entropy_enc.encodeArrayU8(allocator, split_enc[hi_n..], lo_bytes, options, speed_tradeoff, null, 0, null) catch return 0;
+            const hi_n = entropy_enc.encodeArrayU8Huffman(split_enc, hi_bytes) catch return 0;
+            const lo_n = entropy_enc.encodeArrayU8Huffman(split_enc[hi_n..], lo_bytes) catch return 0;
             const split_total = hi_n + lo_n;
             if (split_total < off16_bytes) {
                 if (wp + 2 + split_total > dst.len) return 0;
