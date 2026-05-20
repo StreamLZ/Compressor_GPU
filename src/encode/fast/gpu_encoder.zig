@@ -908,6 +908,10 @@ pub fn gpuCompress(
     var p_total = num_chunks;
     var p_hash_bits = hash_bits;
     var p_use_chain: u32 = if (chain) 1 else 0;
+    // L4+ enables the greedy parser's match-range rehash (CPU engine_level>=2).
+    // L3 stays without it — that is the L3/L4 distinction. L5 uses the chain
+    // parser so the flag is inert there.
+    var p_l4: u32 = if (level >= 4) 1 else 0;
 
     var params = [_]?*anyopaque{
         @ptrCast(&p_input),
@@ -918,6 +922,7 @@ pub fn gpuCompress(
         @ptrCast(&p_total),
         @ptrCast(&p_hash_bits),
         @ptrCast(&p_use_chain),
+        @ptrCast(&p_l4),
     };
     var extra = [_]?*anyopaque{null};
 

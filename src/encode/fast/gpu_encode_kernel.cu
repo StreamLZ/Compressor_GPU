@@ -763,7 +763,8 @@ __device__ void scanBlock(
     uint8_t* off32_buf, uint32_t &off32_pos, uint32_t &off32_count,
     uint8_t* len_buf, uint32_t &length_count,
     uint32_t &anchor, int32_t &recent_offset,
-    uint32_t start_pos, uint32_t end_pos, uint32_t block2_start
+    uint32_t start_pos, uint32_t end_pos, uint32_t block2_start,
+    uint32_t l4_features
 ) {
     const uint32_t lane = threadIdx.x & 31;
     uint32_t pos = start_pos;
@@ -1041,6 +1042,28 @@ __device__ void scanBlock(
             recent_offset = neg_off;
         }
 
+        // L4 (l4_features): match-range rehash. Insert hash-table entries
+        // for positions *inside* the just-emitted match at exponentially
+        // spaced offsets, so later positions can reference mid-match.
+        // Port of CPU emitMatch's level>=2 rehash (fast_lz_parser.zig:285).
+        if (l4_features) {
+            uint32_t ri = 1u << lane;
+            if (ri < match_len) {
+                uint32_t rp = match_pos + ri;
+                if (rp + 8 <= src_size) {
+                    uint64_t rk = (uint64_t)src[rp]
+                                | ((uint64_t)src[rp+1] << 8)
+                                | ((uint64_t)src[rp+2] << 16)
+                                | ((uint64_t)src[rp+3] << 24)
+                                | ((uint64_t)src[rp+4] << 32)
+                                | ((uint64_t)src[rp+5] << 40)
+                                | ((uint64_t)src[rp+6] << 48)
+                                | ((uint64_t)src[rp+7] << 56);
+                    ht[hashKey6(rk, hash_bits, hash_mask)] = rp;
+                }
+            }
+        }
+
         anchor = match_pos + match_len;
         pos = anchor;
     }
@@ -1073,7 +1096,8 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzCompressL1Kernel(
     uint32_t* __restrict__ comp_sizes,
     uint32_t total_chunks,
     uint32_t hash_bits,
-    uint32_t use_chain
+    uint32_t use_chain,
+    uint32_t l4_features
 ) {
     extern __shared__ uint32_t shared_ht[];
 
@@ -1174,7 +1198,7 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzCompressL1Kernel(
                       off32_buf, off32_pos, off32_count,
                       len_buf, length_count,
                       anchor, recent_offset,
-                      anchor, block1_end, /*block2_start=*/0);
+                      anchor, block1_end, /*block2_start=*/0, l4_features);
             off32_count_block1 = off32_count;
             off32_count = 0;
         }
@@ -1190,7 +1214,7 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzCompressL1Kernel(
                       off32_buf, off32_pos, off32_count,
                       len_buf, length_count,
                       anchor, recent_offset,
-                      block2_start_pos, src_size, /*block2_start=*/BLOCK1_SIZE);
+                      block2_start_pos, src_size, /*block2_start=*/BLOCK1_SIZE, l4_features);
             off32_count_block2 = off32_count;
         }
     }
