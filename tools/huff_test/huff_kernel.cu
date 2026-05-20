@@ -47,12 +47,22 @@ __device__ __forceinline__ uint32_t decode_stream_one_lane(
     uint32_t in_pos = 0;
     uint32_t out_pos = 0;
 
-    // ── Hot loop: 1 LUT lookup per iter, but it emits 1 OR 2 symbols ──
-    // Each lookup consumes up to MAX_CODE_LEN bits (max 11). A 4-byte
-    // refill from bit_count=0 yields 32 bits — comfortably > 11.
-    // We require enough output room for 2 symbols (the lookup may emit 2).
-    while (out_pos + 2 <= out_size) {
-        if (bit_count < MAX_CODE_LEN) {
+    // ── Hot loop: unrolled 2× — one refill guards two LUT decodes ──
+    // Each LUT lookup is indexed by MAX_CODE_LEN (11) bits and consumes
+    // total_len ≤ 11 bits while emitting 1 OR 2 symbols. Two decodes
+    // consume ≤ 22 bits.
+    //
+    // The 32-bit refill `bit_buf |= v << (32 - bit_count)` is only valid
+    // when bit_count ≤ 32. We refill whenever bit_count < 2*MAX_CODE_LEN
+    // (< 22), so the shift amount is in [10, 32] — always valid — and the
+    // post-refill bit_count is in [32, 53], i.e. ≥ 22, enough for the two
+    // decodes below with no mid-group refill check. This halves the
+    // refill-branch / loop-branch / bounds-check overhead per symbol.
+    //
+    // Each iteration emits up to 4 symbols (2 decodes × ≤2 syms), so the
+    // output-room guard is `out_pos + 4 <= out_size`.
+    while (out_pos + 4 <= out_size) {
+        if (bit_count < 2 * MAX_CODE_LEN) {
             if (in_pos + 4 > in_size) break;
             uint32_t v = ((uint32_t)in[in_pos    ] << 24)
                        | ((uint32_t)in[in_pos + 1] << 16)
@@ -62,18 +72,27 @@ __device__ __forceinline__ uint32_t decode_stream_one_lane(
             bit_count += 32;
             in_pos += 4;
         }
-        uint32_t e = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
-        int total_len = (e >> 16) & 0xFF;
-        int num_syms  = (e >> 24) & 0xFF;
-        if (total_len == 0) return 0;
-        // Always write both bytes — sym2 is harmless when num_syms==1 because
-        // the next iteration overwrites out[out_pos+1] with its own sym1.
-        // Guard at end-of-buffer handled by the outer condition (out_pos + 2 <= out_size).
-        out[out_pos]     = (uint8_t)(e & 0xFF);
-        out[out_pos + 1] = (uint8_t)((e >> 8) & 0xFF);
-        out_pos += num_syms;
-        bit_buf <<= total_len;
-        bit_count -= total_len;
+        // decode A
+        uint32_t e0 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len0 = (e0 >> 16) & 0xFF;
+        int ns0  = (e0 >> 24) & 0xFF;
+        if (len0 == 0) return 0;
+        out[out_pos]     = (uint8_t)(e0 & 0xFF);
+        out[out_pos + 1] = (uint8_t)((e0 >> 8) & 0xFF);
+        out_pos += ns0;
+        bit_buf <<= len0;
+        bit_count -= len0;
+        // decode B (≤ 22 bits total consumed this iter; refill above
+        // guaranteed ≥ 22 valid bits, so no refill check needed here)
+        uint32_t e1 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len1 = (e1 >> 16) & 0xFF;
+        int ns1  = (e1 >> 24) & 0xFF;
+        if (len1 == 0) return 0;
+        out[out_pos]     = (uint8_t)(e1 & 0xFF);
+        out[out_pos + 1] = (uint8_t)((e1 >> 8) & 0xFF);
+        out_pos += ns1;
+        bit_buf <<= len1;
+        bit_count -= len1;
     }
 
     // ── Tail loop: handles last 1-2 bytes; clamps dual entries to single ──
