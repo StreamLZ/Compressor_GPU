@@ -242,6 +242,9 @@ const TansDecChunkDesc = extern struct {
 
 var d_tans_scratch: CUdeviceptr = 0;
 var d_tans_scratch_size: usize = 0;
+
+// Debug: one-shot capture of the tans32 decode input (SLZ_DUMP_TANS32=1).
+var tans32_dumped: bool = false;
 var d_shared_lut: CUdeviceptr = 0;
 var d_shared_lut_size: usize = 0;
 var shared_lut_log_bits: u32 = 0;
@@ -1508,6 +1511,36 @@ pub fn fullGpuLaunch(
                     var tans_extra = [_]?*anyopaque{null};
                     if (launch_fn(tans_kernel_fn, tans_grid, 1, 1, 32, 2, 1, 0, stream, &tans_params, &tans_extra) != CUDA_SUCCESS)
                         return error.BadMode;
+                }
+
+                // ── Debug: one-shot tans32 snapshot (SLZ_DUMP_TANS32=1) ──
+                // Dumps the exact (src_buf, descs, decoded output) the
+                // tans32 decode consumed/produced, for the standalone
+                // testbed in tools/huff_test/. Inert without the env var.
+                if (scan.use_tans32 and !tans32_dumped and std.c.getenv("SLZ_DUMP_TANS32") != null) {
+                    tans32_dumped = true;
+                    _ = sync_fn();
+                    dumpTans32: {
+                        const cio = @cImport({ @cInclude("stdio.h"); });
+                        const a = std.heap.page_allocator;
+                        const dbytes: usize = @as(usize, tc) * @sizeOf(TansDecChunkDesc);
+                        const dhost = a.alloc(u8, dbytes) catch break :dumpTans32;
+                        defer a.free(dhost);
+                        const chost = a.alloc(u8, comp_bytes) catch break :dumpTans32;
+                        defer a.free(chost);
+                        const shost = a.alloc(u8, d_tans_scratch_size) catch break :dumpTans32;
+                        defer a.free(shost);
+                        _ = d2h_fn(dhost.ptr, bp_descs, dbytes);
+                        _ = d2h_fn(chost.ptr, d_comp_persist, comp_bytes);
+                        _ = d2h_fn(shost.ptr, d_tans_scratch, d_tans_scratch_size);
+                        const fp = cio.fopen("c:/tmp/tans32_snapshot.bin", "wb") orelse break :dumpTans32;
+                        var hdr = [_]u32{ 0x544e3332, tc, @intCast(comp_bytes), @intCast(d_tans_scratch_size) };
+                        _ = cio.fwrite(&hdr, 4, 4, fp);
+                        _ = cio.fwrite(dhost.ptr, 1, dbytes, fp);
+                        _ = cio.fwrite(chost.ptr, 1, comp_bytes, fp);
+                        _ = cio.fwrite(shost.ptr, 1, d_tans_scratch_size, fp);
+                        _ = cio.fclose(fp);
+                    }
                 }
             }
 
