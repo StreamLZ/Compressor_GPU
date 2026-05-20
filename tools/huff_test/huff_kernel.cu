@@ -2067,3 +2067,165 @@ extern "C" __global__ void huffDecode4StreamWStoreAlignedEscQueueKernel(
         __syncwarp();  // decode (reads shared_lut) done before next iter's load
     }
 }
+
+// ══════════════════════════════════════════════════════════════════
+//  LUT-build testbed: serial vs parallel 10-bit-escape LUT construction.
+//  Input  : code_lengths_all — 256 bytes per block (lengths 0..11).
+//  Output : luts — LUT_SIZE (1024) u32 entries per block.
+//  Both compute canonical codes internally, then build the escape LUT.
+// ══════════════════════════════════════════════════════════════════
+
+// Shared canonical-code setup (histogram + next_code + codes). All 32
+// lanes participate; leaves cl[], codes[] populated, lut[] zeroed.
+__device__ __forceinline__ void huffBuildSetup(
+    const uint8_t* CL, uint32_t* lut, int lane,
+    uint8_t* cl, uint32_t* codes, uint32_t* bl_count, uint32_t* next_code)
+{
+    for (int i = lane; i < 256; i += 32) cl[i] = CL[i];
+    if (lane < 16) bl_count[lane] = 0;
+    __syncwarp();
+    for (int s = lane; s < 256; s += 32) {
+        uint8_t L = cl[s];
+        if (L > 0 && L <= MAX_CODE_LEN + 1) atomicAdd(&bl_count[L], 1);
+    }
+    __syncwarp();
+    if (lane == 0) {
+        uint32_t code = 0;
+        next_code[0] = 0;
+        for (int L = 1; L <= MAX_CODE_LEN + 1; L++) {
+            code = (code + bl_count[L - 1]) << 1;
+            next_code[L] = code;
+        }
+        for (int s = 0; s < 256; s++) {
+            uint8_t L = cl[s];
+            codes[s] = (L == 0) ? 0u : next_code[L]++;
+        }
+    }
+    __syncwarp();
+    for (int i = lane; i < LUT_SIZE; i += 32) lut[i] = 0;
+    __syncwarp();
+}
+
+__device__ __forceinline__ uint32_t huffPack(uint32_t ns, uint32_t len,
+                                              uint32_t s2, uint32_t s1) {
+    return (ns << 24) | (len << 16) | (s2 << 8) | s1;
+}
+
+// Escape pass — length-(MAX_CODE_LEN+1) codes. Lane 0 only (rare; sibling
+// pairs share a prefix so parallel writes would race).
+__device__ __forceinline__ void huffBuildEscapePass(
+    const uint8_t* cl, const uint32_t* codes, uint32_t* lut, int lane)
+{
+    if (lane != 0) return;
+    for (int s = 0; s < 256; s++) {
+        if (cl[s] != MAX_CODE_LEN + 1) continue;
+        uint32_t c = codes[s];
+        uint32_t p = c >> 1;
+        uint32_t e = lut[p];
+        uint32_t b0 = e & 0xFF, b1 = (e >> 8) & 0xFF;
+        if (c & 1u) b1 = (uint32_t)s; else b0 = (uint32_t)s;
+        lut[p] = huffPack(3, MAX_CODE_LEN + 1, b1, b0);
+    }
+}
+
+// ── Serial build: lane 0 does the whole pass 1 + pass 2 fan-out ──────
+extern "C" __global__ void huffBuildLutEscSerialKernel(
+    const uint8_t* __restrict__ code_lengths_all,
+    uint32_t* __restrict__ luts,
+    uint32_t n_blocks)
+{
+    const uint32_t block_id = blockIdx.x;
+    if (block_id >= n_blocks) return;
+    const int lane = threadIdx.x & 31;
+
+    __shared__ uint8_t  cl[256];
+    __shared__ uint32_t codes[256];
+    __shared__ uint32_t bl_count[16];
+    __shared__ uint32_t next_code[16];
+
+    const uint8_t* CL = code_lengths_all + (size_t)block_id * 256;
+    uint32_t* lut = luts + (size_t)block_id * LUT_SIZE;
+    huffBuildSetup(CL, lut, lane, cl, codes, bl_count, next_code);
+
+    if (lane == 0) {
+        for (int s = 0; s < 256; s++) {                 // pass 1
+            int L = cl[s];
+            if (L == 0 || L > MAX_CODE_LEN) continue;
+            uint32_t aligned = codes[s] << (MAX_CODE_LEN - L);
+            uint32_t span = 1u << (MAX_CODE_LEN - L);
+            uint32_t entry = huffPack(1, (uint32_t)L, 0, (uint32_t)s);
+            for (uint32_t i = 0; i < span; i++) lut[aligned + i] = entry;
+        }
+        for (int s1 = 0; s1 < 256; s1++) {              // pass 2
+            int L1 = cl[s1];
+            if (L1 == 0 || L1 >= MAX_CODE_LEN) continue;
+            uint32_t C1 = codes[s1];
+            for (int s2 = 0; s2 < 256; s2++) {
+                int L2 = cl[s2];
+                if (L2 == 0) continue;
+                int total = L1 + L2;
+                if (total > MAX_CODE_LEN) continue;
+                uint32_t C2 = codes[s2];
+                uint32_t aligned = (C1 << (MAX_CODE_LEN - L1))
+                                 | (C2 << (MAX_CODE_LEN - L1 - L2));
+                uint32_t span = 1u << (MAX_CODE_LEN - total);
+                uint32_t entry = huffPack(2, (uint32_t)total, (uint32_t)s2, (uint32_t)s1);
+                for (uint32_t i = 0; i < span; i++) lut[aligned + i] = entry;
+            }
+        }
+    }
+    __syncwarp();
+    huffBuildEscapePass(cl, codes, lut, lane);
+}
+
+// ── Parallel build: pass 1 over symbols, pass 2 over s1, 32 lanes ────
+// Canonical codes are prefix-free, so distinct symbols (pass 1) and
+// distinct s1 prefixes (pass 2) fill mutually-disjoint LUT spans — the
+// 32-lane fan-out is race-free with no atomics.
+extern "C" __global__ void huffBuildLutEscParallelKernel(
+    const uint8_t* __restrict__ code_lengths_all,
+    uint32_t* __restrict__ luts,
+    uint32_t n_blocks)
+{
+    const uint32_t block_id = blockIdx.x;
+    if (block_id >= n_blocks) return;
+    const int lane = threadIdx.x & 31;
+
+    __shared__ uint8_t  cl[256];
+    __shared__ uint32_t codes[256];
+    __shared__ uint32_t bl_count[16];
+    __shared__ uint32_t next_code[16];
+
+    const uint8_t* CL = code_lengths_all + (size_t)block_id * 256;
+    uint32_t* lut = luts + (size_t)block_id * LUT_SIZE;
+    huffBuildSetup(CL, lut, lane, cl, codes, bl_count, next_code);
+
+    for (int s = lane; s < 256; s += 32) {              // pass 1 — over symbols
+        int L = cl[s];
+        if (L == 0 || L > MAX_CODE_LEN) continue;
+        uint32_t aligned = codes[s] << (MAX_CODE_LEN - L);
+        uint32_t span = 1u << (MAX_CODE_LEN - L);
+        uint32_t entry = huffPack(1, (uint32_t)L, 0, (uint32_t)s);
+        for (uint32_t i = 0; i < span; i++) lut[aligned + i] = entry;
+    }
+    __syncwarp();
+    for (int s1 = lane; s1 < 256; s1 += 32) {           // pass 2 — over s1
+        int L1 = cl[s1];
+        if (L1 == 0 || L1 >= MAX_CODE_LEN) continue;
+        uint32_t C1 = codes[s1];
+        for (int s2 = 0; s2 < 256; s2++) {
+            int L2 = cl[s2];
+            if (L2 == 0) continue;
+            int total = L1 + L2;
+            if (total > MAX_CODE_LEN) continue;
+            uint32_t C2 = codes[s2];
+            uint32_t aligned = (C1 << (MAX_CODE_LEN - L1))
+                             | (C2 << (MAX_CODE_LEN - L1 - L2));
+            uint32_t span = 1u << (MAX_CODE_LEN - total);
+            uint32_t entry = huffPack(2, (uint32_t)total, (uint32_t)s2, (uint32_t)s1);
+            for (uint32_t i = 0; i < span; i++) lut[aligned + i] = entry;
+        }
+    }
+    __syncwarp();
+    huffBuildEscapePass(cl, codes, lut, lane);
+}

@@ -1764,6 +1764,112 @@ static void bench_gpu_decode_realfile_cpasync_esc_cb(const uint8_t *file, size_t
     free(comp_buf); free(lut_buf); free(gpu_out);
 }
 
+// ── LUT-build bench: serial (lane-0) vs parallel (32-lane) ─────────────
+// The production split timer showed the per-block decode LUT *build* is
+// ~68% of the Huffman pass (lane-0-serial pass1+pass2). This A/Bs the
+// serial build kernel against the 32-lane parallel build, and verifies
+// both produce a bit-identical LUT vs the CPU `build_decode_lut_esc`.
+static void bench_lut_build(const uint8_t *file, size_t file_size) {
+    const size_t BLK = 65536;
+    int n_blocks = (int)(file_size / BLK);
+    if (n_blocks < 1) { printf("[lut-build] input < block size — skipping\n"); return; }
+
+    uint8_t  *cl_all  = (uint8_t*)malloc((size_t)n_blocks * 256);
+    uint32_t *lut_ref = (uint32_t*)malloc((size_t)n_blocks * LUT_SIZE * sizeof(uint32_t));
+
+    uint8_t  code_lengths[256];
+    uint32_t codes[256];
+    for (int b = 0; b < n_blocks; b++) {
+        const uint8_t *src = file + (size_t)b * BLK;
+        uint32_t hist[256] = {0};
+        for (size_t i = 0; i < BLK; i++) hist[src[i]]++;
+
+        memset(code_lengths, 0, sizeof(code_lengths));
+        int max_len = build_code_lengths(hist, code_lengths);
+        if (max_len > MAX_CODE_LEN + 1) height_limit(hist, code_lengths, MAX_CODE_LEN + 1);
+        memset(codes, 0, sizeof(codes));
+        assign_canonical_codes(code_lengths, codes);
+        build_decode_lut_esc(code_lengths, codes, lut_ref + (size_t)b * LUT_SIZE);
+        memcpy(cl_all + (size_t)b * 256, code_lengths, 256);
+    }
+
+    uint8_t  *d_cl;
+    uint32_t *d_lut_s, *d_lut_p;
+    CK(cudaMalloc(&d_cl,    (size_t)n_blocks * 256));
+    CK(cudaMalloc(&d_lut_s, (size_t)n_blocks * LUT_SIZE * sizeof(uint32_t)));
+    CK(cudaMalloc(&d_lut_p, (size_t)n_blocks * LUT_SIZE * sizeof(uint32_t)));
+    CK(cudaMemcpy(d_cl, cl_all, (size_t)n_blocks * 256, cudaMemcpyHostToDevice));
+
+    // Warmup both.
+    huffBuildLutEscSerialKernel<<<n_blocks, 32>>>(d_cl, d_lut_s, n_blocks);
+    huffBuildLutEscParallelKernel<<<n_blocks, 32>>>(d_cl, d_lut_p, n_blocks);
+    CK(cudaDeviceSynchronize());
+
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    const int N_RUNS = 50;
+
+    float best_s = 1e9f;
+    for (int r = 0; r < N_RUNS; r++) {
+        cudaEventRecord(e0);
+        huffBuildLutEscSerialKernel<<<n_blocks, 32>>>(d_cl, d_lut_s, n_blocks);
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+        if (ms < best_s) best_s = ms;
+    }
+    float best_p = 1e9f;
+    for (int r = 0; r < N_RUNS; r++) {
+        cudaEventRecord(e0);
+        huffBuildLutEscParallelKernel<<<n_blocks, 32>>>(d_cl, d_lut_p, n_blocks);
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+        if (ms < best_p) best_p = ms;
+    }
+
+    // Verify both LUTs bit-identical to the CPU reference.
+    size_t lut_bytes = (size_t)n_blocks * LUT_SIZE * sizeof(uint32_t);
+    uint32_t *h_lut_s = (uint32_t*)malloc(lut_bytes);
+    uint32_t *h_lut_p = (uint32_t*)malloc(lut_bytes);
+    CK(cudaMemcpy(h_lut_s, d_lut_s, lut_bytes, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h_lut_p, d_lut_p, lut_bytes, cudaMemcpyDeviceToHost));
+    int fail_s = memcmp(h_lut_s, lut_ref, lut_bytes) != 0;
+    int fail_p = memcmp(h_lut_p, lut_ref, lut_bytes) != 0;
+    if (fail_s || fail_p) {
+        for (int b = 0; b < n_blocks; b++) {
+            for (int i = 0; i < LUT_SIZE; i++) {
+                size_t k = (size_t)b * LUT_SIZE + i;
+                if (fail_s && h_lut_s[k] != lut_ref[k]) {
+                    printf("  [lut-build] serial   blk %d idx %d: gpu %08x ref %08x\n",
+                           b, i, h_lut_s[k], lut_ref[k]); fail_s = 2; break;
+                }
+            }
+            if (fail_s == 2) break;
+        }
+        for (int b = 0; b < n_blocks; b++) {
+            for (int i = 0; i < LUT_SIZE; i++) {
+                size_t k = (size_t)b * LUT_SIZE + i;
+                if (fail_p && h_lut_p[k] != lut_ref[k]) {
+                    printf("  [lut-build] parallel blk %d idx %d: gpu %08x ref %08x\n",
+                           b, i, h_lut_p[k], lut_ref[k]); fail_p = 2; break;
+                }
+            }
+            if (fail_p == 2) break;
+        }
+    }
+
+    printf("\n--- LUT-build bench (%d blocks, 64 KB each) ---\n", n_blocks);
+    printf("[lut-build] serial   (lane-0): best %.3f ms%s\n",
+           best_s, fail_s ? "  [VERIFY FAIL]" : "  [verified]");
+    printf("[lut-build] parallel (32-lane): best %.3f ms%s  (%.2fx)\n",
+           best_p, fail_p ? "  [VERIFY FAIL]" : "  [verified]",
+           best_s / best_p);
+
+    cudaFree(d_cl); cudaFree(d_lut_s); cudaFree(d_lut_p);
+    free(cl_all); free(lut_ref); free(h_lut_s); free(h_lut_p);
+}
+
 int main(int argc, char **argv) {
     int fails = 0;
 
@@ -1834,6 +1940,7 @@ int main(int argc, char **argv) {
                 bench_gpu_decode_realfile_wstore_aligned_esc(full, (size_t)sz);
                 bench_gpu_decode_realfile_cpasync_esc(full, (size_t)sz);
                 bench_gpu_decode_realfile_cpasync_esc_cb(full, (size_t)sz);
+                bench_lut_build(full, (size_t)sz);
                 bench_gpu_decode_realfile_wstore_aligned_esc_queue(full, (size_t)sz);
                 bench_gpu_decode_realfile_wstore64(full, (size_t)sz);
                 bench_gpu_decode_realfile_lut16(full, (size_t)sz);
