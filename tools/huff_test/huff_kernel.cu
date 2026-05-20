@@ -22,6 +22,11 @@ static constexpr int MAX_CODE_LEN = 11;
 static constexpr int LUT_SIZE     = 1 << MAX_CODE_LEN;  // 2048
 static constexpr int LUT_BYTES    = LUT_SIZE * sizeof(uint32_t);  // 4096
 
+// Word-interleaved 4-stream format header: 4 × u24 LE per-stream byte
+// sizes (the 4th can't be derived — the interleaved payload is padded to
+// the longest stream, so total bytes != sum of stream sizes).
+static constexpr int HUFF_4SI_HDR_BYTES = 12;
+
 struct HuffBlockDesc {
     uint32_t in_offset;     // byte offset in compressed buffer (points at 9-byte header)
     uint32_t in_size;       // total compressed bytes including header
@@ -556,4 +561,124 @@ extern "C" __global__ void huffDecode4Stream2LaneKernel(
                                                   my_out, my_out_size);
         (void)written;
     }
+}
+
+// ── Interleaved-stream decode core ────────────────────────────────────
+// Decodes one stream of a word-interleaved 4-stream block. The stream's
+// 32-bit words are not contiguous: word w lives at stream_base + w*16
+// (the 4 streams' word-w slots sit adjacent so the 4 decode lanes' refill
+// loads coalesce into one 32-byte sector instead of 4 scattered ones).
+// `in_size` is this stream's byte length (its last word may hold trailing
+// zero padding, harmless — output is bounded by out_size).
+__device__ __forceinline__ uint32_t decode_stream_interleaved(
+    const uint8_t* __restrict__ stream_base, uint32_t in_size,
+    const uint32_t* __restrict__ lut,
+    uint8_t* __restrict__ out, uint32_t out_size)
+{
+    uint64_t bit_buf = 0;
+    int bit_count = 0;
+    uint32_t word_idx = 0;
+    const uint32_t n_words = (in_size + 3) / 4;
+    uint32_t out_pos = 0;
+
+    // Hot loop: unrolled 2× — one strided word refill guards two decodes.
+    while (out_pos + 4 <= out_size) {
+        if (bit_count < 2 * MAX_CODE_LEN) {
+            if (word_idx >= n_words) break;
+            const uint8_t* p = stream_base + (size_t)word_idx * 16;
+            uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+                       | ((uint32_t)p[2] <<  8) | ((uint32_t)p[3]);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            word_idx++;
+        }
+        uint32_t e0 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len0 = (e0 >> 16) & 0xFF;
+        int ns0  = (e0 >> 24) & 0xFF;
+        if (len0 == 0) return 0;
+        out[out_pos]     = (uint8_t)(e0 & 0xFF);
+        out[out_pos + 1] = (uint8_t)((e0 >> 8) & 0xFF);
+        out_pos += ns0;
+        bit_buf <<= len0;
+        bit_count -= len0;
+        uint32_t e1 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len1 = (e1 >> 16) & 0xFF;
+        int ns1  = (e1 >> 24) & 0xFF;
+        if (len1 == 0) return 0;
+        out[out_pos]     = (uint8_t)(e1 & 0xFF);
+        out[out_pos + 1] = (uint8_t)((e1 >> 8) & 0xFF);
+        out_pos += ns1;
+        bit_buf <<= len1;
+        bit_count -= len1;
+    }
+
+    // Tail: 1 decode per iter, word-at-a-time refill, end-of-stream pad.
+    while (out_pos < out_size) {
+        if (bit_count <= 32 && word_idx < n_words) {
+            const uint8_t* p = stream_base + (size_t)word_idx * 16;
+            uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+                       | ((uint32_t)p[2] <<  8) | ((uint32_t)p[3]);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            word_idx++;
+        }
+        if (bit_count < MAX_CODE_LEN) bit_count = MAX_CODE_LEN;
+        uint32_t e = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int total_len = (e >> 16) & 0xFF;
+        int num_syms  = (e >> 24) & 0xFF;
+        if (total_len == 0) return 0;
+        out[out_pos++] = (uint8_t)(e & 0xFF);
+        if (num_syms == 2 && out_pos < out_size) {
+            out[out_pos++] = (uint8_t)((e >> 8) & 0xFF);
+        }
+        bit_buf <<= total_len;
+        bit_count -= total_len;
+    }
+    return out_pos;
+}
+
+// ── Decoder kernel: word-interleaved 4-stream, 4 active lanes ─────────
+// Same 4-lane layout as huffDecode4StreamKernel, but the compressed
+// block is word-interleaved (see huff_encode_4s_interleaved). The 4
+// lanes' refill loads now hit adjacent addresses and coalesce, fixing
+// the uncoalesced-global-load stall the profiler flagged.
+// Header: 4 × u24 LE per-stream byte sizes.
+// Launch: <<<n_blocks, 32, LUT_BYTES>>>
+extern "C" __global__ void huffDecode4StreamInterleavedKernel(
+    const uint8_t* __restrict__ comp,
+    const HuffBlockDesc* __restrict__ descs,
+    const uint32_t* __restrict__ luts,
+    uint8_t* __restrict__ output,
+    uint32_t n_blocks)
+{
+    const uint32_t block_id = blockIdx.x;
+    if (block_id >= n_blocks) return;
+    const int lane = threadIdx.x & 31;
+    const HuffBlockDesc desc = descs[block_id];
+
+    extern __shared__ uint32_t shared_lut[];
+    const uint32_t* src_lut = luts + desc.lut_offset;
+    for (int i = lane; i < LUT_SIZE; i += 32) shared_lut[i] = src_lut[i];
+    __syncwarp();
+
+    if (lane >= 4) return;
+
+    // Header: 4 × u24 LE per-stream byte sizes.
+    const uint8_t* hdr = comp + desc.in_offset;
+    uint32_t my_in_size = (uint32_t)hdr[lane*3 + 0]
+                        | ((uint32_t)hdr[lane*3 + 1] << 8)
+                        | ((uint32_t)hdr[lane*3 + 2] << 16);
+
+    // This lane decodes stream `lane`. Its word 0 is at
+    // hdr + HUFF_4SI_HDR_BYTES + lane*4; successive words stride by 16.
+    const uint8_t* stream_base = hdr + HUFF_4SI_HDR_BYTES + lane * 4;
+
+    uint32_t q = desc.out_size / 4;
+    uint32_t my_out_start = (lane < 3) ? (lane * q) : (3 * q);
+    uint32_t my_out_size  = (lane < 3) ? q : (desc.out_size - 3 * q);
+    uint8_t* my_out = output + desc.out_offset + my_out_start;
+
+    uint32_t written = decode_stream_interleaved(stream_base, my_in_size,
+                                                 shared_lut, my_out, my_out_size);
+    (void)written;
 }

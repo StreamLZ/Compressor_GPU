@@ -372,6 +372,111 @@ static int huff_encode_4s(const uint8_t *in, size_t n,
     return (int)written;
 }
 
+// ─── Word-interleaved 4-stream split ───────────────────────────────────
+// Same 4-quarter split + per-stream Huffman encode as huff_encode_4s, but
+// the 4 encoded streams are stored INTERLEAVED at 32-bit-word granularity:
+//   [hdr][s0.w0][s1.w0][s2.w0][s3.w0][s0.w1][s1.w1]...
+// so the 4 GPU decode lanes' word-w refill loads hit adjacent addresses
+// and coalesce into one memory sector (vs 4 scattered sectors for the
+// contiguous layout). The payload is padded to the longest stream, so a
+// 12-byte header carries all 4 per-stream byte sizes explicitly (the 4th
+// is no longer derivable from the total).
+#ifndef HUFF_4SI_HDR_BYTES
+#define HUFF_4SI_HDR_BYTES 12
+#endif
+
+static int huff_encode_4s_interleaved(const uint8_t *in, size_t n,
+                                      const uint8_t code_lengths[256],
+                                      const uint32_t codes[256],
+                                      uint8_t *out, size_t out_cap) {
+    if (out_cap < HUFF_4SI_HDR_BYTES) return -1;
+    size_t q = n / 4;
+    size_t boundaries[5] = { 0, q, 2*q, 3*q, n };
+
+    uint8_t  *tmp[4]   = {0};
+    uint32_t  sizes[4] = {0};
+    uint32_t  words[4] = {0};
+    uint32_t  max_words = 0;
+    int rc = -1;
+
+    for (int s = 0; s < 4; s++) {
+        size_t stream_n = boundaries[s+1] - boundaries[s];
+        size_t cap = stream_n * 2 + 64;
+        tmp[s] = (uint8_t*)malloc(cap + 4);   // +4 so word padding never overruns
+        if (!tmp[s]) goto done;
+        int sz = huff_encode(in + boundaries[s], stream_n,
+                             code_lengths, codes, tmp[s], cap);
+        if (sz < 0 || sz >= (1 << 24)) goto done;
+        sizes[s] = (uint32_t)sz;
+        words[s] = ((uint32_t)sz + 3) / 4;
+        // Zero the padding bytes of the final partial word.
+        for (uint32_t p = (uint32_t)sz; p < words[s] * 4; p++) tmp[s][p] = 0;
+        if (words[s] > max_words) max_words = words[s];
+    }
+
+    {
+        size_t total = HUFF_4SI_HDR_BYTES + (size_t)max_words * 16;
+        if (out_cap < total) goto done;
+
+        // Header: 4 × u24 LE per-stream byte sizes.
+        for (int s = 0; s < 4; s++) {
+            out[s*3 + 0] = (uint8_t)(sizes[s] & 0xFF);
+            out[s*3 + 1] = (uint8_t)((sizes[s] >> 8) & 0xFF);
+            out[s*3 + 2] = (uint8_t)((sizes[s] >> 16) & 0xFF);
+        }
+        // Interleave: word w of all 4 streams, then word w+1, ...
+        uint8_t *dst = out + HUFF_4SI_HDR_BYTES;
+        for (uint32_t w = 0; w < max_words; w++) {
+            for (int s = 0; s < 4; s++) {
+                if (w < words[s]) {
+                    memcpy(dst, tmp[s] + (size_t)w * 4, 4);
+                } else {
+                    dst[0] = dst[1] = dst[2] = dst[3] = 0;  // exhausted stream
+                }
+                dst += 4;
+            }
+        }
+        rc = (int)total;
+    }
+
+done:
+    for (int s = 0; s < 4; s++) free(tmp[s]);
+    return rc;
+}
+
+static int huff_decode_4s_interleaved(const uint8_t *in, size_t in_bytes,
+                                      const uint32_t lut[LUT_SIZE],
+                                      uint8_t *out, size_t expected_out_bytes) {
+    if (in_bytes < HUFF_4SI_HDR_BYTES) return -1;
+    uint32_t sizes[4];
+    for (int s = 0; s < 4; s++) {
+        sizes[s] = (uint32_t)in[s*3 + 0]
+                 | ((uint32_t)in[s*3 + 1] << 8)
+                 | ((uint32_t)in[s*3 + 2] << 16);
+    }
+    size_t q = expected_out_bytes / 4;
+    size_t boundaries[5] = { 0, q, 2*q, 3*q, expected_out_bytes };
+
+    // De-interleave each stream into a contiguous temp, then decode.
+    const uint8_t *payload = in + HUFF_4SI_HDR_BYTES;
+    size_t payload_bytes = in_bytes - HUFF_4SI_HDR_BYTES;
+    uint32_t max_words = (uint32_t)(payload_bytes / 16);
+    for (int s = 0; s < 4; s++) {
+        uint32_t nw = (sizes[s] + 3) / 4;
+        if (nw > max_words) return -1;
+        uint8_t *tmp = (uint8_t*)malloc((size_t)nw * 4 + 4);
+        if (!tmp) return -1;
+        for (uint32_t w = 0; w < nw; w++) {
+            memcpy(tmp + (size_t)w * 4, payload + ((size_t)w * 4 + s) * 4, 4);
+        }
+        size_t stream_out = boundaries[s+1] - boundaries[s];
+        int dec = huff_decode(tmp, sizes[s], lut, out + boundaries[s], stream_out);
+        free(tmp);
+        if (dec != (int)stream_out) return -1;
+    }
+    return (int)expected_out_bytes;
+}
+
 static int huff_decode_4s(const uint8_t *in, size_t in_bytes,
                           const uint32_t lut[LUT_SIZE],
                           uint8_t *out, size_t expected_out_bytes) {
