@@ -1859,3 +1859,186 @@ confirm bound type before picking the fix — and a profiler metric being
 "bad" does not make it the critical path. The interleaved code is kept
 in `tools/huff_test/` as a documented dead end; the contiguous 4-stream
 kernel remains the baseline.
+
+## Software prefetch in the GPU Huffman decode loop (2026-05-19)
+
+**Context**: Follow-up to the interleaving dead end above. The Huffman
+4-lane decoder is latency-bound (NCU: 43.5% Long Scoreboard on the 32-bit
+refill load). The latency-appropriate fix is software prefetch: issue the
+next refill load one refill *ahead* of when it's consumed, so its
+~200-cycle global-load latency overlaps the LUT-decode work.
+
+**Experiment**: New decode core `decode_stream_prefetch` — a depth-1
+prefetch variant of `decode_stream_one_lane`. A `nextw` register always
+holds the next refill word, already loaded. When a refill is needed the
+core consumes `nextw`, then immediately issues the load for the word
+after it; the two LUT decodes that follow are independent of `nextw`, so
+the load runs in their shadow. New kernel
+`huffDecode4StreamPrefetchKernel` (same contiguous format as the
+baseline). Drain+rewind hands any unconsumed prefetched word back to
+`in_pos` before the byte-exact tail loop.
+
+**Results** (realistic per-block-LUT bench, distinct 64 KB blocks, enwik8):
+
+| Variant            | GB/s (run 1) | GB/s (run 2) |
+|--------------------|--------------|--------------|
+| Contiguous 4-stream| 19.2         | 19.3         |
+| Software prefetch  | 19.4         | 19.3         |
+
+Byte-exact, but no speed change — identical within run-to-run noise.
+
+**Why prefetch doesn't help**: depth-1 prefetch overlaps one ~200-cycle
+load against only ~2 LUT decodes (~40 cycles of independent work) — far
+too little to cover it. The per-warp `bit_buf` dependency chain is
+strictly serial (each decode needs the previous decode's shifted buffer),
+so there is no deeper independent work to hide the load behind within a
+lane. The GPU's real latency-hiding mechanism here is **warp-level
+parallelism**: the same bench with smaller blocks — 16 KB → 6103 warps →
+21.5 GB/s, 8 KB → 12207 warps → 22.6 GB/s — is faster purely because more
+resident warps cover each other's stalls. 64 KB blocks only field 1525
+warps.
+
+**Lesson**: Software prefetch only pays off when there is enough
+*independent* work per stall to fill the latency window; a serial
+bit-buffer dependency chain has none. For this kernel the lever is warp
+count (more, smaller independent units), not intra-lane scheduling. The
+prefetch code is kept in `tools/huff_test/` as a documented dead end; the
+contiguous 4-stream kernel remains the baseline.
+
+## u16 single-symbol Huffman LUT — halve shared mem for occupancy (2026-05-19)
+
+**Context**: NCU profiled `huffDecode4StreamKernel` with theoretical
+occupancy capped at **22.9%, explicitly limited by shared memory** — each
+warp holds an 8 KB Huffman LUT (2048 entries × u32), so an SM fits only
+11 resident warps of its 48-warp maximum. The hypothesis: halve the LUT
+to 4 KB → ~2× resident warps → more latency hiding → faster.
+
+**Experiment**: `build_decode_lut16` (u16 entries: symbol:8, length:4),
+`decode_stream_one_lane_lut16`, and `huffDecode4StreamLut16Kernel`. The
+u16 width cannot hold two symbols (2 × 8 bits leaves no room for length),
+so this **drops the dual-symbol fast path** — every LUT lookup yields
+exactly one symbol instead of up to two.
+
+**Results** (realistic per-block-LUT bench, distinct 64 KB blocks, enwik8):
+
+| Variant            | GB/s (run 1) | GB/s (run 2) |
+|--------------------|--------------|--------------|
+| u32 LUT (8 KB)     | 19.2         | 19.3         |
+| u16 LUT (4 KB)     | 15.8         | 15.8         |
+
+Byte-exact, but **~18% slower** — the opposite of the prediction.
+
+**Why halving the LUT lost**: two compounding reasons.
+1. Dropping dual-symbol decode raises decode work ~1.5× — the u32 LUT
+   emits ~1.5 symbols per lookup on text; single-symbol emits 1, so ~50%
+   more lookups, loop iterations, refill checks, and bit-buffer shifts.
+2. The doubled occupancy bought nothing. The kernel's SOL ceiling is the
+   **L2 cache at 81.6%** — adding resident warps just makes more warps
+   queue against an already-near-saturated L2; they cannot decode faster.
+
+So the u16 kernel paid the full 1.5× compute penalty and collected none
+of the occupancy dividend.
+
+**Lesson**: This is a clean controlled test of the occupancy hypothesis —
+and it falsifies it. A profiler reporting "occupancy limited by shared
+memory (22.9%)" flags an *opportunity*, not the *bottleneck*. 11 warps/SM
+is already enough to hide most latency here; the hard wall is L2
+throughput, and warp count cannot beat a saturated memory pipe. The
+dual-symbol fast path, by contrast, is genuinely load-bearing — it is a
+real ~1.5× throughput multiplier and must not be traded away. The u16
+code is kept in `tools/huff_test/` as a documented dead end; the u32
+dual-symbol 4-stream kernel remains the baseline. The remaining real
+levers are reducing L2 traffic and the ~20% tail effect (more blocks).
+
+## 64-bit output stores in the GPU Huffman decoder (2026-05-19)
+
+**Context**: Reducing L2 traffic was the live lever after NCU put the
+SOL ceiling at L2 (81.6%). The first attempt — accumulating decoded
+bytes and flushing them as **32-bit** stores instead of single-byte
+stores (`decode_stream_one_lane_wstore`) — **worked**: 19.3 → 20.6 GB/s
+(+7%), byte-exact. The decode loop appends each LUT entry's 1-2 output
+bytes as a 16-bit chunk into a u64 and flushes a 4-byte store when ≥ 4
+bytes are pending. This experiment tried to extend that to 8-byte stores.
+
+**Experiment**: `decode_stream_one_lane_wstore64` + `wflush8` helper +
+`huffDecode4StreamWStore64Kernel`. A u64 accumulator can hold only 8
+bytes, and a 16-bit chunked append at pending == 7 would overshoot, so
+the 64-bit variant must append **one byte at a time**, flushing an 8-byte
+store the moment 8 bytes are pending.
+
+**Results** (realistic per-block-LUT bench, distinct 64 KB blocks, enwik8):
+
+| Variant                | GB/s (run 1) | GB/s (run 2) |
+|------------------------|--------------|--------------|
+| Baseline (byte stores) | 19.2         | 19.2         |
+| 32-bit stores (wstore) | 20.6         | 20.6         |
+| 64-bit stores (wstore64)| 16.0        | 16.0         |
+
+Byte-exact, but **~22% slower than wstore32** and slower than baseline.
+
+**Why 64-bit lost**: store *sector* traffic to L2/DRAM is identical for
+32- and 64-bit stores — 100 MB of output is the same number of 32-byte
+sectors regardless of store width. The only thing a wider store buys is
+fewer store *instructions* (2048/lane vs 4096/lane) — a small saving.
+But getting there cost a lot: the u64 accumulator can't absorb a 16-bit
+chunked append safely, forcing **byte-at-a-time** appends with a flush
+branch per byte, plus an `if (ns==2)` branch per decode. That roughly
+tripled the accumulator bookkeeping in the hot loop. For a kernel issuing
+at ~1.19 IPC, hot-loop instruction count matters, and the bloat swamped
+the store-instruction saving.
+
+**Lesson**: wstore32 is the sweet spot — a 16-bit chunked append packs
+both bytes of a dual-symbol decode in one op with one flush check, and a
+4-byte store already fits inside a 32-byte sector. Going wider doesn't
+cut sector traffic (the real L2 cost) and only pays in store-instruction
+count, which was already cheap; the byte-at-a-time append needed to feed
+a u64 cleanly costs more than it saves. The wstore64 code is kept in
+`tools/huff_test/` as a documented dead end; **`huffDecode4StreamWStore`
+(32-bit, 20.6 GB/s) is the new fastest 64 KB-block decoder**.
+
+## Persistent atomic-work-queue GPU Huffman decoder (2026-05-19)
+
+**Context**: NCU's launch-statistics rule flagged a ~20% tail effect on
+the 64KB-block decoder (1525 blocks ≈ 2.2 waves on a 34-SM GPU → a
+partial final wave). The hypothesis: replace one-CUDA-block-per-Huffman-
+block with a **persistent kernel** — grid = exactly one wave of CUDA
+blocks (34 SM × 20 = 680), each a worker that `atomicAdd`s a global
+counter to grab the next Huffman block until the queue drains. This
+should remove the partial wave and load-balance non-uniform per-block
+decode durations.
+
+**Experiment**: `huffDecode4StreamWStoreAlignedEscQueueKernel` — the
+escape decoder wrapped in a `for(;;)` loop: lane 0 does
+`atomicAdd(g_counter,1)`, `__shfl_sync` broadcasts the index, decode,
+repeat. Counter zeroed before each timed launch.
+
+**Results** (realistic per-block-LUT bench, distinct 64 KB blocks, enwik8):
+
+| Variant                    | GB/s (run 1) | GB/s (run 2) |
+|-----------------------------|--------------|--------------|
+| wse (1 block per Huff block)| 27.4         | 27.4         |
+| wseq (persistent queue)     | 9.3          | 9.3          |
+
+Byte-exact, but **~3× SLOWER** — a severe regression, not the hoped-for
++20%.
+
+**Why the queue lost badly**: the GPU's **hardware block scheduler is
+already a work queue** — and a much better one. With 1525 independent
+CUDA blocks it launches them *staggered* as SM slots free up, so the ~20
+blocks resident on an SM are at diverse phases (some loading their LUT,
+some decoding, some refilling). That phase diversity pipelines the memory
+system and overlaps each block's startup LUT-load with others' decode.
+The persistent kernel throws all of that away: 680 workers launched
+simultaneously run in near-lockstep — synchronized bursts of 20 LUT
+loads, then 20 decode phases, then 20 refill bursts — destroying the
+memory pipelining. (Register pressure from carrying loop + `desc` state
+across iterations, possibly spilling, may compound it.)
+
+**Lesson**: NCU's "tail effect, up to 20%" is an *upper bound* computed
+from a pessimistic lockstep-wave model. Real hardware dynamic block
+scheduling already recovers almost all of it — there was no easy 20% to
+grab. Do not hand-roll a persistent work-queue to "fix" a tail the
+hardware scheduler already handles; the staggered-launch behaviour of
+many-small-independent-blocks is a feature, not a bug. The queue code is
+kept in `tools/huff_test/` as a documented dead end; one CUDA block per
+Huffman block remains the launch model.

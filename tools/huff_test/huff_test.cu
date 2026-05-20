@@ -947,6 +947,735 @@ static void bench_gpu_decode_realfile_interleaved(const uint8_t *file, size_t fi
     free(comp_buf); free(lut_buf); free(gpu_out);
 }
 
+// ── Realistic bench: software-prefetched 4-stream variant ──────────────
+// Identical contiguous format / setup as bench_gpu_decode_realfile, but
+// decodes with huffDecode4StreamPrefetchKernel — the decode core issues
+// each 32-bit refill load one refill ahead to hide global-load latency
+// (NCU flagged the kernel as latency-bound on the refill load).
+static void bench_gpu_decode_realfile_prefetch(const uint8_t *file, size_t file_size) {
+    const size_t BLK = 65536;
+    int n_blocks = (int)(file_size / BLK);
+    if (n_blocks < 1) { printf("[realfile-pf] input < block size — skipping\n"); return; }
+
+    uint32_t *lut_buf  = (uint32_t*)malloc((size_t)n_blocks * LUT_SIZE * sizeof(uint32_t));
+    uint8_t  *comp_buf = (uint8_t*)malloc(file_size * 2 + (size_t)64 * n_blocks);
+    std::vector<HuffBlockDesc> descs(n_blocks);
+
+    size_t comp_off = 0;
+    uint8_t  code_lengths[256];
+    uint32_t codes[256];
+    for (int b = 0; b < n_blocks; b++) {
+        const uint8_t *src = file + (size_t)b * BLK;
+        uint32_t hist[256] = {0};
+        for (size_t i = 0; i < BLK; i++) hist[src[i]]++;
+
+        memset(code_lengths, 0, sizeof(code_lengths));
+        int max_len = build_code_lengths(hist, code_lengths);
+        if (max_len > MAX_CODE_LEN) height_limit(hist, code_lengths, MAX_CODE_LEN);
+        memset(codes, 0, sizeof(codes));
+        assign_canonical_codes(code_lengths, codes);
+        build_decode_lut(code_lengths, codes, lut_buf + (size_t)b * LUT_SIZE);
+
+        int enc_bytes = huff_encode_4s(src, BLK, code_lengths, codes,
+                                       comp_buf + comp_off,
+                                       file_size * 2 + (size_t)64 * n_blocks - comp_off);
+        if (enc_bytes <= 0) { printf("[realfile-pf] block %d encode fail\n", b); return; }
+        descs[b].in_offset  = (uint32_t)comp_off;
+        descs[b].in_size    = (uint32_t)enc_bytes;
+        descs[b].out_offset = (uint32_t)((size_t)b * BLK);
+        descs[b].out_size   = (uint32_t)BLK;
+        descs[b].lut_offset = (uint32_t)((size_t)b * LUT_SIZE);
+        comp_off += enc_bytes;
+    }
+
+    size_t total_out = (size_t)n_blocks * BLK;
+    uint8_t *d_comp, *d_out;
+    uint32_t *d_lut;
+    HuffBlockDesc *d_descs;
+    CK(cudaMalloc(&d_comp, comp_off));
+    CK(cudaMalloc(&d_out, total_out));
+    CK(cudaMalloc(&d_lut, (size_t)n_blocks * LUT_BYTES));
+    CK(cudaMalloc(&d_descs, sizeof(HuffBlockDesc) * n_blocks));
+    CK(cudaMemcpy(d_comp, comp_buf, comp_off, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_lut, lut_buf, (size_t)n_blocks * LUT_BYTES, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_descs, descs.data(), sizeof(HuffBlockDesc) * n_blocks, cudaMemcpyHostToDevice));
+
+    huffDecode4StreamPrefetchKernel<<<n_blocks, 32, LUT_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+    CK(cudaDeviceSynchronize());
+
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    const int N_RUNS = 50;
+    float best_ms = 1e9f;
+    for (int r = 0; r < N_RUNS; r++) {
+        cudaEventRecord(e0);
+        huffDecode4StreamPrefetchKernel<<<n_blocks, 32, LUT_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        if (ms < best_ms) best_ms = ms;
+    }
+
+    uint8_t *gpu_out = (uint8_t*)malloc(total_out);
+    CK(cudaMemcpy(gpu_out, d_out, total_out, cudaMemcpyDeviceToHost));
+    int verify_fail = 0;
+    for (int b = 0; b < n_blocks; b++) {
+        if (memcmp(file + (size_t)b * BLK, gpu_out + (size_t)b * BLK, BLK) != 0) {
+            if (verify_fail < 3) printf("  [realfile-pf] block %d mismatch\n", b);
+            verify_fail++;
+        }
+    }
+
+    double gb_per_s = (double)total_out / (best_ms * 1e6);
+    double ratio = 100.0 * (double)comp_off / (double)total_out;
+    printf("[realfile-pf] %d blocks x 64 KB (4-stream prefetch, per-block LUT), "
+           "enc %.1f%% -> best %.3f ms = %.1f GB/s%s\n",
+           n_blocks, ratio, best_ms, gb_per_s, verify_fail ? " [VERIFY FAIL]" : "");
+
+    cudaFree(d_comp); cudaFree(d_out); cudaFree(d_lut); cudaFree(d_descs);
+    free(comp_buf); free(lut_buf); free(gpu_out);
+}
+
+// ── Realistic bench: u16 single-symbol LUT variant ─────────────────────
+// Same contiguous format / setup as bench_gpu_decode_realfile, but the
+// per-block LUT is u16 (4 KB) instead of u32 (8 KB), decoded by
+// huffDecode4StreamLut16Kernel. Halving shared memory per warp roughly
+// doubles the SM's shared-mem-limited occupancy (NCU: 22.9% -> ~46%).
+static void bench_gpu_decode_realfile_lut16(const uint8_t *file, size_t file_size) {
+    const size_t BLK = 65536;
+    int n_blocks = (int)(file_size / BLK);
+    if (n_blocks < 1) { printf("[realfile-l16] input < block size — skipping\n"); return; }
+
+    uint16_t *lut_buf  = (uint16_t*)malloc((size_t)n_blocks * LUT_SIZE * sizeof(uint16_t));
+    uint8_t  *comp_buf = (uint8_t*)malloc(file_size * 2 + (size_t)64 * n_blocks);
+    std::vector<HuffBlockDesc> descs(n_blocks);
+
+    size_t comp_off = 0;
+    uint8_t  code_lengths[256];
+    uint32_t codes[256];
+    for (int b = 0; b < n_blocks; b++) {
+        const uint8_t *src = file + (size_t)b * BLK;
+        uint32_t hist[256] = {0};
+        for (size_t i = 0; i < BLK; i++) hist[src[i]]++;
+
+        memset(code_lengths, 0, sizeof(code_lengths));
+        int max_len = build_code_lengths(hist, code_lengths);
+        if (max_len > MAX_CODE_LEN) height_limit(hist, code_lengths, MAX_CODE_LEN);
+        memset(codes, 0, sizeof(codes));
+        assign_canonical_codes(code_lengths, codes);
+        build_decode_lut16(code_lengths, codes, lut_buf + (size_t)b * LUT_SIZE);
+
+        int enc_bytes = huff_encode_4s(src, BLK, code_lengths, codes,
+                                       comp_buf + comp_off,
+                                       file_size * 2 + (size_t)64 * n_blocks - comp_off);
+        if (enc_bytes <= 0) { printf("[realfile-l16] block %d encode fail\n", b); return; }
+        descs[b].in_offset  = (uint32_t)comp_off;
+        descs[b].in_size    = (uint32_t)enc_bytes;
+        descs[b].out_offset = (uint32_t)((size_t)b * BLK);
+        descs[b].out_size   = (uint32_t)BLK;
+        descs[b].lut_offset = (uint32_t)((size_t)b * LUT_SIZE);
+        comp_off += enc_bytes;
+    }
+
+    size_t total_out = (size_t)n_blocks * BLK;
+    uint8_t *d_comp, *d_out;
+    uint16_t *d_lut;
+    HuffBlockDesc *d_descs;
+    CK(cudaMalloc(&d_comp, comp_off));
+    CK(cudaMalloc(&d_out, total_out));
+    CK(cudaMalloc(&d_lut, (size_t)n_blocks * LUT16_BYTES));
+    CK(cudaMalloc(&d_descs, sizeof(HuffBlockDesc) * n_blocks));
+    CK(cudaMemcpy(d_comp, comp_buf, comp_off, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_lut, lut_buf, (size_t)n_blocks * LUT16_BYTES, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_descs, descs.data(), sizeof(HuffBlockDesc) * n_blocks, cudaMemcpyHostToDevice));
+
+    huffDecode4StreamLut16Kernel<<<n_blocks, 32, LUT16_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+    CK(cudaDeviceSynchronize());
+
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    const int N_RUNS = 50;
+    float best_ms = 1e9f;
+    for (int r = 0; r < N_RUNS; r++) {
+        cudaEventRecord(e0);
+        huffDecode4StreamLut16Kernel<<<n_blocks, 32, LUT16_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        if (ms < best_ms) best_ms = ms;
+    }
+
+    uint8_t *gpu_out = (uint8_t*)malloc(total_out);
+    CK(cudaMemcpy(gpu_out, d_out, total_out, cudaMemcpyDeviceToHost));
+    int verify_fail = 0;
+    for (int b = 0; b < n_blocks; b++) {
+        if (memcmp(file + (size_t)b * BLK, gpu_out + (size_t)b * BLK, BLK) != 0) {
+            if (verify_fail < 3) printf("  [realfile-l16] block %d mismatch\n", b);
+            verify_fail++;
+        }
+    }
+
+    double gb_per_s = (double)total_out / (best_ms * 1e6);
+    double ratio = 100.0 * (double)comp_off / (double)total_out;
+    printf("[realfile-l16] %d blocks x 64 KB (4-stream u16 LUT, per-block LUT), "
+           "enc %.1f%% -> best %.3f ms = %.1f GB/s%s\n",
+           n_blocks, ratio, best_ms, gb_per_s, verify_fail ? " [VERIFY FAIL]" : "");
+
+    cudaFree(d_comp); cudaFree(d_out); cudaFree(d_lut); cudaFree(d_descs);
+    free(comp_buf); free(lut_buf); free(gpu_out);
+}
+
+// ── Realistic bench: wide-output-store variant ─────────────────────────
+// Same contiguous format / u32 LUT / setup as bench_gpu_decode_realfile,
+// but decoded by huffDecode4StreamWStoreKernel — the decode core flushes
+// output as 32-bit stores instead of single bytes, cutting store
+// transactions and L2 store traffic ~4×.
+static void bench_gpu_decode_realfile_wstore(const uint8_t *file, size_t file_size) {
+    const size_t BLK = 65536;
+    int n_blocks = (int)(file_size / BLK);
+    if (n_blocks < 1) { printf("[realfile-ws] input < block size — skipping\n"); return; }
+
+    uint32_t *lut_buf  = (uint32_t*)malloc((size_t)n_blocks * LUT_SIZE * sizeof(uint32_t));
+    uint8_t  *comp_buf = (uint8_t*)malloc(file_size * 2 + (size_t)64 * n_blocks);
+    std::vector<HuffBlockDesc> descs(n_blocks);
+
+    size_t comp_off = 0;
+    uint8_t  code_lengths[256];
+    uint32_t codes[256];
+    for (int b = 0; b < n_blocks; b++) {
+        const uint8_t *src = file + (size_t)b * BLK;
+        uint32_t hist[256] = {0};
+        for (size_t i = 0; i < BLK; i++) hist[src[i]]++;
+
+        memset(code_lengths, 0, sizeof(code_lengths));
+        int max_len = build_code_lengths(hist, code_lengths);
+        if (max_len > MAX_CODE_LEN) height_limit(hist, code_lengths, MAX_CODE_LEN);
+        memset(codes, 0, sizeof(codes));
+        assign_canonical_codes(code_lengths, codes);
+        build_decode_lut(code_lengths, codes, lut_buf + (size_t)b * LUT_SIZE);
+
+        int enc_bytes = huff_encode_4s(src, BLK, code_lengths, codes,
+                                       comp_buf + comp_off,
+                                       file_size * 2 + (size_t)64 * n_blocks - comp_off);
+        if (enc_bytes <= 0) { printf("[realfile-ws] block %d encode fail\n", b); return; }
+        descs[b].in_offset  = (uint32_t)comp_off;
+        descs[b].in_size    = (uint32_t)enc_bytes;
+        descs[b].out_offset = (uint32_t)((size_t)b * BLK);
+        descs[b].out_size   = (uint32_t)BLK;
+        descs[b].lut_offset = (uint32_t)((size_t)b * LUT_SIZE);
+        comp_off += enc_bytes;
+    }
+
+    size_t total_out = (size_t)n_blocks * BLK;
+    uint8_t *d_comp, *d_out;
+    uint32_t *d_lut;
+    HuffBlockDesc *d_descs;
+    CK(cudaMalloc(&d_comp, comp_off));
+    CK(cudaMalloc(&d_out, total_out));
+    CK(cudaMalloc(&d_lut, (size_t)n_blocks * LUT_BYTES));
+    CK(cudaMalloc(&d_descs, sizeof(HuffBlockDesc) * n_blocks));
+    CK(cudaMemcpy(d_comp, comp_buf, comp_off, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_lut, lut_buf, (size_t)n_blocks * LUT_BYTES, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_descs, descs.data(), sizeof(HuffBlockDesc) * n_blocks, cudaMemcpyHostToDevice));
+
+    huffDecode4StreamWStoreKernel<<<n_blocks, 32, LUT_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+    CK(cudaDeviceSynchronize());
+
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    const int N_RUNS = 50;
+    float best_ms = 1e9f;
+    for (int r = 0; r < N_RUNS; r++) {
+        cudaEventRecord(e0);
+        huffDecode4StreamWStoreKernel<<<n_blocks, 32, LUT_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        if (ms < best_ms) best_ms = ms;
+    }
+
+    uint8_t *gpu_out = (uint8_t*)malloc(total_out);
+    CK(cudaMemcpy(gpu_out, d_out, total_out, cudaMemcpyDeviceToHost));
+    int verify_fail = 0;
+    for (int b = 0; b < n_blocks; b++) {
+        if (memcmp(file + (size_t)b * BLK, gpu_out + (size_t)b * BLK, BLK) != 0) {
+            if (verify_fail < 3) printf("  [realfile-ws] block %d mismatch\n", b);
+            verify_fail++;
+        }
+    }
+
+    double gb_per_s = (double)total_out / (best_ms * 1e6);
+    double ratio = 100.0 * (double)comp_off / (double)total_out;
+    printf("[realfile-ws] %d blocks x 64 KB (4-stream 32-bit stores, per-block LUT), "
+           "enc %.1f%% -> best %.3f ms = %.1f GB/s%s\n",
+           n_blocks, ratio, best_ms, gb_per_s, verify_fail ? " [VERIFY FAIL]" : "");
+
+    cudaFree(d_comp); cudaFree(d_out); cudaFree(d_lut); cudaFree(d_descs);
+    free(comp_buf); free(lut_buf); free(gpu_out);
+}
+
+// ── Realistic bench: 64-bit wide-output-store variant ──────────────────
+// Same setup as bench_gpu_decode_realfile_wstore, but decoded by
+// huffDecode4StreamWStore64Kernel — 8-byte output stores.
+static void bench_gpu_decode_realfile_wstore64(const uint8_t *file, size_t file_size) {
+    const size_t BLK = 65536;
+    int n_blocks = (int)(file_size / BLK);
+    if (n_blocks < 1) { printf("[realfile-w64] input < block size — skipping\n"); return; }
+
+    uint32_t *lut_buf  = (uint32_t*)malloc((size_t)n_blocks * LUT_SIZE * sizeof(uint32_t));
+    uint8_t  *comp_buf = (uint8_t*)malloc(file_size * 2 + (size_t)64 * n_blocks);
+    std::vector<HuffBlockDesc> descs(n_blocks);
+
+    size_t comp_off = 0;
+    uint8_t  code_lengths[256];
+    uint32_t codes[256];
+    for (int b = 0; b < n_blocks; b++) {
+        const uint8_t *src = file + (size_t)b * BLK;
+        uint32_t hist[256] = {0};
+        for (size_t i = 0; i < BLK; i++) hist[src[i]]++;
+
+        memset(code_lengths, 0, sizeof(code_lengths));
+        int max_len = build_code_lengths(hist, code_lengths);
+        if (max_len > MAX_CODE_LEN) height_limit(hist, code_lengths, MAX_CODE_LEN);
+        memset(codes, 0, sizeof(codes));
+        assign_canonical_codes(code_lengths, codes);
+        build_decode_lut(code_lengths, codes, lut_buf + (size_t)b * LUT_SIZE);
+
+        int enc_bytes = huff_encode_4s(src, BLK, code_lengths, codes,
+                                       comp_buf + comp_off,
+                                       file_size * 2 + (size_t)64 * n_blocks - comp_off);
+        if (enc_bytes <= 0) { printf("[realfile-w64] block %d encode fail\n", b); return; }
+        descs[b].in_offset  = (uint32_t)comp_off;
+        descs[b].in_size    = (uint32_t)enc_bytes;
+        descs[b].out_offset = (uint32_t)((size_t)b * BLK);
+        descs[b].out_size   = (uint32_t)BLK;
+        descs[b].lut_offset = (uint32_t)((size_t)b * LUT_SIZE);
+        comp_off += enc_bytes;
+    }
+
+    size_t total_out = (size_t)n_blocks * BLK;
+    uint8_t *d_comp, *d_out;
+    uint32_t *d_lut;
+    HuffBlockDesc *d_descs;
+    CK(cudaMalloc(&d_comp, comp_off));
+    CK(cudaMalloc(&d_out, total_out));
+    CK(cudaMalloc(&d_lut, (size_t)n_blocks * LUT_BYTES));
+    CK(cudaMalloc(&d_descs, sizeof(HuffBlockDesc) * n_blocks));
+    CK(cudaMemcpy(d_comp, comp_buf, comp_off, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_lut, lut_buf, (size_t)n_blocks * LUT_BYTES, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_descs, descs.data(), sizeof(HuffBlockDesc) * n_blocks, cudaMemcpyHostToDevice));
+
+    huffDecode4StreamWStore64Kernel<<<n_blocks, 32, LUT_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+    CK(cudaDeviceSynchronize());
+
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    const int N_RUNS = 50;
+    float best_ms = 1e9f;
+    for (int r = 0; r < N_RUNS; r++) {
+        cudaEventRecord(e0);
+        huffDecode4StreamWStore64Kernel<<<n_blocks, 32, LUT_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        if (ms < best_ms) best_ms = ms;
+    }
+
+    uint8_t *gpu_out = (uint8_t*)malloc(total_out);
+    CK(cudaMemcpy(gpu_out, d_out, total_out, cudaMemcpyDeviceToHost));
+    int verify_fail = 0;
+    for (int b = 0; b < n_blocks; b++) {
+        if (memcmp(file + (size_t)b * BLK, gpu_out + (size_t)b * BLK, BLK) != 0) {
+            if (verify_fail < 3) printf("  [realfile-w64] block %d mismatch\n", b);
+            verify_fail++;
+        }
+    }
+
+    double gb_per_s = (double)total_out / (best_ms * 1e6);
+    double ratio = 100.0 * (double)comp_off / (double)total_out;
+    printf("[realfile-w64] %d blocks x 64 KB (4-stream 64-bit stores, per-block LUT), "
+           "enc %.1f%% -> best %.3f ms = %.1f GB/s%s\n",
+           n_blocks, ratio, best_ms, gb_per_s, verify_fail ? " [VERIFY FAIL]" : "");
+
+    cudaFree(d_comp); cudaFree(d_out); cudaFree(d_lut); cudaFree(d_descs);
+    free(comp_buf); free(lut_buf); free(gpu_out);
+}
+
+// ── Realistic bench: aligned 32-bit refill + wide-store variant ────────
+// Encodes with huff_encode_4s_aligned (12-byte header, each stream padded
+// to a 4-byte boundary) and decodes with huffDecode4StreamWStoreAlignedKernel
+// — single aligned 32-bit refill load instead of four byte loads.
+static void bench_gpu_decode_realfile_wstore_aligned(const uint8_t *file, size_t file_size) {
+    const size_t BLK = 65536;
+    int n_blocks = (int)(file_size / BLK);
+    if (n_blocks < 1) { printf("[realfile-wsa] input < block size — skipping\n"); return; }
+
+    uint32_t *lut_buf  = (uint32_t*)malloc((size_t)n_blocks * LUT_SIZE * sizeof(uint32_t));
+    uint8_t  *comp_buf = (uint8_t*)malloc(file_size * 2 + (size_t)64 * n_blocks);
+    std::vector<HuffBlockDesc> descs(n_blocks);
+
+    size_t comp_off = 0;
+    uint8_t  code_lengths[256];
+    uint32_t codes[256];
+    for (int b = 0; b < n_blocks; b++) {
+        const uint8_t *src = file + (size_t)b * BLK;
+        uint32_t hist[256] = {0};
+        for (size_t i = 0; i < BLK; i++) hist[src[i]]++;
+
+        memset(code_lengths, 0, sizeof(code_lengths));
+        int max_len = build_code_lengths(hist, code_lengths);
+        if (max_len > MAX_CODE_LEN) height_limit(hist, code_lengths, MAX_CODE_LEN);
+        memset(codes, 0, sizeof(codes));
+        assign_canonical_codes(code_lengths, codes);
+        build_decode_lut(code_lengths, codes, lut_buf + (size_t)b * LUT_SIZE);
+
+        int enc_bytes = huff_encode_4s_aligned(src, BLK, code_lengths, codes,
+                                               comp_buf + comp_off,
+                                               file_size * 2 + (size_t)64 * n_blocks - comp_off);
+        if (enc_bytes <= 0) { printf("[realfile-wsa] block %d encode fail\n", b); return; }
+        descs[b].in_offset  = (uint32_t)comp_off;
+        descs[b].in_size    = (uint32_t)enc_bytes;
+        descs[b].out_offset = (uint32_t)((size_t)b * BLK);
+        descs[b].out_size   = (uint32_t)BLK;
+        descs[b].lut_offset = (uint32_t)((size_t)b * LUT_SIZE);
+        comp_off += enc_bytes;  // enc_bytes is a multiple of 4 -> blocks stay 4-aligned
+    }
+
+    size_t total_out = (size_t)n_blocks * BLK;
+    uint8_t *d_comp, *d_out;
+    uint32_t *d_lut;
+    HuffBlockDesc *d_descs;
+    CK(cudaMalloc(&d_comp, comp_off));
+    CK(cudaMalloc(&d_out, total_out));
+    CK(cudaMalloc(&d_lut, (size_t)n_blocks * LUT_BYTES));
+    CK(cudaMalloc(&d_descs, sizeof(HuffBlockDesc) * n_blocks));
+    CK(cudaMemcpy(d_comp, comp_buf, comp_off, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_lut, lut_buf, (size_t)n_blocks * LUT_BYTES, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_descs, descs.data(), sizeof(HuffBlockDesc) * n_blocks, cudaMemcpyHostToDevice));
+
+    huffDecode4StreamWStoreAlignedKernel<<<n_blocks, 32, LUT_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+    CK(cudaDeviceSynchronize());
+
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    const int N_RUNS = 50;
+    float best_ms = 1e9f;
+    for (int r = 0; r < N_RUNS; r++) {
+        cudaEventRecord(e0);
+        huffDecode4StreamWStoreAlignedKernel<<<n_blocks, 32, LUT_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        if (ms < best_ms) best_ms = ms;
+    }
+
+    uint8_t *gpu_out = (uint8_t*)malloc(total_out);
+    CK(cudaMemcpy(gpu_out, d_out, total_out, cudaMemcpyDeviceToHost));
+    int verify_fail = 0;
+    for (int b = 0; b < n_blocks; b++) {
+        if (memcmp(file + (size_t)b * BLK, gpu_out + (size_t)b * BLK, BLK) != 0) {
+            if (verify_fail < 3) printf("  [realfile-wsa] block %d mismatch\n", b);
+            verify_fail++;
+        }
+    }
+
+    double gb_per_s = (double)total_out / (best_ms * 1e6);
+    double ratio = 100.0 * (double)comp_off / (double)total_out;
+    printf("[realfile-wsa] %d blocks x 64 KB (4-stream aligned refill + 32-bit stores), "
+           "enc %.1f%% -> best %.3f ms = %.1f GB/s%s\n",
+           n_blocks, ratio, best_ms, gb_per_s, verify_fail ? " [VERIFY FAIL]" : "");
+
+    cudaFree(d_comp); cudaFree(d_out); cudaFree(d_lut); cudaFree(d_descs);
+    free(comp_buf); free(lut_buf); free(gpu_out);
+}
+
+// ── Realistic bench: 10-bit-LUT + 11-bit-escape variant ────────────────
+// Codes height-limited to 11 (NO ratio loss vs the 11-bit codec), but the
+// GPU LUT is 1024-entry (4 KB) with escape entries for length-11 codes —
+// keeping the doubled occupancy of the simple 10-bit variant. Decoded by
+// huffDecode4StreamWStoreAlignedEscKernel.
+static void bench_gpu_decode_realfile_wstore_aligned_esc(const uint8_t *file, size_t file_size) {
+    const size_t BLK = 65536;
+    int n_blocks = (int)(file_size / BLK);
+    if (n_blocks < 1) { printf("[realfile-wse] input < block size — skipping\n"); return; }
+
+    uint32_t *lut_buf  = (uint32_t*)malloc((size_t)n_blocks * LUT_SIZE * sizeof(uint32_t));
+    uint8_t  *comp_buf = (uint8_t*)malloc(file_size * 2 + (size_t)64 * n_blocks);
+    std::vector<HuffBlockDesc> descs(n_blocks);
+
+    size_t comp_off = 0;
+    uint8_t  code_lengths[256];
+    uint32_t codes[256];
+    for (int b = 0; b < n_blocks; b++) {
+        const uint8_t *src = file + (size_t)b * BLK;
+        uint32_t hist[256] = {0};
+        for (size_t i = 0; i < BLK; i++) hist[src[i]]++;
+
+        memset(code_lengths, 0, sizeof(code_lengths));
+        int max_len = build_code_lengths(hist, code_lengths);
+        // Height-limit to 11 (not MAX_CODE_LEN=10) — escape LUT covers 11-bit codes.
+        if (max_len > MAX_CODE_LEN + 1) height_limit(hist, code_lengths, MAX_CODE_LEN + 1);
+        memset(codes, 0, sizeof(codes));
+        assign_canonical_codes(code_lengths, codes);
+        build_decode_lut_esc(code_lengths, codes, lut_buf + (size_t)b * LUT_SIZE);
+
+        int enc_bytes = huff_encode_4s_aligned(src, BLK, code_lengths, codes,
+                                               comp_buf + comp_off,
+                                               file_size * 2 + (size_t)64 * n_blocks - comp_off);
+        if (enc_bytes <= 0) { printf("[realfile-wse] block %d encode fail\n", b); return; }
+        descs[b].in_offset  = (uint32_t)comp_off;
+        descs[b].in_size    = (uint32_t)enc_bytes;
+        descs[b].out_offset = (uint32_t)((size_t)b * BLK);
+        descs[b].out_size   = (uint32_t)BLK;
+        descs[b].lut_offset = (uint32_t)((size_t)b * LUT_SIZE);
+        comp_off += enc_bytes;
+    }
+
+    size_t total_out = (size_t)n_blocks * BLK;
+    uint8_t *d_comp, *d_out;
+    uint32_t *d_lut;
+    HuffBlockDesc *d_descs;
+    CK(cudaMalloc(&d_comp, comp_off));
+    CK(cudaMalloc(&d_out, total_out));
+    CK(cudaMalloc(&d_lut, (size_t)n_blocks * LUT_BYTES));
+    CK(cudaMalloc(&d_descs, sizeof(HuffBlockDesc) * n_blocks));
+    CK(cudaMemcpy(d_comp, comp_buf, comp_off, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_lut, lut_buf, (size_t)n_blocks * LUT_BYTES, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_descs, descs.data(), sizeof(HuffBlockDesc) * n_blocks, cudaMemcpyHostToDevice));
+
+    huffDecode4StreamWStoreAlignedEscKernel<<<n_blocks, 32, LUT_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+    CK(cudaDeviceSynchronize());
+
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    const int N_RUNS = 50;
+    float best_ms = 1e9f;
+    for (int r = 0; r < N_RUNS; r++) {
+        cudaEventRecord(e0);
+        huffDecode4StreamWStoreAlignedEscKernel<<<n_blocks, 32, LUT_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        if (ms < best_ms) best_ms = ms;
+    }
+
+    uint8_t *gpu_out = (uint8_t*)malloc(total_out);
+    CK(cudaMemcpy(gpu_out, d_out, total_out, cudaMemcpyDeviceToHost));
+    int verify_fail = 0;
+    for (int b = 0; b < n_blocks; b++) {
+        if (memcmp(file + (size_t)b * BLK, gpu_out + (size_t)b * BLK, BLK) != 0) {
+            if (verify_fail < 3) printf("  [realfile-wse] block %d mismatch\n", b);
+            verify_fail++;
+        }
+    }
+
+    double gb_per_s = (double)total_out / (best_ms * 1e6);
+    double ratio = 100.0 * (double)comp_off / (double)total_out;
+    printf("[realfile-wse] %d blocks x 64 KB (4-stream 10-bit LUT + 11-bit escape), "
+           "enc %.1f%% -> best %.3f ms = %.1f GB/s%s\n",
+           n_blocks, ratio, best_ms, gb_per_s, verify_fail ? " [VERIFY FAIL]" : "");
+
+    cudaFree(d_comp); cudaFree(d_out); cudaFree(d_lut); cudaFree(d_descs);
+    free(comp_buf); free(lut_buf); free(gpu_out);
+}
+
+// ── Realistic bench: persistent atomic-work-queue variant ──────────────
+// Same encode/format/LUT as bench_gpu_decode_realfile_wstore_aligned_esc,
+// but decoded by the persistent huffDecode4StreamWStoreAlignedEscQueueKernel
+// — grid = one wave of CUDA blocks, each draining a global atomic counter.
+static void bench_gpu_decode_realfile_wstore_aligned_esc_queue(const uint8_t *file, size_t file_size) {
+    const size_t BLK = 65536;
+    int n_blocks = (int)(file_size / BLK);
+    if (n_blocks < 1) { printf("[realfile-wseq] input < block size — skipping\n"); return; }
+
+    uint32_t *lut_buf  = (uint32_t*)malloc((size_t)n_blocks * LUT_SIZE * sizeof(uint32_t));
+    uint8_t  *comp_buf = (uint8_t*)malloc(file_size * 2 + (size_t)64 * n_blocks);
+    std::vector<HuffBlockDesc> descs(n_blocks);
+
+    size_t comp_off = 0;
+    uint8_t  code_lengths[256];
+    uint32_t codes[256];
+    for (int b = 0; b < n_blocks; b++) {
+        const uint8_t *src = file + (size_t)b * BLK;
+        uint32_t hist[256] = {0};
+        for (size_t i = 0; i < BLK; i++) hist[src[i]]++;
+
+        memset(code_lengths, 0, sizeof(code_lengths));
+        int max_len = build_code_lengths(hist, code_lengths);
+        if (max_len > MAX_CODE_LEN + 1) height_limit(hist, code_lengths, MAX_CODE_LEN + 1);
+        memset(codes, 0, sizeof(codes));
+        assign_canonical_codes(code_lengths, codes);
+        build_decode_lut_esc(code_lengths, codes, lut_buf + (size_t)b * LUT_SIZE);
+
+        int enc_bytes = huff_encode_4s_aligned(src, BLK, code_lengths, codes,
+                                               comp_buf + comp_off,
+                                               file_size * 2 + (size_t)64 * n_blocks - comp_off);
+        if (enc_bytes <= 0) { printf("[realfile-wseq] block %d encode fail\n", b); return; }
+        descs[b].in_offset  = (uint32_t)comp_off;
+        descs[b].in_size    = (uint32_t)enc_bytes;
+        descs[b].out_offset = (uint32_t)((size_t)b * BLK);
+        descs[b].out_size   = (uint32_t)BLK;
+        descs[b].lut_offset = (uint32_t)((size_t)b * LUT_SIZE);
+        comp_off += enc_bytes;
+    }
+
+    size_t total_out = (size_t)n_blocks * BLK;
+    uint8_t *d_comp, *d_out;
+    uint32_t *d_lut, *d_counter;
+    HuffBlockDesc *d_descs;
+    CK(cudaMalloc(&d_comp, comp_off));
+    CK(cudaMalloc(&d_out, total_out));
+    CK(cudaMalloc(&d_lut, (size_t)n_blocks * LUT_BYTES));
+    CK(cudaMalloc(&d_descs, sizeof(HuffBlockDesc) * n_blocks));
+    CK(cudaMalloc(&d_counter, sizeof(uint32_t)));
+    CK(cudaMemcpy(d_comp, comp_buf, comp_off, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_lut, lut_buf, (size_t)n_blocks * LUT_BYTES, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_descs, descs.data(), sizeof(HuffBlockDesc) * n_blocks, cudaMemcpyHostToDevice));
+
+    // Persistent grid: one full wave of CUDA blocks (SMs × blocks/SM).
+    int numSM = 0, blocksPerSM = 0;
+    cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, 0);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocksPerSM,
+        huffDecode4StreamWStoreAlignedEscQueueKernel, 32, LUT_BYTES);
+    int grid = numSM * blocksPerSM;
+    if (grid < 1) grid = 1;
+    if (grid > n_blocks) grid = n_blocks;
+
+    CK(cudaMemset(d_counter, 0, sizeof(uint32_t)));
+    huffDecode4StreamWStoreAlignedEscQueueKernel<<<grid, 32, LUT_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks, d_counter);
+    CK(cudaDeviceSynchronize());
+
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    const int N_RUNS = 50;
+    float best_ms = 1e9f;
+    for (int r = 0; r < N_RUNS; r++) {
+        cudaMemset(d_counter, 0, sizeof(uint32_t));  // before e0 -> not timed
+        cudaEventRecord(e0);
+        huffDecode4StreamWStoreAlignedEscQueueKernel<<<grid, 32, LUT_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks, d_counter);
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        if (ms < best_ms) best_ms = ms;
+    }
+
+    uint8_t *gpu_out = (uint8_t*)malloc(total_out);
+    CK(cudaMemcpy(gpu_out, d_out, total_out, cudaMemcpyDeviceToHost));
+    int verify_fail = 0;
+    for (int b = 0; b < n_blocks; b++) {
+        if (memcmp(file + (size_t)b * BLK, gpu_out + (size_t)b * BLK, BLK) != 0) {
+            if (verify_fail < 3) printf("  [realfile-wseq] block %d mismatch\n", b);
+            verify_fail++;
+        }
+    }
+
+    double gb_per_s = (double)total_out / (best_ms * 1e6);
+    double ratio = 100.0 * (double)comp_off / (double)total_out;
+    printf("[realfile-wseq] %d blocks, persistent queue (%d-block grid = %d SM x %d), "
+           "enc %.1f%% -> best %.3f ms = %.1f GB/s%s\n",
+           n_blocks, grid, numSM, blocksPerSM, ratio, best_ms, gb_per_s,
+           verify_fail ? " [VERIFY FAIL]" : "");
+
+    cudaFree(d_comp); cudaFree(d_out); cudaFree(d_lut); cudaFree(d_descs); cudaFree(d_counter);
+    free(comp_buf); free(lut_buf); free(gpu_out);
+}
+
+// ── Realistic bench: cp.async ring-buffer-refill variant ───────────────
+// Same encode/format/escape-LUT as bench_gpu_decode_realfile_wstore_aligned_esc,
+// but decoded by huffDecode4StreamCpAsyncEscKernel — bit-buffer refill fed
+// by cp.async (global→shared) instead of a synchronous load.
+static void bench_gpu_decode_realfile_cpasync_esc(const uint8_t *file, size_t file_size) {
+    const size_t BLK = 65536;
+    int n_blocks = (int)(file_size / BLK);
+    if (n_blocks < 1) { printf("[realfile-cpa] input < block size — skipping\n"); return; }
+
+    uint32_t *lut_buf  = (uint32_t*)malloc((size_t)n_blocks * LUT_SIZE * sizeof(uint32_t));
+    uint8_t  *comp_buf = (uint8_t*)malloc(file_size * 2 + (size_t)64 * n_blocks);
+    std::vector<HuffBlockDesc> descs(n_blocks);
+
+    size_t comp_off = 0;
+    uint8_t  code_lengths[256];
+    uint32_t codes[256];
+    for (int b = 0; b < n_blocks; b++) {
+        const uint8_t *src = file + (size_t)b * BLK;
+        uint32_t hist[256] = {0};
+        for (size_t i = 0; i < BLK; i++) hist[src[i]]++;
+
+        memset(code_lengths, 0, sizeof(code_lengths));
+        int max_len = build_code_lengths(hist, code_lengths);
+        if (max_len > MAX_CODE_LEN + 1) height_limit(hist, code_lengths, MAX_CODE_LEN + 1);
+        memset(codes, 0, sizeof(codes));
+        assign_canonical_codes(code_lengths, codes);
+        build_decode_lut_esc(code_lengths, codes, lut_buf + (size_t)b * LUT_SIZE);
+
+        int enc_bytes = huff_encode_4s_aligned(src, BLK, code_lengths, codes,
+                                               comp_buf + comp_off,
+                                               file_size * 2 + (size_t)64 * n_blocks - comp_off);
+        if (enc_bytes <= 0) { printf("[realfile-cpa] block %d encode fail\n", b); return; }
+        descs[b].in_offset  = (uint32_t)comp_off;
+        descs[b].in_size    = (uint32_t)enc_bytes;
+        descs[b].out_offset = (uint32_t)((size_t)b * BLK);
+        descs[b].out_size   = (uint32_t)BLK;
+        descs[b].lut_offset = (uint32_t)((size_t)b * LUT_SIZE);
+        comp_off += enc_bytes;
+    }
+
+    size_t total_out = (size_t)n_blocks * BLK;
+    uint8_t *d_comp, *d_out;
+    uint32_t *d_lut;
+    HuffBlockDesc *d_descs;
+    CK(cudaMalloc(&d_comp, comp_off));
+    CK(cudaMalloc(&d_out, total_out));
+    CK(cudaMalloc(&d_lut, (size_t)n_blocks * LUT_BYTES));
+    CK(cudaMalloc(&d_descs, sizeof(HuffBlockDesc) * n_blocks));
+    CK(cudaMemcpy(d_comp, comp_buf, comp_off, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_lut, lut_buf, (size_t)n_blocks * LUT_BYTES, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_descs, descs.data(), sizeof(HuffBlockDesc) * n_blocks, cudaMemcpyHostToDevice));
+
+    huffDecode4StreamCpAsyncEscKernel<<<n_blocks, 32, LUT_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+    CK(cudaDeviceSynchronize());
+
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    const int N_RUNS = 50;
+    float best_ms = 1e9f;
+    for (int r = 0; r < N_RUNS; r++) {
+        cudaEventRecord(e0);
+        huffDecode4StreamCpAsyncEscKernel<<<n_blocks, 32, LUT_BYTES>>>(d_comp, d_descs, d_lut, d_out, n_blocks);
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        if (ms < best_ms) best_ms = ms;
+    }
+
+    uint8_t *gpu_out = (uint8_t*)malloc(total_out);
+    CK(cudaMemcpy(gpu_out, d_out, total_out, cudaMemcpyDeviceToHost));
+    int verify_fail = 0;
+    for (int b = 0; b < n_blocks; b++) {
+        if (memcmp(file + (size_t)b * BLK, gpu_out + (size_t)b * BLK, BLK) != 0) {
+            if (verify_fail < 3) printf("  [realfile-cpa] block %d mismatch\n", b);
+            verify_fail++;
+        }
+    }
+
+    double gb_per_s = (double)total_out / (best_ms * 1e6);
+    double ratio = 100.0 * (double)comp_off / (double)total_out;
+    printf("[realfile-cpa] %d blocks x 64 KB (4-stream cp.async refill + escape LUT), "
+           "enc %.1f%% -> best %.3f ms = %.1f GB/s%s\n",
+           n_blocks, ratio, best_ms, gb_per_s, verify_fail ? " [VERIFY FAIL]" : "");
+
+    cudaFree(d_comp); cudaFree(d_out); cudaFree(d_lut); cudaFree(d_descs);
+    free(comp_buf); free(lut_buf); free(gpu_out);
+}
+
 int main(int argc, char **argv) {
     int fails = 0;
 
@@ -1012,6 +1741,14 @@ int main(int argc, char **argv) {
                 // content with its own Huffman table + LUT.
                 printf("\n--- realistic decode bench (per-block LUT, distinct blocks) ---\n");
                 bench_gpu_decode_realfile(full, (size_t)sz, 65536);
+                bench_gpu_decode_realfile_wstore(full, (size_t)sz);
+                bench_gpu_decode_realfile_wstore_aligned(full, (size_t)sz);
+                bench_gpu_decode_realfile_wstore_aligned_esc(full, (size_t)sz);
+                bench_gpu_decode_realfile_cpasync_esc(full, (size_t)sz);
+                bench_gpu_decode_realfile_wstore_aligned_esc_queue(full, (size_t)sz);
+                bench_gpu_decode_realfile_wstore64(full, (size_t)sz);
+                bench_gpu_decode_realfile_lut16(full, (size_t)sz);
+                bench_gpu_decode_realfile_prefetch(full, (size_t)sz);
                 bench_gpu_decode_realfile_interleaved(full, (size_t)sz);
                 bench_gpu_decode_realfile_2lane(full, (size_t)sz);
                 bench_gpu_decode_realfile_2x(full, (size_t)sz);

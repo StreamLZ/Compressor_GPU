@@ -19,11 +19,12 @@
 #include <string.h>
 #include <assert.h>
 
-// 11 bits matches zstd's default Huffman max length. LUT = 2048 × 2-byte
-// entries = 4 KB, fits comfortably in shared memory.
+// 10-bit max code length: 1024-entry LUT = 4 KB (u32 dual-symbol),
+// halving the GPU decoder's shared-memory footprint vs 11-bit to double
+// occupancy. Codes are height-limited to 10 bits — no decode slow path.
 #ifndef MAX_CODE_LEN
-#define MAX_CODE_LEN 11
-#define LUT_SIZE     (1u << MAX_CODE_LEN)  // 2048
+#define MAX_CODE_LEN 10
+#define LUT_SIZE     (1u << MAX_CODE_LEN)  // 1024
 #endif
 
 // ─── Bit writer ─────────────────────────────────────────────────────────
@@ -273,6 +274,85 @@ static void build_decode_lut(const uint8_t code_lengths[256],
     }
 }
 
+// ─── Build decode LUT, u16 single-symbol variant ─────────────────────
+// Half the size of build_decode_lut (2048 × 2 B = 4 KB vs 8 KB) so a GPU
+// warp's shared-memory footprint drops, doubling occupancy. The price is
+// no dual-symbol decode: every lookup yields exactly one symbol.
+// u16 entry:  bits 0-7 = symbol,  bits 8-11 = code length (1..11).
+// length == 0 marks an unused (invalid) entry.
+static void build_decode_lut16(const uint8_t code_lengths[256],
+                               const uint32_t codes[256],
+                               uint16_t lut[LUT_SIZE]) {
+    memset(lut, 0, LUT_SIZE * sizeof(uint16_t));
+    for (int s = 0; s < 256; s++) {
+        int len = code_lengths[s];
+        if (len == 0) continue;
+        uint32_t aligned = codes[s] << (MAX_CODE_LEN - len);
+        uint32_t span = 1u << (MAX_CODE_LEN - len);
+        uint16_t entry = (uint16_t)(((uint16_t)len << 8) | (uint16_t)s);
+        for (uint32_t i = 0; i < span; i++) lut[aligned + i] = entry;
+    }
+}
+
+// ─── Build decode LUT with 11-bit escape, 10-bit fast index ──────────
+// Zero-ratio-cost occupancy trick: codes stay height-limited to 11 bits
+// (same compression as the 11-bit codec — no ratio loss), but the GPU
+// LUT is only 1024 entries (10-bit index, 4 KB shared — half an 11-bit
+// LUT). Codes of length ≤ 10 resolve directly. Length-11 codes form a
+// full binary tree, so they occur in sibling pairs sharing a 10-bit
+// prefix; that prefix's slot is an ESCAPE entry (num_syms == 3) holding
+// both siblings — the decoder reads the 11th bit to choose.
+//   escape entry: byte0 = symbol when 11th bit == 0
+//                 byte1 = symbol when 11th bit == 1
+//                 total_len = 11, num_syms = 3
+static void build_decode_lut_esc(const uint8_t code_lengths[256],
+                                 const uint32_t codes[256],
+                                 uint32_t lut[LUT_SIZE]) {
+    memset(lut, 0, LUT_SIZE * sizeof(uint32_t));
+
+    // Pass 1: single-symbol entries for codes of length ≤ 10.
+    for (int s = 0; s < 256; s++) {
+        int len = code_lengths[s];
+        if (len == 0 || len > (int)MAX_CODE_LEN) continue;
+        uint32_t aligned = codes[s] << (MAX_CODE_LEN - len);
+        uint32_t span = 1u << (MAX_CODE_LEN - len);
+        uint32_t entry = pack_lut_entry((uint8_t)s, 0, (uint8_t)len, 1);
+        for (uint32_t i = 0; i < span; i++) lut[aligned + i] = entry;
+    }
+
+    // Pass 2: dual-symbol entries — both codes ≤ 10, total ≤ 10.
+    for (int s1 = 0; s1 < 256; s1++) {
+        int L1 = code_lengths[s1];
+        if (L1 == 0 || L1 >= (int)MAX_CODE_LEN) continue;
+        uint32_t C1 = codes[s1];
+        for (int s2 = 0; s2 < 256; s2++) {
+            int L2 = code_lengths[s2];
+            if (L2 == 0) continue;
+            int total = L1 + L2;
+            if (total > (int)MAX_CODE_LEN) continue;
+            uint32_t C2 = codes[s2];
+            uint32_t aligned = (C1 << (MAX_CODE_LEN - L1))
+                             | (C2 << (MAX_CODE_LEN - L1 - L2));
+            uint32_t span = 1u << (MAX_CODE_LEN - total);
+            uint32_t entry = pack_lut_entry((uint8_t)s1, (uint8_t)s2, (uint8_t)total, 2);
+            for (uint32_t i = 0; i < span; i++) lut[aligned + i] = entry;
+        }
+    }
+
+    // Pass 3: escape entries for length-11 codes. Runs last; their 10-bit
+    // prefixes are never touched by passes 1-2 (prefix-free property).
+    for (int s = 0; s < 256; s++) {
+        if (code_lengths[s] != (int)MAX_CODE_LEN + 1) continue;
+        uint32_t c = codes[s];
+        uint32_t p = c >> 1;            // 10-bit prefix = LUT index
+        uint32_t e = lut[p];            // 0, or the partial sibling pair
+        uint8_t b0 = (uint8_t)(e & 0xFF);
+        uint8_t b1 = (uint8_t)((e >> 8) & 0xFF);
+        if (c & 1u) b1 = (uint8_t)s; else b0 = (uint8_t)s;
+        lut[p] = pack_lut_entry(b0, b1, (uint8_t)(MAX_CODE_LEN + 1), 3);
+    }
+}
+
 // ─── Encode ─────────────────────────────────────────────────────────────
 // Returns bytes written (including trailing partial byte) or -1 on overflow.
 static int huff_encode(const uint8_t *in, size_t n,
@@ -365,6 +445,48 @@ static int huff_encode_4s(const uint8_t *in, size_t n,
 
     // Header: 3 × u24 sizes.
     for (int s = 0; s < 3; s++) {
+        out[s*3 + 0] = (uint8_t)(sizes[s] & 0xFF);
+        out[s*3 + 1] = (uint8_t)((sizes[s] >> 8) & 0xFF);
+        out[s*3 + 2] = (uint8_t)((sizes[s] >> 16) & 0xFF);
+    }
+    return (int)written;
+}
+
+// ─── 4-stream split, per-stream 4-byte aligned ─────────────────────────
+// Same 4-quarter contiguous layout as huff_encode_4s, but the header is
+// 12 bytes (4 × u24 sizes — 4-aligned) and each stream is zero-padded to
+// a 4-byte boundary. Every stream then starts 4-byte aligned, so the GPU
+// decoder's 32-bit refill is a single aligned 32-bit load + byte-swap
+// instead of four separate byte loads.
+#define HUFF_4SA_HDR_BYTES 12
+
+static int huff_encode_4s_aligned(const uint8_t *in, size_t n,
+                                  const uint8_t code_lengths[256],
+                                  const uint32_t codes[256],
+                                  uint8_t *out, size_t out_cap) {
+    if (out_cap < HUFF_4SA_HDR_BYTES) return -1;
+    size_t q = n / 4;
+    size_t boundaries[5] = { 0, q, 2*q, 3*q, n };
+    size_t written = HUFF_4SA_HDR_BYTES;
+    uint32_t sizes[4] = {0};
+
+    for (int s = 0; s < 4; s++) {
+        size_t stream_n = boundaries[s+1] - boundaries[s];
+        int sz = huff_encode(in + boundaries[s], stream_n,
+                             code_lengths, codes,
+                             out + written, out_cap - written);
+        if (sz < 0 || sz >= (1 << 24)) return -1;
+        sizes[s] = (uint32_t)sz;
+        written += (size_t)sz;
+        // Zero-pad this stream up to a 4-byte boundary.
+        while (written & 3u) {
+            if (written >= out_cap) return -1;
+            out[written++] = 0;
+        }
+    }
+
+    // Header: 4 × u24 LE stream sizes (unpadded lengths).
+    for (int s = 0; s < 4; s++) {
         out[s*3 + 0] = (uint8_t)(sizes[s] & 0xFF);
         out[s*3 + 1] = (uint8_t)((sizes[s] >> 8) & 0xFF);
         out[s*3 + 2] = (uint8_t)((sizes[s] >> 16) & 0xFF);

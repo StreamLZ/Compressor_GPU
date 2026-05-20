@@ -17,15 +17,25 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cuda_pipeline.h>   // cp.async (LDGSTS) intrinsics
 
-static constexpr int MAX_CODE_LEN = 11;
-static constexpr int LUT_SIZE     = 1 << MAX_CODE_LEN;  // 2048
+static constexpr int MAX_CODE_LEN = 10;
+static constexpr int LUT_SIZE     = 1 << MAX_CODE_LEN;  // 1024
 static constexpr int LUT_BYTES    = LUT_SIZE * sizeof(uint32_t);  // 4096
+// u16 single-symbol LUT: half the shared-memory footprint (4 KB), so a
+// warp's occupancy limit roughly doubles. See decode_stream_one_lane_lut16.
+static constexpr int LUT16_BYTES  = LUT_SIZE * sizeof(uint16_t);  // 4096
 
 // Word-interleaved 4-stream format header: 4 × u24 LE per-stream byte
 // sizes (the 4th can't be derived — the interleaved payload is padded to
 // the longest stream, so total bytes != sum of stream sizes).
 static constexpr int HUFF_4SI_HDR_BYTES = 12;
+
+// 4-byte-aligned 4-stream format header: 4 × u24 LE per-stream byte sizes
+// (12 bytes — itself 4-aligned). Each stream is zero-padded to a 4-byte
+// boundary, so every stream starts 4-aligned and the refill is one
+// aligned 32-bit load. See huff_encode_4s_aligned.
+static constexpr int HUFF_4SA_HDR_BYTES = 12;
 
 struct HuffBlockDesc {
     uint32_t in_offset;     // byte offset in compressed buffer (points at 9-byte header)
@@ -126,6 +136,763 @@ __device__ __forceinline__ uint32_t decode_stream_one_lane(
         }
         // Even if we clamped to single output, we still consumed total_len
         // bits — see CPU reference rationale (only happens at end-of-stream).
+        bit_buf <<= total_len;
+        bit_count -= total_len;
+    }
+    return out_pos;
+}
+
+// ── Single-stream decode core, u16 single-symbol LUT ─────────────────
+// Same bitstream/format as decode_stream_one_lane, but the LUT is u16
+// (2048 × 2 B = 4 KB shared vs 8 KB). Each lookup yields exactly ONE
+// symbol — no dual-symbol fast path — trading ~33-50% more lookups for
+// half the shared-memory footprint, which roughly doubles occupancy.
+// u16 entry: bits 0-7 = symbol, bits 8-11 = code length (1..11).
+__device__ __forceinline__ uint32_t decode_stream_one_lane_lut16(
+    const uint8_t* __restrict__ in, uint32_t in_size,
+    const uint16_t* __restrict__ lut,
+    uint8_t* __restrict__ out, uint32_t out_size)
+{
+    uint64_t bit_buf = 0;
+    int bit_count = 0;
+    uint32_t in_pos = 0;
+    uint32_t out_pos = 0;
+
+    // Hot loop unrolled 2× — one refill guards two decodes. Two single-
+    // symbol decodes consume ≤ 22 bits; refilling when bit_count < 22
+    // leaves ≥ 22 valid bits, so no mid-group refill check is needed.
+    while (out_pos + 2 <= out_size) {
+        if (bit_count < 2 * MAX_CODE_LEN) {
+            if (in_pos + 4 > in_size) break;
+            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
+                       | ((uint32_t)in[in_pos + 1] << 16)
+                       | ((uint32_t)in[in_pos + 2] <<  8)
+                       | ((uint32_t)in[in_pos + 3]);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            in_pos += 4;
+        }
+        // decode A
+        uint32_t e0 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len0 = (e0 >> 8) & 0xFF;
+        if (len0 == 0) return 0;
+        out[out_pos++] = (uint8_t)(e0 & 0xFF);
+        bit_buf <<= len0;
+        bit_count -= len0;
+        // decode B
+        uint32_t e1 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len1 = (e1 >> 8) & 0xFF;
+        if (len1 == 0) return 0;
+        out[out_pos++] = (uint8_t)(e1 & 0xFF);
+        bit_buf <<= len1;
+        bit_count -= len1;
+    }
+
+    // ── Tail loop: last 0-1 bytes ──
+    while (out_pos < out_size) {
+        if (bit_count <= 32 && in_pos + 4 <= in_size) {
+            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
+                       | ((uint32_t)in[in_pos + 1] << 16)
+                       | ((uint32_t)in[in_pos + 2] <<  8)
+                       | ((uint32_t)in[in_pos + 3]);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            in_pos += 4;
+        }
+        while (bit_count < MAX_CODE_LEN && in_pos < in_size) {
+            bit_buf |= ((uint64_t)in[in_pos++]) << (56 - bit_count);
+            bit_count += 8;
+        }
+        if (bit_count < MAX_CODE_LEN) bit_count = MAX_CODE_LEN;
+        uint32_t e = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int total_len = (e >> 8) & 0xFF;
+        if (total_len == 0) return 0;
+        out[out_pos++] = (uint8_t)(e & 0xFF);
+        bit_buf <<= total_len;
+        bit_count -= total_len;
+    }
+    return out_pos;
+}
+
+// ── Single-stream decode core, software-prefetched ───────────────────
+// Identical decode semantics to decode_stream_one_lane, but issues the
+// next 32-bit refill load one refill ahead so its ~200-cycle global-load
+// latency overlaps the LUT-decode work of the current iteration. The
+// kernel is latency-bound (NCU: 43.5% Long Scoreboard on the refill
+// load), so hiding load latency — not improving bandwidth — is the lever.
+//
+// Depth-1 prefetch: `nextw` always holds the next refill word, already
+// loaded. When a refill is needed we consume `nextw`, then immediately
+// issue the load for the word after it. The two LUT decodes that follow
+// are independent of `nextw`, so the load runs in their shadow.
+__device__ __forceinline__ uint32_t decode_stream_prefetch(
+    const uint8_t* __restrict__ in, uint32_t in_size,
+    const uint32_t* __restrict__ lut,
+    uint8_t* __restrict__ out, uint32_t out_size)
+{
+    uint64_t bit_buf = 0;
+    int bit_count = 0;
+    uint32_t in_pos = 0;
+    uint32_t out_pos = 0;
+
+    // `nextw` holds the 32-bit word at [fetch_pos-4 .. fetch_pos-1] when
+    // have_next is set — loaded one refill ahead of consumption.
+    uint32_t fetch_pos = 0;
+    uint32_t nextw = 0;
+    bool have_next = false;
+    if (fetch_pos + 4 <= in_size) {
+        nextw = ((uint32_t)in[fetch_pos    ] << 24)
+              | ((uint32_t)in[fetch_pos + 1] << 16)
+              | ((uint32_t)in[fetch_pos + 2] <<  8)
+              | ((uint32_t)in[fetch_pos + 3]);
+        fetch_pos += 4;
+        have_next = true;
+    }
+
+    while (out_pos + 4 <= out_size) {
+        if (bit_count < 2 * MAX_CODE_LEN) {
+            if (!have_next) break;
+            // Consume the already-loaded word, then issue the NEXT load
+            // immediately so its latency overlaps the two decodes below.
+            uint32_t v = nextw;
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            if (fetch_pos + 4 <= in_size) {
+                nextw = ((uint32_t)in[fetch_pos    ] << 24)
+                      | ((uint32_t)in[fetch_pos + 1] << 16)
+                      | ((uint32_t)in[fetch_pos + 2] <<  8)
+                      | ((uint32_t)in[fetch_pos + 3]);
+                fetch_pos += 4;
+            } else {
+                have_next = false;
+            }
+        }
+        // decode A
+        uint32_t e0 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len0 = (e0 >> 16) & 0xFF;
+        int ns0  = (e0 >> 24) & 0xFF;
+        if (len0 == 0) return 0;
+        out[out_pos]     = (uint8_t)(e0 & 0xFF);
+        out[out_pos + 1] = (uint8_t)((e0 >> 8) & 0xFF);
+        out_pos += ns0;
+        bit_buf <<= len0;
+        bit_count -= len0;
+        // decode B
+        uint32_t e1 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len1 = (e1 >> 16) & 0xFF;
+        int ns1  = (e1 >> 24) & 0xFF;
+        if (len1 == 0) return 0;
+        out[out_pos]     = (uint8_t)(e1 & 0xFF);
+        out[out_pos + 1] = (uint8_t)((e1 >> 8) & 0xFF);
+        out_pos += ns1;
+        bit_buf <<= len1;
+        bit_count -= len1;
+    }
+
+    // Drain: hand any unconsumed prefetched word back to in_pos so the
+    // tail loop re-reads from the correct byte position.
+    in_pos = have_next ? (fetch_pos - 4) : fetch_pos;
+
+    // ── Tail loop: identical to decode_stream_one_lane ──
+    while (out_pos < out_size) {
+        if (bit_count <= 32 && in_pos + 4 <= in_size) {
+            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
+                       | ((uint32_t)in[in_pos + 1] << 16)
+                       | ((uint32_t)in[in_pos + 2] <<  8)
+                       | ((uint32_t)in[in_pos + 3]);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            in_pos += 4;
+        }
+        while (bit_count < MAX_CODE_LEN && in_pos < in_size) {
+            bit_buf |= ((uint64_t)in[in_pos++]) << (56 - bit_count);
+            bit_count += 8;
+        }
+        if (bit_count < MAX_CODE_LEN) bit_count = MAX_CODE_LEN;
+        uint32_t e = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int total_len = (e >> 16) & 0xFF;
+        int num_syms  = (e >> 24) & 0xFF;
+        if (total_len == 0) return 0;
+        out[out_pos++] = (uint8_t)(e & 0xFF);
+        if (num_syms == 2 && out_pos < out_size) {
+            out[out_pos++] = (uint8_t)((e >> 8) & 0xFF);
+        }
+        bit_buf <<= total_len;
+        bit_count -= total_len;
+    }
+    return out_pos;
+}
+
+// ── Single-stream decode core, wide (32-bit) output stores ───────────
+// Same decode semantics as decode_stream_one_lane (u32 dual-symbol LUT),
+// but decoded bytes are accumulated and flushed to global memory as
+// 32-bit stores instead of single-byte stores. The 4 active lanes write
+// to output regions 16 KB apart, so a warp's store touches 4 separate
+// sectors regardless — but a 4-byte store carries 4 useful bytes per
+// sector vs 1, cutting store transactions (and L2 store traffic) ~4×.
+// Assumes `out` is 4-byte aligned (true for 64 KB blocks: each lane's
+// region starts at a multiple of out_size/4 = 16384).
+__device__ __forceinline__ uint32_t decode_stream_one_lane_wstore(
+    const uint8_t* __restrict__ in, uint32_t in_size,
+    const uint32_t* __restrict__ lut,
+    uint8_t* __restrict__ out, uint32_t out_size)
+{
+    uint64_t bit_buf = 0;
+    int bit_count = 0;
+    uint32_t in_pos = 0;
+    uint32_t out_pos = 0;    // total bytes decoded
+    uint32_t written = 0;    // bytes flushed to global (always a multiple of 4)
+    uint64_t acc = 0;        // pending decoded bytes, byte 0 = oldest
+    int pending = 0;         // ≤ 3 at loop top, ≤ 5 transiently before a flush
+
+    while (out_pos + 4 <= out_size) {
+        if (bit_count < 2 * MAX_CODE_LEN) {
+            if (in_pos + 4 > in_size) break;
+            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
+                       | ((uint32_t)in[in_pos + 1] << 16)
+                       | ((uint32_t)in[in_pos + 2] <<  8)
+                       | ((uint32_t)in[in_pos + 3]);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            in_pos += 4;
+        }
+        // decode A — append 1-2 bytes; entry's sym2 byte is 0 when ns==1,
+        // and is overwritten by the next append, so masking 0xFFFF is safe.
+        uint32_t e0 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len0 = (e0 >> 16) & 0xFF;
+        int ns0  = (e0 >> 24) & 0xFF;
+        if (len0 == 0) return 0;
+        acc |= (uint64_t)(e0 & 0xFFFF) << (pending * 8);
+        pending += ns0;
+        bit_buf <<= len0;
+        bit_count -= len0;
+        out_pos += ns0;
+        if (pending >= 4) {
+            *reinterpret_cast<uint32_t*>(out + written) = (uint32_t)acc;
+            acc >>= 32;
+            pending -= 4;
+            written += 4;
+        }
+        // decode B
+        uint32_t e1 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len1 = (e1 >> 16) & 0xFF;
+        int ns1  = (e1 >> 24) & 0xFF;
+        if (len1 == 0) return 0;
+        acc |= (uint64_t)(e1 & 0xFFFF) << (pending * 8);
+        pending += ns1;
+        bit_buf <<= len1;
+        bit_count -= len1;
+        out_pos += ns1;
+        if (pending >= 4) {
+            *reinterpret_cast<uint32_t*>(out + written) = (uint32_t)acc;
+            acc >>= 32;
+            pending -= 4;
+            written += 4;
+        }
+    }
+
+    // Drain whole pending bytes (written catches up to out_pos), then
+    // finish byte-at-a-time.
+    while (pending > 0) {
+        out[written++] = (uint8_t)(acc & 0xFF);
+        acc >>= 8;
+        pending--;
+    }
+    while (out_pos < out_size) {
+        if (bit_count <= 32 && in_pos + 4 <= in_size) {
+            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
+                       | ((uint32_t)in[in_pos + 1] << 16)
+                       | ((uint32_t)in[in_pos + 2] <<  8)
+                       | ((uint32_t)in[in_pos + 3]);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            in_pos += 4;
+        }
+        while (bit_count < MAX_CODE_LEN && in_pos < in_size) {
+            bit_buf |= ((uint64_t)in[in_pos++]) << (56 - bit_count);
+            bit_count += 8;
+        }
+        if (bit_count < MAX_CODE_LEN) bit_count = MAX_CODE_LEN;
+        uint32_t e = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int total_len = (e >> 16) & 0xFF;
+        int num_syms  = (e >> 24) & 0xFF;
+        if (total_len == 0) return 0;
+        out[out_pos++] = (uint8_t)(e & 0xFF);
+        if (num_syms == 2 && out_pos < out_size) {
+            out[out_pos++] = (uint8_t)((e >> 8) & 0xFF);
+        }
+        bit_buf <<= total_len;
+        bit_count -= total_len;
+    }
+    return out_pos;
+}
+
+// ── Single-stream decode core, aligned 32-bit refill + wide stores ───
+// Identical to decode_stream_one_lane_wstore, except the hot-loop refill
+// is a single aligned 32-bit load + byte-swap instead of four byte loads
+// — cutting ~8 instructions per refill (3 IMAD.WIDE shifts + 3 ORs + 3
+// extra LDG). Requires `in` 4-byte aligned (huff_encode_4s_aligned pads
+// every stream to a 4-byte boundary); in_pos is always a multiple of 4
+// in the hot loop. The tail keeps byte loads.
+__device__ __forceinline__ uint32_t decode_stream_one_lane_wstore_aligned(
+    const uint8_t* __restrict__ in, uint32_t in_size,
+    const uint32_t* __restrict__ lut,
+    uint8_t* __restrict__ out, uint32_t out_size)
+{
+    uint64_t bit_buf = 0;
+    int bit_count = 0;
+    uint32_t in_pos = 0;
+    uint32_t out_pos = 0;
+    uint32_t written = 0;
+    uint64_t acc = 0;
+    int pending = 0;
+
+    while (out_pos + 4 <= out_size) {
+        if (bit_count < 2 * MAX_CODE_LEN) {
+            if (in_pos + 4 > in_size) break;
+            // One aligned 32-bit load; byte-swap to big-endian order so
+            // `v` matches the byte-by-byte assembly (in[pos] = MSB).
+            uint32_t word = *reinterpret_cast<const uint32_t*>(in + in_pos);
+            uint32_t v = __byte_perm(word, 0, 0x0123);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            in_pos += 4;
+        }
+        // decode A
+        uint32_t e0 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len0 = (e0 >> 16) & 0xFF;
+        int ns0  = (e0 >> 24) & 0xFF;
+        if (len0 == 0) return 0;
+        acc |= (uint64_t)(e0 & 0xFFFF) << (pending * 8);
+        pending += ns0;
+        bit_buf <<= len0;
+        bit_count -= len0;
+        out_pos += ns0;
+        if (pending >= 4) {
+            *reinterpret_cast<uint32_t*>(out + written) = (uint32_t)acc;
+            acc >>= 32;
+            pending -= 4;
+            written += 4;
+        }
+        // decode B
+        uint32_t e1 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len1 = (e1 >> 16) & 0xFF;
+        int ns1  = (e1 >> 24) & 0xFF;
+        if (len1 == 0) return 0;
+        acc |= (uint64_t)(e1 & 0xFFFF) << (pending * 8);
+        pending += ns1;
+        bit_buf <<= len1;
+        bit_count -= len1;
+        out_pos += ns1;
+        if (pending >= 4) {
+            *reinterpret_cast<uint32_t*>(out + written) = (uint32_t)acc;
+            acc >>= 32;
+            pending -= 4;
+            written += 4;
+        }
+    }
+
+    while (pending > 0) {
+        out[written++] = (uint8_t)(acc & 0xFF);
+        acc >>= 8;
+        pending--;
+    }
+    while (out_pos < out_size) {
+        if (bit_count <= 32 && in_pos + 4 <= in_size) {
+            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
+                       | ((uint32_t)in[in_pos + 1] << 16)
+                       | ((uint32_t)in[in_pos + 2] <<  8)
+                       | ((uint32_t)in[in_pos + 3]);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            in_pos += 4;
+        }
+        while (bit_count < MAX_CODE_LEN && in_pos < in_size) {
+            bit_buf |= ((uint64_t)in[in_pos++]) << (56 - bit_count);
+            bit_count += 8;
+        }
+        if (bit_count < MAX_CODE_LEN) bit_count = MAX_CODE_LEN;
+        uint32_t e = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int total_len = (e >> 16) & 0xFF;
+        int num_syms  = (e >> 24) & 0xFF;
+        if (total_len == 0) return 0;
+        out[out_pos++] = (uint8_t)(e & 0xFF);
+        if (num_syms == 2 && out_pos < out_size) {
+            out[out_pos++] = (uint8_t)((e >> 8) & 0xFF);
+        }
+        bit_buf <<= total_len;
+        bit_count -= total_len;
+    }
+    return out_pos;
+}
+
+// ── Decode core: 10-bit LUT + 11-bit escape, aligned refill, wide store ─
+// Like decode_stream_one_lane_wstore_aligned, but the LUT is 1024-entry
+// (10-bit index, 4 KB) while codes may be up to 11 bits — no ratio loss.
+// MAX_CODE_LEN (10) is the fast index width; codes can be one bit longer.
+// An escape entry (num_syms == 3) means "length-11 code": the decoder
+// reads the 11th bit to pick byte0 (bit==0) or byte1 (bit==1).
+__device__ __forceinline__ uint32_t decode_stream_one_lane_wstore_aligned_esc(
+    const uint8_t* __restrict__ in, uint32_t in_size,
+    const uint32_t* __restrict__ lut,
+    uint8_t* __restrict__ out, uint32_t out_size)
+{
+    uint64_t bit_buf = 0;
+    int bit_count = 0;
+    uint32_t in_pos = 0;
+    uint32_t out_pos = 0;
+    uint32_t written = 0;
+    uint64_t acc = 0;
+    int pending = 0;
+
+    // Two decodes consume ≤ 2*(MAX_CODE_LEN+1) = 22 bits; refill below 22.
+    while (out_pos + 4 <= out_size) {
+        if (bit_count < 2 * (MAX_CODE_LEN + 1)) {
+            if (in_pos + 4 > in_size) break;
+            uint32_t word = *reinterpret_cast<const uint32_t*>(in + in_pos);
+            uint32_t v = __byte_perm(word, 0, 0x0123);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            in_pos += 4;
+        }
+        // decode A
+        uint32_t e0 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len0 = (e0 >> 16) & 0xFF;
+        int ns0  = (e0 >> 24) & 0xFF;
+        if (len0 == 0) return 0;
+        uint32_t bytes0; int app0;
+        if (ns0 == 3) {  // escape: length-11 code
+            uint32_t b11 = (uint32_t)((bit_buf >> (63 - MAX_CODE_LEN)) & 1u);
+            bytes0 = b11 ? ((e0 >> 8) & 0xFF) : (e0 & 0xFF);
+            app0 = 1;
+        } else {
+            bytes0 = e0 & 0xFFFF;
+            app0 = ns0;
+        }
+        acc |= (uint64_t)bytes0 << (pending * 8);
+        pending += app0;
+        bit_buf <<= len0;
+        bit_count -= len0;
+        out_pos += app0;
+        if (pending >= 4) {
+            *reinterpret_cast<uint32_t*>(out + written) = (uint32_t)acc;
+            acc >>= 32;
+            pending -= 4;
+            written += 4;
+        }
+        // decode B
+        uint32_t e1 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len1 = (e1 >> 16) & 0xFF;
+        int ns1  = (e1 >> 24) & 0xFF;
+        if (len1 == 0) return 0;
+        uint32_t bytes1; int app1;
+        if (ns1 == 3) {
+            uint32_t b11 = (uint32_t)((bit_buf >> (63 - MAX_CODE_LEN)) & 1u);
+            bytes1 = b11 ? ((e1 >> 8) & 0xFF) : (e1 & 0xFF);
+            app1 = 1;
+        } else {
+            bytes1 = e1 & 0xFFFF;
+            app1 = ns1;
+        }
+        acc |= (uint64_t)bytes1 << (pending * 8);
+        pending += app1;
+        bit_buf <<= len1;
+        bit_count -= len1;
+        out_pos += app1;
+        if (pending >= 4) {
+            *reinterpret_cast<uint32_t*>(out + written) = (uint32_t)acc;
+            acc >>= 32;
+            pending -= 4;
+            written += 4;
+        }
+    }
+
+    while (pending > 0) {
+        out[written++] = (uint8_t)(acc & 0xFF);
+        acc >>= 8;
+        pending--;
+    }
+    while (out_pos < out_size) {
+        if (bit_count <= 32 && in_pos + 4 <= in_size) {
+            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
+                       | ((uint32_t)in[in_pos + 1] << 16)
+                       | ((uint32_t)in[in_pos + 2] <<  8)
+                       | ((uint32_t)in[in_pos + 3]);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            in_pos += 4;
+        }
+        while (bit_count < MAX_CODE_LEN + 1 && in_pos < in_size) {
+            bit_buf |= ((uint64_t)in[in_pos++]) << (56 - bit_count);
+            bit_count += 8;
+        }
+        if (bit_count < MAX_CODE_LEN + 1) bit_count = MAX_CODE_LEN + 1;
+        uint32_t e = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int total_len = (e >> 16) & 0xFF;
+        int num_syms  = (e >> 24) & 0xFF;
+        if (total_len == 0) return 0;
+        if (num_syms == 3) {  // escape
+            uint32_t b11 = (uint32_t)((bit_buf >> (63 - MAX_CODE_LEN)) & 1u);
+            out[out_pos++] = (uint8_t)(b11 ? ((e >> 8) & 0xFF) : (e & 0xFF));
+        } else {
+            out[out_pos++] = (uint8_t)(e & 0xFF);
+            if (num_syms == 2 && out_pos < out_size) {
+                out[out_pos++] = (uint8_t)((e >> 8) & 0xFF);
+            }
+        }
+        bit_buf <<= total_len;
+        bit_count -= total_len;
+    }
+    return out_pos;
+}
+
+// ── Decode core: cp.async ring-buffer refill (escape LUT + wide store) ─
+// Same decode as decode_stream_one_lane_wstore_aligned_esc, but the
+// 32-bit bit-buffer refill is fed by an asynchronous global→shared copy
+// (cp.async / LDGSTS) instead of a synchronous global load. The refill
+// word is staged into a small per-lane shared ring CPA_DEPTH words ahead;
+// cp.async removes the ~200-cycle load from the warp's register/scoreboard
+// dependency chain entirely, so it overlaps the serial decode arithmetic.
+// This is the technique nvCOMP's zstd decoder uses (SASS-confirmed).
+// `ring` points at this lane's CPA_DEPTH-slot shared ring (CPA_DEPTH is a
+// power of two). Requires `in` 4-byte aligned (huff_encode_4s_aligned).
+static constexpr int CPA_DEPTH = 4;   // refill words prefetched ahead
+
+__device__ __forceinline__ uint32_t decode_stream_one_lane_cpasync_esc(
+    const uint8_t* __restrict__ in, uint32_t in_size,
+    const uint32_t* __restrict__ lut,
+    uint8_t* __restrict__ out, uint32_t out_size,
+    uint32_t* ring)
+{
+    uint64_t bit_buf = 0;
+    int bit_count = 0;
+    uint32_t out_pos = 0;
+    uint32_t written = 0;
+    uint64_t acc = 0;
+    int pending = 0;
+
+    const uint32_t n_words = in_size >> 2;   // full 32-bit words in the stream
+    uint32_t fetch = 0;     // next word index to cp.async
+    uint32_t consume = 0;   // next word index to read from the ring
+
+    // Prologue: prime CPA_DEPTH pipeline stages. Every iteration commits a
+    // group (a real cp.async if words remain, else an empty group), so the
+    // committed-group count stays exactly CPA_DEPTH ahead of `consume` —
+    // letting every wait use the constant CPA_DEPTH-1.
+    #pragma unroll
+    for (int d = 0; d < CPA_DEPTH; d++) {
+        if (fetch < n_words) {
+            __pipeline_memcpy_async(&ring[fetch & (CPA_DEPTH - 1)], in + fetch * 4, 4);
+            fetch++;
+        }
+        __pipeline_commit();
+    }
+
+    while (out_pos + 4 <= out_size) {
+        if (bit_count < 2 * (MAX_CODE_LEN + 1)) {
+            if (consume >= n_words) break;
+            __pipeline_wait_prior(CPA_DEPTH - 1);   // word `consume` now staged
+            uint32_t word = ring[consume & (CPA_DEPTH - 1)];
+            uint32_t v = __byte_perm(word, 0, 0x0123);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            consume++;
+            // Refill the pipeline: one new group per consumed word.
+            if (fetch < n_words) {
+                __pipeline_memcpy_async(&ring[fetch & (CPA_DEPTH - 1)], in + fetch * 4, 4);
+                fetch++;
+            }
+            __pipeline_commit();
+        }
+        // decode A
+        uint32_t e0 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len0 = (e0 >> 16) & 0xFF;
+        int ns0  = (e0 >> 24) & 0xFF;
+        if (len0 == 0) return 0;
+        uint32_t bytes0; int app0;
+        if (ns0 == 3) {
+            uint32_t b11 = (uint32_t)((bit_buf >> (63 - MAX_CODE_LEN)) & 1u);
+            bytes0 = b11 ? ((e0 >> 8) & 0xFF) : (e0 & 0xFF);
+            app0 = 1;
+        } else {
+            bytes0 = e0 & 0xFFFF;
+            app0 = ns0;
+        }
+        acc |= (uint64_t)bytes0 << (pending * 8);
+        pending += app0;
+        bit_buf <<= len0;
+        bit_count -= len0;
+        out_pos += app0;
+        if (pending >= 4) {
+            *reinterpret_cast<uint32_t*>(out + written) = (uint32_t)acc;
+            acc >>= 32;
+            pending -= 4;
+            written += 4;
+        }
+        // decode B
+        uint32_t e1 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len1 = (e1 >> 16) & 0xFF;
+        int ns1  = (e1 >> 24) & 0xFF;
+        if (len1 == 0) return 0;
+        uint32_t bytes1; int app1;
+        if (ns1 == 3) {
+            uint32_t b11 = (uint32_t)((bit_buf >> (63 - MAX_CODE_LEN)) & 1u);
+            bytes1 = b11 ? ((e1 >> 8) & 0xFF) : (e1 & 0xFF);
+            app1 = 1;
+        } else {
+            bytes1 = e1 & 0xFFFF;
+            app1 = ns1;
+        }
+        acc |= (uint64_t)bytes1 << (pending * 8);
+        pending += app1;
+        bit_buf <<= len1;
+        bit_count -= len1;
+        out_pos += app1;
+        if (pending >= 4) {
+            *reinterpret_cast<uint32_t*>(out + written) = (uint32_t)acc;
+            acc >>= 32;
+            pending -= 4;
+            written += 4;
+        }
+    }
+
+    while (pending > 0) {
+        out[written++] = (uint8_t)(acc & 0xFF);
+        acc >>= 8;
+        pending--;
+    }
+    // Tail: byte loads straight from global, starting past the consumed words.
+    uint32_t in_pos = consume * 4;
+    while (out_pos < out_size) {
+        if (bit_count <= 32 && in_pos + 4 <= in_size) {
+            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
+                       | ((uint32_t)in[in_pos + 1] << 16)
+                       | ((uint32_t)in[in_pos + 2] <<  8)
+                       | ((uint32_t)in[in_pos + 3]);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            in_pos += 4;
+        }
+        while (bit_count < MAX_CODE_LEN + 1 && in_pos < in_size) {
+            bit_buf |= ((uint64_t)in[in_pos++]) << (56 - bit_count);
+            bit_count += 8;
+        }
+        if (bit_count < MAX_CODE_LEN + 1) bit_count = MAX_CODE_LEN + 1;
+        uint32_t e = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int total_len = (e >> 16) & 0xFF;
+        int num_syms  = (e >> 24) & 0xFF;
+        if (total_len == 0) return 0;
+        if (num_syms == 3) {
+            uint32_t b11 = (uint32_t)((bit_buf >> (63 - MAX_CODE_LEN)) & 1u);
+            out[out_pos++] = (uint8_t)(b11 ? ((e >> 8) & 0xFF) : (e & 0xFF));
+        } else {
+            out[out_pos++] = (uint8_t)(e & 0xFF);
+            if (num_syms == 2 && out_pos < out_size) {
+                out[out_pos++] = (uint8_t)((e >> 8) & 0xFF);
+            }
+        }
+        bit_buf <<= total_len;
+        bit_count -= total_len;
+    }
+    return out_pos;
+}
+
+// ── Single-stream decode core, wide (64-bit) output stores ───────────
+// Like decode_stream_one_lane_wstore but flushes 8 bytes per global
+// store, halving store transactions again vs the 32-bit variant. Each
+// decode appends 1-2 bytes; a u64 accumulator can hold at most 8, and an
+// append could otherwise overshoot, so bytes are appended one at a time
+// and an 8-byte store fires the moment 8 are pending (wflush8).
+// Assumes `out` is 8-byte aligned (true for 64 KB blocks: each lane's
+// region starts at a multiple of 16384).
+__device__ __forceinline__ void wflush8(uint64_t& acc, int& pending,
+                                        uint8_t* out, uint32_t& written, uint8_t b)
+{
+    acc |= (uint64_t)b << (pending * 8);
+    if (++pending == 8) {
+        *reinterpret_cast<uint64_t*>(out + written) = acc;
+        written += 8;
+        acc = 0;
+        pending = 0;
+    }
+}
+
+__device__ __forceinline__ uint32_t decode_stream_one_lane_wstore64(
+    const uint8_t* __restrict__ in, uint32_t in_size,
+    const uint32_t* __restrict__ lut,
+    uint8_t* __restrict__ out, uint32_t out_size)
+{
+    uint64_t bit_buf = 0;
+    int bit_count = 0;
+    uint32_t in_pos = 0;
+    uint32_t out_pos = 0;    // total bytes decoded
+    uint32_t written = 0;    // bytes flushed to global (always a multiple of 8)
+    uint64_t acc = 0;        // pending decoded bytes, byte 0 = oldest
+    int pending = 0;         // 0..7 between appends
+
+    while (out_pos + 4 <= out_size) {
+        if (bit_count < 2 * MAX_CODE_LEN) {
+            if (in_pos + 4 > in_size) break;
+            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
+                       | ((uint32_t)in[in_pos + 1] << 16)
+                       | ((uint32_t)in[in_pos + 2] <<  8)
+                       | ((uint32_t)in[in_pos + 3]);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            in_pos += 4;
+        }
+        // decode A
+        uint32_t e0 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len0 = (e0 >> 16) & 0xFF;
+        int ns0  = (e0 >> 24) & 0xFF;
+        if (len0 == 0) return 0;
+        wflush8(acc, pending, out, written, (uint8_t)(e0 & 0xFF));
+        if (ns0 == 2) wflush8(acc, pending, out, written, (uint8_t)((e0 >> 8) & 0xFF));
+        bit_buf <<= len0;
+        bit_count -= len0;
+        out_pos += ns0;
+        // decode B
+        uint32_t e1 = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int len1 = (e1 >> 16) & 0xFF;
+        int ns1  = (e1 >> 24) & 0xFF;
+        if (len1 == 0) return 0;
+        wflush8(acc, pending, out, written, (uint8_t)(e1 & 0xFF));
+        if (ns1 == 2) wflush8(acc, pending, out, written, (uint8_t)((e1 >> 8) & 0xFF));
+        bit_buf <<= len1;
+        bit_count -= len1;
+        out_pos += ns1;
+    }
+
+    // Drain whole pending bytes (written catches up to out_pos), then
+    // finish byte-at-a-time.
+    while (pending > 0) {
+        out[written++] = (uint8_t)(acc & 0xFF);
+        acc >>= 8;
+        pending--;
+    }
+    while (out_pos < out_size) {
+        if (bit_count <= 32 && in_pos + 4 <= in_size) {
+            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
+                       | ((uint32_t)in[in_pos + 1] << 16)
+                       | ((uint32_t)in[in_pos + 2] <<  8)
+                       | ((uint32_t)in[in_pos + 3]);
+            bit_buf |= ((uint64_t)v) << (32 - bit_count);
+            bit_count += 32;
+            in_pos += 4;
+        }
+        while (bit_count < MAX_CODE_LEN && in_pos < in_size) {
+            bit_buf |= ((uint64_t)in[in_pos++]) << (56 - bit_count);
+            bit_count += 8;
+        }
+        if (bit_count < MAX_CODE_LEN) bit_count = MAX_CODE_LEN;
+        uint32_t e = lut[(uint32_t)(bit_buf >> (64 - MAX_CODE_LEN))];
+        int total_len = (e >> 16) & 0xFF;
+        int num_syms  = (e >> 24) & 0xFF;
+        if (total_len == 0) return 0;
+        out[out_pos++] = (uint8_t)(e & 0xFF);
+        if (num_syms == 2 && out_pos < out_size) {
+            out[out_pos++] = (uint8_t)((e >> 8) & 0xFF);
+        }
         bit_buf <<= total_len;
         bit_count -= total_len;
     }
@@ -681,4 +1448,425 @@ extern "C" __global__ void huffDecode4StreamInterleavedKernel(
     uint32_t written = decode_stream_interleaved(stream_base, my_in_size,
                                                  shared_lut, my_out, my_out_size);
     (void)written;
+}
+
+// ── Decoder kernel: software-prefetched, 4 active lanes ──────────────
+// Identical layout/format to huffDecode4StreamKernel (contiguous 9-byte
+// header, 3 × u24 stream sizes). Only the decode core differs:
+// decode_stream_prefetch issues each 32-bit refill load one refill ahead
+// to hide global-load latency — the profiled bottleneck (Long Scoreboard).
+// Launch: <<<n_blocks, 32, LUT_BYTES>>>
+extern "C" __global__ void huffDecode4StreamPrefetchKernel(
+    const uint8_t* __restrict__ comp,
+    const HuffBlockDesc* __restrict__ descs,
+    const uint32_t* __restrict__ luts,
+    uint8_t* __restrict__ output,
+    uint32_t n_blocks)
+{
+    const uint32_t block_id = blockIdx.x;
+    if (block_id >= n_blocks) return;
+
+    const int lane = threadIdx.x & 31;
+    const HuffBlockDesc desc = descs[block_id];
+
+    extern __shared__ uint32_t shared_lut[];
+    const uint32_t* src_lut = luts + desc.lut_offset;
+    for (int i = lane; i < LUT_SIZE; i += 32) shared_lut[i] = src_lut[i];
+    __syncwarp();
+
+    if (lane >= 4) return;
+
+    const uint8_t* hdr = comp + desc.in_offset;
+    uint32_t stream_sizes[4];
+    #pragma unroll
+    for (int s = 0; s < 3; s++) {
+        stream_sizes[s] = (uint32_t)hdr[s*3 + 0]
+                        | ((uint32_t)hdr[s*3 + 1] << 8)
+                        | ((uint32_t)hdr[s*3 + 2] << 16);
+    }
+    uint32_t total_streams = desc.in_size - 9;
+    stream_sizes[3] = total_streams - stream_sizes[0] - stream_sizes[1] - stream_sizes[2];
+
+    uint32_t s_in_off = 0;
+    for (int s = 0; s < lane; s++) s_in_off += stream_sizes[s];
+    const uint8_t* my_in = hdr + 9 + s_in_off;
+    uint32_t my_in_size = stream_sizes[lane];
+
+    uint32_t q = desc.out_size / 4;
+    uint32_t my_out_start = (lane < 3) ? (lane * q) : (3 * q);
+    uint32_t my_out_size  = (lane < 3) ? q : (desc.out_size - 3 * q);
+    uint8_t* my_out = output + desc.out_offset + my_out_start;
+
+    uint32_t written = decode_stream_prefetch(my_in, my_in_size, shared_lut,
+                                              my_out, my_out_size);
+    (void)written;
+}
+
+// ── Decoder kernel: u16 single-symbol LUT, 4 active lanes ────────────
+// Identical layout/format to huffDecode4StreamKernel (contiguous 9-byte
+// header, 3 × u24). The LUT is u16 (4 KB shared vs 8 KB) — this halves
+// the per-warp shared-memory footprint, so the SM's shared-mem-limited
+// block count roughly doubles (NCU: occupancy was capped at 22.9% by
+// the 8 KB LUT). decode_stream_one_lane_lut16 does single-symbol decode.
+// Launch: <<<n_blocks, 32, LUT16_BYTES>>>
+extern "C" __global__ void huffDecode4StreamLut16Kernel(
+    const uint8_t* __restrict__ comp,
+    const HuffBlockDesc* __restrict__ descs,
+    const uint16_t* __restrict__ luts,
+    uint8_t* __restrict__ output,
+    uint32_t n_blocks)
+{
+    const uint32_t block_id = blockIdx.x;
+    if (block_id >= n_blocks) return;
+
+    const int lane = threadIdx.x & 31;
+    const HuffBlockDesc desc = descs[block_id];
+
+    extern __shared__ uint16_t shared_lut16[];
+    const uint16_t* src_lut = luts + desc.lut_offset;
+    for (int i = lane; i < LUT_SIZE; i += 32) shared_lut16[i] = src_lut[i];
+    __syncwarp();
+
+    if (lane >= 4) return;
+
+    const uint8_t* hdr = comp + desc.in_offset;
+    uint32_t stream_sizes[4];
+    #pragma unroll
+    for (int s = 0; s < 3; s++) {
+        stream_sizes[s] = (uint32_t)hdr[s*3 + 0]
+                        | ((uint32_t)hdr[s*3 + 1] << 8)
+                        | ((uint32_t)hdr[s*3 + 2] << 16);
+    }
+    uint32_t total_streams = desc.in_size - 9;
+    stream_sizes[3] = total_streams - stream_sizes[0] - stream_sizes[1] - stream_sizes[2];
+
+    uint32_t s_in_off = 0;
+    for (int s = 0; s < lane; s++) s_in_off += stream_sizes[s];
+    const uint8_t* my_in = hdr + 9 + s_in_off;
+    uint32_t my_in_size = stream_sizes[lane];
+
+    uint32_t q = desc.out_size / 4;
+    uint32_t my_out_start = (lane < 3) ? (lane * q) : (3 * q);
+    uint32_t my_out_size  = (lane < 3) ? q : (desc.out_size - 3 * q);
+    uint8_t* my_out = output + desc.out_offset + my_out_start;
+
+    uint32_t written = decode_stream_one_lane_lut16(my_in, my_in_size, shared_lut16,
+                                                    my_out, my_out_size);
+    (void)written;
+}
+
+// ── Decoder kernel: wide (32-bit) output stores, 4 active lanes ──────
+// Identical layout/format/LUT to huffDecode4StreamKernel (contiguous
+// 9-byte header, u32 dual-symbol LUT). Only the decode core differs:
+// decode_stream_one_lane_wstore batches decoded bytes into 32-bit global
+// stores, cutting store transactions / L2 store traffic ~4× — targeting
+// the L2 SOL ceiling (81.6%) the profiler flagged.
+// Launch: <<<n_blocks, 32, LUT_BYTES>>>
+extern "C" __global__ void huffDecode4StreamWStoreKernel(
+    const uint8_t* __restrict__ comp,
+    const HuffBlockDesc* __restrict__ descs,
+    const uint32_t* __restrict__ luts,
+    uint8_t* __restrict__ output,
+    uint32_t n_blocks)
+{
+    const uint32_t block_id = blockIdx.x;
+    if (block_id >= n_blocks) return;
+
+    const int lane = threadIdx.x & 31;
+    const HuffBlockDesc desc = descs[block_id];
+
+    extern __shared__ uint32_t shared_lut[];
+    const uint32_t* src_lut = luts + desc.lut_offset;
+    for (int i = lane; i < LUT_SIZE; i += 32) shared_lut[i] = src_lut[i];
+    __syncwarp();
+
+    if (lane >= 4) return;
+
+    const uint8_t* hdr = comp + desc.in_offset;
+    uint32_t stream_sizes[4];
+    #pragma unroll
+    for (int s = 0; s < 3; s++) {
+        stream_sizes[s] = (uint32_t)hdr[s*3 + 0]
+                        | ((uint32_t)hdr[s*3 + 1] << 8)
+                        | ((uint32_t)hdr[s*3 + 2] << 16);
+    }
+    uint32_t total_streams = desc.in_size - 9;
+    stream_sizes[3] = total_streams - stream_sizes[0] - stream_sizes[1] - stream_sizes[2];
+
+    uint32_t s_in_off = 0;
+    for (int s = 0; s < lane; s++) s_in_off += stream_sizes[s];
+    const uint8_t* my_in = hdr + 9 + s_in_off;
+    uint32_t my_in_size = stream_sizes[lane];
+
+    uint32_t q = desc.out_size / 4;
+    uint32_t my_out_start = (lane < 3) ? (lane * q) : (3 * q);
+    uint32_t my_out_size  = (lane < 3) ? q : (desc.out_size - 3 * q);
+    uint8_t* my_out = output + desc.out_offset + my_out_start;
+
+    uint32_t written = decode_stream_one_lane_wstore(my_in, my_in_size, shared_lut,
+                                                     my_out, my_out_size);
+    (void)written;
+}
+
+// ── Decoder kernel: wide (64-bit) output stores, 4 active lanes ──────
+// Identical layout/format/LUT to huffDecode4StreamKernel. Decodes with
+// decode_stream_one_lane_wstore64 — 8-byte global stores, halving store
+// transactions again vs the 32-bit wstore kernel.
+// Launch: <<<n_blocks, 32, LUT_BYTES>>>
+extern "C" __global__ void huffDecode4StreamWStore64Kernel(
+    const uint8_t* __restrict__ comp,
+    const HuffBlockDesc* __restrict__ descs,
+    const uint32_t* __restrict__ luts,
+    uint8_t* __restrict__ output,
+    uint32_t n_blocks)
+{
+    const uint32_t block_id = blockIdx.x;
+    if (block_id >= n_blocks) return;
+
+    const int lane = threadIdx.x & 31;
+    const HuffBlockDesc desc = descs[block_id];
+
+    extern __shared__ uint32_t shared_lut[];
+    const uint32_t* src_lut = luts + desc.lut_offset;
+    for (int i = lane; i < LUT_SIZE; i += 32) shared_lut[i] = src_lut[i];
+    __syncwarp();
+
+    if (lane >= 4) return;
+
+    const uint8_t* hdr = comp + desc.in_offset;
+    uint32_t stream_sizes[4];
+    #pragma unroll
+    for (int s = 0; s < 3; s++) {
+        stream_sizes[s] = (uint32_t)hdr[s*3 + 0]
+                        | ((uint32_t)hdr[s*3 + 1] << 8)
+                        | ((uint32_t)hdr[s*3 + 2] << 16);
+    }
+    uint32_t total_streams = desc.in_size - 9;
+    stream_sizes[3] = total_streams - stream_sizes[0] - stream_sizes[1] - stream_sizes[2];
+
+    uint32_t s_in_off = 0;
+    for (int s = 0; s < lane; s++) s_in_off += stream_sizes[s];
+    const uint8_t* my_in = hdr + 9 + s_in_off;
+    uint32_t my_in_size = stream_sizes[lane];
+
+    uint32_t q = desc.out_size / 4;
+    uint32_t my_out_start = (lane < 3) ? (lane * q) : (3 * q);
+    uint32_t my_out_size  = (lane < 3) ? q : (desc.out_size - 3 * q);
+    uint8_t* my_out = output + desc.out_offset + my_out_start;
+
+    uint32_t written = decode_stream_one_lane_wstore64(my_in, my_in_size, shared_lut,
+                                                       my_out, my_out_size);
+    (void)written;
+}
+
+// ── Decoder kernel: aligned 32-bit refill + 32-bit stores ────────────
+// Uses the 4-byte-aligned format (huff_encode_4s_aligned): 12-byte header
+// of 4 × u24 stream sizes, each stream zero-padded to a 4-byte boundary.
+// Every stream start is 4-aligned, so the decode core's refill is one
+// aligned 32-bit load. Combines that with the 32-bit wide output stores.
+// Launch: <<<n_blocks, 32, LUT_BYTES>>>
+extern "C" __global__ void huffDecode4StreamWStoreAlignedKernel(
+    const uint8_t* __restrict__ comp,
+    const HuffBlockDesc* __restrict__ descs,
+    const uint32_t* __restrict__ luts,
+    uint8_t* __restrict__ output,
+    uint32_t n_blocks)
+{
+    const uint32_t block_id = blockIdx.x;
+    if (block_id >= n_blocks) return;
+
+    const int lane = threadIdx.x & 31;
+    const HuffBlockDesc desc = descs[block_id];
+
+    extern __shared__ uint32_t shared_lut[];
+    const uint32_t* src_lut = luts + desc.lut_offset;
+    for (int i = lane; i < LUT_SIZE; i += 32) shared_lut[i] = src_lut[i];
+    __syncwarp();
+
+    if (lane >= 4) return;
+
+    // Header: 4 × u24 LE stream sizes (12 bytes).
+    const uint8_t* hdr = comp + desc.in_offset;
+    uint32_t stream_sizes[4];
+    #pragma unroll
+    for (int s = 0; s < 4; s++) {
+        stream_sizes[s] = (uint32_t)hdr[s*3 + 0]
+                        | ((uint32_t)hdr[s*3 + 1] << 8)
+                        | ((uint32_t)hdr[s*3 + 2] << 16);
+    }
+
+    // Each stream is padded to a 4-byte boundary, so offsets advance by
+    // the rounded-up size.
+    uint32_t s_in_off = 0;
+    for (int s = 0; s < lane; s++) s_in_off += (stream_sizes[s] + 3u) & ~3u;
+    const uint8_t* my_in = hdr + HUFF_4SA_HDR_BYTES + s_in_off;
+    uint32_t my_in_size = stream_sizes[lane];
+
+    uint32_t q = desc.out_size / 4;
+    uint32_t my_out_start = (lane < 3) ? (lane * q) : (3 * q);
+    uint32_t my_out_size  = (lane < 3) ? q : (desc.out_size - 3 * q);
+    uint8_t* my_out = output + desc.out_offset + my_out_start;
+
+    uint32_t written = decode_stream_one_lane_wstore_aligned(my_in, my_in_size, shared_lut,
+                                                             my_out, my_out_size);
+    (void)written;
+}
+
+// ── Decoder kernel: 10-bit-LUT + 11-bit-escape, aligned refill ───────
+// Same aligned format / 4 KB LUT as huffDecode4StreamWStoreAlignedKernel,
+// but codes may be 11 bits — the LUT carries escape entries for them, so
+// occupancy stays doubled (4 KB LUT) at zero compression cost.
+// Launch: <<<n_blocks, 32, LUT_BYTES>>>
+extern "C" __global__ void huffDecode4StreamWStoreAlignedEscKernel(
+    const uint8_t* __restrict__ comp,
+    const HuffBlockDesc* __restrict__ descs,
+    const uint32_t* __restrict__ luts,
+    uint8_t* __restrict__ output,
+    uint32_t n_blocks)
+{
+    const uint32_t block_id = blockIdx.x;
+    if (block_id >= n_blocks) return;
+
+    const int lane = threadIdx.x & 31;
+    const HuffBlockDesc desc = descs[block_id];
+
+    extern __shared__ uint32_t shared_lut[];
+    const uint32_t* src_lut = luts + desc.lut_offset;
+    for (int i = lane; i < LUT_SIZE; i += 32) shared_lut[i] = src_lut[i];
+    __syncwarp();
+
+    if (lane >= 4) return;
+
+    const uint8_t* hdr = comp + desc.in_offset;
+    uint32_t stream_sizes[4];
+    #pragma unroll
+    for (int s = 0; s < 4; s++) {
+        stream_sizes[s] = (uint32_t)hdr[s*3 + 0]
+                        | ((uint32_t)hdr[s*3 + 1] << 8)
+                        | ((uint32_t)hdr[s*3 + 2] << 16);
+    }
+
+    uint32_t s_in_off = 0;
+    for (int s = 0; s < lane; s++) s_in_off += (stream_sizes[s] + 3u) & ~3u;
+    const uint8_t* my_in = hdr + HUFF_4SA_HDR_BYTES + s_in_off;
+    uint32_t my_in_size = stream_sizes[lane];
+
+    uint32_t q = desc.out_size / 4;
+    uint32_t my_out_start = (lane < 3) ? (lane * q) : (3 * q);
+    uint32_t my_out_size  = (lane < 3) ? q : (desc.out_size - 3 * q);
+    uint8_t* my_out = output + desc.out_offset + my_out_start;
+
+    uint32_t written = decode_stream_one_lane_wstore_aligned_esc(my_in, my_in_size, shared_lut,
+                                                                 my_out, my_out_size);
+    (void)written;
+}
+
+// ── Decoder kernel: cp.async ring-buffer refill ──────────────────────
+// Same aligned format / escape LUT as huffDecode4StreamWStoreAlignedEscKernel.
+// Each decode lane refills its bit buffer from a small per-lane shared
+// ring fed by cp.async — targeting the input-load-latency stall (NCU:
+// 33.5% Long Scoreboard on the refill load).
+// Launch: <<<n_blocks, 32, LUT_BYTES>>>
+extern "C" __global__ void huffDecode4StreamCpAsyncEscKernel(
+    const uint8_t* __restrict__ comp,
+    const HuffBlockDesc* __restrict__ descs,
+    const uint32_t* __restrict__ luts,
+    uint8_t* __restrict__ output,
+    uint32_t n_blocks)
+{
+    const uint32_t block_id = blockIdx.x;
+    if (block_id >= n_blocks) return;
+
+    const int lane = threadIdx.x & 31;
+    const HuffBlockDesc desc = descs[block_id];
+
+    extern __shared__ uint32_t shared_lut[];
+    __shared__ uint32_t cpa_ring[4][CPA_DEPTH];   // per decode-lane refill ring
+    const uint32_t* src_lut = luts + desc.lut_offset;
+    for (int i = lane; i < LUT_SIZE; i += 32) shared_lut[i] = src_lut[i];
+    __syncwarp();
+
+    if (lane >= 4) return;
+
+    const uint8_t* hdr = comp + desc.in_offset;
+    uint32_t stream_sizes[4];
+    #pragma unroll
+    for (int s = 0; s < 4; s++) {
+        stream_sizes[s] = (uint32_t)hdr[s*3 + 0]
+                        | ((uint32_t)hdr[s*3 + 1] << 8)
+                        | ((uint32_t)hdr[s*3 + 2] << 16);
+    }
+
+    uint32_t s_in_off = 0;
+    for (int s = 0; s < lane; s++) s_in_off += (stream_sizes[s] + 3u) & ~3u;
+    const uint8_t* my_in = hdr + HUFF_4SA_HDR_BYTES + s_in_off;
+    uint32_t my_in_size = stream_sizes[lane];
+
+    uint32_t q = desc.out_size / 4;
+    uint32_t my_out_start = (lane < 3) ? (lane * q) : (3 * q);
+    uint32_t my_out_size  = (lane < 3) ? q : (desc.out_size - 3 * q);
+    uint8_t* my_out = output + desc.out_offset + my_out_start;
+
+    uint32_t written = decode_stream_one_lane_cpasync_esc(my_in, my_in_size, shared_lut,
+                                                          my_out, my_out_size,
+                                                          &cpa_ring[lane][0]);
+    (void)written;
+}
+
+// ── Decoder kernel: persistent + atomic work queue (tail-effect fix) ──
+// Same per-block decode as huffDecode4StreamWStoreAlignedEscKernel, but
+// launched as a PERSISTENT kernel: grid = exactly one wave of CUDA blocks
+// (SMs × blocks/SM). Each block is a worker that atomically grabs the
+// next Huffman block from a global counter until the queue drains. This
+// targets the partial-wave tail NCU flagged, and load-balances the
+// non-uniform per-block decode durations. `g_counter` must be zeroed
+// before each launch.
+// Launch: <<<one_wave, 32, LUT_BYTES>>>
+extern "C" __global__ void huffDecode4StreamWStoreAlignedEscQueueKernel(
+    const uint8_t* __restrict__ comp,
+    const HuffBlockDesc* __restrict__ descs,
+    const uint32_t* __restrict__ luts,
+    uint8_t* __restrict__ output,
+    uint32_t n_blocks,
+    uint32_t* __restrict__ g_counter)
+{
+    const int lane = threadIdx.x & 31;
+    extern __shared__ uint32_t shared_lut[];
+
+    for (;;) {
+        // Lane 0 grabs the next block index; broadcast to the warp.
+        uint32_t block_id = 0;
+        if (lane == 0) block_id = atomicAdd(g_counter, 1u);
+        block_id = __shfl_sync(0xFFFFFFFFu, block_id, 0);
+        if (block_id >= n_blocks) break;
+
+        const HuffBlockDesc desc = descs[block_id];
+        const uint32_t* src_lut = luts + desc.lut_offset;
+        for (int i = lane; i < LUT_SIZE; i += 32) shared_lut[i] = src_lut[i];
+        __syncwarp();
+
+        if (lane < 4) {
+            const uint8_t* hdr = comp + desc.in_offset;
+            uint32_t stream_sizes[4];
+            #pragma unroll
+            for (int s = 0; s < 4; s++) {
+                stream_sizes[s] = (uint32_t)hdr[s*3 + 0]
+                                | ((uint32_t)hdr[s*3 + 1] << 8)
+                                | ((uint32_t)hdr[s*3 + 2] << 16);
+            }
+            uint32_t s_in_off = 0;
+            for (int s = 0; s < lane; s++) s_in_off += (stream_sizes[s] + 3u) & ~3u;
+            const uint8_t* my_in = hdr + HUFF_4SA_HDR_BYTES + s_in_off;
+            uint32_t my_in_size = stream_sizes[lane];
+
+            uint32_t q = desc.out_size / 4;
+            uint32_t my_out_start = (lane < 3) ? (lane * q) : (3 * q);
+            uint32_t my_out_size  = (lane < 3) ? q : (desc.out_size - 3 * q);
+            uint8_t* my_out = output + desc.out_offset + my_out_start;
+
+            decode_stream_one_lane_wstore_aligned_esc(my_in, my_in_size, shared_lut,
+                                                      my_out, my_out_size);
+        }
+        __syncwarp();  // decode (reads shared_lut) done before next iter's load
+    }
 }
