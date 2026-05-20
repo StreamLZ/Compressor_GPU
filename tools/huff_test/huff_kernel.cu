@@ -498,3 +498,62 @@ extern "C" __global__ void huffDecode4Stream2xKernel(
                                               my_out, my_out_size);
     (void)written;
 }
+
+// ── Decoder kernel: 1 block per warp, only 2 active lanes ─────────────
+// Each of 2 lanes decodes TWO of the block's 4 streams sequentially.
+// Lane 0 -> streams 0,1 ; lane 1 -> streams 2,3. This is the "narrow"
+// counterpart to the 4/8/32-lane variants: it minimizes concurrent LUT
+// lookups (2 lanes -> 2 indices) at the cost of 2x serial work per lane.
+// Launch: <<<n_blocks, 32, LUT_BYTES>>>
+extern "C" __global__ void huffDecode4Stream2LaneKernel(
+    const uint8_t* __restrict__ comp,
+    const HuffBlockDesc* __restrict__ descs,
+    const uint32_t* __restrict__ luts,
+    uint8_t* __restrict__ output,
+    uint32_t n_blocks)
+{
+    const uint32_t block_id = blockIdx.x;
+    if (block_id >= n_blocks) return;
+    const int lane = threadIdx.x & 31;
+    const HuffBlockDesc desc = descs[block_id];
+
+    extern __shared__ uint32_t shared_lut[];
+    const uint32_t* src_lut = luts + desc.lut_offset;
+    for (int i = lane; i < LUT_SIZE; i += 32) shared_lut[i] = src_lut[i];
+    __syncwarp();
+
+    if (lane >= 2) return;
+
+    const uint8_t* hdr = comp + desc.in_offset;
+    uint32_t stream_sizes[4];
+    #pragma unroll
+    for (int s = 0; s < 3; s++) {
+        stream_sizes[s] = (uint32_t)hdr[s*3 + 0]
+                        | ((uint32_t)hdr[s*3 + 1] << 8)
+                        | ((uint32_t)hdr[s*3 + 2] << 16);
+    }
+    stream_sizes[3] = (desc.in_size - 9)
+                    - stream_sizes[0] - stream_sizes[1] - stream_sizes[2];
+
+    uint32_t prefix[4];
+    prefix[0] = 0;
+    prefix[1] = stream_sizes[0];
+    prefix[2] = stream_sizes[0] + stream_sizes[1];
+    prefix[3] = stream_sizes[0] + stream_sizes[1] + stream_sizes[2];
+
+    const uint32_t q = desc.out_size / 4;
+
+    // This lane owns streams (2*lane) and (2*lane + 1).
+    #pragma unroll
+    for (int k = 0; k < 2; k++) {
+        const int s = 2 * lane + k;
+        const uint8_t* my_in = hdr + 9 + prefix[s];
+        uint32_t my_in_size  = stream_sizes[s];
+        uint32_t my_out_start = (s < 3) ? (s * q) : (3 * q);
+        uint32_t my_out_size  = (s < 3) ? q : (desc.out_size - 3 * q);
+        uint8_t* my_out = output + desc.out_offset + my_out_start;
+        uint32_t written = decode_stream_one_lane(my_in, my_in_size, shared_lut,
+                                                  my_out, my_out_size);
+        (void)written;
+    }
+}
