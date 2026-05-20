@@ -145,6 +145,12 @@ fn reencodeGpuWithEntropy(
     /// side using the supplied body sizes.
     tans_encoded_off16_hi: ?[]const u8,
     tans_encoded_off16_lo: ?[]const u8,
+    /// GPU-Huffman off16 hi/lo plane bodies (chunk_type=4, body only —
+    /// no 5-byte chunk header). When both are non-null the off16 branch
+    /// emits chunk_type=4 planes on the GPU's behalf instead of running
+    /// the CPU Huffman encoder; the emitted bytes are identical.
+    huff_off16_hi: ?[]const u8,
+    huff_off16_lo: ?[]const u8,
     /// Phase 2 — shared-LUT (chunk_type=3) pre-encoded bodies. When
     /// non-null, the assembler emits chunk_type=3 streams (with the
     /// kernel's 1-byte lut_id prefix already inside the body) instead
@@ -446,6 +452,53 @@ fn reencodeGpuWithEntropy(
         const lo_n = entropy_enc.encodeArrayU8(allocator, dst[wp..], lo_bytes, options, speed_tradeoff, null, 0, null) catch return 0;
         wp += lo_n;
     } else if (off16_count >= 32) {
+        if (huff_off16_hi != null and huff_off16_lo != null) {
+            // GPU-Huffman off16 (chunk_type=4 per plane). Replicates the
+            // CPU encodeArrayU8Huffman per-plane min(huffman, memcpy)
+            // decision, so the emitted bytes match the CPU path exactly.
+            const hi_body = huff_off16_hi.?;
+            const lo_body = huff_off16_lo.?;
+            // Type-4 chunk (5B hdr + body) beats a memcpy chunk (3B hdr +
+            // raw) when 5 + body < 3 + count  <=>  body + 2 < count.
+            const hi_use_huff = hi_body.len + 2 < off16_count;
+            const lo_use_huff = lo_body.len + 2 < off16_count;
+            const hi_chunk_len: usize = if (hi_use_huff) 5 + hi_body.len else off16_count + 3;
+            const lo_chunk_len: usize = if (lo_use_huff) 5 + lo_body.len else off16_count + 3;
+            const split_total = hi_chunk_len + lo_chunk_len;
+            if (split_total < off16_bytes) {
+                if (wp + 2 + split_total > dst.len) return 0;
+                std.mem.writeInt(u16, dst[wp..][0..2], fast_constants.entropy_coded_16_marker, .little);
+                wp += 2;
+                if (hi_use_huff) {
+                    entropy_enc.writeNonCompactChunkHeader(dst[wp..], 4, @intCast(hi_body.len), @intCast(off16_count));
+                    @memcpy(dst[wp + 5 ..][0..hi_body.len], hi_body);
+                    wp += 5 + hi_body.len;
+                } else {
+                    dst[wp] = @intCast((off16_count >> 16) & 0xFF);
+                    dst[wp + 1] = @intCast((off16_count >> 8) & 0xFF);
+                    dst[wp + 2] = @intCast(off16_count & 0xFF);
+                    for (0..off16_count) |i| dst[wp + 3 + i] = off16_data[i * 2 + 1];
+                    wp += off16_count + 3;
+                }
+                if (lo_use_huff) {
+                    entropy_enc.writeNonCompactChunkHeader(dst[wp..], 4, @intCast(lo_body.len), @intCast(off16_count));
+                    @memcpy(dst[wp + 5 ..][0..lo_body.len], lo_body);
+                    wp += 5 + lo_body.len;
+                } else {
+                    dst[wp] = @intCast((off16_count >> 16) & 0xFF);
+                    dst[wp + 1] = @intCast((off16_count >> 8) & 0xFF);
+                    dst[wp + 2] = @intCast(off16_count & 0xFF);
+                    for (0..off16_count) |i| dst[wp + 3 + i] = off16_data[i * 2];
+                    wp += off16_count + 3;
+                }
+            } else {
+                if (wp + 2 + off16_bytes > dst.len) return 0;
+                std.mem.writeInt(u16, dst[wp..][0..2], @intCast(off16_count), .little);
+                wp += 2;
+                @memcpy(dst[wp..][0..off16_bytes], off16_data);
+                wp += off16_bytes;
+            }
+        } else {
         // off16 hi/lo are entropy-coded with CPU Huffman (chunk_type=4).
         // The GPU tANS off16 encoder mis-encodes ~10pp of silesia content
         // (a GPU-encoder bug, see [[gpu-silesia-off16-bug]]), but
@@ -501,6 +554,7 @@ fn reencodeGpuWithEntropy(
                 @memcpy(dst[wp..][0..off16_bytes], off16_data);
                 wp += off16_bytes;
             }
+        }
         }
     } else {
         if (wp + 2 + off16_bytes > dst.len) return 0;
@@ -1231,6 +1285,30 @@ pub fn compressFramedOne(
             gpu_enc.tans32_off16lo_offsets = null;
         };
 
+        // ── GPU Huffman off16 encode (gated by SLZ_GPU_HUFF) ─────
+        // Entropy-codes the off16 hi/lo planes with the GPU Huffman
+        // encoder instead of the CPU encodeArrayU8Huffman. The emitted
+        // chunk_type=4 bytes are identical to the CPU path.
+        const gpu_off16_huff_encoded: bool =
+            if (opts.level >= 3 and !use_shared_luts and std.c.getenv("SLZ_GPU_HUFF") != null)
+                gpu_enc.gpuEncodeOff16Huff(allocator, gpu_out, descs, comp_sizes)
+            else
+                false;
+        defer if (gpu_off16_huff_encoded) {
+            // hi_data and lo_data share the same backing buffer; free once.
+            if (gpu_enc.huff_off16hi_sizes) |s| allocator.free(s);
+            if (gpu_enc.huff_off16lo_sizes) |s| allocator.free(s);
+            if (gpu_enc.huff_off16hi_offsets) |o| allocator.free(o);
+            if (gpu_enc.huff_off16lo_offsets) |o| allocator.free(o);
+            if (gpu_enc.huff_off16hi_data) |d| allocator.free(d);
+            gpu_enc.huff_off16hi_sizes = null;
+            gpu_enc.huff_off16hi_data = null;
+            gpu_enc.huff_off16hi_offsets = null;
+            gpu_enc.huff_off16lo_sizes = null;
+            gpu_enc.huff_off16lo_data = null;
+            gpu_enc.huff_off16lo_offsets = null;
+        };
+
         var is_first_tans32_in_frame: bool = true;
 
         // ── Paired-literal pre-pass ──────────────────────────────────
@@ -1472,6 +1550,33 @@ pub fn compressFramedOne(
                             if (off + sz > data.len) break :blk_lo null;
                             break :blk_lo data[off..][0..sz];
                         };
+                        // GPU-Huffman off16 plane bodies for this sub-chunk
+                        // (chunk_type=4 body, no 5-byte header). sz == 0
+                        // marks an empty descriptor — fall back to CPU.
+                        const huff_off16hi_slice: ?[]const u8 = blk_hh: {
+                            if (!gpu_off16_huff_encoded) break :blk_hh null;
+                            const sizes = gpu_enc.huff_off16hi_sizes orelse break :blk_hh null;
+                            const data = gpu_enc.huff_off16hi_data orelse break :blk_hh null;
+                            const offs = gpu_enc.huff_off16hi_offsets orelse break :blk_hh null;
+                            if (gpu_bi_idx >= sizes.len) break :blk_hh null;
+                            const sz = sizes[gpu_bi_idx];
+                            if (sz == 0) break :blk_hh null;
+                            const off = offs[gpu_bi_idx];
+                            if (off + sz > data.len) break :blk_hh null;
+                            break :blk_hh data[off..][0..sz];
+                        };
+                        const huff_off16lo_slice: ?[]const u8 = blk_hl: {
+                            if (!gpu_off16_huff_encoded) break :blk_hl null;
+                            const sizes = gpu_enc.huff_off16lo_sizes orelse break :blk_hl null;
+                            const data = gpu_enc.huff_off16lo_data orelse break :blk_hl null;
+                            const offs = gpu_enc.huff_off16lo_offsets orelse break :blk_hl null;
+                            if (gpu_bi_idx >= sizes.len) break :blk_hl null;
+                            const sz = sizes[gpu_bi_idx];
+                            if (sz == 0) break :blk_hl null;
+                            const off = offs[gpu_bi_idx];
+                            if (off + sz > data.len) break :blk_hl null;
+                            break :blk_hl data[off..][0..sz];
+                        };
                         // Phase 2 shared-LUT slices for this sub-chunk
                         // (kernel output: [1B lut_id][128B sizes+states][sub-streams]).
                         const N_shared: u32 = gpu_enc.tans32_shared_n_per_stream;
@@ -1536,6 +1641,8 @@ pub fn compressFramedOne(
                             gpu_tok_pre,
                             gpu_off16hi_pre,
                             gpu_off16lo_pre,
+                            huff_off16hi_slice,
+                            huff_off16lo_slice,
                             shared_lit_slice,
                             shared_tok_slice,
                             shared_hi_slice,
