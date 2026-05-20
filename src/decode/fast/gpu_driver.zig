@@ -208,6 +208,25 @@ fn ensureDeviceOutput(size: usize) bool {
     return ensureDeviceBuf(&d_output, &d_output_size, size);
 }
 
+/// Page-locked (pinned) host allocation. D2H/H2D against pinned memory runs
+/// at full PCIe bandwidth (~2x pageable, which the driver stages chunk-wise
+/// through an internal pinned buffer) and is genuinely async-capable.
+/// Returns null when CUDA is unavailable — caller falls back to a normal
+/// allocation, so this is always safe to attempt.
+pub fn allocHost(size: usize) ?[]u8 {
+    if (!init()) return null;
+    const f = cuMemAllocHost_fn orelse return null;
+    var p: ?*anyopaque = null;
+    if (f(&p, size) != CUDA_SUCCESS) return null;
+    const base = p orelse return null;
+    return @as([*]u8, @ptrCast(base))[0..size];
+}
+
+pub fn freeHost(buf: []u8) void {
+    const f = cuMemFreeHost_fn orelse return;
+    _ = f(@ptrCast(buf.ptr));
+}
+
 // ── Full GPU decode ─────────────────────────────────────────────
 // Two-pass pipeline:
 //   Pass 1: Launch tANS decode kernel for chunks with tANS literals

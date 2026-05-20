@@ -946,12 +946,36 @@ fn runBenchDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
         if (dict_mod.findById(did)) |d| d.data.len + decoder.safe_space else 0
     else
         0;
-    const dst = allocator.alloc(u8, content_size + decoder.safe_space + db_dict_overhead) catch |err| {
-        try w.print("error: cannot allocate {d} bytes: {s}\n", .{ content_size + decoder.safe_space + db_dict_overhead, @errorName(err) });
-        try w.flush();
-        std.process.exit(1);
+    const use_gpu_bench = comptime blk: {
+        const bo = @import("build_options");
+        break :blk if (@hasDecl(bo, "gpu")) bo.gpu else false;
     };
-    defer allocator.free(dst);
+
+    // GPU decode pins the output buffer so the D2H of the decompressed
+    // output — the single biggest copy in end-to-end decode — runs at full
+    // PCIe bandwidth instead of ~half on pageable memory. Falls back to a
+    // normal allocation when CUDA is unavailable.
+    const dst_size = content_size + decoder.safe_space + db_dict_overhead;
+    const DstBuf = struct { buf: []u8, pinned: bool };
+    const dh: DstBuf = dstblk: {
+        if (use_gpu_bench) {
+            const gpu_drv = @import("decode/fast/gpu_driver.zig");
+            if (gpu_drv.allocHost(dst_size)) |p|
+                break :dstblk .{ .buf = p, .pinned = true };
+        }
+        break :dstblk .{ .buf = allocator.alloc(u8, dst_size) catch |err| {
+            try w.print("error: cannot allocate {d} bytes: {s}\n", .{ dst_size, @errorName(err) });
+            try w.flush();
+            std.process.exit(1);
+        }, .pinned = false };
+    };
+    const dst = dh.buf;
+    defer {
+        if (use_gpu_bench and dh.pinned) {
+            const gpu_drv = @import("decode/fast/gpu_driver.zig");
+            gpu_drv.freeHost(dst);
+        } else allocator.free(dst);
+    }
 
     var dec_ctx = decoder.DecompressContext.initThreadedWithIo(allocator, io, args.threads);
     defer dec_ctx.deinit();
@@ -961,11 +985,6 @@ fn runBenchDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
         try w.print("error: decompression failed: {s}\n", .{@errorName(err)});
         try w.flush();
         std.process.exit(1);
-    };
-
-    const use_gpu_bench = comptime blk: {
-        const bo = @import("build_options");
-        break :blk if (@hasDecl(bo, "gpu")) bo.gpu else false;
     };
 
     var best_ns: u64 = std.math.maxInt(u64);
