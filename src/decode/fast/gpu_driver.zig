@@ -52,6 +52,7 @@ const FnMemsetD8 = *const fn (CUdeviceptr, u8, usize) callconv(.c) CUresult;
 const FnStreamCreate = *const fn (*usize, c_uint) callconv(.c) CUresult;
 const FnStreamSync = *const fn (usize) callconv(.c) CUresult;
 const FnMemcpyHtoDAsync = *const fn (CUdeviceptr, *const anyopaque, usize, usize) callconv(.c) CUresult;
+const FnMemcpyDtoDAsync = *const fn (CUdeviceptr, CUdeviceptr, usize, usize) callconv(.c) CUresult;
 const FnMemsetD8Async = *const fn (CUdeviceptr, u8, usize, usize) callconv(.c) CUresult;
 const FnMemAllocHost = *const fn (*?*anyopaque, usize) callconv(.c) CUresult;
 const FnMemFreeHost = *const fn (*anyopaque) callconv(.c) CUresult;
@@ -71,6 +72,7 @@ var cuMemsetD8_fn: ?FnMemsetD8 = null;
 var cuStreamCreate_fn: ?FnStreamCreate = null;
 var cuStreamSync_fn: ?FnStreamSync = null;
 var cuMemcpyHtoDAsync_fn: ?FnMemcpyHtoDAsync = null;
+var cuMemcpyDtoDAsync_fn: ?FnMemcpyDtoDAsync = null;
 var cuMemsetD8Async_fn: ?FnMemsetD8Async = null;
 var cuMemAllocHost_fn: ?FnMemAllocHost = null;
 var cuMemFreeHost_fn: ?FnMemFreeHost = null;
@@ -112,6 +114,7 @@ pub fn init() bool {
     cuStreamCreate_fn = getProc(FnStreamCreate, "cuStreamCreate_v2") orelse getProc(FnStreamCreate, "cuStreamCreate");
     cuStreamSync_fn = getProc(FnStreamSync, "cuStreamSynchronize_v2") orelse getProc(FnStreamSync, "cuStreamSynchronize");
     cuMemcpyHtoDAsync_fn = getProc(FnMemcpyHtoDAsync, "cuMemcpyHtoDAsync_v2");
+    cuMemcpyDtoDAsync_fn = getProc(FnMemcpyDtoDAsync, "cuMemcpyDtoDAsync_v2");
     cuMemsetD8Async_fn = getProc(FnMemsetD8Async, "cuMemsetD8Async");
     cuMemAllocHost_fn = getProc(FnMemAllocHost, "cuMemAllocHost_v2");
     cuMemFreeHost_fn = getProc(FnMemFreeHost, "cuMemFreeHost");
@@ -1191,11 +1194,26 @@ pub fn fullGpuLaunch(
             e2e_cum_postscan_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
         };
 
-        // Upload raw (type 0) off16 sub-streams to GPU (before timer)
-        for (0..scan.num_raw_off16) |ri| {
-            const rd = raw_off16_buf[ri];
-            if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len) {
-                _ = h2d_fn(d_tans_off16_scratch + rd.gpu_offset, @ptrCast(compressed_block.ptr + rd.src_offset), rd.size);
+        // Place raw (type 0) off16 sub-streams into the off16 scratch.
+        // The bytes are already on the GPU — the whole compressed blob was
+        // uploaded to d_comp_persist — so copy device-to-device, async, on
+        // the default stream and sync once. This replaces 1526 separate
+        // host-blocking cuMemcpyHtoD calls (~15 ms) with pipelined on-device
+        // copies (~1-2 ms).
+        if (cuMemcpyDtoDAsync_fn) |d2d| {
+            for (0..scan.num_raw_off16) |ri| {
+                const rd = raw_off16_buf[ri];
+                if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len) {
+                    _ = d2d(d_tans_off16_scratch + rd.gpu_offset, d_comp_persist + rd.src_offset, rd.size, 0);
+                }
+            }
+            if (scan.num_raw_off16 > 0) _ = sync_fn();
+        } else {
+            for (0..scan.num_raw_off16) |ri| {
+                const rd = raw_off16_buf[ri];
+                if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len) {
+                    _ = h2d_fn(d_tans_off16_scratch + rd.gpu_offset, @ptrCast(compressed_block.ptr + rd.src_offset), rd.size);
+                }
             }
         }
     }
