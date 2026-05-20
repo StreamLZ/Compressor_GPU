@@ -1811,3 +1811,51 @@ globally evaluate token cost vs decode overhead. With a greedy/lazy
 parser, local truncation decisions create worse output. StreamLZ's L6+
 High codec already uses an optimal parser, and the Fast codec's token
 decisions are already well-tuned for the greedy/lazy tradeoff.
+
+---
+
+## Word-interleaved 4-stream GPU Huffman layout (2026-05-19)
+
+**Context**: The GPU Huffman decoder (`tools/huff_test/`) decodes a 64 KB
+block as 4 independent bitstreams, one per warp lane (4 active lanes of
+32). Nsight Compute profiled the 4-lane kernel as **latency/stall-bound**:
+Compute 38.9%, DRAM 12%, 8.79 warp-cycles per issued instruction, and the
+dominant stall was **Long Scoreboard at 43.5%** (global-load latency). NCU
+also flagged the per-lane input refill as badly uncoalesced — the 4 lanes
+read 4 streams 16 KB apart, so each 32-byte memory sector delivered only
+~1.2 useful bytes (67% excess sectors).
+
+**Experiment**: Store the 4 encoded streams INTERLEAVED at 32-bit-word
+granularity — `[hdr][s0.w0][s1.w0][s2.w0][s3.w0][s0.w1]...` — so the 4
+decode lanes' word-`w` refill loads hit 16 contiguous bytes and coalesce
+into one sector instead of four scattered ones. New encoder
+(`huff_encode_4s_interleaved`), strided decode core
+(`decode_stream_interleaved`), and kernel
+(`huffDecode4StreamInterleavedKernel`).
+
+**Results** (realistic per-block-LUT bench, distinct 64 KB blocks):
+
+| Dataset | Contiguous 4-stream | Word-interleaved |
+|---------|---------------------|------------------|
+| enwik8  | 19.3 GB/s           | 19.0 GB/s        |
+| silesia | 19.0 GB/s           | 19.0 GB/s        |
+
+No speed gain (slightly worse), and it cost ratio — enwik8 64.0% → 66.7%,
+silesia 61.9% → 64.4% (+2.5-2.7pp) from per-stream word padding plus the
+interleaved payload running to the longest stream's length.
+
+**Why interleaving doesn't help**: coalescing fixes **bandwidth**, not
+**latency**. The kernel is latency-bound — 4 scattered loads and 1
+coalesced load incur the *same* ~200-cycle wait (issued together, return
+together). Reducing the sector count lowers transaction traffic but does
+nothing for how long the warp stalls. The "uncoalesced loads" NCU metric
+was a *symptom*, not the bottleneck.
+
+**Lesson**: For a latency-bound kernel, optimize for latency *overlap*
+(software prefetch — issue the refill load ahead of when it's consumed)
+or latency *reduction* (move the data to a faster memory space), not for
+transaction efficiency. Coalescing is a bandwidth-bound lever. Always
+confirm bound type before picking the fix — and a profiler metric being
+"bad" does not make it the critical path. The interleaved code is kept
+in `tools/huff_test/` as a documented dead end; the contiguous 4-stream
+kernel remains the baseline.
