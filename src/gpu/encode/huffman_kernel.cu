@@ -3,9 +3,9 @@
 //   slzHuffBuildTablesKernel  — histogram + canonical code-length build.
 //   slzHuffEncode4StreamKernel — pack a sub-chunk into a chunk_type=4 body.
 //
-// Both mirror the production CPU encoder `huffman_encoder.zig` exactly, so
-// the output pairs bit-for-bit with the production Huffman decoder. Codes
-// are canonical and height-limited to `ENC_MAX_CODE_LEN` (11) bits.
+// Both mirror the production CPU Huffman encoder exactly, so the output
+// pairs bit-for-bit with the production Huffman decoder. Codes are
+// canonical and height-limited to `ENC_MAX_CODE_LEN` (11) bits.
 //
 // Developed and verified byte-identical to a CPU oracle in the standalone
 // harness tools/huff_test/ before being backported here.
@@ -16,7 +16,7 @@
 #include "../common/gpu_huffman.cuh"  // HUFF_* constants, weights pack, buildCanonicalCodes
 
 // Canonical-Huffman height limit — an alias of the shared
-// HUFF_MAX_CODE_LEN (11). Matches huffman_encoder.zig MAX_CODE_LEN.
+// HUFF_MAX_CODE_LEN (11), the same limit the CPU Huffman encoder uses.
 // gpu_huffman.cuh ties the LUT index width on the decode side to this
 // value with a static_assert, so the old hand-maintained "must equal
 // MAX_CODE_LEN + 1" invariant is now compiler-checked.
@@ -81,9 +81,9 @@ __device__ __forceinline__ uint32_t encodeStreamOneLane(
 // ── Table builder — one block per sub-chunk, WARP_SIZE lanes ─────────
 //
 // 32 lanes histogram the input into shared memory (atomicAdd); lane 0 then
-// serially builds canonical code lengths and codes. Mirrors
-// huffman_encoder.zig: buildCodeLengths -> Kraft-sum fixed-point height
-// limiting (1<<KRAFT_PRECISION_BITS budget) -> assignCanonicalCodes.
+// serially builds canonical code lengths and codes. Mirrors the CPU
+// Huffman encoder: build code lengths -> Kraft-sum fixed-point height
+// limiting (1<<KRAFT_PRECISION_BITS budget) -> assign canonical codes.
 //
 // Writes code_lengths[256] (u8) + codes[256] (u32) per block, strided by
 // `tables_stride` (= HUFF_ALPHABET; a runtime parameter that never varies).
@@ -128,8 +128,8 @@ extern "C" __global__ void slzHuffBuildTablesKernel(
 
         if (symbols_used == 1) {
             // Degenerate single-symbol alphabet: a 1-bit code. Deliberate
-            // path matching huffman_encoder.zig; the decoder LUT fan-out
-            // handles length-1 codes.
+            // path matching the CPU Huffman encoder; the decoder LUT
+            // fan-out handles length-1 codes.
             code_lengths[used_symbols[0]] = 1;
         } else if (symbols_used >= 2) {
             int n_active = symbols_used;
@@ -209,8 +209,8 @@ extern "C" __global__ void slzHuffBuildTablesKernel(
 
 // ── 4-stream encoder — one block per sub-chunk, lanes 0..3 active ────
 //
-// Emits the chunk_type=4 body (huffman_encoder.zig encodeBlock, minus the
-// 5-byte chunk header which the frame assembler prepends):
+// Emits the chunk_type=4 body (the CPU encoder's encode-block output,
+// minus the 5-byte chunk header which the frame assembler prepends):
 //   [128 B weights — 4 bits/symbol, byte i = cl[2i] | cl[2i+1]<<4]
 //   [9 B sub-header — 3 × u24 LE stream sizes; stream 3 derived]
 //   [stream 0 | stream 1 | stream 2 | stream 3]

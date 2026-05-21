@@ -14,7 +14,7 @@
 
 // ── Code-height limit ───────────────────────────────────────────
 // Canonical codes are height-limited to HUFF_MAX_CODE_LEN bits
-// (matches huffman_encoder.zig MAX_CODE_LEN). The decode fast-LUT is
+// (the same limit the CPU Huffman encoder uses). The decode fast-LUT is
 // indexed by HUFF_LUT_INDEX_BITS bits; an HUFF_MAX_CODE_LEN-bit code
 // cannot be resolved by that prefix and instead uses an escape LUT
 // entry (the decoder then reads one extra bit). The two constants are

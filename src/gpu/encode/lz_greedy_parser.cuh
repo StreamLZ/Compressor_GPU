@@ -309,8 +309,8 @@ __device__ void scanBlock(
         // enable_match_rehash: match-range rehash. Insert hash-table
         // entries for positions *inside* the just-emitted match at
         // exponentially spaced offsets, so later positions can
-        // reference mid-match. Port of CPU emitMatch's level>=2 rehash
-        // (fast_lz_parser.zig runGreedyParser).
+        // reference mid-match. Port of the CPU greedy parser's
+        // level>=2 match rehash.
         if (enable_match_rehash) {
             uint32_t ri = 1u << lane;
             if (ri < match_len) {
