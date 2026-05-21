@@ -1149,6 +1149,47 @@ pub fn fullGpuLaunchImpl(
 
         merged_count = scan.num_lit + scan.num_tok + scan.num_off16hi + scan.num_off16lo;
 
+        // ── Debug: scan snapshot (SLZ_DUMP_SCAN=1) ────────────────
+        // Dumps the scanForTansChunks input (chunk_descs + compressed
+        // block) and its output (the four Huffman descriptor arrays +
+        // the raw-off16 list) for the GPU scan-kernel testbed in
+        // tools/huff_test/. Inert without the env var.
+        if (std.c.getenv("SLZ_DUMP_SCAN") != null) dumpScan: {
+            const cio = @cImport({
+                @cInclude("stdio.h");
+            });
+            const fp = cio.fopen("c:/tmp/scan_dump.bin", "wb") orelse break :dumpScan;
+            defer _ = cio.fclose(fp);
+            var hdr = [_]u32{
+                0x53434E31, // 'SCN1'
+                @intCast(chunk_descs.len),
+                sub_chunk_cap,
+                @intCast(compressed_block.len),
+            };
+            _ = cio.fwrite(&hdr, 4, 4, fp);
+            _ = cio.fwrite(chunk_descs.ptr, @sizeOf(ChunkDesc), chunk_descs.len, fp);
+            if (compressed_block.len > 0)
+                _ = cio.fwrite(compressed_block.ptr, 1, compressed_block.len, fp);
+            const huff_streams = [_]struct { buf: []const HuffDecChunkDesc, n: u32 }{
+                .{ .buf = &self.huff_lit_host_buf, .n = scan.num_huff_lit },
+                .{ .buf = &self.huff_tok_host_buf, .n = scan.num_huff_tok },
+                .{ .buf = &self.huff_off16hi_host_buf, .n = scan.num_huff_off16hi },
+                .{ .buf = &self.huff_off16lo_host_buf, .n = scan.num_huff_off16lo },
+            };
+            for (huff_streams) |hs| {
+                var n = [_]u32{hs.n};
+                _ = cio.fwrite(&n, 4, 1, fp);
+                _ = cio.fwrite(hs.buf.ptr, @sizeOf(HuffDecChunkDesc), hs.n, fp);
+            }
+            var nraw = [_]u32{scan.num_raw_off16};
+            _ = cio.fwrite(&nraw, 4, 1, fp);
+            for (0..scan.num_raw_off16) |ri| {
+                const rd = self.raw_off16_buf[ri];
+                var t = [_]u32{ rd.src_offset, rd.size, rd.gpu_offset };
+                _ = cio.fwrite(&t, 4, 3, fp);
+            }
+        }
+
         if (t_e2e0) |t0| if (io) |iv| {
             e2e_cum_postscan_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
         };
