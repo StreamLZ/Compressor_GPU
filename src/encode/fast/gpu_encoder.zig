@@ -200,17 +200,6 @@ pub const HuffEncDesc = extern struct {
     dst_capacity: u32,
 };
 
-// Persistent buffers for the 32-lane tANS pass.
-var d_tans32_descs_persist: CUdeviceptr = 0;
-var d_tans32_descs_size: usize = 0;
-var d_tans32_out_persist: CUdeviceptr = 0;
-var d_tans32_out_size: usize = 0;
-var d_tans32_sizes_persist: CUdeviceptr = 0;
-var d_tans32_sizes_size: usize = 0;
-// Phase 2 shared encode tables — 4 × Tans32EncodeTable in device memory.
-var d_tans32_shared_tables: CUdeviceptr = 0;
-var d_tans32_shared_tables_size: usize = 0;
-
 /// Launch the 32-lane tANS encoder on a batch of streams already
 /// resident in device memory (`d_input_persist` from the LZ encode
 /// pass). Writes encoded bytes to a fresh device buffer and downloads
@@ -222,6 +211,17 @@ var d_tans32_shared_tables_size: usize = 0;
 ///
 /// Returns true on success. Caller owns the returned slices.
 pub fn gpuEncodeTans32(
+    allocator: std.mem.Allocator,
+    descs: []const Tans32EncDesc,
+    total_dst_bytes: usize,
+    out_sizes: []u32,
+    out_bytes: []u8,
+) bool {
+    return gpuEncodeTans32Impl(&g_default, allocator, descs, total_dst_bytes, out_sizes, out_bytes);
+}
+
+fn gpuEncodeTans32Impl(
+    self: *EncodeContext,
     allocator: std.mem.Allocator,
     descs: []const Tans32EncDesc,
     total_dst_bytes: usize,
@@ -244,20 +244,20 @@ pub fn gpuEncodeTans32(
     const desc_bytes: usize = descs.len * @sizeOf(Tans32EncDesc);
     const sizes_bytes: usize = descs.len * 4;
 
-    if (!ensureBuf(&d_tans32_descs_persist, &d_tans32_descs_size, desc_bytes)) return false;
-    if (!ensureBuf(&d_tans32_out_persist, &d_tans32_out_size, total_dst_bytes)) return false;
-    if (!ensureBuf(&d_tans32_sizes_persist, &d_tans32_sizes_size, sizes_bytes)) return false;
+    if (!ensureBuf(&self.d_tans32_descs_persist, &self.d_tans32_descs_size, desc_bytes)) return false;
+    if (!ensureBuf(&self.d_tans32_out_persist, &self.d_tans32_out_size, total_dst_bytes)) return false;
+    if (!ensureBuf(&self.d_tans32_sizes_persist, &self.d_tans32_sizes_size, sizes_bytes)) return false;
 
-    _ = h2d_fn(d_tans32_descs_persist, @ptrCast(descs.ptr), desc_bytes);
-    _ = memset_fn(d_tans32_sizes_persist, 0, sizes_bytes);
+    _ = h2d_fn(self.d_tans32_descs_persist, @ptrCast(descs.ptr), desc_bytes);
+    _ = memset_fn(self.d_tans32_sizes_persist, 0, sizes_bytes);
     _ = sync_fn();
 
     // Source streams (literals, tokens, off16) live in the LZ-encode
     // OUTPUT buffer (d_output_persist) where the LZ kernel wrote them.
-    var p_src = d_output_persist;
-    var p_dst = d_tans32_out_persist;
-    var p_descs = d_tans32_descs_persist;
-    var p_sizes = d_tans32_sizes_persist;
+    var p_src = self.d_output_persist;
+    var p_dst = self.d_tans32_out_persist;
+    var p_descs = self.d_tans32_descs_persist;
+    var p_sizes = self.d_tans32_sizes_persist;
     var p_n: u32 = n;
     var params = [_]?*anyopaque{
         @ptrCast(&p_src), @ptrCast(&p_dst), @ptrCast(&p_descs),
@@ -269,25 +269,12 @@ pub fn gpuEncodeTans32(
     if (launch_fn(tans32_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return false;
     if (sync_fn() != CUDA_SUCCESS) return false;
 
-    _ = d2h_fn(@ptrCast(out_sizes.ptr), d_tans32_sizes_persist, sizes_bytes);
-    _ = d2h_fn(@ptrCast(out_bytes.ptr), d_tans32_out_persist, total_dst_bytes);
+    _ = d2h_fn(@ptrCast(out_sizes.ptr), self.d_tans32_sizes_persist, sizes_bytes);
+    _ = d2h_fn(@ptrCast(out_bytes.ptr), self.d_tans32_out_persist, total_dst_bytes);
     return true;
 }
 
 // ── GPU Huffman encode pass ────────────────────────────────────
-// Persistent device buffers for the two-kernel Huffman encode.
-var d_huff_descs_persist: CUdeviceptr = 0;
-var d_huff_descs_size: usize = 0;
-var d_huff_cl_persist: CUdeviceptr = 0;
-var d_huff_cl_size: usize = 0;
-var d_huff_codes_persist: CUdeviceptr = 0;
-var d_huff_codes_size: usize = 0;
-var d_huff_scratch_persist: CUdeviceptr = 0;
-var d_huff_scratch_size: usize = 0;
-var d_huff_out_persist: CUdeviceptr = 0;
-var d_huff_out_size: usize = 0;
-var d_huff_sizes_persist: CUdeviceptr = 0;
-var d_huff_sizes_size: usize = 0;
 
 /// Run the GPU Huffman encoder on a batch of streams already resident in
 /// the LZ-encode output buffer (`d_output_persist`). Launches the table
@@ -301,6 +288,16 @@ var d_huff_sizes_size: usize = 0;
 ///
 /// Returns true on success. Caller owns the returned slices.
 pub fn gpuEncodeHuff(
+    descs: []const HuffEncDesc,
+    total_dst_bytes: usize,
+    out_sizes: []u32,
+    out_bytes: []u8,
+) bool {
+    return gpuEncodeHuffImpl(&g_default, descs, total_dst_bytes, out_sizes, out_bytes);
+}
+
+fn gpuEncodeHuffImpl(
+    self: *EncodeContext,
     descs: []const HuffEncDesc,
     total_dst_bytes: usize,
     out_sizes: []u32,
@@ -333,22 +330,22 @@ pub fn gpuEncodeHuff(
     const codes_bytes: usize = descs.len * 256 * 4;
     const scratch_bytes: usize = descs.len * 4 * scratch_per_stream;
 
-    if (!ensureBuf(&d_huff_descs_persist, &d_huff_descs_size, desc_bytes)) return false;
-    if (!ensureBuf(&d_huff_cl_persist, &d_huff_cl_size, cl_bytes)) return false;
-    if (!ensureBuf(&d_huff_codes_persist, &d_huff_codes_size, codes_bytes)) return false;
-    if (!ensureBuf(&d_huff_scratch_persist, &d_huff_scratch_size, scratch_bytes)) return false;
-    if (!ensureBuf(&d_huff_out_persist, &d_huff_out_size, total_dst_bytes)) return false;
-    if (!ensureBuf(&d_huff_sizes_persist, &d_huff_sizes_size, sizes_bytes)) return false;
+    if (!ensureBuf(&self.d_huff_descs_persist, &self.d_huff_descs_size, desc_bytes)) return false;
+    if (!ensureBuf(&self.d_huff_cl_persist, &self.d_huff_cl_size, cl_bytes)) return false;
+    if (!ensureBuf(&self.d_huff_codes_persist, &self.d_huff_codes_size, codes_bytes)) return false;
+    if (!ensureBuf(&self.d_huff_scratch_persist, &self.d_huff_scratch_size, scratch_bytes)) return false;
+    if (!ensureBuf(&self.d_huff_out_persist, &self.d_huff_out_size, total_dst_bytes)) return false;
+    if (!ensureBuf(&self.d_huff_sizes_persist, &self.d_huff_sizes_size, sizes_bytes)) return false;
 
-    _ = h2d_fn(d_huff_descs_persist, @ptrCast(descs.ptr), desc_bytes);
-    _ = memset_fn(d_huff_sizes_persist, 0, sizes_bytes);
+    _ = h2d_fn(self.d_huff_descs_persist, @ptrCast(descs.ptr), desc_bytes);
+    _ = memset_fn(self.d_huff_sizes_persist, 0, sizes_bytes);
     _ = sync_fn();
 
     // Kernel 1: build per-block Huffman tables from the source streams.
-    var p_src = d_output_persist;
-    var p_descs = d_huff_descs_persist;
-    var p_cl = d_huff_cl_persist;
-    var p_codes = d_huff_codes_persist;
+    var p_src = self.d_output_persist;
+    var p_descs = self.d_huff_descs_persist;
+    var p_cl = self.d_huff_cl_persist;
+    var p_codes = self.d_huff_codes_persist;
     var p_stride: u32 = 256;
     var p_n: u32 = n;
     var tbl_params = [_]?*anyopaque{
@@ -360,9 +357,9 @@ pub fn gpuEncodeHuff(
         return false;
 
     // Kernel 2: pack each sub-chunk into a chunk_type=4 body.
-    var p_scratch = d_huff_scratch_persist;
-    var p_out = d_huff_out_persist;
-    var p_sizes = d_huff_sizes_persist;
+    var p_scratch = self.d_huff_scratch_persist;
+    var p_out = self.d_huff_out_persist;
+    var p_sizes = self.d_huff_sizes_persist;
     var p_sps: u32 = @intCast(scratch_per_stream);
     var enc_params = [_]?*anyopaque{
         @ptrCast(&p_src),     @ptrCast(&p_descs), @ptrCast(&p_cl),
@@ -374,28 +371,65 @@ pub fn gpuEncodeHuff(
         return false;
     if (sync_fn() != CUDA_SUCCESS) return false;
 
-    _ = d2h_fn(@ptrCast(out_sizes.ptr), d_huff_sizes_persist, sizes_bytes);
-    _ = d2h_fn(@ptrCast(out_bytes.ptr), d_huff_out_persist, total_dst_bytes);
+    _ = d2h_fn(@ptrCast(out_sizes.ptr), self.d_huff_sizes_persist, sizes_bytes);
+    _ = d2h_fn(@ptrCast(out_bytes.ptr), self.d_huff_out_persist, total_dst_bytes);
     return true;
 }
 
-// ── Persistent device buffers ──────────────────────────────────
-var d_input_persist: CUdeviceptr = 0;
-var d_input_size: usize = 0;
-var d_output_persist: CUdeviceptr = 0;
-var d_output_size: usize = 0;
-var d_descs_persist: CUdeviceptr = 0;
-var d_descs_size: usize = 0;
-var d_tans_descs_persist: CUdeviceptr = 0;
-var d_tans_descs_size: usize = 0;
-var d_tans_out_persist: CUdeviceptr = 0;
-var d_tans_out_size: usize = 0;
-var d_tans_sizes_persist: CUdeviceptr = 0;
-var d_tans_sizes_size: usize = 0;
-var d_hash_persist: CUdeviceptr = 0;
-var d_hash_size: usize = 0;
-var d_sizes_persist: CUdeviceptr = 0;
-var d_sizes_size: usize = 0;
+/// Per-encode-operation mutable state. Every persistent device-buffer
+/// pointer and its buffer-size companion formerly held as a module-global
+/// lives here so a future library API can hand each handle its own
+/// context. Load-once module handles, kernel/driver function pointers,
+/// and `pub var` result slices stay module-global on purpose.
+pub const EncodeContext = struct {
+    // ── LZ-encode persistent device buffers ────────────────────
+    d_input_persist: CUdeviceptr = 0,
+    d_input_size: usize = 0,
+    d_output_persist: CUdeviceptr = 0,
+    d_output_size: usize = 0,
+    d_descs_persist: CUdeviceptr = 0,
+    d_descs_size: usize = 0,
+    d_tans_descs_persist: CUdeviceptr = 0,
+    d_tans_descs_size: usize = 0,
+    d_tans_out_persist: CUdeviceptr = 0,
+    d_tans_out_size: usize = 0,
+    d_tans_sizes_persist: CUdeviceptr = 0,
+    d_tans_sizes_size: usize = 0,
+    d_hash_persist: CUdeviceptr = 0,
+    d_hash_size: usize = 0,
+    d_sizes_persist: CUdeviceptr = 0,
+    d_sizes_size: usize = 0,
+
+    // ── 32-lane tANS persistent device buffers ─────────────────
+    d_tans32_descs_persist: CUdeviceptr = 0,
+    d_tans32_descs_size: usize = 0,
+    d_tans32_out_persist: CUdeviceptr = 0,
+    d_tans32_out_size: usize = 0,
+    d_tans32_sizes_persist: CUdeviceptr = 0,
+    d_tans32_sizes_size: usize = 0,
+    // Phase 2 shared encode tables — 4 × Tans32EncodeTable in device memory.
+    d_tans32_shared_tables: CUdeviceptr = 0,
+    d_tans32_shared_tables_size: usize = 0,
+
+    // ── GPU Huffman encode persistent device buffers ───────────
+    d_huff_descs_persist: CUdeviceptr = 0,
+    d_huff_descs_size: usize = 0,
+    d_huff_cl_persist: CUdeviceptr = 0,
+    d_huff_cl_size: usize = 0,
+    d_huff_codes_persist: CUdeviceptr = 0,
+    d_huff_codes_size: usize = 0,
+    d_huff_scratch_persist: CUdeviceptr = 0,
+    d_huff_scratch_size: usize = 0,
+    d_huff_out_persist: CUdeviceptr = 0,
+    d_huff_out_size: usize = 0,
+    d_huff_sizes_persist: CUdeviceptr = 0,
+    d_huff_sizes_size: usize = 0,
+};
+
+/// Default context used by the thin public wrappers. External callers go
+/// through the original `pub fn` names; those delegate to this. A future
+/// library API will hand each handle its own `EncodeContext`.
+var g_default: EncodeContext = .{};
 
 fn ensureBuf(ptr: *CUdeviceptr, cur: *usize, needed: usize) bool {
     if (cur.* >= needed) return true;
@@ -481,6 +515,16 @@ pub fn gpuEncodeLiteralsTans32(
     chunk_descs: []const CompressChunkDesc,
     comp_sizes: []const u32,
 ) bool {
+    return gpuEncodeLiteralsTans32Impl(&g_default, allocator, output, chunk_descs, comp_sizes);
+}
+
+fn gpuEncodeLiteralsTans32Impl(
+    self: *EncodeContext,
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes: []const u32,
+) bool {
     if (!init()) return false;
     if (tans32_kernel_fn == 0) return false;
     const n = chunk_descs.len;
@@ -537,7 +581,7 @@ pub fn gpuEncodeLiteralsTans32(
     };
     errdefer allocator.free(bytes);
 
-    if (!gpuEncodeTans32(allocator, descs, total, sizes, bytes)) {
+    if (!gpuEncodeTans32Impl(self, allocator, descs, total, sizes, bytes)) {
         allocator.free(offsets);
         allocator.free(sizes);
         allocator.free(bytes);
@@ -556,6 +600,16 @@ pub fn gpuEncodeLiteralsTans32(
 /// leaves the pub vars nulled) when the kernel is unavailable or any
 /// step fails — caller falls back to CPU re-encode in that case.
 pub fn gpuEncodeTokensTans32(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes: []const u32,
+) bool {
+    return gpuEncodeTokensTans32Impl(&g_default, allocator, output, chunk_descs, comp_sizes);
+}
+
+fn gpuEncodeTokensTans32Impl(
+    self: *EncodeContext,
     allocator: std.mem.Allocator,
     output: []const u8,
     chunk_descs: []const CompressChunkDesc,
@@ -631,7 +685,7 @@ pub fn gpuEncodeTokensTans32(
     };
     errdefer allocator.free(bytes);
 
-    if (!gpuEncodeTans32(allocator, descs, total, sizes, bytes)) {
+    if (!gpuEncodeTans32Impl(self, allocator, descs, total, sizes, bytes)) {
         allocator.free(offsets);
         allocator.free(sizes);
         allocator.free(bytes);
@@ -654,6 +708,16 @@ pub fn gpuEncodeTokensTans32(
 /// so the kernel returns a raw-fallback marker and the caller writes
 /// the raw off16 stream verbatim.
 pub fn gpuEncodeOff16Tans32(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes: []const u32,
+) bool {
+    return gpuEncodeOff16Tans32Impl(&g_default, allocator, output, chunk_descs, comp_sizes);
+}
+
+fn gpuEncodeOff16Tans32Impl(
+    self: *EncodeContext,
     allocator: std.mem.Allocator,
     output: []const u8,
     chunk_descs: []const CompressChunkDesc,
@@ -754,7 +818,7 @@ pub fn gpuEncodeOff16Tans32(
     };
     errdefer allocator.free(bytes);
 
-    if (!gpuEncodeTans32(allocator, descs, total, all_sizes, bytes)) {
+    if (!gpuEncodeTans32Impl(self, allocator, descs, total, all_sizes, bytes)) {
         allocator.free(hi_offsets);
         allocator.free(lo_offsets);
         allocator.free(all_sizes);
@@ -795,6 +859,16 @@ pub fn gpuEncodeOff16Tans32(
 /// `huff_off16{hi,lo}_*` pub vars on success; the bodies carry no 5-byte
 /// chunk header (the frame assembler prepends it).
 pub fn gpuEncodeOff16Huff(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes: []const u32,
+) bool {
+    return gpuEncodeOff16HuffImpl(&g_default, allocator, output, chunk_descs, comp_sizes);
+}
+
+fn gpuEncodeOff16HuffImpl(
+    self: *EncodeContext,
     allocator: std.mem.Allocator,
     output: []const u8,
     chunk_descs: []const CompressChunkDesc,
@@ -895,7 +969,7 @@ pub fn gpuEncodeOff16Huff(
     };
     errdefer allocator.free(bytes);
 
-    if (!gpuEncodeHuff(descs, total, all_sizes, bytes)) {
+    if (!gpuEncodeHuffImpl(self, descs, total, all_sizes, bytes)) {
         allocator.free(hi_offsets);
         allocator.free(lo_offsets);
         allocator.free(all_sizes);
@@ -932,6 +1006,16 @@ pub fn gpuEncodeOff16Huff(
 /// each sub-chunk's literal stream with the GPU Huffman encoder
 /// (chunk_type=4). Populates the `huff_lit_*` pub vars on success.
 pub fn gpuEncodeLiteralsHuff(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes: []const u32,
+) bool {
+    return gpuEncodeLiteralsHuffImpl(&g_default, allocator, output, chunk_descs, comp_sizes);
+}
+
+fn gpuEncodeLiteralsHuffImpl(
+    self: *EncodeContext,
     allocator: std.mem.Allocator,
     output: []const u8,
     chunk_descs: []const CompressChunkDesc,
@@ -995,7 +1079,7 @@ pub fn gpuEncodeLiteralsHuff(
     };
     errdefer allocator.free(bytes);
 
-    if (!gpuEncodeHuff(descs, total, sizes, bytes)) {
+    if (!gpuEncodeHuffImpl(self, descs, total, sizes, bytes)) {
         allocator.free(offsets);
         allocator.free(sizes);
         allocator.free(bytes);
@@ -1012,6 +1096,16 @@ pub fn gpuEncodeLiteralsHuff(
 /// sub-chunk's token stream with the GPU Huffman encoder (chunk_type=4).
 /// Populates the `huff_tok_*` pub vars on success.
 pub fn gpuEncodeTokensHuff(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes: []const u32,
+) bool {
+    return gpuEncodeTokensHuffImpl(&g_default, allocator, output, chunk_descs, comp_sizes);
+}
+
+fn gpuEncodeTokensHuffImpl(
+    self: *EncodeContext,
     allocator: std.mem.Allocator,
     output: []const u8,
     chunk_descs: []const CompressChunkDesc,
@@ -1079,7 +1173,7 @@ pub fn gpuEncodeTokensHuff(
     };
     errdefer allocator.free(bytes);
 
-    if (!gpuEncodeHuff(descs, total, sizes, bytes)) {
+    if (!gpuEncodeHuffImpl(self, descs, total, sizes, bytes)) {
         allocator.free(offsets);
         allocator.free(sizes);
         allocator.free(bytes);
@@ -1098,6 +1192,17 @@ const shared_luts_mod = @import("gpu_shared_luts.zig");
 /// the four pre-built frame-wide encoding tables. One kernel launch,
 /// 4*N descriptors. Populates `tans32_shared_*` pub vars on success.
 pub fn gpuEncodeAllSharedTans32(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes: []const u32,
+    tables: [4]shared_luts_mod.Tans32EncodeTable,
+) bool {
+    return gpuEncodeAllSharedTans32Impl(&g_default, allocator, output, chunk_descs, comp_sizes, tables);
+}
+
+fn gpuEncodeAllSharedTans32Impl(
+    self: *EncodeContext,
     allocator: std.mem.Allocator,
     output: []const u8,
     chunk_descs: []const CompressChunkDesc,
@@ -1236,7 +1341,7 @@ pub fn gpuEncodeAllSharedTans32(
 
     // ── Upload 4 encoding tables ─────────────────────────────────
     const tables_bytes = @sizeOf(shared_luts_mod.Tans32EncodeTable) * 4;
-    if (!ensureBuf(&d_tans32_shared_tables, &d_tans32_shared_tables_size, tables_bytes)) {
+    if (!ensureBuf(&self.d_tans32_shared_tables, &self.d_tans32_shared_tables_size, tables_bytes)) {
         allocator.free(offsets); allocator.free(sizes); allocator.free(bytes);
         return false;
     }
@@ -1248,29 +1353,29 @@ pub fn gpuEncodeAllSharedTans32(
     const memset_fn = cuMemsetD8_fn orelse return false;
 
     var tables_copy = tables;
-    _ = h2d_fn(d_tans32_shared_tables, @ptrCast(&tables_copy), tables_bytes);
+    _ = h2d_fn(self.d_tans32_shared_tables, @ptrCast(&tables_copy), tables_bytes);
 
     // ── Allocate device buffers ───────────────────────────────────
     const desc_bytes_dev: usize = num_descs * @sizeOf(Tans32EncSharedDesc);
     const sizes_bytes_dev: usize = num_descs * 4;
-    if (!ensureBuf(&d_tans32_descs_persist, &d_tans32_descs_size, desc_bytes_dev) or
-        !ensureBuf(&d_tans32_out_persist, &d_tans32_out_size, total) or
-        !ensureBuf(&d_tans32_sizes_persist, &d_tans32_sizes_size, sizes_bytes_dev))
+    if (!ensureBuf(&self.d_tans32_descs_persist, &self.d_tans32_descs_size, desc_bytes_dev) or
+        !ensureBuf(&self.d_tans32_out_persist, &self.d_tans32_out_size, total) or
+        !ensureBuf(&self.d_tans32_sizes_persist, &self.d_tans32_sizes_size, sizes_bytes_dev))
     {
         allocator.free(offsets); allocator.free(sizes); allocator.free(bytes);
         return false;
     }
 
-    _ = h2d_fn(d_tans32_descs_persist, @ptrCast(descs.ptr), desc_bytes_dev);
-    _ = memset_fn(d_tans32_sizes_persist, 0, sizes_bytes_dev);
+    _ = h2d_fn(self.d_tans32_descs_persist, @ptrCast(descs.ptr), desc_bytes_dev);
+    _ = memset_fn(self.d_tans32_sizes_persist, 0, sizes_bytes_dev);
     _ = sync_fn();
 
-    var p_src = d_output_persist;
-    var p_dst = d_tans32_out_persist;
-    var p_descs_dev = d_tans32_descs_persist;
-    var p_sizes_dev = d_tans32_sizes_persist;
+    var p_src = self.d_output_persist;
+    var p_dst = self.d_tans32_out_persist;
+    var p_descs_dev = self.d_tans32_descs_persist;
+    var p_sizes_dev = self.d_tans32_sizes_persist;
     var p_n: u32 = @intCast(num_descs);
-    var p_tables = d_tans32_shared_tables;
+    var p_tables = self.d_tans32_shared_tables;
 
     var params = [_]?*anyopaque{
         @ptrCast(&p_src), @ptrCast(&p_dst), @ptrCast(&p_descs_dev),
@@ -1287,8 +1392,8 @@ pub fn gpuEncodeAllSharedTans32(
         return false;
     }
 
-    _ = d2h_fn(@ptrCast(sizes.ptr), d_tans32_sizes_persist, sizes_bytes_dev);
-    _ = d2h_fn(@ptrCast(bytes.ptr), d_tans32_out_persist, total);
+    _ = d2h_fn(@ptrCast(sizes.ptr), self.d_tans32_sizes_persist, sizes_bytes_dev);
+    _ = d2h_fn(@ptrCast(bytes.ptr), self.d_tans32_out_persist, total);
 
     tans32_shared_sizes = sizes;
     tans32_shared_data = bytes;
@@ -1298,6 +1403,18 @@ pub fn gpuEncodeAllSharedTans32(
 }
 
 pub fn gpuCompress(
+    input: []const u8,
+    output: []u8,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes_out: []u32,
+    io: ?std.Io,
+    level: u8,
+) bool {
+    return gpuCompressImpl(&g_default, input, output, chunk_descs, comp_sizes_out, io, level);
+}
+
+fn gpuCompressImpl(
+    self: *EncodeContext,
     input: []const u8,
     output: []u8,
     chunk_descs: []const CompressChunkDesc,
@@ -1320,10 +1437,10 @@ pub fn gpuCompress(
     const global = useGlobalHash(level);
     const chain = useChainParser(level);
 
-    if (!ensureBuf(&d_input_persist, &d_input_size, input.len)) return false;
-    if (!ensureBuf(&d_output_persist, &d_output_size, output.len)) return false;
-    if (!ensureBuf(&d_descs_persist, &d_descs_size, desc_bytes)) return false;
-    if (!ensureBuf(&d_sizes_persist, &d_sizes_size, sizes_bytes)) return false;
+    if (!ensureBuf(&self.d_input_persist, &self.d_input_size, input.len)) return false;
+    if (!ensureBuf(&self.d_output_persist, &self.d_output_size, output.len)) return false;
+    if (!ensureBuf(&self.d_descs_persist, &self.d_descs_size, desc_bytes)) return false;
+    if (!ensureBuf(&self.d_sizes_persist, &self.d_sizes_size, sizes_bytes)) return false;
 
     // Global hash tables — chain mode uses 3 tables per block:
     //   first_hash (hash_size u32) + long_hash (hash_size u32) + next_hash (32768 u16 = 16384 u32)
@@ -1331,16 +1448,16 @@ pub fn gpuCompress(
         const next_hash_words: usize = 65536 / 2; // 65536 u16 entries = 32768 u32 words
         const table_stride = hash_size + hash_size + next_hash_words;
         const hash_bytes = @as(usize, num_chunks) * table_stride * 4;
-        if (!ensureBuf(&d_hash_persist, &d_hash_size, hash_bytes)) return false;
+        if (!ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) return false;
     } else if (global) {
         const hash_bytes = @as(usize, num_chunks) * hash_size * 4;
-        if (!ensureBuf(&d_hash_persist, &d_hash_size, hash_bytes)) return false;
+        if (!ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) return false;
     }
 
-    const d_input = d_input_persist;
-    const d_output = d_output_persist;
-    const d_descs = d_descs_persist;
-    const d_sizes = d_sizes_persist;
+    const d_input = self.d_input_persist;
+    const d_output = self.d_output_persist;
+    const d_descs = self.d_descs_persist;
+    const d_sizes = self.d_sizes_persist;
 
     // Upload input + descriptors, zero sizes
     _ = h2d_fn(d_input, @ptrCast(input.ptr), input.len);
@@ -1353,7 +1470,7 @@ pub fn gpuCompress(
     var p_input = d_input;
     var p_output = d_output;
     var p_descs = d_descs;
-    var p_global_hash: CUdeviceptr = if (global or chain) d_hash_persist else 0;
+    var p_global_hash: CUdeviceptr = if (global or chain) self.d_hash_persist else 0;
     var p_sizes = d_sizes;
     var p_total = num_chunks;
     var p_hash_bits = hash_bits;
@@ -1444,20 +1561,20 @@ pub fn gpuCompress(
         // Allocate device buffers for tANS
         const tans_descs_bytes = num_chunks * @sizeOf(TansChunkDesc);
         const tans_sizes_bytes = @as(usize, num_chunks) * 4;
-        if (!ensureBuf(&d_tans_descs_persist, &d_tans_descs_size, tans_descs_bytes)) break :tans_pass;
-        if (!ensureBuf(&d_tans_out_persist, &d_tans_out_size, total_tans_dst)) break :tans_pass;
-        if (!ensureBuf(&d_tans_sizes_persist, &d_tans_sizes_size, tans_sizes_bytes)) break :tans_pass;
+        if (!ensureBuf(&self.d_tans_descs_persist, &self.d_tans_descs_size, tans_descs_bytes)) break :tans_pass;
+        if (!ensureBuf(&self.d_tans_out_persist, &self.d_tans_out_size, total_tans_dst)) break :tans_pass;
+        if (!ensureBuf(&self.d_tans_sizes_persist, &self.d_tans_sizes_size, tans_sizes_bytes)) break :tans_pass;
 
         // Upload descriptors, zero sizes
-        _ = h2d_fn(d_tans_descs_persist, @ptrCast(tans_descs_host.ptr), tans_descs_bytes);
-        if (cuMemsetD8_fn) |memset_fn| _ = memset_fn(d_tans_sizes_persist, 0, tans_sizes_bytes);
+        _ = h2d_fn(self.d_tans_descs_persist, @ptrCast(tans_descs_host.ptr), tans_descs_bytes);
+        if (cuMemsetD8_fn) |memset_fn| _ = memset_fn(self.d_tans_sizes_persist, 0, tans_sizes_bytes);
         _ = sync_fn();
 
         // Launch tANS kernel: source is d_output (literal data already there from LZ kernel)
         var tp_src = d_output; // literals are in the LZ output buffer
-        var tp_dst = d_tans_out_persist;
-        var tp_descs = d_tans_descs_persist;
-        var tp_sizes = d_tans_sizes_persist;
+        var tp_dst = self.d_tans_out_persist;
+        var tp_descs = self.d_tans_descs_persist;
+        var tp_sizes = self.d_tans_sizes_persist;
         var tp_total = num_chunks;
 
         var tans_params = [_]?*anyopaque{
@@ -1477,8 +1594,8 @@ pub fn gpuCompress(
         // Download tANS sizes and encoded data
         const h_tans_sizes = allocator.alloc(u32, num_chunks) catch break :tans_pass;
         const h_tans_data = allocator.alloc(u8, total_tans_dst) catch break :tans_pass;
-        _ = d2h_fn(@ptrCast(h_tans_sizes.ptr), d_tans_sizes_persist, tans_sizes_bytes);
-        _ = d2h_fn(@ptrCast(h_tans_data.ptr), d_tans_out_persist, total_tans_dst);
+        _ = d2h_fn(@ptrCast(h_tans_sizes.ptr), self.d_tans_sizes_persist, tans_sizes_bytes);
+        _ = d2h_fn(@ptrCast(h_tans_data.ptr), self.d_tans_out_persist, total_tans_dst);
 
         // Store for frame assembler
         tans_lit_sizes = h_tans_sizes;
