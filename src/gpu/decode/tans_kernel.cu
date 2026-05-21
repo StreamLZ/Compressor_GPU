@@ -9,8 +9,8 @@
 //   2. initLut      — build the L-entry decode LUT in shared memory
 //   3. decode5State — 5-state forward/backward interleaved hot loop
 //
-// Build: nvcc -cubin -arch=sm_89 -O3 gpu_tans_decode_kernel.cu
-// Embed: @embedFile("gpu_tans_decode_kernel.cubin") in gpu_driver.zig
+// Built to tans_kernel.ptx by tools/build_gpu.bat (nvcc);
+// decode/driver.zig @embedFile's the PTX.
 
 #include <cstdint>
 

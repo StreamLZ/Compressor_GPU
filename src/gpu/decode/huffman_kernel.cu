@@ -15,7 +15,8 @@
 //   slzHuffDecode4StreamKernel — 1 warp per block, 4 active lanes decode
 //                                the 4 streams into output[dst_offset].
 //
-// Build: nvcc -cubin -arch=sm_89 -O3 gpu_huff_decode_kernel.cu
+// Built to huffman_kernel.ptx by tools/build_gpu.bat (nvcc);
+// decode/driver.zig @embedFile's the PTX.
 
 #include <cstdint>
 

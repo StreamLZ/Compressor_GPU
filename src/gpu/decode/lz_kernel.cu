@@ -10,8 +10,8 @@
 //   decodeSubChunk        — general (off32, delta literals, 2-block sub-chunks)
 //   parseAndDecodeSubChunk — parses stream headers, dispatches to above
 //
-// Build: nvcc -cubin -arch=sm_89 -O3 gpu_decode_kernel.cu
-// Embed: @embedFile("gpu_decode_kernel.cubin") in gpu_driver.zig
+// Built to lz_kernel.ptx by tools/build_gpu.bat (nvcc);
+// decode/driver.zig @embedFile's the PTX.
 
 #include <cstdint>
 

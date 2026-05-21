@@ -1,10 +1,10 @@
 // ── StreamLZ GPU Decode Kernel (Vulkan Compute / SPIR-V) ───────
-// Cross-vendor port of gpu_decode_kernel.cu.
+// Cross-vendor port of lz_kernel.cu.
 // Each subgroup (32 invocations) decodes one StreamLZ chunk.
 // Two subgroups per workgroup for occupancy (workgroup size 64 = 32×2).
 //
-// Build: glslangValidator -V -S comp -o gpu_decode_kernel.spv gpu_decode_kernel.comp
-// Embed: @embedFile("gpu_decode_kernel.spv") in vk_driver.zig
+// Built to lz_kernel.spv by tools/build_gpu.bat (glslangValidator);
+// decode/vulkan_driver.zig @embedFile's the SPIR-V.
 
 #version 450
 #extension GL_KHR_shader_subgroup_ballot : require
