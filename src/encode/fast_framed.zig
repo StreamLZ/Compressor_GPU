@@ -613,6 +613,10 @@ fn reencodeGpuWithEntropy(
 // Also need the High-framed path for L6+ dispatch inside compressFramedOne.
 const high_framed = @import("high_framed.zig");
 
+// GPU compress driver — `EncodeContext` is threaded through
+// `compressFramedOne` so the GPU compress path is reentrant per handle.
+const gpu_enc = @import("fast/gpu_encoder.zig");
+
 const areAllBytesEqual = block_header.areAllBytesEqual;
 
 // ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
@@ -943,6 +947,7 @@ pub fn compressFramedOne(
     src: []const u8,
     dst: []u8,
     opts: Options,
+    enc_ctx: *gpu_enc.EncodeContext,
 ) CompressError!usize {
     // Levels 6-11 use the High codec (optimal parser + hash-based /
     // BT4 match finder). Fork here so the Fast path below stays
@@ -1161,7 +1166,6 @@ pub fn compressFramedOne(
         };
         if (!use_gpu_enc) break :gpu_compress;
 
-        const gpu_enc = @import("fast/gpu_encoder.zig");
         if (!gpu_enc.isAvailable()) break :gpu_compress;
 
         const data_src = effective_src[dict_len..];
@@ -1211,7 +1215,7 @@ pub fn compressFramedOne(
             }
         }
 
-        if (!gpu_enc.gpuCompress(effective_src, gpu_out, descs, comp_sizes, io, opts.level))
+        if (!gpu_enc.gpuCompressImpl(enc_ctx, effective_src, gpu_out, descs, comp_sizes, io, opts.level))
             break :gpu_compress;
 
         // ── Phase 2: frame-wide shared probability tables ─────────
@@ -1251,16 +1255,16 @@ pub fn compressFramedOne(
                 built_hi.?.enc_table,
                 built_lo.?.enc_table,
             };
-            const ok = gpu_enc.gpuEncodeAllSharedTans32(allocator, gpu_out, descs, comp_sizes, tables);
+            const ok = gpu_enc.gpuEncodeAllSharedTans32Impl(enc_ctx, allocator, gpu_out, descs, comp_sizes, tables);
             break :blk_shared_build ok;
         };
         defer if (use_shared_luts) {
-            if (gpu_enc.tans32_shared_sizes)   |s| allocator.free(s);
-            if (gpu_enc.tans32_shared_data)    |d| allocator.free(d);
-            if (gpu_enc.tans32_shared_offsets) |o| allocator.free(o);
-            gpu_enc.tans32_shared_sizes = null;
-            gpu_enc.tans32_shared_data = null;
-            gpu_enc.tans32_shared_offsets = null;
+            if (enc_ctx.tans32_shared_sizes)   |s| allocator.free(s);
+            if (enc_ctx.tans32_shared_data)    |d| allocator.free(d);
+            if (enc_ctx.tans32_shared_offsets) |o| allocator.free(o);
+            enc_ctx.tans32_shared_sizes = null;
+            enc_ctx.tans32_shared_data = null;
+            enc_ctx.tans32_shared_offsets = null;
         };
 
         // SLZ_GPU_HUFF routes lit/tok/off16 through the GPU Huffman
@@ -1270,49 +1274,49 @@ pub fn compressFramedOne(
 
         // ── GPU 32-lane tANS encode of TOKEN + off16 streams ────
         // For L3+ only (matches the reencode entropy gate). Populates
-        // gpu_enc.tans32_tok_* and gpu_enc.tans32_off16{hi,lo}_*.
+        // enc_ctx.tans32_tok_* and enc_ctx.tans32_off16{hi,lo}_*.
         // Skipped when Phase 2 shared-LUT mode is active.
         const gpu_tok_pre_encoded: bool = if (opts.level >= 3 and !use_shared_luts and !slz_gpu_huff)
-            gpu_enc.gpuEncodeTokensTans32(allocator, gpu_out, descs, comp_sizes)
+            gpu_enc.gpuEncodeTokensTans32Impl(enc_ctx, allocator, gpu_out, descs, comp_sizes)
         else
             false;
         defer if (gpu_tok_pre_encoded) {
-            if (gpu_enc.tans32_tok_sizes) |s| allocator.free(s);
-            if (gpu_enc.tans32_tok_data) |d| allocator.free(d);
-            if (gpu_enc.tans32_tok_offsets) |o| allocator.free(o);
-            gpu_enc.tans32_tok_sizes = null;
-            gpu_enc.tans32_tok_data = null;
-            gpu_enc.tans32_tok_offsets = null;
+            if (enc_ctx.tans32_tok_sizes) |s| allocator.free(s);
+            if (enc_ctx.tans32_tok_data) |d| allocator.free(d);
+            if (enc_ctx.tans32_tok_offsets) |o| allocator.free(o);
+            enc_ctx.tans32_tok_sizes = null;
+            enc_ctx.tans32_tok_data = null;
+            enc_ctx.tans32_tok_offsets = null;
         };
         const gpu_lit_pre_encoded: bool = if (opts.level >= 3 and !use_shared_luts and !slz_gpu_huff)
-            gpu_enc.gpuEncodeLiteralsTans32(allocator, gpu_out, descs, comp_sizes)
+            gpu_enc.gpuEncodeLiteralsTans32Impl(enc_ctx, allocator, gpu_out, descs, comp_sizes)
         else
             false;
         defer if (gpu_lit_pre_encoded) {
-            if (gpu_enc.tans32_lit_sizes) |s| allocator.free(s);
-            if (gpu_enc.tans32_lit_data) |d| allocator.free(d);
-            if (gpu_enc.tans32_lit_offsets) |o| allocator.free(o);
-            gpu_enc.tans32_lit_sizes = null;
-            gpu_enc.tans32_lit_data = null;
-            gpu_enc.tans32_lit_offsets = null;
+            if (enc_ctx.tans32_lit_sizes) |s| allocator.free(s);
+            if (enc_ctx.tans32_lit_data) |d| allocator.free(d);
+            if (enc_ctx.tans32_lit_offsets) |o| allocator.free(o);
+            enc_ctx.tans32_lit_sizes = null;
+            enc_ctx.tans32_lit_data = null;
+            enc_ctx.tans32_lit_offsets = null;
         };
         const gpu_off16_pre_encoded: bool = if (opts.level >= 3 and !use_shared_luts and !slz_gpu_huff)
-            gpu_enc.gpuEncodeOff16Tans32(allocator, gpu_out, descs, comp_sizes)
+            gpu_enc.gpuEncodeOff16Tans32Impl(enc_ctx, allocator, gpu_out, descs, comp_sizes)
         else
             false;
         defer if (gpu_off16_pre_encoded) {
             // hi_data and lo_data share the same backing buffer; free once.
-            if (gpu_enc.tans32_off16hi_sizes) |s| allocator.free(s);
-            if (gpu_enc.tans32_off16lo_sizes) |s| allocator.free(s);
-            if (gpu_enc.tans32_off16hi_offsets) |o| allocator.free(o);
-            if (gpu_enc.tans32_off16lo_offsets) |o| allocator.free(o);
-            if (gpu_enc.tans32_off16hi_data) |d| allocator.free(d);
-            gpu_enc.tans32_off16hi_sizes = null;
-            gpu_enc.tans32_off16hi_data = null;
-            gpu_enc.tans32_off16hi_offsets = null;
-            gpu_enc.tans32_off16lo_sizes = null;
-            gpu_enc.tans32_off16lo_data = null;
-            gpu_enc.tans32_off16lo_offsets = null;
+            if (enc_ctx.tans32_off16hi_sizes) |s| allocator.free(s);
+            if (enc_ctx.tans32_off16lo_sizes) |s| allocator.free(s);
+            if (enc_ctx.tans32_off16hi_offsets) |o| allocator.free(o);
+            if (enc_ctx.tans32_off16lo_offsets) |o| allocator.free(o);
+            if (enc_ctx.tans32_off16hi_data) |d| allocator.free(d);
+            enc_ctx.tans32_off16hi_sizes = null;
+            enc_ctx.tans32_off16hi_data = null;
+            enc_ctx.tans32_off16hi_offsets = null;
+            enc_ctx.tans32_off16lo_sizes = null;
+            enc_ctx.tans32_off16lo_data = null;
+            enc_ctx.tans32_off16lo_offsets = null;
         };
 
         // ── GPU Huffman encode of lit / tok / off16 (SLZ_GPU_HUFF) ──
@@ -1320,48 +1324,48 @@ pub fn compressFramedOne(
         // coded on the GPU (chunk_type=4). Replaces the GPU tANS passes.
         const gpu_lit_huff_encoded: bool =
             if (opts.level >= 3 and !use_shared_luts and slz_gpu_huff)
-                gpu_enc.gpuEncodeLiteralsHuff(allocator, gpu_out, descs, comp_sizes)
+                gpu_enc.gpuEncodeLiteralsHuffImpl(enc_ctx, allocator, gpu_out, descs, comp_sizes)
             else
                 false;
         defer if (gpu_lit_huff_encoded) {
-            if (gpu_enc.huff_lit_sizes) |s| allocator.free(s);
-            if (gpu_enc.huff_lit_data) |d| allocator.free(d);
-            if (gpu_enc.huff_lit_offsets) |o| allocator.free(o);
-            gpu_enc.huff_lit_sizes = null;
-            gpu_enc.huff_lit_data = null;
-            gpu_enc.huff_lit_offsets = null;
+            if (enc_ctx.huff_lit_sizes) |s| allocator.free(s);
+            if (enc_ctx.huff_lit_data) |d| allocator.free(d);
+            if (enc_ctx.huff_lit_offsets) |o| allocator.free(o);
+            enc_ctx.huff_lit_sizes = null;
+            enc_ctx.huff_lit_data = null;
+            enc_ctx.huff_lit_offsets = null;
         };
         const gpu_tok_huff_encoded: bool =
             if (opts.level >= 3 and !use_shared_luts and slz_gpu_huff)
-                gpu_enc.gpuEncodeTokensHuff(allocator, gpu_out, descs, comp_sizes)
+                gpu_enc.gpuEncodeTokensHuffImpl(enc_ctx, allocator, gpu_out, descs, comp_sizes)
             else
                 false;
         defer if (gpu_tok_huff_encoded) {
-            if (gpu_enc.huff_tok_sizes) |s| allocator.free(s);
-            if (gpu_enc.huff_tok_data) |d| allocator.free(d);
-            if (gpu_enc.huff_tok_offsets) |o| allocator.free(o);
-            gpu_enc.huff_tok_sizes = null;
-            gpu_enc.huff_tok_data = null;
-            gpu_enc.huff_tok_offsets = null;
+            if (enc_ctx.huff_tok_sizes) |s| allocator.free(s);
+            if (enc_ctx.huff_tok_data) |d| allocator.free(d);
+            if (enc_ctx.huff_tok_offsets) |o| allocator.free(o);
+            enc_ctx.huff_tok_sizes = null;
+            enc_ctx.huff_tok_data = null;
+            enc_ctx.huff_tok_offsets = null;
         };
         const gpu_off16_huff_encoded: bool =
             if (opts.level >= 3 and !use_shared_luts and slz_gpu_huff)
-                gpu_enc.gpuEncodeOff16Huff(allocator, gpu_out, descs, comp_sizes)
+                gpu_enc.gpuEncodeOff16HuffImpl(enc_ctx, allocator, gpu_out, descs, comp_sizes)
             else
                 false;
         defer if (gpu_off16_huff_encoded) {
             // hi_data and lo_data share the same backing buffer; free once.
-            if (gpu_enc.huff_off16hi_sizes) |s| allocator.free(s);
-            if (gpu_enc.huff_off16lo_sizes) |s| allocator.free(s);
-            if (gpu_enc.huff_off16hi_offsets) |o| allocator.free(o);
-            if (gpu_enc.huff_off16lo_offsets) |o| allocator.free(o);
-            if (gpu_enc.huff_off16hi_data) |d| allocator.free(d);
-            gpu_enc.huff_off16hi_sizes = null;
-            gpu_enc.huff_off16hi_data = null;
-            gpu_enc.huff_off16hi_offsets = null;
-            gpu_enc.huff_off16lo_sizes = null;
-            gpu_enc.huff_off16lo_data = null;
-            gpu_enc.huff_off16lo_offsets = null;
+            if (enc_ctx.huff_off16hi_sizes) |s| allocator.free(s);
+            if (enc_ctx.huff_off16lo_sizes) |s| allocator.free(s);
+            if (enc_ctx.huff_off16hi_offsets) |o| allocator.free(o);
+            if (enc_ctx.huff_off16lo_offsets) |o| allocator.free(o);
+            if (enc_ctx.huff_off16hi_data) |d| allocator.free(d);
+            enc_ctx.huff_off16hi_sizes = null;
+            enc_ctx.huff_off16hi_data = null;
+            enc_ctx.huff_off16hi_offsets = null;
+            enc_ctx.huff_off16lo_sizes = null;
+            enc_ctx.huff_off16lo_data = null;
+            enc_ctx.huff_off16lo_offsets = null;
         };
 
         var is_first_tans32_in_frame: bool = true;
@@ -1486,7 +1490,7 @@ pub fn compressFramedOne(
                     const init_bytes: usize = if (gpu_bi_idx == 0 and dict_len == 0) 8 else 0;
 
                     // Check if GPU tANS produced smaller literal encoding
-                    const tans_lits: ?[]const u8 = if (gpu_enc.tans_lit_sizes) |tsizes| blk: {
+                    const tans_lits: ?[]const u8 = if (enc_ctx.tans_lit_sizes) |tsizes| blk: {
                         if (gpu_bi_idx >= tsizes.len) break :blk null;
                         const tsz = tsizes[gpu_bi_idx];
                         const is_raw = (tsz & 0x80000000) != 0;
@@ -1499,8 +1503,8 @@ pub fn compressFramedOne(
                             raw_payload[init_bytes + 2];
                         // tANS worthwhile? 5-byte header + data < 3-byte header + raw
                         if (actual_sz + 5 >= raw_lit_count + 3) break :blk null;
-                        if (gpu_enc.tans_lit_data) |tdata| {
-                            if (gpu_enc.tans_lit_offsets) |toffs| {
+                        if (enc_ctx.tans_lit_data) |tdata| {
+                            if (enc_ctx.tans_lit_offsets) |toffs| {
                                 const off = toffs[gpu_bi_idx];
                                 if (off + actual_sz <= tdata.len) {
                                     break :blk tdata[off..][0..actual_sz];
@@ -1553,9 +1557,9 @@ pub fn compressFramedOne(
                         // GPU-pre-encoded literals (32-lane tANS) — body only.
                         const gpu_lit_pre: ?[]const u8 = blk_gpu_lit: {
                             if (!gpu_lit_pre_encoded) break :blk_gpu_lit null;
-                            const sizes = gpu_enc.tans32_lit_sizes orelse break :blk_gpu_lit null;
-                            const data = gpu_enc.tans32_lit_data orelse break :blk_gpu_lit null;
-                            const offs = gpu_enc.tans32_lit_offsets orelse break :blk_gpu_lit null;
+                            const sizes = enc_ctx.tans32_lit_sizes orelse break :blk_gpu_lit null;
+                            const data = enc_ctx.tans32_lit_data orelse break :blk_gpu_lit null;
+                            const offs = enc_ctx.tans32_lit_offsets orelse break :blk_gpu_lit null;
                             if (gpu_bi_idx >= sizes.len) break :blk_gpu_lit null;
                             const sz = sizes[gpu_bi_idx];
                             if ((sz & 0x80000000) != 0) break :blk_gpu_lit null;
@@ -1568,9 +1572,9 @@ pub fn compressFramedOne(
                         // sizes[gpu_bi_idx] MSB set → raw fallback (skip).
                         const gpu_tok_pre: ?[]const u8 = blk_gpu_tok: {
                             if (!gpu_tok_pre_encoded) break :blk_gpu_tok null;
-                            const sizes = gpu_enc.tans32_tok_sizes orelse break :blk_gpu_tok null;
-                            const data = gpu_enc.tans32_tok_data orelse break :blk_gpu_tok null;
-                            const offs = gpu_enc.tans32_tok_offsets orelse break :blk_gpu_tok null;
+                            const sizes = enc_ctx.tans32_tok_sizes orelse break :blk_gpu_tok null;
+                            const data = enc_ctx.tans32_tok_data orelse break :blk_gpu_tok null;
+                            const offs = enc_ctx.tans32_tok_offsets orelse break :blk_gpu_tok null;
                             if (gpu_bi_idx >= sizes.len) break :blk_gpu_tok null;
                             const sz = sizes[gpu_bi_idx];
                             if ((sz & 0x80000000) != 0) break :blk_gpu_tok null;
@@ -1581,9 +1585,9 @@ pub fn compressFramedOne(
                         };
                         const gpu_off16hi_pre: ?[]const u8 = blk_hi: {
                             if (!gpu_off16_pre_encoded) break :blk_hi null;
-                            const sizes = gpu_enc.tans32_off16hi_sizes orelse break :blk_hi null;
-                            const data = gpu_enc.tans32_off16hi_data orelse break :blk_hi null;
-                            const offs = gpu_enc.tans32_off16hi_offsets orelse break :blk_hi null;
+                            const sizes = enc_ctx.tans32_off16hi_sizes orelse break :blk_hi null;
+                            const data = enc_ctx.tans32_off16hi_data orelse break :blk_hi null;
+                            const offs = enc_ctx.tans32_off16hi_offsets orelse break :blk_hi null;
                             if (gpu_bi_idx >= sizes.len) break :blk_hi null;
                             const sz = sizes[gpu_bi_idx];
                             if ((sz & 0x80000000) != 0) break :blk_hi null;
@@ -1594,9 +1598,9 @@ pub fn compressFramedOne(
                         };
                         const gpu_off16lo_pre: ?[]const u8 = blk_lo: {
                             if (!gpu_off16_pre_encoded) break :blk_lo null;
-                            const sizes = gpu_enc.tans32_off16lo_sizes orelse break :blk_lo null;
-                            const data = gpu_enc.tans32_off16lo_data orelse break :blk_lo null;
-                            const offs = gpu_enc.tans32_off16lo_offsets orelse break :blk_lo null;
+                            const sizes = enc_ctx.tans32_off16lo_sizes orelse break :blk_lo null;
+                            const data = enc_ctx.tans32_off16lo_data orelse break :blk_lo null;
+                            const offs = enc_ctx.tans32_off16lo_offsets orelse break :blk_lo null;
                             if (gpu_bi_idx >= sizes.len) break :blk_lo null;
                             const sz = sizes[gpu_bi_idx];
                             if ((sz & 0x80000000) != 0) break :blk_lo null;
@@ -1610,9 +1614,9 @@ pub fn compressFramedOne(
                         // marks an empty descriptor — fall back to CPU.
                         const huff_lit_slice: ?[]const u8 = blk_hlit: {
                             if (!gpu_lit_huff_encoded) break :blk_hlit null;
-                            const sizes = gpu_enc.huff_lit_sizes orelse break :blk_hlit null;
-                            const data = gpu_enc.huff_lit_data orelse break :blk_hlit null;
-                            const offs = gpu_enc.huff_lit_offsets orelse break :blk_hlit null;
+                            const sizes = enc_ctx.huff_lit_sizes orelse break :blk_hlit null;
+                            const data = enc_ctx.huff_lit_data orelse break :blk_hlit null;
+                            const offs = enc_ctx.huff_lit_offsets orelse break :blk_hlit null;
                             if (gpu_bi_idx >= sizes.len) break :blk_hlit null;
                             const sz = sizes[gpu_bi_idx];
                             if (sz == 0) break :blk_hlit null;
@@ -1622,9 +1626,9 @@ pub fn compressFramedOne(
                         };
                         const huff_tok_slice: ?[]const u8 = blk_htok: {
                             if (!gpu_tok_huff_encoded) break :blk_htok null;
-                            const sizes = gpu_enc.huff_tok_sizes orelse break :blk_htok null;
-                            const data = gpu_enc.huff_tok_data orelse break :blk_htok null;
-                            const offs = gpu_enc.huff_tok_offsets orelse break :blk_htok null;
+                            const sizes = enc_ctx.huff_tok_sizes orelse break :blk_htok null;
+                            const data = enc_ctx.huff_tok_data orelse break :blk_htok null;
+                            const offs = enc_ctx.huff_tok_offsets orelse break :blk_htok null;
                             if (gpu_bi_idx >= sizes.len) break :blk_htok null;
                             const sz = sizes[gpu_bi_idx];
                             if (sz == 0) break :blk_htok null;
@@ -1637,9 +1641,9 @@ pub fn compressFramedOne(
                         // marks an empty descriptor — fall back to CPU.
                         const huff_off16hi_slice: ?[]const u8 = blk_hh: {
                             if (!gpu_off16_huff_encoded) break :blk_hh null;
-                            const sizes = gpu_enc.huff_off16hi_sizes orelse break :blk_hh null;
-                            const data = gpu_enc.huff_off16hi_data orelse break :blk_hh null;
-                            const offs = gpu_enc.huff_off16hi_offsets orelse break :blk_hh null;
+                            const sizes = enc_ctx.huff_off16hi_sizes orelse break :blk_hh null;
+                            const data = enc_ctx.huff_off16hi_data orelse break :blk_hh null;
+                            const offs = enc_ctx.huff_off16hi_offsets orelse break :blk_hh null;
                             if (gpu_bi_idx >= sizes.len) break :blk_hh null;
                             const sz = sizes[gpu_bi_idx];
                             if (sz == 0) break :blk_hh null;
@@ -1649,9 +1653,9 @@ pub fn compressFramedOne(
                         };
                         const huff_off16lo_slice: ?[]const u8 = blk_hl: {
                             if (!gpu_off16_huff_encoded) break :blk_hl null;
-                            const sizes = gpu_enc.huff_off16lo_sizes orelse break :blk_hl null;
-                            const data = gpu_enc.huff_off16lo_data orelse break :blk_hl null;
-                            const offs = gpu_enc.huff_off16lo_offsets orelse break :blk_hl null;
+                            const sizes = enc_ctx.huff_off16lo_sizes orelse break :blk_hl null;
+                            const data = enc_ctx.huff_off16lo_data orelse break :blk_hl null;
+                            const offs = enc_ctx.huff_off16lo_offsets orelse break :blk_hl null;
                             if (gpu_bi_idx >= sizes.len) break :blk_hl null;
                             const sz = sizes[gpu_bi_idx];
                             if (sz == 0) break :blk_hl null;
@@ -1661,12 +1665,12 @@ pub fn compressFramedOne(
                         };
                         // Phase 2 shared-LUT slices for this sub-chunk
                         // (kernel output: [1B lut_id][128B sizes+states][sub-streams]).
-                        const N_shared: u32 = gpu_enc.tans32_shared_n_per_stream;
+                        const N_shared: u32 = enc_ctx.tans32_shared_n_per_stream;
                         const shared_lit_slice: ?[]const u8 = blk_sl: {
                             if (!use_shared_luts) break :blk_sl null;
-                            const sizes = gpu_enc.tans32_shared_sizes orelse break :blk_sl null;
-                            const data = gpu_enc.tans32_shared_data orelse break :blk_sl null;
-                            const offs = gpu_enc.tans32_shared_offsets orelse break :blk_sl null;
+                            const sizes = enc_ctx.tans32_shared_sizes orelse break :blk_sl null;
+                            const data = enc_ctx.tans32_shared_data orelse break :blk_sl null;
+                            const offs = enc_ctx.tans32_shared_offsets orelse break :blk_sl null;
                             const idx: usize = 0 * @as(usize, N_shared) + gpu_bi_idx;
                             if (idx >= sizes.len) break :blk_sl null;
                             const sz = sizes[idx];
@@ -1677,9 +1681,9 @@ pub fn compressFramedOne(
                         };
                         const shared_tok_slice: ?[]const u8 = blk_ss: {
                             if (!use_shared_luts) break :blk_ss null;
-                            const sizes = gpu_enc.tans32_shared_sizes orelse break :blk_ss null;
-                            const data = gpu_enc.tans32_shared_data orelse break :blk_ss null;
-                            const offs = gpu_enc.tans32_shared_offsets orelse break :blk_ss null;
+                            const sizes = enc_ctx.tans32_shared_sizes orelse break :blk_ss null;
+                            const data = enc_ctx.tans32_shared_data orelse break :blk_ss null;
+                            const offs = enc_ctx.tans32_shared_offsets orelse break :blk_ss null;
                             const idx: usize = 1 * @as(usize, N_shared) + gpu_bi_idx;
                             if (idx >= sizes.len) break :blk_ss null;
                             const sz = sizes[idx];
@@ -1690,9 +1694,9 @@ pub fn compressFramedOne(
                         };
                         const shared_hi_slice: ?[]const u8 = blk_sh: {
                             if (!use_shared_luts) break :blk_sh null;
-                            const sizes = gpu_enc.tans32_shared_sizes orelse break :blk_sh null;
-                            const data = gpu_enc.tans32_shared_data orelse break :blk_sh null;
-                            const offs = gpu_enc.tans32_shared_offsets orelse break :blk_sh null;
+                            const sizes = enc_ctx.tans32_shared_sizes orelse break :blk_sh null;
+                            const data = enc_ctx.tans32_shared_data orelse break :blk_sh null;
+                            const offs = enc_ctx.tans32_shared_offsets orelse break :blk_sh null;
                             const idx: usize = 2 * @as(usize, N_shared) + gpu_bi_idx;
                             if (idx >= sizes.len) break :blk_sh null;
                             const sz = sizes[idx];
@@ -1703,9 +1707,9 @@ pub fn compressFramedOne(
                         };
                         const shared_lo_slice: ?[]const u8 = blk_sllo: {
                             if (!use_shared_luts) break :blk_sllo null;
-                            const sizes = gpu_enc.tans32_shared_sizes orelse break :blk_sllo null;
-                            const data = gpu_enc.tans32_shared_data orelse break :blk_sllo null;
-                            const offs = gpu_enc.tans32_shared_offsets orelse break :blk_sllo null;
+                            const sizes = enc_ctx.tans32_shared_sizes orelse break :blk_sllo null;
+                            const data = enc_ctx.tans32_shared_data orelse break :blk_sllo null;
+                            const offs = enc_ctx.tans32_shared_offsets orelse break :blk_sllo null;
                             const idx: usize = 3 * @as(usize, N_shared) + gpu_bi_idx;
                             if (idx >= sizes.len) break :blk_sllo null;
                             const sz = sizes[idx];
@@ -2230,7 +2234,7 @@ pub fn compressFramedOne(
 test "compressFramedOne: empty input roundtrip" {
     const allocator = std.testing.allocator;
     var dst: [256]u8 = undefined;
-    const n = try compressFramedOne(allocator, std.testing.io, &.{}, &dst, .{ .level = 1 });
+    const n = try compressFramedOne(allocator, std.testing.io, &.{}, &dst, .{ .level = 1 }, &gpu_enc.g_default);
     try std.testing.expect(n > 0);
     try std.testing.expect(n < 64);
     const decoder = @import("../decode/streamlz_decoder.zig");
@@ -2247,7 +2251,7 @@ test "compressFramedOne: all-equal bytes compresses small" {
     const bound = compressBound(src.len);
     const dst = try allocator.alloc(u8, bound);
     defer allocator.free(dst);
-    const n = try compressFramedOne(allocator, std.testing.io, src, dst, .{ .level = 1 });
+    const n = try compressFramedOne(allocator, std.testing.io, src, dst, .{ .level = 1 }, &gpu_enc.g_default);
     try std.testing.expect(n < 200);
     const decoder = @import("../decode/streamlz_decoder.zig");
     const dec = try allocator.alloc(u8, src.len + 64);

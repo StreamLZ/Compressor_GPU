@@ -1,5 +1,6 @@
 const std = @import("std");
 const encoder = @import("encode/streamlz_encoder.zig");
+const gpu_encoder = @import("encode/fast/gpu_encoder.zig");
 const decoder = @import("decode/streamlz_decoder.zig");
 const frame = @import("format/frame_format.zig");
 
@@ -45,6 +46,7 @@ export fn slz_compress(
         src[0..src_len],
         dst[0..dst_len],
         .{ .level = @intCast(level) },
+        &gpu_encoder.g_default,
     ) catch |err| return mapCompressError(err);
     if (result > std.math.maxInt(c_int)) return SLZ_ERROR_UNKNOWN;
     return @intCast(result);

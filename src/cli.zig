@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const frame = @import("format/frame_format.zig");
 const decoder = @import("decode/streamlz_decoder.zig");
 const encoder = @import("encode/streamlz_encoder.zig");
+const gpu_encoder = @import("encode/fast/gpu_encoder.zig");
 const dict_mod = @import("dict/dictionary.zig");
 
 const version_string = "2.0.0";
@@ -553,7 +554,7 @@ fn runCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
         .dictionary_id = dict_id,
         .gpu_mode = args.gpu,
         .sc_group_size_override = args.sc_group,
-    }) catch |err| {
+    }, &gpu_encoder.g_default) catch |err| {
         out_map.unmap();
         try w.print("error: compression failed: {s}\n", .{@errorName(err)});
         try w.flush();
@@ -809,12 +810,12 @@ fn runBenchCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer,
 
     // Warm-up compress.
     const comp_opts: encoder.Options = .{ .level = level, .dictionary = dict_data_b, .dictionary_id = dict_id_b, .num_threads = args.threads };
-    var comp_size: usize = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts);
+    var comp_size: usize = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_encoder.g_default);
 
     // Compress (single timed run — -r only affects decompress).
     {
         const timer_start = std.Io.Clock.awake.now(io);
-        comp_size = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts);
+        comp_size = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_encoder.g_default);
         const ns = @as(u64, @intCast(timer_start.untilNow(io, .awake).toNanoseconds()));
         const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
         const mbps = mb * 1000.0 / ms;
@@ -1147,7 +1148,7 @@ fn runBenchAll(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
         // Compress once, timed.
         const comp_opts: encoder.Options = .{ .level = level, .num_threads = @intCast(num_threads) };
         const comp_start = std.Io.Clock.awake.now(io);
-        const comp_size = encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts) catch |err| {
+        const comp_size = encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_encoder.g_default) catch |err| {
             try w.print("  L{d}: compress failed: {s}\n", .{ level, @errorName(err) });
             results[idx] = .{ .level = level, .comp_size = 0, .ratio = 0, .comp_mbps = 0, .dec_mbps = 0, .pass = false };
             continue;
@@ -1526,7 +1527,7 @@ fn runBenchCompare(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, 
 
         const opts: encoder.Options = .{ .level = slz_level, .num_threads = @intCast(threads) };
         const comp_timer = std.Io.Clock.awake.now(io);
-        const comp_size = encoder.compressFramedWithIo(allocator, io, src, compressed, opts) catch 0;
+        const comp_size = encoder.compressFramedWithIo(allocator, io, src, compressed, opts, &gpu_encoder.g_default) catch 0;
         const comp_ns = @as(u64, @intCast(comp_timer.untilNow(io, .awake).toNanoseconds()));
         if (comp_size > 0) {
             var dec_ctx = decoder.DecompressContext.initThreadedWithIo(allocator, io, @intCast(threads));
@@ -1687,7 +1688,7 @@ fn runForwardAnalyze(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer
     const bound = encoder.compressBound(src.len);
     const comp_buf = try allocator.alloc(u8, bound);
     defer allocator.free(comp_buf);
-    const slz_size = encoder.compressFramedWithIo(allocator, io, src, comp_buf, .{ .level = 1 }) catch 0;
+    const slz_size = encoder.compressFramedWithIo(allocator, io, src, comp_buf, .{ .level = 1 }, &gpu_encoder.g_default) catch 0;
     if (slz_size > 0) {
         const slz_ratio = @as(f64, @floatFromInt(slz_size)) / @as(f64, @floatFromInt(src.len)) * 100.0;
         try w.print("\nStreamLZ L1: {d:>12} bytes ({d:.1}%)\n", .{ slz_size, slz_ratio });
@@ -1787,7 +1788,7 @@ fn runTrain(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: A
         // Serial intentional: small sample, parallel overhead not worth it.
         const no_dict_size = encoder.compressFramed(allocator, sample, comp_buf, .{
             .level = 3,
-        }) catch continue;
+        }, &gpu_encoder.g_default) catch continue;
         total_no_dict += no_dict_size;
 
         // Serial intentional: small sample, parallel overhead not worth it.
@@ -1795,7 +1796,7 @@ fn runTrain(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: A
             .level = 3,
             .dictionary = result.dict,
             .dictionary_id = 0x10000001,
-        }) catch continue;
+        }, &gpu_encoder.g_default) catch continue;
         total_with_dict += with_dict_size;
     }
 

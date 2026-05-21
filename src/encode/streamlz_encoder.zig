@@ -30,6 +30,10 @@ const EntropyOptions = entropy_enc.EntropyOptions;
 // Re-export the fast-framed builder for the multi-piece retry path.
 const fast_framed = @import("fast_framed.zig");
 
+// GPU compress driver — `EncodeContext` is threaded through the framed
+// entry points so the GPU compress path is reentrant per handle.
+const gpu_encoder = @import("fast/gpu_encoder.zig");
+
 /// Default dictionary size when the caller doesn't override (1 GB).
 pub const default_dictionary_size: u32 = @intCast(lz_constants.max_dictionary_size);
 
@@ -275,11 +279,12 @@ pub fn compressFramed(
     src: []const u8,
     dst: []u8,
     opts: Options,
+    enc_ctx: *gpu_encoder.EncodeContext,
 ) CompressError!usize {
     // Use std.Io.failing as the default io when callers don't provide
     // one. ConcurrencyUnavailable from group.concurrent() will cause
     // the fallback handler to run workers inline (serial execution).
-    return compressFramedWithIo(allocator, std.Io.failing, src, dst, opts);
+    return compressFramedWithIo(allocator, std.Io.failing, src, dst, opts, enc_ctx);
 }
 
 /// Compress `src` into an SLZ1 frame using an explicit I/O interface for thread spawning.
@@ -289,6 +294,7 @@ pub fn compressFramedWithIo(
     src: []const u8,
     dst: []u8,
     opts: Options,
+    enc_ctx: *gpu_encoder.EncodeContext,
 ) CompressError!usize {
     if (opts.level < 1 or opts.level > 11) return error.BadLevel;
     if (opts.hash_bits != 0 and (opts.hash_bits < 8 or opts.hash_bits > 24)) return error.BadLevel;
@@ -296,7 +302,7 @@ pub fn compressFramedWithIo(
     if (dst.len < min_dst) return error.DestinationTooSmall;
 
     // Fast path: attempt the whole input in a single piece.
-    const whole = fast_framed.compressFramedOne(allocator, io, src, dst, opts);
+    const whole = fast_framed.compressFramedOne(allocator, io, src, dst, opts, enc_ctx);
     if (whole) |n| return n else |err| switch (err) {
         error.OutOfMemory => {
             // Fall through to multi-piece retry below.
@@ -344,7 +350,7 @@ pub fn compressFramedWithIo(
             const piece_dst = dst[total..];
             const piece_bound = compressBound(this_piece_len);
             if (piece_dst.len < piece_bound) return error.DestinationTooSmall;
-            const piece_n = fast_framed.compressFramedOne(allocator, io, piece_src, piece_dst, piece_opts) catch |err| switch (err) {
+            const piece_n = fast_framed.compressFramedOne(allocator, io, piece_src, piece_dst, piece_opts, enc_ctx) catch |err| switch (err) {
                 error.OutOfMemory => {
                     piece_ok = false;
                     break;
@@ -386,7 +392,7 @@ fn roundtrip(source: []const u8, level: u8) !void {
     const dst = try allocator.alloc(u8, bound);
     defer allocator.free(dst);
 
-    const n = try compressFramed(allocator, source, dst, .{ .level = level });
+    const n = try compressFramed(allocator, source, dst, .{ .level = level }, &gpu_encoder.g_default);
     try testing.expect(n > 0);
     try testing.expect(n <= bound);
 
@@ -703,7 +709,7 @@ fn roundtripSC(source: []const u8, level: u8) !void {
     const dst = try allocator.alloc(u8, bound);
     defer allocator.free(dst);
 
-    const n = try compressFramed(allocator, source, dst, .{ .level = level, .self_contained = true });
+    const n = try compressFramed(allocator, source, dst, .{ .level = level, .self_contained = true }, &gpu_encoder.g_default);
     try testing.expect(n > 0);
     try testing.expect(n <= bound);
 
@@ -762,7 +768,7 @@ test "SC: block header has bit 4 set in first internal header" {
     const bound = compressBound(src.len);
     const out = try allocator.alloc(u8, bound);
     defer allocator.free(out);
-    const n = try compressFramed(allocator, &src, out, .{ .level = 1, .self_contained = true });
+    const n = try compressFramed(allocator, &src, out, .{ .level = 1, .self_contained = true }, &gpu_encoder.g_default);
     _ = n;
 
     // Peek the first internal block header just past the frame header + 8 outer block bytes.
@@ -785,7 +791,7 @@ test "TwoPhase: implies self_contained and sets block header bits 4 + 5" {
     const bound = compressBound(src.len);
     const out = try allocator.alloc(u8, bound);
     defer allocator.free(out);
-    const n = try compressFramed(allocator, &src, out, .{ .level = 1, .two_phase = true });
+    const n = try compressFramed(allocator, &src, out, .{ .level = 1, .two_phase = true }, &gpu_encoder.g_default);
 
     const hdr = try frame.parseHeader(out);
     const block_hdr_pos = hdr.header_size + 8;
@@ -894,7 +900,7 @@ fn roundtripParallel(source: []const u8, level: u8, num_threads: u32) !void {
     const n = try compressFramed(allocator, source, dst, .{
         .level = level,
         .num_threads = num_threads,
-    });
+    }, &gpu_encoder.g_default);
     try testing.expect(n > 0);
     try testing.expect(n <= bound);
 
@@ -1004,11 +1010,11 @@ test "decompressFramed: decoder accepts 2 concatenated SLZ1 frames" {
     const n0 = try fast_framed.compressFramedOne(allocator, std.testing.io, src[0..half], tmp, .{
         .level = 1,
         .self_contained = true,
-    });
+    }, &gpu_encoder.g_default);
     const n1 = try fast_framed.compressFramedOne(allocator, std.testing.io, src[half..], tmp[n0..], .{
         .level = 1,
         .self_contained = true,
-    });
+    }, &gpu_encoder.g_default);
     const total = n0 + n1;
 
     const decoded = try allocator.alloc(u8, src.len + decoder.safe_space);
@@ -1035,8 +1041,8 @@ test "decompressFramed: multi-piece concatenation across L6 + L9 codecs" {
     const tmp = try allocator.alloc(u8, piece0_bound + piece1_bound);
     defer allocator.free(tmp);
 
-    const n0 = try fast_framed.compressFramedOne(allocator, std.testing.io, src[0..half], tmp, .{ .level = 6 });
-    const n1 = try fast_framed.compressFramedOne(allocator, std.testing.io, src[half..], tmp[n0..], .{ .level = 9 });
+    const n0 = try fast_framed.compressFramedOne(allocator, std.testing.io, src[0..half], tmp, .{ .level = 6 }, &gpu_encoder.g_default);
+    const n1 = try fast_framed.compressFramedOne(allocator, std.testing.io, src[half..], tmp[n0..], .{ .level = 9 }, &gpu_encoder.g_default);
     const total = n0 + n1;
 
     const decoded = try allocator.alloc(u8, src.len + decoder.safe_space);
@@ -1051,28 +1057,28 @@ test "decompressFramed: multi-piece concatenation across L6 + L9 codecs" {
 test "compressFramed: level=0 returns error.BadLevel" {
     var dst: [1024]u8 = undefined;
     const src = "hello";
-    const result = compressFramed(testing.allocator, src, &dst, .{ .level = 0 });
+    const result = compressFramed(testing.allocator, src, &dst, .{ .level = 0 }, &gpu_encoder.g_default);
     try testing.expectError(error.BadLevel, result);
 }
 
 test "compressFramed: level=12 returns error.BadLevel" {
     var dst: [1024]u8 = undefined;
     const src = "hello";
-    const result = compressFramed(testing.allocator, src, &dst, .{ .level = 12 });
+    const result = compressFramed(testing.allocator, src, &dst, .{ .level = 12 }, &gpu_encoder.g_default);
     try testing.expectError(error.BadLevel, result);
 }
 
 test "compressFramed: hash_bits=7 returns error.BadLevel" {
     var dst: [1024]u8 = undefined;
     const src = "hello";
-    const result = compressFramed(testing.allocator, src, &dst, .{ .level = 1, .hash_bits = 7 });
+    const result = compressFramed(testing.allocator, src, &dst, .{ .level = 1, .hash_bits = 7 }, &gpu_encoder.g_default);
     try testing.expectError(error.BadLevel, result);
 }
 
 test "compressFramed: dst too small returns error.DestinationTooSmall" {
     var dst: [4]u8 = undefined;
     const src = "hello world, this needs more than 4 bytes of output space";
-    const result = compressFramed(testing.allocator, src, &dst, .{ .level = 1 });
+    const result = compressFramed(testing.allocator, src, &dst, .{ .level = 1 }, &gpu_encoder.g_default);
     try testing.expectError(error.DestinationTooSmall, result);
 }
 
@@ -1081,6 +1087,6 @@ test "compressFramed handles OOM cleanly" {
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     const src = comptimeRepeat("The quick brown fox jumps over the lazy dog. ", 100);
     var dst: [compressBound(src.len)]u8 = undefined;
-    const result = compressFramed(failing.allocator(), src, &dst, .{ .level = 1 });
+    const result = compressFramed(failing.allocator(), src, &dst, .{ .level = 1 }, &gpu_encoder.g_default);
     try testing.expectError(error.OutOfMemory, result);
 }

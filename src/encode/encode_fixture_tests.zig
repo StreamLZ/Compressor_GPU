@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const encoder = @import("streamlz_encoder.zig");
+const gpu_encoder = @import("fast/gpu_encoder.zig");
 const decoder = @import("../decode/streamlz_decoder.zig");
 
 const testing = std.testing;
@@ -92,7 +93,7 @@ test "encoder roundtrip: every .raw encodes + decodes byte-exact (L1/L2)" {
             const encoded = try page_alloc.alloc(u8, bound);
             defer page_alloc.free(encoded);
 
-            const n = encoder.compressFramed(allocator, raw_bytes, encoded, .{ .level = level }) catch |err| {
+            const n = encoder.compressFramed(allocator, raw_bytes, encoded, .{ .level = level }, &gpu_encoder.g_default) catch |err| {
                 try failures.append(allocator, .{
                     .raw_name = try allocator.dupe(u8, entry.name),
                     .level = level,

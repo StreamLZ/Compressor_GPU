@@ -1227,12 +1227,13 @@ test "decompressBlock roundtrips a raw compressed block (no frame wrapper)" {
 
     const allocator = testing.allocator;
     const encoder = @import("../encode/streamlz_encoder.zig");
+    const gpu_encoder = @import("../encode/fast/gpu_encoder.zig");
 
     // Compress via the framed API, then strip the SLZ1 frame header + 8-byte
     // outer block header to get the raw inner compressed block that
     // `decompressBlock` expects.
     var framed: [2048]u8 = undefined;
-    const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 });
+    const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 }, &gpu_encoder.g_default);
 
     const hdr = try frame.parseHeader(framed[0..framed_len]);
     const block_hdr = try frame.parseBlockHeader(framed[hdr.header_size..]);
@@ -1296,9 +1297,10 @@ test "decompressBlockWithDict matches decompressBlock when dst_offset == 0" {
 
     const allocator = testing.allocator;
     const encoder = @import("../encode/streamlz_encoder.zig");
+    const gpu_encoder = @import("../encode/fast/gpu_encoder.zig");
 
     var framed: [2048]u8 = undefined;
-    const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 });
+    const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 }, &gpu_encoder.g_default);
 
     const hdr = try frame.parseHeader(framed[0..framed_len]);
     const block_hdr = try frame.parseBlockHeader(framed[hdr.header_size..]);
@@ -1335,9 +1337,10 @@ test "decompressStream roundtrips a compressed frame into a Writer" {
 
     const allocator = testing.allocator;
     const encoder = @import("../encode/streamlz_encoder.zig");
+    const gpu_encoder = @import("../encode/fast/gpu_encoder.zig");
 
     var framed: [2048]u8 = undefined;
-    const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 });
+    const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 }, &gpu_encoder.g_default);
 
     var out_buf: [2048]u8 = @splat(0);
     var out_writer: std.Io.Writer = .fixed(&out_buf);
@@ -1357,9 +1360,10 @@ test "decompressStream enforces max_decompressed_size cap" {
 
     const allocator = testing.allocator;
     const encoder = @import("../encode/streamlz_encoder.zig");
+    const gpu_encoder = @import("../encode/fast/gpu_encoder.zig");
 
     var framed: [1024]u8 = undefined;
-    const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 });
+    const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 }, &gpu_encoder.g_default);
 
     var out_buf: [1024]u8 = @splat(0);
     var out_writer: std.Io.Writer = .fixed(&out_buf);
@@ -1385,9 +1389,10 @@ test "encoder sets RestartDecoder flag on first internal block header" {
 
     const allocator = testing.allocator;
     const encoder = @import("../encode/streamlz_encoder.zig");
+    const gpu_encoder = @import("../encode/fast/gpu_encoder.zig");
 
     var framed: [2048]u8 = undefined;
-    const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 });
+    const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 }, &gpu_encoder.g_default);
 
     const hdr = try frame.parseHeader(framed[0..framed_len]);
     const block_hdr = try frame.parseBlockHeader(framed[hdr.header_size..]);

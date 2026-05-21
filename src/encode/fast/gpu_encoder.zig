@@ -220,7 +220,7 @@ pub fn gpuEncodeTans32(
     return gpuEncodeTans32Impl(&g_default, allocator, descs, total_dst_bytes, out_sizes, out_bytes);
 }
 
-fn gpuEncodeTans32Impl(
+pub fn gpuEncodeTans32Impl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
     descs: []const Tans32EncDesc,
@@ -296,7 +296,7 @@ pub fn gpuEncodeHuff(
     return gpuEncodeHuffImpl(&g_default, descs, total_dst_bytes, out_sizes, out_bytes);
 }
 
-fn gpuEncodeHuffImpl(
+pub fn gpuEncodeHuffImpl(
     self: *EncodeContext,
     descs: []const HuffEncDesc,
     total_dst_bytes: usize,
@@ -424,12 +424,54 @@ pub const EncodeContext = struct {
     d_huff_out_size: usize = 0,
     d_huff_sizes_persist: CUdeviceptr = 0,
     d_huff_sizes_size: usize = 0,
+
+    // ── Result slices — formerly module-global `pub var`. Each encode
+    // operation writes its downloaded host-side payloads here; the frame
+    // assembler reads them back. Moved into the context so the compress
+    // path is reentrant per handle.
+    tans_lit_sizes: ?[]u32 = null,
+    tans_lit_data: ?[]u8 = null,
+    tans_lit_offsets: ?[]u32 = null,
+
+    tans32_lit_sizes: ?[]u32 = null,
+    tans32_lit_data: ?[]u8 = null,
+    tans32_lit_offsets: ?[]u32 = null,
+
+    tans32_tok_sizes: ?[]u32 = null,
+    tans32_tok_data: ?[]u8 = null,
+    tans32_tok_offsets: ?[]u32 = null,
+
+    tans32_off16hi_sizes: ?[]u32 = null,
+    tans32_off16hi_data: ?[]u8 = null,
+    tans32_off16hi_offsets: ?[]u32 = null,
+    tans32_off16lo_sizes: ?[]u32 = null,
+    tans32_off16lo_data: ?[]u8 = null,
+    tans32_off16lo_offsets: ?[]u32 = null,
+
+    huff_off16hi_sizes: ?[]u32 = null,
+    huff_off16hi_data: ?[]u8 = null,
+    huff_off16hi_offsets: ?[]u32 = null,
+    huff_off16lo_sizes: ?[]u32 = null,
+    huff_off16lo_data: ?[]u8 = null,
+    huff_off16lo_offsets: ?[]u32 = null,
+
+    huff_lit_sizes: ?[]u32 = null,
+    huff_lit_data: ?[]u8 = null,
+    huff_lit_offsets: ?[]u32 = null,
+    huff_tok_sizes: ?[]u32 = null,
+    huff_tok_data: ?[]u8 = null,
+    huff_tok_offsets: ?[]u32 = null,
+
+    tans32_shared_sizes: ?[]u32 = null,
+    tans32_shared_data: ?[]u8 = null,
+    tans32_shared_offsets: ?[]u32 = null,
+    tans32_shared_n_per_stream: u32 = 0,
 };
 
 /// Default context used by the thin public wrappers. External callers go
 /// through the original `pub fn` names; those delegate to this. A future
 /// library API will hand each handle its own `EncodeContext`.
-var g_default: EncodeContext = .{};
+pub var g_default: EncodeContext = .{};
 
 fn ensureBuf(ptr: *CUdeviceptr, cur: *usize, needed: usize) bool {
     if (cur.* >= needed) return true;
@@ -442,57 +484,31 @@ fn ensureBuf(ptr: *CUdeviceptr, cur: *usize, needed: usize) bool {
     return true;
 }
 
-/// Compress all chunks on GPU. Returns per-chunk compressed sizes.
-/// Caller provides input data, output buffer, and chunk layout.
-pub var tans_lit_sizes: ?[]u32 = null;
-pub var tans_lit_data: ?[]u8 = null;
-pub var tans_lit_offsets: ?[]u32 = null;
-
-// ── 32-lane tANS pre-encoded streams (per sub-chunk) ───────────────
-// sizes[i]:
+// ── Result slices ──────────────────────────────────────────────
+// The downloaded host-side encoded streams formerly lived here as
+// module-global `pub var`s. They are now fields of `EncodeContext`
+// (see the struct definition above) so the compress path is reentrant.
+//
+// tans_lit_*: 5-state tANS literal streams.
+//
+// tans32_*: 32-lane tANS pre-encoded streams (per sub-chunk). sizes[i]:
 //   if MSB set → tANS not beneficial; use raw bytes / memcpy.
 //   else      → encoded byte count at data[offsets[i] .. offsets[i] + size].
 // The encoded payload is the kernel's raw output: [128B sizes+states]
 // [prob table][32 sub-streams]. The caller prepends a 5-byte type-6
 // non-compact chunk header when writing to the final frame.
-pub var tans32_lit_sizes: ?[]u32 = null;
-pub var tans32_lit_data: ?[]u8 = null;
-pub var tans32_lit_offsets: ?[]u32 = null;
-
-pub var tans32_tok_sizes: ?[]u32 = null;
-pub var tans32_tok_data: ?[]u8 = null;
-pub var tans32_tok_offsets: ?[]u32 = null;
-
-// Off16 hi/lo byte-plane streams. Both planes share one device output
-// buffer and one descriptor array (hi descs first, then lo descs) but
-// expose separate (sizes, data, offsets) host-side for clarity.
-pub var tans32_off16hi_sizes: ?[]u32 = null;
-pub var tans32_off16hi_data: ?[]u8 = null;
-pub var tans32_off16hi_offsets: ?[]u32 = null;
-pub var tans32_off16lo_sizes: ?[]u32 = null;
-pub var tans32_off16lo_data: ?[]u8 = null;
-pub var tans32_off16lo_offsets: ?[]u32 = null;
-
-// GPU-Huffman off16 hi/lo byte-plane streams (chunk_type=4 bodies, no
-// 5-byte chunk header). `sizes[i] == 0` → no Huffman for that sub-chunk.
-// hi and lo share one `data` buffer; `offsets[i]` indexes into it.
-pub var huff_off16hi_sizes: ?[]u32 = null;
-pub var huff_off16hi_data: ?[]u8 = null;
-pub var huff_off16hi_offsets: ?[]u32 = null;
-pub var huff_off16lo_sizes: ?[]u32 = null;
-pub var huff_off16lo_data: ?[]u8 = null;
-pub var huff_off16lo_offsets: ?[]u32 = null;
-
-// GPU-Huffman literal / token streams (chunk_type=4 bodies, no 5-byte
-// chunk header). `sizes[i] == 0` → no Huffman body for that sub-chunk.
-pub var huff_lit_sizes: ?[]u32 = null;
-pub var huff_lit_data: ?[]u8 = null;
-pub var huff_lit_offsets: ?[]u32 = null;
-pub var huff_tok_sizes: ?[]u32 = null;
-pub var huff_tok_data: ?[]u8 = null;
-pub var huff_tok_offsets: ?[]u32 = null;
-
-// Phase 2 shared-LUT encoded streams. Single descriptor array layout:
+//
+// tans32_off16{hi,lo}_*: off16 hi/lo byte-plane streams. Both planes
+// share one device output buffer and one descriptor array (hi descs
+// first, then lo descs) but expose separate (sizes, data, offsets)
+// host-side for clarity.
+//
+// huff_*: GPU-Huffman streams (chunk_type=4 bodies, no 5-byte chunk
+// header). `sizes[i] == 0` → no Huffman body for that sub-chunk. The
+// off16 hi and lo share one `data` buffer; `offsets[i]` indexes into it.
+//
+// tans32_shared_*: Phase 2 shared-LUT encoded streams. Single descriptor
+// array layout:
 //   descs[0..N]     → literals (lut_id=0)
 //   descs[N..2N]    → tokens   (lut_id=1)
 //   descs[2N..3N]   → off16-hi (lut_id=2)
@@ -500,10 +516,6 @@ pub var huff_tok_offsets: ?[]u32 = null;
 // `tans32_shared_n_per_stream` records N. The body at offset O has
 // length sizes[i]; the body starts with a 1-byte lut_id followed by
 // [128B sizes+states][32 sub-streams].
-pub var tans32_shared_sizes: ?[]u32 = null;
-pub var tans32_shared_data: ?[]u8 = null;
-pub var tans32_shared_offsets: ?[]u32 = null;
-pub var tans32_shared_n_per_stream: u32 = 0;
 
 /// Build literal descriptors and run the 32-lane tANS encoder.
 /// Output is a per-sub-chunk encoded body (no chunk header). Caller
@@ -518,7 +530,7 @@ pub fn gpuEncodeLiteralsTans32(
     return gpuEncodeLiteralsTans32Impl(&g_default, allocator, output, chunk_descs, comp_sizes);
 }
 
-fn gpuEncodeLiteralsTans32Impl(
+pub fn gpuEncodeLiteralsTans32Impl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
     output: []const u8,
@@ -588,9 +600,9 @@ fn gpuEncodeLiteralsTans32Impl(
         return false;
     }
 
-    tans32_lit_sizes = sizes;
-    tans32_lit_data = bytes;
-    tans32_lit_offsets = offsets;
+    self.tans32_lit_sizes = sizes;
+    self.tans32_lit_data = bytes;
+    self.tans32_lit_offsets = offsets;
     return true;
 }
 
@@ -608,7 +620,7 @@ pub fn gpuEncodeTokensTans32(
     return gpuEncodeTokensTans32Impl(&g_default, allocator, output, chunk_descs, comp_sizes);
 }
 
-fn gpuEncodeTokensTans32Impl(
+pub fn gpuEncodeTokensTans32Impl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
     output: []const u8,
@@ -692,9 +704,9 @@ fn gpuEncodeTokensTans32Impl(
         return false;
     }
 
-    tans32_tok_sizes = sizes;
-    tans32_tok_data = bytes;
-    tans32_tok_offsets = offsets;
+    self.tans32_tok_sizes = sizes;
+    self.tans32_tok_data = bytes;
+    self.tans32_tok_offsets = offsets;
     return true;
 }
 
@@ -716,7 +728,7 @@ pub fn gpuEncodeOff16Tans32(
     return gpuEncodeOff16Tans32Impl(&g_default, allocator, output, chunk_descs, comp_sizes);
 }
 
-fn gpuEncodeOff16Tans32Impl(
+pub fn gpuEncodeOff16Tans32Impl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
     output: []const u8,
@@ -844,12 +856,12 @@ fn gpuEncodeOff16Tans32Impl(
     @memcpy(lo_sizes, all_sizes[n..]);
     allocator.free(all_sizes);
 
-    tans32_off16hi_sizes = hi_sizes;
-    tans32_off16hi_data = bytes; // shared buffer; both hi and lo offsets index into it
-    tans32_off16hi_offsets = hi_offsets;
-    tans32_off16lo_sizes = lo_sizes;
-    tans32_off16lo_data = bytes; // SAME pointer — only one of {hi,lo} should free it
-    tans32_off16lo_offsets = lo_offsets;
+    self.tans32_off16hi_sizes = hi_sizes;
+    self.tans32_off16hi_data = bytes; // shared buffer; both hi and lo offsets index into it
+    self.tans32_off16hi_offsets = hi_offsets;
+    self.tans32_off16lo_sizes = lo_sizes;
+    self.tans32_off16lo_data = bytes; // SAME pointer — only one of {hi,lo} should free it
+    self.tans32_off16lo_offsets = lo_offsets;
     return true;
 }
 
@@ -867,7 +879,7 @@ pub fn gpuEncodeOff16Huff(
     return gpuEncodeOff16HuffImpl(&g_default, allocator, output, chunk_descs, comp_sizes);
 }
 
-fn gpuEncodeOff16HuffImpl(
+pub fn gpuEncodeOff16HuffImpl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
     output: []const u8,
@@ -993,12 +1005,12 @@ fn gpuEncodeOff16HuffImpl(
     @memcpy(lo_sizes, all_sizes[n..]);
     allocator.free(all_sizes);
 
-    huff_off16hi_sizes = hi_sizes;
-    huff_off16hi_data = bytes; // shared buffer; both hi and lo offsets index into it
-    huff_off16hi_offsets = hi_offsets;
-    huff_off16lo_sizes = lo_sizes;
-    huff_off16lo_data = bytes; // SAME pointer — only one of {hi,lo} should free it
-    huff_off16lo_offsets = lo_offsets;
+    self.huff_off16hi_sizes = hi_sizes;
+    self.huff_off16hi_data = bytes; // shared buffer; both hi and lo offsets index into it
+    self.huff_off16hi_offsets = hi_offsets;
+    self.huff_off16lo_sizes = lo_sizes;
+    self.huff_off16lo_data = bytes; // SAME pointer — only one of {hi,lo} should free it
+    self.huff_off16lo_offsets = lo_offsets;
     return true;
 }
 
@@ -1014,7 +1026,7 @@ pub fn gpuEncodeLiteralsHuff(
     return gpuEncodeLiteralsHuffImpl(&g_default, allocator, output, chunk_descs, comp_sizes);
 }
 
-fn gpuEncodeLiteralsHuffImpl(
+pub fn gpuEncodeLiteralsHuffImpl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
     output: []const u8,
@@ -1086,9 +1098,9 @@ fn gpuEncodeLiteralsHuffImpl(
         return false;
     }
 
-    huff_lit_sizes = sizes;
-    huff_lit_data = bytes;
-    huff_lit_offsets = offsets;
+    self.huff_lit_sizes = sizes;
+    self.huff_lit_data = bytes;
+    self.huff_lit_offsets = offsets;
     return true;
 }
 
@@ -1104,7 +1116,7 @@ pub fn gpuEncodeTokensHuff(
     return gpuEncodeTokensHuffImpl(&g_default, allocator, output, chunk_descs, comp_sizes);
 }
 
-fn gpuEncodeTokensHuffImpl(
+pub fn gpuEncodeTokensHuffImpl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
     output: []const u8,
@@ -1180,9 +1192,9 @@ fn gpuEncodeTokensHuffImpl(
         return false;
     }
 
-    huff_tok_sizes = sizes;
-    huff_tok_data = bytes;
-    huff_tok_offsets = offsets;
+    self.huff_tok_sizes = sizes;
+    self.huff_tok_data = bytes;
+    self.huff_tok_offsets = offsets;
     return true;
 }
 
@@ -1201,7 +1213,7 @@ pub fn gpuEncodeAllSharedTans32(
     return gpuEncodeAllSharedTans32Impl(&g_default, allocator, output, chunk_descs, comp_sizes, tables);
 }
 
-fn gpuEncodeAllSharedTans32Impl(
+pub fn gpuEncodeAllSharedTans32Impl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
     output: []const u8,
@@ -1395,10 +1407,10 @@ fn gpuEncodeAllSharedTans32Impl(
     _ = d2h_fn(@ptrCast(sizes.ptr), self.d_tans32_sizes_persist, sizes_bytes_dev);
     _ = d2h_fn(@ptrCast(bytes.ptr), self.d_tans32_out_persist, total);
 
-    tans32_shared_sizes = sizes;
-    tans32_shared_data = bytes;
-    tans32_shared_offsets = offsets;
-    tans32_shared_n_per_stream = n;
+    self.tans32_shared_sizes = sizes;
+    self.tans32_shared_data = bytes;
+    self.tans32_shared_offsets = offsets;
+    self.tans32_shared_n_per_stream = n;
     return true;
 }
 
@@ -1413,7 +1425,7 @@ pub fn gpuCompress(
     return gpuCompressImpl(&g_default, input, output, chunk_descs, comp_sizes_out, io, level);
 }
 
-fn gpuCompressImpl(
+pub fn gpuCompressImpl(
     self: *EncodeContext,
     input: []const u8,
     output: []u8,
@@ -1598,9 +1610,9 @@ fn gpuCompressImpl(
         _ = d2h_fn(@ptrCast(h_tans_data.ptr), self.d_tans_out_persist, total_tans_dst);
 
         // Store for frame assembler
-        tans_lit_sizes = h_tans_sizes;
-        tans_lit_data = h_tans_data;
-        tans_lit_offsets = lit_dst_offsets;
+        self.tans_lit_sizes = h_tans_sizes;
+        self.tans_lit_data = h_tans_data;
+        self.tans_lit_offsets = lit_dst_offsets;
     }
 
     return true;

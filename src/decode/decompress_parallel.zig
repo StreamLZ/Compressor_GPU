@@ -1283,6 +1283,7 @@ fn reportWorkerError(shared: *const FastL14Shared) DecodeError {
 
 const testing = std.testing;
 const encoder = @import("../encode/streamlz_encoder.zig");
+const gpu_encoder = @import("../encode/fast/gpu_encoder.zig");
 const decoder = @import("streamlz_decoder.zig");
 
 fn parallelRoundtrip(source: []const u8, level: u8) !void {
@@ -1291,7 +1292,7 @@ fn parallelRoundtrip(source: []const u8, level: u8) !void {
     const compressed = try allocator.alloc(u8, bound);
     defer allocator.free(compressed);
 
-    const n = try encoder.compressFramed(allocator, source, compressed, .{ .level = level });
+    const n = try encoder.compressFramed(allocator, source, compressed, .{ .level = level }, &gpu_encoder.g_default);
     try testing.expect(n > 0);
     try testing.expect(n <= bound);
 
