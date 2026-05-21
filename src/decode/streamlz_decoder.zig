@@ -18,7 +18,7 @@ const constants = @import("../format/streamlz_constants.zig");
 const fast = @import("fast/fast_lz_decoder.zig");
 const high = @import("high/high_lz_decoder.zig");
 const parallel = @import("decompress_parallel.zig");
-const gpu_driver = @import("../gpu/gpu_driver.zig");
+const gpu_driver = @import("../gpu/decode/driver.zig");
 
 /// Extra bytes the decoder is allowed to write past `dst_len`.
 pub const safe_space = constants.safe_space;
@@ -315,7 +315,7 @@ fn decompressOneFrame(
         // so it handles any sc_group_size. At sc>0.5 the encoder gates off tANS
         // (raw streams only) so the per-chunk tANS scratch isn't needed there.
         if (use_gpu) gpu_frame: {
-            const gpu = @import("../gpu/gpu_driver.zig");
+            const gpu = @import("../gpu/decode/driver.zig");
             if (!gpu.isAvailable()) break :gpu_frame;
             if (block_src.len < 2) break :gpu_frame;
             const peek = block_header.parseBlockHeader(block_src) catch break :gpu_frame;
@@ -349,7 +349,7 @@ fn decompressOneFrame(
 
         // Vulkan fallback: try Vulkan compute when CUDA is unavailable
         if (!dispatched_parallel and use_gpu and hdr.sc_group_size <= 1.0) vk_frame: {
-            const vk = @import("fast/vk_driver.zig");
+            const vk = @import("../gpu/decode/vulkan_driver.zig");
             if (!vk.isAvailable()) break :vk_frame;
             if (block_src.len < 2) break :vk_frame;
             const peek_vk = block_header.parseBlockHeader(block_src) catch break :vk_frame;
@@ -724,7 +724,7 @@ fn decompressCompressedBlock(
     // tANS literal/token streams are pre-decoded by the tANS kernel (Pass 1).
     // Entropy-coded off16 streams are decoded on the CPU and uploaded.
     if (use_gpu and sc_group_size <= 1.0) gpu_batch: {
-        const gpu = @import("../gpu/gpu_driver.zig");
+        const gpu = @import("../gpu/decode/driver.zig");
         if (!gpu.isAvailable()) break :gpu_batch;
         gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, sc_group_size, scratch, null, dec_ctx) catch {
             break :gpu_batch;
@@ -933,7 +933,7 @@ fn gpuBatchDecode(
     dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!void {
     _ = scratch;
-    const gpu = @import("../gpu/gpu_driver.zig");
+    const gpu = @import("../gpu/decode/driver.zig");
     const alloc = std.heap.page_allocator;
 
     const eff_chunk_sz = @min(frame.scGroupSizeToBytes(sc_group_size_in), constants.chunk_size);
@@ -1075,7 +1075,7 @@ fn vkBatchDecode(
     io_opt: ?std.Io,
 ) DecompressError!void {
     _ = scratch;
-    const vk = @import("fast/vk_driver.zig");
+    const vk = @import("../gpu/decode/vulkan_driver.zig");
     const alloc = std.heap.page_allocator;
 
     const eff_chunk_sz = @min(frame.scGroupSizeToBytes(sc_group_size_in), constants.chunk_size);
@@ -1246,7 +1246,7 @@ test "decompressBlock roundtrips a raw compressed block (no frame wrapper)" {
 
     const allocator = testing.allocator;
     const encoder = @import("../encode/streamlz_encoder.zig");
-    const gpu_encoder = @import("../gpu/gpu_encoder.zig");
+    const gpu_encoder = @import("../gpu/encode/driver.zig");
 
     // Compress via the framed API, then strip the SLZ1 frame header + 8-byte
     // outer block header to get the raw inner compressed block that
@@ -1316,7 +1316,7 @@ test "decompressBlockWithDict matches decompressBlock when dst_offset == 0" {
 
     const allocator = testing.allocator;
     const encoder = @import("../encode/streamlz_encoder.zig");
-    const gpu_encoder = @import("../gpu/gpu_encoder.zig");
+    const gpu_encoder = @import("../gpu/encode/driver.zig");
 
     var framed: [2048]u8 = undefined;
     const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 }, &gpu_encoder.g_default);
@@ -1356,7 +1356,7 @@ test "decompressStream roundtrips a compressed frame into a Writer" {
 
     const allocator = testing.allocator;
     const encoder = @import("../encode/streamlz_encoder.zig");
-    const gpu_encoder = @import("../gpu/gpu_encoder.zig");
+    const gpu_encoder = @import("../gpu/encode/driver.zig");
 
     var framed: [2048]u8 = undefined;
     const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 }, &gpu_encoder.g_default);
@@ -1380,7 +1380,7 @@ test "decompressStream enforces max_decompressed_size cap" {
 
     const allocator = testing.allocator;
     const encoder = @import("../encode/streamlz_encoder.zig");
-    const gpu_encoder = @import("../gpu/gpu_encoder.zig");
+    const gpu_encoder = @import("../gpu/encode/driver.zig");
 
     var framed: [1024]u8 = undefined;
     const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 }, &gpu_encoder.g_default);
@@ -1410,7 +1410,7 @@ test "encoder sets RestartDecoder flag on first internal block header" {
 
     const allocator = testing.allocator;
     const encoder = @import("../encode/streamlz_encoder.zig");
-    const gpu_encoder = @import("../gpu/gpu_encoder.zig");
+    const gpu_encoder = @import("../gpu/encode/driver.zig");
 
     var framed: [2048]u8 = undefined;
     const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 }, &gpu_encoder.g_default);

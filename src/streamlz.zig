@@ -19,7 +19,7 @@ pub const DecompressError = @import("decode/streamlz_decoder.zig").DecompressErr
 /// Per-handle GPU decode context. The decode entry points take a
 /// `*DecodeContext`; pass `&default_decode_context` for the legacy
 /// module-global behavior, or allocate one per library handle.
-pub const DecodeContext = @import("gpu/gpu_driver.zig").DecodeContext;
-pub const default_decode_context = &@import("gpu/gpu_driver.zig").g_default;
+pub const DecodeContext = @import("gpu/decode/driver.zig").DecodeContext;
+pub const default_decode_context = &@import("gpu/decode/driver.zig").g_default;
 
 pub const safe_space = @import("decode/streamlz_decoder.zig").safe_space;

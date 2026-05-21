@@ -553,7 +553,7 @@ const high_framed = @import("high_framed.zig");
 
 // GPU compress driver — `EncodeContext` is threaded through
 // `compressFramedOne` so the GPU compress path is reentrant per handle.
-const gpu_enc = @import("../gpu/gpu_encoder.zig");
+const gpu_enc = @import("../gpu/encode/driver.zig");
 
 const areAllBytesEqual = block_header.areAllBytesEqual;
 
@@ -2028,7 +2028,7 @@ test "compressFramedOne: empty input roundtrip" {
     try std.testing.expect(n > 0);
     try std.testing.expect(n < 64);
     const decoder = @import("../decode/streamlz_decoder.zig");
-    const gpu_driver = @import("../gpu/gpu_driver.zig");
+    const gpu_driver = @import("../gpu/decode/driver.zig");
     var dec_buf: [64]u8 = undefined;
     const dec_n = try decoder.decompressFramed(dst[0..n], &dec_buf, &gpu_driver.g_default);
     try std.testing.expectEqual(@as(usize, 0), dec_n);
@@ -2045,7 +2045,7 @@ test "compressFramedOne: all-equal bytes compresses small" {
     const n = try compressFramedOne(allocator, std.testing.io, src, dst, .{ .level = 1 }, &gpu_enc.g_default);
     try std.testing.expect(n < 200);
     const decoder = @import("../decode/streamlz_decoder.zig");
-    const gpu_driver = @import("../gpu/gpu_driver.zig");
+    const gpu_driver = @import("../gpu/decode/driver.zig");
     const dec = try allocator.alloc(u8, src.len + 64);
     defer allocator.free(dec);
     const dec_n = try decoder.decompressFramed(dst[0..n], dec, &gpu_driver.g_default);

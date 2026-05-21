@@ -4,7 +4,7 @@
 //! Fallback path when CUDA is unavailable (AMD, Intel, etc).
 
 const std = @import("std");
-const fast_dec = @import("fast_lz_decoder.zig");
+const GpuError = @import("driver.zig").GpuError;
 
 const win32 = struct {
     extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.c) ?*anyopaque;
@@ -435,7 +435,7 @@ fn initPipeline() bool {
     const createPL = vkProc(*const fn (Handle, *const VkPipelineLayoutCreateInfo, ?*anyopaque, *Handle) callconv(.c) VkResult, "vkCreatePipelineLayout") orelse return false;
     const createCP = vkProc(*const fn (Handle, Handle, u32, [*]const VkComputePipelineCreateInfo, ?*anyopaque, [*]Handle) callconv(.c) VkResult, "vkCreateComputePipelines") orelse return false;
 
-    const spv align(@alignOf(u32)) = @embedFile("../../gpu/gpu_decode_kernel.spv");
+    const spv align(@alignOf(u32)) = @embedFile("lz_kernel.spv");
     var sm_ci = VkShaderModuleCreateInfo{ .codeSize = spv.len, .pCode = @ptrCast(@alignCast(spv.ptr)) };
     var shader_mod: Handle = null;
     if (createSM(vk_dev, &sm_ci, null, &shader_mod) != VK_SUCCESS) return false;
@@ -701,7 +701,7 @@ pub fn fullVkLaunch(
     chunks_per_group: u32,
     sub_chunk_cap: u32,
     io: ?std.Io,
-) fast_dec.DecodeError!void {
+) GpuError!void {
     if (!init()) return error.BadMode;
     _ = io;
 

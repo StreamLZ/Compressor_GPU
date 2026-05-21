@@ -145,7 +145,7 @@ pub fn init() bool {
     const get_fn = cuModuleGetFunction_fn orelse return false;
 
     // Load LZ decode kernel (Pass 2)
-    const ptx = @embedFile("gpu_decode_kernel.ptx") ++ "\x00";
+    const ptx = @embedFile("lz_kernel.ptx") ++ "\x00";
     if (load_fn(&module, ptx.ptr) != CUDA_SUCCESS) return false;
     if (get_fn(&kernel_fn, module, "slzFullDecompressL1Kernel") != CUDA_SUCCESS) return false;
     // Optional raw-off16 gather kernel — driver falls back to D2D copies
@@ -156,7 +156,7 @@ pub fn init() bool {
     _ = get_fn(&kernel_raw_fn, module, "slzFullDecompressL1KernelRaw");
 
     // Load tANS decode kernel (Pass 1)
-    const tans_ptx = @embedFile("gpu_tans_decode_kernel.ptx") ++ "\x00";
+    const tans_ptx = @embedFile("tans_kernel.ptx") ++ "\x00";
     if (load_fn(&tans_module, tans_ptx.ptr) == CUDA_SUCCESS) {
         _ = get_fn(&tans_kernel_fn, tans_module, "slzTansDecodeKernel");
         _ = get_fn(&tans_build_fn, tans_module, "slzTansBuildTablesKernel");
@@ -168,7 +168,7 @@ pub fn init() bool {
     }
 
     // Load Huffman decode kernels (Pass 1.5, for chunk_type=4 literals)
-    const huff_ptx = @embedFile("gpu_huff_decode_kernel.ptx") ++ "\x00";
+    const huff_ptx = @embedFile("huffman_kernel.ptx") ++ "\x00";
     if (load_fn(&huff_module, huff_ptx.ptr) == CUDA_SUCCESS) {
         _ = get_fn(&huff_build_fn, huff_module, "slzHuffBuildLutKernel");
         _ = get_fn(&huff_decode_fn, huff_module, "slzHuffDecode4StreamKernel");

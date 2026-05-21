@@ -1,8 +1,8 @@
 const std = @import("std");
 const encoder = @import("encode/streamlz_encoder.zig");
-const gpu_encoder = @import("gpu/gpu_encoder.zig");
+const gpu_encoder = @import("gpu/encode/driver.zig");
 const decoder = @import("decode/streamlz_decoder.zig");
-const gpu_driver = @import("gpu/gpu_driver.zig");
+const gpu_driver = @import("gpu/decode/driver.zig");
 const frame = @import("format/frame_format.zig");
 
 const allocator = std.heap.c_allocator;

@@ -32,7 +32,7 @@ const fast_framed = @import("fast_framed.zig");
 
 // GPU compress driver — `EncodeContext` is threaded through the framed
 // entry points so the GPU compress path is reentrant per handle.
-const gpu_encoder = @import("../gpu/gpu_encoder.zig");
+const gpu_encoder = @import("../gpu/encode/driver.zig");
 
 /// Default dictionary size when the caller doesn't override (1 GB).
 pub const default_dictionary_size: u32 = @intCast(lz_constants.max_dictionary_size);
@@ -371,7 +371,7 @@ pub fn compressFramedWithIo(
 
 const testing = std.testing;
 const decoder = @import("../decode/streamlz_decoder.zig");
-const gpu_driver = @import("../gpu/gpu_driver.zig");
+const gpu_driver = @import("../gpu/decode/driver.zig");
 
 fn comptimeRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
     @setEvalBranchQuota(s.len * n * 4);

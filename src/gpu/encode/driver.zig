@@ -65,7 +65,7 @@ pub fn init() bool {
 
     // Reuse CUDA context from the decode driver if available.
     // This avoids creating a second context which would clobber the first.
-    const dec_gpu = @import("gpu_driver.zig");
+    const dec_gpu = @import("../decode/driver.zig");
     if (!dec_gpu.init()) return false;
 
     lib = win32.LoadLibraryA("nvcuda.dll");
@@ -81,14 +81,14 @@ pub fn init() bool {
     cuCtxSynchronize_fn = getProc(FnCtxSync, "cuCtxSynchronize");
     cuMemsetD8_fn = getProc(FnMemsetD8, "cuMemsetD8_v2");
 
-    const ptx = @embedFile("gpu_encode_kernel.ptx") ++ "\x00";
+    const ptx = @embedFile("lz_kernel.ptx") ++ "\x00";
     if ((cuModuleLoadData_fn orelse return false)(&module, ptx.ptr) != CUDA_SUCCESS) return false;
 
     const get_fn = cuModuleGetFunction_fn orelse return false;
     if (get_fn(&kernel_fn, module, "slzCompressL1Kernel") != CUDA_SUCCESS) return false;
 
     // Load tANS entropy kernel (5-state + 32-lane)
-    const tans_ptx = @embedFile("gpu_tans_kernel.ptx") ++ "\x00";
+    const tans_ptx = @embedFile("tans_kernel.ptx") ++ "\x00";
     if ((cuModuleLoadData_fn orelse return false)(&tans_module, tans_ptx.ptr) != CUDA_SUCCESS) return false;
     if (get_fn(&tans_kernel_fn, tans_module, "slzTansEncodeKernel") != CUDA_SUCCESS) return false;
     // 32-lane tANS encoder (chunk_type=6). Loaded lazily — kernel symbol must
@@ -98,7 +98,7 @@ pub fn init() bool {
     // GPU Huffman encoder (chunk_type=4). Optional — if the module or
     // either kernel is missing, gpuEncode*Huff returns false and the
     // caller falls back to the CPU Huffman encoder.
-    const huff_ptx = @embedFile("gpu_huff_kernel.ptx") ++ "\x00";
+    const huff_ptx = @embedFile("huffman_kernel.ptx") ++ "\x00";
     if ((cuModuleLoadData_fn orelse return false)(&huff_module, huff_ptx.ptr) == CUDA_SUCCESS) {
         _ = get_fn(&huff_tables_kernel_fn, huff_module, "slzHuffBuildTablesKernel");
         _ = get_fn(&huff_encode_kernel_fn, huff_module, "slzHuffEncode4StreamKernel");

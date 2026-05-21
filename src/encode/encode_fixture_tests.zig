@@ -9,9 +9,9 @@
 
 const std = @import("std");
 const encoder = @import("streamlz_encoder.zig");
-const gpu_encoder = @import("../gpu/gpu_encoder.zig");
+const gpu_encoder = @import("../gpu/encode/driver.zig");
 const decoder = @import("../decode/streamlz_decoder.zig");
-const gpu_driver = @import("../gpu/gpu_driver.zig");
+const gpu_driver = @import("../gpu/decode/driver.zig");
 
 const testing = std.testing;
 const page_alloc = std.heap.page_allocator;
