@@ -143,13 +143,18 @@ decode path applies here.)
 |-------|------:|--------------:|-----------:|
 | StreamLZ L1 | 58.6% | 3.8 ms | 16.3 ms |
 | StreamLZ L5 | 38.9% | 7.4 ms | 18.5 ms |
-| nvCOMP LZ4 | 60.0% | ~5.0 ms | — |
-| nvCOMP Zstd | 40.2% | ~6.4 ms | 18.2 ms |
+| nvCOMP LZ4 | 60.0% | 5.1 ms | 18.5 ms |
+| nvCOMP Zstd | 40.2% | 6.2 ms | 18.2 ms |
+
+nvCOMP figures are best-of-20 from the `nvcomp_bench3` harness (nvCOMP
+5.2.0), measured the same way as StreamLZ's `-db`: decode kernel timed
+by CUDA event, e2e as H2D(compressed) + decode + D2H(output) wall-clock,
+both with a correctness verify.
 
 StreamLZ L5 compresses tighter than nvCOMP Zstd (38.9% vs 40.2%) at a
 comparable end-to-end decode (18.5 vs 18.2 ms). StreamLZ L1 matches
-nvCOMP LZ4's ratio (58.6% vs 60.0%) with a faster decode kernel
-(3.8 vs ~5.0 ms).
+nvCOMP LZ4's ratio (58.6% vs 60.0%) and decodes faster on both axes —
+kernel 3.8 vs 5.1 ms, e2e 16.3 vs 18.5 ms.
 
 ## Invariants — do not break these
 
