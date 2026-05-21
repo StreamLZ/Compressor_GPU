@@ -65,7 +65,7 @@ pub fn init() bool {
 
     // Reuse CUDA context from the decode driver if available.
     // This avoids creating a second context which would clobber the first.
-    const dec_gpu = @import("../../decode/fast/gpu_driver.zig");
+    const dec_gpu = @import("gpu_driver.zig");
     if (!dec_gpu.init()) return false;
 
     lib = win32.LoadLibraryA("nvcuda.dll");

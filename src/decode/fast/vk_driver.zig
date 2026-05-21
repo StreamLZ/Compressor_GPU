@@ -435,7 +435,7 @@ fn initPipeline() bool {
     const createPL = vkProc(*const fn (Handle, *const VkPipelineLayoutCreateInfo, ?*anyopaque, *Handle) callconv(.c) VkResult, "vkCreatePipelineLayout") orelse return false;
     const createCP = vkProc(*const fn (Handle, Handle, u32, [*]const VkComputePipelineCreateInfo, ?*anyopaque, [*]Handle) callconv(.c) VkResult, "vkCreateComputePipelines") orelse return false;
 
-    const spv align(@alignOf(u32)) = @embedFile("gpu_decode_kernel.spv");
+    const spv align(@alignOf(u32)) = @embedFile("../../gpu/gpu_decode_kernel.spv");
     var sm_ci = VkShaderModuleCreateInfo{ .codeSize = spv.len, .pCode = @ptrCast(@alignCast(spv.ptr)) };
     var shader_mod: Handle = null;
     if (createSM(vk_dev, &sm_ci, null, &shader_mod) != VK_SUCCESS) return false;

@@ -2,9 +2,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const frame = @import("format/frame_format.zig");
 const decoder = @import("decode/streamlz_decoder.zig");
-const gpu_driver = @import("decode/fast/gpu_driver.zig");
+const gpu_driver = @import("gpu/gpu_driver.zig");
 const encoder = @import("encode/streamlz_encoder.zig");
-const gpu_encoder = @import("encode/fast/gpu_encoder.zig");
+const gpu_encoder = @import("gpu/gpu_encoder.zig");
 const dict_mod = @import("dict/dictionary.zig");
 
 const version_string = "2.0.0";
@@ -580,7 +580,7 @@ fn runCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
         const bo = @import("build_options");
         break :blk if (@hasDecl(bo, "gpu")) bo.gpu else false;
     }) {
-        const gpu_enc = @import("encode/fast/gpu_encoder.zig");
+        const gpu_enc = @import("gpu/gpu_encoder.zig");
         if (gpu_enc.last_kernel_ns > 0) {
             const kms: f64 = @as(f64, @floatFromInt(gpu_enc.last_kernel_ns)) / 1e6;
             const kmbps: f64 = @as(f64, @floatFromInt(src.len)) / (1024.0 * 1024.0) * 1e9 / @as(f64, @floatFromInt(gpu_enc.last_kernel_ns));
@@ -961,7 +961,7 @@ fn runBenchDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
     const DstBuf = struct { buf: []u8, pinned: bool };
     const dh: DstBuf = dstblk: {
         if (use_gpu_bench) {
-            const gpu_drv = @import("decode/fast/gpu_driver.zig");
+            const gpu_drv = @import("gpu/gpu_driver.zig");
             if (gpu_drv.allocHost(dst_size)) |p|
                 break :dstblk .{ .buf = p, .pinned = true };
         }
@@ -974,7 +974,7 @@ fn runBenchDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
     const dst = dh.buf;
     defer {
         if (use_gpu_bench and dh.pinned) {
-            const gpu_drv = @import("decode/fast/gpu_driver.zig");
+            const gpu_drv = @import("gpu/gpu_driver.zig");
             gpu_drv.freeHost(dst);
         } else allocator.free(dst);
     }
@@ -1007,7 +1007,7 @@ fn runBenchDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
         if (elapsed < best_ns) best_ns = elapsed;
         total_ns += elapsed;
         if (use_gpu_bench) {
-            const gpu = @import("decode/fast/gpu_driver.zig");
+            const gpu = @import("gpu/gpu_driver.zig");
             const vk = @import("decode/fast/vk_driver.zig");
             const kns = if (gpu.last_kernel_ns > 0) gpu.last_kernel_ns else vk.last_kernel_ns;
             if (kns > 0) {

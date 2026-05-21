@@ -20,7 +20,7 @@
 
 const std = @import("std");
 const decoder = @import("streamlz_decoder.zig");
-const gpu_driver = @import("fast/gpu_driver.zig");
+const gpu_driver = @import("../gpu/gpu_driver.zig");
 
 const testing = std.testing;
 const page_alloc = std.heap.page_allocator;

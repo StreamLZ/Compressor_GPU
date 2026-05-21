@@ -1283,8 +1283,8 @@ fn reportWorkerError(shared: *const FastL14Shared) DecodeError {
 
 const testing = std.testing;
 const encoder = @import("../encode/streamlz_encoder.zig");
-const gpu_encoder = @import("../encode/fast/gpu_encoder.zig");
-const gpu_driver = @import("fast/gpu_driver.zig");
+const gpu_encoder = @import("../gpu/gpu_encoder.zig");
+const gpu_driver = @import("../gpu/gpu_driver.zig");
 const decoder = @import("streamlz_decoder.zig");
 
 fn parallelRoundtrip(source: []const u8, level: u8) !void {

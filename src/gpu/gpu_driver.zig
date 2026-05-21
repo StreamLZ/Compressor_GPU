@@ -197,7 +197,15 @@ pub fn isAvailable() bool {
 
 // ── Device buffer management ────────────────────────────────────
 
-const fast_dec = @import("fast_lz_decoder.zig");
+/// Error set returned by `fullGpuLaunch` / `fullGpuLaunchImpl`. The GPU
+/// decode path only ever fails with `BadMode` (driver/kernel unavailable,
+/// device allocation failure, or a CUDA call returning non-success). Kept
+/// local so this file imports nothing outside `src/gpu/`. `BadMode` is a
+/// member of the decoder's `DecodeError`, so callers that return
+/// `DecompressError` (which includes `fast.DecodeError`) still unify.
+pub const GpuError = error{
+    BadMode,
+};
 
 pub var last_kernel_ns: i64 = 0;
 pub var last_tans_kernel_ns: i64 = 0;
@@ -1006,7 +1014,7 @@ pub fn fullGpuLaunch(
     chunks_per_group: u32,
     sub_chunk_cap: u32,
     io: ?std.Io,
-) fast_dec.DecodeError!void {
+) GpuError!void {
     return fullGpuLaunchImpl(
         &g_default,
         chunk_descs,
@@ -1032,7 +1040,7 @@ pub fn fullGpuLaunchImpl(
     chunks_per_group: u32,
     sub_chunk_cap: u32,
     io: ?std.Io,
-) fast_dec.DecodeError!void {
+) GpuError!void {
     if (!init() or kernel_fn == 0) return error.BadMode;
 
     // SLZ_E2E_TIMER: end-to-end decode phase breakdown — setup+H2D /
