@@ -24,6 +24,7 @@ var module: usize = 0;
 var kernel_fn: usize = 0;
 var kernel_raw_fn: usize = 0;
 var gather_off16_fn: usize = 0;
+var scan_parse_fn: usize = 0;
 var tans_module: usize = 0;
 var tans_kernel_fn: usize = 0;
 var tans_build_fn: usize = 0;
@@ -154,6 +155,9 @@ pub fn init() bool {
     // Optional lean L1/L2-raw kernel — driver routes to it when no entropy
     // is present. Failing to load is fine; falls back to general kernel.
     _ = get_fn(&kernel_raw_fn, module, "slzLzDecodeRawKernel");
+    // Optional GPU decode-scan kernel (roadmap 4d Phase 2). Absent → the
+    // driver keeps the CPU scanForTansChunks path.
+    _ = get_fn(&scan_parse_fn, module, "slzScanParseKernel");
 
     // Load Huffman decode kernels (Pass 1.5, for chunk_type=4 literals)
     const huff_ptx = @embedFile("huffman_kernel.ptx") ++ "\x00";
@@ -304,6 +308,25 @@ const HuffDecChunkDesc = extern struct {
 
 const HUFF_LUT_ENTRIES: usize = 1024; // matches MAX_CODE_LEN=10 (10-bit escape LUT) in kernel
 
+// Staged decode-scan output — mirror SlzScanHuffDesc / SlzScanRawDesc in
+// lz_kernels.cuh. slzScanParseKernel fills one entry per stream type per
+// global sub-chunk index; `valid` marks an entropy-coded / raw stream
+// present. gpuScanChunks compacts the valid slots into the merged
+// HuffDecChunkDesc / RawOff16Desc arrays.
+const ScanHuffDesc = extern struct {
+    in_offset: u32 = 0,
+    in_size: u32 = 0,
+    out_offset: u32 = 0,
+    out_size: u32 = 0,
+    valid: u32 = 0,
+};
+const ScanRawDesc = extern struct {
+    src_offset: u32 = 0,
+    size: u32 = 0,
+    gpu_offset: u32 = 0,
+    valid: u32 = 0,
+};
+
 /// Per-decode-operation mutable state. Every device-buffer pointer, buffer
 /// size, host scratch array, and per-operation flag formerly held as a
 /// module-global lives here so a future library API can hand each handle
@@ -387,6 +410,14 @@ pub const DecodeContext = struct {
     tans_off16lo_host_buf: [4096]TansDecChunkDesc = undefined,
     raw_off16_buf: [8192]RawOff16Desc = undefined,
 
+    // GPU decode-scan staged buffers (roadmap 4d Phase 2). d_scan_staged
+    // packs the six staged arrays (lit/tok/hi/lo huff + raw hi/lo);
+    // d_scan_first_sub holds the per-chunk first-sub-chunk prefix sum.
+    d_scan_staged: CUdeviceptr = 0,
+    d_scan_staged_size: usize = 0,
+    d_scan_first_sub: CUdeviceptr = 0,
+    d_scan_first_sub_size: usize = 0,
+
     // Huffman descriptors + LUT.
     d_huff_descs: CUdeviceptr = 0,
     d_huff_descs_size: usize = 0,
@@ -462,7 +493,10 @@ fn scanForTansChunks(
     var cur_sub_idx: u32 = 0; // global sub-chunk index — mirrors driver prefix sum
     const cap_safe: u32 = if (sub_chunk_cap == 0) 65536 else sub_chunk_cap;
 
-    // SLZ_E2E_TIMER: confirm whether this walk is the ~15 ms cost.
+    // SLZ_E2E_TIMER: per-sub-chunk walk timing. Measured ~0.5-0.9 ms on
+    // the dev desktop — the scan is not a decode bottleneck (decode is
+    // PCIe-bound); SLZ_GPU_SCAN moves it to the GPU mainly for the
+    // device-resident D2D path, not for speed.
     const scan_dbg = std.c.getenv("SLZ_E2E_TIMER") != null;
     const t_scan0 = if (scan_dbg)
         (if (io) |iv| std.Io.Clock.awake.now(iv) else null)
@@ -990,6 +1024,143 @@ fn parseTansHeaderPaired(
     return false;
 }
 
+/// GPU decode scan (roadmap 4d Phase 2). Drop-in replacement for
+/// scanForTansChunks: slzScanParseKernel parses every sub-chunk's stream
+/// headers on the GPU (one thread per chunk); the staged per-sub-chunk
+/// output is downloaded and compacted here into the same merged
+/// HuffDecChunkDesc / RawOff16Desc arrays. The compressed block and
+/// chunk descriptors must already be resident in d_comp_persist /
+/// d_descs_persist. Returns null — caller keeps the CPU scan — on any
+/// failure. tANS is retired, so only the Huffman + raw-off16 outputs are
+/// produced (num_lit/num_tok/... stay 0).
+fn gpuScanChunks(
+    self: *DecodeContext,
+    chunk_descs: []const ChunkDesc,
+    compressed_block: []const u8,
+    sub_chunk_cap: u32,
+    first_subchunk_idx: []const u32,
+    total_subchunks: u32,
+    huff_lit_descs: []HuffDecChunkDesc,
+    huff_tok_descs: []HuffDecChunkDesc,
+    huff_off16hi_descs: []HuffDecChunkDesc,
+    huff_off16lo_descs: []HuffDecChunkDesc,
+    raw_off16_descs: []RawOff16Desc,
+) ?ScanResult {
+    if (scan_parse_fn == 0) return null;
+    const n: u32 = @intCast(chunk_descs.len);
+    if (n == 0 or total_subchunks == 0 or first_subchunk_idx.len < n) return null;
+
+    const h2d = cuMemcpyHtoD_fn orelse return null;
+    const d2h = cuMemcpyDtoH_fn orelse return null;
+    const launch = cuLaunchKernel_fn orelse return null;
+    const sync = cuCtxSynchronize_fn orelse return null;
+    const memset = cuMemsetD8_fn orelse return null;
+
+    // Upload the per-chunk first-sub-chunk prefix sum.
+    const fs_bytes: usize = @as(usize, n) * 4;
+    if (!ensureDeviceBuf(&self.d_scan_first_sub, &self.d_scan_first_sub_size, fs_bytes)) return null;
+    _ = h2d(self.d_scan_first_sub, @ptrCast(first_subchunk_idx.ptr), fs_bytes);
+
+    // Staged buffer: [lit][tok][hi][lo] ScanHuffDesc, then [raw_hi][raw_lo]
+    // ScanRawDesc — one entry per global sub-chunk index per stream type.
+    const huff_arr_bytes: usize = @as(usize, total_subchunks) * @sizeOf(ScanHuffDesc);
+    const raw_arr_bytes: usize = @as(usize, total_subchunks) * @sizeOf(ScanRawDesc);
+    const staged_bytes: usize = huff_arr_bytes * 4 + raw_arr_bytes * 2;
+    if (!ensureDeviceBuf(&self.d_scan_staged, &self.d_scan_staged_size, staged_bytes)) return null;
+    // Zero so sub-chunk slots no thread reaches keep valid=0.
+    _ = memset(self.d_scan_staged, 0, staged_bytes);
+
+    const base = self.d_scan_staged;
+    var k_block = self.d_comp_persist;
+    var k_blen: u32 = @intCast(compressed_block.len);
+    var k_chunks = self.d_descs_persist;
+    var k_first = self.d_scan_first_sub;
+    var k_n = n;
+    var k_cap = sub_chunk_cap;
+    var k_lit = base;
+    var k_tok = base + huff_arr_bytes;
+    var k_hi = base + huff_arr_bytes * 2;
+    var k_lo = base + huff_arr_bytes * 3;
+    var k_rhi = base + huff_arr_bytes * 4;
+    var k_rlo = base + huff_arr_bytes * 4 + raw_arr_bytes;
+    var params = [_]?*anyopaque{
+        @ptrCast(&k_block), @ptrCast(&k_blen),  @ptrCast(&k_chunks),
+        @ptrCast(&k_first), @ptrCast(&k_n),     @ptrCast(&k_cap),
+        @ptrCast(&k_lit),   @ptrCast(&k_tok),   @ptrCast(&k_hi),
+        @ptrCast(&k_lo),    @ptrCast(&k_rhi),   @ptrCast(&k_rlo),
+    };
+    var extra = [_]?*anyopaque{null};
+    const tpb: u32 = 256;
+    const blocks: u32 = (n + tpb - 1) / tpb;
+    if (launch(scan_parse_fn, blocks, 1, 1, tpb, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return null;
+    if (sync() != CUDA_SUCCESS) return null;
+
+    // Download the staged arrays.
+    const alloc = std.heap.page_allocator;
+    const staged = alloc.alloc(u8, staged_bytes) catch return null;
+    defer alloc.free(staged);
+    _ = d2h(@ptrCast(staged.ptr), base, staged_bytes);
+
+    const lit_st: [*]const ScanHuffDesc = @ptrCast(@alignCast(staged.ptr));
+    const tok_st: [*]const ScanHuffDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes));
+    const hi_st: [*]const ScanHuffDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes * 2));
+    const lo_st: [*]const ScanHuffDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes * 3));
+    const rhi_st: [*]const ScanRawDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes * 4));
+    const rlo_st: [*]const ScanRawDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes * 4 + raw_arr_bytes));
+
+    // Compact: drop invalid slots, assign sequential lut_offset.
+    const compactHuff = struct {
+        fn run(st: [*]const ScanHuffDesc, tot: u32, out: []HuffDecChunkDesc) u32 {
+            var k: u32 = 0;
+            var i: u32 = 0;
+            while (i < tot) : (i += 1) {
+                if (st[i].valid == 0) continue;
+                if (k >= out.len) break;
+                out[k] = .{
+                    .in_offset = st[i].in_offset,
+                    .in_size = st[i].in_size,
+                    .out_offset = st[i].out_offset,
+                    .out_size = st[i].out_size,
+                    .lut_offset = k * @as(u32, @intCast(HUFF_LUT_ENTRIES)),
+                };
+                k += 1;
+            }
+            return k;
+        }
+    }.run;
+    const num_lit = compactHuff(lit_st, total_subchunks, huff_lit_descs);
+    const num_tok = compactHuff(tok_st, total_subchunks, huff_tok_descs);
+    const num_hi = compactHuff(hi_st, total_subchunks, huff_off16hi_descs);
+    const num_lo = compactHuff(lo_st, total_subchunks, huff_off16lo_descs);
+
+    // Raw off16: per sub-chunk emit hi then lo, in sub-chunk order.
+    var num_raw: u32 = 0;
+    var si: u32 = 0;
+    while (si < total_subchunks) : (si += 1) {
+        if (rhi_st[si].valid != 0 and num_raw < raw_off16_descs.len) {
+            raw_off16_descs[num_raw] = .{ .src_offset = rhi_st[si].src_offset, .size = rhi_st[si].size, .gpu_offset = rhi_st[si].gpu_offset };
+            num_raw += 1;
+        }
+        if (rlo_st[si].valid != 0 and num_raw < raw_off16_descs.len) {
+            raw_off16_descs[num_raw] = .{ .src_offset = rlo_st[si].src_offset, .size = rlo_st[si].size, .gpu_offset = rlo_st[si].gpu_offset };
+            num_raw += 1;
+        }
+    }
+
+    return .{
+        .num_lit = 0,
+        .num_tok = 0,
+        .num_off16hi = 0,
+        .num_off16lo = 0,
+        .num_raw_off16 = num_raw,
+        .num_huff_lit = num_lit,
+        .num_huff_tok = num_tok,
+        .num_huff_off16hi = num_hi,
+        .num_huff_off16lo = num_lo,
+        .use_tans32 = false,
+    };
+}
+
 /// Public entry point — delegates to the default context. External callers
 /// (streamlz_decoder.zig) keep this exact name + signature.
 pub fn fullGpuLaunch(
@@ -1131,7 +1302,30 @@ pub fn fullGpuLaunchImpl(
         // multiple sub-chunks and each gets its own tANS stream.
         const max_tans = @min(@as(usize, total_subchunks), self.tans_host_buf.len);
 
-        scan = scanForTansChunks(
+        // GPU decode scan (roadmap 4d Phase 2): SLZ_GPU_SCAN routes the
+        // sub-chunk header walk onto the GPU. Falls back to the CPU scan
+        // on any failure or when chunk_descs exceeds the prefix-sum buf.
+        const want_gpu_scan = scan_parse_fn != 0 and
+            chunk_descs.len <= first_subchunk_idx_buf.len and
+            std.c.getenv("SLZ_GPU_SCAN") != null;
+        const gpu_scan: ?ScanResult = if (want_gpu_scan)
+            gpuScanChunks(
+                self,
+                chunk_descs,
+                compressed_block,
+                sub_chunk_cap,
+                first_subchunk_idx_buf[0..chunk_descs.len],
+                total_subchunks,
+                &self.huff_lit_host_buf,
+                &self.huff_tok_host_buf,
+                &self.huff_off16hi_host_buf,
+                &self.huff_off16lo_host_buf,
+                &self.raw_off16_buf,
+            )
+        else
+            null;
+
+        scan = gpu_scan orelse scanForTansChunks(
             chunk_descs,
             compressed_block,
             sub_chunk_cap,
