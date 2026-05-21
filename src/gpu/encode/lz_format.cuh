@@ -7,6 +7,8 @@
 #pragma once
 
 #include <cstdint>
+#include "../common/gpu_warp.cuh"     // WARP_SIZE, LANE_MASK, U32_BITS, U64_BITS, BITS_PER_BYTE
+#include "../common/gpu_byteio.cuh"   // read8safe
 
 // ── Match / format constants ────────────────────────────────────
 static constexpr uint32_t MIN_MATCH    = 4;       // shortest LZ match
@@ -16,12 +18,9 @@ static constexpr uint32_t BLOCK1_SIZE  = 0x10000u;     // 64KB block boundary
 static constexpr uint32_t CHAIN_MAX_STEPS = 8;    // chain-parser walk depth
 static constexpr uint32_t NEXT_HASH_SIZE  = 65536;  // 2^16 entries of uint16_t (matches CPU c_bits=16)
 
-// Warp layout: the kernel runs exactly one warp per chunk.
-static constexpr uint32_t WARP_SIZE = 32;
-static constexpr uint32_t LANE_MASK = WARP_SIZE - 1;  // threadIdx.x & 31
-static constexpr uint32_t U32_BITS  = 32;
-static constexpr uint32_t U64_BITS  = 64;
-static constexpr uint32_t BITS_PER_BYTE = 8;
+// Warp layout: the kernel runs exactly one warp per chunk. The warp /
+// bit-width constants (WARP_SIZE, LANE_MASK, U32_BITS, U64_BITS,
+// BITS_PER_BYTE) come from ../common/gpu_warp.cuh.
 
 // Offset / length stream encoding (see lz_token_emit.cuh).
 static constexpr uint32_t NEAR_OFFSET_MAX = 0xFFFFu;        // off16 vs off32 split
@@ -56,6 +55,7 @@ struct CompressChunkDesc {
     uint32_t dst_capacity;
     uint32_t is_first;
 };
+static_assert(sizeof(CompressChunkDesc) == 20, "ABI: keep in sync with encode/driver.zig");
 
 // Match result returned by findMatchChain.
 struct ChainMatch {
@@ -74,13 +74,8 @@ __device__ uint32_t hashKey6(uint64_t word8, uint32_t hash_bits, uint32_t hash_m
     return (uint32_t)(product >> (U64_BITS - hash_bits)) & hash_mask;
 }
 
-// Read up to 8 bytes at p, zero-padding if fewer than 8 remain.
-__device__ uint64_t read8safe(const uint8_t* p, uint32_t pos, uint32_t src_size) {
-    uint64_t v = 0;
-    uint32_t avail = (pos + 8 <= src_size) ? 8 : (src_size > pos ? src_size - pos : 0);
-    memcpy(&v, p, avail);
-    return v;
-}
+// read8safe (read up to 8 bytes, zero-padding past src_size) comes
+// from ../common/gpu_byteio.cuh.
 
 // Hash-A: 8-byte key with 64-bit multiply, matching CPU MatchHasher2.
 __device__ uint32_t hashTableA(uint32_t hash_bits, uint32_t hash_mask, uint64_t at_src) {

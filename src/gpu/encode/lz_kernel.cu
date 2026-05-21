@@ -36,7 +36,7 @@ static constexpr uint32_t OFF16_HEADER_BYTES  = 2;  // 2-byte off16 count header
 static constexpr uint32_t OFF32_COUNT_FIELD_BITS = 12;  // packed off32-count field width
 static constexpr uint32_t OFF32_COUNT_PACK_MAX = (1u << OFF32_COUNT_FIELD_BITS) - 1;  // 4095; overflow spills to a 2-byte extension
 
-// ── slzCompressL1Kernel ─────────────────────────────────────────
+// ── slzLzEncodeKernel ───────────────────────────────────────────
 // LZ encode kernel entry point. One block per chunk, one warp (32
 // lanes) per block; __launch_bounds__(32, 1) pins that 1-warp design.
 //
@@ -65,7 +65,7 @@ static constexpr uint32_t OFF32_COUNT_PACK_MAX = (1u << OFF32_COUNT_FIELD_BITS) 
 //   [2-byte LE block-1 off32 ext]   (only if count >= OFF32_COUNT_PACK_MAX)
 //   [2-byte LE block-2 off32 ext]   (only if count >= OFF32_COUNT_PACK_MAX)
 //   [off32 stream][length stream]
-extern "C" __global__ void __launch_bounds__(32, 1) slzCompressL1Kernel(
+extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
     const uint8_t* __restrict__ input,
     uint8_t* __restrict__ output,
     const CompressChunkDesc* __restrict__ descs,

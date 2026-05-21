@@ -85,7 +85,7 @@ pub fn init() bool {
     if ((cuModuleLoadData_fn orelse return false)(&module, ptx.ptr) != CUDA_SUCCESS) return false;
 
     const get_fn = cuModuleGetFunction_fn orelse return false;
-    if (get_fn(&kernel_fn, module, "slzCompressL1Kernel") != CUDA_SUCCESS) return false;
+    if (get_fn(&kernel_fn, module, "slzLzEncodeKernel") != CUDA_SUCCESS) return false;
 
     // GPU Huffman encoder (chunk_type=4). Optional — if the module or
     // either kernel is missing, gpuEncode*Huff returns false and the

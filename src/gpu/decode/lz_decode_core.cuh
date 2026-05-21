@@ -32,7 +32,7 @@ __device__ __noinline__ void decodeSubChunkRawMode(
     uint32_t initial_copy,
     uint32_t dst_offset
 ) {
-    const int lane = threadIdx.x & WARP_LANE_MASK;
+    const int lane = threadIdx.x & LANE_MASK;
     uint32_t cmd_pos = 0, lit_pos = 0, off16_pos = 0;
     uint32_t dst_pos = dst_offset + initial_copy;
     int32_t recent_offset = INITIAL_RECENT_OFFSET;
@@ -150,7 +150,7 @@ __device__ void decodeSubChunkGeneral(
     uint32_t dst_offset,
     uint32_t mode
 ) {
-    const int lane = threadIdx.x & WARP_LANE_MASK;
+    const int lane = threadIdx.x & LANE_MASK;
     uint32_t cmd_pos = 0, lit_pos = 0, off16_pos = 0, off32_pos = 0;
     uint32_t dst_pos = dst_offset + initial_copy;
     int32_t recent_offset = INITIAL_RECENT_OFFSET;

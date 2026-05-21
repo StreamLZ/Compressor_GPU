@@ -40,13 +40,13 @@ __device__ void scanBlock(
 
         // 8-byte lookahead via shfl_down. Matches CPU's runGreedyParser
         // which reads a u64 word for hashing. Note key4 = low 32 bits.
-        uint32_t b1 = __shfl_down_sync(0xFFFFFFFF, my_byte, 1);
-        uint32_t b2 = __shfl_down_sync(0xFFFFFFFF, my_byte, 2);
-        uint32_t b3 = __shfl_down_sync(0xFFFFFFFF, my_byte, 3);
-        uint32_t b4 = __shfl_down_sync(0xFFFFFFFF, my_byte, 4);
-        uint32_t b5 = __shfl_down_sync(0xFFFFFFFF, my_byte, 5);
-        uint32_t b6 = __shfl_down_sync(0xFFFFFFFF, my_byte, 6);
-        uint32_t b7 = __shfl_down_sync(0xFFFFFFFF, my_byte, 7);
+        uint32_t b1 = __shfl_down_sync(FULL_WARP_MASK, my_byte, 1);
+        uint32_t b2 = __shfl_down_sync(FULL_WARP_MASK, my_byte, 2);
+        uint32_t b3 = __shfl_down_sync(FULL_WARP_MASK, my_byte, 3);
+        uint32_t b4 = __shfl_down_sync(FULL_WARP_MASK, my_byte, 4);
+        uint32_t b5 = __shfl_down_sync(FULL_WARP_MASK, my_byte, 5);
+        uint32_t b6 = __shfl_down_sync(FULL_WARP_MASK, my_byte, 6);
+        uint32_t b7 = __shfl_down_sync(FULL_WARP_MASK, my_byte, 7);
         uint32_t key4 = my_byte | (b1 << 8) | (b2 << 16) | (b3 << 24);
         uint64_t key8 = (uint64_t)key4
                       | ((uint64_t)b4 << 32) | ((uint64_t)b5 << 40)
@@ -77,11 +77,11 @@ __device__ void scanBlock(
         //     Content match: only if K'.key4 == K.key4 (and K-K' >= 8).
         //   - otherwise, pre-warp ht[h(K)] is what CPU sees.
         //
-        // All warp-wide intrinsics here are unconditional with full mask
-        // 0xFFFFFFFF; per-lane logic uses purely-local mask arithmetic.
-        uint32_t bucket_same = __match_any_sync(0xFFFFFFFF, h);
-        uint32_t key_same    = __match_any_sync(0xFFFFFFFF, key4);
-        uint32_t active_mask = __ballot_sync(0xFFFFFFFF, is_active);
+        // All warp-wide intrinsics here are unconditional with the
+        // FULL_WARP_MASK; per-lane logic uses purely-local mask arithmetic.
+        uint32_t bucket_same = __match_any_sync(FULL_WARP_MASK, h);
+        uint32_t key_same    = __match_any_sync(FULL_WARP_MASK, key4);
+        uint32_t active_mask = __ballot_sync(FULL_WARP_MASK, is_active);
         uint32_t lower_same_bucket = bucket_same & active_mask & ((1u << lane) - 1);
 
         bool hash_match = false;
@@ -168,7 +168,7 @@ __device__ void scanBlock(
                                : eight_match ? 2u
                                : 0u;
         uint32_t my_ref = hash_ref;
-        uint32_t match_ballot = __ballot_sync(0xFFFFFFFF, has_match);
+        uint32_t match_ballot = __ballot_sync(FULL_WARP_MASK, has_match);
 
         // CPU runGreedyParser advances by an adaptive step on no match:
         //   step = (dist < 128) ? 1 : min((dist >> 7) + 1, 16)
@@ -203,7 +203,7 @@ __device__ void scanBlock(
         }
 
         uint32_t first_lane = __ffs(match_ballot) - 1;
-        uint32_t winning_type = __shfl_sync(0xFFFFFFFF, my_match_type, first_lane);
+        uint32_t winning_type = __shfl_sync(FULL_WARP_MASK, my_match_type, first_lane);
         uint32_t match_pos;
         uint32_t match_ref;
         uint32_t min_match_len;
@@ -211,7 +211,7 @@ __device__ void scanBlock(
         if (winning_type == 0) {
             // Hash match (includes intra-warp same-key — unified above).
             match_pos = pos + first_lane;
-            match_ref = __shfl_sync(0xFFFFFFFF, my_ref, first_lane);
+            match_ref = __shfl_sync(FULL_WARP_MASK, my_ref, first_lane);
             min_match_len = MIN_MATCH;
         } else if (winning_type == 1) {
             // XOR recent-offset: match starts at first_lane + 1,
@@ -237,7 +237,7 @@ __device__ void scanBlock(
                 mm = true;
             else
                 mm = (src[match_pos + check] != src[match_ref + check]);
-            uint32_t mm_mask = __ballot_sync(0xFFFFFFFF, mm);
+            uint32_t mm_mask = __ballot_sync(FULL_WARP_MASK, mm);
             if (mm_mask != 0) {
                 match_len = ext + __ffs(mm_mask) - 1;
                 ext_found = true;
@@ -276,7 +276,7 @@ __device__ void scanBlock(
                     bw_steps++;
                 }
             }
-            bw_steps = __shfl_sync(0xFFFFFFFF, bw_steps, 0);
+            bw_steps = __shfl_sync(FULL_WARP_MASK, bw_steps, 0);
             match_pos -= bw_steps;
             match_ref -= bw_steps;
             match_len += bw_steps;

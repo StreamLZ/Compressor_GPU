@@ -46,10 +46,8 @@ struct OutputStreams {
     uint8_t* len_buf;   uint32_t length_count;
 };
 
-// Store a uint16_t little-endian without alignment assumptions.
-__device__ void storeU16LE(uint8_t* dst, uint16_t value) {
-    memcpy(dst, &value, 2);
-}
+// storeU16LE (unaligned-safe u16 little-endian store) comes from
+// ../common/gpu_byteio.cuh (via lz_format.cuh).
 
 // ── writeLengthValue ────────────────────────────────────────────
 // Append a length to len_buf. Values <= LENGTH_INLINE_MAX take one

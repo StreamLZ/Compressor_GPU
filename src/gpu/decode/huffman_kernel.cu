@@ -21,38 +21,26 @@
 // decode/driver.zig @embedFile's the PTX.
 
 #include <cstdint>
+#include "../common/gpu_warp.cuh"     // WARP_SIZE
+#include "../common/gpu_byteio.cuh"   // readLE24
+#include "../common/gpu_huffman.cuh"  // HUFF_* constants, LUT pack/unpack, buildCanonicalCodes
 
-// MAX_CODE_LEN is the fast-LUT *index width* (10). Codes are
-// height-limited to MAX_CODE_LEN+1 = 11; length-11 codes resolve via
+// MAX_CODE_LEN is the fast-LUT *index width* (10) — an alias of the
+// shared HUFF_LUT_INDEX_BITS. Codes are height-limited to
+// MAX_CODE_LEN+1 = HUFF_MAX_CODE_LEN = 11; length-11 codes resolve via
 // escape LUT entries (num_syms == LUT_NUM_SYMS_ESCAPE) — a 1024-entry
 // LUT (4 KB shared) instead of 2048 (8 KB), roughly doubling
 // decode-kernel occupancy.
-static constexpr int MAX_CODE_LEN = 10;
-static constexpr int LUT_SIZE     = 1 << MAX_CODE_LEN;  // 1024
+static constexpr int MAX_CODE_LEN = HUFF_LUT_INDEX_BITS;  // 10
+static constexpr int LUT_SIZE     = 1 << MAX_CODE_LEN;    // 1024
 
-// ── Wire-format / hardware constants ────────────────────────────────
-static constexpr int      WARP_SIZE             = 32;          // CUDA warp width
-static constexpr int      HUFF_NUM_STREAMS      = 4;           // 4-stream split
-static constexpr int      HUFF_ALPHABET         = 256;         // 8-bit symbol alphabet
-static constexpr int      HUFF_WEIGHTS_BYTES    = 128;         // 256 symbols × 4-bit lengths
-static constexpr int      HUFF_STREAM_SIZE_BYTES = 3;          // bytes per u24 stream-size field
-static constexpr int      HUFF_SUBHEADER_BYTES  = (HUFF_NUM_STREAMS - 1) * HUFF_STREAM_SIZE_BYTES;  // 9
-static constexpr int      HUFF_BODY_HEADER_BYTES = HUFF_WEIGHTS_BYTES + HUFF_SUBHEADER_BYTES;       // 137
-static constexpr int      HUFF_MAX_LEN_PLUS1    = MAX_CODE_LEN + 2;  // code-length histogram size (12)
-static constexpr uint8_t  HUFF_NIBBLE_MASK      = 0x0F;        // low-nibble mask
-
-// num_syms field values in a packed LUT entry.
-static constexpr uint8_t  LUT_NUM_SYMS_SINGLE   = 1;           // single-symbol entry
-static constexpr uint8_t  LUT_NUM_SYMS_DUAL     = 2;           // double-symbol entry
-static constexpr uint8_t  LUT_NUM_SYMS_ESCAPE   = 3;           // length-11 escape entry
-static constexpr int      LUT_MAX_SYMS_PER_STEP = 2;           // max symbols an X2 entry emits
+// HUFF_* wire constants, the canonical-code builder, the LUT-entry
+// pack/unpack helpers and the num_syms tags come from
+// common/gpu_huffman.cuh.
 
 // Bit-buffer arithmetic.
 static constexpr int      BITBUF_BITS  = 64;                   // bit_buf width in bits
 static constexpr int      REFILL_BITS  = 32;                   // bits per 4-byte refill chunk
-
-static_assert(HUFF_SUBHEADER_BYTES == (HUFF_NUM_STREAMS - 1) * HUFF_STREAM_SIZE_BYTES,
-              "sub-header holds one u24 size per non-derived stream");
 
 // ── Descriptor — matches Zig HuffDecChunkDesc in decode/driver.zig ──
 // Unified: in_offset/in_size cover the FULL payload (128 B weights +
@@ -65,32 +53,11 @@ struct HuffDecChunkDesc {
     uint32_t out_size;      // expected decompressed bytes
     uint32_t lut_offset;    // entry index into luts[] (LUT_SIZE entries per block)
 };
+static_assert(sizeof(HuffDecChunkDesc) == 20, "ABI: keep in sync with decode/driver.zig");
 
-// ── LUT entry packing / unpacking ───────────────────────────────────
-// Same layout as tools/huff_test/huff_ref.c pack_lut_entry():
-//   bits  7:0  — sym1
-//   bits 15:8  — sym2
-//   bits 23:16 — total_len (bits consumed)
-//   bits 31:24 — num_syms (1, 2, or LUT_NUM_SYMS_ESCAPE)
-static constexpr int LUT_SYM1_SHIFT = 0;
-static constexpr int LUT_SYM2_SHIFT = 8;
-static constexpr int LUT_LEN_SHIFT  = 16;
-static constexpr int LUT_NSYM_SHIFT = 24;
-
-__device__ __forceinline__ uint32_t packLutEntry(uint8_t sym1, uint8_t sym2,
-                                                  uint8_t total_len, uint8_t num_syms) {
-    return ((uint32_t)num_syms  << LUT_NSYM_SHIFT)
-         | ((uint32_t)total_len << LUT_LEN_SHIFT)
-         | ((uint32_t)sym2      << LUT_SYM2_SHIFT)
-         | ((uint32_t)sym1      << LUT_SYM1_SHIFT);
-}
-
-// Field accessors mirroring packLutEntry — keep unpack centralized.
-__device__ __forceinline__ uint8_t  lutSym1(uint32_t entry)     { return (uint8_t)(entry >> LUT_SYM1_SHIFT); }
-__device__ __forceinline__ uint8_t  lutSym2(uint32_t entry)     { return (uint8_t)(entry >> LUT_SYM2_SHIFT); }
-__device__ __forceinline__ uint16_t lutSymPair(uint32_t entry)  { return (uint16_t)(entry & 0xFFFFu); }
-__device__ __forceinline__ int      lutTotalLen(uint32_t entry) { return (entry >> LUT_LEN_SHIFT)  & 0xFF; }
-__device__ __forceinline__ int      lutNumSyms(uint32_t entry)  { return (entry >> LUT_NSYM_SHIFT) & 0xFF; }
+// LUT entry packing/unpacking (packLutEntry, lutSym1/lutSym2/lutSymPair/
+// lutTotalLen/lutNumSyms) and the LUT_NUM_SYMS_* / LUT_MAX_SYMS_PER_STEP
+// constants come from common/gpu_huffman.cuh.
 
 // ── LUT build kernel ────────────────────────────────────────────────
 // Grid: (n_blocks, 1, 1). Block: (WARP_SIZE, 1, 1).
@@ -119,46 +86,17 @@ extern "C" __global__ void slzHuffBuildLutKernel(
     // Unpack 128 B → 256 lengths into shared memory (one cache line of accesses).
     __shared__ uint8_t code_lengths[HUFF_ALPHABET];
     for (int i = lane; i < HUFF_WEIGHTS_BYTES; i += WARP_SIZE) {
-        uint8_t b = weights[i];
-        code_lengths[i * 2 + 0] = b & HUFF_NIBBLE_MASK;
-        code_lengths[i * 2 + 1] = (b >> 4) & HUFF_NIBBLE_MASK;
+        unpackWeightByte(weights[i], code_lengths[i * 2 + 0], code_lengths[i * 2 + 1]);
     }
     __syncwarp();
 
     // Compute canonical codes (RFC 1951 style — assigned in length-ascending
-    // order, sym-ascending within each length). All lanes derive the same
-    // codes[] table so each can do its slice of the fan-out work.
+    // order, sym-ascending within each length). buildCanonicalCodes
+    // (common/gpu_huffman.cuh) does the histogram + next_code + code
+    // assignment serially in lane 0; all lanes then read the same codes[]
+    // table for their slice of the fan-out work.
     __shared__ uint32_t codes[HUFF_ALPHABET];
-    __shared__ uint32_t bl_count[HUFF_MAX_LEN_PLUS1];
-    __shared__ uint32_t next_code[HUFF_MAX_LEN_PLUS1];
-
-    if (lane < HUFF_MAX_LEN_PLUS1) bl_count[lane] = 0;
-    __syncwarp();
-    // Histogram lengths into bl_count. Each lane handles a stride of 32 symbols.
-    for (int s = lane; s < HUFF_ALPHABET; s += WARP_SIZE) {
-        uint8_t L = code_lengths[s];
-        if (L > 0 && L <= MAX_CODE_LEN + 1) atomicAdd(&bl_count[L], 1);
-    }
-    __syncwarp();
-    // Lane 0 builds next_code[] (serial — only a handful of lengths).
-    if (lane == 0) {
-        uint32_t code = 0;
-        next_code[0] = 0;
-        for (int L = 1; L <= MAX_CODE_LEN + 1; L++) {
-            code = (code + bl_count[L - 1]) << 1;
-            next_code[L] = code;
-        }
-    }
-    __syncwarp();
-    // Assign codes in (length, symbol) ascending order. Serial in lane 0:
-    // only 256 symbols and trivially cheap. Avoids cross-lane sync.
-    if (lane == 0) {
-        for (int s = 0; s < HUFF_ALPHABET; s++) {
-            uint8_t L = code_lengths[s];
-            if (L == 0) { codes[s] = 0; continue; }
-            codes[s] = next_code[L]++;
-        }
-    }
+    if (lane == 0) buildCanonicalCodes(code_lengths, codes);
     __syncwarp();
 
     // ── Build LUT in global memory ──
@@ -365,9 +303,7 @@ extern "C" __global__ void slzHuffDecode4StreamKernel(
     uint32_t stream_sizes[HUFF_NUM_STREAMS];
     #pragma unroll
     for (int s = 0; s < HUFF_NUM_STREAMS - 1; s++) {
-        stream_sizes[s] = (uint32_t)hdr[s * HUFF_STREAM_SIZE_BYTES + 0]
-                        | ((uint32_t)hdr[s * HUFF_STREAM_SIZE_BYTES + 1] << 8)
-                        | ((uint32_t)hdr[s * HUFF_STREAM_SIZE_BYTES + 2] << 16);
+        stream_sizes[s] = readLE24(hdr + s * HUFF_STREAM_SIZE_BYTES);
     }
     // Stream 3 size is the payload remainder. For a well-formed frame
     // in_size >= HUFF_BODY_HEADER_BYTES and the first three sizes sum to

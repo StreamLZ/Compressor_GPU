@@ -10,19 +10,19 @@
 .target sm_89
 .address_size 64
 
-	// .globl	slzCompressL1Kernel
+	// .globl	slzLzEncodeKernel
 .extern .shared .align 16 .b8 shared_ht[];
 
-.visible .entry slzCompressL1Kernel(
-	.param .u64 slzCompressL1Kernel_param_0,
-	.param .u64 slzCompressL1Kernel_param_1,
-	.param .u64 slzCompressL1Kernel_param_2,
-	.param .u64 slzCompressL1Kernel_param_3,
-	.param .u64 slzCompressL1Kernel_param_4,
-	.param .u32 slzCompressL1Kernel_param_5,
-	.param .u32 slzCompressL1Kernel_param_6,
-	.param .u32 slzCompressL1Kernel_param_7,
-	.param .u32 slzCompressL1Kernel_param_8
+.visible .entry slzLzEncodeKernel(
+	.param .u64 slzLzEncodeKernel_param_0,
+	.param .u64 slzLzEncodeKernel_param_1,
+	.param .u64 slzLzEncodeKernel_param_2,
+	.param .u64 slzLzEncodeKernel_param_3,
+	.param .u64 slzLzEncodeKernel_param_4,
+	.param .u32 slzLzEncodeKernel_param_5,
+	.param .u32 slzLzEncodeKernel_param_6,
+	.param .u32 slzLzEncodeKernel_param_7,
+	.param .u32 slzLzEncodeKernel_param_8
 )
 .maxntid 32, 1, 1
 .minnctapersm 1
@@ -37,14 +37,14 @@
 
 
 	mov.u64 	%SPL, __local_depot0;
-	ld.param.u64 	%rd252, [slzCompressL1Kernel_param_0];
-	ld.param.u64 	%rd256, [slzCompressL1Kernel_param_1];
-	ld.param.u64 	%rd253, [slzCompressL1Kernel_param_2];
-	ld.param.u64 	%rd254, [slzCompressL1Kernel_param_3];
-	ld.param.u32 	%r1526, [slzCompressL1Kernel_param_5];
-	ld.param.u32 	%r1523, [slzCompressL1Kernel_param_6];
-	ld.param.u32 	%r1524, [slzCompressL1Kernel_param_7];
-	ld.param.u32 	%r1525, [slzCompressL1Kernel_param_8];
+	ld.param.u64 	%rd252, [slzLzEncodeKernel_param_0];
+	ld.param.u64 	%rd256, [slzLzEncodeKernel_param_1];
+	ld.param.u64 	%rd253, [slzLzEncodeKernel_param_2];
+	ld.param.u64 	%rd254, [slzLzEncodeKernel_param_3];
+	ld.param.u32 	%r1526, [slzLzEncodeKernel_param_5];
+	ld.param.u32 	%r1523, [slzLzEncodeKernel_param_6];
+	ld.param.u32 	%r1524, [slzLzEncodeKernel_param_7];
+	ld.param.u32 	%r1525, [slzLzEncodeKernel_param_8];
 	cvta.to.global.u64 	%rd1, %rd254;
 	cvta.to.global.u64 	%rd2, %rd256;
 	add.u64 	%rd3, %SPL, 8;
@@ -3750,7 +3750,7 @@ $L__BB0_869:
 	bra.uni 	$L__BB0_1078;
 
 $L__BB0_870:
-	ld.param.u64 	%rd2158, [slzCompressL1Kernel_param_3];
+	ld.param.u64 	%rd2158, [slzLzEncodeKernel_param_3];
 	mov.u32 	%r3076, shared_ht;
 	{ .reg .b64 %tmp;
 	  cvt.u64.u32 	%tmp, %r3076;
@@ -3760,7 +3760,7 @@ $L__BB0_870:
 
 	mov.u32 	%r3590, %ctaid.x;
 	cvt.u64.u32 	%rd2161, %r3590;
-	ld.param.u64 	%rd2159, [slzCompressL1Kernel_param_3];
+	ld.param.u64 	%rd2159, [slzLzEncodeKernel_param_3];
 	cvt.u64.u32 	%rd1794, %r2;
 	mul.lo.s64 	%rd1795, %rd1794, %rd2161;
 	shl.b64 	%rd1796, %rd1795, 2;
@@ -10184,7 +10184,7 @@ $L__BB0_1098:
 	@%p1126 bra 	$L__BB0_1098;
 
 $L__BB0_1099:
-	ld.param.u64 	%rd2157, [slzCompressL1Kernel_param_4];
+	ld.param.u64 	%rd2157, [slzLzEncodeKernel_param_4];
 	mov.u32 	%r3587, %ctaid.x;
 	cvt.u32.u64 	%r3538, %rd246;
 	add.s32 	%r3539, %r3538, %r4251;

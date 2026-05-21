@@ -13,7 +13,7 @@
 // Parses literal / cmd / cmd2 / off16 / off32 headers inline (no
 // ParsedStreams struct, no chunk_type dispatch, no off16 entropy
 // branch): every parsed value flows as a local → register and is never
-// spilled to the stack. Called by slzFullDecompressL1KernelRaw when a
+// spilled to the stack. Called by slzLzDecodeRawKernel when a
 // sub-chunk's mode == 1 (raw literals). The general parseAndDecodeSubChunk
 // handles modes 0, 2-15 (entropy).
 //
@@ -27,7 +27,7 @@ __device__ void parseAndDecodeSubChunkRaw(
     uint32_t dst_offset,
     uint32_t base_offset
 ) {
-    const int lane = threadIdx.x & WARP_LANE_MASK;
+    const int lane = threadIdx.x & LANE_MASK;
     const uint8_t* src = sc_src;
     const uint8_t* src_end = sc_src + sc_comp_size;
 
@@ -156,8 +156,8 @@ __device__ void parseAndDecodeSubChunkRaw(
 }
 
 // ── Sub-chunk decoder dispatch ────────────────────────────────
-// General entropy-capable path (used by slzFullDecompressL1Kernel only;
-// the slzFullDecompressL1KernelRaw fast path uses parseAndDecodeSubChunkRaw).
+// General entropy-capable path (used by slzLzDecodeKernel only;
+// the slzLzDecodeRawKernel fast path uses parseAndDecodeSubChunkRaw).
 // Calls parseSubChunkHeaders (__noinline__) then dispatches to
 // decodeSubChunkRawMode or decodeSubChunkGeneral. The header parser's
 // registers are freed before the decode hot loop runs.
@@ -218,7 +218,7 @@ __device__ void parseAndDecodeSubChunk(
     }
 }
 
-// ── Production kernel ──────────────────────────────────────────
+// ── Production kernel: slzLzDecodeKernel ───────────────────────
 // Full GPU LZ kernel: 1 block per SC group, parses raw compressed
 // chunks on-GPU. WARPS_PER_BLOCK warps per block for SM occupancy.
 // Entropy streams (tANS / Huffman) are decoded by a separate kernel
@@ -238,7 +238,7 @@ __device__ void parseAndDecodeSubChunk(
 //                      nullptr → fall back to chunk_idx (legacy)
 extern "C" __global__ void
 __launch_bounds__(LZ_KERNEL_BLOCK_THREADS, LZ_KERNEL_MIN_BLOCKS_PER_SM)
-slzFullDecompressL1Kernel(
+slzLzDecodeKernel(
     const uint8_t* __restrict__ compressed,
     const SlzChunkDesc* __restrict__ chunks,
     uint8_t* __restrict__ dst,
@@ -252,7 +252,7 @@ slzFullDecompressL1Kernel(
     // WARPS_PER_BLOCK warps per block: warp 0 = threadIdx.y==0, etc.
     const uint32_t warp_id = threadIdx.y;
     const uint32_t group_id = blockIdx.x * WARPS_PER_BLOCK + warp_id;
-    const int lane = threadIdx.x & WARP_LANE_MASK;
+    const int lane = threadIdx.x & LANE_MASK;
     if (group_id >= (total_chunks + chunks_per_group - 1) / chunks_per_group) return;
     const uint32_t base_chunk = group_id * chunks_per_group;
 
@@ -355,16 +355,16 @@ slzFullDecompressL1Kernel(
 // coding, all chunk_type 0). Lean parameter list, single parsing path,
 // all parsed values flow in registers (no ParsedStreams struct, no
 // chunk_type dispatch). The driver picks this kernel when
-// scan.use_tans32 == false; the general slzFullDecompressL1Kernel
+// scan.use_tans32 == false; the general slzLzDecodeKernel
 // handles L3+ entropy.
 //
 // Parameters: compressed input blob, per-chunk descriptors, output
 // blob, chunks-per-warp count, valid descriptor count, and the max
-// decompressed sub-chunk size — see slzFullDecompressL1Kernel for the
+// decompressed sub-chunk size — see slzLzDecodeKernel for the
 // shared parameter semantics.
 extern "C" __global__ void
 __launch_bounds__(LZ_KERNEL_BLOCK_THREADS, LZ_KERNEL_MIN_BLOCKS_PER_SM)
-slzFullDecompressL1KernelRaw(
+slzLzDecodeRawKernel(
     const uint8_t* __restrict__ compressed,
     const SlzChunkDesc* __restrict__ chunks,
     uint8_t* __restrict__ dst,
@@ -374,7 +374,7 @@ slzFullDecompressL1KernelRaw(
 ) {
     const uint32_t warp_id = threadIdx.y;
     const uint32_t group_id = blockIdx.x * WARPS_PER_BLOCK + warp_id;
-    const int lane = threadIdx.x & WARP_LANE_MASK;
+    const int lane = threadIdx.x & LANE_MASK;
     if (group_id >= (total_chunks + chunks_per_group - 1) / chunks_per_group) return;
     const uint32_t base_chunk = group_id * chunks_per_group;
 

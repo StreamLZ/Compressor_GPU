@@ -3,8 +3,8 @@
 //! Pre-compiled PTX is embedded via @embedFile.
 //!
 //! Two-pass decode pipeline:
-//!   Pass 1: slzTansDecodeKernel — decodes tANS literal streams to temp buffer
-//!   Pass 2: slzFullDecompressL1Kernel — LZ decode, reads pre-decoded literals
+//!   Pass 1: slzHuffDecode4StreamKernel — decodes Huffman literal streams to temp buffer
+//!   Pass 2: slzLzDecodeKernel — LZ decode, reads pre-decoded literals
 
 const std = @import("std");
 const win32 = struct {
@@ -147,13 +147,13 @@ pub fn init() bool {
     // Load LZ decode kernel (Pass 2)
     const ptx = @embedFile("lz_kernel.ptx") ++ "\x00";
     if (load_fn(&module, ptx.ptr) != CUDA_SUCCESS) return false;
-    if (get_fn(&kernel_fn, module, "slzFullDecompressL1Kernel") != CUDA_SUCCESS) return false;
+    if (get_fn(&kernel_fn, module, "slzLzDecodeKernel") != CUDA_SUCCESS) return false;
     // Optional raw-off16 gather kernel — driver falls back to D2D copies
     // if absent.
     _ = get_fn(&gather_off16_fn, module, "slzGatherRawOff16Kernel");
     // Optional lean L1/L2-raw kernel — driver routes to it when no entropy
     // is present. Failing to load is fine; falls back to general kernel.
-    _ = get_fn(&kernel_raw_fn, module, "slzFullDecompressL1KernelRaw");
+    _ = get_fn(&kernel_raw_fn, module, "slzLzDecodeRawKernel");
 
     // Load Huffman decode kernels (Pass 1.5, for chunk_type=4 literals)
     const huff_ptx = @embedFile("huffman_kernel.ptx") ++ "\x00";

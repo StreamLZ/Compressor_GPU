@@ -8,6 +8,8 @@
 #pragma once
 
 #include <cstdint>
+#include "../common/gpu_warp.cuh"     // WARP_SIZE, LANE_MASK, FULL_WARP_MASK
+#include "../common/gpu_byteio.cuh"   // readBE24
 
 // ── StreamLZ token format constants ────────────────────────────
 // Tokens encode literal-length + match-length + offset type in one byte.
@@ -44,11 +46,9 @@ static constexpr int MAX_BLOCKS_PER_SUBCHUNK   = 2;
 static constexpr uint32_t INITIAL_LITERAL_COPY_BYTES = 8;
 static constexpr int32_t  INITIAL_RECENT_OFFSET      = -8;
 
-// Warp-cooperative copy constants.
-static constexpr uint32_t WARP_SIZE       = 32;
-static constexpr int      WARP_LANE_MASK  = 31;          // threadIdx.x & 31 = lane
-static constexpr uint32_t FULL_WARP_MASK  = 0xFFFFFFFF;  // all 32 lanes active
-
+// Warp / lane constants (WARP_SIZE, LANE_MASK, FULL_WARP_MASK) come
+// from ../common/gpu_warp.cuh.
+//
 // A warp-parallel match copy is only used when the match does not
 // overlap the destination (match_dist >= match_len) and is long enough
 // to be worth splitting across lanes.
@@ -110,7 +110,7 @@ static constexpr uint32_t SUBCHUNK_MODE_SHIFT      = 19;
 static constexpr uint32_t SUBCHUNK_MODE_MASK       = 0xF;
 
 // Per-sub-chunk entropy-scratch slot size in bytes (128KB). One slot
-// holds the lit / tok / off16 sub-buffers (see slzFullDecompressL1Kernel).
+// holds the lit / tok / off16 sub-buffers (see slzLzDecodeKernel).
 static constexpr uint64_t ENTROPY_SCRATCH_SLOT_BYTES = 131072;
 
 // Kernel launch geometry: 2 warps (64 threads) per block.
@@ -130,6 +130,7 @@ struct SlzChunkDesc {
     uint8_t  memset_fill;   // fill byte for memset chunks
     uint8_t  _pad[3];       // alignment pad, keep in sync with Zig ChunkDesc
 };
+static_assert(sizeof(SlzChunkDesc) == 24, "ABI: keep in sync with decode/driver.zig");
 
 // ── Raw off16 gather descriptor ────────────────────────────────
 // ABI struct — must stay byte-identical to `RawOff16Desc` in
@@ -139,6 +140,7 @@ struct SlzRawOff16Desc {
     uint32_t size;         // bytes to copy
     uint32_t gpu_offset;   // byte offset into scratch_base
 };
+static_assert(sizeof(SlzRawOff16Desc) == 12, "ABI: keep in sync with decode/driver.zig");
 
 // ── Parsed sub-chunk streams ───────────────────────────────────
 // Filled by parseSubChunkHeaders, consumed by the decoders. Lives on
@@ -168,10 +170,7 @@ struct ParsedStreams {
     uint32_t initial_copy;        // 8 if this sub-chunk did the initial copy, else 0
 };
 
-// ── 24-bit big-endian read ─────────────────────────────────────
-__device__ inline uint32_t readBE24(const uint8_t* p) {
-    return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
-}
+// readBE24 (24-bit big-endian read) comes from ../common/gpu_byteio.cuh.
 
 // ── Extended length decode ─────────────────────────────────────
 // Reads a variable-length count from the length stream. Uses a uint32

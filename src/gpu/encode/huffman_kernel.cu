@@ -11,24 +11,20 @@
 // harness tools/huff_test/ before being backported here.
 
 #include <cstdint>
+#include "../common/gpu_warp.cuh"     // WARP_SIZE, FULL_WARP_MASK, BITS_PER_BYTE
+#include "../common/gpu_byteio.cuh"   // writeLE24
+#include "../common/gpu_huffman.cuh"  // HUFF_* constants, weights pack, buildCanonicalCodes
 
-// Canonical-Huffman height limit. Matches huffman_encoder.zig MAX_CODE_LEN.
-// Must equal `MAX_CODE_LEN + 1` in `decode/huffman_kernel.cu`.
-static constexpr int ENC_MAX_CODE_LEN = 11;
+// Canonical-Huffman height limit — an alias of the shared
+// HUFF_MAX_CODE_LEN (11). Matches huffman_encoder.zig MAX_CODE_LEN.
+// gpu_huffman.cuh ties the LUT index width on the decode side to this
+// value with a static_assert, so the old hand-maintained "must equal
+// MAX_CODE_LEN + 1" invariant is now compiler-checked.
+static constexpr int ENC_MAX_CODE_LEN = HUFF_MAX_CODE_LEN;  // 11
 
-// ── Wire-format / hardware constants ────────────────────────────────
-static constexpr int      WARP_SIZE              = 32;          // CUDA warp width
-static constexpr int      HUFF_NUM_STREAMS       = 4;           // 4-stream split
-static constexpr int      HUFF_ALPHABET          = 256;         // 8-bit symbol alphabet
-static constexpr int      HUFF_TREE_NODES        = 2 * HUFF_ALPHABET;  // 256 leaves + up to 255 internals
-static constexpr int      HUFF_LEN_HIST_SIZE     = ENC_MAX_CODE_LEN + 2;  // code-length histogram size (13)
-static constexpr int      HUFF_WEIGHTS_BYTES     = 128;         // 256 symbols × 4-bit lengths
-static constexpr int      HUFF_STREAM_SIZE_BYTES = 3;           // bytes per u24 stream-size field
-static constexpr int      HUFF_SUBHEADER_BYTES   = (HUFF_NUM_STREAMS - 1) * HUFF_STREAM_SIZE_BYTES;  // 9
-static constexpr int      HUFF_BODY_HEADER_BYTES = HUFF_WEIGHTS_BYTES + HUFF_SUBHEADER_BYTES;        // 137
-static constexpr uint8_t  HUFF_NIBBLE_MASK       = 0x0F;        // low-nibble mask
-static constexpr uint32_t FULL_WARP_MASK         = 0xFFFFFFFFu; // all 32 lanes participate
-static constexpr int      BITS_PER_BYTE          = 8;
+// Encode-specific table sizes. HUFF_* wire constants, the weights
+// pack helper and buildCanonicalCodes come from common/gpu_huffman.cuh.
+static constexpr int HUFF_TREE_NODES = 2 * HUFF_ALPHABET;  // 256 leaves + up to 255 internals
 
 // Kraft fixed-point precision. The Kraft sum 1.0 is represented as
 // 1u << KRAFT_PRECISION_BITS; 30 leaves headroom so `1u << (30 - 1)`
@@ -46,6 +42,7 @@ struct HuffEncDesc {
     uint32_t dst_offset;    // body offset in the output buffer
     uint32_t dst_capacity;
 };
+static_assert(sizeof(HuffEncDesc) == 20, "ABI: keep in sync with encode/driver.zig");
 
 // ── Single-stream encode core ─────────────────────────────────────────
 // Sequential encode of one stream by one lane. Packs codewords MSB-first
@@ -195,22 +192,9 @@ extern "C" __global__ void slzHuffBuildTablesKernel(
             }
         }
 
-        // canonical code assignment
-        {
-            uint32_t length_count[HUFF_LEN_HIST_SIZE] = {0};
-            for (int s = 0; s < HUFF_ALPHABET; s++) length_count[code_lengths[s]]++;
-            length_count[0] = 0;
-            uint32_t next_code[HUFF_LEN_HIST_SIZE] = {0};
-            uint32_t code = 0;
-            for (int L = 1; L <= ENC_MAX_CODE_LEN + 1; L++) {
-                code = (code + length_count[L - 1]) << 1;
-                next_code[L] = code;
-            }
-            for (int s = 0; s < HUFF_ALPHABET; s++) {
-                int L = code_lengths[s];
-                codes[s] = (L != 0) ? next_code[L]++ : 0u;
-            }
-        }
+        // canonical code assignment — RFC-1951 canonical codes, shared
+        // with the decoder's LUT builder (common/gpu_huffman.cuh).
+        buildCanonicalCodes(code_lengths, codes);
     }
     __syncwarp();
 
@@ -296,17 +280,13 @@ extern "C" __global__ void slzHuffEncode4StreamKernel(
 
     // 128-byte weights — 32 lanes pack 4 entries each.
     for (int i = lane; i < HUFF_WEIGHTS_BYTES; i += WARP_SIZE)
-        out[i] = (uint8_t)((block_code_lengths[2 * i] & HUFF_NIBBLE_MASK)
-                         | ((block_code_lengths[2 * i + 1] & HUFF_NIBBLE_MASK) << 4));
+        out[i] = packWeightByte(block_code_lengths[2 * i], block_code_lengths[2 * i + 1]);
 
     if (lane == 0) {
         // 9-byte sub-header at offset 128 (3 × u24 LE; stream 3 derived).
         uint8_t* subheader = out + HUFF_WEIGHTS_BYTES;
         for (int s = 0; s < HUFF_NUM_STREAMS - 1; s++) {
-            uint8_t* field = subheader + s * HUFF_STREAM_SIZE_BYTES;
-            field[0] = (uint8_t)(stream_bytes[s] & 0xFF);
-            field[1] = (uint8_t)((stream_bytes[s] >> 8) & 0xFF);
-            field[2] = (uint8_t)((stream_bytes[s] >> 16) & 0xFF);
+            writeLE24(subheader + s * HUFF_STREAM_SIZE_BYTES, stream_bytes[s]);
         }
 
         // Concatenate the 4 per-stream scratch buffers into the body.

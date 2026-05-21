@@ -42,7 +42,7 @@ __device__ __noinline__ void parseSubChunkHeaders(
     uint8_t* entropy_off16_scratch,
     ParsedStreams& ps
 ) {
-    const int lane = threadIdx.x & WARP_LANE_MASK;
+    const int lane = threadIdx.x & LANE_MASK;
     const uint8_t* src = sc_src;
     const uint8_t* src_end = sc_src + sc_comp_size;
 

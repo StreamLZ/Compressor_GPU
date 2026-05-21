@@ -20,9 +20,9 @@
 //   parseAndDecodeSubChunkRaw — raw L1/L2 inline parse + dispatch
 //
 // extern "C" __global__ kernels (bound by name from driver.zig):
-//   slzFullDecompressL1Kernel    — general entropy-capable kernel
-//   slzFullDecompressL1KernelRaw — raw L1/L2 fast-path kernel
-//   slzGatherRawOff16Kernel      — raw off16 scatter (1 block per stream)
+//   slzLzDecodeKernel       — general entropy-capable kernel
+//   slzLzDecodeRawKernel    — raw L1/L2 fast-path kernel
+//   slzGatherRawOff16Kernel — raw off16 scatter (1 block per stream)
 
 #include "slz_wire_format.cuh"   // constants, descriptor structs, header parsers
 #include "lz_decode_core.cuh"    // decodeSubChunkRawMode / decodeSubChunkGeneral
