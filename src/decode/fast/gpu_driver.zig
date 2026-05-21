@@ -57,6 +57,8 @@ const FnMemcpyDtoDAsync = *const fn (CUdeviceptr, CUdeviceptr, usize, usize) cal
 const FnMemsetD8Async = *const fn (CUdeviceptr, u8, usize, usize) callconv(.c) CUresult;
 const FnMemAllocHost = *const fn (*?*anyopaque, usize) callconv(.c) CUresult;
 const FnMemFreeHost = *const fn (*anyopaque) callconv(.c) CUresult;
+const FnCtxGetCurrent = *const fn (*usize) callconv(.c) CUresult;
+const FnCtxSetCurrent = *const fn (usize) callconv(.c) CUresult;
 
 var cuInit_fn: ?FnInit = null;
 var cuDeviceGet_fn: ?FnDeviceGet = null;
@@ -77,6 +79,8 @@ var cuMemcpyDtoDAsync_fn: ?FnMemcpyDtoDAsync = null;
 var cuMemsetD8Async_fn: ?FnMemsetD8Async = null;
 var cuMemAllocHost_fn: ?FnMemAllocHost = null;
 var cuMemFreeHost_fn: ?FnMemFreeHost = null;
+var cuCtxGetCurrent_fn: ?FnCtxGetCurrent = null;
+var cuCtxSetCurrent_fn: ?FnCtxSetCurrent = null;
 
 // Pipeline streams (persistent, created once in init)
 const NUM_PIPELINE_STREAMS = 1;
@@ -117,15 +121,25 @@ pub fn init() bool {
     cuMemsetD8Async_fn = getProc(FnMemsetD8Async, "cuMemsetD8Async");
     cuMemAllocHost_fn = getProc(FnMemAllocHost, "cuMemAllocHost_v2");
     cuMemFreeHost_fn = getProc(FnMemFreeHost, "cuMemFreeHost");
+    cuCtxGetCurrent_fn = getProc(FnCtxGetCurrent, "cuCtxGetCurrent");
+    cuCtxSetCurrent_fn = getProc(FnCtxSetCurrent, "cuCtxSetCurrent");
 
     if ((cuInit_fn orelse return false)(0) != CUDA_SUCCESS) return false;
 
     var dev: CUdevice = 0;
     if ((cuDeviceGet_fn orelse return false)(&dev, 0) != CUDA_SUCCESS) return false;
 
-    cuCtxCreate_fn = getProc(FnCtxCreate, "cuCtxCreate_v2");
-    if (cuCtxCreate_fn == null) cuCtxCreate_fn = getProc(FnCtxCreate, "cuCtxCreate");
-    if ((cuCtxCreate_fn orelse return false)(&ctx, 0, dev) != CUDA_SUCCESS) return false;
+    // Prefer the caller's already-current CUDA context — a library should
+    // interoperate with the caller's CUDA / nvCOMP work rather than create
+    // a rival context. Only create our own when no context is current
+    // (CLI / standalone use).
+    if (cuCtxGetCurrent_fn) |get_current| {
+        var existing: usize = 0;
+        if (get_current(&existing) == CUDA_SUCCESS and existing != 0) ctx = existing;
+    }
+    if (ctx == 0) {
+        if ((cuCtxCreate_fn orelse return false)(&ctx, 0, dev) != CUDA_SUCCESS) return false;
+    }
 
     const load_fn = cuModuleLoadData_fn orelse return false;
     const get_fn = cuModuleGetFunction_fn orelse return false;
@@ -239,6 +253,16 @@ pub fn copyHostToDevice(dst_device: u64, src: []const u8) bool {
     if (src.len == 0) return true;
     const f = cuMemcpyHtoD_fn orelse return false;
     return f(dst_device, @ptrCast(src.ptr), src.len) == CUDA_SUCCESS;
+}
+
+/// Make the library's CUDA context current on the calling thread. A
+/// driver-API context is current per-thread, so any thread that issues
+/// GPU work (e.g. a library-owned worker thread) must call this first.
+/// Requires init() to have succeeded.
+pub fn bindContextToCallingThread() bool {
+    if (ctx == 0) return false;
+    const f = cuCtxSetCurrent_fn orelse return false;
+    return f(ctx) == CUDA_SUCCESS;
 }
 
 // ── Full GPU decode ─────────────────────────────────────────────
