@@ -155,18 +155,6 @@ pub fn init() bool {
     // is present. Failing to load is fine; falls back to general kernel.
     _ = get_fn(&kernel_raw_fn, module, "slzFullDecompressL1KernelRaw");
 
-    // Load tANS decode kernel (Pass 1)
-    const tans_ptx = @embedFile("tans_kernel.ptx") ++ "\x00";
-    if (load_fn(&tans_module, tans_ptx.ptr) == CUDA_SUCCESS) {
-        _ = get_fn(&tans_kernel_fn, tans_module, "slzTansDecodeKernel");
-        _ = get_fn(&tans_build_fn, tans_module, "slzTansBuildTablesKernel");
-        _ = get_fn(&tans32_kernel_fn, tans_module, "slzTans32DecodeKernel");
-        _ = get_fn(&tans_parse_fn, tans_module, "slzTansParseTablesKernel");
-        _ = get_fn(&tans_initlut_fn, tans_module, "slzTansInitLutKernel");
-        _ = get_fn(&tans_fused_fn, tans_module, "slzTans32FusedKernel");
-        _ = get_fn(&tans_fse_build_fn, tans_module, "slzTansFseBuildKernel");
-    }
-
     // Load Huffman decode kernels (Pass 1.5, for chunk_type=4 literals)
     const huff_ptx = @embedFile("huffman_kernel.ptx") ++ "\x00";
     if (load_fn(&huff_module, huff_ptx.ptr) == CUDA_SUCCESS) {
@@ -1130,11 +1118,14 @@ pub fn fullGpuLaunchImpl(
         e2e_cum_prescan_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
     };
 
-    // ── Scan for tANS chunks ──────────────────────────────────
+    // ── Scan for entropy chunks (Huffman + raw off16) ─────────
+    // scanForTansChunks fills both the Huffman descriptor buffers and the
+    // raw-off16 gather list, so it must run whenever the Huffman decoder
+    // is present (tANS is retired — tans_kernel_fn is always 0).
     var merged_count: u32 = 0;
     var scan: ScanResult = .{ .num_lit = 0, .num_tok = 0, .num_off16hi = 0, .num_off16lo = 0, .num_raw_off16 = 0 };
 
-    if (tans_kernel_fn != 0) {
+    if (tans_kernel_fn != 0 or huff_build_fn != 0) {
         // Cap by total_subchunks (each sub-chunk can contribute one descriptor per
         // stream type), not chunk_descs.len, because at sc>=1.0 a chunk has
         // multiple sub-chunks and each gets its own tANS stream.
@@ -1256,9 +1247,11 @@ pub fn fullGpuLaunchImpl(
         _ = sync_fn();
     }
 
-    // ── Pipeline: split into N groups, overlap tANS with LZ ───
+    // ── Pipeline: split into N groups, overlap entropy with LZ ───
+    // tANS is retired; the pipeline path now overlaps Huffman pre-decode
+    // with the LZ kernel. It no longer depends on the tANS kernels.
     const total_chunks: u32 = @intCast(chunk_descs.len);
-    const use_pipeline = self.pipeline_streams_created and tans_kernel_fn != 0 and tans_build_fn != 0 and total_chunks >= NUM_PIPELINE_STREAMS;
+    const use_pipeline = self.pipeline_streams_created and total_chunks >= NUM_PIPELINE_STREAMS;
     if (use_pipeline) {
         // Merge tANS descriptors grouped by pipeline stage
         // Pipeline group g handles chunks [g*pipe_chunk_count .. (g+1)*pipe_chunk_count)

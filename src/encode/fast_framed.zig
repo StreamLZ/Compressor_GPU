@@ -164,24 +164,19 @@ fn reencodeGpuWithEntropy(
     var rp: usize = 0;
     var wp: usize = 0;
 
-    // SLZ_HUFF_LIT=1: bypass GPU's pre-encoded tANS bodies for all four
-    // streams so the assembly falls through to encodeArrayU8, which the
-    // entropy_encoder routes to my Huffman wrapper. This gives us an
-    // apples-to-apples GPU-encoder + Huffman vs GPU-encoder + tANS.
+    // The GPU encoder is pure-Huffman: literal, token and off16 streams
+    // are all Huffman-coded (chunk_type=4). The tANS candidate bodies are
+    // never used — null them so the assembly always takes the Huffman /
+    // raw path.
     var lit32_eff = tans_encoded_lits_32;
     var lit_eff = tans_encoded_lits;
     var tok_eff = tans_encoded_tokens;
-    // off16 GPU-encoder bodies are intentionally ignored: the GPU tANS
-    // off16 encoder mis-encodes ~10pp of silesia content
-    // ([[gpu-silesia-off16-bug]]). off16 is CPU-Huffman-encoded below.
     _ = tans_encoded_off16_hi;
     _ = tans_encoded_off16_lo;
     _ = is_first_subchunk;
-    if (std.c.getenv("SLZ_HUFF_LIT") != null) {
-        lit32_eff = null;
-        lit_eff = null;
-        tok_eff = null;
-    }
+    lit32_eff = null;
+    lit_eff = null;
+    tok_eff = null;
 
     // Copy initial bytes (first 8 raw bytes for is_first chunks)
     if (initial_bytes > 0) {
@@ -1156,10 +1151,10 @@ pub fn compressFramedOne(
         if (!gpu_enc.gpuCompressImpl(enc_ctx, effective_src, gpu_out, descs, comp_sizes, io, opts.level))
             break :gpu_compress;
 
-        // SLZ_GPU_HUFF routes lit/tok/off16 through the GPU Huffman
-        // encoder instead of GPU tANS — the tANS passes below are then
-        // skipped so only one entropy encoder runs per stream.
-        const slz_gpu_huff = std.c.getenv("SLZ_GPU_HUFF") != null;
+        // lit/tok/off16 are Huffman-coded on the GPU (chunk_type=4). The
+        // GPU tANS passes are retired — kept false so the tANS branches
+        // below are dead and can be removed.
+        const slz_gpu_huff = true;
 
         // ── GPU 32-lane tANS encode of TOKEN + off16 streams ────
         // For L3+ only (matches the reencode entropy gate). Populates
@@ -1272,7 +1267,9 @@ pub fn compressFramedOne(
             tok: PairStream = .{},
             off16hi: PairStream = .{},
         };
-        const can_pair = (n_gpu_blocks == n_chunks) and opts.gpu_mode;
+        // Sub-chunk pairing emits tANS paired-primary/secondary chunks; the
+        // GPU encoder is pure-Huffman, so pairing is disabled.
+        const can_pair = false;
         var pair_infos: []PairInfo = allocator.alloc(PairInfo, n_chunks) catch &[_]PairInfo{};
         defer {
             for (pair_infos) |pinf| {
@@ -1401,11 +1398,10 @@ pub fn compressFramedOne(
                         if (opts.level < 3) break :blk_reencode false;
                         const sub_size = @min(gpu_block, chunk_size - si * gpu_block);
                         var entropy_options = entropyOptionsForLevel(opts.level);
-                        entropy_options.allow_tans = true;
-                        // tans32 is GPU-format only; gate it against dict because the
-                        // GPU pipeline never combines them and the CPU decoder hits
-                        // the SC+dict off-by-8 bug if forced into that path.
-                        entropy_options.allow_tans32 = dict_len == 0;
+                        // The GPU encoder emits only raw or Huffman (chunk_type=4)
+                        // sub-chunks — never tANS.
+                        entropy_options.allow_tans = false;
+                        entropy_options.allow_tans32 = false;
                         // Derive a per-stream LitOverride from a PairStream entry.
                         const ovFor = struct {
                             fn f(ps: anytype, idx: usize) LitOverride {

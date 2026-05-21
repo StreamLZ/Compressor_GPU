@@ -87,14 +87,6 @@ pub fn init() bool {
     const get_fn = cuModuleGetFunction_fn orelse return false;
     if (get_fn(&kernel_fn, module, "slzCompressL1Kernel") != CUDA_SUCCESS) return false;
 
-    // Load tANS entropy kernel (5-state + 32-lane)
-    const tans_ptx = @embedFile("tans_kernel.ptx") ++ "\x00";
-    if ((cuModuleLoadData_fn orelse return false)(&tans_module, tans_ptx.ptr) != CUDA_SUCCESS) return false;
-    if (get_fn(&tans_kernel_fn, tans_module, "slzTansEncodeKernel") != CUDA_SUCCESS) return false;
-    // 32-lane tANS encoder (chunk_type=6). Loaded lazily — kernel symbol must
-    // exist in PTX or this returns failure. Driver falls back to CPU path.
-    _ = get_fn(&tans32_kernel_fn, tans_module, "slzTans32EncodeKernel");
-
     // GPU Huffman encoder (chunk_type=4). Optional — if the module or
     // either kernel is missing, gpuEncode*Huff returns false and the
     // caller falls back to the CPU Huffman encoder.
