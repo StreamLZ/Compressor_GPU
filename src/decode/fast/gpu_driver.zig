@@ -288,12 +288,10 @@ const TansDecChunkDesc = extern struct {
     dst_size: u32, // total decompressed symbol count (countA + countB for paired)
     dst_offset_b: u32, // offset for symbols [split_count, dst_size) — paired unit B
     split_count: u32, // symbols < this go to dst_offset, rest to dst_offset_b
-    /// Phase 2: index into the LUT buffer. For per-stream mode (existing),
-    /// equals the descriptor's index in the array (== chunk_id) — the
-    /// scan leaves the sentinel value `0xFFFFFFFF` here and the merge
-    /// step backfills it with the final descriptor index. For shared-LUT
-    /// mode (frame.gpu_shared_luts_present), the scan sets it to 0-3,
-    /// selecting one of the 4 frame-wide LUTs at slots 0-3.
+    /// Index into the LUT buffer. Equals the descriptor's index in the
+    /// array (== chunk_id) — the scan leaves the sentinel value
+    /// `0xFFFFFFFF` here and the merge step backfills it with the final
+    /// descriptor index.
     lut_id: u32 = 0xFFFFFFFF,
 };
 
@@ -333,9 +331,6 @@ pub const DecodeContext = struct {
     // Debug: one-shot capture of the tans32 decode input (SLZ_DUMP_TANS32=1).
     tans32_dumped: bool = false,
 
-    d_shared_lut: CUdeviceptr = 0,
-    d_shared_lut_size: usize = 0,
-    shared_lut_log_bits: u32 = 0,
     d_build_timing: CUdeviceptr = 0,
     d_build_timing_size: usize = 0,
     d_parsed_weights: CUdeviceptr = 0,
@@ -552,20 +547,6 @@ fn scanForTansChunks(
                             tans_lit_descs[num_lit - 1].src_size -|= 128;
                         }
                     }
-                } else if (lit_type == 3) {
-                    // Phase 2 shared-LUT (chunk_type=3). Body layout:
-                    // [1B lut_id][128B sizes+states][32 sub-streams].
-                    // Set src_offset past the 1+128 header and tag with lut_id.
-                    const lit_before = num_lit;
-                    _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, sub_dst_off, tans_lit_descs, &num_lit);
-                    use_tans32 = true;
-                    if (num_lit > lit_before) {
-                        const body_in_chunk: u32 = tans_lit_descs[num_lit - 1].src_offset - ch.src_offset;
-                        if (body_in_chunk < chunk_src.len)
-                            tans_lit_descs[num_lit - 1].lut_id = chunk_src[body_in_chunk];
-                        tans_lit_descs[num_lit - 1].src_offset += 129;
-                        tans_lit_descs[num_lit - 1].src_size -|= 129;
-                    }
                 } else if (lit_type == 4) {
                     // Huffman literal stream — parse 3 or 5 byte header
                     // (same convention as tANS type 1/6). Payload after the
@@ -602,18 +583,6 @@ fn scanForTansChunks(
                     }
                 } else if (tok_type == 1 and !use_tans32) {
                     _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, sub_dst_off, tans_tok_descs, &num_tok);
-                } else if (tok_type == 3) {
-                    // Phase 2 shared-LUT (chunk_type=3).
-                    const tok_before = num_tok;
-                    _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, sub_dst_off, tans_tok_descs, &num_tok);
-                    use_tans32 = true;
-                    if (num_tok > tok_before) {
-                        const body_in_chunk: u32 = tans_tok_descs[num_tok - 1].src_offset - ch.src_offset;
-                        if (body_in_chunk < chunk_src.len)
-                            tans_tok_descs[num_tok - 1].lut_id = chunk_src[body_in_chunk];
-                        tans_tok_descs[num_tok - 1].src_offset += 129;
-                        tans_tok_descs[num_tok - 1].src_size -|= 129;
-                    }
                 } else if (tok_type == 4) {
                     // Huffman token stream — record sub_dst_off; driver adds
                     // tok_offset later when merging into the unified descriptor array.
@@ -663,17 +632,6 @@ fn scanForTansChunks(
                             tans_off16hi_descs[num_off16hi - 1].src_size -|= 128;
                         }
                     }
-                } else if (hi_type == 3) {
-                    const hi_before = num_off16hi;
-                    _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, sub_dst_off, tans_off16hi_descs, &num_off16hi);
-                    use_tans32 = true;
-                    if (num_off16hi > hi_before) {
-                        const body_in_chunk: u32 = tans_off16hi_descs[num_off16hi - 1].src_offset - ch.src_offset;
-                        if (body_in_chunk < chunk_src.len)
-                            tans_off16hi_descs[num_off16hi - 1].lut_id = chunk_src[body_in_chunk];
-                        tans_off16hi_descs[num_off16hi - 1].src_offset += 129;
-                        tans_off16hi_descs[num_off16hi - 1].src_size -|= 129;
-                    }
                 } else if (hi_type == 0) {
                     const raw_info = parseType0StreamInfo(chunk_src, pos);
                     if (raw_info.data_offset != 0 and num_raw < raw_off16_descs.len) {
@@ -706,17 +664,6 @@ fn scanForTansChunks(
                             tans_off16lo_descs[num_off16lo - 1].src_offset += 128;
                             tans_off16lo_descs[num_off16lo - 1].src_size -|= 128;
                         }
-                    }
-                } else if (lo_type == 3) {
-                    const lo_before = num_off16lo;
-                    _ = parseTansHeaderWithDstOffset(chunk_src, pos, ch.src_offset, sub_dst_off + 65536, tans_off16lo_descs, &num_off16lo);
-                    use_tans32 = true;
-                    if (num_off16lo > lo_before) {
-                        const body_in_chunk: u32 = tans_off16lo_descs[num_off16lo - 1].src_offset - ch.src_offset;
-                        if (body_in_chunk < chunk_src.len)
-                            tans_off16lo_descs[num_off16lo - 1].lut_id = chunk_src[body_in_chunk];
-                        tans_off16lo_descs[num_off16lo - 1].src_offset += 129;
-                        tans_off16lo_descs[num_off16lo - 1].src_size -|= 129;
                     }
                 } else if (lo_type == 0) {
                     const raw_info = parseType0StreamInfo(chunk_src, pos);
@@ -846,10 +793,9 @@ fn skipStreamHeader(chunk_src: []const u8, pos: u32) ?u32 {
             const sz: u32 = (@as(u32, chunk_src[pos]) << 16) | (@as(u32, chunk_src[pos + 1]) << 8) | @as(u32, chunk_src[pos + 2]);
             return pos + 3 + sz;
         }
-    } else if (ct == 1 or ct == 2 or ct == 3 or ct == 4 or ct == 6) {
-        // tANS (1) / Huffman (2, 4) / shared-LUT tANS (3) / 32-lane tANS (6):
-        // 3 or 5 byte header + compressed payload. chunk_type=3 always uses
-        // non-compact (top bit clear) because its high nibble is 0x3.
+    } else if (ct == 1 or ct == 2 or ct == 4 or ct == 6) {
+        // tANS (1) / Huffman (2, 4) / 32-lane tANS (6):
+        // 3 or 5 byte header + compressed payload.
         if (first_byte >= 0x80) {
             if (pos + 3 > chunk_src.len) return null;
             const bits: u32 = (@as(u32, chunk_src[pos]) << 16) | (@as(u32, chunk_src[pos + 1]) << 8) | @as(u32, chunk_src[pos + 2]);
@@ -1059,11 +1005,6 @@ pub fn fullGpuLaunch(
     num_groups: u32,
     chunks_per_group: u32,
     sub_chunk_cap: u32,
-    /// Phase 2: when non-null, 4 frame-wide shared probability tables
-    /// to install at LUT slots 0-3. All chunk_type=3 sub-chunk streams
-    /// will reference these via lut_id (0-3). null = legacy per-stream
-    /// mode (build kernel runs once per descriptor).
-    gpu_shared_luts: ?@import("../../format/frame_format.zig").GpuSharedLuts,
     io: ?std.Io,
 ) fast_dec.DecodeError!void {
     return fullGpuLaunchImpl(
@@ -1076,7 +1017,6 @@ pub fn fullGpuLaunch(
         num_groups,
         chunks_per_group,
         sub_chunk_cap,
-        gpu_shared_luts,
         io,
     );
 }
@@ -1091,7 +1031,6 @@ pub fn fullGpuLaunchImpl(
     num_groups: u32,
     chunks_per_group: u32,
     sub_chunk_cap: u32,
-    gpu_shared_luts: ?@import("../../format/frame_format.zig").GpuSharedLuts,
     io: ?std.Io,
 ) fast_dec.DecodeError!void {
     if (!init() or kernel_fn == 0) return error.BadMode;
@@ -1175,83 +1114,6 @@ pub fn fullGpuLaunchImpl(
     _ = sync_fn();
     if (t_e2e0) |t0| if (io) |iv| {
         e2e_cum_h2d_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
-    };
-
-    // ── Phase 2: build 4 shared LUTs into d_tans_lut[0..3] ─────
-    // When the frame carries shared probability tables, run the FSE
-    // build kernel ONCE here against 4 synthetic descriptors pointing
-    // at the 4 tables (uploaded to d_shared_lut as scratch). The
-    // per-group build kernels below are skipped — all chunk_type=3
-    // streams just index into slots 0-3 via their lut_id.
-    if (gpu_shared_luts) |luts| if (tans_fse_build_fn != 0) {
-        // Concatenate the 4 prob tables into a small buffer for upload.
-        const tables = [_]@import("../../format/frame_format.zig").SharedLut{
-            luts.lit, luts.tok, luts.off16_hi, luts.off16_lo,
-        };
-        var total_tbl_bytes: usize = 0;
-        for (tables) |t| total_tbl_bytes += t.table_bytes.len;
-        var concat_buf: [4 * 512]u8 = undefined;
-        if (total_tbl_bytes <= concat_buf.len) {
-            var wp: usize = 0;
-            var synthetic_descs: [4]TansDecChunkDesc = undefined;
-            for (tables, 0..) |t, i| {
-                @memcpy(concat_buf[wp..][0..t.table_bytes.len], t.table_bytes);
-                synthetic_descs[i] = .{
-                    .src_offset = @intCast(wp),
-                    // Extend src_size to the end of the concat buffer so the
-                    // FSE build kernel's `byte_idx + 3 > src_size` speculative-
-                    // read check passes (it needs up to 3 bytes of slack past
-                    // the actual table bytes).
-                    .src_size = 0, // filled in after the loop
-                    .dst_offset = 0,
-                    .dst_size = 1, // unused for build kernel
-                    .dst_offset_b = 0,
-                    .split_count = 1,
-                    .lut_id = @intCast(i),
-                };
-                wp += t.table_bytes.len;
-            }
-            // Zero-pad trailing 16 bytes for safe over-read.
-            @memset(concat_buf[wp..][0..@min(16, concat_buf.len - wp)], 0);
-            for (0..4) |i| {
-                synthetic_descs[i].src_size = @intCast(wp + 16 - synthetic_descs[i].src_offset);
-            }
-
-            // Upload concatenated tables to d_shared_lut as scratch
-            // (incl. 16B over-read pad past the last table).
-            const upload_bytes = total_tbl_bytes + 16;
-            if (!ensureDeviceBuf(&self.d_shared_lut, &self.d_shared_lut_size, upload_bytes)) return error.BadMode;
-            _ = h2d_fn(self.d_shared_lut, @ptrCast(&concat_buf), upload_bytes);
-
-            // Upload 4 synthetic descriptors to a small scratch in the
-            // existing descs buffer area (we'll overwrite later for the
-            // per-group descs upload). Use a separate small alloc to be safe.
-            if (!ensureDeviceBuf(&self.d_tans_descs_persist, &self.d_tans_descs_persist_size, @max(self.d_tans_descs_persist_size, 4 * @sizeOf(TansDecChunkDesc)))) return error.BadMode;
-            _ = h2d_fn(self.d_tans_descs_persist, @ptrCast(&synthetic_descs), 4 * @sizeOf(TansDecChunkDesc));
-
-            // Allocate meta buf for 4 slots.
-            if (!ensureDeviceBuf(&self.d_tans_meta, &self.d_tans_meta_size, @max(self.d_tans_meta_size, 4 * 16))) return error.BadMode;
-
-            // Work counter for FSE build kernel.
-            if (!ensureDeviceBuf(&self.d_work_counter, &self.d_work_counter_size, 4)) return error.BadMode;
-            if (cuMemsetD8_fn) |memset_fn| _ = memset_fn(self.d_work_counter, 0, 4);
-
-            var bp_src = self.d_shared_lut;
-            var bp_descs_sh = self.d_tans_descs_persist;
-            var bp_lut_sh = self.d_tans_lut;
-            var bp_meta_sh = self.d_tans_meta;
-            var bp_num_sh: u32 = 4;
-            var bp_wc_sh = self.d_work_counter;
-            var build_params = [_]?*anyopaque{
-                @ptrCast(&bp_src), @ptrCast(&bp_descs_sh),
-                @ptrCast(&bp_lut_sh), @ptrCast(&bp_meta_sh), @ptrCast(&bp_num_sh),
-                @ptrCast(&bp_wc_sh),
-            };
-            var build_extra = [_]?*anyopaque{null};
-            if (launch_fn(tans_fse_build_fn, 4, 1, 1, 32, 2, 1, 0, 0, &build_params, &build_extra) != CUDA_SUCCESS)
-                return error.BadMode;
-            _ = sync_fn();
-        }
     };
 
     var e2e_cum_prescan_ns: i64 = 0;
@@ -1602,13 +1464,7 @@ pub fn fullGpuLaunchImpl(
                 var bp_num = tc;
 
                 // Use split parse+initlut kernels when available, else legacy combined.
-                // Skip ALL per-group build paths in shared-LUT mode — the 4
-                // LUTs were already built ONCE in the setup pass before the
-                // per-group loop and live at d_tans_lut[0..3].
-                const skip_build = gpu_shared_luts != null;
-                if (skip_build) {
-                    // intentionally empty
-                } else if (scan.use_tans32 and tans_fse_build_fn != 0 and tans32_kernel_fn != 0) {
+                if (scan.use_tans32 and tans_fse_build_fn != 0 and tans32_kernel_fn != 0) {
                     // FSE build kernel with atomicAdd work claiming
                     if (!ensureDeviceBuf(&self.d_work_counter, &self.d_work_counter_size, 4)) return error.BadMode;
                     if (cuMemsetD8_fn) |memset_fn| _ = memset_fn(self.d_work_counter, 0, 4);
@@ -1638,13 +1494,7 @@ pub fn fullGpuLaunchImpl(
                     var tp_num2 = tc;
                     var tp_lut2 = bp_lut;
                     var tp_meta2 = bp_meta;
-                    var tp_shared: u32 = if (gpu_shared_luts != null) 1 else 0;
-                    // Shared mode: LUTs live at d_tans_lut[0..3] regardless
-                    // of the per-group offset; rebase pointers.
-                    if (tp_shared != 0) {
-                        tp_lut2 = self.d_tans_lut;
-                        tp_meta2 = self.d_tans_meta;
-                    }
+                    var tp_shared: u32 = 0; // per-stream LUT mode
                     var tans32_params = [_]?*anyopaque{
                         @ptrCast(&tp_comp2), @ptrCast(&tp_scratch2),
                         @ptrCast(&tp_descs2), @ptrCast(&tp_status2), @ptrCast(&tp_num2),
@@ -1700,11 +1550,7 @@ pub fn fullGpuLaunchImpl(
                     var tp_num = tc;
                     var tp_lut = bp_lut;
                     var tp_meta = bp_meta;
-                    var tp_shared: u32 = if (gpu_shared_luts != null) 1 else 0;
-                    if (tp_shared != 0) {
-                        tp_lut = self.d_tans_lut;
-                        tp_meta = self.d_tans_meta;
-                    }
+                    var tp_shared: u32 = 0; // per-stream LUT mode
                     var tans32_params = [_]?*anyopaque{
                         @ptrCast(&tp_comp), @ptrCast(&tp_scratch),
                         @ptrCast(&tp_descs), @ptrCast(&tp_status), @ptrCast(&tp_num),

@@ -74,14 +74,8 @@ pub const FrameFlags = packed struct(u8) {
     /// parallel Fast L1-L4 decode. When set, the decoder should locate
     /// and apply the sidecar before spawning phase-2 worker threads.
     parallel_decode_metadata_present: bool = false,
-    /// GPU specialisation (Phase 2): the frame carries 4 frame-wide
-    /// probability tables (one per stream type — lit, tok, off16-hi,
-    /// off16-lo). Sub-chunks emit chunk_type=3 streams that omit the
-    /// per-stream probability table; the decoder builds 4 LUTs once
-    /// per frame and reuses them for every sub-chunk. Set only by the
-    /// GPU encoder.
-    gpu_shared_luts_present: bool = false,
-    _reserved: u2 = 0,
+    /// Bit reserved for future use (was the Phase-2 GPU shared-LUT flag).
+    _reserved: u3 = 0,
 };
 
 pub const Codec = enum(u8) {
@@ -98,39 +92,6 @@ pub const Codec = enum(u8) {
     }
 };
 
-/// A single frame-wide shared probability table, as written to disk.
-/// The bytes are the bit-packed FSE-style table produced by the
-/// `emitTans32ProbabilityTable` helpers (kernel side) / Zig `tans_encoder`
-/// (CPU side). Byte 0 is `log_table_bits` (8..11). The remaining bytes
-/// encode the per-symbol weights with truncated-binary coding.
-pub const SharedLut = struct {
-    /// Slice into the parsed frame buffer; lifetime tied to the caller's
-    /// frame source. Empty slice ⇒ "no entropy table for this stream
-    /// type" (decoder treats every chunk_type=3 stream of that id as
-    /// raw / unsupported and the frame is malformed; encoders only emit
-    /// the section when all four tables are present).
-    table_bytes: []const u8,
-};
-
-/// All four frame-wide shared probability tables, in fixed order:
-/// 0=lit, 1=tok, 2=off16-hi, 3=off16-lo.
-pub const GpuSharedLuts = struct {
-    lit: SharedLut,
-    tok: SharedLut,
-    off16_hi: SharedLut,
-    off16_lo: SharedLut,
-
-    pub fn byId(self: *const GpuSharedLuts, id: u8) SharedLut {
-        return switch (id) {
-            0 => self.lit,
-            1 => self.tok,
-            2 => self.off16_hi,
-            3 => self.off16_lo,
-            else => SharedLut{ .table_bytes = &[_]u8{} },
-        };
-    }
-};
-
 pub const FrameHeader = struct {
     version: u8,
     flags: FrameFlags,
@@ -143,8 +104,6 @@ pub const FrameHeader = struct {
     sc_group_size: f32,
     content_size: ?u64,
     dictionary_id: ?u32,
-    /// Phase 2 / GPU specialisation. Non-null when flags.gpu_shared_luts_present.
-    gpu_shared_luts: ?GpuSharedLuts = null,
     header_size: usize,
 };
 
@@ -205,26 +164,6 @@ pub fn parseHeader(src: []const u8) ParseError!FrameHeader {
         pos += 4;
     }
 
-    var gpu_shared_luts: ?GpuSharedLuts = null;
-    if (raw_flags.gpu_shared_luts_present) {
-        var luts: GpuSharedLuts = .{
-            .lit = .{ .table_bytes = &[_]u8{} },
-            .tok = .{ .table_bytes = &[_]u8{} },
-            .off16_hi = .{ .table_bytes = &[_]u8{} },
-            .off16_lo = .{ .table_bytes = &[_]u8{} },
-        };
-        const tables = [_]*SharedLut{ &luts.lit, &luts.tok, &luts.off16_hi, &luts.off16_lo };
-        for (tables) |slot| {
-            if (src.len < pos + 2) return error.Truncated;
-            const tbl_len = std.mem.readInt(u16, src[pos..][0..2], .little);
-            pos += 2;
-            if (src.len < pos + tbl_len) return error.Truncated;
-            slot.* = .{ .table_bytes = src[pos..][0..tbl_len] };
-            pos += tbl_len;
-        }
-        gpu_shared_luts = luts;
-    }
-
     return .{
         .version = ver,
         .flags = raw_flags,
@@ -234,7 +173,6 @@ pub fn parseHeader(src: []const u8) ParseError!FrameHeader {
         .sc_group_size = sc_group_size,
         .content_size = content_size,
         .dictionary_id = dict_id,
-        .gpu_shared_luts = gpu_shared_luts,
         .header_size = pos,
     };
 }
@@ -268,10 +206,6 @@ pub const WriteHeaderOptions = struct {
     content_checksum: bool = false,
     block_checksums: bool = false,
     dictionary_id: ?u32 = null,
-    /// GPU-only: when non-null, the four frame-wide shared probability
-    /// tables are written immediately after content_size + dict_id.
-    /// Sets `flags.gpu_shared_luts_present`. Order: lit, tok, hi, lo.
-    gpu_shared_luts: ?GpuSharedLuts = null,
 };
 
 pub const WriteError = error{ BadLevel, BadBlockSize, BadScGroupSize };
@@ -290,7 +224,6 @@ pub fn writeHeader(dst: []u8, opts: WriteHeaderOptions) WriteError!usize {
         .block_checksums = opts.block_checksums,
         .dictionary_id_present = opts.dictionary_id != null,
         .parallel_decode_metadata_present = opts.parallel_decode_metadata_present,
-        .gpu_shared_luts_present = opts.gpu_shared_luts != null,
     };
 
     var pos: usize = 0;
@@ -323,15 +256,6 @@ pub fn writeHeader(dst: []u8, opts: WriteHeaderOptions) WriteError!usize {
     if (opts.dictionary_id) |id| {
         std.mem.writeInt(u32, dst[pos..][0..4], id, .little);
         pos += 4;
-    }
-    if (opts.gpu_shared_luts) |luts| {
-        const tables = [_]SharedLut{ luts.lit, luts.tok, luts.off16_hi, luts.off16_lo };
-        for (tables) |t| {
-            std.mem.writeInt(u16, dst[pos..][0..2], @intCast(t.table_bytes.len), .little);
-            pos += 2;
-            @memcpy(dst[pos..][0..t.table_bytes.len], t.table_bytes);
-            pos += t.table_bytes.len;
-        }
     }
     return pos;
 }
