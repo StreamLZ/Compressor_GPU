@@ -46,6 +46,7 @@ struct AssembleDesc {
     uint32_t huff_off16lo_offset; // in d_huff_off16
     uint32_t huff_off16lo_size;
     uint32_t sub_decomp_size;     // decompressed size of this sub-chunk
+    uint32_t init_bytes;          // 8 for the frame's first sub-chunk (verbatim prefix), else 0
     uint32_t out_offset;          // assembled payload destination in d_frame (pass 2)
 };
 
@@ -197,10 +198,21 @@ __device__ static uint32_t assembleSubChunk(
     const uint8_t* d_huff_off16, const AssembleDesc& desc,
     uint8_t* out, int lane) {
 
-    const RawStreams s = parseRaw(d_raw + desc.raw_offset, desc.raw_size,
+    // The frame's first sub-chunk carries 8 verbatim raw bytes before the
+    // literal header (matches reencodeGpuWithEntropy's `initial_bytes`).
+    const uint8_t* raw_base = d_raw + desc.raw_offset;
+    const uint32_t init_n = desc.init_bytes;
+    if (init_n > desc.raw_size) return 0;
+    const RawStreams s = parseRaw(raw_base + init_n, desc.raw_size - init_n,
                                   desc.sub_decomp_size);
     if (!s.ok) return 0;
     uint32_t wp = 0;
+
+    // 0. initial raw bytes (frame's first sub-chunk only) — verbatim.
+    if (init_n > 0) {
+        if (out) { warpCopy(out, raw_base, init_n, lane); __syncwarp(); }
+        wp += init_n;
+    }
 
     // 1. literals — huff vs raw.
     wp += emitEntropyStream(out ? out + wp : nullptr, s.lit, s.lit_count,

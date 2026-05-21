@@ -1202,6 +1202,14 @@ pub fn compressFramedOne(
             enc_ctx.tans32_off16lo_offsets = null;
         };
 
+        // 4d device-resident compress: when SLZ_GPU_ASSEMBLE is set the
+        // three GPU Huffman passes keep their bodies device-resident
+        // (huff_keep_device) so the assembly kernels read them with no
+        // host bounce. Must be decided before the Huffman passes run.
+        const want_gpu_assemble: bool =
+            opts.level >= 3 and slz_gpu_huff and std.c.getenv("SLZ_GPU_ASSEMBLE") != null;
+        enc_ctx.huff_keep_device = want_gpu_assemble;
+
         // ── GPU Huffman encode of lit / tok / off16 (SLZ_GPU_HUFF) ──
         // The pure-Huffman pipeline: every entropy stream is Huffman-
         // coded on the GPU (chunk_type=4). Replaces the GPU tANS passes.
@@ -1324,7 +1332,7 @@ pub fn compressFramedOne(
         // per-sub-chunk frame assembly onto the GPU (slzAssemble* kernels)
         // instead of the CPU reencodeGpuWithEntropy loop. The assembled
         // [3-byte header][payload] blocks are spliced into `dst` below.
-        const gpu_assembled: bool = if (opts.level >= 3 and std.c.getenv("SLZ_GPU_ASSEMBLE") != null)
+        const gpu_assembled: bool = if (want_gpu_assemble)
             gpu_enc.gpuAssembleFrameImpl(enc_ctx, allocator, descs, comp_sizes)
         else
             false;
