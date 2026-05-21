@@ -9,3 +9,13 @@ cuobjdump -res-usage "%OUT%.cubin"
 echo.
 nvcc -ptx -o "%OUT%.ptx" "%SRC%" -arch=sm_89 -O3
 echo PTX exit code: %ERRORLEVEL%
+
+echo.
+echo Compiling GPU frame-assembly kernel...
+set ASM=%~dp0..\src\gpu\encode\assemble_kernel.cu
+set ASMOUT=%~dp0..\src\gpu\encode\assemble_kernel
+nvcc -cubin -o "%ASMOUT%.cubin" "%ASM%" -arch=sm_89 -O3
+echo NVCC asm exit code: %ERRORLEVEL%
+cuobjdump -res-usage "%ASMOUT%.cubin"
+nvcc -ptx -o "%ASMOUT%.ptx" "%ASM%" -arch=sm_89 -O3
+echo asm PTX exit code: %ERRORLEVEL%
