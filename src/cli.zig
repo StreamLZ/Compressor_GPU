@@ -604,6 +604,15 @@ fn runCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
 
 // ─── Decompress ──────────────────────────────────────────────────────
 
+// SLZ_E2E_TIMER decode-phase print. decode-call also covers cold CUDA
+// init — cross-reference the [gpu-init] line for that split.
+fn printDecPhases(t0: i64, t_setup: i64, t_alloc: i64, t_decode: i64, t_write: i64, label: []const u8) void {
+    const ms = gpu_driver.qpcMs;
+    std.debug.print("[dec] mmap+parse {d:.2}  out-alloc {d:.2}  decode-call(+CUDA init) {d:.2}  file-write {d:.2}  total {d:.2} ms  ({s})\n", .{
+        ms(t0, t_setup), ms(t_setup, t_alloc), ms(t_alloc, t_decode), ms(t_decode, t_write), ms(t0, t_write), label,
+    });
+}
+
 fn runDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: Args) !void {
     const in_path = requireInput(args, w);
 
@@ -657,6 +666,11 @@ fn runDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, ar
     }
 
     // ── SLZ decompress: mmap input, mmap output ──
+
+    // SLZ_E2E_TIMER: outer decode-phase breakdown. The decode-call span
+    // also covers cold CUDA init — see the [gpu-init] line.
+    const dec_dbg = std.c.getenv("SLZ_E2E_TIMER") != null;
+    const t_dec0 = gpu_driver.qpcNow();
 
     // Open + mmap input file (read-only)
     const in_file = std.Io.Dir.cwd().openFile(io, in_path, .{}) catch |err| {
@@ -716,8 +730,13 @@ fn runDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, ar
     const derived = if (args.output == null) try deriveDecompressOutput(allocator, in_path) else null;
     defer if (derived) |d| allocator.free(d);
     const out_path = args.output orelse derived.?;
+    const t_setup = gpu_driver.qpcNow();
 
-    // Create output file, pre-size it, and mmap for direct decompress.
+    // Create output file, pre-size it, and mmap for direct decompress —
+    // the decoder D2H's straight into the file's page cache, fusing the
+    // download and the file write into one pass. (A pinned host buffer
+    // was tried and measured slower for a one-shot CLI: it adds a pin +
+    // a redundant second copy via fwrite. See SLZ_E2E_TIMER.)
     const out_file = std.Io.Dir.cwd().createFile(io, out_path, .{ .read = true }) catch |err| {
         try w.print("error: cannot create '{s}': {s}\n", .{ out_path, @errorName(err) });
         try w.flush();
@@ -738,6 +757,7 @@ fn runDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, ar
     };
 
     const dst = out_map.slice();
+    const t_alloc = gpu_driver.qpcNow();
 
     const dec_result = decoder.decompressFramedParallelThreaded(allocator, io, src, dst, args.threads, &gpu_driver.g_default) catch |err| {
         out_map.unmap();
@@ -746,6 +766,7 @@ fn runDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, ar
         std.process.exit(1);
     };
     const written = dec_result.written;
+    const t_decode = gpu_driver.qpcNow();
 
     // Shift content past the dictionary prefix (if any) to file offset 0.
     if (dec_result.offset > 0) {
@@ -761,7 +782,9 @@ fn runDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, ar
         try w.flush();
         std.process.exit(1);
     };
+    const t_write = gpu_driver.qpcNow();
 
+    if (dec_dbg) printDecPhases(t_dec0, t_setup, t_alloc, t_decode, t_write, "mmap");
     try w.print("decompressed {d} -> {d} bytes  ({s} -> {s})\n", .{
         src.len, written, in_path, out_path,
     });

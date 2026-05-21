@@ -10,7 +10,24 @@ const std = @import("std");
 const win32 = struct {
     extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.c) ?*anyopaque;
     extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.c) ?*anyopaque;
+    extern "kernel32" fn QueryPerformanceCounter(count: *i64) callconv(.c) c_int;
+    extern "kernel32" fn QueryPerformanceFrequency(freq: *i64) callconv(.c) c_int;
 };
+
+/// Monotonic high-resolution timestamp (QueryPerformanceCounter). Pair
+/// with qpcMs() for elapsed-millisecond timing without an std.Io handle
+/// — used by the SLZ_E2E_TIMER instrumentation in init() and the CLI.
+pub fn qpcNow() i64 {
+    var c: i64 = 0;
+    _ = win32.QueryPerformanceCounter(&c);
+    return c;
+}
+pub fn qpcMs(from: i64, to: i64) f64 {
+    var freq: i64 = 1;
+    _ = win32.QueryPerformanceFrequency(&freq);
+    if (freq == 0) freq = 1;
+    return @as(f64, @floatFromInt(to - from)) * 1000.0 / @as(f64, @floatFromInt(freq));
+}
 
 const CUresult = c_int;
 const CUdevice = c_int;
@@ -100,6 +117,11 @@ pub fn init() bool {
 
     if (std.c.getenv("SLZ_NO_CUDA") != null) return false;
 
+    // SLZ_E2E_TIMER: break down cold CUDA bring-up (the dominant fixed
+    // cost of a one-shot decode — context creation + PTX JIT).
+    const init_dbg = std.c.getenv("SLZ_E2E_TIMER") != null;
+    const t_init0 = qpcNow();
+
     lib = win32.LoadLibraryA("nvcuda.dll");
     if (lib == null) return false;
 
@@ -141,6 +163,7 @@ pub fn init() bool {
     if (ctx == 0) {
         if ((cuCtxCreate_fn orelse return false)(&ctx, 0, dev) != CUDA_SUCCESS) return false;
     }
+    const t_ctx = qpcNow();
 
     const load_fn = cuModuleLoadData_fn orelse return false;
     const get_fn = cuModuleGetFunction_fn orelse return false;
@@ -158,12 +181,19 @@ pub fn init() bool {
     // Optional GPU decode-scan kernel (roadmap 4d Phase 2). Absent → the
     // driver keeps the CPU scanForTansChunks path.
     _ = get_fn(&scan_parse_fn, module, "slzScanParseKernel");
+    const t_lz = qpcNow();
 
     // Load Huffman decode kernels (Pass 1.5, for chunk_type=4 literals)
     const huff_ptx = @embedFile("huffman_kernel.ptx") ++ "\x00";
     if (load_fn(&huff_module, huff_ptx.ptr) == CUDA_SUCCESS) {
         _ = get_fn(&huff_build_fn, huff_module, "slzHuffBuildLutKernel");
         _ = get_fn(&huff_decode_fn, huff_module, "slzHuffDecode4StreamKernel");
+    }
+    const t_huff = qpcNow();
+    if (init_dbg) {
+        std.debug.print("[gpu-init] dll+cuInit+ctx {d:.2}  lz-module(PTX JIT) {d:.2}  huff-module(PTX JIT) {d:.2}  total {d:.2} ms\n", .{
+            qpcMs(t_init0, t_ctx), qpcMs(t_ctx, t_lz), qpcMs(t_lz, t_huff), qpcMs(t_init0, t_huff),
+        });
     }
 
     // Create persistent pipeline streams (CU_STREAM_NON_BLOCKING = 1)
