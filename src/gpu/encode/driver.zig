@@ -26,6 +26,9 @@ var tans32_kernel_fn: usize = 0;
 var huff_module: usize = 0;
 var huff_tables_kernel_fn: usize = 0;
 var huff_encode_kernel_fn: usize = 0;
+var assemble_module: usize = 0;
+var assemble_measure_fn: usize = 0;
+var assemble_write_fn: usize = 0;
 var initialized = false;
 
 const FnInit = *const fn (c_uint) callconv(.c) CUresult;
@@ -96,6 +99,14 @@ pub fn init() bool {
         _ = get_fn(&huff_encode_kernel_fn, huff_module, "slzHuffEncode4StreamKernel");
     }
 
+    // GPU frame-assembly kernels (chunk_type=4 device-resident compress
+    // tail). Optional — gpuAssembleFrameImpl returns false if absent.
+    const asm_ptx = @embedFile("assemble_kernel.ptx") ++ "\x00";
+    if ((cuModuleLoadData_fn orelse return false)(&assemble_module, asm_ptx.ptr) == CUDA_SUCCESS) {
+        _ = get_fn(&assemble_measure_fn, assemble_module, "slzAssembleMeasureKernel");
+        _ = get_fn(&assemble_write_fn, assemble_module, "slzAssembleWriteKernel");
+    }
+
     return true;
 }
 
@@ -110,6 +121,23 @@ pub const CompressChunkDesc = extern struct {
     dst_offset: u32,
     dst_capacity: u32,
     is_first: u32,
+};
+
+// Per-sub-chunk descriptor for the frame-assembly kernels. Mirrors
+// `AssembleDesc` in assemble_kernel.cu — keep field order/types in sync.
+pub const AssembleDesc = extern struct {
+    raw_offset: u32, // sub-chunk raw payload offset in d_output
+    raw_size: u32, // raw payload byte count (comp_sizes[i])
+    huff_lit_offset: u32,
+    huff_lit_size: u32, // 0 = no Huffman body -> stream is raw
+    huff_tok_offset: u32,
+    huff_tok_size: u32,
+    huff_off16hi_offset: u32,
+    huff_off16hi_size: u32,
+    huff_off16lo_offset: u32,
+    huff_off16lo_size: u32,
+    sub_decomp_size: u32, // decompressed size of this sub-chunk
+    out_offset: u32, // assembled [hdr+payload] destination (filled pass 2)
 };
 
 /// Hash bits per level. Mirrors CPU `fast_framed.zig:955-963` engine-level
@@ -397,6 +425,26 @@ pub const EncodeContext = struct {
     d_huff_out_size: usize = 0,
     d_huff_sizes_persist: CUdeviceptr = 0,
     d_huff_sizes_size: usize = 0,
+
+    // ── Frame-assembly (4d device-resident compress) device buffers ──
+    d_asm_huff_lit: CUdeviceptr = 0,
+    d_asm_huff_lit_size: usize = 0,
+    d_asm_huff_tok: CUdeviceptr = 0,
+    d_asm_huff_tok_size: usize = 0,
+    d_asm_huff_off16: CUdeviceptr = 0,
+    d_asm_huff_off16_size: usize = 0,
+    d_asm_descs: CUdeviceptr = 0,
+    d_asm_descs_size: usize = 0,
+    d_asm_out: CUdeviceptr = 0,
+    d_asm_out_size: usize = 0,
+    d_asm_sizes: CUdeviceptr = 0,
+    d_asm_sizes_size: usize = 0,
+    // Host-side assembled result — packed [3-byte sub-chunk hdr][payload]
+    // blocks; the frame assembler splices block i from
+    // assembled_data[assembled_offsets[i]..][0..assembled_sizes[i]].
+    assembled_data: ?[]u8 = null,
+    assembled_offsets: ?[]u32 = null,
+    assembled_sizes: ?[]u32 = null,
 
     // ── Result slices — formerly module-global `pub var`. Each encode
     // operation writes its downloaded host-side payloads here; the frame
@@ -1059,6 +1107,141 @@ pub fn gpuEncodeLiteralsHuffImpl(
     self.huff_lit_sizes = sizes;
     self.huff_lit_data = bytes;
     self.huff_lit_offsets = offsets;
+    return true;
+}
+
+/// Device-resident frame assembly (roadmap 4d). Runs after gpuCompressImpl
+/// (raw streams resident in d_output) and the three GPU Huffman passes
+/// (bodies in the host huff_*_data). Assembles every sub-chunk's
+/// [3-byte header][payload] on the GPU and publishes the packed host-side
+/// result in `assembled_*` for the frame assembler to splice. Returns
+/// false — caller keeps the CPU path — if any prerequisite is absent.
+pub fn gpuAssembleFrameImpl(
+    self: *EncodeContext,
+    allocator: std.mem.Allocator,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes: []const u32,
+) bool {
+    if (!init()) return false;
+    if (assemble_measure_fn == 0 or assemble_write_fn == 0) return false;
+    const n: u32 = @intCast(chunk_descs.len);
+    if (n == 0) return false;
+
+    // All three Huffman passes must have produced host body buffers.
+    const hl = self.huff_lit_data orelse return false;
+    const ht = self.huff_tok_data orelse return false;
+    const ho = self.huff_off16hi_data orelse return false; // hi+lo share it
+    const hl_off = self.huff_lit_offsets orelse return false;
+    const hl_sz = self.huff_lit_sizes orelse return false;
+    const ht_off = self.huff_tok_offsets orelse return false;
+    const ht_sz = self.huff_tok_sizes orelse return false;
+    const hoh_off = self.huff_off16hi_offsets orelse return false;
+    const hoh_sz = self.huff_off16hi_sizes orelse return false;
+    const hol_off = self.huff_off16lo_offsets orelse return false;
+    const hol_sz = self.huff_off16lo_sizes orelse return false;
+    if (hl_off.len < n or ht_off.len < n or hoh_off.len < n or hol_off.len < n) return false;
+
+    const h2d = cuMemcpyHtoD_fn orelse return false;
+    const d2h = cuMemcpyDtoH_fn orelse return false;
+    const launch = cuLaunchKernel_fn orelse return false;
+    const sync = cuCtxSynchronize_fn orelse return false;
+
+    // H2D the three Huffman body buffers (off16 hi+lo share one buffer).
+    if (!ensureBuf(&self.d_asm_huff_lit, &self.d_asm_huff_lit_size, @max(hl.len, 1))) return false;
+    if (!ensureBuf(&self.d_asm_huff_tok, &self.d_asm_huff_tok_size, @max(ht.len, 1))) return false;
+    if (!ensureBuf(&self.d_asm_huff_off16, &self.d_asm_huff_off16_size, @max(ho.len, 1))) return false;
+    if (hl.len > 0) _ = h2d(self.d_asm_huff_lit, @ptrCast(hl.ptr), hl.len);
+    if (ht.len > 0) _ = h2d(self.d_asm_huff_tok, @ptrCast(ht.ptr), ht.len);
+    if (ho.len > 0) _ = h2d(self.d_asm_huff_off16, @ptrCast(ho.ptr), ho.len);
+
+    // Build per-sub-chunk descriptors (out_offset filled after pass 1).
+    var descs = allocator.alloc(AssembleDesc, n) catch return false;
+    defer allocator.free(descs);
+    for (0..n) |i| {
+        descs[i] = .{
+            .raw_offset = chunk_descs[i].dst_offset,
+            .raw_size = comp_sizes[i],
+            .huff_lit_offset = hl_off[i],
+            .huff_lit_size = hl_sz[i],
+            .huff_tok_offset = ht_off[i],
+            .huff_tok_size = ht_sz[i],
+            .huff_off16hi_offset = hoh_off[i],
+            .huff_off16hi_size = hoh_sz[i],
+            .huff_off16lo_offset = hol_off[i],
+            .huff_off16lo_size = hol_sz[i],
+            .sub_decomp_size = chunk_descs[i].src_size,
+            .out_offset = 0,
+        };
+    }
+
+    const desc_bytes: usize = @as(usize, n) * @sizeOf(AssembleDesc);
+    const sizes_bytes: usize = @as(usize, n) * 4;
+    if (!ensureBuf(&self.d_asm_descs, &self.d_asm_descs_size, desc_bytes)) return false;
+    if (!ensureBuf(&self.d_asm_sizes, &self.d_asm_sizes_size, sizes_bytes)) return false;
+    _ = h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes);
+    _ = sync();
+
+    var p_raw = self.d_output_persist;
+    var p_hl = self.d_asm_huff_lit;
+    var p_ht = self.d_asm_huff_tok;
+    var p_ho = self.d_asm_huff_off16;
+    var p_descs = self.d_asm_descs;
+    var p_sizes = self.d_asm_sizes;
+    var p_n = n;
+    var extra = [_]?*anyopaque{null};
+
+    // Pass 1 — measure each sub-chunk's assembled payload size.
+    var m_params = [_]?*anyopaque{
+        @ptrCast(&p_raw),   @ptrCast(&p_hl),    @ptrCast(&p_ht),
+        @ptrCast(&p_ho),    @ptrCast(&p_descs), @ptrCast(&p_sizes),
+        @ptrCast(&p_n),
+    };
+    if (launch(assemble_measure_fn, n, 1, 1, 32, 1, 1, 0, 0, &m_params, &extra) != CUDA_SUCCESS) return false;
+    if (sync() != CUDA_SUCCESS) return false;
+
+    const enc_sizes = allocator.alloc(u32, n) catch return false;
+    defer allocator.free(enc_sizes);
+    _ = d2h(@ptrCast(enc_sizes.ptr), self.d_asm_sizes, sizes_bytes);
+
+    // Prefix-sum: each sub-chunk block is 3 (header) + enc_n bytes.
+    var total: u32 = 0;
+    for (0..n) |i| {
+        if (enc_sizes[i] == 0) return false; // kernel parse error
+        descs[i].out_offset = total;
+        total += 3 + enc_sizes[i];
+    }
+
+    // Pass 2 — write [3-byte header][payload] for every sub-chunk.
+    _ = h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes);
+    if (!ensureBuf(&self.d_asm_out, &self.d_asm_out_size, @max(total, 1))) return false;
+    var p_out = self.d_asm_out;
+    var w_params = [_]?*anyopaque{
+        @ptrCast(&p_raw),   @ptrCast(&p_hl),    @ptrCast(&p_ht),
+        @ptrCast(&p_ho),    @ptrCast(&p_descs), @ptrCast(&p_out),
+        @ptrCast(&p_n),
+    };
+    if (launch(assemble_write_fn, n, 1, 1, 32, 1, 1, 0, 0, &w_params, &extra) != CUDA_SUCCESS) return false;
+    if (sync() != CUDA_SUCCESS) return false;
+
+    // Download the assembled blocks; publish the host-side result.
+    const assembled = allocator.alloc(u8, total) catch return false;
+    const off = allocator.alloc(u32, n) catch {
+        allocator.free(assembled);
+        return false;
+    };
+    const sz = allocator.alloc(u32, n) catch {
+        allocator.free(assembled);
+        allocator.free(off);
+        return false;
+    };
+    _ = d2h(@ptrCast(assembled.ptr), self.d_asm_out, total);
+    for (0..n) |i| {
+        off[i] = descs[i].out_offset;
+        sz[i] = 3 + enc_sizes[i];
+    }
+    self.assembled_data = assembled;
+    self.assembled_offsets = off;
+    self.assembled_sizes = sz;
     return true;
 }
 

@@ -1320,6 +1320,23 @@ pub fn compressFramedOne(
 
         // tANS entropy handled by GPU kernel ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no CPU-side re-encoding needed
 
+        // 4d device-resident compress: SLZ_GPU_ASSEMBLE routes the
+        // per-sub-chunk frame assembly onto the GPU (slzAssemble* kernels)
+        // instead of the CPU reencodeGpuWithEntropy loop. The assembled
+        // [3-byte header][payload] blocks are spliced into `dst` below.
+        const gpu_assembled: bool = if (opts.level >= 3 and std.c.getenv("SLZ_GPU_ASSEMBLE") != null)
+            gpu_enc.gpuAssembleFrameImpl(enc_ctx, allocator, descs, comp_sizes)
+        else
+            false;
+        defer if (gpu_assembled) {
+            if (enc_ctx.assembled_data) |d| allocator.free(d);
+            if (enc_ctx.assembled_offsets) |o| allocator.free(o);
+            if (enc_ctx.assembled_sizes) |s| allocator.free(s);
+            enc_ctx.assembled_data = null;
+            enc_ctx.assembled_offsets = null;
+            enc_ctx.assembled_sizes = null;
+        };
+
         // Assemble frame from GPU-compressed sub-chunks grouped into chunks
         var soff: usize = dict_len;
         var gpu_bi: usize = 0;
@@ -1361,6 +1378,21 @@ pub fn compressFramedOne(
                     const raw_cs = comp_sizes[gpu_bi + si];
                     const raw_payload = gpu_out[(gpu_bi + si) * per_block_cap ..][0..raw_cs];
                     const gpu_bi_idx = gpu_bi + si;
+
+                    // 4d: GPU-assembled sub-chunk — splice the [3-byte
+                    // header][payload] block the assembly kernels produced.
+                    if (gpu_assembled) gpu_splice: {
+                        const ad = enc_ctx.assembled_data orelse break :gpu_splice;
+                        const ao = enc_ctx.assembled_offsets orelse break :gpu_splice;
+                        const asz = enc_ctx.assembled_sizes orelse break :gpu_splice;
+                        if (gpu_bi_idx >= asz.len) break :gpu_splice;
+                        const block = ad[ao[gpu_bi_idx]..][0..asz[gpu_bi_idx]];
+                        if (pos + block.len > dst.len) return error.DestinationTooSmall;
+                        @memcpy(dst[pos..][0..block.len], block);
+                        pos += block.len;
+                        continue;
+                    }
+
                     // Only the very first sub-chunk of the frame has 8 raw init
                     // bytes in its payload (matches CPU encoder convention).
                     const init_bytes: usize = if (gpu_bi_idx == 0 and dict_len == 0) 8 else 0;
