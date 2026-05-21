@@ -371,6 +371,7 @@ pub fn compressFramedWithIo(
 
 const testing = std.testing;
 const decoder = @import("../decode/streamlz_decoder.zig");
+const gpu_driver = @import("../decode/fast/gpu_driver.zig");
 
 fn comptimeRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
     @setEvalBranchQuota(s.len * n * 4);
@@ -399,7 +400,7 @@ fn roundtrip(source: []const u8, level: u8) !void {
     // Decode.
     const decoded = try allocator.alloc(u8, source.len + decoder.safe_space);
     defer allocator.free(decoded);
-    const written = try decoder.decompressFramed(dst[0..n], decoded);
+    const written = try decoder.decompressFramed(dst[0..n], decoded, &gpu_driver.g_default);
     try testing.expectEqual(source.len, written);
     try testing.expectEqualSlices(u8, source, decoded[0..written]);
 }
@@ -715,7 +716,7 @@ fn roundtripSC(source: []const u8, level: u8) !void {
 
     const decoded = try allocator.alloc(u8, source.len + decoder.safe_space);
     defer allocator.free(decoded);
-    const written = try decoder.decompressFramed(dst[0..n], decoded);
+    const written = try decoder.decompressFramed(dst[0..n], decoded, &gpu_driver.g_default);
     try testing.expectEqual(source.len, written);
     try testing.expectEqualSlices(u8, source, decoded[0..written]);
 }
@@ -804,7 +805,7 @@ test "TwoPhase: implies self_contained and sets block header bits 4 + 5" {
     // Roundtrip via the standard decoder.
     const decoded = try allocator.alloc(u8, src.len + decoder.safe_space);
     defer allocator.free(decoded);
-    const written = try decoder.decompressFramed(out[0..n], decoded);
+    const written = try decoder.decompressFramed(out[0..n], decoded, &gpu_driver.g_default);
     try testing.expectEqual(src.len, written);
     try testing.expectEqualSlices(u8, &src, decoded[0..written]);
 }
@@ -906,7 +907,7 @@ fn roundtripParallel(source: []const u8, level: u8, num_threads: u32) !void {
 
     const decoded = try allocator.alloc(u8, source.len + decoder.safe_space);
     defer allocator.free(decoded);
-    const written = try decoder.decompressFramed(dst[0..n], decoded);
+    const written = try decoder.decompressFramed(dst[0..n], decoded, &gpu_driver.g_default);
     try testing.expectEqual(source.len, written);
     try testing.expectEqualSlices(u8, source, decoded[0..written]);
 }
@@ -1019,7 +1020,7 @@ test "decompressFramed: decoder accepts 2 concatenated SLZ1 frames" {
 
     const decoded = try allocator.alloc(u8, src.len + decoder.safe_space);
     defer allocator.free(decoded);
-    const written = try decoder.decompressFramed(tmp[0..total], decoded);
+    const written = try decoder.decompressFramed(tmp[0..total], decoded, &gpu_driver.g_default);
     try testing.expectEqual(src.len, written);
     try testing.expectEqualSlices(u8, &src, decoded[0..written]);
 }
@@ -1047,7 +1048,7 @@ test "decompressFramed: multi-piece concatenation across L6 + L9 codecs" {
 
     const decoded = try allocator.alloc(u8, src.len + decoder.safe_space);
     defer allocator.free(decoded);
-    const written = try decoder.decompressFramed(tmp[0..total], decoded);
+    const written = try decoder.decompressFramed(tmp[0..total], decoded, &gpu_driver.g_default);
     try testing.expectEqual(src.len, written);
     try testing.expectEqualSlices(u8, &src, decoded[0..written]);
 }

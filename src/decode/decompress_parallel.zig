@@ -1284,6 +1284,7 @@ fn reportWorkerError(shared: *const FastL14Shared) DecodeError {
 const testing = std.testing;
 const encoder = @import("../encode/streamlz_encoder.zig");
 const gpu_encoder = @import("../encode/fast/gpu_encoder.zig");
+const gpu_driver = @import("fast/gpu_driver.zig");
 const decoder = @import("streamlz_decoder.zig");
 
 fn parallelRoundtrip(source: []const u8, level: u8) !void {
@@ -1300,7 +1301,7 @@ fn parallelRoundtrip(source: []const u8, level: u8) !void {
     // encoder bugs from parallel-decoder bugs.
     const decoded_ser = try allocator.alloc(u8, source.len + decoder.safe_space);
     defer allocator.free(decoded_ser);
-    const written_ser = try decoder.decompressFramed(compressed[0..n], decoded_ser);
+    const written_ser = try decoder.decompressFramed(compressed[0..n], decoded_ser, &gpu_driver.g_default);
     try testing.expectEqual(source.len, written_ser);
     try testing.expectEqualSlices(u8, source, decoded_ser[0..written_ser]);
 
@@ -1311,6 +1312,7 @@ fn parallelRoundtrip(source: []const u8, level: u8) !void {
         allocator,
         compressed[0..n],
         decoded_par,
+        &gpu_driver.g_default,
     );
     try testing.expectEqual(source.len, written_par);
     try testing.expectEqualSlices(u8, source, decoded_par[0..written_par]);

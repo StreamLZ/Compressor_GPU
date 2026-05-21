@@ -18,6 +18,7 @@ const constants = @import("../format/streamlz_constants.zig");
 const fast = @import("fast/fast_lz_decoder.zig");
 const high = @import("high/high_lz_decoder.zig");
 const parallel = @import("decompress_parallel.zig");
+const gpu_driver = @import("fast/gpu_driver.zig");
 
 /// Extra bytes the decoder is allowed to write past `dst_len`.
 pub const safe_space = constants.safe_space;
@@ -51,8 +52,12 @@ pub const DecompressResult = struct {
     offset: usize = 0,
 };
 
-pub fn decompressFramed(src: []const u8, dst: []u8) DecompressError!usize {
-    const r = try decompressFramedInner(null, null, src, dst, 0);
+pub fn decompressFramed(
+    src: []const u8,
+    dst: []u8,
+    dec_ctx: *gpu_driver.DecodeContext,
+) DecompressError!usize {
+    const r = try decompressFramedInner(null, null, src, dst, 0, dec_ctx);
     if (r.offset > 0 and r.written > 0) {
         std.mem.copyForwards(u8, dst[0..r.written], dst[r.offset..][0..r.written]);
     }
@@ -66,8 +71,9 @@ pub fn decompressFramedParallel(
     allocator: std.mem.Allocator,
     src: []const u8,
     dst: []u8,
+    dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!usize {
-    const r = try decompressFramedInner(allocator, null, src, dst, 0);
+    const r = try decompressFramedInner(allocator, null, src, dst, 0, dec_ctx);
     if (r.offset > 0 and r.written > 0) {
         std.mem.copyForwards(u8, dst[0..r.written], dst[r.offset..][0..r.written]);
     }
@@ -80,8 +86,9 @@ pub fn decompressFramedParallelThreaded(
     src: []const u8,
     dst: []u8,
     max_threads: usize,
+    dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!DecompressResult {
-    return decompressFramedInner(allocator, io, src, dst, max_threads);
+    return decompressFramedInner(allocator, io, src, dst, max_threads, dec_ctx);
 }
 
 /// Reusable decompression context that keeps configuration across
@@ -92,6 +99,10 @@ pub const DecompressContext = struct {
     allocator: std.mem.Allocator,
     io: ?std.Io,
     max_threads: usize,
+    /// GPU decode context backing this handle's decode calls. Points at
+    /// the module-global default so existing behavior is unchanged; a
+    /// future library API will hand each handle its own DecodeContext.
+    dec_ctx: *gpu_driver.DecodeContext = &gpu_driver.g_default,
 
     pub fn init(allocator: std.mem.Allocator) DecompressContext {
         return .{
@@ -125,7 +136,7 @@ pub const DecompressContext = struct {
         while (src_pos < src.len) {
             const piece_src = src[src_pos..];
             const piece_dst = dst[dst_off..];
-            const pair = try decompressOneFrame(self.allocator, self.io, piece_src, piece_dst, self.max_threads);
+            const pair = try decompressOneFrame(self.allocator, self.io, piece_src, piece_dst, self.max_threads, self.dec_ctx);
             src_pos += pair.src_consumed;
             if (dict_off == 0 and pair.dst_offset > 0) dict_off = pair.dst_offset;
             dst_off += pair.dst_offset + pair.dst_written;
@@ -145,6 +156,7 @@ fn decompressFramedInner(
     src: []const u8,
     dst: []u8,
     max_threads: usize,
+    dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!DecompressResult {
     if (src.len == 0) return .{ .written = 0, .offset = 0 };
 
@@ -159,7 +171,7 @@ fn decompressFramedInner(
     while (src_pos < src.len) {
         const piece_src = src[src_pos..];
         const piece_dst = dst[dst_off..];
-        const pair = try decompressOneFrame(allocator_opt, io_opt, piece_src, piece_dst, max_threads);
+        const pair = try decompressOneFrame(allocator_opt, io_opt, piece_src, piece_dst, max_threads, dec_ctx);
         src_pos += pair.src_consumed;
         if (dict_off == 0 and pair.dst_offset > 0) dict_off = pair.dst_offset;
         dst_off += pair.dst_offset + pair.dst_written;
@@ -180,6 +192,7 @@ fn decompressOneFrame(
     src: []const u8,
     dst: []u8,
     max_threads: usize,
+    dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!FrameResult {
     if (src.len == 0) return .{ .src_consumed = 0, .dst_written = 0 };
 
@@ -315,7 +328,7 @@ fn decompressOneFrame(
             const prefix_sz: usize = if (peek.self_contained and num_chunks_est > 1) (num_chunks_est - 1) * 8 else 0;
             const block_payload = block_src[0 .. block_src.len - prefix_sz];
 
-            gpuBatchDecode(block_payload, dst, dst_off, block_hdr.decompressed_size, hdr.sc_group_size, hdr.gpu_shared_luts, &scratch, io_opt) catch |err| {
+            gpuBatchDecode(block_payload, dst, dst_off, block_hdr.decompressed_size, hdr.sc_group_size, hdr.gpu_shared_luts, &scratch, io_opt, dec_ctx) catch |err| {
                 std.debug.print("GPU decode FAILED (NO FALLBACK): {s}\n", .{@errorName(err)});
                 return error.BadMode;
             };
@@ -431,6 +444,7 @@ fn decompressOneFrame(
                 &scratch,
                 hdr.sc_group_size,
                 hdr.level,
+                dec_ctx,
             );
         }
         pos += block_hdr.compressed_size;
@@ -500,6 +514,7 @@ pub fn decompressStream(
     src: []const u8,
     writer: *std.Io.Writer,
     opts: StreamDecompressOptions,
+    dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!u64 {
     if (src.len == 0) return 0;
 
@@ -572,6 +587,7 @@ pub fn decompressStream(
                 window_buf,
                 dict_bytes,
                 block_hdr.decompressed_size,
+                dec_ctx,
             );
             if (n != block_hdr.decompressed_size) return error.SizeMismatch;
             pos += block_hdr.compressed_size;
@@ -626,8 +642,9 @@ pub fn decompressBlock(
     src: []const u8,
     dst: []u8,
     decompressed_size: usize,
+    dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!usize {
-    return decompressBlockWithDict(src, dst, 0, decompressed_size);
+    return decompressBlockWithDict(src, dst, 0, decompressed_size, dec_ctx);
 }
 
 /// Decompresses a raw StreamLZ block into `dst[dst_offset..dst_offset + decompressed_size]`,
@@ -643,6 +660,7 @@ pub fn decompressBlockWithDict(
     dst: []u8,
     dst_offset: usize,
     decompressed_size: usize,
+    dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!usize {
     if (decompressed_size == 0) return 0;
     if (dst_offset + decompressed_size + safe_space > dst.len) return error.OutputTooSmall;
@@ -653,7 +671,7 @@ pub fn decompressBlockWithDict(
     // v2 default sc_group_size. Streaming / framed callers should
     // instead use `decompressFramed` / `decompressStream` so the
     // header-declared sc_group_size flows through.
-    try decompressCompressedBlock(src, dst, &dst_off, decompressed_size, &scratch, @as(f32, @floatFromInt(constants.default_sc_group_size)), 0);
+    try decompressCompressedBlock(src, dst, &dst_off, decompressed_size, &scratch, @as(f32, @floatFromInt(constants.default_sc_group_size)), 0, dec_ctx);
     return dst_off - dst_offset;
 }
 
@@ -678,6 +696,7 @@ fn decompressCompressedBlock(
     scratch: []u8,
     sc_group_size: f32,
     frame_level: u8,
+    dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!void {
     _ = frame_level;
     // Peek the first 2-byte internal block header to detect SC mode up-front.
@@ -707,7 +726,7 @@ fn decompressCompressedBlock(
     if (use_gpu and sc_group_size <= 1.0) gpu_batch: {
         const gpu = @import("fast/gpu_driver.zig");
         if (!gpu.isAvailable()) break :gpu_batch;
-        gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, sc_group_size, null, scratch, null) catch {
+        gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, sc_group_size, null, scratch, null, dec_ctx) catch {
             break :gpu_batch;
         };
         dst_off_inout.* = sc_start_dst_off + decompressed_size;
@@ -912,6 +931,7 @@ fn gpuBatchDecode(
     gpu_shared_luts: ?frame.GpuSharedLuts,
     scratch: []u8,
     io_opt: ?std.Io,
+    dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!void {
     _ = scratch;
     const gpu = @import("fast/gpu_driver.zig");
@@ -1028,7 +1048,8 @@ fn gpuBatchDecode(
     }
 
     const eff_sc_cap: u32 = @intCast(constants.sub_chunk_size);
-    try gpu.fullGpuLaunch(
+    try gpu.fullGpuLaunchImpl(
+        dec_ctx,
         chunk_descs[0..chunk_idx],
         block_src,
         dst.ptr,
@@ -1207,7 +1228,7 @@ test "decompressFramed roundtrips a tiny uncompressed L1 fixture (synthesized)" 
     const total_len = hdr_len + 8 + payload.len + 4;
 
     var out: [256]u8 = @splat(0);
-    const written = try decompressFramed(buf[0..total_len], out[0..]);
+    const written = try decompressFramed(buf[0..total_len], out[0..], &gpu_driver.g_default);
     try testing.expectEqual(@as(usize, payload.len), written);
     try testing.expectEqualSlices(u8, payload, out[0..written]);
 }
@@ -1215,7 +1236,7 @@ test "decompressFramed roundtrips a tiny uncompressed L1 fixture (synthesized)" 
 test "decompressFramed rejects bad magic" {
     const junk = [_]u8{ 'N', 'O', 'P', 'E', 1, 0, 0, 1, 2, 0 };
     var out: [32]u8 = undefined;
-    try testing.expectError(error.BadFrame, decompressFramed(&junk, &out));
+    try testing.expectError(error.BadFrame, decompressFramed(&junk, &out, &gpu_driver.g_default));
 }
 
 test "decompressBlock roundtrips a raw compressed block (no frame wrapper)" {
@@ -1248,7 +1269,7 @@ test "decompressBlock roundtrips a raw compressed block (no frame wrapper)" {
     const inner = framed[inner_start .. inner_start + block_hdr.compressed_size];
 
     var out: [2048]u8 = @splat(0);
-    const written = try decompressBlock(inner, &out, payload.len);
+    const written = try decompressBlock(inner, &out, payload.len, &gpu_driver.g_default);
     try testing.expectEqual(payload.len, written);
     try testing.expectEqualSlices(u8, &payload, out[0..payload.len]);
 }
@@ -1273,7 +1294,7 @@ test "decompressBlockWithDict writes output at dst_offset for an uncompressed bl
 
     const dict_len: usize = 100;
     var out: [256]u8 = @splat(0xAA);
-    const written = try decompressBlockWithDict(&block, &out, dict_len, payload_len);
+    const written = try decompressBlockWithDict(&block, &out, dict_len, payload_len, &gpu_driver.g_default);
     try testing.expectEqual(payload_len, written);
     // Dictionary prefix untouched.
     for (out[0..dict_len]) |b| try testing.expectEqual(@as(u8, 0xAA), b);
@@ -1315,8 +1336,8 @@ test "decompressBlockWithDict matches decompressBlock when dst_offset == 0" {
 
     var out_a: [2048]u8 = @splat(0);
     var out_b: [2048]u8 = @splat(0);
-    const n_a = try decompressBlock(inner, &out_a, payload.len);
-    const n_b = try decompressBlockWithDict(inner, &out_b, 0, payload.len);
+    const n_a = try decompressBlock(inner, &out_a, payload.len, &gpu_driver.g_default);
+    const n_b = try decompressBlockWithDict(inner, &out_b, 0, payload.len, &gpu_driver.g_default);
     try testing.expectEqual(n_a, n_b);
     try testing.expectEqualSlices(u8, out_a[0..n_a], out_b[0..n_b]);
     try testing.expectEqualSlices(u8, &payload, out_a[0..payload.len]);
@@ -1325,7 +1346,7 @@ test "decompressBlockWithDict matches decompressBlock when dst_offset == 0" {
 test "decompressBlock rejects undersized output buffer" {
     const dummy_src = [_]u8{ 0x05, 0x01, 0x00, 0x00, 0x00, 0x00 };
     var out: [16]u8 = undefined;
-    try testing.expectError(error.OutputTooSmall, decompressBlock(&dummy_src, &out, 1024));
+    try testing.expectError(error.OutputTooSmall, decompressBlock(&dummy_src, &out, 1024, &gpu_driver.g_default));
 }
 
 test "decompressStream roundtrips a compressed frame into a Writer" {
@@ -1349,6 +1370,7 @@ test "decompressStream roundtrips a compressed frame into a Writer" {
         framed[0..framed_len],
         &out_writer,
         .{},
+        &gpu_driver.g_default,
     );
     try testing.expectEqual(@as(u64, payload.len), written);
     try testing.expectEqualSlices(u8, &payload, out_buf[0..payload.len]);
@@ -1372,6 +1394,7 @@ test "decompressStream enforces max_decompressed_size cap" {
         framed[0..framed_len],
         &out_writer,
         .{ .max_decompressed_size = 100 },
+        &gpu_driver.g_default,
     );
     try testing.expectError(error.OutputTooSmall, err);
 }
@@ -1442,6 +1465,7 @@ test "decompressStream handles empty source" {
         &[_]u8{},
         &out_writer,
         .{},
+        &gpu_driver.g_default,
     );
     try testing.expectEqual(@as(u64, 0), written);
 }

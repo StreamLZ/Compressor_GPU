@@ -24,5 +24,5 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(input);
 
     var dst: [1 << 24]u8 = undefined;
-    _ = slz.decompressFramed(input, &dst) catch return;
+    _ = slz.decompressFramed(input, &dst, slz.default_decode_context) catch return;
 }

@@ -2238,8 +2238,9 @@ test "compressFramedOne: empty input roundtrip" {
     try std.testing.expect(n > 0);
     try std.testing.expect(n < 64);
     const decoder = @import("../decode/streamlz_decoder.zig");
+    const gpu_driver = @import("../decode/fast/gpu_driver.zig");
     var dec_buf: [64]u8 = undefined;
-    const dec_n = try decoder.decompressFramed(dst[0..n], &dec_buf);
+    const dec_n = try decoder.decompressFramed(dst[0..n], &dec_buf, &gpu_driver.g_default);
     try std.testing.expectEqual(@as(usize, 0), dec_n);
 }
 
@@ -2254,9 +2255,10 @@ test "compressFramedOne: all-equal bytes compresses small" {
     const n = try compressFramedOne(allocator, std.testing.io, src, dst, .{ .level = 1 }, &gpu_enc.g_default);
     try std.testing.expect(n < 200);
     const decoder = @import("../decode/streamlz_decoder.zig");
+    const gpu_driver = @import("../decode/fast/gpu_driver.zig");
     const dec = try allocator.alloc(u8, src.len + 64);
     defer allocator.free(dec);
-    const dec_n = try decoder.decompressFramed(dst[0..n], dec);
+    const dec_n = try decoder.decompressFramed(dst[0..n], dec, &gpu_driver.g_default);
     try std.testing.expectEqual(src.len, dec_n);
     try std.testing.expectEqualSlices(u8, src, dec[0..dec_n]);
 }

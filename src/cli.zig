@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const frame = @import("format/frame_format.zig");
 const decoder = @import("decode/streamlz_decoder.zig");
+const gpu_driver = @import("decode/fast/gpu_driver.zig");
 const encoder = @import("encode/streamlz_encoder.zig");
 const gpu_encoder = @import("encode/fast/gpu_encoder.zig");
 const dict_mod = @import("dict/dictionary.zig");
@@ -738,7 +739,7 @@ fn runDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, ar
 
     const dst = out_map.slice();
 
-    const dec_result = decoder.decompressFramedParallelThreaded(allocator, io, src, dst, args.threads) catch |err| {
+    const dec_result = decoder.decompressFramedParallelThreaded(allocator, io, src, dst, args.threads, &gpu_driver.g_default) catch |err| {
         out_map.unmap();
         try w.print("error: decompression failed: {s}\n", .{@errorName(err)});
         try w.flush();

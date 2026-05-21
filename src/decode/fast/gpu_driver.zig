@@ -375,7 +375,7 @@ pub const DecodeContext = struct {
 
 /// Default decode context backing the module-level public API. Library
 /// callers will eventually allocate their own DecodeContext per handle.
-var g_default: DecodeContext = .{};
+pub var g_default: DecodeContext = .{};
 
 // ── tANS header scanning ───────────────────────────────────────
 // Scans the host-side compressed data to find tANS literal, token,
@@ -1041,7 +1041,7 @@ pub fn fullGpuLaunch(
     );
 }
 
-fn fullGpuLaunchImpl(
+pub fn fullGpuLaunchImpl(
     self: *DecodeContext,
     chunk_descs: []const ChunkDesc,
     compressed_block: []const u8,

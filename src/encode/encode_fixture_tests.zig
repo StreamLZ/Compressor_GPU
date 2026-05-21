@@ -11,6 +11,7 @@ const std = @import("std");
 const encoder = @import("streamlz_encoder.zig");
 const gpu_encoder = @import("fast/gpu_encoder.zig");
 const decoder = @import("../decode/streamlz_decoder.zig");
+const gpu_driver = @import("../decode/fast/gpu_driver.zig");
 
 const testing = std.testing;
 const page_alloc = std.heap.page_allocator;
@@ -106,7 +107,7 @@ test "encoder roundtrip: every .raw encodes + decodes byte-exact (L1/L2)" {
             const decoded = try page_alloc.alloc(u8, raw_bytes.len + decoder.safe_space);
             defer page_alloc.free(decoded);
 
-            const written = decoder.decompressFramed(encoded[0..n], decoded) catch |err| {
+            const written = decoder.decompressFramed(encoded[0..n], decoded, &gpu_driver.g_default) catch |err| {
                 try failures.append(allocator, .{
                     .raw_name = try allocator.dupe(u8, entry.name),
                     .level = level,

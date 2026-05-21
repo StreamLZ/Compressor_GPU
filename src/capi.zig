@@ -2,6 +2,7 @@ const std = @import("std");
 const encoder = @import("encode/streamlz_encoder.zig");
 const gpu_encoder = @import("encode/fast/gpu_encoder.zig");
 const decoder = @import("decode/streamlz_decoder.zig");
+const gpu_driver = @import("decode/fast/gpu_driver.zig");
 const frame = @import("format/frame_format.zig");
 
 const allocator = std.heap.c_allocator;
@@ -68,6 +69,7 @@ export fn slz_decompress(
         src[0..src_len],
         dst[0..dst_len],
         0,
+        &gpu_driver.g_default,
     ) catch |err| return mapDecompressError(err);
     if (result.offset > 0) {
         std.mem.copyForwards(u8, dst[0..result.written], dst[result.offset..][0..result.written]);
