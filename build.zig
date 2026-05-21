@@ -138,6 +138,31 @@ pub fn build(b: *std.Build) void {
     const lib_step = b.step("lib", "Build C API static library (libstreamlz.a)");
     lib_step.dependOn(&lib_install.step);
     lib_step.dependOn(&hdr_install.step);
+
+    // ---- GPU C API shared library ----
+    // The nvCOMP-style handle-based GPU library (src/gpu/streamlz_gpu.zig).
+    // Always built with GPU enabled; CUDA (nvcuda.dll) is loaded at runtime.
+    const gpulib_options = b.addOptions();
+    gpulib_options.addOption(bool, "enable_bench", false);
+    gpulib_options.addOption(bool, "gpu", true);
+    const gpulib_module = b.createModule(.{
+        .root_source_file = b.path("src/streamlz_gpu.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .link_libc = true,
+    });
+    gpulib_module.addOptions("build_options", gpulib_options);
+    const gpulib = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "streamlz_gpu",
+        .root_module = gpulib_module,
+    });
+    const gpulib_install = b.addInstallArtifact(gpulib, .{});
+    const gpu_hdr_install = b.addInstallHeaderFile(b.path("include/streamlz_gpu.h"), "streamlz_gpu.h");
+    const gpulib_step = b.step("gpulib", "Build GPU C API shared library (streamlz_gpu.dll)");
+    gpulib_step.dependOn(&gpulib_install.step);
+    gpulib_step.dependOn(&gpu_hdr_install.step);
 }
 
 fn addVendorLibs(b: *std.Build, exe: *std.Build.Step.Compile) void {

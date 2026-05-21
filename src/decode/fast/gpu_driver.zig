@@ -225,6 +225,22 @@ pub fn freeHost(buf: []u8) void {
     _ = f(@ptrCast(buf.ptr));
 }
 
+/// Copy `dst.len` bytes from a device address into the host slice `dst`.
+/// Requires init() to have succeeded. Returns false on any CUDA failure.
+pub fn copyDeviceToHost(dst: []u8, src_device: u64) bool {
+    if (dst.len == 0) return true;
+    const f = cuMemcpyDtoH_fn orelse return false;
+    return f(@ptrCast(dst.ptr), src_device, dst.len) == CUDA_SUCCESS;
+}
+
+/// Copy the host slice `src` to a device address. Requires init() to have
+/// succeeded. Returns false on any CUDA failure.
+pub fn copyHostToDevice(dst_device: u64, src: []const u8) bool {
+    if (src.len == 0) return true;
+    const f = cuMemcpyHtoD_fn orelse return false;
+    return f(dst_device, @ptrCast(src.ptr), src.len) == CUDA_SUCCESS;
+}
+
 // ── Full GPU decode ─────────────────────────────────────────────
 // Two-pass pipeline:
 //   Pass 1: Launch tANS decode kernel for chunks with tANS literals
