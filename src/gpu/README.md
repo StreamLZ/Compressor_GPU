@@ -80,6 +80,77 @@ zig build gpulib                              streamlz_gpu.dll (nvCOMP-style C A
 `nvcuda.dll` is loaded at runtime; if CUDA is unavailable the codec falls
 back to the CPU path.
 
+## Performance
+
+Measured on an RTX 4060 Ti (`sm_89`), HEAD `e6f5e0a`, `-gpu` mode (64 KB
+sub-chunks). Corpora: enwik8 (100 MB text), silesia (212.8 MB mixed).
+Decode figures are best-of-30 (`streamlz -db -r 30`); all times in
+**milliseconds**.
+
+### Compression ratio
+
+| Level | enwik8 | silesia |
+|-------|-------:|--------:|
+| L1 | 58.6% | 47.8% |
+| L2 | 58.6% | 47.8% |
+| L3 | 43.0% | 37.3% |
+| L4 | 41.9% | 36.7% |
+| L5 | 38.9% | 33.1% |
+
+L1–L2 are LZ-only (no entropy stage); L3–L5 add GPU Huffman.
+
+### Decode (ms) — H2D · kernel · D2H · end-to-end
+
+The decode kernel is the GPU work; e2e adds the H2D upload of the
+compressed frame and the D2H download of the decompressed output.
+
+| | enwik8 H2D / kernel / D2H / e2e | silesia H2D / kernel / D2H / e2e |
+|--|--|--|
+| L1 | 4.8 / 3.8 / 7.6 / 16.3 | 8.3 / 6.3 / 16.1 / 31.1 |
+| L2 | 4.8 / 3.8 / 7.6 / 16.3 | 8.3 / 6.3 / 16.1 / 31.1 |
+| L3 | 3.5 / 7.4 / 7.6 / 18.8 | 6.5 / 13.3 / 16.1 / 36.8 |
+| L4 | 3.4 / 7.2 / 7.6 / 18.6 | 6.4 / 13.3 / 16.1 / 36.5 |
+| L5 | 3.2 / 7.4 / 7.6 / 18.5 | 5.8 / 13.9 / 16.1 / 36.5 |
+
+The Huffman pre-decode (L3+) roughly doubles the decode kernel time over
+LZ-only L1/L2. The D2H copy of the decompressed output is the single
+largest e2e cost — moving the frame scan onto the GPU (roadmap item 4d)
+and a device→device API path are what shrink it.
+
+### Encode (ms) — GPU LZ-encode kernel
+
+`last_kernel_ns` covers the LZ-encode kernel only (the Huffman-encode
+kernels run as a separate pass and are not included).
+
+| Level | enwik8 | silesia |
+|-------|-------:|--------:|
+| L1 | 74 | 135 |
+| L2 | 78 | 142 |
+| L3 | 81 | 158 |
+| L4 | 112 | 203 |
+| L5 | 296 | 4502 † |
+
+† silesia L5 is a known pathological slow path in the serial chain
+parser; not representative.
+
+### vs nvCOMP (enwik8, 100 MB)
+
+nvCOMP 5.2.0, same RTX 4060 Ti. (nvCOMP's hardware decompression engine
+is Hopper/Blackwell-only — not available on Ada — so only the CUDA
+decode path applies here.)
+
+| Codec | ratio | decode kernel | decode e2e |
+|-------|------:|--------------:|-----------:|
+| StreamLZ L1 | 58.6% | 3.8 ms | 16.3 ms |
+| StreamLZ L5 | 38.9% | 7.4 ms | 18.5 ms |
+| nvCOMP LZ4 | 60.0% | ~5.0 ms | — |
+| nvCOMP Zstd | 40.2% | ~6.4 ms | 18.2 ms |
+
+StreamLZ L5 compresses tighter than nvCOMP Zstd (38.9% vs 40.2%) at a
+comparable end-to-end decode (18.5 vs 18.2 ms). StreamLZ L1 matches
+nvCOMP LZ4's ratio (58.6% vs 60.0%) with a faster decode kernel
+(3.8 vs ~5.0 ms).
+
 ## Invariants — do not break these
 
 1. **One `.cu` → one `.ptx`.** The `.cuh` files are a size-only split:
