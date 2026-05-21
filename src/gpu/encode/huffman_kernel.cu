@@ -5,7 +5,7 @@
 //
 // Both mirror the production CPU encoder `huffman_encoder.zig` exactly, so
 // the output pairs bit-for-bit with the production Huffman decoder. Codes
-// are canonical and height-limited to 11 bits.
+// are canonical and height-limited to `ENC_MAX_CODE_LEN` (11) bits.
 //
 // Developed and verified byte-identical to a CPU oracle in the standalone
 // harness tools/huff_test/ before being backported here.
@@ -13,12 +13,32 @@
 #include <cstdint>
 
 // Canonical-Huffman height limit. Matches huffman_encoder.zig MAX_CODE_LEN.
+// Must equal `MAX_CODE_LEN + 1` in `decode/huffman_kernel.cu`.
 static constexpr int ENC_MAX_CODE_LEN = 11;
 
-// One encode unit (one 64KB sub-chunk's stream). Mirrors Tans32EncDesc in
-// gpu_tans_kernel.cu. `src_stride` is 1 for a contiguous stream (literals,
-// tokens) or 2 to encode one byte plane of an interleaved lo/hi off16
-// array (`src_offset` picks the lo=+0 or hi=+1 plane).
+// ── Wire-format / hardware constants ────────────────────────────────
+static constexpr int      WARP_SIZE              = 32;          // CUDA warp width
+static constexpr int      HUFF_NUM_STREAMS       = 4;           // 4-stream split
+static constexpr int      HUFF_ALPHABET          = 256;         // 8-bit symbol alphabet
+static constexpr int      HUFF_TREE_NODES        = 2 * HUFF_ALPHABET;  // 256 leaves + up to 255 internals
+static constexpr int      HUFF_LEN_HIST_SIZE     = ENC_MAX_CODE_LEN + 2;  // code-length histogram size (13)
+static constexpr int      HUFF_WEIGHTS_BYTES     = 128;         // 256 symbols × 4-bit lengths
+static constexpr int      HUFF_STREAM_SIZE_BYTES = 3;           // bytes per u24 stream-size field
+static constexpr int      HUFF_SUBHEADER_BYTES   = (HUFF_NUM_STREAMS - 1) * HUFF_STREAM_SIZE_BYTES;  // 9
+static constexpr int      HUFF_BODY_HEADER_BYTES = HUFF_WEIGHTS_BYTES + HUFF_SUBHEADER_BYTES;        // 137
+static constexpr uint8_t  HUFF_NIBBLE_MASK       = 0x0F;        // low-nibble mask
+static constexpr uint32_t FULL_WARP_MASK         = 0xFFFFFFFFu; // all 32 lanes participate
+static constexpr int      BITS_PER_BYTE          = 8;
+
+// Kraft fixed-point precision. The Kraft sum 1.0 is represented as
+// 1u << KRAFT_PRECISION_BITS; 30 leaves headroom so `1u << (30 - 1)`
+// (shortest code) and the running sum both stay within a u32.
+static constexpr int      KRAFT_PRECISION_BITS   = 30;
+
+// ── Encode unit descriptor — matches Zig HuffEncDesc in encode/driver.zig ──
+// One encode unit (one 64KB sub-chunk's stream). `src_stride` is 1 for a
+// contiguous stream (literals, tokens) or 2 to encode one byte plane of an
+// interleaved lo/hi off16 array (`src_offset` picks the lo=+0 or hi=+1 plane).
 struct HuffEncDesc {
     uint32_t src_offset;
     uint32_t src_size;      // logical symbol count after stride extraction
@@ -31,10 +51,13 @@ struct HuffEncDesc {
 // Sequential encode of one stream by one lane. Packs codewords MSB-first
 // into `out`. Returns total bytes written (including the trailing partial
 // byte). `stride` reads either a contiguous stream or one byte plane.
-__device__ __forceinline__ uint32_t encode_stream_one_lane(
+// Capacity invariant: the caller guarantees `out` holds at least
+// `in_size * 2` bytes (driver-sized per-stream scratch); this core does
+// not bounds-check against dst_capacity.
+__device__ __forceinline__ uint32_t encodeStreamOneLane(
     const uint8_t* __restrict__ in, uint32_t in_size, uint32_t stride,
-    const uint8_t* __restrict__ code_lengths,    // 256 entries
-    const uint32_t* __restrict__ codes,          // 256 entries
+    const uint8_t* __restrict__ code_lengths,    // HUFF_ALPHABET entries
+    const uint32_t* __restrict__ codes,          // HUFF_ALPHABET entries
     uint8_t* __restrict__ out)
 {
     uint64_t bit_buf = 0;
@@ -47,28 +70,26 @@ __device__ __forceinline__ uint32_t encode_stream_one_lane(
         int      len  = code_lengths[sym];
         bit_buf = (bit_buf << len) | (uint64_t)(code & ((1u << len) - 1u));
         bit_count += len;
-        while (bit_count >= 8) {
-            bit_count -= 8;
+        while (bit_count >= BITS_PER_BYTE) {
+            bit_count -= BITS_PER_BYTE;
             out[out_pos++] = (uint8_t)((bit_buf >> bit_count) & 0xFFu);
         }
     }
     if (bit_count > 0) {
-        out[out_pos++] = (uint8_t)((bit_buf << (8 - bit_count)) & 0xFFu);
+        out[out_pos++] = (uint8_t)((bit_buf << (BITS_PER_BYTE - bit_count)) & 0xFFu);
     }
     return out_pos;
 }
 
-// ══════════════════════════════════════════════════════════════════════
-// Table builder — one block per sub-chunk, 32 lanes.
-// ══════════════════════════════════════════════════════════════════════
+// ── Table builder — one block per sub-chunk, WARP_SIZE lanes ─────────
 //
 // 32 lanes histogram the input into shared memory (atomicAdd); lane 0 then
 // serially builds canonical code lengths and codes. Mirrors
-// huffman_encoder.zig: buildCodeLengths -> heightLimit(11) ->
-// assignCanonicalCodes.
+// huffman_encoder.zig: buildCodeLengths -> Kraft-sum fixed-point height
+// limiting (1<<KRAFT_PRECISION_BITS budget) -> assignCanonicalCodes.
 //
 // Writes code_lengths[256] (u8) + codes[256] (u32) per block, strided by
-// `tables_stride` (= 256).
+// `tables_stride` (= HUFF_ALPHABET; a runtime parameter that never varies).
 extern "C" __global__ void slzHuffBuildTablesKernel(
     const uint8_t* __restrict__ input,
     const HuffEncDesc* __restrict__ descs,        // src_offset, src_size, src_stride
@@ -79,41 +100,44 @@ extern "C" __global__ void slzHuffBuildTablesKernel(
 {
     const uint32_t block_id = blockIdx.x;
     if (block_id >= n_blocks) return;
-    const int lane = threadIdx.x & 31;
-    const HuffEncDesc d = descs[block_id];
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const HuffEncDesc desc = descs[block_id];
 
-    __shared__ uint32_t hist[256];
-    __shared__ uint32_t weights[512];   // leaves 0..255, internals 256..510
-    __shared__ int      parents[512];
-    __shared__ int      active[512];
-    __shared__ int      idx[256];
-    __shared__ uint8_t  cl[256];
-    __shared__ uint32_t codes[256];
+    __shared__ uint32_t hist[HUFF_ALPHABET];
+    __shared__ uint32_t weights[HUFF_TREE_NODES];   // leaves 0..255, internals 256..510
+    __shared__ int      parents[HUFF_TREE_NODES];
+    __shared__ int      active[HUFF_TREE_NODES];
+    __shared__ int      used_symbols[HUFF_ALPHABET];
+    __shared__ uint8_t  code_lengths[HUFF_ALPHABET];
+    __shared__ uint32_t codes[HUFF_ALPHABET];
 
     // ── Histogram (32 lanes → shared atomics) ──
-    for (int i = lane; i < 256; i += 32) hist[i] = 0;
+    for (int i = lane; i < HUFF_ALPHABET; i += WARP_SIZE) hist[i] = 0;
     __syncwarp();
-    const uint8_t* in = input + d.src_offset;
-    for (uint32_t i = lane; i < d.src_size; i += 32)
-        atomicAdd(&hist[in[(uint64_t)i * d.src_stride]], 1u);
+    const uint8_t* in = input + desc.src_offset;
+    for (uint32_t i = lane; i < desc.src_size; i += WARP_SIZE)
+        atomicAdd(&hist[in[(uint64_t)i * desc.src_stride]], 1u);
     __syncwarp();
 
     // ── Lane 0: serial tree-build + height-limit + canonical codes ──
     if (lane == 0) {
-        for (int i = 0; i < 512; i++) { weights[i] = 0; parents[i] = -1; }
-        for (int s = 0; s < 256; s++) { cl[s] = 0; codes[s] = 0; }
+        for (int i = 0; i < HUFF_TREE_NODES; i++) { weights[i] = 0; parents[i] = -1; }
+        for (int s = 0; s < HUFF_ALPHABET; s++) { code_lengths[s] = 0; codes[s] = 0; }
 
         int symbols_used = 0;
-        for (int s = 0; s < 256; s++) {
-            if (hist[s] > 0) { weights[s] = hist[s]; idx[symbols_used++] = s; }
+        for (int s = 0; s < HUFF_ALPHABET; s++) {
+            if (hist[s] > 0) { weights[s] = hist[s]; used_symbols[symbols_used++] = s; }
         }
 
         if (symbols_used == 1) {
-            cl[idx[0]] = 1;
+            // Degenerate single-symbol alphabet: a 1-bit code. Deliberate
+            // path matching huffman_encoder.zig; the decoder LUT fan-out
+            // handles length-1 codes.
+            code_lengths[used_symbols[0]] = 1;
         } else if (symbols_used >= 2) {
             int n_active = symbols_used;
-            int next_node = 256;
-            for (int i = 0; i < n_active; i++) active[i] = idx[i];
+            int next_node = HUFF_ALPHABET;
+            for (int i = 0; i < n_active; i++) active[i] = used_symbols[i];
             while (n_active > 1) {
                 int a_pos = 0, b_pos = 1;
                 if (weights[active[a_pos]] > weights[active[b_pos]]) {
@@ -135,55 +159,55 @@ extern "C" __global__ void slzHuffBuildTablesKernel(
                 next_node++;
             }
             for (int i = 0; i < symbols_used; i++) {
-                int s = idx[i];
+                int s = used_symbols[i];
                 int depth = 0, n = s;
                 while (parents[n] != -1) { depth++; n = parents[n]; }
-                cl[s] = (uint8_t)depth;
+                code_lengths[s] = (uint8_t)depth;
             }
         }
 
-        // height-limit to ENC_MAX_CODE_LEN (Kraft-preserving, 30-bit fixed point)
+        // height-limit to ENC_MAX_CODE_LEN (Kraft-preserving, fixed point)
         {
-            const uint32_t TARGET = 1u << 30;
-            const int limit = ENC_MAX_CODE_LEN;
+            const uint32_t kraft_budget = 1u << KRAFT_PRECISION_BITS;
+            const int max_len = ENC_MAX_CODE_LEN;
             uint32_t sum = 0;
-            for (int s = 0; s < 256; s++)
-                if (cl[s] > 0) sum += (1u << (30 - cl[s]));
-            for (int s = 0; s < 256; s++) {
-                if (cl[s] > limit) {
-                    sum -= (1u << (30 - cl[s]));
-                    cl[s] = (uint8_t)limit;
-                    sum += (1u << (30 - limit));
+            for (int s = 0; s < HUFF_ALPHABET; s++)
+                if (code_lengths[s] > 0) sum += (1u << (KRAFT_PRECISION_BITS - code_lengths[s]));
+            for (int s = 0; s < HUFF_ALPHABET; s++) {
+                if (code_lengths[s] > max_len) {
+                    sum -= (1u << (KRAFT_PRECISION_BITS - code_lengths[s]));
+                    code_lengths[s] = (uint8_t)max_len;
+                    sum += (1u << (KRAFT_PRECISION_BITS - max_len));
                 }
             }
-            while (sum > TARGET) {
+            while (sum > kraft_budget) {
                 int best = -1;
                 uint32_t best_w = 0xFFFFFFFFu;
-                for (int s = 0; s < 256; s++) {
-                    if (cl[s] > 0 && cl[s] < limit && hist[s] < best_w) {
+                for (int s = 0; s < HUFF_ALPHABET; s++) {
+                    if (code_lengths[s] > 0 && code_lengths[s] < max_len && hist[s] < best_w) {
                         best_w = hist[s]; best = s;
                     }
                 }
                 if (best < 0) break;
-                sum -= (1u << (30 - cl[best]));
-                cl[best]++;
-                sum += (1u << (30 - cl[best]));
+                sum -= (1u << (KRAFT_PRECISION_BITS - code_lengths[best]));
+                code_lengths[best]++;
+                sum += (1u << (KRAFT_PRECISION_BITS - code_lengths[best]));
             }
         }
 
         // canonical code assignment
         {
-            uint32_t length_count[ENC_MAX_CODE_LEN + 2] = {0};
-            for (int s = 0; s < 256; s++) length_count[cl[s]]++;
+            uint32_t length_count[HUFF_LEN_HIST_SIZE] = {0};
+            for (int s = 0; s < HUFF_ALPHABET; s++) length_count[code_lengths[s]]++;
             length_count[0] = 0;
-            uint32_t next_code[ENC_MAX_CODE_LEN + 2] = {0};
+            uint32_t next_code[HUFF_LEN_HIST_SIZE] = {0};
             uint32_t code = 0;
             for (int L = 1; L <= ENC_MAX_CODE_LEN + 1; L++) {
                 code = (code + length_count[L - 1]) << 1;
                 next_code[L] = code;
             }
-            for (int s = 0; s < 256; s++) {
-                int L = cl[s];
+            for (int s = 0; s < HUFF_ALPHABET; s++) {
+                int L = code_lengths[s];
                 codes[s] = (L != 0) ? next_code[L]++ : 0u;
             }
         }
@@ -191,14 +215,15 @@ extern "C" __global__ void slzHuffBuildTablesKernel(
     __syncwarp();
 
     // ── Write tables ──
-    uint8_t*  CLo = code_lengths_out + (size_t)block_id * tables_stride;
-    uint32_t* CDo = codes_out        + (size_t)block_id * tables_stride;
-    for (int i = lane; i < 256; i += 32) { CLo[i] = cl[i]; CDo[i] = codes[i]; }
+    uint8_t*  code_lengths_dst = code_lengths_out + (size_t)block_id * tables_stride;
+    uint32_t* codes_dst        = codes_out        + (size_t)block_id * tables_stride;
+    for (int i = lane; i < HUFF_ALPHABET; i += WARP_SIZE) {
+        code_lengths_dst[i] = code_lengths[i];
+        codes_dst[i]        = codes[i];
+    }
 }
 
-// ══════════════════════════════════════════════════════════════════════
-// 4-stream encoder — one block per sub-chunk, lanes 0..3 active.
-// ══════════════════════════════════════════════════════════════════════
+// ── 4-stream encoder — one block per sub-chunk, lanes 0..3 active ────
 //
 // Emits the chunk_type=4 body (huffman_encoder.zig encodeBlock, minus the
 // 5-byte chunk header which the frame assembler prepends):
@@ -212,8 +237,8 @@ extern "C" __global__ void slzHuffBuildTablesKernel(
 extern "C" __global__ void slzHuffEncode4StreamKernel(
     const uint8_t* __restrict__ input,
     const HuffEncDesc* __restrict__ descs_in,
-    const uint8_t* __restrict__ code_lengths,         // 256 × n_blocks
-    const uint32_t* __restrict__ codes,               // 256 × n_blocks
+    const uint8_t* __restrict__ code_lengths,         // HUFF_ALPHABET × n_blocks
+    const uint32_t* __restrict__ codes,               // HUFF_ALPHABET × n_blocks
     uint8_t* __restrict__ scratch,                    // per-stream scratch
     uint8_t* __restrict__ output,                     // packed bodies
     uint32_t* __restrict__ out_sizes,                 // per-block body size
@@ -224,61 +249,77 @@ extern "C" __global__ void slzHuffEncode4StreamKernel(
     const uint32_t block_id = blockIdx.x;
     if (block_id >= n_blocks) return;
 
-    const int lane = threadIdx.x & 31;
-    const HuffEncDesc d = descs_in[block_id];
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const HuffEncDesc desc = descs_in[block_id];
 
     // Empty descriptor → no Huffman body for this sub-chunk (caller uses
-    // the raw fallback). Signalled by out_sizes == 0. d is block-uniform,
+    // the raw fallback). Signalled by out_sizes == 0. desc is block-uniform,
     // so all 32 lanes return together — no shuffle/sync divergence.
-    if (d.src_size == 0) {
+    if (desc.src_size == 0) {
         if (lane == 0) out_sizes[block_id] = 0;
         return;
     }
 
+    // Per-block table base (one buffer, one name — reused for encode and
+    // for the weights pack below).
+    const uint8_t* block_code_lengths = code_lengths + (uint64_t)block_id * tables_stride;
+
     // Lanes 0..3 each encode one of the 4 quarters into scratch.
     uint32_t bytes = 0;
-    if (lane < 4) {
-        uint32_t q = d.src_size / 4;
-        uint32_t my_in_start = (lane < 3) ? (lane * q) : (3 * q);
-        uint32_t my_in_size  = (lane < 3) ? q : (d.src_size - 3 * q);
-        const uint8_t* my_in = input + d.src_offset + (uint64_t)my_in_start * d.src_stride;
-        uint8_t* my_scratch = scratch + ((uint64_t)block_id * 4 + lane) * scratch_per_stream;
-        const uint8_t*  my_cl = code_lengths + (uint64_t)block_id * tables_stride;
-        const uint32_t* my_cd = codes        + (uint64_t)block_id * tables_stride;
-        bytes = encode_stream_one_lane(my_in, my_in_size, d.src_stride, my_cl, my_cd, my_scratch);
+    if (lane < HUFF_NUM_STREAMS) {
+        uint32_t q = desc.src_size / HUFF_NUM_STREAMS;
+        uint32_t my_in_start = (lane < HUFF_NUM_STREAMS - 1)
+                             ? (lane * q)
+                             : ((HUFF_NUM_STREAMS - 1) * q);
+        uint32_t my_in_size  = (lane < HUFF_NUM_STREAMS - 1)
+                             ? q
+                             : (desc.src_size - (HUFF_NUM_STREAMS - 1) * q);
+        const uint8_t* my_in = input + desc.src_offset + (uint64_t)my_in_start * desc.src_stride;
+        uint8_t* my_scratch = scratch
+            + ((uint64_t)block_id * HUFF_NUM_STREAMS + lane) * scratch_per_stream;
+        const uint32_t* my_codes = codes + (uint64_t)block_id * tables_stride;
+        bytes = encodeStreamOneLane(my_in, my_in_size, desc.src_stride,
+                                    block_code_lengths, my_codes, my_scratch);
     }
+    // Barrier covers the lane-0..3 scratch writes before the cross-lane
+    // shuffles below; all 32 lanes reach here (the if-block has no return).
     __syncwarp();
 
-    // Convergent shuffles — every lane participates.
-    uint32_t s0 = __shfl_sync(0xFFFFFFFF, bytes, 0);
-    uint32_t s1 = __shfl_sync(0xFFFFFFFF, bytes, 1);
-    uint32_t s2 = __shfl_sync(0xFFFFFFFF, bytes, 2);
-    uint32_t s3 = __shfl_sync(0xFFFFFFFF, bytes, 3);
+    // Convergent shuffles — every lane participates. stream_bytes[s] holds
+    // the encoded byte count of stream s.
+    uint32_t stream_bytes[HUFF_NUM_STREAMS];
+    #pragma unroll
+    for (int s = 0; s < HUFF_NUM_STREAMS; s++)
+        stream_bytes[s] = __shfl_sync(FULL_WARP_MASK, bytes, s);
 
-    uint8_t* out = output + d.dst_offset;
-    const uint8_t* cl = code_lengths + (uint64_t)block_id * tables_stride;
+    uint8_t* out = output + desc.dst_offset;
 
     // 128-byte weights — 32 lanes pack 4 entries each.
-    for (int i = lane; i < 128; i += 32)
-        out[i] = (uint8_t)((cl[2 * i] & 0x0F) | ((cl[2 * i + 1] & 0x0F) << 4));
+    for (int i = lane; i < HUFF_WEIGHTS_BYTES; i += WARP_SIZE)
+        out[i] = (uint8_t)((block_code_lengths[2 * i] & HUFF_NIBBLE_MASK)
+                         | ((block_code_lengths[2 * i + 1] & HUFF_NIBBLE_MASK) << 4));
 
     if (lane == 0) {
         // 9-byte sub-header at offset 128 (3 × u24 LE; stream 3 derived).
-        uint8_t* h = out + 128;
-        h[0] = (uint8_t)(s0 & 0xFF); h[1] = (uint8_t)((s0 >> 8) & 0xFF); h[2] = (uint8_t)((s0 >> 16) & 0xFF);
-        h[3] = (uint8_t)(s1 & 0xFF); h[4] = (uint8_t)((s1 >> 8) & 0xFF); h[5] = (uint8_t)((s1 >> 16) & 0xFF);
-        h[6] = (uint8_t)(s2 & 0xFF); h[7] = (uint8_t)((s2 >> 8) & 0xFF); h[8] = (uint8_t)((s2 >> 16) & 0xFF);
+        uint8_t* subheader = out + HUFF_WEIGHTS_BYTES;
+        for (int s = 0; s < HUFF_NUM_STREAMS - 1; s++) {
+            uint8_t* field = subheader + s * HUFF_STREAM_SIZE_BYTES;
+            field[0] = (uint8_t)(stream_bytes[s] & 0xFF);
+            field[1] = (uint8_t)((stream_bytes[s] >> 8) & 0xFF);
+            field[2] = (uint8_t)((stream_bytes[s] >> 16) & 0xFF);
+        }
 
-        uint8_t* dst = out + 137;
-        uint8_t* src0 = scratch + ((uint64_t)block_id * 4 + 0) * scratch_per_stream;
-        uint8_t* src1 = scratch + ((uint64_t)block_id * 4 + 1) * scratch_per_stream;
-        uint8_t* src2 = scratch + ((uint64_t)block_id * 4 + 2) * scratch_per_stream;
-        uint8_t* src3 = scratch + ((uint64_t)block_id * 4 + 3) * scratch_per_stream;
-        for (uint32_t i = 0; i < s0; i++) dst[i] = src0[i]; dst += s0;
-        for (uint32_t i = 0; i < s1; i++) dst[i] = src1[i]; dst += s1;
-        for (uint32_t i = 0; i < s2; i++) dst[i] = src2[i]; dst += s2;
-        for (uint32_t i = 0; i < s3; i++) dst[i] = src3[i];
+        // Concatenate the 4 per-stream scratch buffers into the body.
+        uint8_t* dst = out + HUFF_BODY_HEADER_BYTES;
+        uint32_t total_body = 0;
+        for (int s = 0; s < HUFF_NUM_STREAMS; s++) {
+            const uint8_t* src = scratch
+                + ((uint64_t)block_id * HUFF_NUM_STREAMS + s) * scratch_per_stream;
+            for (uint32_t i = 0; i < stream_bytes[s]; i++) dst[i] = src[i];
+            dst += stream_bytes[s];
+            total_body += stream_bytes[s];
+        }
 
-        out_sizes[block_id] = 128 + 9 + s0 + s1 + s2 + s3;
+        out_sizes[block_id] = HUFF_WEIGHTS_BYTES + HUFF_SUBHEADER_BYTES + total_body;
     }
 }
