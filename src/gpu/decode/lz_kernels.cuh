@@ -516,8 +516,9 @@ __device__ __forceinline__ float walkReadF32LE(const uint8_t* p) {
 
 // d_block_start / d_block_size: byte range of the block payload within
 // d_frame. Wrapper D2D-copies this range into d_comp_persist; chunk_descs
-// src_offset is block-payload-relative (matches gpuBatchDecode).
-// Single-block frames only (status 13 otherwise) — slzCompress output.
+// src_offset is block-payload-relative (matches the CPU walk in
+// gpuBatchDecode). Single-block frames only (status 13 otherwise) —
+// slzCompress output.
 extern "C" __global__ void slzWalkFrameKernel(
     const uint8_t* __restrict__ d_frame,
     uint32_t                    frame_size,
@@ -591,10 +592,12 @@ extern "C" __global__ void slzWalkFrameKernel(
         if (uncompressed_block) {
             if (pos + decomp_size > frame_size) { *d_status = 12; return; }
             if (n_chunks >= max_chunks) { *d_status = 11; return; }
-            // src_offset is FRAME-ABSOLUTE — downstream kernels read
-            // d_frame (or a D2D copy of it) + src_offset directly. The
-            // pure-D2D pipeline can therefore skip block_start juggling.
-            d_chunks[n_chunks] = { block_payload_start, decomp_size, decomp_size, dst_off, 1u, 0, {0, 0, 0} };
+            // src_offset is BLOCK-PAYLOAD-RELATIVE (matches the CPU walk
+            // in gpuBatchDecode). decompressFramedFromDevice passes
+            // `d_compressed_src = d_frame + block_start` so the decode
+            // kernels' `compressed + src_offset` reads land on the right
+            // bytes.
+            d_chunks[n_chunks] = { 0u, decomp_size, decomp_size, dst_off, 1u, 0, {0, 0, 0} };
             n_chunks++;
             dst_off += decomp_size;
             pos += comp_size;
@@ -640,8 +643,8 @@ extern "C" __global__ void slzWalkFrameKernel(
                 if (pos + comp > block_end) { *d_status = 12; return; }
                 if (n_chunks >= max_chunks) { *d_status = 11; return; }
                 const uint32_t flg = (comp == dst_this) ? 1u : 0u;
-                // src_offset is FRAME-ABSOLUTE (see header comment above).
-                d_chunks[n_chunks] = { pos, comp, dst_this, dst_off, flg, 0, {0, 0, 0} };
+                // src_offset is BLOCK-PAYLOAD-RELATIVE (matches CPU walk).
+                d_chunks[n_chunks] = { pos - block_payload_start, comp, dst_this, dst_off, flg, 0, {0, 0, 0} };
                 n_chunks++;
                 pos += comp;
             } else if (chunk_type == 1) {

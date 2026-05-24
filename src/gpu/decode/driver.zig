@@ -212,20 +212,25 @@ pub fn init() bool {
     }
 
     // Create persistent pipeline streams (CU_STREAM_NON_BLOCKING = 1)
-    if (!g_default.pipeline_streams_created) {
-        if (cuStreamCreate_fn) |create_fn| {
-            var all_ok = true;
-            for (0..NUM_PIPELINE_STREAMS) |i| {
-                if (create_fn(&g_default.pipeline_streams[i], 1) != CUDA_SUCCESS) {
-                    all_ok = false;
-                    break;
-                }
-            }
-            if (all_ok) g_default.pipeline_streams_created = true;
-        }
-    }
+    // on the module-default context. Per-handle DecodeContexts get the
+    // same treatment lazily in `ensurePipelineStreams` below.
+    ensurePipelineStreams(&g_default);
 
     return true;
+}
+
+/// Lazily allocate the persistent pipeline streams on `ctx`. Called from
+/// init() for g_default and from fullGpuLaunchImpl for any per-handle
+/// context that hasn't created them yet. Without this, h.dec contexts
+/// fall through to the non-pipelined branch of fullGpuLaunchImpl, which
+/// never launches the Huffman kernels and silently produces zero literals.
+fn ensurePipelineStreams(dec_ctx: *DecodeContext) void {
+    if (dec_ctx.pipeline_streams_created) return;
+    const create_fn = cuStreamCreate_fn orelse return;
+    for (0..NUM_PIPELINE_STREAMS) |i| {
+        if (create_fn(&dec_ctx.pipeline_streams[i], 1) != CUDA_SUCCESS) return;
+    }
+    dec_ctx.pipeline_streams_created = true;
 }
 
 pub fn isAvailable() bool {
@@ -1527,6 +1532,7 @@ pub fn fullGpuLaunchImpl(
     d_compressed_src: ?u64,
 ) GpuError!void {
     if (!init() or kernel_fn == 0) return error.BadMode;
+    ensurePipelineStreams(self);
 
     // SLZ_E2E_TIMER: end-to-end decode phase breakdown — setup+H2D /
     // host scan+prep / kernels / D2H. Off by default.

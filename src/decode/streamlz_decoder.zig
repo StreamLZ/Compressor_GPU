@@ -127,14 +127,12 @@ pub fn decompressFramedFromDevice(
     const num_groups: u32 = meta.n_chunks;
     const chunks_per_group: u32 = 1;
 
-    // src_offsets in chunks are now FRAME-ABSOLUTE — pass d_frame itself
-    // as the device source, and size up the buffer to cover the block
-    // payload (block_start + block_size). The decode kernels read
-    // d_comp_persist[chunk.src_offset], which after the D2D copy holds
-    // the full frame bytes up through the block end.
-    const cover_size: u32 = meta.block_start + meta.block_size;
+    // src_offsets in chunks are block-payload-relative — matches the CPU
+    // walk in gpuBatchDecode. d_compressed_src points at the block payload
+    // (d_frame + block_start) so d_comp_persist holds exactly the block,
+    // matching the CLI path's H2D layout.
     const stub_ptr: [*]const u8 = @ptrFromInt(0x10);
-    const compressed_block: []const u8 = stub_ptr[0..cover_size];
+    const compressed_block: []const u8 = stub_ptr[0..meta.block_size];
 
     var dst_dummy: u8 = 0;
     gpu_driver.fullGpuLaunchImpl(
@@ -149,7 +147,7 @@ pub fn decompressFramedFromDevice(
         meta.sub_chunk_cap,
         io,
         d_output,
-        d_frame, // d_compressed_src: frame-absolute — no +block_start
+        d_frame + meta.block_start,
     ) catch |err| return err;
     return meta.decomp_size;
 }
