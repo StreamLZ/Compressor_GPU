@@ -1542,23 +1542,23 @@ fn gpuScanChunks(
         num_lo = counts[3];
         num_raw = counts[4];
 
-        // Legacy CPU-merge path still reads the host arrays (huff_*_host_buf
-        // and raw_off16_descs). D2H the compacted arrays into them so that
-        // path keeps working. The pure-D2D path in fullGpuLaunchImpl uses
-        // the device-resident compact arrays directly (step 6c) and ignores
-        // these host copies. Total cost: ~5 streams × (n_subs * 20 B) — bounded
-        // (~30 KB for 1500 sub-chunks). Removable once the legacy CPU-merge
-        // path is retired.
-        if (num_lit > 0 and num_lit <= huff_lit_descs.len)
-            _ = d2h(@ptrCast(huff_lit_descs.ptr), self.d_compact_lit, @as(usize, num_lit) * @sizeOf(HuffDecChunkDesc));
-        if (num_tok > 0 and num_tok <= huff_tok_descs.len)
-            _ = d2h(@ptrCast(huff_tok_descs.ptr), self.d_compact_tok, @as(usize, num_tok) * @sizeOf(HuffDecChunkDesc));
-        if (num_hi > 0 and num_hi <= huff_off16hi_descs.len)
-            _ = d2h(@ptrCast(huff_off16hi_descs.ptr), self.d_compact_hi, @as(usize, num_hi) * @sizeOf(HuffDecChunkDesc));
-        if (num_lo > 0 and num_lo <= huff_off16lo_descs.len)
-            _ = d2h(@ptrCast(huff_off16lo_descs.ptr), self.d_compact_lo, @as(usize, num_lo) * @sizeOf(HuffDecChunkDesc));
-        if (num_raw > 0 and num_raw <= raw_off16_descs.len)
-            _ = d2h(@ptrCast(raw_off16_descs.ptr), self.d_compact_raw, @as(usize, num_raw) * @sizeOf(RawOff16Desc));
+        // The legacy CPU-merge fallback consumes huff_*_host_buf /
+        // raw_off16_descs. The pure-D2D merge kernel reads d_compact_*
+        // directly, so the host arrays are only needed when the merge
+        // kernel itself is missing. Skip the ~120 KB D2H in the common
+        // case; populate host arrays only as a true fallback path.
+        if (merge_huff_descs_fn == 0) {
+            if (num_lit > 0 and num_lit <= huff_lit_descs.len)
+                _ = d2h(@ptrCast(huff_lit_descs.ptr), self.d_compact_lit, @as(usize, num_lit) * @sizeOf(HuffDecChunkDesc));
+            if (num_tok > 0 and num_tok <= huff_tok_descs.len)
+                _ = d2h(@ptrCast(huff_tok_descs.ptr), self.d_compact_tok, @as(usize, num_tok) * @sizeOf(HuffDecChunkDesc));
+            if (num_hi > 0 and num_hi <= huff_off16hi_descs.len)
+                _ = d2h(@ptrCast(huff_off16hi_descs.ptr), self.d_compact_hi, @as(usize, num_hi) * @sizeOf(HuffDecChunkDesc));
+            if (num_lo > 0 and num_lo <= huff_off16lo_descs.len)
+                _ = d2h(@ptrCast(huff_off16lo_descs.ptr), self.d_compact_lo, @as(usize, num_lo) * @sizeOf(HuffDecChunkDesc));
+            if (num_raw > 0 and num_raw <= raw_off16_descs.len)
+                _ = d2h(@ptrCast(raw_off16_descs.ptr), self.d_compact_raw, @as(usize, num_raw) * @sizeOf(RawOff16Desc));
+        }
     } else {
         // Fallback: D2H the staged arrays and compact on host.
         const alloc = std.heap.page_allocator;
@@ -1775,7 +1775,8 @@ pub fn fullGpuLaunchImpl(
             _ = h2d_fn(self.d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len);
         }
     }
-    _ = h2d_fn(self.d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes);
+    // Step 2 consolidation: chunk_descs already H2D'd above (before the
+    // prefix-sum kernel ran). Drop the redundant second upload.
     _ = sync_fn();
     if (t_e2e0) |t0| if (io) |iv| {
         e2e_cum_h2d_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
