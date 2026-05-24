@@ -812,14 +812,14 @@ extern "C" __global__ void slzMergeHuffDescsKernel(
 // fullGpuLaunchImpl on the pure-D2D path.
 extern "C" __global__ void slzPrefixSumChunksKernel(
     const SlzChunkDesc* __restrict__ d_chunks,
-    const uint32_t* __restrict__     d_n_chunks,
-    const uint32_t* __restrict__     d_cap,
+    uint32_t                         n_chunks,
+    uint32_t                         sub_chunk_cap,
     uint32_t* __restrict__            d_first_sub_idx,
     uint32_t* __restrict__            d_total_subchunks)
 {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    const uint32_t n = *d_n_chunks;
-    uint32_t cap = *d_cap;
+    const uint32_t n = n_chunks;
+    uint32_t cap = sub_chunk_cap;
     if (cap == 0) cap = 65536u;
     uint32_t total = 0;
     for (uint32_t i = 0; i < n; i++) {

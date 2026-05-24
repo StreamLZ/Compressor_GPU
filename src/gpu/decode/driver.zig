@@ -1188,8 +1188,8 @@ pub const PrefixSumResultDev = struct {
 pub fn gpuPrefixSumChunksImpl(
     self: *DecodeContext,
     d_chunk_descs: u64,
-    d_n_chunks: u64,
-    d_sub_chunk_cap: u64,
+    n_chunks: u32,
+    sub_chunk_cap: u32,
 ) ?PrefixSumResultDev {
     if (!init()) return null;
     if (prefix_sum_chunks_fn == 0) return null;
@@ -1201,8 +1201,8 @@ pub fn gpuPrefixSumChunksImpl(
     if (!ensureDeviceBuf(&self.d_total_subchunks_buf, &self.d_total_subchunks_buf_size, 4)) return null;
 
     var k_chunks = d_chunk_descs;
-    var k_n = d_n_chunks;
-    var k_cap = d_sub_chunk_cap;
+    var k_n = n_chunks;
+    var k_cap = sub_chunk_cap;
     var k_first = self.d_first_sub_idx_persist;
     var k_total = self.d_total_subchunks_buf;
     var params = [_]?*anyopaque{
