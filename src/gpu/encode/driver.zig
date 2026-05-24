@@ -431,6 +431,13 @@ pub const EncodeContext = struct {
     pending_timings: std.ArrayListUnmanaged(gpu_decode.PendingTiming) = .empty,
     last_timings: std.ArrayListUnmanaged(gpu_decode.KernelTiming) = .empty,
 
+    // CUDA stream used for the heavy-phase encode kernel launches (LZ
+    // compress, huff encode, assemble write, frame assemble) + the final
+    // frame writer. slzCompressAsync sets it to the caller's stream so
+    // cudaStreamSynchronize on that stream waits for the compress to
+    // complete. The sync wrapper leaves it at 0 (default stream).
+    work_stream: usize = 0,
+
     // 4d Phase 3: when set to a non-zero device address, gpuCompressImpl
     // populates d_input_persist via a D2D copy from this pointer instead
     // of the H2D from the host `input` slice — the caller's data is
@@ -1446,10 +1453,18 @@ pub fn gpuFrameAssembleImpl(
     // Grid: n_chunks blocks for per-chunk writes + 1 block for prefix/tail/end mark.
     // 128 threads per block — enough for cooperative copies up to ~few KB/iter.
     const grid_x: u32 = n_chunks + 1;
-    const _t_fa = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzFrameAssembleKernel", 0);
-    if (launch(frame_assemble_fn, grid_x, 1, 1, 128, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return null;
-    gpu_decode.endKernelTiming(_t_fa, 0);
-    if (sync() != CUDA_SUCCESS) return null;
+    // Heavy phase: ride the caller's stream when slzCompressAsync set
+    // work_stream so cudaStreamSynchronize on it waits for the frame
+    // bytes to be in d_output.
+    const heavy_stream: usize = self.work_stream;
+    const _t_fa = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzFrameAssembleKernel", heavy_stream);
+    if (launch(frame_assemble_fn, grid_x, 1, 1, 128, 1, 1, 0, heavy_stream, &params, &extra) != CUDA_SUCCESS) return null;
+    gpu_decode.endKernelTiming(_t_fa, heavy_stream);
+    // In async mode we leave the kernel in flight on the caller's stream
+    // (their cudaStreamSynchronize is the sync point); else block here.
+    if (heavy_stream == 0) {
+        if (sync() != CUDA_SUCCESS) return null;
+    }
 
     return total_frame_size;
 }

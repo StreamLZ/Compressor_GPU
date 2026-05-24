@@ -153,6 +153,10 @@ const CompressJob = struct {
     opts: CompressOpts,
     d_src: u64 = 0,
     d_dst: u64 = 0,
+    /// Caller-supplied CUstream for the async variant; 0 = default stream.
+    /// When non-zero, the encode driver leaves the final frame-assembly
+    /// kernel queued on this stream rather than blocking on it.
+    work_stream: usize = 0,
     result: c_int = SLZ_ERROR_CUDA,
 
     fn run(j: *CompressJob) void {
@@ -179,12 +183,17 @@ const CompressJob = struct {
             j.h.enc.output_written_to_device = false;
         }
         j.h.enc.enable_profiling = j.opts.enable_profiling != 0;
+        j.h.enc.work_stream = j.work_stream;
         defer {
             j.h.enc.d_input_override = 0;
             j.h.enc.d_output_override = 0;
             j.h.enc.output_written_to_device = false;
-            // Drain cuEvent pairs → last_timings (no-op when profiling off).
-            gpu_driver.finalizeProfiling(&j.h.enc.pending_timings, &j.h.enc.last_timings);
+            j.h.enc.work_stream = 0;
+            // Drain cuEvent pairs → last_timings (sync mode only — async
+            // leaves events pending until the user syncs + calls
+            // slzGetLastTimings).
+            if (j.work_stream == 0)
+                gpu_driver.finalizeProfiling(&j.h.enc.pending_timings, &j.h.enc.last_timings);
             j.h.enc.enable_profiling = false;
         }
         const rc = compressCore(j.h, j.src, j.dst, j.opts);
@@ -244,6 +253,10 @@ const DecompressJobTrueD2D = struct {
     src_size: u32,
     d_dst: u64,
     opts: DecompressOpts = .{},
+    /// Caller-supplied CUstream for the async variant; 0 = default stream.
+    /// When non-zero, the decode driver queues huff + LZ + output D2D on
+    /// this stream and skips its final sync — the caller is the sync.
+    work_stream: usize = 0,
     result: c_int = SLZ_ERROR_CUDA,
     fall_back: bool = false,
 
@@ -253,7 +266,11 @@ const DecompressJobTrueD2D = struct {
             return;
         }
         j.h.dec.enable_profiling = j.opts.enable_profiling != 0;
-        defer j.h.dec.enable_profiling = false;
+        j.h.dec.work_stream = j.work_stream;
+        defer {
+            j.h.dec.enable_profiling = false;
+            j.h.dec.work_stream = 0;
+        }
         const n = decoder.decompressFramedFromDevice(
             allocator,
             null,
@@ -593,6 +610,91 @@ export fn slzDecompress(
     return SLZ_SUCCESS;
 }
 
+// ── Async (stream-taking) device-to-device variants ──────────────────
+// Mirror nvCOMP's pattern: submit on `stream`, return; caller is the
+// sync. NULL stream is the default stream and makes these behave like
+// the sync entry points.
+export fn slzCompressAsync(
+    handle: ?*Context,
+    d_input: ?*const anyopaque,
+    input_size: usize,
+    d_temp: ?*anyopaque,
+    temp_size: usize,
+    d_output: ?*anyopaque,
+    output_capacity: usize,
+    output_size: ?*usize,
+    opts: CompressOpts,
+    stream: ?*anyopaque,
+) c_int {
+    _ = d_temp;
+    _ = temp_size;
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    const in_dev = d_input orelse return SLZ_ERROR_INVALID_ARG;
+    const out_dev = d_output orelse return SLZ_ERROR_INVALID_ARG;
+    const out_size = output_size orelse return SLZ_ERROR_INVALID_ARG;
+
+    const host_out = allocator.alloc(u8, output_capacity) catch return SLZ_ERROR_OUT_OF_MEMORY;
+    defer allocator.free(host_out);
+
+    const sentinel_ptr: [*]const u8 = @ptrFromInt(0x10);
+    const src_stub: []const u8 = sentinel_ptr[0..input_size];
+
+    var job = CompressJob{
+        .h = h,
+        .src = src_stub,
+        .dst = host_out,
+        .opts = opts,
+        .d_src = @intFromPtr(in_dev),
+        .d_dst = @intFromPtr(out_dev),
+        .work_stream = @intFromPtr(stream),
+    };
+    const rc = runOnWorker(CompressJob, &job);
+    if (rc < 0) return rc;
+    out_size.* = @intCast(rc);
+    return SLZ_SUCCESS;
+}
+
+export fn slzDecompressAsync(
+    handle: ?*Context,
+    d_frame: ?*const anyopaque,
+    frame_size: usize,
+    d_temp: ?*anyopaque,
+    temp_size: usize,
+    d_output: ?*anyopaque,
+    output_capacity: usize,
+    output_size: ?*usize,
+    opts: DecompressOpts,
+    stream: ?*anyopaque,
+) c_int {
+    _ = d_temp;
+    _ = temp_size;
+    _ = output_capacity;
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    const frame_dev = d_frame orelse return SLZ_ERROR_INVALID_ARG;
+    const out_dev = d_output orelse return SLZ_ERROR_INVALID_ARG;
+    const out_size = output_size orelse return SLZ_ERROR_INVALID_ARG;
+
+    var true_job = DecompressJobTrueD2D{
+        .h = h,
+        .d_src = @intFromPtr(frame_dev),
+        .src_size = @intCast(frame_size),
+        .d_dst = @intFromPtr(out_dev),
+        .opts = opts,
+        .work_stream = @intFromPtr(stream),
+    };
+    const rc = runOnWorker(DecompressJobTrueD2D, &true_job);
+    if (rc >= 0) {
+        out_size.* = @intCast(rc);
+        return SLZ_SUCCESS;
+    }
+    // Async path doesn't fall back. If the TrueD2D shape isn't satisfied
+    // (dict frame / PDM / multi-block), the caller should use the sync
+    // slzDecompress entry point which handles fallback through the
+    // half-D2D and full-host paths.
+    if (true_job.fall_back) return SLZ_ERROR_UNSUPPORTED;
+    return rc;
+}
+
 // ── Profiling ─────────────────────────────────────────────────────────
 // Reads the per-kernel timings captured during the most recent compress
 // or decompress call on this handle. Combines encode + decode timings
@@ -606,6 +708,12 @@ export fn slzGetLastTimings(
 ) c_int {
     const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
     const cnt = count_out orelse return SLZ_ERROR_INVALID_ARG;
+    // Drain any pending cuEvent pairs. Idempotent: no-op when pending is
+    // empty (already finalized by sync wrapper or another call). For
+    // slzCompressAsync/slzDecompressAsync callers this is where timings
+    // materialize — they must have synced the user stream first.
+    gpu_driver.finalizeProfiling(&h.enc.pending_timings, &h.enc.last_timings);
+    gpu_driver.finalizeProfiling(&h.dec.pending_timings, &h.dec.last_timings);
     const enc_list = h.enc.last_timings.items;
     const dec_list = h.dec.last_timings.items;
     const total = enc_list.len + dec_list.len;

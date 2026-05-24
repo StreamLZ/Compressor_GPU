@@ -173,6 +173,49 @@ slzStatus_t slzDecompress(slzHandle_t handle,
                           size_t* output_size,
                           slzDecompressOpts_t opts);
 
+/* ---- Async (stream-taking) entry points ----------------------------- */
+/* slzCompressAsync / slzDecompressAsync mirror nvCOMP's
+ * nvcompBatchedXxxAsync pattern: submit GPU work on the caller's stream
+ * and return — the caller's cudaStreamSynchronize is the sync point.
+ *
+ * `stream` is a CUDA driver-API CUstream (== cudaStream_t) cast to
+ * void*. NULL is interpreted as the default stream (stream 0), which
+ * makes the call behave like the synchronous variant.
+ *
+ * `output_size` is a HOST pointer; the library writes the byte count
+ * before returning (it knows the size from the frame header / the
+ * compressed-frame layout — no cuMemcpy is required after sync).
+ *
+ * Decompress: the walk + scan + compact + merge phases still block
+ * internally (host-dependent values). The heavy Huffman-decode + LZ-
+ * decode kernels and the final D2D output copy ride the caller's
+ * stream and are NOT waited on; user must cudaStreamSynchronize the
+ * stream to consume `d_output`.
+ *
+ * Compress: the LZ-encode + Huff-encode + assemble passes still block
+ * internally (data dependencies on per-chunk sizes). Only the final
+ * frame-assembly kernel is queued on the caller's stream; for the
+ * pure-D2D path that is where the frame bytes land in d_output.
+ *
+ * Errors from the synchronous prefix surface as a negative status code
+ * the same way as the sync entry points; errors from the queued kernels
+ * surface via cudaGetLastError after the user's synchronize. */
+slzStatus_t slzCompressAsync(slzHandle_t handle,
+                             const void* d_input, size_t input_size,
+                             void* d_temp, size_t temp_size,
+                             void* d_output, size_t output_capacity,
+                             size_t* output_size,
+                             slzCompressOpts_t opts,
+                             void* stream);
+
+slzStatus_t slzDecompressAsync(slzHandle_t handle,
+                               const void* d_frame, size_t frame_size,
+                               void* d_temp, size_t temp_size,
+                               void* d_output, size_t output_capacity,
+                               size_t* output_size,
+                               slzDecompressOpts_t opts,
+                               void* stream);
+
 /* ---- Compress / decompress: host -> host ---------------------------- */
 /* Same as slzCompress / slzDecompress but with plain host buffers: the
  * library performs the H2D/D2H copies and owns every device-side buffer

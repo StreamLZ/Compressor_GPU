@@ -642,6 +642,16 @@ pub const DecodeContext = struct {
     enable_profiling: bool = false,
     pending_timings: std.ArrayListUnmanaged(PendingTiming) = .empty,
     last_timings: std.ArrayListUnmanaged(KernelTiming) = .empty,
+
+    // CUDA stream used for the heavy-phase kernel launches (huff build/
+    // decode, LZ decode) and the final D2D output copy. slzDecompressAsync
+    // sets it to the caller's stream so cudaStreamSynchronize on that
+    // stream waits for the decompress to complete. The sync slzDecompress
+    // wrapper leaves it at 0 (default stream) and waits with cuCtxSync.
+    // The walk + scan + compact + merge phases still serialize on stream 0
+    // (they share host-dependent values like total_subchunks); only the
+    // back half rides the caller's stream.
+    work_stream: usize = 0,
 };
 
 /// Default decode context backing the module-level public API. Library
@@ -2056,6 +2066,13 @@ pub fn fullGpuLaunchImpl(
     // with the LZ kernel. It no longer depends on the tANS kernels.
     const total_chunks: u32 = @intCast(chunk_descs.len);
     const use_pipeline = self.pipeline_streams_created and total_chunks >= NUM_PIPELINE_STREAMS;
+    // The heavy-phase kernel launches (huff_build / huff_decode / LZ)
+    // ride this stream. When the caller is slzDecompressAsync, work_stream
+    // is the caller's CUstream so its cudaStreamSynchronize waits for
+    // the decompress to land in d_output. The sync slzDecompress wrapper
+    // leaves work_stream at 0 and falls back to the library's own
+    // pipeline_streams[0].
+    const heavy_stream: usize = if (self.work_stream != 0) self.work_stream else self.pipeline_streams[0];
     if (use_pipeline) {
         // Merge tANS descriptors grouped by pipeline stage
         // Pipeline group g handles chunks [g*pipe_chunk_count .. (g+1)*pipe_chunk_count)
@@ -2181,7 +2198,7 @@ pub fn fullGpuLaunchImpl(
         // SLZ_SPLIT_TIMER: build-vs-decode breakdown of the Huff pass.
         var split_huff_build_ns: i64 = 0;
         if (have_huff) {
-            const huff_stream = self.pipeline_streams[0];
+            const huff_stream = heavy_stream;
             // Step 7: huff kernels self-gate on `*d_n_blocks`. The GPU
             // merge kernel writes n_merged to d_compact_counts+20; reuse
             // that slot when GPU merge ran. CPU-merge fallback stages
@@ -2260,7 +2277,10 @@ pub fn fullGpuLaunchImpl(
         }
 
         for (0..NUM_PIPELINE_STREAMS) |g| {
-            const stream = self.pipeline_streams[g];
+            // With NUM_PIPELINE_STREAMS=1, the LZ stream is the same as
+            // huff_stream (= heavy_stream). For >1 we'd need a per-pipeline
+            // user stream; keep the existing pipeline_streams[g] path.
+            const stream: usize = if (NUM_PIPELINE_STREAMS == 1) heavy_stream else self.pipeline_streams[g];
             const chunk_start = @as(u32, @intCast(g)) * pipe_chunk_count;
             const chunk_end = @min(chunk_start + pipe_chunk_count, total_chunks);
             const group_chunks = chunk_end - chunk_start;
@@ -2529,12 +2549,19 @@ pub fn fullGpuLaunchImpl(
             }
         }
 
-        // Sync all pipeline streams
-        for (0..NUM_PIPELINE_STREAMS) |g| {
-            const sync_rc = stream_sync_fn(self.pipeline_streams[g]);
-            if (sync_rc != CUDA_SUCCESS) {
-                std.debug.print("GPU pipe[{d}]: stream sync FAILED rc={d}\n", .{ g, sync_rc });
-                return error.BadMode;
+        // Sync all pipeline streams — UNLESS the caller is async
+        // (work_stream set). In async mode we leave the queued work on
+        // the user's stream and let them sync; blocking here would
+        // defeat the purpose. The post-pipeline timing readback below
+        // and the build-timing dump rely on completion, so when async
+        // we skip them too.
+        if (self.work_stream == 0) {
+            for (0..NUM_PIPELINE_STREAMS) |g| {
+                const sync_rc = stream_sync_fn(self.pipeline_streams[g]);
+                if (sync_rc != CUDA_SUCCESS) {
+                    std.debug.print("GPU pipe[{d}]: stream sync FAILED rc={d}\n", .{ g, sync_rc });
+                    return error.BadMode;
+                }
             }
         }
 
@@ -2770,22 +2797,31 @@ pub fn fullGpuLaunchImpl(
     if (t_e2e0) |t0| if (io) |iv| {
         e2e_cum_predh_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
     };
-    // Profiling: drain pending cuEvent pairs into last_timings now that
-    // every kernel has run. Idempotent and a no-op when profiling is off.
-    finalizeProfiling(&self.pending_timings, &self.last_timings);
-
     // Device-resident output (4d Phase 3): D2D-copy the decoded bytes
     // straight to the caller's device buffer, skipping the host bounce.
+    // Use heavy_stream so the copy serializes after the LZ kernel on
+    // the same stream (and so the user's cudaStreamSynchronize on that
+    // stream waits for the result).
     if (d_output_target) |dev_target| {
         if (cuMemcpyDtoDAsync_fn) |d2d| {
-            _ = d2d(dev_target + dst_start_off, self.d_output + dst_start_off, decompressed_size, 0);
-            _ = sync_fn();
+            _ = d2d(dev_target + dst_start_off, self.d_output + dst_start_off, decompressed_size, heavy_stream);
+            // Sync only when the caller did NOT supply a stream. When
+            // work_stream is set we leave the result in-flight on the
+            // caller's stream for slzDecompressAsync.
+            if (self.work_stream == 0) _ = sync_fn();
         } else {
             // No async D2D — bounce through host (unreachable on supported drivers).
             return error.BadMode;
         }
     } else {
         _ = d2h_fn(@ptrCast(dst_full + dst_start_off), self.d_output + dst_start_off, decompressed_size);
+    }
+
+    // Profiling: drain pending cuEvent pairs into last_timings. Skip in
+    // async mode (caller hasn't synced yet; the events may still be
+    // pending). slzGetLastTimings finalizes on demand.
+    if (self.work_stream == 0) {
+        finalizeProfiling(&self.pending_timings, &self.last_timings);
     }
     if (t_e2e0) |t0| if (io) |iv| {
         const cum_end_ns: i64 = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
