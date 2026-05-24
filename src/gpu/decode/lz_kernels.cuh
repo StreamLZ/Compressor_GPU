@@ -243,13 +243,14 @@ slzLzDecodeKernel(
     const SlzChunkDesc* __restrict__ chunks,
     uint8_t* __restrict__ dst,
     uint32_t chunks_per_group,
-    uint32_t total_chunks,
+    const uint32_t* __restrict__ d_total_chunks,
     uint32_t sub_chunk_cap,
     uint8_t* __restrict__ tans_scratch,
     uint64_t tans_slot_stride,
     const uint32_t* __restrict__ first_subchunk_idx
 ) {
     // WARPS_PER_BLOCK warps per block: warp 0 = threadIdx.y==0, etc.
+    const uint32_t total_chunks = *d_total_chunks;
     const uint32_t warp_id = threadIdx.y;
     const uint32_t group_id = blockIdx.x * WARPS_PER_BLOCK + warp_id;
     const int lane = threadIdx.x & LANE_MASK;
@@ -369,9 +370,10 @@ slzLzDecodeRawKernel(
     const SlzChunkDesc* __restrict__ chunks,
     uint8_t* __restrict__ dst,
     uint32_t chunks_per_group,
-    uint32_t total_chunks,
+    const uint32_t* __restrict__ d_total_chunks,
     uint32_t sub_chunk_cap
 ) {
+    const uint32_t total_chunks = *d_total_chunks;
     const uint32_t warp_id = threadIdx.y;
     const uint32_t group_id = blockIdx.x * WARPS_PER_BLOCK + warp_id;
     const int lane = threadIdx.x & LANE_MASK;
@@ -443,19 +445,21 @@ slzLzDecodeRawKernel(
 // ~8 ms). Descriptor layout matches the Zig RawOff16Desc
 // {src_offset, size, gpu_offset}.
 //
-// Launch contract: a 1-D grid of `count` blocks, one block per
-// descriptor; blockDim.x lanes stride the copy of one stream. This
-// shape is a hard contract with the driver. No __launch_bounds__: the
-// kernel is bandwidth-bound, so occupancy tuning is not needed.
+// Launch contract: over-launch with a safe upper bound; each block
+// reads `*d_count` and self-gates on `blockIdx.x >= *d_count`. The
+// driver passes a device-resident counter (e.g. d_compact_counts+16
+// for the n_raw slot) so no per-call D2H of the count is needed.
+// blockDim.x lanes stride the copy of one stream. No __launch_bounds__:
+// the kernel is bandwidth-bound, so occupancy tuning is not needed.
 extern "C" __global__ void slzGatherRawOff16Kernel(
     const uint8_t* __restrict__ comp_base,
     uint32_t comp_len,
     uint8_t* __restrict__ scratch_base,
     const SlzRawOff16Desc* __restrict__ descs,
-    uint32_t count
+    const uint32_t* __restrict__ d_count
 ) {
     const uint32_t i = blockIdx.x;
-    if (i >= count) return;
+    if (i >= *d_count) return;
     const SlzRawOff16Desc d = descs[i];
     if (d.size == 0 || d.src_offset + d.size > comp_len) return;
     const uint8_t* s = comp_base + d.src_offset;
@@ -946,7 +950,7 @@ extern "C" __global__ void slzScanParseKernel(
     uint32_t                    block_len,
     const SlzChunkDesc* __restrict__ chunks,
     const uint32_t* __restrict__ first_sub_idx,
-    uint32_t                    n_chunks,
+    const uint32_t* __restrict__ d_n_chunks,
     uint32_t                    sub_chunk_cap,
     SlzScanHuffDesc* __restrict__ st_lit,
     SlzScanHuffDesc* __restrict__ st_tok,
@@ -955,6 +959,7 @@ extern "C" __global__ void slzScanParseKernel(
     SlzScanRawDesc*  __restrict__ st_raw_hi,
     SlzScanRawDesc*  __restrict__ st_raw_lo)
 {
+    const uint32_t n_chunks = *d_n_chunks;
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_chunks) return;
 

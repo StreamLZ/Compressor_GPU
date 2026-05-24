@@ -73,10 +73,10 @@ extern "C" __global__ void slzHuffBuildLutKernel(
     const uint8_t* __restrict__ comp,
     const HuffDecChunkDesc* __restrict__ descs,
     uint32_t* __restrict__ luts,
-    uint32_t n_blocks)
+    const uint32_t* __restrict__ d_n_blocks)
 {
     const uint32_t block_id = blockIdx.x;
-    if (block_id >= n_blocks) return;
+    if (block_id >= *d_n_blocks) return;
     const int lane = threadIdx.x & (WARP_SIZE - 1);
 
     const HuffDecChunkDesc desc = descs[block_id];
@@ -279,10 +279,10 @@ extern "C" __global__ void slzHuffDecode4StreamKernel(
     const HuffDecChunkDesc* __restrict__ descs,
     const uint32_t* __restrict__ luts,
     uint8_t* __restrict__ output,
-    uint32_t n_blocks)
+    const uint32_t* __restrict__ d_n_blocks)
 {
     const uint32_t block_id = blockIdx.x;
-    if (block_id >= n_blocks) return;
+    if (block_id >= *d_n_blocks) return;
     const int lane = threadIdx.x & (WARP_SIZE - 1);
 
     const HuffDecChunkDesc desc = descs[block_id];

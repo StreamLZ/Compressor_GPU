@@ -504,6 +504,19 @@ pub const DecodeContext = struct {
     d_compact_counts: CUdeviceptr = 0,
     d_compact_counts_size: usize = 0,
 
+    // Step 7 launch-plumbing scratch: device-resident 4 B counters used
+    // to feed kernel self-gates when the GPU compact path didn't run
+    // (CPU-scan fallback). The pure-D2D path consumes d_compact_counts
+    // slots directly and never touches these.
+    d_n_raw_scratch: CUdeviceptr = 0,
+    d_n_raw_scratch_size: usize = 0,
+    d_n_huff_scratch: CUdeviceptr = 0,
+    d_n_huff_scratch_size: usize = 0,
+    d_n_chunks_scratch: CUdeviceptr = 0,
+    d_n_chunks_scratch_size: usize = 0,
+    d_n_groups_scratch: CUdeviceptr = 0,
+    d_n_groups_scratch_size: usize = 0,
+
     // Huffman descriptors + LUT.
     d_huff_descs: CUdeviceptr = 0,
     d_huff_descs_size: usize = 0,
@@ -1278,6 +1291,7 @@ fn gpuScanChunks(
     if (n == 0 or total_subchunks == 0 or first_subchunk_idx.len < n) return null;
 
     const d2h = cuMemcpyDtoH_fn orelse return null;
+    const h2d = cuMemcpyHtoD_fn orelse return null;
     const launch = cuLaunchKernel_fn orelse return null;
     const sync = cuCtxSynchronize_fn orelse return null;
     const memset = cuMemsetD8_fn orelse return null;
@@ -1303,7 +1317,12 @@ fn gpuScanChunks(
     // `total_subchunks == n_chunks` case in fullGpuLaunchImpl and
     // would feed the scan kernel a bogus prefix sum.
     var k_first = self.d_first_sub_idx_persist;
-    var k_n = n;
+    // Step 7: scan kernel self-gates on `*d_n_chunks`. Stage host n
+    // into d_n_chunks_scratch (4 B H2D).
+    if (!ensureDeviceBuf(&self.d_n_chunks_scratch, &self.d_n_chunks_scratch_size, 4)) return null;
+    var host_n_chunks: u32 = n;
+    _ = h2d(self.d_n_chunks_scratch, @ptrCast(&host_n_chunks), 4);
+    var k_n: u64 = self.d_n_chunks_scratch;
     var k_cap = sub_chunk_cap;
     var k_lit = base;
     var k_tok = base + huff_arr_bytes;
@@ -1765,18 +1784,36 @@ pub fn fullGpuLaunchImpl(
                     _ = h2d_fn(self.d_raw_off16_descs, @ptrCast(&self.raw_off16_buf), dbytes);
                     break :d_raw self.d_raw_off16_descs;
                 };
+                // Step 7: kernel self-gates on `*d_count`. Use the n_raw
+                // slot of d_compact_counts when the GPU compact ran (no
+                // D2H needed); else stage the host-known count in
+                // d_n_raw_scratch and pass that.
+                const d_count: u64 = if (scan.device_compact_populated)
+                    self.d_compact_counts + 16
+                else d_cnt: {
+                    if (!ensureDeviceBuf(&self.d_n_raw_scratch, &self.d_n_raw_scratch_size, 4))
+                        break :gather_blk;
+                    var host_n: u32 = ndesc;
+                    _ = h2d_fn(self.d_n_raw_scratch, @ptrCast(&host_n), 4);
+                    break :d_cnt self.d_n_raw_scratch;
+                };
                 {
                     var p_comp = self.d_comp_persist;
                     var p_comp_len: u32 = @intCast(compressed_block.len);
                     var p_scratch = self.d_tans_off16_scratch;
                     var p_descs = desc_dev;
-                    var p_count = ndesc;
+                    var p_count = d_count;
                     var params = [_]?*anyopaque{
                         @ptrCast(&p_comp), @ptrCast(&p_comp_len), @ptrCast(&p_scratch),
                         @ptrCast(&p_descs), @ptrCast(&p_count),
                     };
                     var extra = [_]?*anyopaque{null};
-                    if (launch_fn(gather_off16_fn, ndesc, 1, 1, 256, 1, 1, 0, 0, &params, &extra) == CUDA_SUCCESS) {
+                    // Over-launch with a safe upper bound (2 raw off16
+                    // descs per sub-chunk × walk_max_chunks * 4 sub-chunks
+                    // = 131072). Out-of-range blocks return immediately
+                    // via the self-gate above.
+                    const grid_x: u32 = ndesc; // ndesc is exact, no over-launch needed when host knows it
+                    if (launch_fn(gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, 0, &params, &extra) == CUDA_SUCCESS) {
                         _ = sync_fn();
                         break :gather_blk;
                     }
@@ -2013,11 +2050,23 @@ pub fn fullGpuLaunchImpl(
         var split_huff_build_ns: i64 = 0;
         if (have_huff) {
             const huff_stream = self.pipeline_streams[0];
+            // Step 7: huff kernels self-gate on `*d_n_blocks`. The GPU
+            // merge kernel writes n_merged to d_compact_counts+20; reuse
+            // that slot when GPU merge ran. CPU-merge fallback stages
+            // n_huff into d_n_huff_scratch via a 4 B H2D.
+            const d_n_huff: u64 = if (scan.device_compact_populated and merge_huff_descs_fn != 0)
+                self.d_compact_counts + 20
+            else d_nh: {
+                if (!ensureDeviceBuf(&self.d_n_huff_scratch, &self.d_n_huff_scratch_size, 4)) return error.BadMode;
+                var host_n_huff: u32 = n_huff;
+                _ = h2d_fn(self.d_n_huff_scratch, @ptrCast(&host_n_huff), 4);
+                break :d_nh self.d_n_huff_scratch;
+            };
             {
                 var p_comp = self.d_comp_persist;
                 var p_descs = self.d_huff_descs;
                 var p_lut = self.d_huff_lut;
-                var p_n = n_huff;
+                var p_n = d_n_huff;
                 var params = [_]?*anyopaque{
                     @ptrCast(&p_comp), @ptrCast(&p_descs),
                     @ptrCast(&p_lut), @ptrCast(&p_n),
@@ -2039,7 +2088,7 @@ pub fn fullGpuLaunchImpl(
                 var p_descs = self.d_huff_descs;
                 var p_lut = self.d_huff_lut;
                 var p_out = self.d_tans_scratch;
-                var p_n = n_huff;
+                var p_n = d_n_huff;
                 var params = [_]?*anyopaque{
                     @ptrCast(&p_comp), @ptrCast(&p_descs),
                     @ptrCast(&p_lut), @ptrCast(&p_out), @ptrCast(&p_n),
@@ -2267,6 +2316,14 @@ pub fn fullGpuLaunchImpl(
             const lz_groups_in_pipe = (group_chunks + chunks_per_group - 1) / chunks_per_group;
             const lz_grid_x = (lz_groups_in_pipe + 1) / 2;
 
+            // Step 7: LZ kernels self-gate on `*d_total_chunks`. Stage the
+            // per-pipeline-group count into d_n_groups_scratch (4 B H2D).
+            // With NUM_PIPELINE_STREAMS=1 this happens once; a multi-stream
+            // setup would need one scratch slot per stream.
+            if (!ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4)) return error.BadMode;
+            var host_per_group_total: u32 = chunk_end - chunk_start;
+            _ = h2d_fn(self.d_n_groups_scratch, @ptrCast(&host_per_group_total), 4);
+
             // Fast path: no entropy in this scan → use lean L1/L2 raw kernel.
             // Huffman literals also require the general kernel (it reads tans_scratch).
             const use_raw_kernel = merged_count == 0 and n_huff == 0 and kernel_raw_fn != 0;
@@ -2276,7 +2333,7 @@ pub fn fullGpuLaunchImpl(
                 var p_descs_dev = self.d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc);
                 var p_dst = self.d_output;
                 var p_cpg = chunks_per_group;
-                var p_total = chunk_end - chunk_start;
+                var p_total = self.d_n_groups_scratch;
                 var p_sc_cap = sub_chunk_cap;
                 var raw_params = [_]?*anyopaque{
                     @ptrCast(&p_comp),
@@ -2298,7 +2355,7 @@ pub fn fullGpuLaunchImpl(
                 var p_descs_dev = self.d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc);
                 var p_dst = self.d_output;
                 var p_cpg = chunks_per_group;
-                var p_total = chunk_end - chunk_start;
+                var p_total = self.d_n_groups_scratch;
                 var p_sc_cap = sub_chunk_cap;
                 var p_tans_scratch = self.d_tans_scratch;
                 var p_tans_slot_stride: u64 = @as(u64, total_subchunks) * 131072;
@@ -2506,12 +2563,18 @@ pub fn fullGpuLaunchImpl(
 
         const grid_x = (num_groups + 1) / 2;
 
+        // Step 7: LZ kernels self-gate on `*d_total_chunks`. Stage the
+        // frame-wide total_chunks into d_n_groups_scratch (4 B H2D).
+        if (!ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4)) return error.BadMode;
+        var host_total_chunks: u32 = total_chunks;
+        _ = h2d_fn(self.d_n_groups_scratch, @ptrCast(&host_total_chunks), 4);
+
         if (use_raw_kernel) {
             var p_comp = self.d_comp_persist;
             var p_descs_dev = self.d_descs_persist;
             var p_dst = self.d_output;
             var p_cpg = chunks_per_group;
-            var p_total: u32 = total_chunks;
+            var p_total = self.d_n_groups_scratch;
             var p_sc_cap = sub_chunk_cap;
             var raw_params = [_]?*anyopaque{
                 @ptrCast(&p_comp),
@@ -2529,7 +2592,7 @@ pub fn fullGpuLaunchImpl(
             var p_descs_dev = self.d_descs_persist;
             var p_dst = self.d_output;
             var p_cpg = chunks_per_group;
-            var p_total: u32 = total_chunks;
+            var p_total = self.d_n_groups_scratch;
             var p_sc_cap = sub_chunk_cap;
             var p_tans_scratch = self.d_tans_scratch;
             var p_tans_slot_stride: u64 = @as(u64, total_subchunks) * 131072;
