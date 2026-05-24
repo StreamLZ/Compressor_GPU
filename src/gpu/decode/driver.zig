@@ -43,6 +43,10 @@ var kernel_raw_fn: usize = 0;
 var gather_off16_fn: usize = 0;
 var scan_parse_fn: usize = 0;
 var walk_frame_fn: usize = 0;
+var prefix_sum_chunks_fn: usize = 0;
+var compact_huff_descs_fn: usize = 0;
+var compact_raw_descs_fn: usize = 0;
+var merge_huff_descs_fn: usize = 0;
 var tans_module: usize = 0;
 var tans_kernel_fn: usize = 0;
 var tans_build_fn: usize = 0;
@@ -185,6 +189,13 @@ pub fn init() bool {
     // Optional GPU frame-walk kernel (roadmap 4d Phase 3). Absent → the
     // D2D decompress path falls back to host bounce.
     _ = get_fn(&walk_frame_fn, module, "slzWalkFrameKernel");
+    // Optional GPU prefix-sum-chunks kernel (4d Phase 3 step 2). Absent
+    // → pure-D2D pipeline disabled, host computes first_sub_idx.
+    _ = get_fn(&prefix_sum_chunks_fn, module, "slzPrefixSumChunksKernel");
+    // Optional pure-D2D compaction + merge kernels (4d Phase 3 steps 4-5).
+    _ = get_fn(&compact_huff_descs_fn, module, "slzCompactHuffDescsKernel");
+    _ = get_fn(&compact_raw_descs_fn, module, "slzCompactRawDescsKernel");
+    _ = get_fn(&merge_huff_descs_fn, module, "slzMergeHuffDescsKernel");
     const t_lz = qpcNow();
 
     // Load Huffman decode kernels (Pass 1.5, for chunk_type=4 literals)
@@ -460,6 +471,15 @@ pub const DecodeContext = struct {
     d_walk_chunks_size: usize = 0,
     d_walk_meta: CUdeviceptr = 0,
     d_walk_meta_size: usize = 0,
+
+    // Pure-D2D prefix-sum scratch (step 2): d_first_sub_idx holds the
+    // per-chunk first-sub-chunk index; d_total_subchunks_buf is a single
+    // u32 with the running total (device-resident, never D2H'd on the
+    // pure path).
+    d_first_sub_idx_persist: CUdeviceptr = 0,
+    d_first_sub_idx_persist_size: usize = 0,
+    d_total_subchunks_buf: CUdeviceptr = 0,
+    d_total_subchunks_buf_size: usize = 0,
 
     // Huffman descriptors + LUT.
     d_huff_descs: CUdeviceptr = 0,
@@ -1076,53 +1096,56 @@ fn parseTansHeaderPaired(
 /// d_descs_persist. Returns null — caller keeps the CPU scan — on any
 /// failure. tANS is retired, so only the Huffman + raw-off16 outputs are
 /// produced (num_lit/num_tok/... stay 0).
-/// 4d Phase 3 GPU frame-walk result. chunk_descs is host-allocated by
-/// `gpuWalkFrameImpl` from `allocator`; caller frees. block_start /
-/// block_size give the device-byte range of the block payload — the
-/// caller passes (d_frame + block_start, block_size) as the compressed
-/// source to fullGpuLaunchImpl (D2D copy into d_comp_persist).
-pub const WalkFrameResult = struct {
-    chunk_descs: []ChunkDesc,
-    decompressed_size: u32,
-    sub_chunk_cap: u32,
-    block_start: u32,
-    block_size: u32,
+/// 4d Phase 3 step 1: GPU walk-kernel result, device-only. d_chunk_descs
+/// holds up to `walk_max_chunks` SlzChunkDesc entries; d_meta is six
+/// u32s: (n_chunks, decomp_size, sub_chunk_cap, block_start, block_size,
+/// status). Nothing is D2H'd by the walk — downstream kernels read the
+/// device pointers directly.
+pub const WalkFrameResultDev = struct {
+    d_chunk_descs: u64,
+    d_meta: u64,
+};
+pub const walk_max_chunks: u32 = 16384;
+pub const walk_meta_offsets = struct {
+    pub const n_chunks: u32 = 0;
+    pub const decomp_size: u32 = 4;
+    pub const sub_chunk_cap: u32 = 8;
+    pub const block_start: u32 = 12;
+    pub const block_size: u32 = 16;
+    pub const status: u32 = 20;
+    pub const bytes: usize = 24;
 };
 
-/// 4d Phase 3 GPU frame walk. Replaces the CPU decompressOneFrame +
-/// gpuBatchDecode walk for the slzCompress-shape frame (Fast codec, no
-/// dict, no PDM, no checksums, single block). Returns null on any
-/// unsupported feature; caller falls back to the host-bounce decode.
+/// 4d Phase 3 GPU frame walk — device-only output. Launches the walk
+/// kernel and returns the device pointers it wrote to. NO D2H. Caller
+/// either passes the device pointers to downstream kernels (true D2D
+/// path) or invokes `walkResultToHost` to copy what it needs out.
 pub fn gpuWalkFrameImpl(
     self: *DecodeContext,
-    allocator: std.mem.Allocator,
     d_frame: u64,
     frame_size: u32,
-) ?WalkFrameResult {
+) ?WalkFrameResultDev {
     if (!init()) return null;
     if (walk_frame_fn == 0) return null;
     const launch = cuLaunchKernel_fn orelse return null;
     const sync = cuCtxSynchronize_fn orelse return null;
-    const d2h = cuMemcpyDtoH_fn orelse return null;
     const memset = cuMemsetD8_fn orelse return null;
 
-    const max_chunks: u32 = 16384;
-    const chunks_bytes: usize = @as(usize, max_chunks) * @sizeOf(ChunkDesc);
-    const meta_bytes: usize = 6 * 4;
+    const chunks_bytes: usize = @as(usize, walk_max_chunks) * @sizeOf(ChunkDesc);
     if (!ensureDeviceBuf(&self.d_walk_chunks, &self.d_walk_chunks_size, chunks_bytes)) return null;
-    if (!ensureDeviceBuf(&self.d_walk_meta, &self.d_walk_meta_size, meta_bytes)) return null;
-    _ = memset(self.d_walk_meta, 0, meta_bytes);
+    if (!ensureDeviceBuf(&self.d_walk_meta, &self.d_walk_meta_size, walk_meta_offsets.bytes)) return null;
+    _ = memset(self.d_walk_meta, 0, walk_meta_offsets.bytes);
 
     var k_frame = d_frame;
     var k_size = frame_size;
     var k_chunks = self.d_walk_chunks;
-    var k_max = max_chunks;
-    var k_meta_n: u64 = self.d_walk_meta;
-    var k_meta_decomp: u64 = self.d_walk_meta + 4;
-    var k_meta_sccap: u64 = self.d_walk_meta + 8;
-    var k_meta_bstart: u64 = self.d_walk_meta + 12;
-    var k_meta_bsize: u64 = self.d_walk_meta + 16;
-    var k_meta_status: u64 = self.d_walk_meta + 20;
+    var k_max = walk_max_chunks;
+    var k_meta_n: u64 = self.d_walk_meta + walk_meta_offsets.n_chunks;
+    var k_meta_decomp: u64 = self.d_walk_meta + walk_meta_offsets.decomp_size;
+    var k_meta_sccap: u64 = self.d_walk_meta + walk_meta_offsets.sub_chunk_cap;
+    var k_meta_bstart: u64 = self.d_walk_meta + walk_meta_offsets.block_start;
+    var k_meta_bsize: u64 = self.d_walk_meta + walk_meta_offsets.block_size;
+    var k_meta_status: u64 = self.d_walk_meta + walk_meta_offsets.status;
     var params = [_]?*anyopaque{
         @ptrCast(&k_frame),       @ptrCast(&k_size),
         @ptrCast(&k_chunks),      @ptrCast(&k_max),
@@ -1134,29 +1157,75 @@ pub fn gpuWalkFrameImpl(
     if (launch(walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return null;
     if (sync() != CUDA_SUCCESS) return null;
 
-    var meta: [6]u32 = .{0} ** 6;
-    _ = d2h(@ptrCast(&meta), self.d_walk_meta, meta_bytes);
-    const n_chunks = meta[0];
-    const decomp_size = meta[1];
-    const sub_chunk_cap = meta[2];
-    const block_start = meta[3];
-    const block_size = meta[4];
-    const status = meta[5];
-    if (std.c.getenv("SLZ_E2E_TIMER") != null)
-        std.debug.print("[walk] n_chunks={d} decomp={d} block_start={d} block_size={d} status={d}\n", .{ n_chunks, decomp_size, block_start, block_size, status });
-    if (status != 0) return null;
-    if (n_chunks == 0 or n_chunks > max_chunks) return null;
+    return .{
+        .d_chunk_descs = self.d_walk_chunks,
+        .d_meta = self.d_walk_meta,
+    };
+}
 
-    const chunks = allocator.alloc(ChunkDesc, n_chunks) catch return null;
-    const chunks_actual_bytes = @as(usize, n_chunks) * @sizeOf(ChunkDesc);
-    _ = d2h(@ptrCast(chunks.ptr), self.d_walk_chunks, chunks_actual_bytes);
+/// Host-side mirror of the walk kernel's meta. Used only by code paths
+/// that still need the values on the host (the legacy / fallback
+/// decompress entries). The pure-D2D path never calls this.
+pub const WalkMeta = struct {
+    n_chunks: u32,
+    decomp_size: u32,
+    sub_chunk_cap: u32,
+    block_start: u32,
+    block_size: u32,
+    status: u32,
+};
+
+/// 4d Phase 3 step 2: device-side prefix sum of per-chunk sub-chunk
+/// counts. Reads (d_chunk_descs, d_n_chunks, d_sub_chunk_cap) — all
+/// device-resident — and writes (d_first_sub_idx, d_total_subchunks).
+/// No D2H, no CPU work. Returns the populated device pointers; the
+/// driver never reads them on the host.
+pub const PrefixSumResultDev = struct {
+    d_first_sub_idx: u64,
+    d_total_subchunks: u64,
+};
+
+pub fn gpuPrefixSumChunksImpl(
+    self: *DecodeContext,
+    d_chunk_descs: u64,
+    d_n_chunks: u64,
+    d_sub_chunk_cap: u64,
+) ?PrefixSumResultDev {
+    if (!init()) return null;
+    if (prefix_sum_chunks_fn == 0) return null;
+    const launch = cuLaunchKernel_fn orelse return null;
+    const sync = cuCtxSynchronize_fn orelse return null;
+
+    const first_bytes: usize = @as(usize, walk_max_chunks) * 4;
+    if (!ensureDeviceBuf(&self.d_first_sub_idx_persist, &self.d_first_sub_idx_persist_size, first_bytes)) return null;
+    if (!ensureDeviceBuf(&self.d_total_subchunks_buf, &self.d_total_subchunks_buf_size, 4)) return null;
+
+    var k_chunks = d_chunk_descs;
+    var k_n = d_n_chunks;
+    var k_cap = d_sub_chunk_cap;
+    var k_first = self.d_first_sub_idx_persist;
+    var k_total = self.d_total_subchunks_buf;
+    var params = [_]?*anyopaque{
+        @ptrCast(&k_chunks), @ptrCast(&k_n), @ptrCast(&k_cap),
+        @ptrCast(&k_first), @ptrCast(&k_total),
+    };
+    var extra = [_]?*anyopaque{null};
+    if (launch(prefix_sum_chunks_fn, 1, 1, 1, 1, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return null;
+    if (sync() != CUDA_SUCCESS) return null;
 
     return .{
-        .chunk_descs = chunks,
-        .decompressed_size = decomp_size,
-        .sub_chunk_cap = sub_chunk_cap,
-        .block_start = block_start,
-        .block_size = block_size,
+        .d_first_sub_idx = self.d_first_sub_idx_persist,
+        .d_total_subchunks = self.d_total_subchunks_buf,
+    };
+}
+
+pub fn walkMetaToHost(d_meta: u64) ?WalkMeta {
+    const d2h = cuMemcpyDtoH_fn orelse return null;
+    var m: [6]u32 = .{0} ** 6;
+    _ = d2h(@ptrCast(&m), d_meta, walk_meta_offsets.bytes);
+    return .{
+        .n_chunks = m[0], .decomp_size = m[1], .sub_chunk_cap = m[2],
+        .block_start = m[3], .block_size = m[4], .status = m[5],
     };
 }
 

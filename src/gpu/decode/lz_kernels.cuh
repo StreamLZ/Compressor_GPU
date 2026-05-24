@@ -591,8 +591,10 @@ extern "C" __global__ void slzWalkFrameKernel(
         if (uncompressed_block) {
             if (pos + decomp_size > frame_size) { *d_status = 12; return; }
             if (n_chunks >= max_chunks) { *d_status = 11; return; }
-            // src_offset is block-payload-relative.
-            d_chunks[n_chunks] = { 0, decomp_size, decomp_size, dst_off, 1u, 0, {0, 0, 0} };
+            // src_offset is FRAME-ABSOLUTE — downstream kernels read
+            // d_frame (or a D2D copy of it) + src_offset directly. The
+            // pure-D2D pipeline can therefore skip block_start juggling.
+            d_chunks[n_chunks] = { block_payload_start, decomp_size, decomp_size, dst_off, 1u, 0, {0, 0, 0} };
             n_chunks++;
             dst_off += decomp_size;
             pos += comp_size;
@@ -638,8 +640,8 @@ extern "C" __global__ void slzWalkFrameKernel(
                 if (pos + comp > block_end) { *d_status = 12; return; }
                 if (n_chunks >= max_chunks) { *d_status = 11; return; }
                 const uint32_t flg = (comp == dst_this) ? 1u : 0u;
-                // src_offset is BLOCK-PAYLOAD-relative — matches gpuBatchDecode.
-                d_chunks[n_chunks] = { pos - block_payload_start, comp, dst_this, dst_off, flg, 0, {0, 0, 0} };
+                // src_offset is FRAME-ABSOLUTE (see header comment above).
+                d_chunks[n_chunks] = { pos, comp, dst_this, dst_off, flg, 0, {0, 0, 0} };
                 n_chunks++;
                 pos += comp;
             } else if (chunk_type == 1) {
@@ -666,6 +668,171 @@ extern "C" __global__ void slzWalkFrameKernel(
     *d_sub_chunk_cap = sub_chunk_cap;
 }
 
+// ── Compact-huff-descs / Compact-raw-descs (4d Phase 3 step 4) ─────
+// Single-threaded device-side compaction of the scan kernel's staged
+// arrays. Each (slzScanParseKernel-produced) staged entry has a `valid`
+// flag; the compaction drops invalid entries and assigns a sequential
+// lut_offset = slot * 1024 (mirrors HUFF_LUT_ENTRIES in driver.zig).
+// Used by the pure-D2D pipeline to eliminate the CPU compaction loop
+// that gpuScanChunks used to do after a D2H of the staged data.
+
+// HuffDecChunkDesc output struct — must match the Zig HuffDecChunkDesc
+// (and huffman_kernel.cu's local definition). 5 u32 = 20 bytes.
+struct SlzHuffDecChunkDesc {
+    uint32_t in_offset, in_size, out_offset, out_size, lut_offset;
+};
+static_assert(sizeof(SlzHuffDecChunkDesc) == 20, "ABI: keep in sync with decode/driver.zig");
+
+// Staged scan output (used by the compact kernels and slzScanParseKernel
+// below). chunk_type=4 Huffman stream descriptor — staged form:
+// lut_offset is assigned by the compact step, not the scan kernel.
+struct SlzScanHuffDesc { uint32_t in_offset, in_size, out_offset, out_size, valid; };
+struct SlzScanRawDesc  { uint32_t src_offset, size, gpu_offset, valid; };
+static_assert(sizeof(SlzScanHuffDesc) == 20, "ABI: keep in sync with decode/driver.zig");
+static_assert(sizeof(SlzScanRawDesc) == 16, "ABI: keep in sync with decode/driver.zig");
+
+extern "C" __global__ void slzCompactHuffDescsKernel(
+    const SlzScanHuffDesc* __restrict__ d_staged,
+    const uint32_t* __restrict__         d_total_subs,
+    SlzHuffDecChunkDesc* __restrict__    d_out,
+    uint32_t* __restrict__               d_n_out)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const uint32_t tot = *d_total_subs;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < tot; i++) {
+        const SlzScanHuffDesc s = d_staged[i];
+        if (s.valid != 0) {
+            d_out[k].in_offset  = s.in_offset;
+            d_out[k].in_size    = s.in_size;
+            d_out[k].out_offset = s.out_offset;
+            d_out[k].out_size   = s.out_size;
+            d_out[k].lut_offset = k * 1024u; // HUFF_LUT_ENTRIES
+            k++;
+        }
+    }
+    *d_n_out = k;
+}
+
+extern "C" __global__ void slzCompactRawDescsKernel(
+    const SlzScanRawDesc* __restrict__ d_staged_hi,
+    const SlzScanRawDesc* __restrict__ d_staged_lo,
+    const uint32_t* __restrict__       d_total_subs,
+    SlzRawOff16Desc* __restrict__      d_out,
+    uint32_t* __restrict__             d_n_out)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const uint32_t tot = *d_total_subs;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < tot; i++) {
+        const SlzScanRawDesc hi = d_staged_hi[i];
+        if (hi.valid != 0) {
+            d_out[k].src_offset = hi.src_offset;
+            d_out[k].size       = hi.size;
+            d_out[k].gpu_offset = hi.gpu_offset;
+            k++;
+        }
+        const SlzScanRawDesc lo = d_staged_lo[i];
+        if (lo.valid != 0) {
+            d_out[k].src_offset = lo.src_offset;
+            d_out[k].size       = lo.size;
+            d_out[k].gpu_offset = lo.gpu_offset;
+            k++;
+        }
+    }
+    *d_n_out = k;
+}
+
+// ── Merge-huff-descs kernel (4d Phase 3 step 5) ────────────────────
+// Combines four per-stream compacted SlzHuffDecChunkDesc arrays into a
+// single merged array, adding the per-stream region offset (lit=0,
+// tok=tok_region, off16hi/lo=off16_region) to out_offset and assigning
+// sequential lut_offsets across the union (lit slots 0..n_lit-1, tok
+// slots n_lit..n_lit+n_tok-1, etc.). Mirrors the CPU `append` loop in
+// fullGpuLaunchImpl.
+//
+// Stream regions (4 entries): each {src, n, region_off}. Each block
+// handles one region in its lane-0; per-block prefix is computed via a
+// pre-pass on lane 0.
+extern "C" __global__ void slzMergeHuffDescsKernel(
+    const SlzHuffDecChunkDesc* __restrict__ d_lit,
+    const SlzHuffDecChunkDesc* __restrict__ d_tok,
+    const SlzHuffDecChunkDesc* __restrict__ d_hi,
+    const SlzHuffDecChunkDesc* __restrict__ d_lo,
+    const uint32_t* __restrict__            d_n_lit,
+    const uint32_t* __restrict__            d_n_tok,
+    const uint32_t* __restrict__            d_n_hi,
+    const uint32_t* __restrict__            d_n_lo,
+    uint32_t                                tok_region_off,
+    uint32_t                                off16_region_off,
+    SlzHuffDecChunkDesc* __restrict__       d_merged,
+    uint32_t* __restrict__                  d_n_merged)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const uint32_t n_lit = *d_n_lit;
+    const uint32_t n_tok = *d_n_tok;
+    const uint32_t n_hi  = *d_n_hi;
+    const uint32_t n_lo  = *d_n_lo;
+    uint32_t lut_slot = 0;
+    for (uint32_t i = 0; i < n_lit; i++) {
+        SlzHuffDecChunkDesc d = d_lit[i];
+        d.lut_offset = lut_slot * 1024u;
+        d_merged[lut_slot] = d;
+        lut_slot++;
+    }
+    for (uint32_t i = 0; i < n_tok; i++) {
+        SlzHuffDecChunkDesc d = d_tok[i];
+        d.out_offset += tok_region_off;
+        d.lut_offset = lut_slot * 1024u;
+        d_merged[lut_slot] = d;
+        lut_slot++;
+    }
+    for (uint32_t i = 0; i < n_hi; i++) {
+        SlzHuffDecChunkDesc d = d_hi[i];
+        d.out_offset += off16_region_off;
+        d.lut_offset = lut_slot * 1024u;
+        d_merged[lut_slot] = d;
+        lut_slot++;
+    }
+    for (uint32_t i = 0; i < n_lo; i++) {
+        SlzHuffDecChunkDesc d = d_lo[i];
+        d.out_offset += off16_region_off;
+        d.lut_offset = lut_slot * 1024u;
+        d_merged[lut_slot] = d;
+        lut_slot++;
+    }
+    *d_n_merged = lut_slot;
+}
+
+// ── Prefix-sum-chunks kernel (roadmap 4d Phase 3 step 2) ───────────
+// Computes the per-chunk first-sub-chunk index plus the total
+// sub-chunk count, on device. Single-threaded sequential sum — n is
+// bounded by walk_max_chunks (16384), so trivial wall-time and not
+// worth a parallel scan. Replaces the CPU first_subchunk_idx loop in
+// fullGpuLaunchImpl on the pure-D2D path.
+extern "C" __global__ void slzPrefixSumChunksKernel(
+    const SlzChunkDesc* __restrict__ d_chunks,
+    const uint32_t* __restrict__     d_n_chunks,
+    const uint32_t* __restrict__     d_cap,
+    uint32_t* __restrict__            d_first_sub_idx,
+    uint32_t* __restrict__            d_total_subchunks)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const uint32_t n = *d_n_chunks;
+    uint32_t cap = *d_cap;
+    if (cap == 0) cap = 65536u;
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        d_first_sub_idx[i] = total;
+        const SlzChunkDesc ch = d_chunks[i];
+        const uint32_t n_subs = (ch.flags != 0 || ch.decomp_size == 0)
+            ? 1u
+            : (ch.decomp_size + cap - 1u) / cap;
+        total += n_subs;
+    }
+    *d_total_subchunks = total;
+}
+
 // ── Decode-scan kernel (roadmap 4d Phase 2) ─────────────────────────
 // GPU port of scanForTansChunks (decode/driver.zig): one thread per
 // chunk walks every sub-chunk's literal / token / off16 stream headers
@@ -674,12 +841,8 @@ extern "C" __global__ void slzWalkFrameKernel(
 // absent slots, assigns lut_offset). Verified byte-identical to the CPU
 // scan in tools/huff_test/scan_test.cu across enwik8 + silesia L3-L5.
 
-// chunk_type=4 Huffman stream descriptor — staged form: lut_offset is
-// assigned by the host compaction, not the kernel.
-struct SlzScanHuffDesc { uint32_t in_offset, in_size, out_offset, out_size, valid; };
-struct SlzScanRawDesc  { uint32_t src_offset, size, gpu_offset, valid; };
-static_assert(sizeof(SlzScanHuffDesc) == 20, "ABI: keep in sync with decode/driver.zig");
-static_assert(sizeof(SlzScanRawDesc) == 16, "ABI: keep in sync with decode/driver.zig");
+// SlzScanHuffDesc + SlzScanRawDesc defined earlier in the compact
+// section so the compact kernels can reference them.
 
 static constexpr uint32_t SCAN_SUBCHUNK_SLOT = 131072; // sub_dst_off stride
 static constexpr uint32_t SCAN_OFF16_LO_SLOT = 65536;  // lo half within slot

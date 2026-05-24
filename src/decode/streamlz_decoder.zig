@@ -107,37 +107,51 @@ pub fn decompressFramedFromDevice(
     d_output: u64,
     dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!u32 {
-    const result = gpu_driver.gpuWalkFrameImpl(dec_ctx, allocator, d_frame, frame_size) orelse return error.BadMode;
-    defer allocator.free(result.chunk_descs);
+    // Step 1: walk kernel — device-only result, no D2H inside the launch.
+    const dev = gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size) orelse return error.BadMode;
+    // Legacy bridge — until fullGpuLaunchImpl becomes a pure launcher
+    // (steps 2-5) it still wants host values + a host chunk_descs slice.
+    // Pull them explicitly here; subsequent steps eliminate each.
+    const meta = gpu_driver.walkMetaToHost(dev.d_meta) orelse return error.BadMode;
+    if (meta.status != 0) return error.BadMode;
+    if (meta.n_chunks == 0 or meta.n_chunks > gpu_driver.walk_max_chunks) return error.BadMode;
+    const chunks = allocator.alloc(gpu_driver.ChunkDesc, meta.n_chunks) catch return error.OutOfMemory;
+    defer allocator.free(chunks);
+    {
+        const d2h = @import("../gpu/decode/driver.zig");
+        if (!d2h.copyDeviceToHost(std.mem.sliceAsBytes(chunks), dev.d_chunk_descs)) return error.BadMode;
+    }
+    if (std.c.getenv("SLZ_E2E_TIMER") != null)
+        std.debug.print("[walk] n_chunks={d} decomp={d} block_start={d} block_size={d} status={d}\n", .{ meta.n_chunks, meta.decomp_size, meta.block_start, meta.block_size, meta.status });
 
-    // -gpu output is single-block / sc_group=0.25, every chunk its own
-    // group. The walk kernel rejects anything else (status 13), so a
-    // successful result implies these.
-    const num_groups: u32 = @intCast(result.chunk_descs.len);
+    const num_groups: u32 = meta.n_chunks;
     const chunks_per_group: u32 = 1;
 
-    // Stub `compressed_block` slice — `.len` is real; `.ptr` is unused
-    // when d_compressed_src is set. Sentinel triggers a segfault on
-    // accidental host-side read (debugging signal).
+    // src_offsets in chunks are now FRAME-ABSOLUTE — pass d_frame itself
+    // as the device source, and size up the buffer to cover the block
+    // payload (block_start + block_size). The decode kernels read
+    // d_comp_persist[chunk.src_offset], which after the D2D copy holds
+    // the full frame bytes up through the block end.
+    const cover_size: u32 = meta.block_start + meta.block_size;
     const stub_ptr: [*]const u8 = @ptrFromInt(0x10);
-    const compressed_block: []const u8 = stub_ptr[0..result.block_size];
+    const compressed_block: []const u8 = stub_ptr[0..cover_size];
 
     var dst_dummy: u8 = 0;
     gpu_driver.fullGpuLaunchImpl(
         dec_ctx,
-        result.chunk_descs,
+        chunks,
         compressed_block,
-        @ptrCast(&dst_dummy), // dst_full — unused when d_output_target set
+        @ptrCast(&dst_dummy),
         0,
-        result.decompressed_size,
+        meta.decomp_size,
         num_groups,
         chunks_per_group,
-        result.sub_chunk_cap,
+        meta.sub_chunk_cap,
         io,
-        d_output, // d_output_target: D2D-write decoded bytes to caller's buffer
-        d_frame + result.block_start, // d_compressed_src: D2D-copy frame bytes in
+        d_output,
+        d_frame, // d_compressed_src: frame-absolute — no +block_start
     ) catch |err| return err;
-    return result.decompressed_size;
+    return meta.decomp_size;
 }
 
 /// 4d Phase 3 device-resident decode. `src` is a host-readable mirror of
