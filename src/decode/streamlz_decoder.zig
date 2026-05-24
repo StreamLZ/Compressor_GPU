@@ -73,7 +73,7 @@ pub fn decompressFramedParallel(
     dst: []u8,
     dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!usize {
-    const r = try decompressFramedInner(allocator, null, src, dst, 0, dec_ctx);
+    const r = try decompressFramedInner(allocator, null, src, dst, 0, dec_ctx, null);
     if (r.offset > 0 and r.written > 0) {
         std.mem.copyForwards(u8, dst[0..r.written], dst[r.offset..][0..r.written]);
     }
@@ -88,7 +88,28 @@ pub fn decompressFramedParallelThreaded(
     max_threads: usize,
     dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!DecompressResult {
-    return decompressFramedInner(allocator, io, src, dst, max_threads, dec_ctx);
+    return decompressFramedInner(allocator, io, src, dst, max_threads, dec_ctx, null);
+}
+
+/// 4d Phase 3 device-resident decode. `src` is a host-readable mirror of
+/// the compressed frame (the CPU needs the bytes to walk frame/block/
+/// chunk headers — caller D2H's into a host buffer once). The decoded
+/// bytes are D2D-copied to `d_output + dst_off` for each block — never
+/// touching the host output side. Every block must be GPU-decodable;
+/// returns error.BadMode if any block requires the CPU fallback path,
+/// so the caller can retry via the host-bounce path.
+pub fn decompressFramedParallelToDevice(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    src: []const u8,
+    d_output: u64,
+    max_threads: usize,
+    dec_ctx: *gpu_driver.DecodeContext,
+) DecompressError!DecompressResult {
+    const r = try decompressFramedInner(allocator, io, src, &[_]u8{}, max_threads, dec_ctx, d_output);
+    if (std.c.getenv("SLZ_E2E_TIMER") != null)
+        std.debug.print("[d2d] decompressFramedParallelToDevice wrote {d} bytes to device\n", .{r.written});
+    return r;
 }
 
 /// Reusable decompression context that keeps configuration across
@@ -136,7 +157,7 @@ pub const DecompressContext = struct {
         while (src_pos < src.len) {
             const piece_src = src[src_pos..];
             const piece_dst = dst[dst_off..];
-            const pair = try decompressOneFrame(self.allocator, self.io, piece_src, piece_dst, self.max_threads, self.dec_ctx);
+            const pair = try decompressOneFrame(self.allocator, self.io, piece_src, piece_dst, self.max_threads, self.dec_ctx, null);
             src_pos += pair.src_consumed;
             if (dict_off == 0 and pair.dst_offset > 0) dict_off = pair.dst_offset;
             dst_off += pair.dst_offset + pair.dst_written;
@@ -157,6 +178,12 @@ fn decompressFramedInner(
     dst: []u8,
     max_threads: usize,
     dec_ctx: *gpu_driver.DecodeContext,
+    /// 4d Phase 3: when non-null, the GPU decode path D2D-copies decoded
+    /// bytes to `d_output_target + dst_off` instead of D2H-copying into
+    /// `dst`. Non-GPU dispatch paths (uncompressed blocks, CPU fallback,
+    /// Vulkan) cannot satisfy this contract; the inner loop returns
+    /// error.BadMode if it has to fall back to a non-GPU branch.
+    d_output_target: ?u64,
 ) DecompressError!DecompressResult {
     if (src.len == 0) return .{ .written = 0, .offset = 0 };
 
@@ -171,7 +198,11 @@ fn decompressFramedInner(
     while (src_pos < src.len) {
         const piece_src = src[src_pos..];
         const piece_dst = dst[dst_off..];
-        const pair = try decompressOneFrame(allocator_opt, io_opt, piece_src, piece_dst, max_threads, dec_ctx);
+        // Pre-shift d_output_target by dst_off so the inner block loop
+        // can keep its dst_off relative to the piece (matches the host
+        // `dst` slicing one line above).
+        const piece_dev_target = if (d_output_target) |t| t + dst_off else null;
+        const pair = try decompressOneFrame(allocator_opt, io_opt, piece_src, piece_dst, max_threads, dec_ctx, piece_dev_target);
         src_pos += pair.src_consumed;
         if (dict_off == 0 and pair.dst_offset > 0) dict_off = pair.dst_offset;
         dst_off += pair.dst_offset + pair.dst_written;
@@ -193,12 +224,20 @@ fn decompressOneFrame(
     dst: []u8,
     max_threads: usize,
     dec_ctx: *gpu_driver.DecodeContext,
+    /// 4d Phase 3: see decompressFramedInner. Forwarded as-is to the
+    /// per-block dispatch — null = legacy host-output path.
+    d_output_target: ?u64,
 ) DecompressError!FrameResult {
     if (src.len == 0) return .{ .src_consumed = 0, .dst_written = 0 };
 
     const hdr = frame.parseHeader(src) catch return error.BadFrame;
 
     const dict_mod = @import("../dict/dictionary.zig");
+
+    // 4d Phase 3 D2D: dictionary frames aren't supported (the prefix
+    // copy below targets the host dst, which the caller did not supply).
+    // Bail with BadMode so the wrapper falls back to the host-bounce.
+    if (d_output_target != null and hdr.dictionary_id != null) return error.BadMode;
 
     if (hdr.content_size) |cs| {
         if (cs > max_content_size) return error.ContentSizeTooLarge;
@@ -209,7 +248,10 @@ fn decompressOneFrame(
             if (dict_mod.findById(did)) |d| d.data.len + safe_space else 0
         else
             0;
-        if (dst.len < needed + dict_overhead) return error.OutputTooSmall;
+        // Skip the host-dst size check on the D2D path — the caller's
+        // device buffer is sized separately and `dst` is intentionally
+        // empty in that mode.
+        if (d_output_target == null and dst.len < needed + dict_overhead) return error.OutputTooSmall;
     }
 
     var pos: usize = hdr.header_size;
@@ -290,11 +332,18 @@ fn decompressOneFrame(
 
         if (block_hdr.uncompressed) {
             if (pos + block_hdr.decompressed_size > src.len) return error.BlockDataTruncated;
-            if (dst_off + block_hdr.decompressed_size > dst.len) return error.OutputTooSmall;
-            @memcpy(
-                dst[dst_off..][0..block_hdr.decompressed_size],
-                src[pos..][0..block_hdr.decompressed_size],
-            );
+            // D2D output (4d Phase 3): H2D the uncompressed block straight
+            // into the caller's device buffer; the host `dst` is unused.
+            if (d_output_target) |dev_target| {
+                if (!gpu_driver.copyHostToDevice(dev_target + dst_off, src[pos..][0..block_hdr.decompressed_size]))
+                    return error.BadMode;
+            } else {
+                if (dst_off + block_hdr.decompressed_size > dst.len) return error.OutputTooSmall;
+                @memcpy(
+                    dst[dst_off..][0..block_hdr.decompressed_size],
+                    src[pos..][0..block_hdr.decompressed_size],
+                );
+            }
             dst_off += block_hdr.decompressed_size;
             pos += block_hdr.compressed_size;
             continue;
@@ -328,7 +377,7 @@ fn decompressOneFrame(
             const prefix_sz: usize = if (peek.self_contained and num_chunks_est > 1) (num_chunks_est - 1) * 8 else 0;
             const block_payload = block_src[0 .. block_src.len - prefix_sz];
 
-            gpuBatchDecode(block_payload, dst, dst_off, block_hdr.decompressed_size, hdr.sc_group_size, &scratch, io_opt, dec_ctx) catch |err| {
+            gpuBatchDecode(block_payload, dst, dst_off, block_hdr.decompressed_size, hdr.sc_group_size, &scratch, io_opt, dec_ctx, d_output_target) catch |err| {
                 std.debug.print("GPU decode FAILED (NO FALLBACK): {s}\n", .{@errorName(err)});
                 return error.BadMode;
             };
@@ -341,7 +390,14 @@ fn decompressOneFrame(
                     const cdst = dst_off - block_hdr.decompressed_size + (pi + 1) * eff_cs_gpu;
                     var csz: usize = 8;
                     if ((pi + 1) * eff_cs_gpu + csz > block_hdr.decompressed_size) csz = block_hdr.decompressed_size - (pi + 1) * eff_cs_gpu;
-                    @memcpy(dst[cdst..][0..csz], prefix_base[pi * 8 ..][0..csz]);
+                    // D2D output (4d Phase 3): patch the sub-chunk prefix
+                    // bytes onto the device-resident output directly.
+                    if (d_output_target) |dev_target| {
+                        if (!gpu_driver.copyHostToDevice(dev_target + cdst, prefix_base[pi * 8 ..][0..csz]))
+                            return error.BadMode;
+                    } else {
+                        @memcpy(dst[cdst..][0..csz], prefix_base[pi * 8 ..][0..csz]);
+                    }
                 }
             }
             dispatched_parallel = true;
@@ -435,6 +491,10 @@ fn decompressOneFrame(
         }
 
         if (!dispatched_parallel) {
+            // D2D output (4d Phase 3) requires the GPU dispatch to take
+            // every block; the serial CPU path would write into the host
+            // `dst`, which the caller did not supply. Caller falls back.
+            if (d_output_target != null) return error.BadMode;
             // Compressed block — iterate 256 KB chunks inside serially.
             try decompressCompressedBlock(
                 block_src,
@@ -726,7 +786,7 @@ fn decompressCompressedBlock(
     if (use_gpu and sc_group_size <= 1.0) gpu_batch: {
         const gpu = @import("../gpu/decode/driver.zig");
         if (!gpu.isAvailable()) break :gpu_batch;
-        gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, sc_group_size, scratch, null, dec_ctx) catch {
+        gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, sc_group_size, scratch, null, dec_ctx, null) catch {
             break :gpu_batch;
         };
         dst_off_inout.* = sc_start_dst_off + decompressed_size;
@@ -931,6 +991,10 @@ fn gpuBatchDecode(
     scratch: []u8,
     io_opt: ?std.Io,
     dec_ctx: *gpu_driver.DecodeContext,
+    /// 4d Phase 3: when non-null, the decoder D2D-copies the decoded
+    /// bytes to `d_output_target + dst_start_off` instead of D2H-copying
+    /// to `dst + dst_start_off` — `dst` is then unused for the payload.
+    d_output_target: ?u64,
 ) DecompressError!void {
     _ = scratch;
     const gpu = @import("../gpu/decode/driver.zig");
@@ -1058,6 +1122,7 @@ fn gpuBatchDecode(
         chunks_per_group,
         eff_sc_cap,
         io_opt,
+        d_output_target,
     );
 }
 

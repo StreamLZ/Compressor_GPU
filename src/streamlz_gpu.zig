@@ -98,6 +98,33 @@ fn decompressCore(h: *Context, frame_bytes: []const u8, output: []u8) c_int {
     return @intCast(r.written);
 }
 
+/// 4d Phase 3 device-resident decode: the decoded bytes are D2D-copied
+/// straight into the caller's device output buffer (no host bounce on
+/// the output). The CPU still needs the frame bytes (host-readable) to
+/// walk frame/block/chunk headers — full GPU-side header walk is a
+/// follow-up. Returns -1 on the GPU-only contract failing so the caller
+/// can fall back to the host-bounce path.
+fn decompressCoreD2D(h: *Context, frame_bytes: []const u8, d_output: u64) c_int {
+    const r = decoder.decompressFramedParallelToDevice(
+        allocator,
+        null,
+        frame_bytes,
+        d_output,
+        0,
+        &h.dec,
+    ) catch |err| return switch (err) {
+        error.BadMode => -1, // signal "fall back"
+        else => mapDecompressError(err),
+    };
+    // For a frame with a dictionary prefix, the decoded content sits at
+    // d_output[r.offset..r.offset+r.written]. The library API contract
+    // returns the *content* size, so callers expect the bytes at
+    // d_output[0..]. Dictionary frames aren't supported on the D2D path
+    // for now — return -1 to fall back.
+    if (r.offset > 0) return -1;
+    return @intCast(r.written);
+}
+
 // ── Worker jobs ───────────────────────────────────────────────────────
 // `d_src`/`d_dst` are 0 for the host->host path, or device addresses for
 // the device->device path (then `src` aliases an internal bounce buffer
@@ -156,6 +183,37 @@ const DecompressJob = struct {
             return;
         }
         if (j.d_dst != 0 and !gpu_driver.copyHostToDevice(j.d_dst, j.dst[0..@intCast(rc)])) {
+            j.result = SLZ_ERROR_CUDA;
+            return;
+        }
+        j.result = rc;
+    }
+};
+
+/// 4d Phase 3 D2D decompress worker: D2H the frame into a host scratch
+/// (CPU header walk needs it), then decompress directly to the caller's
+/// device output via decompressCoreD2D (D2D output, no host bounce).
+/// On a -1 return the caller falls back to `DecompressJob`'s host path.
+const DecompressJobD2D = struct {
+    h: *Context,
+    host_frame: []u8,
+    d_src: u64,
+    d_dst: u64,
+    result: c_int = SLZ_ERROR_CUDA,
+    fall_back: bool = false,
+
+    fn run(j: *DecompressJobD2D) void {
+        if (!gpu_driver.bindContextToCallingThread()) {
+            j.result = SLZ_ERROR_CUDA;
+            return;
+        }
+        if (!gpu_driver.copyDeviceToHost(j.host_frame, j.d_src)) {
+            j.result = SLZ_ERROR_CUDA;
+            return;
+        }
+        const rc = decompressCoreD2D(j.h, j.host_frame, j.d_dst);
+        if (rc == -1) {
+            j.fall_back = true;
             j.result = SLZ_ERROR_CUDA;
             return;
         }
@@ -387,6 +445,25 @@ export fn slzDecompress(
 
     const host_frame = allocator.alloc(u8, frame_size) catch return SLZ_ERROR_OUT_OF_MEMORY;
     defer allocator.free(host_frame);
+
+    // 4d Phase 3 D2D path: D2H the frame to host (CPU header walk needs
+    // it), then decompress directly to the caller's device output — no
+    // host output bounce. Falls back to the legacy host-bounce path if
+    // the frame requires a CPU-only block decoder or carries a dict.
+    var d2d_job = DecompressJobD2D{
+        .h = h,
+        .host_frame = host_frame,
+        .d_src = @intFromPtr(frame_dev),
+        .d_dst = @intFromPtr(out_dev),
+    };
+    const rc_d2d = runOnWorker(DecompressJobD2D, &d2d_job);
+    if (rc_d2d >= 0) {
+        out_size.* = @intCast(rc_d2d);
+        return SLZ_SUCCESS;
+    }
+    if (!d2d_job.fall_back) return rc_d2d;
+
+    // Fallback: host-bounce output. Reuses the already-D2H'd host_frame.
     const host_out = allocator.alloc(u8, output_capacity) catch return SLZ_ERROR_OUT_OF_MEMORY;
     defer allocator.free(host_out);
 
@@ -394,7 +471,7 @@ export fn slzDecompress(
         .h = h,
         .src = host_frame,
         .dst = host_out,
-        .d_src = @intFromPtr(frame_dev),
+        .d_src = 0, // host_frame already populated by the D2D try
         .d_dst = @intFromPtr(out_dev),
     };
     const rc = runOnWorker(DecompressJob, &job);

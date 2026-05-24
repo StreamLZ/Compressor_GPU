@@ -1215,9 +1215,14 @@ pub fn fullGpuLaunch(
         chunks_per_group,
         sub_chunk_cap,
         io,
+        null,
     );
 }
 
+/// Roadmap 4d Phase 3 device-resident decode output. When non-null the
+/// decoded bytes are D2D-copied to `d_output_target + dst_start_off`
+/// instead of D2H-copied to `dst_full + dst_start_off`. `dst_full` is
+/// ignored in that mode (the caller may pass `undefined`).
 pub fn fullGpuLaunchImpl(
     self: *DecodeContext,
     chunk_descs: []const ChunkDesc,
@@ -1229,6 +1234,7 @@ pub fn fullGpuLaunchImpl(
     chunks_per_group: u32,
     sub_chunk_cap: u32,
     io: ?std.Io,
+    d_output_target: ?u64,
 ) GpuError!void {
     if (!init() or kernel_fn == 0) return error.BadMode;
 
@@ -2193,7 +2199,19 @@ pub fn fullGpuLaunchImpl(
     if (t_e2e0) |t0| if (io) |iv| {
         e2e_cum_predh_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
     };
-    _ = d2h_fn(@ptrCast(dst_full + dst_start_off), self.d_output + dst_start_off, decompressed_size);
+    // Device-resident output (4d Phase 3): D2D-copy the decoded bytes
+    // straight to the caller's device buffer, skipping the host bounce.
+    if (d_output_target) |dev_target| {
+        if (cuMemcpyDtoDAsync_fn) |d2d| {
+            _ = d2d(dev_target + dst_start_off, self.d_output + dst_start_off, decompressed_size, 0);
+            _ = sync_fn();
+        } else {
+            // No async D2D — bounce through host (unreachable on supported drivers).
+            return error.BadMode;
+        }
+    } else {
+        _ = d2h_fn(@ptrCast(dst_full + dst_start_off), self.d_output + dst_start_off, decompressed_size);
+    }
     if (t_e2e0) |t0| if (io) |iv| {
         const cum_end_ns: i64 = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
         const ms = struct {
