@@ -63,6 +63,29 @@ The user has been emphatic and repeated: **"0.0000000000000000% host involvement
   kernel for host-side buffer sizing. `self.d_first_subchunk_idx` is aliased to
   `self.d_first_sub_idx_persist`. For sc>=1 multi-sub-chunk modes, `d_first_sub_idx`
   is D2H'd to host (~few KB) for the pipeline branch.
+- **`d5a24ad`** — Steps 6b + 6c wired together (the cleaner path the doc
+  recommended). `gpuScanChunks` launches `slzCompactHuffDescsKernel ×4` +
+  `slzCompactRawDescsKernel` on device, then D2Hs a single 5-u32 counts
+  block. `fullGpuLaunchImpl` dispatches `slzMergeHuffDescsKernel` straight
+  into `self.d_huff_descs` whenever the device compact ran; the host append
+  + H2D path stays as a fallback for the CPU-scan branch. The raw-off16
+  gather kernel now consumes `d_compact_raw` directly when available.
+
+  Two pre-existing bugs surfaced and were fixed while verifying 6b/6c:
+    1. `fullGpuLaunchImpl` ran `gpuPrefixSumChunksImpl` against
+       `d_descs_persist` *before* the chunk-descs H2D. Garbage read until
+       6b started consuming `d_total_subchunks_buf` as a device value;
+       fix hoists the H2D above the prefix-sum kernel call.
+    2. `gpuScanChunks` consumed a host `first_subchunk_idx[]` that
+       `fullGpuLaunchImpl` zero-filled in the `total_subchunks ==
+       n_chunks` branch — so the scan kernel saw every chunk at sub_idx 0
+       and only flagged one valid huff slot. Scan kernel now reads
+       `d_first_sub_idx_persist` directly; the host array parameter is
+       documented as vestigial.
+
+  Regression matrix (enwik8 + silesia L1/L3/L5): byte-exact under both
+  `SLZ_GPU_SCAN=1` (GPU scan + GPU compact + GPU merge) and the default
+  CPU-scan path. D2D smoke also still passes.
 
 ### Encode side — committed work (commits, in order):
 
@@ -74,22 +97,40 @@ The user has been emphatic and repeated: **"0.0000000000000000% host involvement
 ### What still has CPU work (the remaining target):
 
 **Decompress side:**
-1. **`gpuScanChunks` (driver.zig:1232)** — runs scan kernel, then **D2Hs the staged
-   arrays + CPU-compacts** into `huff_*_host_buf` host arrays. The compact kernels
-   exist (`slzCompactHuffDescsKernel`, `slzCompactRawDescsKernel`) but aren't wired.
-2. **`fullGpuLaunchImpl`'s `append` loop (driver.zig ~1699)** — CPU loop that merges
-   4 host huff arrays into `merged_huff` (host), then H2Ds to `self.d_huff_descs`.
-   `slzMergeHuffDescsKernel` exists but isn't wired.
+- ~~6b + 6c~~ — landed in `d5a24ad`. Decompress pure-D2D pipeline (walk →
+  prefix-sum → scan → compact → merge → gather → huff build/decode → LZ
+  decode) is now all-device for chunk_descs / sub-chunk / huff bookkeeping;
+  the only host work is launch-plumbing D2Hs (~56 B per decompress).
+- Step 7 (optional self-gating): would convert each decode kernel's `n`
+  launch param into a `const uint32_t* d_n` device read so even the
+  launch-plumbing D2Hs disappear. Not started — marginal win.
 
-**Encode side:**
-3. **`gpuAssembleFrameImpl` (encode/driver.zig:1181)** — at the end, D2Hs the
+**Encode side (untouched as of `d5a24ad`):**
+1. **`gpuAssembleFrameImpl` (encode/driver.zig:1181)** — at the end, D2Hs the
    assembled sub-chunk blocks to `assembled_data` (host). `fast_framed`'s gpu_splice
    then `@memcpy`s those host bytes into host `dst`, and `slzCompress`'s wrapper
    H2Ds the full frame back to `d_output`. This is the entire encode-output bounce
    — 20MB for a 100MB input.
-4. **`fast_framed.gpu_compress` block** — many CPU loops compute frame structure,
+2. **`fast_framed.gpu_compress` block** — many CPU loops compute frame structure,
    write headers, splice payloads. To go pure-D2D, the entire frame must be built
    on device (new "frame-assemble-on-device" kernel).
+
+**Pre-existing encode bugs surfaced while verifying decode (not regressions
+from 6b/6c, since my changes only touched the decode driver):**
+- `slzCompress` at L3 on entropy-rich input (enwik8) → access violation.
+  The 1 MB alphabet smoke at L5 hides this because the synthetic input
+  doesn't exercise the same encode path.
+- `slzCompress` at L5 on enwik8 produces a frame that `slzDecompress` reads
+  back as wrong bytes (silent decode mismatch, no error). Round-trip fail.
+- Diagnosis was via a temporary `tools/slz_gpu_smoke_dev2.c` (now removed)
+  that compress-then-decompress'd 512 KB of enwik8 at L1/L3/L5 through
+  the C ABI. The same enwik8 frames produced by the CLI encoder
+  (`streamlz -gpu`) decode fine — so the bug is in the C-ABI compress
+  path (`slzCompress` → `gpu_compress` block), not in the kernels.
+
+Step 8 needs to fix these before — or as part of — building the
+frame-assemble-on-device kernel; otherwise the kernel will assemble
+malformed frames.
 
 ## File map
 
