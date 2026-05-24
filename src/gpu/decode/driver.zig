@@ -481,6 +481,24 @@ pub const DecodeContext = struct {
     d_total_subchunks_buf: CUdeviceptr = 0,
     d_total_subchunks_buf_size: usize = 0,
 
+    // Pure-D2D compaction outputs (step 6b). Each compact buffer holds
+    // a compacted per-stream HuffDecChunkDesc array (slzCompactHuffDescs-
+    // Kernel output). d_compact_raw holds the interleaved hi/lo
+    // RawOff16Descs (slzCompactRawDescsKernel output). d_compact_counts
+    // is a 6 u32 region: [n_lit, n_tok, n_hi, n_lo, n_raw, n_merged].
+    d_compact_lit: CUdeviceptr = 0,
+    d_compact_lit_size: usize = 0,
+    d_compact_tok: CUdeviceptr = 0,
+    d_compact_tok_size: usize = 0,
+    d_compact_hi: CUdeviceptr = 0,
+    d_compact_hi_size: usize = 0,
+    d_compact_lo: CUdeviceptr = 0,
+    d_compact_lo_size: usize = 0,
+    d_compact_raw: CUdeviceptr = 0,
+    d_compact_raw_size: usize = 0,
+    d_compact_counts: CUdeviceptr = 0,
+    d_compact_counts_size: usize = 0,
+
     // Huffman descriptors + LUT.
     d_huff_descs: CUdeviceptr = 0,
     d_huff_descs_size: usize = 0,
@@ -526,6 +544,11 @@ const ScanResult = struct {
     num_huff_off16hi: u32 = 0,
     num_huff_off16lo: u32 = 0,
     use_tans32: bool = false,
+    /// Set when gpuScanChunks ran the device-side compact kernels and
+    /// `d_compact_*` buffers hold the per-stream compacted descs + counts
+    /// in `d_compact_counts`. fullGpuLaunchImpl uses this to dispatch the
+    /// GPU merge kernel (step 6c) instead of the CPU append loop.
+    device_compact_populated: bool = false,
 };
 
 fn scanForTansChunks(
@@ -1234,6 +1257,9 @@ fn gpuScanChunks(
     chunk_descs: []const ChunkDesc,
     compressed_block: []const u8,
     sub_chunk_cap: u32,
+    /// Vestigial — gpuScanChunks now reads the device-resident prefix
+    /// sum directly. Kept in the signature to limit churn at the call
+    /// site; only the `.len` is consulted (must equal chunk_descs.len).
     first_subchunk_idx: []const u32,
     total_subchunks: u32,
     huff_lit_descs: []HuffDecChunkDesc,
@@ -1246,16 +1272,13 @@ fn gpuScanChunks(
     const n: u32 = @intCast(chunk_descs.len);
     if (n == 0 or total_subchunks == 0 or first_subchunk_idx.len < n) return null;
 
-    const h2d = cuMemcpyHtoD_fn orelse return null;
     const d2h = cuMemcpyDtoH_fn orelse return null;
     const launch = cuLaunchKernel_fn orelse return null;
     const sync = cuCtxSynchronize_fn orelse return null;
     const memset = cuMemsetD8_fn orelse return null;
-
-    // Upload the per-chunk first-sub-chunk prefix sum.
-    const fs_bytes: usize = @as(usize, n) * 4;
-    if (!ensureDeviceBuf(&self.d_scan_first_sub, &self.d_scan_first_sub_size, fs_bytes)) return null;
-    _ = h2d(self.d_scan_first_sub, @ptrCast(first_subchunk_idx.ptr), fs_bytes);
+    // The legacy `first_subchunk_idx` host array is unused — the scan
+    // kernel reads the device-resident prefix sum (d_first_sub_idx_persist)
+    // directly. We only kept the len-check above.
 
     // Staged buffer: [lit][tok][hi][lo] ScanHuffDesc, then [raw_hi][raw_lo]
     // ScanRawDesc — one entry per global sub-chunk index per stream type.
@@ -1270,7 +1293,11 @@ fn gpuScanChunks(
     var k_block = self.d_comp_persist;
     var k_blen: u32 = @intCast(compressed_block.len);
     var k_chunks = self.d_descs_persist;
-    var k_first = self.d_scan_first_sub;
+    // Use the device-resident prefix-sum output directly. The legacy
+    // host array (`first_subchunk_idx`) is zero-filled for the
+    // `total_subchunks == n_chunks` case in fullGpuLaunchImpl and
+    // would feed the scan kernel a bogus prefix sum.
+    var k_first = self.d_first_sub_idx_persist;
     var k_n = n;
     var k_cap = sub_chunk_cap;
     var k_lit = base;
@@ -1291,55 +1318,145 @@ fn gpuScanChunks(
     if (launch(scan_parse_fn, blocks, 1, 1, tpb, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return null;
     if (sync() != CUDA_SUCCESS) return null;
 
-    // Download the staged arrays.
-    const alloc = std.heap.page_allocator;
-    const staged = alloc.alloc(u8, staged_bytes) catch return null;
-    defer alloc.free(staged);
-    _ = d2h(@ptrCast(staged.ptr), base, staged_bytes);
+    // ── Step 6b: device-side compaction ─────────────────────────────
+    // 4 × slzCompactHuffDescsKernel + 1 × slzCompactRawDescsKernel
+    // produce compacted per-stream arrays + counts entirely on device.
+    // Total D2H from this fn: 5 × u32 counts (20 B). Falls back to the
+    // host-side compact path if any compact-kernel symbol is missing.
+    const gpu_compact_ok =
+        compact_huff_descs_fn != 0 and compact_raw_descs_fn != 0;
 
-    const lit_st: [*]const ScanHuffDesc = @ptrCast(@alignCast(staged.ptr));
-    const tok_st: [*]const ScanHuffDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes));
-    const hi_st: [*]const ScanHuffDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes * 2));
-    const lo_st: [*]const ScanHuffDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes * 3));
-    const rhi_st: [*]const ScanRawDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes * 4));
-    const rlo_st: [*]const ScanRawDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes * 4 + raw_arr_bytes));
-
-    // Compact: drop invalid slots, assign sequential lut_offset.
-    const compactHuff = struct {
-        fn run(st: [*]const ScanHuffDesc, tot: u32, out: []HuffDecChunkDesc) u32 {
-            var k: u32 = 0;
-            var i: u32 = 0;
-            while (i < tot) : (i += 1) {
-                if (st[i].valid == 0) continue;
-                if (k >= out.len) break;
-                out[k] = .{
-                    .in_offset = st[i].in_offset,
-                    .in_size = st[i].in_size,
-                    .out_offset = st[i].out_offset,
-                    .out_size = st[i].out_size,
-                    .lut_offset = k * @as(u32, @intCast(HUFF_LUT_ENTRIES)),
-                };
-                k += 1;
-            }
-            return k;
-        }
-    }.run;
-    const num_lit = compactHuff(lit_st, total_subchunks, huff_lit_descs);
-    const num_tok = compactHuff(tok_st, total_subchunks, huff_tok_descs);
-    const num_hi = compactHuff(hi_st, total_subchunks, huff_off16hi_descs);
-    const num_lo = compactHuff(lo_st, total_subchunks, huff_off16lo_descs);
-
-    // Raw off16: per sub-chunk emit hi then lo, in sub-chunk order.
+    var num_lit: u32 = 0;
+    var num_tok: u32 = 0;
+    var num_hi: u32 = 0;
+    var num_lo: u32 = 0;
     var num_raw: u32 = 0;
-    var si: u32 = 0;
-    while (si < total_subchunks) : (si += 1) {
-        if (rhi_st[si].valid != 0 and num_raw < raw_off16_descs.len) {
-            raw_off16_descs[num_raw] = .{ .src_offset = rhi_st[si].src_offset, .size = rhi_st[si].size, .gpu_offset = rhi_st[si].gpu_offset };
-            num_raw += 1;
+
+    if (gpu_compact_ok) {
+        // Size compact buffers. n_huff bound: walk_max_chunks * 4
+        // (sub-chunks per chunk at sc>=1). n_raw bound: 2 × that.
+        const huff_compact_max = @as(usize, walk_max_chunks) * 4;
+        const huff_compact_bytes = huff_compact_max * @sizeOf(HuffDecChunkDesc);
+        const raw_compact_max = huff_compact_max * 2;
+        const raw_compact_bytes = raw_compact_max * @sizeOf(RawOff16Desc);
+        if (!ensureDeviceBuf(&self.d_compact_lit, &self.d_compact_lit_size, huff_compact_bytes)) return null;
+        if (!ensureDeviceBuf(&self.d_compact_tok, &self.d_compact_tok_size, huff_compact_bytes)) return null;
+        if (!ensureDeviceBuf(&self.d_compact_hi, &self.d_compact_hi_size, huff_compact_bytes)) return null;
+        if (!ensureDeviceBuf(&self.d_compact_lo, &self.d_compact_lo_size, huff_compact_bytes)) return null;
+        if (!ensureDeviceBuf(&self.d_compact_raw, &self.d_compact_raw_size, raw_compact_bytes)) return null;
+        // 6 u32: [n_lit, n_tok, n_hi, n_lo, n_raw, n_merged]. n_merged is
+        // written by slzMergeHuffDescsKernel in step 6c.
+        if (!ensureDeviceBuf(&self.d_compact_counts, &self.d_compact_counts_size, 6 * 4)) return null;
+        _ = memset(self.d_compact_counts, 0, 6 * 4);
+
+        const huff_streams = [_]struct { staged_off: usize, dst: u64, n_off: u32 }{
+            .{ .staged_off = 0,                  .dst = self.d_compact_lit, .n_off = 0 },
+            .{ .staged_off = huff_arr_bytes,     .dst = self.d_compact_tok, .n_off = 4 },
+            .{ .staged_off = huff_arr_bytes * 2, .dst = self.d_compact_hi,  .n_off = 8 },
+            .{ .staged_off = huff_arr_bytes * 3, .dst = self.d_compact_lo,  .n_off = 12 },
+        };
+        for (huff_streams) |hs| {
+            var k_staged: u64 = base + hs.staged_off;
+            var k_total: u64 = self.d_total_subchunks_buf;
+            var k_dst: u64 = hs.dst;
+            var k_count: u64 = self.d_compact_counts + hs.n_off;
+            var c_params = [_]?*anyopaque{
+                @ptrCast(&k_staged), @ptrCast(&k_total),
+                @ptrCast(&k_dst), @ptrCast(&k_count),
+            };
+            var c_extra = [_]?*anyopaque{null};
+            if (launch(compact_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, 0, &c_params, &c_extra) != CUDA_SUCCESS) return null;
         }
-        if (rlo_st[si].valid != 0 and num_raw < raw_off16_descs.len) {
-            raw_off16_descs[num_raw] = .{ .src_offset = rlo_st[si].src_offset, .size = rlo_st[si].size, .gpu_offset = rlo_st[si].gpu_offset };
-            num_raw += 1;
+        // Raw compact.
+        {
+            var cr_hi: u64 = base + huff_arr_bytes * 4;
+            var cr_lo: u64 = base + huff_arr_bytes * 4 + raw_arr_bytes;
+            var cr_total: u64 = self.d_total_subchunks_buf;
+            var cr_dst: u64 = self.d_compact_raw;
+            var cr_count: u64 = self.d_compact_counts + 16;
+            var cr_params = [_]?*anyopaque{
+                @ptrCast(&cr_hi), @ptrCast(&cr_lo), @ptrCast(&cr_total),
+                @ptrCast(&cr_dst), @ptrCast(&cr_count),
+            };
+            var cr_extra = [_]?*anyopaque{null};
+            if (launch(compact_raw_descs_fn, 1, 1, 1, 1, 1, 1, 0, 0, &cr_params, &cr_extra) != CUDA_SUCCESS) return null;
+        }
+        if (sync() != CUDA_SUCCESS) return null;
+
+        // The 5 counts come back as a single 20 B D2H.
+        var counts: [5]u32 = .{ 0, 0, 0, 0, 0 };
+        _ = d2h(@ptrCast(&counts), self.d_compact_counts, 5 * 4);
+        num_lit = counts[0];
+        num_tok = counts[1];
+        num_hi = counts[2];
+        num_lo = counts[3];
+        num_raw = counts[4];
+
+        // Legacy CPU-merge path still reads the host arrays (huff_*_host_buf
+        // and raw_off16_descs). D2H the compacted arrays into them so that
+        // path keeps working. The pure-D2D path in fullGpuLaunchImpl uses
+        // the device-resident compact arrays directly (step 6c) and ignores
+        // these host copies. Total cost: ~5 streams × (n_subs * 20 B) — bounded
+        // (~30 KB for 1500 sub-chunks). Removable once the legacy CPU-merge
+        // path is retired.
+        if (num_lit > 0 and num_lit <= huff_lit_descs.len)
+            _ = d2h(@ptrCast(huff_lit_descs.ptr), self.d_compact_lit, @as(usize, num_lit) * @sizeOf(HuffDecChunkDesc));
+        if (num_tok > 0 and num_tok <= huff_tok_descs.len)
+            _ = d2h(@ptrCast(huff_tok_descs.ptr), self.d_compact_tok, @as(usize, num_tok) * @sizeOf(HuffDecChunkDesc));
+        if (num_hi > 0 and num_hi <= huff_off16hi_descs.len)
+            _ = d2h(@ptrCast(huff_off16hi_descs.ptr), self.d_compact_hi, @as(usize, num_hi) * @sizeOf(HuffDecChunkDesc));
+        if (num_lo > 0 and num_lo <= huff_off16lo_descs.len)
+            _ = d2h(@ptrCast(huff_off16lo_descs.ptr), self.d_compact_lo, @as(usize, num_lo) * @sizeOf(HuffDecChunkDesc));
+        if (num_raw > 0 and num_raw <= raw_off16_descs.len)
+            _ = d2h(@ptrCast(raw_off16_descs.ptr), self.d_compact_raw, @as(usize, num_raw) * @sizeOf(RawOff16Desc));
+    } else {
+        // Fallback: D2H the staged arrays and compact on host.
+        const alloc = std.heap.page_allocator;
+        const staged = alloc.alloc(u8, staged_bytes) catch return null;
+        defer alloc.free(staged);
+        _ = d2h(@ptrCast(staged.ptr), base, staged_bytes);
+
+        const lit_st: [*]const ScanHuffDesc = @ptrCast(@alignCast(staged.ptr));
+        const tok_st: [*]const ScanHuffDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes));
+        const hi_st: [*]const ScanHuffDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes * 2));
+        const lo_st: [*]const ScanHuffDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes * 3));
+        const rhi_st: [*]const ScanRawDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes * 4));
+        const rlo_st: [*]const ScanRawDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes * 4 + raw_arr_bytes));
+
+        const compactHuff = struct {
+            fn run(st: [*]const ScanHuffDesc, tot: u32, out: []HuffDecChunkDesc) u32 {
+                var k: u32 = 0;
+                var i: u32 = 0;
+                while (i < tot) : (i += 1) {
+                    if (st[i].valid == 0) continue;
+                    if (k >= out.len) break;
+                    out[k] = .{
+                        .in_offset = st[i].in_offset,
+                        .in_size = st[i].in_size,
+                        .out_offset = st[i].out_offset,
+                        .out_size = st[i].out_size,
+                        .lut_offset = k * @as(u32, @intCast(HUFF_LUT_ENTRIES)),
+                    };
+                    k += 1;
+                }
+                return k;
+            }
+        }.run;
+        num_lit = compactHuff(lit_st, total_subchunks, huff_lit_descs);
+        num_tok = compactHuff(tok_st, total_subchunks, huff_tok_descs);
+        num_hi = compactHuff(hi_st, total_subchunks, huff_off16hi_descs);
+        num_lo = compactHuff(lo_st, total_subchunks, huff_off16lo_descs);
+
+        var si: u32 = 0;
+        while (si < total_subchunks) : (si += 1) {
+            if (rhi_st[si].valid != 0 and num_raw < raw_off16_descs.len) {
+                raw_off16_descs[num_raw] = .{ .src_offset = rhi_st[si].src_offset, .size = rhi_st[si].size, .gpu_offset = rhi_st[si].gpu_offset };
+                num_raw += 1;
+            }
+            if (rlo_st[si].valid != 0 and num_raw < raw_off16_descs.len) {
+                raw_off16_descs[num_raw] = .{ .src_offset = rlo_st[si].src_offset, .size = rlo_st[si].size, .gpu_offset = rlo_st[si].gpu_offset };
+                num_raw += 1;
+            }
         }
     }
 
@@ -1354,6 +1471,7 @@ fn gpuScanChunks(
         .num_huff_off16hi = num_hi,
         .num_huff_off16lo = num_lo,
         .use_tans32 = false,
+        .device_compact_populated = gpu_compact_ok,
     };
 }
 
@@ -1439,12 +1557,18 @@ pub fn fullGpuLaunchImpl(
     if (!ensureDeviceBuf(&self.d_comp_persist, &self.d_comp_persist_size, comp_bytes + 16)) return error.BadMode;
     if (!ensureDeviceBuf(&self.d_descs_persist, &self.d_descs_persist_size, desc_bytes)) return error.BadMode;
 
+    // Chunk descs must be on device before the prefix-sum kernel reads
+    // them. (The lower H2D path is still present and unconditionally
+    // re-uploads; this hoist is what feeds the prefix-sum kernel.)
+    _ = h2d_fn(self.d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes);
+    _ = sync_fn();
+
     // 4d Phase 3 step 6: prefix-sum runs on device. chunk_descs are
-    // already H2D'd above (d_descs_persist); slzPrefixSumChunksKernel
-    // reads them and writes d_first_sub_idx_persist + d_total_subchunks_buf.
-    // The 4-byte D2H of total_subchunks below is launch-plumbing — needed
-    // to size the tans scratch + compute region offsets host-side; no
-    // per-chunk CPU work remains.
+    // already H2D'd above; slzPrefixSumChunksKernel reads them and writes
+    // d_first_sub_idx_persist + d_total_subchunks_buf. The 4-byte D2H of
+    // total_subchunks below is launch-plumbing — needed to size the tans
+    // scratch + compute region offsets host-side; no per-chunk CPU work
+    // remains.
     _ = gpuPrefixSumChunksImpl(self, self.d_descs_persist, @intCast(chunk_descs.len), sub_chunk_cap) orelse return error.BadMode;
     var total_subchunks: u32 = 0;
     _ = d2h_fn(@ptrCast(&total_subchunks), self.d_total_subchunks_buf, 4);
@@ -1624,13 +1748,22 @@ pub fn fullGpuLaunchImpl(
         if (scan.num_raw_off16 > 0) gather_blk: {
             if (gather_off16_fn != 0) {
                 const ndesc: u32 = scan.num_raw_off16;
-                const dbytes: usize = @as(usize, ndesc) * @sizeOf(RawOff16Desc);
-                if (ensureDeviceBuf(&self.d_raw_off16_descs, &self.d_raw_off16_descs_size, dbytes)) {
+                // Pure-D2D path: descs already device-resident in
+                // d_compact_raw — skip the H2D and feed the kernel directly.
+                const desc_dev: u64 = if (scan.device_compact_populated)
+                    self.d_compact_raw
+                else d_raw: {
+                    const dbytes: usize = @as(usize, ndesc) * @sizeOf(RawOff16Desc);
+                    if (!ensureDeviceBuf(&self.d_raw_off16_descs, &self.d_raw_off16_descs_size, dbytes))
+                        break :gather_blk;
                     _ = h2d_fn(self.d_raw_off16_descs, @ptrCast(&self.raw_off16_buf), dbytes);
+                    break :d_raw self.d_raw_off16_descs;
+                };
+                {
                     var p_comp = self.d_comp_persist;
                     var p_comp_len: u32 = @intCast(compressed_block.len);
                     var p_scratch = self.d_tans_off16_scratch;
-                    var p_descs = self.d_raw_off16_descs;
+                    var p_descs = desc_dev;
                     var p_count = ndesc;
                     var params = [_]?*anyopaque{
                         @ptrCast(&p_comp), @ptrCast(&p_comp_len), @ptrCast(&p_scratch),
@@ -1678,35 +1811,69 @@ pub fn fullGpuLaunchImpl(
     }
     const have_huff = n_huff > 0 and huff_build_fn != 0 and huff_decode_fn != 0;
     if (have_huff) {
-        // Merge into a host scratch then upload. Capacity = 4 buffers × 4096.
-        var merged_huff: [4096 * 4]HuffDecChunkDesc = undefined;
-        var m: u32 = 0;
-        var lut_slot: u32 = 0;
-        const append = struct {
-            fn run(dst: []HuffDecChunkDesc, m_ptr: *u32, lut_ptr: *u32,
-                   src: []const HuffDecChunkDesc, region_off: u32) void {
-                for (src) |s| {
-                    if (m_ptr.* >= dst.len) return;
-                    var d = s;
-                    d.out_offset += region_off;
-                    d.lut_offset = lut_ptr.* * @as(u32, @intCast(HUFF_LUT_ENTRIES));
-                    dst[m_ptr.*] = d;
-                    m_ptr.* += 1;
-                    lut_ptr.* += 1;
-                }
-            }
-        }.run;
-        append(&merged_huff, &m, &lut_slot, self.huff_lit_host_buf[0..scan.num_huff_lit], 0);
-        append(&merged_huff, &m, &lut_slot, self.huff_tok_host_buf[0..scan.num_huff_tok], @intCast(tok_offset));
-        append(&merged_huff, &m, &lut_slot, self.huff_off16hi_host_buf[0..scan.num_huff_off16hi], @intCast(off16_offset));
-        append(&merged_huff, &m, &lut_slot, self.huff_off16lo_host_buf[0..scan.num_huff_off16lo], @intCast(off16_offset));
-
-        const huff_desc_bytes = @as(usize, m) * @sizeOf(HuffDecChunkDesc);
-        const huff_lut_bytes = @as(usize, m) * HUFF_LUT_ENTRIES * @sizeOf(u32);
+        const huff_desc_bytes = @as(usize, n_huff) * @sizeOf(HuffDecChunkDesc);
+        const huff_lut_bytes = @as(usize, n_huff) * HUFF_LUT_ENTRIES * @sizeOf(u32);
         if (!ensureDeviceBuf(&self.d_huff_descs, &self.d_huff_descs_size, huff_desc_bytes)) return error.BadMode;
         if (!ensureDeviceBuf(&self.d_huff_lut, &self.d_huff_lut_size, huff_lut_bytes)) return error.BadMode;
-        _ = h2d_fn(self.d_huff_descs, @ptrCast(&merged_huff), huff_desc_bytes);
-        _ = sync_fn();
+
+        if (scan.device_compact_populated and merge_huff_descs_fn != 0) {
+            // ── Step 6c: device-side merge ──────────────────────
+            // The compact kernels already populated the 4 per-stream
+            // device buffers in step 6b. Launch the merge kernel —
+            // it writes directly to self.d_huff_descs (out_offsets
+            // adjusted, lut_offsets sequential) and updates the
+            // n_merged slot in d_compact_counts. No host arrays, no
+            // H2D.
+            var k_lit: u64 = self.d_compact_lit;
+            var k_tok: u64 = self.d_compact_tok;
+            var k_hi: u64 = self.d_compact_hi;
+            var k_lo: u64 = self.d_compact_lo;
+            var k_n_lit: u64 = self.d_compact_counts + 0;
+            var k_n_tok: u64 = self.d_compact_counts + 4;
+            var k_n_hi: u64 = self.d_compact_counts + 8;
+            var k_n_lo: u64 = self.d_compact_counts + 12;
+            var k_tok_region: u32 = @intCast(tok_offset);
+            var k_off16_region: u32 = @intCast(off16_offset);
+            var k_merged: u64 = self.d_huff_descs;
+            var k_n_merged: u64 = self.d_compact_counts + 20;
+            var m_params = [_]?*anyopaque{
+                @ptrCast(&k_lit), @ptrCast(&k_tok), @ptrCast(&k_hi), @ptrCast(&k_lo),
+                @ptrCast(&k_n_lit), @ptrCast(&k_n_tok), @ptrCast(&k_n_hi), @ptrCast(&k_n_lo),
+                @ptrCast(&k_tok_region), @ptrCast(&k_off16_region),
+                @ptrCast(&k_merged), @ptrCast(&k_n_merged),
+            };
+            var m_extra = [_]?*anyopaque{null};
+            if (launch_fn(merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, 0, &m_params, &m_extra) != CUDA_SUCCESS)
+                return error.BadMode;
+            _ = sync_fn();
+        } else {
+            // Legacy CPU merge — used by the non-pure-D2D / CPU-scan paths.
+            // Capacity = 4 buffers × 4096.
+            var merged_huff: [4096 * 4]HuffDecChunkDesc = undefined;
+            var m: u32 = 0;
+            var lut_slot: u32 = 0;
+            const append = struct {
+                fn run(dst: []HuffDecChunkDesc, m_ptr: *u32, lut_ptr: *u32,
+                       src: []const HuffDecChunkDesc, region_off: u32) void {
+                    for (src) |s| {
+                        if (m_ptr.* >= dst.len) return;
+                        var d = s;
+                        d.out_offset += region_off;
+                        d.lut_offset = lut_ptr.* * @as(u32, @intCast(HUFF_LUT_ENTRIES));
+                        dst[m_ptr.*] = d;
+                        m_ptr.* += 1;
+                        lut_ptr.* += 1;
+                    }
+                }
+            }.run;
+            append(&merged_huff, &m, &lut_slot, self.huff_lit_host_buf[0..scan.num_huff_lit], 0);
+            append(&merged_huff, &m, &lut_slot, self.huff_tok_host_buf[0..scan.num_huff_tok], @intCast(tok_offset));
+            append(&merged_huff, &m, &lut_slot, self.huff_off16hi_host_buf[0..scan.num_huff_off16hi], @intCast(off16_offset));
+            append(&merged_huff, &m, &lut_slot, self.huff_off16lo_host_buf[0..scan.num_huff_off16lo], @intCast(off16_offset));
+
+            _ = h2d_fn(self.d_huff_descs, @ptrCast(&merged_huff), @as(usize, m) * @sizeOf(HuffDecChunkDesc));
+            _ = sync_fn();
+        }
     }
 
     // ── Pipeline: split into N groups, overlap entropy with LZ ───
