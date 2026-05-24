@@ -91,6 +91,55 @@ pub fn decompressFramedParallelThreaded(
     return decompressFramedInner(allocator, io, src, dst, max_threads, dec_ctx, null);
 }
 
+/// 4d Phase 3 TRUE D2D decompress. The compressed frame is already at
+/// `d_frame` (device); the walk runs on the GPU (gpuWalkFrameImpl), the
+/// decode pipeline reads from the device-resident frame and writes the
+/// decoded bytes to `d_output` (device). Zero host bounce of the payload
+/// or frame bytes. Limited to the slzCompress shape — Fast codec, no
+/// dictionary, no parallel-decode-metadata, no checksums, single block;
+/// returns error.BadMode otherwise so the caller can fall back to the
+/// host-bounce path. Returns the decompressed byte count.
+pub fn decompressFramedFromDevice(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    d_frame: u64,
+    frame_size: u32,
+    d_output: u64,
+    dec_ctx: *gpu_driver.DecodeContext,
+) DecompressError!u32 {
+    const result = gpu_driver.gpuWalkFrameImpl(dec_ctx, allocator, d_frame, frame_size) orelse return error.BadMode;
+    defer allocator.free(result.chunk_descs);
+
+    // -gpu output is single-block / sc_group=0.25, every chunk its own
+    // group. The walk kernel rejects anything else (status 13), so a
+    // successful result implies these.
+    const num_groups: u32 = @intCast(result.chunk_descs.len);
+    const chunks_per_group: u32 = 1;
+
+    // Stub `compressed_block` slice — `.len` is real; `.ptr` is unused
+    // when d_compressed_src is set. Sentinel triggers a segfault on
+    // accidental host-side read (debugging signal).
+    const stub_ptr: [*]const u8 = @ptrFromInt(0x10);
+    const compressed_block: []const u8 = stub_ptr[0..result.block_size];
+
+    var dst_dummy: u8 = 0;
+    gpu_driver.fullGpuLaunchImpl(
+        dec_ctx,
+        result.chunk_descs,
+        compressed_block,
+        @ptrCast(&dst_dummy), // dst_full — unused when d_output_target set
+        0,
+        result.decompressed_size,
+        num_groups,
+        chunks_per_group,
+        result.sub_chunk_cap,
+        io,
+        d_output, // d_output_target: D2D-write decoded bytes to caller's buffer
+        d_frame + result.block_start, // d_compressed_src: D2D-copy frame bytes in
+    ) catch |err| return err;
+    return result.decompressed_size;
+}
+
 /// 4d Phase 3 device-resident decode. `src` is a host-readable mirror of
 /// the compressed frame (the CPU needs the bytes to walk frame/block/
 /// chunk headers — caller D2H's into a host buffer once). The decoded
@@ -1123,6 +1172,7 @@ fn gpuBatchDecode(
         eff_sc_cap,
         io_opt,
         d_output_target,
+        null, // d_compressed_src — legacy path, source is host
     );
 }
 

@@ -42,6 +42,7 @@ var kernel_fn: usize = 0;
 var kernel_raw_fn: usize = 0;
 var gather_off16_fn: usize = 0;
 var scan_parse_fn: usize = 0;
+var walk_frame_fn: usize = 0;
 var tans_module: usize = 0;
 var tans_kernel_fn: usize = 0;
 var tans_build_fn: usize = 0;
@@ -181,6 +182,9 @@ pub fn init() bool {
     // Optional GPU decode-scan kernel (roadmap 4d Phase 2). Absent → the
     // driver keeps the CPU scanForTansChunks path.
     _ = get_fn(&scan_parse_fn, module, "slzScanParseKernel");
+    // Optional GPU frame-walk kernel (roadmap 4d Phase 3). Absent → the
+    // D2D decompress path falls back to host bounce.
+    _ = get_fn(&walk_frame_fn, module, "slzWalkFrameKernel");
     const t_lz = qpcNow();
 
     // Load Huffman decode kernels (Pass 1.5, for chunk_type=4 literals)
@@ -447,6 +451,15 @@ pub const DecodeContext = struct {
     d_scan_staged_size: usize = 0,
     d_scan_first_sub: CUdeviceptr = 0,
     d_scan_first_sub_size: usize = 0,
+
+    // GPU frame-walk kernel scratch (roadmap 4d Phase 3). d_walk_chunks
+    // holds the kernel-produced ChunkDesc array; d_walk_meta is a single
+    // 6-u32 region for (n_chunks, decomp_size, sub_chunk_cap,
+    // block_start, block_size, status).
+    d_walk_chunks: CUdeviceptr = 0,
+    d_walk_chunks_size: usize = 0,
+    d_walk_meta: CUdeviceptr = 0,
+    d_walk_meta_size: usize = 0,
 
     // Huffman descriptors + LUT.
     d_huff_descs: CUdeviceptr = 0,
@@ -1063,6 +1076,90 @@ fn parseTansHeaderPaired(
 /// d_descs_persist. Returns null — caller keeps the CPU scan — on any
 /// failure. tANS is retired, so only the Huffman + raw-off16 outputs are
 /// produced (num_lit/num_tok/... stay 0).
+/// 4d Phase 3 GPU frame-walk result. chunk_descs is host-allocated by
+/// `gpuWalkFrameImpl` from `allocator`; caller frees. block_start /
+/// block_size give the device-byte range of the block payload — the
+/// caller passes (d_frame + block_start, block_size) as the compressed
+/// source to fullGpuLaunchImpl (D2D copy into d_comp_persist).
+pub const WalkFrameResult = struct {
+    chunk_descs: []ChunkDesc,
+    decompressed_size: u32,
+    sub_chunk_cap: u32,
+    block_start: u32,
+    block_size: u32,
+};
+
+/// 4d Phase 3 GPU frame walk. Replaces the CPU decompressOneFrame +
+/// gpuBatchDecode walk for the slzCompress-shape frame (Fast codec, no
+/// dict, no PDM, no checksums, single block). Returns null on any
+/// unsupported feature; caller falls back to the host-bounce decode.
+pub fn gpuWalkFrameImpl(
+    self: *DecodeContext,
+    allocator: std.mem.Allocator,
+    d_frame: u64,
+    frame_size: u32,
+) ?WalkFrameResult {
+    if (!init()) return null;
+    if (walk_frame_fn == 0) return null;
+    const launch = cuLaunchKernel_fn orelse return null;
+    const sync = cuCtxSynchronize_fn orelse return null;
+    const d2h = cuMemcpyDtoH_fn orelse return null;
+    const memset = cuMemsetD8_fn orelse return null;
+
+    const max_chunks: u32 = 16384;
+    const chunks_bytes: usize = @as(usize, max_chunks) * @sizeOf(ChunkDesc);
+    const meta_bytes: usize = 6 * 4;
+    if (!ensureDeviceBuf(&self.d_walk_chunks, &self.d_walk_chunks_size, chunks_bytes)) return null;
+    if (!ensureDeviceBuf(&self.d_walk_meta, &self.d_walk_meta_size, meta_bytes)) return null;
+    _ = memset(self.d_walk_meta, 0, meta_bytes);
+
+    var k_frame = d_frame;
+    var k_size = frame_size;
+    var k_chunks = self.d_walk_chunks;
+    var k_max = max_chunks;
+    var k_meta_n: u64 = self.d_walk_meta;
+    var k_meta_decomp: u64 = self.d_walk_meta + 4;
+    var k_meta_sccap: u64 = self.d_walk_meta + 8;
+    var k_meta_bstart: u64 = self.d_walk_meta + 12;
+    var k_meta_bsize: u64 = self.d_walk_meta + 16;
+    var k_meta_status: u64 = self.d_walk_meta + 20;
+    var params = [_]?*anyopaque{
+        @ptrCast(&k_frame),       @ptrCast(&k_size),
+        @ptrCast(&k_chunks),      @ptrCast(&k_max),
+        @ptrCast(&k_meta_n),      @ptrCast(&k_meta_decomp),
+        @ptrCast(&k_meta_sccap),  @ptrCast(&k_meta_bstart),
+        @ptrCast(&k_meta_bsize),  @ptrCast(&k_meta_status),
+    };
+    var extra = [_]?*anyopaque{null};
+    if (launch(walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return null;
+    if (sync() != CUDA_SUCCESS) return null;
+
+    var meta: [6]u32 = .{0} ** 6;
+    _ = d2h(@ptrCast(&meta), self.d_walk_meta, meta_bytes);
+    const n_chunks = meta[0];
+    const decomp_size = meta[1];
+    const sub_chunk_cap = meta[2];
+    const block_start = meta[3];
+    const block_size = meta[4];
+    const status = meta[5];
+    if (std.c.getenv("SLZ_E2E_TIMER") != null)
+        std.debug.print("[walk] n_chunks={d} decomp={d} block_start={d} block_size={d} status={d}\n", .{ n_chunks, decomp_size, block_start, block_size, status });
+    if (status != 0) return null;
+    if (n_chunks == 0 or n_chunks > max_chunks) return null;
+
+    const chunks = allocator.alloc(ChunkDesc, n_chunks) catch return null;
+    const chunks_actual_bytes = @as(usize, n_chunks) * @sizeOf(ChunkDesc);
+    _ = d2h(@ptrCast(chunks.ptr), self.d_walk_chunks, chunks_actual_bytes);
+
+    return .{
+        .chunk_descs = chunks,
+        .decompressed_size = decomp_size,
+        .sub_chunk_cap = sub_chunk_cap,
+        .block_start = block_start,
+        .block_size = block_size,
+    };
+}
+
 fn gpuScanChunks(
     self: *DecodeContext,
     chunk_descs: []const ChunkDesc,
@@ -1216,6 +1313,7 @@ pub fn fullGpuLaunch(
         sub_chunk_cap,
         io,
         null,
+        null,
     );
 }
 
@@ -1235,6 +1333,11 @@ pub fn fullGpuLaunchImpl(
     sub_chunk_cap: u32,
     io: ?std.Io,
     d_output_target: ?u64,
+    /// 4d Phase 3 D2D: when non-null the compressed block is already
+    /// device-resident at this address; the source is D2D-copied into
+    /// d_comp_persist (no PCIe). `compressed_block.ptr` is then unused
+    /// (caller may pass an undefined slice with the correct `.len`).
+    d_compressed_src: ?u64,
 ) GpuError!void {
     if (!init() or kernel_fn == 0) return error.BadMode;
 
@@ -1311,8 +1414,16 @@ pub fn fullGpuLaunchImpl(
     const lut_bytes = max_tans_descs * 2048 * 8;
     if (!ensureDeviceBuf(&self.d_tans_lut, &self.d_tans_lut_size, lut_bytes)) return error.BadMode;
 
-    if (compressed_block.len > 0)
-        _ = h2d_fn(self.d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len);
+    // 4d Phase 3 D2D: source bytes already device-resident → D2D-copy
+    // them into d_comp_persist (no PCIe). Else H2D from host.
+    if (compressed_block.len > 0) {
+        if (d_compressed_src) |dev_src| {
+            const d2d = cuMemcpyDtoDAsync_fn orelse return error.BadMode;
+            _ = d2d(self.d_comp_persist, dev_src, compressed_block.len, 0);
+        } else {
+            _ = h2d_fn(self.d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len);
+        }
+    }
     _ = h2d_fn(self.d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes);
     _ = sync_fn();
     if (t_e2e0) |t0| if (io) |iv| {
@@ -1341,9 +1452,13 @@ pub fn fullGpuLaunchImpl(
         // GPU decode scan (roadmap 4d Phase 2): SLZ_GPU_SCAN routes the
         // sub-chunk header walk onto the GPU. Falls back to the CPU scan
         // on any failure or when chunk_descs exceeds the prefix-sum buf.
+        // True D2D (d_compressed_src set) forces the GPU scan: the CPU
+        // path would dereference the sentinel `compressed_block` host
+        // slice and segfault. The GPU scan reads from d_comp_persist
+        // (the D2D-copied data), which is what we want.
         const want_gpu_scan = scan_parse_fn != 0 and
             chunk_descs.len <= first_subchunk_idx_buf.len and
-            std.c.getenv("SLZ_GPU_SCAN") != null;
+            (d_compressed_src != null or std.c.getenv("SLZ_GPU_SCAN") != null);
         const gpu_scan: ?ScanResult = if (want_gpu_scan)
             gpuScanChunks(
                 self,

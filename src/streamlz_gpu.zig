@@ -198,6 +198,45 @@ const DecompressJob = struct {
     }
 };
 
+/// 4d Phase 3 TRUE D2D decompress worker: frame stays on device, walk
+/// runs on GPU, output stays on device — zero host bounce of payload
+/// or frame bytes. On -1 (slzCompress-shape constraint failed, e.g.
+/// dict / PDM / multi-block frame) the caller falls back to the host-
+/// frame D2D path; on -2 to the full host-bounce path.
+const DecompressJobTrueD2D = struct {
+    h: *Context,
+    d_src: u64,
+    src_size: u32,
+    d_dst: u64,
+    result: c_int = SLZ_ERROR_CUDA,
+    fall_back: bool = false,
+
+    fn run(j: *DecompressJobTrueD2D) void {
+        if (!gpu_driver.bindContextToCallingThread()) {
+            j.result = SLZ_ERROR_CUDA;
+            return;
+        }
+        const n = decoder.decompressFramedFromDevice(
+            allocator,
+            null,
+            j.d_src,
+            j.src_size,
+            j.d_dst,
+            &j.h.dec,
+        ) catch |err| {
+            // BadMode → unsupported frame shape; caller falls back.
+            if (err == error.BadMode) {
+                j.fall_back = true;
+                j.result = SLZ_ERROR_CUDA;
+            } else {
+                j.result = mapDecompressError(err);
+            }
+            return;
+        };
+        j.result = @intCast(n);
+    }
+};
+
 /// 4d Phase 3 D2D decompress worker: D2H the frame into a host scratch
 /// (CPU header walk needs it), then decompress directly to the caller's
 /// device output via decompressCoreD2D (D2D output, no host bounce).
@@ -455,13 +494,26 @@ export fn slzDecompress(
     const out_dev = d_output orelse return SLZ_ERROR_INVALID_ARG;
     const out_size = output_size orelse return SLZ_ERROR_INVALID_ARG;
 
+    // 4d Phase 3 TRUE D2D path: frame stays on device, walk runs on
+    // GPU, output stays on device — zero host bounce of payload bytes.
+    var true_job = DecompressJobTrueD2D{
+        .h = h,
+        .d_src = @intFromPtr(frame_dev),
+        .src_size = @intCast(frame_size),
+        .d_dst = @intFromPtr(out_dev),
+    };
+    const rc_true = runOnWorker(DecompressJobTrueD2D, &true_job);
+    if (rc_true >= 0) {
+        out_size.* = @intCast(rc_true);
+        return SLZ_SUCCESS;
+    }
+    if (!true_job.fall_back) return rc_true;
+
+    // Fallback A: D2H the frame to host, GPU decode with D2D output
+    // (legacy 4d Phase 3 decode path — half-D2D).
     const host_frame = allocator.alloc(u8, frame_size) catch return SLZ_ERROR_OUT_OF_MEMORY;
     defer allocator.free(host_frame);
 
-    // 4d Phase 3 D2D path: D2H the frame to host (CPU header walk needs
-    // it), then decompress directly to the caller's device output — no
-    // host output bounce. Falls back to the legacy host-bounce path if
-    // the frame requires a CPU-only block decoder or carries a dict.
     var d2d_job = DecompressJobD2D{
         .h = h,
         .host_frame = host_frame,
@@ -475,7 +527,7 @@ export fn slzDecompress(
     }
     if (!d2d_job.fall_back) return rc_d2d;
 
-    // Fallback: host-bounce output. Reuses the already-D2H'd host_frame.
+    // Fallback B: full host-bounce path. Reuses the already-D2H'd host_frame.
     const host_out = allocator.alloc(u8, output_capacity) catch return SLZ_ERROR_OUT_OF_MEMORY;
     defer allocator.free(host_out);
 
