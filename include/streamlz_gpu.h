@@ -80,12 +80,42 @@ slzStatus_t slzDestroy(slzHandle_t handle);
 
 /* ---- Compression options -------------------------------------------- */
 typedef struct slzCompressOpts_t {
-    int level;          /* 1..5 — higher = smaller output, slower encode */
-    int reserved[7];    /* must be zero — reserved for future options */
+    int level;             /* 1..5 — higher = smaller output, slower encode */
+    int enable_profiling;  /* 1 = capture per-kernel timings (see
+                            * slzGetLastTimings); 0 = off. */
+    int reserved[6];       /* must be zero — reserved for future options */
 } slzCompressOpts_t;
 
-/* Default options (level 5). */
+/* Default options (level 5, profiling off). */
 slzCompressOpts_t slzCompressDefaultOpts(void);
+
+/* ---- Decompression options ------------------------------------------ */
+typedef struct slzDecompressOpts_t {
+    int enable_profiling;  /* 1 = capture per-kernel timings; 0 = off. */
+    int reserved[7];       /* must be zero — reserved for future options */
+} slzDecompressOpts_t;
+
+/* Default options (profiling off). */
+slzDecompressOpts_t slzDecompressDefaultOpts(void);
+
+/* ---- Per-kernel profiling ------------------------------------------- */
+/* Returned by slzGetLastTimings when enable_profiling was set on the
+ * most recent compress/decompress call. `name` is a static null-terminated
+ * string valid for the library's lifetime; `ms` is wall-clock kernel time
+ * measured with cudaEvent_t. */
+typedef struct slzKernelTiming_t {
+    const char* name;
+    float ms;
+} slzKernelTiming_t;
+
+/* Retrieve the per-kernel timings captured during the most recent
+ * compress/decompress call on this handle. `timings` may be NULL to query
+ * the count only. On return, *count is the number of timings the library
+ * actually has; only min(capacity, *count) entries are written into
+ * `timings`. Returns SLZ_SUCCESS even when capacity < *count. */
+slzStatus_t slzGetLastTimings(slzHandle_t handle,
+                              slzKernelTiming_t* timings, size_t capacity,
+                              size_t* count);
 
 /* ---- Size queries --------------------------------------------------- */
 /* Worst-case compressed-frame size for `input_size` input bytes. Use it
@@ -140,7 +170,8 @@ slzStatus_t slzDecompress(slzHandle_t handle,
                           const void* d_frame, size_t frame_size,
                           void* d_temp, size_t temp_size,
                           void* d_output, size_t output_capacity,
-                          size_t* output_size);
+                          size_t* output_size,
+                          slzDecompressOpts_t opts);
 
 /* ---- Compress / decompress: host -> host ---------------------------- */
 /* Same as slzCompress / slzDecompress but with plain host buffers: the
@@ -157,7 +188,8 @@ slzStatus_t slzCompressHost(slzHandle_t handle,
 slzStatus_t slzDecompressHost(slzHandle_t handle,
                               const void* frame, size_t frame_size,
                               void* output, size_t output_capacity,
-                              size_t* output_size);
+                              size_t* output_size,
+                              slzDecompressOpts_t opts);
 
 #ifdef __cplusplus
 }  /* extern "C" */

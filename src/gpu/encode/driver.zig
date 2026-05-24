@@ -4,6 +4,7 @@
 //! into the final StreamLZ frame.
 
 const std = @import("std");
+const gpu_decode = @import("../decode/driver.zig");
 
 const win32 = struct {
     extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.c) ?*anyopaque;
@@ -313,7 +314,8 @@ pub fn gpuEncodeHuff(
     out_sizes: []u32,
     out_bytes: []u8,
 ) bool {
-    return gpuEncodeHuffImpl(&g_default, descs, total_dst_bytes, out_sizes, out_bytes, 0);
+    return gpuEncodeHuffImpl(&g_default, descs, total_dst_bytes, out_sizes, out_bytes, 0,
+        .{ "huff/build", "huff/encode" });
 }
 
 /// `out_dev`: when non-zero, the encoder writes Huffman bodies straight
@@ -329,6 +331,11 @@ pub fn gpuEncodeHuffImpl(
     out_sizes: []u32,
     out_bytes: []u8,
     out_dev: CUdeviceptr,
+    /// Two static, null-terminated kernel-name strings the profiler will
+    /// store in last_timings. Index 0 is the build kernel, 1 is the encode
+    /// kernel. Pointers must live for the library's lifetime — use
+    /// string literals (see gpuEncodeLiteralsHuffImpl etc).
+    profile_names: [2][*:0]const u8,
 ) bool {
     if (!init()) return false;
     if (huff_tables_kernel_fn == 0 or huff_encode_kernel_fn == 0) return false;
@@ -380,8 +387,10 @@ pub fn gpuEncodeHuffImpl(
         @ptrCast(&p_codes), @ptrCast(&p_stride), @ptrCast(&p_n),
     };
     var extra = [_]?*anyopaque{null};
+    const _t_htbl = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, profile_names[0], 0);
     if (launch_fn(huff_tables_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &tbl_params, &extra) != CUDA_SUCCESS)
         return false;
+    gpu_decode.endKernelTiming(_t_htbl, 0);
 
     // Kernel 2: pack each sub-chunk into a chunk_type=4 body. Device-
     // resident mode writes straight into the caller's buffer.
@@ -395,8 +404,10 @@ pub fn gpuEncodeHuffImpl(
         @ptrCast(&p_sizes),   @ptrCast(&p_sps), @ptrCast(&p_stride),
         @ptrCast(&p_n),
     };
+    const _t_henc = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, profile_names[1], 0);
     if (launch_fn(huff_encode_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &enc_params, &extra) != CUDA_SUCCESS)
         return false;
+    gpu_decode.endKernelTiming(_t_henc, 0);
     if (sync_fn() != CUDA_SUCCESS) return false;
 
     _ = d2h_fn(@ptrCast(out_sizes.ptr), self.d_huff_sizes_persist, sizes_bytes);
@@ -412,6 +423,14 @@ pub fn gpuEncodeHuffImpl(
 /// context. Load-once module handles, kernel/driver function pointers,
 /// and `pub var` result slices stay module-global on purpose.
 pub const EncodeContext = struct {
+    // Per-kernel timing (slzCompressOpts_t.enable_profiling). When true,
+    // major encode kernels record a cuEvent pair and append to
+    // `pending_timings`; `finalizeProfiling` (in the decode driver, called
+    // after the encode's final sync) drains pending → `last_timings`.
+    enable_profiling: bool = false,
+    pending_timings: std.ArrayListUnmanaged(gpu_decode.PendingTiming) = .empty,
+    last_timings: std.ArrayListUnmanaged(gpu_decode.KernelTiming) = .empty,
+
     // 4d Phase 3: when set to a non-zero device address, gpuCompressImpl
     // populates d_input_persist via a D2D copy from this pointer instead
     // of the H2D from the host `input` slice — the caller's data is
@@ -1060,7 +1079,8 @@ pub fn gpuEncodeOff16HuffImpl(
         return false;
     });
 
-    if (!gpuEncodeHuffImpl(self, descs, total, all_sizes, bytes, out_dev)) {
+    if (!gpuEncodeHuffImpl(self, descs, total, all_sizes, bytes, out_dev,
+        .{ "huff-off16/build", "huff-off16/encode" })) {
         allocator.free(hi_offsets);
         allocator.free(lo_offsets);
         allocator.free(all_sizes);
@@ -1183,7 +1203,8 @@ pub fn gpuEncodeLiteralsHuffImpl(
         return false;
     });
 
-    if (!gpuEncodeHuffImpl(self, descs, total, sizes, bytes, out_dev)) {
+    if (!gpuEncodeHuffImpl(self, descs, total, sizes, bytes, out_dev,
+        .{ "huff-lit/build", "huff-lit/encode" })) {
         allocator.free(offsets);
         allocator.free(sizes);
         if (!resident) allocator.free(bytes);
@@ -1278,7 +1299,9 @@ pub fn gpuAssembleFrameImpl(
         @ptrCast(&p_ho),    @ptrCast(&p_descs), @ptrCast(&p_sizes),
         @ptrCast(&p_n),
     };
+    const _t_am = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleMeasureKernel", 0);
     if (launch(assemble_measure_fn, n, 1, 1, 32, 1, 1, 0, 0, &m_params, &extra) != CUDA_SUCCESS) return false;
+    gpu_decode.endKernelTiming(_t_am, 0);
     if (sync() != CUDA_SUCCESS) return false;
 
     const enc_sizes = allocator.alloc(u32, n) catch return false;
@@ -1302,7 +1325,9 @@ pub fn gpuAssembleFrameImpl(
         @ptrCast(&p_ho),    @ptrCast(&p_descs), @ptrCast(&p_out),
         @ptrCast(&p_n),
     };
+    const _t_aw = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleWriteKernel", 0);
     if (launch(assemble_write_fn, n, 1, 1, 32, 1, 1, 0, 0, &w_params, &extra) != CUDA_SUCCESS) return false;
+    gpu_decode.endKernelTiming(_t_aw, 0);
     if (sync() != CUDA_SUCCESS) return false;
 
     // Download the assembled blocks; publish the host-side result.
@@ -1421,7 +1446,9 @@ pub fn gpuFrameAssembleImpl(
     // Grid: n_chunks blocks for per-chunk writes + 1 block for prefix/tail/end mark.
     // 128 threads per block — enough for cooperative copies up to ~few KB/iter.
     const grid_x: u32 = n_chunks + 1;
+    const _t_fa = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzFrameAssembleKernel", 0);
     if (launch(frame_assemble_fn, grid_x, 1, 1, 128, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return null;
+    gpu_decode.endKernelTiming(_t_fa, 0);
     if (sync() != CUDA_SUCCESS) return null;
 
     return total_frame_size;
@@ -1519,7 +1546,8 @@ pub fn gpuEncodeTokensHuffImpl(
         return false;
     });
 
-    if (!gpuEncodeHuffImpl(self, descs, total, sizes, bytes, out_dev)) {
+    if (!gpuEncodeHuffImpl(self, descs, total, sizes, bytes, out_dev,
+        .{ "huff-tok/build", "huff-tok/encode" })) {
         allocator.free(offsets);
         allocator.free(sizes);
         if (!resident) allocator.free(bytes);
@@ -1635,8 +1663,10 @@ pub fn gpuCompressImpl(
     var extra = [_]?*anyopaque{null};
 
     const shared_bytes: u32 = if (global or chain) 0 else @intCast(hash_size * 4);
+    const _t_lz = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzCompressKernel", 0);
     if (launch_fn(kernel_fn, num_chunks, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra) != CUDA_SUCCESS)
         return false;
+    gpu_decode.endKernelTiming(_t_lz, 0);
 
     if (sync_fn() != CUDA_SUCCESS) return false;
 

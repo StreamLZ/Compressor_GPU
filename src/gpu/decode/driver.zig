@@ -82,6 +82,11 @@ const FnMemAllocHost = *const fn (*?*anyopaque, usize) callconv(.c) CUresult;
 const FnMemFreeHost = *const fn (*anyopaque) callconv(.c) CUresult;
 const FnCtxGetCurrent = *const fn (*usize) callconv(.c) CUresult;
 const FnCtxSetCurrent = *const fn (usize) callconv(.c) CUresult;
+const FnEventCreate = *const fn (*usize, c_uint) callconv(.c) CUresult;
+const FnEventRecord = *const fn (usize, usize) callconv(.c) CUresult;
+const FnEventSynchronize = *const fn (usize) callconv(.c) CUresult;
+const FnEventElapsedTime = *const fn (*f32, usize, usize) callconv(.c) CUresult;
+const FnEventDestroy = *const fn (usize) callconv(.c) CUresult;
 
 var cuInit_fn: ?FnInit = null;
 var cuDeviceGet_fn: ?FnDeviceGet = null;
@@ -104,6 +109,11 @@ var cuMemAllocHost_fn: ?FnMemAllocHost = null;
 var cuMemFreeHost_fn: ?FnMemFreeHost = null;
 var cuCtxGetCurrent_fn: ?FnCtxGetCurrent = null;
 var cuCtxSetCurrent_fn: ?FnCtxSetCurrent = null;
+var cuEventCreate_fn: ?FnEventCreate = null;
+var cuEventRecord_fn: ?FnEventRecord = null;
+var cuEventSynchronize_fn: ?FnEventSynchronize = null;
+var cuEventElapsedTime_fn: ?FnEventElapsedTime = null;
+var cuEventDestroy_fn: ?FnEventDestroy = null;
 
 // Pipeline streams (persistent, created once in init)
 const NUM_PIPELINE_STREAMS = 1;
@@ -151,6 +161,11 @@ pub fn init() bool {
     cuMemFreeHost_fn = getProc(FnMemFreeHost, "cuMemFreeHost");
     cuCtxGetCurrent_fn = getProc(FnCtxGetCurrent, "cuCtxGetCurrent");
     cuCtxSetCurrent_fn = getProc(FnCtxSetCurrent, "cuCtxSetCurrent");
+    cuEventCreate_fn = getProc(FnEventCreate, "cuEventCreate");
+    cuEventRecord_fn = getProc(FnEventRecord, "cuEventRecord");
+    cuEventSynchronize_fn = getProc(FnEventSynchronize, "cuEventSynchronize");
+    cuEventElapsedTime_fn = getProc(FnEventElapsedTime, "cuEventElapsedTime");
+    cuEventDestroy_fn = getProc(FnEventDestroy, "cuEventDestroy_v2");
 
     if ((cuInit_fn orelse return false)(0) != CUDA_SUCCESS) return false;
 
@@ -358,6 +373,92 @@ const HuffDecChunkDesc = extern struct {
 
 const HUFF_LUT_ENTRIES: usize = 1024; // matches MAX_CODE_LEN=10 (10-bit escape LUT) in kernel
 
+// ── Per-kernel timing infrastructure ─────────────────────────────
+// When `enable_profiling` is set on a DecodeContext, each kernel launch
+// is wrapped in a cuEvent pair. After the final sync, finalizeProfiling
+// computes elapsed time per kernel and stores results in `last_timings`,
+// which slzGetLastTimings exposes via the C ABI.
+pub const KernelTiming = extern struct {
+    name: [*:0]const u8,
+    ms: f32,
+};
+
+pub const PendingTiming = struct {
+    name: [*:0]const u8,
+    start_event: usize,
+    end_event: usize,
+};
+
+/// Allocate + record a start event for a kernel about to launch on `stream`.
+/// Returns the end-event handle to pass to `endKernelTiming`, or null when
+/// profiling is disabled or any CUDA call failed (timing is best-effort —
+/// never blocks the encode/decode path).
+pub fn beginKernelTiming(
+    ctx_enabled: bool,
+    pending: *std.ArrayListUnmanaged(PendingTiming),
+    name: [*:0]const u8,
+    stream: usize,
+) ?usize {
+    if (!ctx_enabled) return null;
+    const create_fn = cuEventCreate_fn orelse return null;
+    const record_fn = cuEventRecord_fn orelse return null;
+    var start: usize = 0;
+    var end: usize = 0;
+    if (create_fn(&start, 0) != CUDA_SUCCESS) return null;
+    if (create_fn(&end, 0) != CUDA_SUCCESS) {
+        if (cuEventDestroy_fn) |d| _ = d(start);
+        return null;
+    }
+    if (record_fn(start, stream) != CUDA_SUCCESS) {
+        if (cuEventDestroy_fn) |d| { _ = d(start); _ = d(end); }
+        return null;
+    }
+    pending.append(std.heap.page_allocator, .{
+        .name = name, .start_event = start, .end_event = end,
+    }) catch {
+        if (cuEventDestroy_fn) |d| { _ = d(start); _ = d(end); }
+        return null;
+    };
+    return end;
+}
+
+pub fn endKernelTiming(end_event: ?usize, stream: usize) void {
+    const e = end_event orelse return;
+    const record_fn = cuEventRecord_fn orelse return;
+    _ = record_fn(e, stream);
+}
+
+/// Synchronize on each pending event pair and compute elapsed times into
+/// `last_timings`. Destroys the events. Idempotent (safe to call when
+/// pending is empty).
+pub fn finalizeProfiling(
+    pending: *std.ArrayListUnmanaged(PendingTiming),
+    last_timings: *std.ArrayListUnmanaged(KernelTiming),
+) void {
+    last_timings.clearRetainingCapacity();
+    const sync_fn = cuEventSynchronize_fn orelse {
+        pending.clearRetainingCapacity();
+        return;
+    };
+    const elapsed_fn = cuEventElapsedTime_fn orelse {
+        pending.clearRetainingCapacity();
+        return;
+    };
+    const destroy_fn = cuEventDestroy_fn orelse {
+        pending.clearRetainingCapacity();
+        return;
+    };
+    for (pending.items) |p| {
+        _ = sync_fn(p.end_event);
+        var ms: f32 = 0.0;
+        _ = elapsed_fn(&ms, p.start_event, p.end_event);
+        last_timings.append(std.heap.page_allocator, .{ .name = p.name, .ms = ms }) catch {};
+        _ = destroy_fn(p.start_event);
+        _ = destroy_fn(p.end_event);
+    }
+    pending.clearRetainingCapacity();
+}
+
 // Staged decode-scan output — mirror SlzScanHuffDesc / SlzScanRawDesc in
 // lz_kernels.cuh. slzScanParseKernel fills one entry per stream type per
 // global sub-chunk index; `valid` marks an entropy-coded / raw stream
@@ -532,6 +633,15 @@ pub const DecodeContext = struct {
     // Pipeline streams (persistent, created once in init)
     pipeline_streams: [16]usize = .{0} ** 16,
     pipeline_streams_created: bool = false,
+
+    // Per-kernel timing (slzDecompressOpts_t.enable_profiling). When true,
+    // every kernel launch in fullGpuLaunchImpl records a cuEvent pair and
+    // appends to `pending_timings`. `finalizeProfiling` (called after the
+    // final sync) drains pending → `last_timings`, which slzGetLastTimings
+    // reads out via the C ABI.
+    enable_profiling: bool = false,
+    pending_timings: std.ArrayListUnmanaged(PendingTiming) = .empty,
+    last_timings: std.ArrayListUnmanaged(KernelTiming) = .empty,
 };
 
 /// Default decode context backing the module-level public API. Library
@@ -1195,7 +1305,9 @@ pub fn gpuWalkFrameImpl(
         @ptrCast(&k_meta_bsize),  @ptrCast(&k_meta_status),
     };
     var extra = [_]?*anyopaque{null};
+    const _t = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzWalkFrameKernel", 0);
     if (launch(walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return null;
+    endKernelTiming(_t, 0);
     if (sync() != CUDA_SUCCESS) return null;
 
     return .{
@@ -1251,7 +1363,9 @@ pub fn gpuPrefixSumChunksImpl(
         @ptrCast(&k_first), @ptrCast(&k_total),
     };
     var extra = [_]?*anyopaque{null};
+    const _t = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzPrefixSumChunksKernel", 0);
     if (launch(prefix_sum_chunks_fn, 1, 1, 1, 1, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return null;
+    endKernelTiming(_t, 0);
     if (sync() != CUDA_SUCCESS) return null;
 
     return .{
@@ -1339,7 +1453,9 @@ fn gpuScanChunks(
     var extra = [_]?*anyopaque{null};
     const tpb: u32 = 256;
     const blocks: u32 = (n + tpb - 1) / tpb;
+    const _t_scan = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzScanParseKernel", 0);
     if (launch(scan_parse_fn, blocks, 1, 1, tpb, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return null;
+    endKernelTiming(_t_scan, 0);
     if (sync() != CUDA_SUCCESS) return null;
 
     // ── Step 6b: device-side compaction ─────────────────────────────
@@ -1379,7 +1495,13 @@ fn gpuScanChunks(
             .{ .staged_off = huff_arr_bytes * 2, .dst = self.d_compact_hi,  .n_off = 8 },
             .{ .staged_off = huff_arr_bytes * 3, .dst = self.d_compact_lo,  .n_off = 12 },
         };
-        for (huff_streams) |hs| {
+        const compact_names = [_][*:0]const u8{
+            "slzCompactHuffDescsKernel (lit)",
+            "slzCompactHuffDescsKernel (tok)",
+            "slzCompactHuffDescsKernel (hi)",
+            "slzCompactHuffDescsKernel (lo)",
+        };
+        for (huff_streams, 0..) |hs, ci| {
             var k_staged: u64 = base + hs.staged_off;
             var k_total: u64 = self.d_total_subchunks_buf;
             var k_dst: u64 = hs.dst;
@@ -1389,7 +1511,9 @@ fn gpuScanChunks(
                 @ptrCast(&k_dst), @ptrCast(&k_count),
             };
             var c_extra = [_]?*anyopaque{null};
+            const _t_ch = beginKernelTiming(self.enable_profiling, &self.pending_timings, compact_names[ci], 0);
             if (launch(compact_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, 0, &c_params, &c_extra) != CUDA_SUCCESS) return null;
+            endKernelTiming(_t_ch, 0);
         }
         // Raw compact.
         {
@@ -1403,7 +1527,9 @@ fn gpuScanChunks(
                 @ptrCast(&cr_dst), @ptrCast(&cr_count),
             };
             var cr_extra = [_]?*anyopaque{null};
+            const _t_cr = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzCompactRawDescsKernel", 0);
             if (launch(compact_raw_descs_fn, 1, 1, 1, 1, 1, 1, 0, 0, &cr_params, &cr_extra) != CUDA_SUCCESS) return null;
+            endKernelTiming(_t_cr, 0);
         }
         if (sync() != CUDA_SUCCESS) return null;
 
@@ -1813,10 +1939,13 @@ pub fn fullGpuLaunchImpl(
                     // = 131072). Out-of-range blocks return immediately
                     // via the self-gate above.
                     const grid_x: u32 = ndesc; // ndesc is exact, no over-launch needed when host knows it
+                    const _t_gather = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzGatherRawOff16Kernel", 0);
                     if (launch_fn(gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, 0, &params, &extra) == CUDA_SUCCESS) {
+                        endKernelTiming(_t_gather, 0);
                         _ = sync_fn();
                         break :gather_blk;
                     }
+                    endKernelTiming(_t_gather, 0);
                 }
             }
             // Fallback: async device-to-device, else host upload.
@@ -1886,8 +2015,10 @@ pub fn fullGpuLaunchImpl(
                 @ptrCast(&k_merged), @ptrCast(&k_n_merged),
             };
             var m_extra = [_]?*anyopaque{null};
+            const _t_merge = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzMergeHuffDescsKernel", 0);
             if (launch_fn(merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, 0, &m_params, &m_extra) != CUDA_SUCCESS)
                 return error.BadMode;
+            endKernelTiming(_t_merge, 0);
             _ = sync_fn();
         } else {
             // Legacy CPU merge — used by the non-pure-D2D / CPU-scan paths.
@@ -2072,8 +2203,10 @@ pub fn fullGpuLaunchImpl(
                     @ptrCast(&p_lut), @ptrCast(&p_n),
                 };
                 var extra = [_]?*anyopaque{null};
+                const _t_hb = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffBuildLutKernel", huff_stream);
                 if (launch_fn(huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra) != CUDA_SUCCESS)
                     return error.BadMode;
+                endKernelTiming(_t_hb, huff_stream);
             }
             // Split fence: time the LUT build separately from the decode.
             if (split_timer) {
@@ -2095,8 +2228,10 @@ pub fn fullGpuLaunchImpl(
                 };
                 var extra = [_]?*anyopaque{null};
                 const shared_bytes: c_uint = HUFF_LUT_ENTRIES * @sizeOf(u32);
+                const _t_hd = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffDecode4StreamKernel", huff_stream);
                 if (launch_fn(huff_decode_fn, n_huff, 1, 1, 32, 1, 1, shared_bytes, huff_stream, &params, &extra) != CUDA_SUCCESS)
                     return error.BadMode;
+                endKernelTiming(_t_hd, huff_stream);
             }
         }
 
@@ -2344,8 +2479,10 @@ pub fn fullGpuLaunchImpl(
                     @ptrCast(&p_sc_cap),
                 };
                 var raw_extra = [_]?*anyopaque{null};
+                const _t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", stream);
                 if (launch_fn(kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra) != CUDA_SUCCESS)
                     return error.BadMode;
+                endKernelTiming(_t_lzr, stream);
             } else {
                 // Drop chunk_base / tans_tok_scratch / tans_off16_scratch
                 // from the kernel signature — kernel derives tok/off16 from
@@ -2375,8 +2512,10 @@ pub fn fullGpuLaunchImpl(
                 };
                 var lz_extra = [_]?*anyopaque{null};
 
+                const _t_lz = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeKernel", stream);
                 if (launch_fn(kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra) != CUDA_SUCCESS)
                     return error.BadMode;
+                endKernelTiming(_t_lz, stream);
             }
 
             if (split_timer) {
@@ -2585,8 +2724,10 @@ pub fn fullGpuLaunchImpl(
                 @ptrCast(&p_sc_cap),
             };
             var raw_extra = [_]?*anyopaque{null};
+            const _t_lzr2 = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", 0);
             if (launch_fn(kernel_raw_fn, grid_x, 1, 1, 32, 2, 1, 0, 0, &raw_params, &raw_extra) != CUDA_SUCCESS)
                 return error.BadMode;
+            endKernelTiming(_t_lzr2, 0);
         } else {
             var p_comp = self.d_comp_persist;
             var p_descs_dev = self.d_descs_persist;
@@ -2610,8 +2751,10 @@ pub fn fullGpuLaunchImpl(
                 @ptrCast(&p_first_sub_idx),
             };
             var extra = [_]?*anyopaque{null};
+            const _t_lz2 = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeKernel", 0);
             if (launch_fn(kernel_fn, grid_x, 1, 1, 32, 2, 1, 0, 0, &params, &extra) != CUDA_SUCCESS)
                 return error.BadMode;
+            endKernelTiming(_t_lz2, 0);
         }
 
         if (sync_fn() != CUDA_SUCCESS) return error.BadMode;
@@ -2626,6 +2769,10 @@ pub fn fullGpuLaunchImpl(
     if (t_e2e0) |t0| if (io) |iv| {
         e2e_cum_predh_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
     };
+    // Profiling: drain pending cuEvent pairs into last_timings now that
+    // every kernel has run. Idempotent and a no-op when profiling is off.
+    finalizeProfiling(&self.pending_timings, &self.last_timings);
+
     // Device-resident output (4d Phase 3): D2D-copy the decoded bytes
     // straight to the caller's device buffer, skipping the host bounce.
     if (d_output_target) |dev_target| {

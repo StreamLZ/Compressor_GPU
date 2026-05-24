@@ -42,7 +42,20 @@ const SLZ_ERROR_OUT_OF_MEMORY: c_int = 7;
 // ── slzCompressOpts_t — must match the header struct layout ───────────
 const CompressOpts = extern struct {
     level: c_int = 5,
+    enable_profiling: c_int = 0,
+    reserved: [6]c_int = .{0} ** 6,
+};
+
+// ── slzDecompressOpts_t — must match the header struct layout ─────────
+const DecompressOpts = extern struct {
+    enable_profiling: c_int = 0,
     reserved: [7]c_int = .{0} ** 7,
+};
+
+// ── slzKernelTiming_t — must match the header struct layout ───────────
+const KernelTimingC = extern struct {
+    name: [*:0]const u8,
+    ms: f32,
 };
 
 /// Library handle. Owns the per-operation GPU contexts so concurrent
@@ -83,7 +96,9 @@ fn compressCore(h: *Context, input: []const u8, output: []u8, opts: CompressOpts
     return @intCast(n);
 }
 
-fn decompressCore(h: *Context, frame_bytes: []const u8, output: []u8) c_int {
+fn decompressCore(h: *Context, frame_bytes: []const u8, output: []u8, opts: DecompressOpts) c_int {
+    h.dec.enable_profiling = opts.enable_profiling != 0;
+    defer h.dec.enable_profiling = false;
     const r = decoder.decompressFramedParallelThreaded(
         allocator,
         null,
@@ -104,7 +119,9 @@ fn decompressCore(h: *Context, frame_bytes: []const u8, output: []u8) c_int {
 /// walk frame/block/chunk headers — full GPU-side header walk is a
 /// follow-up. Returns -1 on the GPU-only contract failing so the caller
 /// can fall back to the host-bounce path.
-fn decompressCoreD2D(h: *Context, frame_bytes: []const u8, d_output: u64) c_int {
+fn decompressCoreD2D(h: *Context, frame_bytes: []const u8, d_output: u64, opts: DecompressOpts) c_int {
+    h.dec.enable_profiling = opts.enable_profiling != 0;
+    defer h.dec.enable_profiling = false;
     const r = decoder.decompressFramedParallelToDevice(
         allocator,
         null,
@@ -161,10 +178,14 @@ const CompressJob = struct {
             j.h.enc.d_output_override = j.d_dst;
             j.h.enc.output_written_to_device = false;
         }
+        j.h.enc.enable_profiling = j.opts.enable_profiling != 0;
         defer {
             j.h.enc.d_input_override = 0;
             j.h.enc.d_output_override = 0;
             j.h.enc.output_written_to_device = false;
+            // Drain cuEvent pairs → last_timings (no-op when profiling off).
+            gpu_driver.finalizeProfiling(&j.h.enc.pending_timings, &j.h.enc.last_timings);
+            j.h.enc.enable_profiling = false;
         }
         const rc = compressCore(j.h, j.src, j.dst, j.opts);
         if (rc < 0) {
@@ -185,6 +206,7 @@ const DecompressJob = struct {
     h: *Context,
     src: []const u8,
     dst: []u8,
+    opts: DecompressOpts = .{},
     d_src: u64 = 0,
     d_dst: u64 = 0,
     result: c_int = SLZ_ERROR_CUDA,
@@ -198,7 +220,7 @@ const DecompressJob = struct {
             j.result = SLZ_ERROR_CUDA;
             return;
         }
-        const rc = decompressCore(j.h, j.src, j.dst);
+        const rc = decompressCore(j.h, j.src, j.dst, j.opts);
         if (rc < 0) {
             j.result = rc;
             return;
@@ -221,6 +243,7 @@ const DecompressJobTrueD2D = struct {
     d_src: u64,
     src_size: u32,
     d_dst: u64,
+    opts: DecompressOpts = .{},
     result: c_int = SLZ_ERROR_CUDA,
     fall_back: bool = false,
 
@@ -229,6 +252,8 @@ const DecompressJobTrueD2D = struct {
             j.result = SLZ_ERROR_CUDA;
             return;
         }
+        j.h.dec.enable_profiling = j.opts.enable_profiling != 0;
+        defer j.h.dec.enable_profiling = false;
         const n = decoder.decompressFramedFromDevice(
             allocator,
             null,
@@ -259,6 +284,7 @@ const DecompressJobD2D = struct {
     host_frame: []u8,
     d_src: u64,
     d_dst: u64,
+    opts: DecompressOpts = .{},
     result: c_int = SLZ_ERROR_CUDA,
     fall_back: bool = false,
 
@@ -271,7 +297,7 @@ const DecompressJobD2D = struct {
             j.result = SLZ_ERROR_CUDA;
             return;
         }
-        const rc = decompressCoreD2D(j.h, j.host_frame, j.d_dst);
+        const rc = decompressCoreD2D(j.h, j.host_frame, j.d_dst, j.opts);
         if (rc == -1) {
             j.fall_back = true;
             j.result = SLZ_ERROR_CUDA;
@@ -328,6 +354,10 @@ export fn slzDestroy(handle: ?*Context) c_int {
 
 // ── Options ───────────────────────────────────────────────────────────
 export fn slzCompressDefaultOpts() CompressOpts {
+    return .{};
+}
+
+export fn slzDecompressDefaultOpts() DecompressOpts {
     return .{};
 }
 
@@ -424,6 +454,7 @@ export fn slzDecompressHost(
     output: ?*anyopaque,
     output_capacity: usize,
     output_size: ?*usize,
+    opts: DecompressOpts,
 ) c_int {
     const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
     const frame_ptr = frame_in orelse return SLZ_ERROR_INVALID_ARG;
@@ -436,6 +467,7 @@ export fn slzDecompressHost(
         .h = h,
         .src = fr[0..frame_size],
         .dst = out[0..output_capacity],
+        .opts = opts,
     };
     const rc = runOnWorker(DecompressJob, &job);
     if (rc < 0) return rc;
@@ -499,6 +531,7 @@ export fn slzDecompress(
     d_output: ?*anyopaque,
     output_capacity: usize,
     output_size: ?*usize,
+    opts: DecompressOpts,
 ) c_int {
     _ = d_temp;
     _ = temp_size;
@@ -514,6 +547,7 @@ export fn slzDecompress(
         .d_src = @intFromPtr(frame_dev),
         .src_size = @intCast(frame_size),
         .d_dst = @intFromPtr(out_dev),
+        .opts = opts,
     };
     const rc_true = runOnWorker(DecompressJobTrueD2D, &true_job);
     if (rc_true >= 0) {
@@ -532,6 +566,7 @@ export fn slzDecompress(
         .host_frame = host_frame,
         .d_src = @intFromPtr(frame_dev),
         .d_dst = @intFromPtr(out_dev),
+        .opts = opts,
     };
     const rc_d2d = runOnWorker(DecompressJobD2D, &d2d_job);
     if (rc_d2d >= 0) {
@@ -548,11 +583,45 @@ export fn slzDecompress(
         .h = h,
         .src = host_frame,
         .dst = host_out,
+        .opts = opts,
         .d_src = 0, // host_frame already populated by the D2D try
         .d_dst = @intFromPtr(out_dev),
     };
     const rc = runOnWorker(DecompressJob, &job);
     if (rc < 0) return rc;
     out_size.* = @intCast(rc);
+    return SLZ_SUCCESS;
+}
+
+// ── Profiling ─────────────────────────────────────────────────────────
+// Reads the per-kernel timings captured during the most recent compress
+// or decompress call on this handle. Combines encode + decode timings
+// (encode first if both ran, then decode). `timings` may be NULL — the
+// call always writes *count and returns SLZ_SUCCESS.
+export fn slzGetLastTimings(
+    handle: ?*Context,
+    timings: ?[*]KernelTimingC,
+    capacity: usize,
+    count_out: ?*usize,
+) c_int {
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    const cnt = count_out orelse return SLZ_ERROR_INVALID_ARG;
+    const enc_list = h.enc.last_timings.items;
+    const dec_list = h.dec.last_timings.items;
+    const total = enc_list.len + dec_list.len;
+    cnt.* = total;
+    if (timings) |t| {
+        var i: usize = 0;
+        for (enc_list) |kt| {
+            if (i >= capacity) break;
+            t[i] = .{ .name = kt.name, .ms = kt.ms };
+            i += 1;
+        }
+        for (dec_list) |kt| {
+            if (i >= capacity) break;
+            t[i] = .{ .name = kt.name, .ms = kt.ms };
+            i += 1;
+        }
+    }
     return SLZ_SUCCESS;
 }

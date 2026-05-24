@@ -40,7 +40,8 @@ int main(void) {
 
     unsigned char *output = (unsigned char *)malloc(n + 64);
     size_t out_len = 0;
-    s = slzDecompressHost(h, frame, frame_len, output, n + 64, &out_len);
+    slzDecompressOpts_t dopts = slzDecompressDefaultOpts();
+    s = slzDecompressHost(h, frame, frame_len, output, n + 64, &out_len, dopts);
     if (s != SLZ_SUCCESS) { printf("decompress failed: %s\n", slzStatusString(s)); return 1; }
 
     int ok = (out_len == n) && (memcmp(input, output, n) == 0);

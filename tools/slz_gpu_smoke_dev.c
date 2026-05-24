@@ -33,7 +33,8 @@ int main(void) {
     printf("d2d compressed %zu -> %zu bytes\n", n, frame_len);
 
     size_t out_len = 0;
-    s = slzDecompress(h, d_frame, frame_len, NULL, 0, d_out, n + 64, &out_len);
+    slzDecompressOpts_t dopts = slzDecompressDefaultOpts();
+    s = slzDecompress(h, d_frame, frame_len, NULL, 0, d_out, n + 64, &out_len, dopts);
     if (s != SLZ_SUCCESS) { printf("slzDecompress (d2d) failed: %s\n", slzStatusString(s)); return 1; }
 
     unsigned char *result = (unsigned char *)malloc(n + 64);
