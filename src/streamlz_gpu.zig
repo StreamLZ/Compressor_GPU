@@ -151,18 +151,31 @@ const CompressJob = struct {
         // device input) instead of H2D-ing the host bounce.
         if (j.d_src != 0) {
             j.h.enc.d_input_override = j.d_src;
-        } else {
-            // Host-input path (slzCompressHost): nothing to override.
         }
-        defer j.h.enc.d_input_override = 0;
+        // 4d step 8: when the caller asked for a device output AND the
+        // encode hits the slzFrameAssembleKernel path, the kernel writes
+        // the frame straight to d_dst — no host bounce. The fallback
+        // host->device H2D below stays as the safety net for paths that
+        // didn't take the pure-D2D branch.
+        if (j.d_dst != 0) {
+            j.h.enc.d_output_override = j.d_dst;
+            j.h.enc.output_written_to_device = false;
+        }
+        defer {
+            j.h.enc.d_input_override = 0;
+            j.h.enc.d_output_override = 0;
+            j.h.enc.output_written_to_device = false;
+        }
         const rc = compressCore(j.h, j.src, j.dst, j.opts);
         if (rc < 0) {
             j.result = rc;
             return;
         }
-        if (j.d_dst != 0 and !gpu_driver.copyHostToDevice(j.d_dst, j.dst[0..@intCast(rc)])) {
-            j.result = SLZ_ERROR_CUDA;
-            return;
+        if (j.d_dst != 0 and !j.h.enc.output_written_to_device) {
+            if (!gpu_driver.copyHostToDevice(j.d_dst, j.dst[0..@intCast(rc)])) {
+                j.result = SLZ_ERROR_CUDA;
+                return;
+            }
         }
         j.result = rc;
     }

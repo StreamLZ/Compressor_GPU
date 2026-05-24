@@ -359,3 +359,90 @@ extern "C" __global__ void slzAssembleWriteKernel(
         hdr[2] = (uint8_t)(sc_hdr & 0xFF);
     }
 }
+
+// ── Frame-assemble kernel (4d step 8) ───────────────────────────────
+// Writes the complete StreamLZ frame to d_output on device:
+//   [pre-formed frame_hdr+block_hdr (host-staged via d_prefix_bytes)]
+//   per chunk i:
+//     [2-byte internal_hdr][4-byte chunk_hdr LE u32 = (asm_total-1)]
+//     [asm_total bytes copied from d_asm_out[asm_offsets[i]]]
+//   [(n_chunks-1) * 8 B SC tail prefix from d_input]
+//   [4-byte end mark = 0]
+//
+// Replaces the host loop in fast_framed.gpu_compress when SLZ_GPU_ASSEMBLE
+// is set and the slzCompress D2D path is in use. Grid layout:
+//   block_id < n_chunks  → write chunk's bytes (internal_hdr + chunk_hdr + asm).
+//   block_id == n_chunks → write prefix bytes, SC tail, end mark.
+//
+// All offsets are in d_output's coordinate space.
+extern "C" __global__ void slzFrameAssembleKernel(
+    const uint8_t* __restrict__ d_input,            // for SC tail prefix bytes
+    const uint8_t* __restrict__ d_asm_out,          // assembled sub-chunk blocks
+    const uint32_t* __restrict__ d_asm_offsets,     // per-chunk first asm offset
+    const uint32_t* __restrict__ d_asm_chunk_sizes, // per-chunk total asm size (sum of sub-chunk asm sizes)
+    const uint32_t* __restrict__ d_chunk_dst,       // per-chunk dst offset (start of 2B internal_hdr)
+    const uint8_t* __restrict__ d_prefix_bytes,     // pre-formed frame_hdr + block_hdr bytes
+    uint32_t prefix_size,                            // length of d_prefix_bytes
+    uint8_t  internal_hdr0,
+    uint8_t  internal_hdr1,
+    uint32_t n_chunks,
+    uint32_t eff_chunk_size,                         // source chunk size in bytes (for SC tail src offset)
+    uint32_t src_len,                                // total source length (for SC tail last-entry clamp)
+    uint32_t sc_tail_off,                            // dst offset of SC tail prefix table
+    uint32_t end_mark_off,                           // dst offset of end mark
+    uint8_t* __restrict__ d_output)
+{
+    const uint32_t block_id = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t bdim = blockDim.x;
+
+    if (block_id < n_chunks) {
+        // Per-chunk write: 2B internal_hdr + 4B chunk_hdr + asm bytes.
+        const uint32_t dst_off = d_chunk_dst[block_id];
+        const uint32_t asm_start = d_asm_offsets[block_id];
+        const uint32_t asm_total = d_asm_chunk_sizes[block_id];
+
+        if (lane == 0) {
+            d_output[dst_off + 0] = internal_hdr0;
+            d_output[dst_off + 1] = internal_hdr1;
+            const uint32_t hdr_u32 = asm_total - 1;  // chunk_hdr LE u32
+            d_output[dst_off + 2] = (uint8_t)(hdr_u32 & 0xFF);
+            d_output[dst_off + 3] = (uint8_t)((hdr_u32 >> 8) & 0xFF);
+            d_output[dst_off + 4] = (uint8_t)((hdr_u32 >> 16) & 0xFF);
+            d_output[dst_off + 5] = (uint8_t)((hdr_u32 >> 24) & 0xFF);
+        }
+        // Cooperative copy of the assembled sub-chunk block(s).
+        const uint32_t payload_dst = dst_off + 6;
+        for (uint32_t i = lane; i < asm_total; i += bdim) {
+            d_output[payload_dst + i] = d_asm_out[asm_start + i];
+        }
+        return;
+    }
+
+    if (block_id == n_chunks) {
+        // Block N: prefix bytes (frame_hdr + block_hdr) at d_output[0..prefix_size],
+        // SC tail prefix table, end mark.
+        for (uint32_t i = lane; i < prefix_size; i += bdim) {
+            d_output[i] = d_prefix_bytes[i];
+        }
+
+        // SC tail prefix: (n_chunks - 1) entries of 8 bytes each. Each entry
+        // copies the first 8 bytes of chunk (entry_idx+1) from d_input.
+        // The last entry may have fewer than 8 source bytes — pad with zeros.
+        if (n_chunks > 1) {
+            const uint32_t total_tail_bytes = (n_chunks - 1) * 8u;
+            for (uint32_t i = lane; i < total_tail_bytes; i += bdim) {
+                const uint32_t entry_idx = i / 8;
+                const uint32_t byte_in_entry = i - entry_idx * 8;
+                const uint32_t chunk_idx = entry_idx + 1;
+                const uint32_t src_off = chunk_idx * eff_chunk_size + byte_in_entry;
+                const uint8_t v = (src_off < src_len) ? d_input[src_off] : (uint8_t)0;
+                d_output[sc_tail_off + i] = v;
+            }
+        }
+
+        // End mark: 4 zero bytes.
+        if (lane < 4) d_output[end_mark_off + lane] = 0;
+        return;
+    }
+}

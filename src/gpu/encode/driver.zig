@@ -29,6 +29,7 @@ var huff_encode_kernel_fn: usize = 0;
 var assemble_module: usize = 0;
 var assemble_measure_fn: usize = 0;
 var assemble_write_fn: usize = 0;
+var frame_assemble_fn: usize = 0;
 var initialized = false;
 
 const FnInit = *const fn (c_uint) callconv(.c) CUresult;
@@ -109,6 +110,7 @@ pub fn init() bool {
     if ((cuModuleLoadData_fn orelse return false)(&assemble_module, asm_ptx.ptr) == CUDA_SUCCESS) {
         _ = get_fn(&assemble_measure_fn, assemble_module, "slzAssembleMeasureKernel");
         _ = get_fn(&assemble_write_fn, assemble_module, "slzAssembleWriteKernel");
+        _ = get_fn(&frame_assemble_fn, assemble_module, "slzFrameAssembleKernel");
     }
 
     return true;
@@ -416,6 +418,29 @@ pub const EncodeContext = struct {
     // already GPU-resident (slzCompress D2D path). The caller resets it
     // to 0 after the compress call.
     d_input_override: u64 = 0,
+
+    // 4d step 8: when set to a non-zero device address, the frame-assembly
+    // path writes the full StreamLZ frame straight to this device buffer
+    // (slzFrameAssembleKernel), skipping the host frame-build loop and
+    // the wrapper's H2D bounce. Caller (slzCompress C-ABI) inspects
+    // `output_written_to_device` after the encode to decide whether the
+    // H2D fallback is needed.
+    d_output_override: u64 = 0,
+    output_written_to_device: bool = false,
+
+    // 4d step 8 scratch — small device buffers populated host-side per call:
+    //   d_frame_chunk_dst    — per-chunk dst offsets (n_chunks × u32)
+    //   d_frame_asm_offsets  — per-chunk asm-out start offsets (n_chunks × u32)
+    //   d_frame_asm_chunk_sz — per-chunk total asm size (n_chunks × u32)
+    //   d_frame_prefix_bytes — pre-formed frame_hdr + block_hdr (~40 B)
+    d_frame_chunk_dst: CUdeviceptr = 0,
+    d_frame_chunk_dst_size: usize = 0,
+    d_frame_asm_offsets: CUdeviceptr = 0,
+    d_frame_asm_offsets_size: usize = 0,
+    d_frame_asm_chunk_sz: CUdeviceptr = 0,
+    d_frame_asm_chunk_sz_size: usize = 0,
+    d_frame_prefix_bytes: CUdeviceptr = 0,
+    d_frame_prefix_bytes_size: usize = 0,
 
     // ── LZ-encode persistent device buffers ────────────────────
     d_input_persist: CUdeviceptr = 0,
@@ -1300,6 +1325,106 @@ pub fn gpuAssembleFrameImpl(
     self.assembled_offsets = off;
     self.assembled_sizes = sz;
     return true;
+}
+
+/// 4d step 8 — Pure-D2D frame writer. Takes the device-resident assembled
+/// sub-chunk blocks (already in `self.d_asm_out` from gpuAssembleFrameImpl)
+/// plus host-precomputed per-chunk layout info, launches
+/// slzFrameAssembleKernel, and writes the complete StreamLZ frame to
+/// `d_output` on device. Returns the total frame byte count or null on
+/// failure.
+///
+/// Caller must supply:
+///   `prefix_bytes` — pre-formed frame_hdr + block_hdr (~30-40 B).
+///   `per_chunk_asm_off`  — start of each chunk's sub-chunk(s) in d_asm_out.
+///   `per_chunk_asm_size` — total asm bytes for each chunk (sum across its sub-chunks).
+///   `internal_hdr0/1`    — the 2-byte internal block header (same for every chunk).
+///   `eff_chunk_size`     — source chunk stride in bytes (for SC tail src offsets).
+///   `d_input_dev`        — device source (for SC tail prefix bytes).
+///
+/// Self-contained (`sc_tail_count = n_chunks - 1` when n_chunks > 1, else 0)
+/// is inferred from the chunk count; SC mode is the only one slzCompress
+/// produces.
+pub fn gpuFrameAssembleImpl(
+    self: *EncodeContext,
+    n_chunks: u32,
+    eff_chunk_size: u32,
+    src_len: u32,
+    prefix_bytes: []const u8,
+    internal_hdr0: u8,
+    internal_hdr1: u8,
+    per_chunk_asm_off: []const u32,
+    per_chunk_asm_size: []const u32,
+    d_input_dev: u64,
+    d_output: u64,
+) ?u32 {
+    if (!init()) return null;
+    if (frame_assemble_fn == 0) return null;
+    if (self.d_asm_out == 0) return null;
+    if (n_chunks == 0 or per_chunk_asm_off.len < n_chunks or per_chunk_asm_size.len < n_chunks) return null;
+
+    const h2d = cuMemcpyHtoD_fn orelse return null;
+    const launch = cuLaunchKernel_fn orelse return null;
+    const sync = cuCtxSynchronize_fn orelse return null;
+
+    // Build per-chunk dst offset table on host (prefix sum of 6 + asm_size).
+    var per_chunk_dst_buf: [16384]u32 = undefined;
+    if (n_chunks > per_chunk_dst_buf.len) return null;
+    var pos: u32 = @intCast(prefix_bytes.len);
+    for (0..n_chunks) |i| {
+        per_chunk_dst_buf[i] = pos;
+        pos += 6 + per_chunk_asm_size[i];
+    }
+    const sc_tail_off: u32 = pos;
+    const sc_tail_bytes: u32 = if (n_chunks > 1) (n_chunks - 1) * 8 else 0;
+    pos += sc_tail_bytes;
+    const end_mark_off: u32 = pos;
+    pos += 4;
+    const total_frame_size: u32 = pos;
+
+    const ent_bytes: usize = @as(usize, n_chunks) * 4;
+    if (!ensureBuf(&self.d_frame_chunk_dst, &self.d_frame_chunk_dst_size, ent_bytes)) return null;
+    if (!ensureBuf(&self.d_frame_asm_offsets, &self.d_frame_asm_offsets_size, ent_bytes)) return null;
+    if (!ensureBuf(&self.d_frame_asm_chunk_sz, &self.d_frame_asm_chunk_sz_size, ent_bytes)) return null;
+    if (!ensureBuf(&self.d_frame_prefix_bytes, &self.d_frame_prefix_bytes_size, prefix_bytes.len)) return null;
+
+    _ = h2d(self.d_frame_chunk_dst, @ptrCast(&per_chunk_dst_buf), ent_bytes);
+    _ = h2d(self.d_frame_asm_offsets, @ptrCast(per_chunk_asm_off.ptr), ent_bytes);
+    _ = h2d(self.d_frame_asm_chunk_sz, @ptrCast(per_chunk_asm_size.ptr), ent_bytes);
+    _ = h2d(self.d_frame_prefix_bytes, @ptrCast(prefix_bytes.ptr), prefix_bytes.len);
+
+    var k_input = d_input_dev;
+    var k_asm_out = self.d_asm_out;
+    var k_asm_offs = self.d_frame_asm_offsets;
+    var k_asm_sizes = self.d_frame_asm_chunk_sz;
+    var k_chunk_dst = self.d_frame_chunk_dst;
+    var k_prefix = self.d_frame_prefix_bytes;
+    var k_prefix_size: u32 = @intCast(prefix_bytes.len);
+    var k_hdr0 = internal_hdr0;
+    var k_hdr1 = internal_hdr1;
+    var k_n = n_chunks;
+    var k_eff = eff_chunk_size;
+    var k_src_len = src_len;
+    var k_sc_off = sc_tail_off;
+    var k_end_off = end_mark_off;
+    var k_dst = d_output;
+    var params = [_]?*anyopaque{
+        @ptrCast(&k_input),    @ptrCast(&k_asm_out),  @ptrCast(&k_asm_offs),
+        @ptrCast(&k_asm_sizes),@ptrCast(&k_chunk_dst),@ptrCast(&k_prefix),
+        @ptrCast(&k_prefix_size),
+        @ptrCast(&k_hdr0),     @ptrCast(&k_hdr1),
+        @ptrCast(&k_n),        @ptrCast(&k_eff),      @ptrCast(&k_src_len),
+        @ptrCast(&k_sc_off),   @ptrCast(&k_end_off),  @ptrCast(&k_dst),
+    };
+    var extra = [_]?*anyopaque{null};
+
+    // Grid: n_chunks blocks for per-chunk writes + 1 block for prefix/tail/end mark.
+    // 128 threads per block — enough for cooperative copies up to ~few KB/iter.
+    const grid_x: u32 = n_chunks + 1;
+    if (launch(frame_assemble_fn, grid_x, 1, 1, 128, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return null;
+    if (sync() != CUDA_SUCCESS) return null;
+
+    return total_frame_size;
 }
 
 /// GPU-Huffman counterpart of gpuEncodeTokensTans32: entropy-codes each

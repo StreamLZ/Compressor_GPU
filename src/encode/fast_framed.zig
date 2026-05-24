@@ -1221,8 +1221,12 @@ pub fn compressFramedOne(
         // three GPU Huffman passes keep their bodies device-resident
         // (huff_keep_device) so the assembly kernels read them with no
         // host bounce. Must be decided before the Huffman passes run.
+        // Step 8 pure-D2D path: when the caller hands us a device output
+        // (slzCompress C-ABI), force the device-resident path on so the
+        // frame-assemble kernel can consume the assembled blocks.
         const want_gpu_assemble: bool =
-            opts.level >= 3 and slz_gpu_huff and std.c.getenv("SLZ_GPU_ASSEMBLE") != null;
+            opts.level >= 3 and slz_gpu_huff and
+            (std.c.getenv("SLZ_GPU_ASSEMBLE") != null or enc_ctx.d_output_override != 0);
         enc_ctx.huff_keep_device = want_gpu_assemble;
 
         // ── GPU Huffman encode of lit / tok / off16 (SLZ_GPU_HUFF) ──
@@ -1359,6 +1363,87 @@ pub fn compressFramedOne(
             enc_ctx.assembled_offsets = null;
             enc_ctx.assembled_sizes = null;
         };
+
+        // ── 4d step 8: pure-D2D frame assembly path ──────────────────
+        // When the caller is the slzCompress C-ABI (d_output_override set)
+        // AND the assembly kernel left every sub-chunk on device AND every
+        // chunk has exactly one sub-chunk (sc=0.25 — the only mode
+        // slzCompress emits) AND every chunk compressed below its raw size,
+        // launch slzFrameAssembleKernel to write the whole frame directly
+        // into the caller's device buffer. Skips the host per-chunk loop +
+        // SC tail loop + block-hdr backfill + end mark write below, and
+        // tells the C-ABI wrapper to skip its host->device H2D bounce.
+        pure_d2d: {
+            if (enc_ctx.d_output_override == 0) break :pure_d2d;
+            if (!gpu_assembled) break :pure_d2d;
+            if (gpu_block != eff_chunk) break :pure_d2d; // sc=0.25 → 1 sub per chunk
+            if (dict_len != 0) break :pure_d2d;
+            if (enc_ctx.d_input_override == 0) break :pure_d2d; // need device src for SC tail
+            const sizes = enc_ctx.assembled_sizes orelse break :pure_d2d;
+            const offsets = enc_ctx.assembled_offsets orelse break :pure_d2d;
+            if (sizes.len < n_chunks or offsets.len < n_chunks) break :pure_d2d;
+            if (n_chunks > 16384) break :pure_d2d; // gpuFrameAssembleImpl stack cap
+
+            // Every chunk must have compressed below raw size — else the
+            // host loop's `uncompressed` fallback kicks in, which the kernel
+            // doesn't model. Bail to the host path on any compression miss.
+            for (0..n_chunks) |ci| {
+                const chunk_size = @min(eff_chunk, data_src.len - ci * eff_chunk);
+                const cs = comp_sizes[ci];
+                if (cs >= chunk_size) break :pure_d2d;
+            }
+
+            const flags0_d2d: u8 = 0x05 | sc_flag_bit | two_phase_flag_bit | 0x40;
+            const codec_byte: u8 = @intFromEnum(block_header.CodecType.fast);
+
+            // Pre-formed prefix bytes: [frame_hdr][block_hdr]. frame_hdr is
+            // already in dst[0..hdr_len] from writeHeader at the top of
+            // compressFramedOne; block_hdr is computed below from
+            // block_payload_size = sum(6 + asm_size) + sc_tail.
+            var per_chunk_asm_size_buf: [16384]u32 = undefined;
+            var per_chunk_asm_off_buf: [16384]u32 = undefined;
+            var total_chunk_bytes: usize = 0;
+            for (0..n_chunks) |ci| {
+                per_chunk_asm_off_buf[ci] = offsets[ci];
+                per_chunk_asm_size_buf[ci] = sizes[ci];
+                total_chunk_bytes += 6 + sizes[ci];
+            }
+            const sc_tail_bytes: usize = if (n_chunks > 1) (n_chunks - 1) * 8 else 0;
+            const block_payload_size: usize = total_chunk_bytes + sc_tail_bytes;
+
+            const frame_hdr_len: usize = frame_block_hdr_pos; // pos right after writeHeader
+            // Compose block_hdr bytes via the existing writer into a scratch.
+            var block_hdr_buf: [8]u8 = undefined;
+            frame.writeBlockHeader(&block_hdr_buf, .{
+                .compressed_size = @intCast(block_payload_size),
+                .decompressed_size = @intCast(src.len),
+                .uncompressed = false,
+                .parallel_decode_metadata = false,
+            });
+
+            // Concatenate frame_hdr + block_hdr into a stack-local prefix.
+            var prefix_buf: [128]u8 = undefined;
+            const prefix_size: usize = frame_hdr_len + 8;
+            if (prefix_size > prefix_buf.len) break :pure_d2d;
+            @memcpy(prefix_buf[0..frame_hdr_len], dst[0..frame_hdr_len]);
+            @memcpy(prefix_buf[frame_hdr_len..][0..8], &block_hdr_buf);
+
+            const total_frame_size = gpu_enc.gpuFrameAssembleImpl(
+                enc_ctx,
+                @intCast(n_chunks),
+                @intCast(eff_chunk),
+                @intCast(src.len),
+                prefix_buf[0..prefix_size],
+                flags0_d2d,
+                codec_byte,
+                per_chunk_asm_off_buf[0..n_chunks],
+                per_chunk_asm_size_buf[0..n_chunks],
+                enc_ctx.d_input_override,
+                enc_ctx.d_output_override,
+            ) orelse break :pure_d2d;
+            enc_ctx.output_written_to_device = true;
+            return total_frame_size;
+        }
 
         // Assemble frame from GPU-compressed sub-chunks grouped into chunks
         var soff: usize = dict_len;
