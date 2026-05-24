@@ -198,6 +198,15 @@ pub const Tans32EncDesc = extern struct {
     dst_capacity: u32,
 };
 
+/// Copy `dst.len` bytes from a device address into the host slice `dst`.
+/// Used by 4d Phase 3 D2D encode fallback paths that need a few bytes
+/// of the device-resident input on the host.
+pub fn copyDeviceToHost(dst: []u8, src_device: u64) bool {
+    if (!init()) return false;
+    const f = cuMemcpyDtoH_fn orelse return false;
+    return f(@ptrCast(dst.ptr), src_device, dst.len) == CUDA_SUCCESS;
+}
+
 /// GPU Huffman encode descriptor — matches `HuffEncDesc` in
 /// gpu_huff_kernel.cu. Same field layout as Tans32EncDesc: `src_stride`
 /// is 1 for a contiguous stream or 2 to encode one off16 byte plane.

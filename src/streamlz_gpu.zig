@@ -143,15 +143,17 @@ const CompressJob = struct {
             j.result = SLZ_ERROR_CUDA;
             return;
         }
-        if (j.d_src != 0 and !gpu_driver.copyDeviceToHost(@constCast(j.src), j.d_src)) {
-            j.result = SLZ_ERROR_CUDA;
-            return;
+        // 4d Phase 3 encode-input D2D: the encoder's CPU paths never
+        // dereference `input` for -gpu mode (the GPU LZ kernel + the M2
+        // assembly kernel handle every byte access), so we leave the
+        // host `src` slice's bytes uninitialized. gpuCompressImpl reads
+        // the data from d_input_override (D2D copy from the caller's
+        // device input) instead of H2D-ing the host bounce.
+        if (j.d_src != 0) {
+            j.h.enc.d_input_override = j.d_src;
+        } else {
+            // Host-input path (slzCompressHost): nothing to override.
         }
-        // 4d Phase 3 encode-input D2D: tell gpuCompressImpl to populate
-        // d_input_persist via a D2D copy from the caller's device input,
-        // skipping the H2D from host. The CPU encode paths still read
-        // the host bounce we just D2H'd above.
-        if (j.d_src != 0) j.h.enc.d_input_override = j.d_src;
         defer j.h.enc.d_input_override = 0;
         const rc = compressCore(j.h, j.src, j.dst, j.opts);
         if (rc < 0) {
@@ -390,11 +392,11 @@ export fn slzDecompressHost(
 }
 
 // ── Compress / decompress: device -> device ───────────────────────────
-// v1 bridges to the host pipeline through an internal host bounce: the
-// worker thread copies the device input down, runs the host pipeline
-// (which itself drives the GPU), and copies the result back up.
-// Functionally device->device for the caller; a later revision keeps it
-// device-resident throughout.
+// True D2D: no host bounce of the input bytes. The encoder reads the
+// data from d_input via d_input_override (D2D copy on the GPU); the
+// host `src` slice we hand the job carries `input_size` for sizing but
+// a deliberately unmapped pointer so any accidental host-side read
+// segfaults loud instead of returning garbage.
 export fn slzCompress(
     handle: ?*Context,
     d_input: ?*const anyopaque,
@@ -413,14 +415,18 @@ export fn slzCompress(
     const out_dev = d_output orelse return SLZ_ERROR_INVALID_ARG;
     const out_size = output_size orelse return SLZ_ERROR_INVALID_ARG;
 
-    const host_in = allocator.alloc(u8, input_size) catch return SLZ_ERROR_OUT_OF_MEMORY;
-    defer allocator.free(host_in);
     const host_out = allocator.alloc(u8, output_capacity) catch return SLZ_ERROR_OUT_OF_MEMORY;
     defer allocator.free(host_out);
 
+    // Sentinel `src` slice — correct length, unmapped pointer. Any
+    // dereference is an immediate segfault (intentional; that's how we
+    // catch CPU paths that still try to read host input).
+    const sentinel_ptr: [*]const u8 = @ptrFromInt(0x10);
+    const src_stub: []const u8 = sentinel_ptr[0..input_size];
+
     var job = CompressJob{
         .h = h,
-        .src = host_in,
+        .src = src_stub,
         .dst = host_out,
         .opts = opts,
         .d_src = @intFromPtr(in_dev),

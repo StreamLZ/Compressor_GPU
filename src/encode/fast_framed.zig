@@ -1369,7 +1369,17 @@ pub fn compressFramedOne(
                 dst[pos] = flags0 | 0x80;
                 dst[pos + 1] = @intFromEnum(block_header.CodecType.fast);
                 pos += 2;
-                @memcpy(dst[pos..][0..chunk_size], effective_src[soff..][0..chunk_size]);
+                // 4d Phase 3 D2D: when the encode input is device-resident
+                // only, D2H this uncompressed chunk's bytes straight from
+                // the caller's device buffer (the host `effective_src` is
+                // a sentinel slice). Falls through to the host memcpy
+                // when the host path is in use.
+                if (enc_ctx.d_input_override != 0) {
+                    if (!gpu_enc.copyDeviceToHost(dst[pos..][0..chunk_size], enc_ctx.d_input_override + soff))
+                        return error.DestinationTooSmall;
+                } else {
+                    @memcpy(dst[pos..][0..chunk_size], effective_src[soff..][0..chunk_size]);
+                }
                 pos += chunk_size;
             } else {
                 dst[pos] = flags0;
@@ -1651,7 +1661,15 @@ pub fn compressFramedOne(
                 const copy_size: usize = @min(@as(usize, 8), data_src.len - chunk_start);
                 if (pos + 8 > dst.len) return error.DestinationTooSmall;
                 @memset(dst[pos..][0..8], 0);
-                @memcpy(dst[pos..][0..copy_size], data_src[chunk_start..][0..copy_size]);
+                // 4d Phase 3 D2D: pull the 8-byte tail-prefix bytes
+                // from the device input directly when the host slice is
+                // a sentinel; the wrapper later H2Ds dst to d_output.
+                if (enc_ctx.d_input_override != 0) {
+                    if (!gpu_enc.copyDeviceToHost(dst[pos..][0..copy_size], enc_ctx.d_input_override + dict_len + chunk_start))
+                        return error.DestinationTooSmall;
+                } else {
+                    @memcpy(dst[pos..][0..copy_size], data_src[chunk_start..][0..copy_size]);
+                }
                 pos += 8;
             }
         }
