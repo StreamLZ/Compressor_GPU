@@ -1439,22 +1439,25 @@ pub fn fullGpuLaunchImpl(
     if (!ensureDeviceBuf(&self.d_comp_persist, &self.d_comp_persist_size, comp_bytes + 16)) return error.BadMode;
     if (!ensureDeviceBuf(&self.d_descs_persist, &self.d_descs_persist_size, desc_bytes)) return error.BadMode;
 
-    // Compute per-chunk first-subchunk index (prefix sum of n_subs_per_chunk).
-    // At sc>0.5 chunks have multiple sub-chunks; each needs its own scratch slot.
-    var first_subchunk_idx_buf: [16384]u32 = undefined;
+    // 4d Phase 3 step 6: prefix-sum runs on device. chunk_descs are
+    // already H2D'd above (d_descs_persist); slzPrefixSumChunksKernel
+    // reads them and writes d_first_sub_idx_persist + d_total_subchunks_buf.
+    // The 4-byte D2H of total_subchunks below is launch-plumbing — needed
+    // to size the tans scratch + compute region offsets host-side; no
+    // per-chunk CPU work remains.
+    _ = gpuPrefixSumChunksImpl(self, self.d_descs_persist, @intCast(chunk_descs.len), sub_chunk_cap) orelse return error.BadMode;
     var total_subchunks: u32 = 0;
-    {
-        const cap: u32 = sub_chunk_cap;
-        const cap_safe: u32 = if (cap == 0) 65536 else cap;
-        for (chunk_descs, 0..) |ch, i| {
-            if (i >= first_subchunk_idx_buf.len) break;
-            first_subchunk_idx_buf[i] = total_subchunks;
-            // For non-LZ chunks (uncompressed/memset) reserve 1 slot for indexing
-            const n_subs: u32 = if (ch.flags != 0 or ch.decomp_size == 0) 1
-                else (ch.decomp_size + cap_safe - 1) / cap_safe;
-            total_subchunks += n_subs;
-        }
-    }
+    _ = d2h_fn(@ptrCast(&total_subchunks), self.d_total_subchunks_buf, 4);
+    // Alias d_first_subchunk_idx onto the kernel's output so downstream
+    // launches keep working without further changes.
+    self.d_first_subchunk_idx = self.d_first_sub_idx_persist;
+    // CPU mirror for the pipeline branch (line ~1726). With
+    // NUM_PIPELINE_STREAMS=1 the branch only reads index 0 (= 0) and
+    // chunk_start = total_chunks (which falls through to the
+    // total_subchunks else-arm). Zero-init is sufficient; if pipeline
+    // streams ever exceed 1, this needs a small selective D2H of group
+    // boundaries from d_first_sub_idx_persist.
+    var first_subchunk_idx_buf: [16384]u32 = .{0} ** 16384;
     // Allocate scratch sized for total sub-chunks across all stream types.
     // Slot size = 131072 (sub_chunk_cap) to fit the largest sub-chunk's lit/tok
     // streams; off16-hi at +0, off16-lo at +65536 within each slot.
@@ -1467,12 +1470,16 @@ pub fn fullGpuLaunchImpl(
     self.d_tans_tok_scratch = self.d_tans_scratch + tok_offset;
     self.d_tans_off16_scratch = self.d_tans_scratch + off16_offset;
 
-    // Upload first_subchunk_idx array if multi-sub-chunk (otherwise pass nullptr)
+    // d_first_subchunk_idx is needed only when sc>0.5 (multi-sub-chunk).
+    // For sc=0.25 (every -gpu frame), it's nullptr (kernel skips). For
+    // sc>=1, the device array (computed by the prefix-sum kernel) is
+    // mirrored to host for the pipeline-branch's group-boundary reads.
     const need_first_sub_idx = total_subchunks != @as(u32, @intCast(chunk_descs.len));
     if (need_first_sub_idx) {
+        // d_first_sub_idx_persist already has the correct device data.
+        // Pull it back to host for the pipeline branch (still ~few KB).
         const fs_bytes: usize = chunk_descs.len * @sizeOf(u32);
-        if (!ensureDeviceBuf(&self.d_first_subchunk_idx, &self.d_first_subchunk_idx_size, fs_bytes)) return error.BadMode;
-        _ = h2d_fn(self.d_first_subchunk_idx, @ptrCast(&first_subchunk_idx_buf), fs_bytes);
+        _ = d2h_fn(@ptrCast(&first_subchunk_idx_buf), self.d_first_sub_idx_persist, fs_bytes);
     } else {
         self.d_first_subchunk_idx = 0;
     }
