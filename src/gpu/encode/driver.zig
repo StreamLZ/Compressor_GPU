@@ -52,9 +52,12 @@ var cuMemAlloc_fn: ?FnMemAlloc = null;
 var cuMemFree_fn: ?FnMemFree = null;
 var cuMemcpyHtoD_fn: ?FnMemcpyHtoD = null;
 var cuMemcpyDtoH_fn: ?FnMemcpyDtoH = null;
+var cuMemcpyDtoDAsync_fn: ?FnMemcpyDtoDAsync = null;
 var cuLaunchKernel_fn: ?FnLaunchKernel = null;
 var cuCtxSynchronize_fn: ?FnCtxSync = null;
 var cuMemsetD8_fn: ?FnMemsetD8 = null;
+
+const FnMemcpyDtoDAsync = *const fn (CUdeviceptr, CUdeviceptr, usize, usize) callconv(.c) CUresult;
 
 fn getProc(comptime T: type, name: [*:0]const u8) ?T {
     const h = lib orelse return null;
@@ -80,6 +83,7 @@ pub fn init() bool {
     cuMemFree_fn = getProc(FnMemFree, "cuMemFree_v2");
     cuMemcpyHtoD_fn = getProc(FnMemcpyHtoD, "cuMemcpyHtoD_v2");
     cuMemcpyDtoH_fn = getProc(FnMemcpyDtoH, "cuMemcpyDtoH_v2");
+    cuMemcpyDtoDAsync_fn = getProc(FnMemcpyDtoDAsync, "cuMemcpyDtoDAsync_v2");
     cuLaunchKernel_fn = getProc(FnLaunchKernel, "cuLaunchKernel");
     cuCtxSynchronize_fn = getProc(FnCtxSync, "cuCtxSynchronize");
     cuMemsetD8_fn = getProc(FnMemsetD8, "cuMemsetD8_v2");
@@ -397,6 +401,13 @@ pub fn gpuEncodeHuffImpl(
 /// context. Load-once module handles, kernel/driver function pointers,
 /// and `pub var` result slices stay module-global on purpose.
 pub const EncodeContext = struct {
+    // 4d Phase 3: when set to a non-zero device address, gpuCompressImpl
+    // populates d_input_persist via a D2D copy from this pointer instead
+    // of the H2D from the host `input` slice — the caller's data is
+    // already GPU-resident (slzCompress D2D path). The caller resets it
+    // to 0 after the compress call.
+    d_input_override: u64 = 0,
+
     // ── LZ-encode persistent device buffers ────────────────────
     d_input_persist: CUdeviceptr = 0,
     d_input_size: usize = 0,
@@ -1444,8 +1455,19 @@ pub fn gpuCompressImpl(
     const d_descs = self.d_descs_persist;
     const d_sizes = self.d_sizes_persist;
 
-    // Upload input + descriptors, zero sizes
-    _ = h2d_fn(d_input, @ptrCast(input.ptr), input.len);
+    // Upload input + descriptors, zero sizes. 4d Phase 3: when the
+    // caller's data is already GPU-resident at `d_input_override`,
+    // populate d_input_persist via a D2D copy (no PCIe) instead of the
+    // H2D from the host `input` slice.
+    if (self.d_input_override != 0) {
+        if (cuMemcpyDtoDAsync_fn) |d2d| {
+            _ = d2d(d_input, self.d_input_override, input.len, 0);
+        } else {
+            _ = h2d_fn(d_input, @ptrCast(input.ptr), input.len);
+        }
+    } else {
+        _ = h2d_fn(d_input, @ptrCast(input.ptr), input.len);
+    }
     _ = h2d_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes);
     if (cuMemsetD8_fn) |memset_fn| _ = memset_fn(d_sizes, 0, sizes_bytes);
     _ = sync_fn();

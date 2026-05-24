@@ -147,6 +147,12 @@ const CompressJob = struct {
             j.result = SLZ_ERROR_CUDA;
             return;
         }
+        // 4d Phase 3 encode-input D2D: tell gpuCompressImpl to populate
+        // d_input_persist via a D2D copy from the caller's device input,
+        // skipping the H2D from host. The CPU encode paths still read
+        // the host bounce we just D2H'd above.
+        if (j.d_src != 0) j.h.enc.d_input_override = j.d_src;
+        defer j.h.enc.d_input_override = 0;
         const rc = compressCore(j.h, j.src, j.dst, j.opts);
         if (rc < 0) {
             j.result = rc;
