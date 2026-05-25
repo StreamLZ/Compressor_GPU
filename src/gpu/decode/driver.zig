@@ -29,7 +29,6 @@ const cuda = @import("cuda_api.zig");
 const ml = @import("module_loader.zig");
 const d = @import("descriptors.zig");
 const dc = @import("decode_context.zig");
-const sh = @import("scan_host.zig");
 const sg = @import("scan_gpu.zig");
 const dd = @import("decode_dispatch.zig");
 

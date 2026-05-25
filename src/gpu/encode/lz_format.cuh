@@ -28,11 +28,17 @@ static constexpr uint32_t NEXT_HASH_SIZE   = 65536;        // 2^16 entries of ui
 static constexpr uint32_t NEAR_OFFSET_MAX = 0xFFFFu;        // off16 vs off32 split
 static constexpr uint32_t LARGE_OFFSET_THRESHOLD = 0xC00000u;  // 4-byte extended off32 form
 static constexpr uint32_t OFF32_LARGE_TAG  = 0xC00000u;     // tag bits OR'd into the truncated offset
+static constexpr uint32_t OFF32_LOW22_MASK = 0x3FFFFFu;     // 22-bit low offset mask
 // The decoder's OFF32_LONG_ENTRY_TAG (common/gpu_wire_format.cuh) is the
-// high byte of OFF32_LARGE_TAG — enforce the relationship at compile time.
+// high byte of OFF32_LARGE_TAG; the tag must occupy the bits the low22
+// mask does NOT cover; and the two together must span the whole 24-bit
+// triple. Enforce all three relationships at compile time.
 static_assert(OFF32_LARGE_TAG >> 16 == OFF32_LONG_ENTRY_TAG,
               "OFF32_LARGE_TAG high byte must equal decoder's OFF32_LONG_ENTRY_TAG");
-static constexpr uint32_t OFF32_LOW22_MASK = 0x3FFFFFu;     // 22-bit low offset mask
+static_assert((OFF32_LOW22_MASK & OFF32_LARGE_TAG) == 0,
+              "OFF32_LOW22_MASK must not overlap the OFF32_LARGE_TAG bits");
+static_assert((OFF32_LOW22_MASK | OFF32_LARGE_TAG) == 0xFFFFFFu,
+              "OFF32_LOW22_MASK + OFF32_LARGE_TAG must cover the full 24-bit triple");
 static constexpr uint32_t OFF32_LOW_BITS   = 22;            // low-bit width of the extended offset
 static constexpr uint32_t LENGTH_INLINE_MAX  = 251;  // max single-byte length value
 static constexpr uint32_t LENGTH_EXT_TAG_BIAS = 4;   // tag bias for the 3-byte extended length

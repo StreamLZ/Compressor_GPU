@@ -5,9 +5,7 @@
 //
 // One warp per chunk, one chunk per CUDA block. Match-finder hash
 // tables live in global memory (the driver's useGlobalHash policy
-// returns true for every level); the extern __shared__ shared_ht
-// fallback is currently unreachable in production — see the comment
-// at the shared_ht declaration below.
+// returns true for every level).
 //
 // Two-pass block design: the parser scans block 1 [0..64KB) and
 // block 2 [64KB..src_size) separately so that literal runs and

@@ -31,7 +31,6 @@ static constexpr int32_t  INITIAL_RECENT_OFFSET      = -8;
 // (5, 7) types were retired with the GPU tANS encoder.
 static constexpr uint32_t CHUNK_TYPE_SHIFT      = 4;
 static constexpr uint32_t CHUNK_TYPE_MASK       = 7;
-static constexpr uint8_t  RAW_CHUNK_TYPE        = 0;
 static constexpr uint8_t  HUFF_CHUNK_TYPE       = 4;
 
 // ── Sub-chunk header (3-byte big-endian) ────────────────────────────

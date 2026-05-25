@@ -113,13 +113,16 @@ __device__ static RawStreams parseRaw(const uint8_t* raw, uint32_t raw_size,
         c2 = readU16LE(raw + rp);
         rp += 2; hdr_plus_extra += 2;
     }
-    // Scan c1+c2 entries; each is 3 bytes, or 4 when byte[2] >= 0xC0.
+    // Scan c1+c2 entries; each is 3 bytes, or 4 when the high two bits
+    // of byte[2] are set (the OFF32_LONG_ENTRY_TAG flag). Use the mask
+    // form to match the contract documented in gpu_wire_format.cuh
+    // rather than the `>= 0xC0` byte-order coincidence.
     const uint32_t total_entries = c1 + c2;
     uint32_t data_bytes = 0;
     uint32_t scan = rp;
     for (uint32_t i = 0; i < total_entries; i++) {
         if (scan + 3 > raw_size) return s;
-        if (raw[scan + 2] >= OFF32_LONG_ENTRY_TAG) {
+        if ((raw[scan + 2] & OFF32_LONG_ENTRY_TAG) == OFF32_LONG_ENTRY_TAG) {
             if (scan + 4 > raw_size) return s;
             data_bytes += 4; scan += 4;
         } else {
