@@ -1354,6 +1354,247 @@ pub fn fullGpuLaunch(
 /// decoded bytes are D2D-copied to `d_output_target + dst_start_off`
 /// instead of D2H-copied to `dst_full + dst_start_off`. `dst_full` is
 /// ignored in that mode (the caller may pass `undefined`).
+/// Pre-decode preparation: combine the four per-stream-type Huffman
+/// descriptor arrays (lit / tok / off16-hi / off16-lo) into one merged
+/// device array in `self.d_huff_descs`, with out_offsets adjusted by
+/// the per-stream-type region offset and lut_offsets assigned sequentially.
+/// Two paths:
+///   GPU merge (pure-D2D, when the device compact populated the d_compact_*
+///   buffers): launches slzMergeHuffDescsKernel — no host arrays touched.
+///   CPU merge (CPU-scan fallback): walks the host-side huff_*_host_buf
+///   arrays and uploads the merged result via one H2D.
+fn mergeHuffDescs(
+    self: *DecodeContext,
+    scan: ScanResult,
+    tok_offset: usize,
+    off16_offset: usize,
+    h2d_fn: anytype,
+    sync_fn: anytype,
+    launch_fn: anytype,
+) GpuError!void {
+    if (scan.device_compact_populated and merge_huff_descs_fn != 0) {
+        // Step 6c: the compact kernels already populated the four per-stream
+        // device buffers in step 6b. Launch the merge kernel — it writes
+        // straight to self.d_huff_descs and updates the n_merged slot in
+        // d_compact_counts. No host arrays, no H2D.
+        var k_lit: u64 = self.d_compact_lit;
+        var k_tok: u64 = self.d_compact_tok;
+        var k_hi: u64 = self.d_compact_hi;
+        var k_lo: u64 = self.d_compact_lo;
+        var k_n_lit: u64 = self.d_compact_counts + 0;
+        var k_n_tok: u64 = self.d_compact_counts + 4;
+        var k_n_hi: u64 = self.d_compact_counts + 8;
+        var k_n_lo: u64 = self.d_compact_counts + 12;
+        var k_tok_region: u32 = @intCast(tok_offset);
+        var k_off16_region: u32 = @intCast(off16_offset);
+        var k_merged: u64 = self.d_huff_descs;
+        var k_n_merged: u64 = self.d_compact_counts + 20;
+        var m_params = [_]?*anyopaque{
+            @ptrCast(&k_lit),         @ptrCast(&k_tok),          @ptrCast(&k_hi),       @ptrCast(&k_lo),
+            @ptrCast(&k_n_lit),       @ptrCast(&k_n_tok),        @ptrCast(&k_n_hi),     @ptrCast(&k_n_lo),
+            @ptrCast(&k_tok_region),  @ptrCast(&k_off16_region),
+            @ptrCast(&k_merged),      @ptrCast(&k_n_merged),
+        };
+        var m_extra = [_]?*anyopaque{null};
+        const t_merge = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzMergeHuffDescsKernel", 0);
+        if (launch_fn(merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, 0, &m_params, &m_extra) != CUDA_SUCCESS)
+            return error.BadMode;
+        endKernelTiming(t_merge, 0);
+        _ = sync_fn();
+        return;
+    }
+    // CPU merge fallback: used by the non-pure-D2D / CPU-scan paths.
+    // Capacity = 4 buffers × 4096.
+    var merged_huff: [4096 * 4]HuffDecChunkDesc = undefined;
+    var m: u32 = 0;
+    var lut_slot: u32 = 0;
+    const append = struct {
+        fn run(dst: []HuffDecChunkDesc, m_ptr: *u32, lut_ptr: *u32,
+               src: []const HuffDecChunkDesc, region_off: u32) void {
+            for (src) |s| {
+                if (m_ptr.* >= dst.len) return;
+                var d = s;
+                d.out_offset += region_off;
+                d.lut_offset = lut_ptr.* * @as(u32, @intCast(HUFF_LUT_ENTRIES));
+                dst[m_ptr.*] = d;
+                m_ptr.* += 1;
+                lut_ptr.* += 1;
+            }
+        }
+    }.run;
+    append(&merged_huff, &m, &lut_slot, self.huff_lit_host_buf[0..scan.num_huff_lit], 0);
+    append(&merged_huff, &m, &lut_slot, self.huff_tok_host_buf[0..scan.num_huff_tok], @intCast(tok_offset));
+    append(&merged_huff, &m, &lut_slot, self.huff_off16hi_host_buf[0..scan.num_huff_off16hi], @intCast(off16_offset));
+    append(&merged_huff, &m, &lut_slot, self.huff_off16lo_host_buf[0..scan.num_huff_off16lo], @intCast(off16_offset));
+
+    _ = h2d_fn(self.d_huff_descs, @ptrCast(&merged_huff), @as(usize, m) * @sizeOf(HuffDecChunkDesc));
+    _ = sync_fn();
+}
+
+/// Place raw (type 0) off16 sub-streams into the off16 scratch. The bytes
+/// are already on the GPU (d_comp_persist holds the whole compressed blob).
+/// Preferred: upload the descriptor list in one H2D and run
+/// slzGatherRawOff16Kernel — one launch copies every stream in parallel.
+/// Fallbacks: async device-to-device loop, then a plain host-upload loop.
+fn gatherRawOff16(
+    self: *DecodeContext,
+    scan: ScanResult,
+    compressed_block: []const u8,
+    h2d_fn: anytype,
+    sync_fn: anytype,
+    launch_fn: anytype,
+) void {
+    if (scan.num_raw_off16 == 0) return;
+    if (gather_off16_fn != 0) gather_blk: {
+        const ndesc: u32 = scan.num_raw_off16;
+        // Pure-D2D path: descs already device-resident in d_compact_raw;
+        // skip the H2D and feed the kernel directly.
+        const desc_dev: u64 = if (scan.device_compact_populated)
+            self.d_compact_raw
+        else d_raw: {
+            const dbytes: usize = @as(usize, ndesc) * @sizeOf(RawOff16Desc);
+            if (!ensureDeviceBuf(&self.d_raw_off16_descs, &self.d_raw_off16_descs_size, dbytes))
+                break :gather_blk;
+            _ = h2d_fn(self.d_raw_off16_descs, @ptrCast(&self.raw_off16_buf), dbytes);
+            break :d_raw self.d_raw_off16_descs;
+        };
+        // Step 7: kernel self-gates on `*d_count`. Use the n_raw slot of
+        // d_compact_counts when the GPU compact ran (no D2H needed); else
+        // stage the host-known count in d_n_raw_scratch and pass that.
+        const d_count: u64 = if (scan.device_compact_populated)
+            self.d_compact_counts + 16
+        else d_cnt: {
+            if (!ensureDeviceBuf(&self.d_n_raw_scratch, &self.d_n_raw_scratch_size, 4))
+                break :gather_blk;
+            var host_n: u32 = ndesc;
+            _ = h2d_fn(self.d_n_raw_scratch, @ptrCast(&host_n), 4);
+            break :d_cnt self.d_n_raw_scratch;
+        };
+        {
+            var p_comp = self.d_comp_persist;
+            var p_comp_len: u32 = @intCast(compressed_block.len);
+            var p_scratch = self.d_tans_off16_scratch;
+            var p_descs = desc_dev;
+            var p_count = d_count;
+            var params = [_]?*anyopaque{
+                @ptrCast(&p_comp), @ptrCast(&p_comp_len), @ptrCast(&p_scratch),
+                @ptrCast(&p_descs), @ptrCast(&p_count),
+            };
+            var extra = [_]?*anyopaque{null};
+            // ndesc is exact (host already knows the count); no over-launch.
+            // The self-gate inside the kernel makes over-launch safe regardless.
+            const grid_x: u32 = ndesc;
+            const t_gather = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzGatherRawOff16Kernel", 0);
+            if (launch_fn(gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, 0, &params, &extra) == CUDA_SUCCESS) {
+                endKernelTiming(t_gather, 0);
+                _ = sync_fn();
+                return;
+            }
+            endKernelTiming(t_gather, 0);
+        }
+    }
+    // Fallback: async device-to-device, else host upload.
+    if (cuMemcpyDtoDAsync_fn) |d2d| {
+        for (0..scan.num_raw_off16) |ri| {
+            const rd = self.raw_off16_buf[ri];
+            if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len)
+                _ = d2d(self.d_tans_off16_scratch + rd.gpu_offset, self.d_comp_persist + rd.src_offset, rd.size, 0);
+        }
+        _ = sync_fn();
+    } else {
+        for (0..scan.num_raw_off16) |ri| {
+            const rd = self.raw_off16_buf[ri];
+            if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len)
+                _ = h2d_fn(self.d_tans_off16_scratch + rd.gpu_offset, @ptrCast(compressed_block.ptr + rd.src_offset), rd.size);
+        }
+    }
+}
+
+/// SLZ_E2E_TIMER trace fields, populated incrementally by fullGpuLaunchImpl.
+const E2eCumulative = struct {
+    h2d: i64 = 0,
+    prescan: i64 = 0,
+    postscan: i64 = 0,
+    scan: i64 = 0,
+    predh: i64 = 0,
+};
+
+/// SLZ_E2E_TIMER: phase breakdown print at the end of the decode call.
+/// `t0` is the start clock reading captured at function entry — `anytype`
+/// because the std.Io.Clock reading type is not directly nameable here.
+fn emitE2eTrace(
+    t0: anytype,
+    iv: std.Io,
+    cum: E2eCumulative,
+    last_kernel: i64,
+) void {
+    const cum_end_ns: i64 = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+    const ms = struct {
+        fn f(ns: i64) f64 {
+            return @as(f64, @floatFromInt(ns)) / 1e6;
+        }
+    }.f;
+    const preblk_ns = cum.prescan - cum.h2d; // shared-LUT block region
+    const scanfn_ns = cum.postscan - cum.prescan; // scanForTansChunks call
+    const rawcopy_ns = cum.scan - cum.postscan; // raw-off16 device-to-device scatter
+    const prep_ns = (cum.predh - cum.scan) - last_kernel; // descriptor prep
+    std.debug.print("  [e2e] setup+H2D {d:.3}  preBlk {d:.3}  scanFn {d:.3}  rawD2D {d:.3}  prep {d:.3}  kernels {d:.3}  D2H {d:.3}  total {d:.3} ms\n", .{
+        ms(cum.h2d),
+        ms(preblk_ns),
+        ms(scanfn_ns),
+        ms(rawcopy_ns),
+        ms(prep_ns),
+        ms(last_kernel),
+        ms(cum_end_ns - cum.predh),
+        ms(cum_end_ns),
+    });
+}
+
+/// SLZ_DUMP_SCAN: dumps the scan input/output to c:/tmp/scan_dump.bin for
+/// the GPU scan-kernel testbed in tools/huff_test/. Inert without the env var.
+fn dumpScanIfRequested(
+    self: *DecodeContext,
+    chunk_descs: []const ChunkDesc,
+    compressed_block: []const u8,
+    sub_chunk_cap: u32,
+    scan: ScanResult,
+) void {
+    if (std.c.getenv("SLZ_DUMP_SCAN") == null) return;
+    const cio = @cImport({
+        @cInclude("stdio.h");
+    });
+    const fp = cio.fopen("c:/tmp/scan_dump.bin", "wb") orelse return;
+    defer _ = cio.fclose(fp);
+    var hdr = [_]u32{
+        0x53434E31, // 'SCN1'
+        @intCast(chunk_descs.len),
+        sub_chunk_cap,
+        @intCast(compressed_block.len),
+    };
+    _ = cio.fwrite(&hdr, 4, 4, fp);
+    _ = cio.fwrite(chunk_descs.ptr, @sizeOf(ChunkDesc), chunk_descs.len, fp);
+    if (compressed_block.len > 0)
+        _ = cio.fwrite(compressed_block.ptr, 1, compressed_block.len, fp);
+    const huff_streams = [_]struct { buf: []const HuffDecChunkDesc, n: u32 }{
+        .{ .buf = &self.huff_lit_host_buf, .n = scan.num_huff_lit },
+        .{ .buf = &self.huff_tok_host_buf, .n = scan.num_huff_tok },
+        .{ .buf = &self.huff_off16hi_host_buf, .n = scan.num_huff_off16hi },
+        .{ .buf = &self.huff_off16lo_host_buf, .n = scan.num_huff_off16lo },
+    };
+    for (huff_streams) |hs| {
+        var n = [_]u32{hs.n};
+        _ = cio.fwrite(&n, 4, 1, fp);
+        _ = cio.fwrite(hs.buf.ptr, @sizeOf(HuffDecChunkDesc), hs.n, fp);
+    }
+    var nraw = [_]u32{scan.num_raw_off16};
+    _ = cio.fwrite(&nraw, 4, 1, fp);
+    for (0..scan.num_raw_off16) |ri| {
+        const rd = self.raw_off16_buf[ri];
+        var t = [_]u32{ rd.src_offset, rd.size, rd.gpu_offset };
+        _ = cio.fwrite(&t, 4, 3, fp);
+    }
+}
+
 pub fn fullGpuLaunchImpl(
     self: *DecodeContext,
     chunk_descs: []const ChunkDesc,
@@ -1382,9 +1623,7 @@ pub fn fullGpuLaunchImpl(
         (if (io) |iv| std.Io.Clock.awake.now(iv) else null)
     else
         null;
-    var e2e_cum_h2d_ns: i64 = 0;
-    var e2e_cum_scan_ns: i64 = 0;
-    var e2e_cum_predh_ns: i64 = 0;
+    var e2e_cum: E2eCumulative = .{};
 
     const h2d_fn = cuMemcpyHtoD_fn orelse return error.BadMode;
     const d2h_fn = cuMemcpyDtoH_fn orelse return error.BadMode;
@@ -1468,13 +1707,8 @@ pub fn fullGpuLaunchImpl(
     // prefix-sum kernel ran). Drop the redundant second upload.
     _ = sync_fn();
     if (t_e2e0) |t0| if (io) |iv| {
-        e2e_cum_h2d_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
-    };
-
-    var e2e_cum_prescan_ns: i64 = 0;
-    var e2e_cum_postscan_ns: i64 = 0;
-    if (t_e2e0) |t0| if (io) |iv| {
-        e2e_cum_prescan_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+        e2e_cum.h2d = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+        e2e_cum.prescan = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
     };
 
     // ── Scan for entropy chunks (Huffman + raw off16) ─────────
@@ -1523,129 +1757,17 @@ pub fn fullGpuLaunchImpl(
             io,
         );
 
-        // ── Debug: scan snapshot (SLZ_DUMP_SCAN=1) ────────────────
-        // Dumps the scanForTansChunks input (chunk_descs + compressed
-        // block) and its output (the four Huffman descriptor arrays +
-        // the raw-off16 list) for the GPU scan-kernel testbed in
-        // tools/huff_test/. Inert without the env var.
-        if (std.c.getenv("SLZ_DUMP_SCAN") != null) dumpScan: {
-            const cio = @cImport({
-                @cInclude("stdio.h");
-            });
-            const fp = cio.fopen("c:/tmp/scan_dump.bin", "wb") orelse break :dumpScan;
-            defer _ = cio.fclose(fp);
-            var hdr = [_]u32{
-                0x53434E31, // 'SCN1'
-                @intCast(chunk_descs.len),
-                sub_chunk_cap,
-                @intCast(compressed_block.len),
-            };
-            _ = cio.fwrite(&hdr, 4, 4, fp);
-            _ = cio.fwrite(chunk_descs.ptr, @sizeOf(ChunkDesc), chunk_descs.len, fp);
-            if (compressed_block.len > 0)
-                _ = cio.fwrite(compressed_block.ptr, 1, compressed_block.len, fp);
-            const huff_streams = [_]struct { buf: []const HuffDecChunkDesc, n: u32 }{
-                .{ .buf = &self.huff_lit_host_buf, .n = scan.num_huff_lit },
-                .{ .buf = &self.huff_tok_host_buf, .n = scan.num_huff_tok },
-                .{ .buf = &self.huff_off16hi_host_buf, .n = scan.num_huff_off16hi },
-                .{ .buf = &self.huff_off16lo_host_buf, .n = scan.num_huff_off16lo },
-            };
-            for (huff_streams) |hs| {
-                var n = [_]u32{hs.n};
-                _ = cio.fwrite(&n, 4, 1, fp);
-                _ = cio.fwrite(hs.buf.ptr, @sizeOf(HuffDecChunkDesc), hs.n, fp);
-            }
-            var nraw = [_]u32{scan.num_raw_off16};
-            _ = cio.fwrite(&nraw, 4, 1, fp);
-            for (0..scan.num_raw_off16) |ri| {
-                const rd = self.raw_off16_buf[ri];
-                var t = [_]u32{ rd.src_offset, rd.size, rd.gpu_offset };
-                _ = cio.fwrite(&t, 4, 3, fp);
-            }
-        }
+        dumpScanIfRequested(self, chunk_descs, compressed_block, sub_chunk_cap, scan);
 
         if (t_e2e0) |t0| if (io) |iv| {
-            e2e_cum_postscan_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+            e2e_cum.postscan = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
         };
 
-        // Place raw (type 0) off16 sub-streams into the off16 scratch.
-        // The bytes are already on the GPU (d_comp_persist holds the whole
-        // compressed blob). Preferred: upload the descriptor list in one
-        // H2D and run slzGatherRawOff16Kernel — one launch copies every
-        // stream in parallel. Fallbacks: async device-to-device loop, then
-        // a plain host-upload loop.
-        if (scan.num_raw_off16 > 0) gather_blk: {
-            if (gather_off16_fn != 0) {
-                const ndesc: u32 = scan.num_raw_off16;
-                // Pure-D2D path: descs already device-resident in
-                // d_compact_raw — skip the H2D and feed the kernel directly.
-                const desc_dev: u64 = if (scan.device_compact_populated)
-                    self.d_compact_raw
-                else d_raw: {
-                    const dbytes: usize = @as(usize, ndesc) * @sizeOf(RawOff16Desc);
-                    if (!ensureDeviceBuf(&self.d_raw_off16_descs, &self.d_raw_off16_descs_size, dbytes))
-                        break :gather_blk;
-                    _ = h2d_fn(self.d_raw_off16_descs, @ptrCast(&self.raw_off16_buf), dbytes);
-                    break :d_raw self.d_raw_off16_descs;
-                };
-                // Step 7: kernel self-gates on `*d_count`. Use the n_raw
-                // slot of d_compact_counts when the GPU compact ran (no
-                // D2H needed); else stage the host-known count in
-                // d_n_raw_scratch and pass that.
-                const d_count: u64 = if (scan.device_compact_populated)
-                    self.d_compact_counts + 16
-                else d_cnt: {
-                    if (!ensureDeviceBuf(&self.d_n_raw_scratch, &self.d_n_raw_scratch_size, 4))
-                        break :gather_blk;
-                    var host_n: u32 = ndesc;
-                    _ = h2d_fn(self.d_n_raw_scratch, @ptrCast(&host_n), 4);
-                    break :d_cnt self.d_n_raw_scratch;
-                };
-                {
-                    var p_comp = self.d_comp_persist;
-                    var p_comp_len: u32 = @intCast(compressed_block.len);
-                    var p_scratch = self.d_tans_off16_scratch;
-                    var p_descs = desc_dev;
-                    var p_count = d_count;
-                    var params = [_]?*anyopaque{
-                        @ptrCast(&p_comp), @ptrCast(&p_comp_len), @ptrCast(&p_scratch),
-                        @ptrCast(&p_descs), @ptrCast(&p_count),
-                    };
-                    var extra = [_]?*anyopaque{null};
-                    // Over-launch with a safe upper bound (2 raw off16
-                    // descs per sub-chunk × walk_max_chunks * 4 sub-chunks
-                    // = 131072). Out-of-range blocks return immediately
-                    // via the self-gate above.
-                    const grid_x: u32 = ndesc; // ndesc is exact, no over-launch needed when host knows it
-                    const _t_gather = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzGatherRawOff16Kernel", 0);
-                    if (launch_fn(gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, 0, &params, &extra) == CUDA_SUCCESS) {
-                        endKernelTiming(_t_gather, 0);
-                        _ = sync_fn();
-                        break :gather_blk;
-                    }
-                    endKernelTiming(_t_gather, 0);
-                }
-            }
-            // Fallback: async device-to-device, else host upload.
-            if (cuMemcpyDtoDAsync_fn) |d2d| {
-                for (0..scan.num_raw_off16) |ri| {
-                    const rd = self.raw_off16_buf[ri];
-                    if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len)
-                        _ = d2d(self.d_tans_off16_scratch + rd.gpu_offset, self.d_comp_persist + rd.src_offset, rd.size, 0);
-                }
-                _ = sync_fn();
-            } else {
-                for (0..scan.num_raw_off16) |ri| {
-                    const rd = self.raw_off16_buf[ri];
-                    if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len)
-                        _ = h2d_fn(self.d_tans_off16_scratch + rd.gpu_offset, @ptrCast(compressed_block.ptr + rd.src_offset), rd.size);
-                }
-            }
-        }
+        gatherRawOff16(self, scan, compressed_block, h2d_fn, sync_fn, launch_fn);
     }
 
     if (t_e2e0) |t0| if (io) |iv| {
-        e2e_cum_scan_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+        e2e_cum.scan = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
     };
 
     // ── Huffman pre-decode (Pass 1.5): merge per-stream-type descriptors
@@ -1665,66 +1787,7 @@ pub fn fullGpuLaunchImpl(
         if (!ensureDeviceBuf(&self.d_huff_descs, &self.d_huff_descs_size, huff_desc_bytes)) return error.BadMode;
         if (!ensureDeviceBuf(&self.d_huff_lut, &self.d_huff_lut_size, huff_lut_bytes)) return error.BadMode;
 
-        if (scan.device_compact_populated and merge_huff_descs_fn != 0) {
-            // ── Step 6c: device-side merge ──────────────────────
-            // The compact kernels already populated the 4 per-stream
-            // device buffers in step 6b. Launch the merge kernel —
-            // it writes directly to self.d_huff_descs (out_offsets
-            // adjusted, lut_offsets sequential) and updates the
-            // n_merged slot in d_compact_counts. No host arrays, no
-            // H2D.
-            var k_lit: u64 = self.d_compact_lit;
-            var k_tok: u64 = self.d_compact_tok;
-            var k_hi: u64 = self.d_compact_hi;
-            var k_lo: u64 = self.d_compact_lo;
-            var k_n_lit: u64 = self.d_compact_counts + 0;
-            var k_n_tok: u64 = self.d_compact_counts + 4;
-            var k_n_hi: u64 = self.d_compact_counts + 8;
-            var k_n_lo: u64 = self.d_compact_counts + 12;
-            var k_tok_region: u32 = @intCast(tok_offset);
-            var k_off16_region: u32 = @intCast(off16_offset);
-            var k_merged: u64 = self.d_huff_descs;
-            var k_n_merged: u64 = self.d_compact_counts + 20;
-            var m_params = [_]?*anyopaque{
-                @ptrCast(&k_lit), @ptrCast(&k_tok), @ptrCast(&k_hi), @ptrCast(&k_lo),
-                @ptrCast(&k_n_lit), @ptrCast(&k_n_tok), @ptrCast(&k_n_hi), @ptrCast(&k_n_lo),
-                @ptrCast(&k_tok_region), @ptrCast(&k_off16_region),
-                @ptrCast(&k_merged), @ptrCast(&k_n_merged),
-            };
-            var m_extra = [_]?*anyopaque{null};
-            const _t_merge = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzMergeHuffDescsKernel", 0);
-            if (launch_fn(merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, 0, &m_params, &m_extra) != CUDA_SUCCESS)
-                return error.BadMode;
-            endKernelTiming(_t_merge, 0);
-            _ = sync_fn();
-        } else {
-            // Legacy CPU merge — used by the non-pure-D2D / CPU-scan paths.
-            // Capacity = 4 buffers × 4096.
-            var merged_huff: [4096 * 4]HuffDecChunkDesc = undefined;
-            var m: u32 = 0;
-            var lut_slot: u32 = 0;
-            const append = struct {
-                fn run(dst: []HuffDecChunkDesc, m_ptr: *u32, lut_ptr: *u32,
-                       src: []const HuffDecChunkDesc, region_off: u32) void {
-                    for (src) |s| {
-                        if (m_ptr.* >= dst.len) return;
-                        var d = s;
-                        d.out_offset += region_off;
-                        d.lut_offset = lut_ptr.* * @as(u32, @intCast(HUFF_LUT_ENTRIES));
-                        dst[m_ptr.*] = d;
-                        m_ptr.* += 1;
-                        lut_ptr.* += 1;
-                    }
-                }
-            }.run;
-            append(&merged_huff, &m, &lut_slot, self.huff_lit_host_buf[0..scan.num_huff_lit], 0);
-            append(&merged_huff, &m, &lut_slot, self.huff_tok_host_buf[0..scan.num_huff_tok], @intCast(tok_offset));
-            append(&merged_huff, &m, &lut_slot, self.huff_off16hi_host_buf[0..scan.num_huff_off16hi], @intCast(off16_offset));
-            append(&merged_huff, &m, &lut_slot, self.huff_off16lo_host_buf[0..scan.num_huff_off16lo], @intCast(off16_offset));
-
-            _ = h2d_fn(self.d_huff_descs, @ptrCast(&merged_huff), @as(usize, m) * @sizeOf(HuffDecChunkDesc));
-            _ = sync_fn();
-        }
+        try mergeHuffDescs(self, scan, tok_offset, off16_offset, h2d_fn, sync_fn, launch_fn);
     }
 
     // ── Pipeline: split into N groups, overlap entropy with LZ ───
@@ -2046,7 +2109,7 @@ pub fn fullGpuLaunchImpl(
     }
 
     if (t_e2e0) |t0| if (io) |iv| {
-        e2e_cum_predh_ns = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+        e2e_cum.predh = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
     };
     // Device-resident output (4d Phase 3): D2D-copy the decoded bytes
     // straight to the caller's device buffer, skipping the host bounce.
@@ -2075,26 +2138,7 @@ pub fn fullGpuLaunchImpl(
         finalizeProfiling(&self.pending_timings, &self.last_timings);
     }
     if (t_e2e0) |t0| if (io) |iv| {
-        const cum_end_ns: i64 = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
-        const ms = struct {
-            fn f(ns: i64) f64 {
-                return @as(f64, @floatFromInt(ns)) / 1e6;
-            }
-        }.f;
-        const preblk_ns = e2e_cum_prescan_ns - e2e_cum_h2d_ns; // shared-LUT block region
-        const scanfn_ns = e2e_cum_postscan_ns - e2e_cum_prescan_ns; // scanForTansChunks call
-        const rawcopy_ns = e2e_cum_scan_ns - e2e_cum_postscan_ns; // raw-off16 device-to-device scatter
-        const prep_ns = (e2e_cum_predh_ns - e2e_cum_scan_ns) - last_kernel_ns; // descriptor prep
-        std.debug.print("  [e2e] setup+H2D {d:.3}  preBlk {d:.3}  scanFn {d:.3}  rawD2D {d:.3}  prep {d:.3}  kernels {d:.3}  D2H {d:.3}  total {d:.3} ms\n", .{
-            ms(e2e_cum_h2d_ns),
-            ms(preblk_ns),
-            ms(scanfn_ns),
-            ms(rawcopy_ns),
-            ms(prep_ns),
-            ms(last_kernel_ns),
-            ms(cum_end_ns - e2e_cum_predh_ns),
-            ms(cum_end_ns),
-        });
+        emitE2eTrace(t0, iv, e2e_cum, last_kernel_ns);
     };
 }
 
