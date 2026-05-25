@@ -12,7 +12,7 @@
 // single PTX. The split is purely organizational — keeping each file
 // under the size cap — and does not change the build or driver.
 //
-// Decode chain (see lz_decode_core.cuh / lz_header_parse.cuh):
+// Decode chain (see lz_decode_{core,raw,general}.cuh / lz_header_parse.cuh):
 //   decodeSubChunkRawMode   — single-LZ-block path (no off32, no delta)
 //   decodeSubChunkGeneral   — full path (off32, delta literals, 2 blocks)
 //   parseSubChunkHeaders    — parses per-stream headers into ParsedStreams
@@ -25,7 +25,9 @@
 //   slzGatherRawOff16Kernel — raw off16 scatter (1 block per stream)
 
 #include "slz_wire_format.cuh"           // constants, descriptor structs, header parsers
-#include "lz_decode_core.cuh"            // decodeSubChunkRawMode / decodeSubChunkGeneral
+#include "lz_decode_core.cuh"            // warpScanU32, warp{Literal,Match}Copy
+#include "lz_decode_raw.cuh"             // decodeSubChunkRawMode
+#include "lz_decode_general.cuh"         // decodeSubChunkGeneral
 #include "lz_header_parse.cuh"           // parseSubChunkHeaders
 #include "lz_dispatch.cuh"               // parseAndDecodeSubChunk{,Raw}
 #include "lz_decode_kernels.cuh"         // slzLzDecodeKernel, slzLzDecodeRawKernel
