@@ -163,20 +163,18 @@ extern "C" __global__ void slzHuffBuildTablesKernel(
             }
         }
 
-        // height-limit to ENC_MAX_CODE_LEN (Kraft-preserving, fixed point)
+        // height-limit to ENC_MAX_CODE_LEN (Kraft-preserving, fixed point).
+        // Clamp BEFORE summing: a raw tree depth > KRAFT_PRECISION_BITS
+        // would underflow the shift count and trigger UB. Post-clamp,
+        // every length is in [1, max_len] and the shift is well-defined.
         {
             const uint32_t kraft_budget = 1u << KRAFT_PRECISION_BITS;
             const int max_len = ENC_MAX_CODE_LEN;
+            for (int s = 0; s < HUFF_ALPHABET; s++)
+                if (code_lengths[s] > max_len) code_lengths[s] = (uint8_t)max_len;
             uint32_t sum = 0;
             for (int s = 0; s < HUFF_ALPHABET; s++)
                 if (code_lengths[s] > 0) sum += (1u << (KRAFT_PRECISION_BITS - code_lengths[s]));
-            for (int s = 0; s < HUFF_ALPHABET; s++) {
-                if (code_lengths[s] > max_len) {
-                    sum -= (1u << (KRAFT_PRECISION_BITS - code_lengths[s]));
-                    code_lengths[s] = (uint8_t)max_len;
-                    sum += (1u << (KRAFT_PRECISION_BITS - max_len));
-                }
-            }
             while (sum > kraft_budget) {
                 int best = -1;
                 uint32_t best_w = 0xFFFFFFFFu;

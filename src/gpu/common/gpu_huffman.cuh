@@ -66,21 +66,19 @@ __device__ __forceinline__ void unpackWeightByte(uint8_t b, uint8_t& len_even,
 //                  code for each used symbol, 0 for unused symbols.
 //
 // All input code lengths are <= HUFF_MAX_CODE_LEN (the encoder height-
-// limits; the decoder's weights come from such an encoder). The loop
-// runs to HUFF_MAX_CODE_LEN+1 so next_code[] covers every possible
-// length; the trailing index is harmless when no code reaches it.
+// limits; the decoder's weights come from such an encoder).
 __device__ __forceinline__ void buildCanonicalCodes(const uint8_t* code_lengths,
                                                      uint32_t* codes) {
     uint32_t length_count[HUFF_LEN_HIST_SIZE] = {0};
     for (int s = 0; s < HUFF_ALPHABET; s++) {
         uint8_t L = code_lengths[s];
-        if (L > 0 && L <= HUFF_MAX_CODE_LEN) length_count[L]++;
+        if (L > 0) length_count[L]++;
     }
     length_count[0] = 0;
 
     uint32_t next_code[HUFF_LEN_HIST_SIZE] = {0};
     uint32_t code = 0;
-    for (int L = 1; L <= HUFF_MAX_CODE_LEN + 1; L++) {
+    for (int L = 1; L <= HUFF_MAX_CODE_LEN; L++) {
         code = (code + length_count[L - 1]) << 1;
         next_code[L] = code;
     }

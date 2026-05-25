@@ -30,7 +30,7 @@ extern "C" __global__ void slzGatherRawOff16Kernel(
     const uint32_t i = blockIdx.x;
     if (i >= *d_count) return;
     const SlzRawOff16Desc d = descs[i];
-    if (d.size == 0 || d.src_offset + d.size > comp_len) return;
+    if (d.size == 0 || d.src_offset > comp_len || d.size > comp_len - d.src_offset) return;
     const uint8_t* s = comp_base + d.src_offset;
     uint8_t* t = scratch_base + d.gpu_offset;
     for (uint32_t j = threadIdx.x; j < d.size; j += blockDim.x)

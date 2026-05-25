@@ -181,21 +181,11 @@ __device__ ChainMatch findMatchChain(
                     if (candidate_offset <= previous_offset) break;
                 }
             }
-        } else if (candidate_offset <= pos && candidate_offset < LZ_BLOCK_SIZE) {
-            // Far first-hash hit (> NEAR_OFFSET_MAX but within dictionary)
-            uint32_t ref = pos - candidate_offset;
-            uint32_t ref_word = readU32LE(src + ref);
-            if (ref_word == bytes_at_pos) {
-                uint32_t ml = 4;
-                uint32_t max_ext = end_pos - pos;
-                while (ml < max_ext && src[pos + ml] == src[ref + ml]) ml++;
-                int32_t cand_len = (int32_t)ml;
-                if (cand_len > minimum_match_length && cand_len >= (int32_t)FAR_OFFSET_MIN_MATCH) {
-                    best_match_length = cand_len;
-                    best_offset = (int32_t)candidate_offset;
-                }
-            }
         }
+        // Note: there is no reachable "far first-hash" branch here —
+        // NEAR_OFFSET_MAX == LZ_BLOCK_SIZE - 1, so any candidate_offset
+        // > NEAR_OFFSET_MAX is also >= LZ_BLOCK_SIZE. Far matches are
+        // discovered via the long_hash secondary table below.
     }
 
     // (c) Check long_hash secondary table
@@ -409,10 +399,11 @@ __device__ void scanBlockChain(
         // Advance past the match
         uint32_t match_end = pos + (uint32_t)match.length;
 
-        // Insert matched range positions into hash tables
+        // Insert matched range positions into hash tables. The outer
+        // guard already asserts `match_end + 8 <= src_size`, so the
+        // insert range ends at match_end without further clamping.
         if (match_end > pos + 1 && match_end + 8 <= src_size) {
-            uint32_t insert_end = (match_end + 8 <= src_size) ? match_end : src_size - 8;
-            insertChainRange(src, src_size, pos + 1, insert_end, first_hash, long_hash, next_hash,
+            insertChainRange(src, src_size, pos + 1, match_end, first_hash, long_hash, next_hash,
                              hash_bits, hash_mask);
         }
 

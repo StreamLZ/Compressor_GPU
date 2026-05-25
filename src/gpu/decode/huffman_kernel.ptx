@@ -26,8 +26,8 @@
 	.reg .b64 	%SP;
 	.reg .b64 	%SPL;
 	.reg .pred 	%p<313>;
-	.reg .b16 	%rs<803>;
-	.reg .b32 	%r<1404>;
+	.reg .b16 	%rs<291>;
+	.reg .b32 	%r<1134>;
 	.reg .b64 	%rd<661>;
 	// demoted variable
 	.shared .align 1 .b8 _ZZ21slzHuffBuildLutKernelE12code_lengths[256];
@@ -43,4636 +43,3863 @@
 	add.u64 	%rd2, %SPL, 0;
 	add.u64 	%rd3, %SPL, 52;
 	cvta.to.global.u64 	%rd15, %rd12;
-	ld.global.nc.u32 	%r87, [%rd15];
+	ld.global.nc.u32 	%r86, [%rd15];
 	mov.u32 	%r1, %ctaid.x;
-	setp.ge.u32 	%p1, %r1, %r87;
+	setp.ge.u32 	%p1, %r1, %r86;
 	@%p1 bra 	$L__BB0_595;
 
-	mov.u32 	%r88, %tid.x;
-	and.b32  	%r2, %r88, 31;
+	mov.u32 	%r87, %tid.x;
+	and.b32  	%r1128, %r87, 31;
 	cvta.to.global.u64 	%rd16, %rd10;
 	mul.wide.u32 	%rd17, %r1, 20;
 	add.s64 	%rd18, %rd16, %rd17;
-	ld.global.nc.u32 	%r89, [%rd18];
-	cvt.u64.u32 	%rd19, %r89;
-	ld.global.nc.u32 	%r90, [%rd18+16];
-	cvt.u64.u32 	%rd4, %r90;
-	cvt.u64.u32 	%rd20, %r88;
+	ld.global.nc.u32 	%r88, [%rd18];
+	cvt.u64.u32 	%rd19, %r88;
+	ld.global.nc.u32 	%r89, [%rd18+16];
+	cvt.u64.u32 	%rd4, %r89;
+	cvt.u64.u32 	%rd20, %r87;
 	and.b64  	%rd21, %rd20, 31;
 	add.s64 	%rd22, %rd19, %rd21;
 	cvta.to.global.u64 	%rd23, %rd9;
 	add.s64 	%rd660, %rd23, %rd22;
-	shl.b32 	%r91, %r88, 1;
-	and.b32  	%r92, %r91, 62;
-	mov.u32 	%r93, _ZZ21slzHuffBuildLutKernelE12code_lengths;
-	add.s32 	%r94, %r93, %r92;
-	add.s32 	%r1374, %r94, 1;
-	mov.u32 	%r1375, %r2;
+	shl.b32 	%r90, %r87, 1;
+	and.b32  	%r91, %r90, 62;
+	mov.u32 	%r92, _ZZ21slzHuffBuildLutKernelE12code_lengths;
+	add.s32 	%r93, %r92, %r91;
+	add.s32 	%r1104, %r93, 1;
+	mov.u32 	%r1105, %r1128;
 
 $L__BB0_2:
-	ld.global.nc.u8 	%rs275, [%rd660];
-	cvt.u16.u8 	%rs276, %rs275;
-	and.b16  	%rs277, %rs276, 15;
-	st.shared.u8 	[%r1374+-1], %rs277;
-	shr.u16 	%rs278, %rs276, 4;
-	st.shared.u8 	[%r1374], %rs278;
+	ld.global.nc.u8 	%rs274, [%rd660];
+	cvt.u16.u8 	%rs275, %rs274;
+	and.b16  	%rs276, %rs275, 15;
+	st.shared.u8 	[%r1104+-1], %rs276;
+	shr.u16 	%rs277, %rs275, 4;
+	st.shared.u8 	[%r1104], %rs277;
 	add.s64 	%rd660, %rd660, 32;
-	add.s32 	%r1374, %r1374, 64;
-	add.s32 	%r1375, %r1375, 32;
-	setp.lt.s32 	%p2, %r1375, 128;
+	add.s32 	%r1104, %r1104, 64;
+	add.s32 	%r1105, %r1105, 32;
+	setp.lt.s32 	%p2, %r1105, 128;
 	@%p2 bra 	$L__BB0_2;
 
 	bar.warp.sync 	-1;
-	setp.ne.s32 	%p3, %r2, 0;
+	setp.ne.s32 	%p3, %r1128, 0;
 	@%p3 bra 	$L__BB0_550;
 
-	mov.u32 	%r95, 0;
-	st.local.u32 	[%rd2], %r95;
-	st.local.u32 	[%rd2+4], %r95;
-	st.local.u32 	[%rd2+8], %r95;
-	st.local.u32 	[%rd2+12], %r95;
-	st.local.u32 	[%rd2+16], %r95;
-	st.local.u32 	[%rd2+20], %r95;
-	st.local.u32 	[%rd2+24], %r95;
-	st.local.u32 	[%rd2+28], %r95;
-	st.local.u32 	[%rd2+32], %r95;
-	st.local.u32 	[%rd2+36], %r95;
-	st.local.u32 	[%rd2+40], %r95;
-	st.local.u32 	[%rd2+44], %r95;
-	st.local.u32 	[%rd2+48], %r95;
+	mov.u32 	%r94, 0;
+	st.local.u32 	[%rd2], %r94;
+	st.local.u32 	[%rd2+4], %r94;
+	st.local.u32 	[%rd2+8], %r94;
+	st.local.u32 	[%rd2+12], %r94;
+	st.local.u32 	[%rd2+16], %r94;
+	st.local.u32 	[%rd2+20], %r94;
+	st.local.u32 	[%rd2+24], %r94;
+	st.local.u32 	[%rd2+28], %r94;
+	st.local.u32 	[%rd2+32], %r94;
+	st.local.u32 	[%rd2+36], %r94;
+	st.local.u32 	[%rd2+40], %r94;
+	st.local.u32 	[%rd2+44], %r94;
+	st.local.u32 	[%rd2+48], %r94;
 	ld.shared.u8 	%rs1, [_ZZ21slzHuffBuildLutKernelE12code_lengths];
-	add.s16 	%rs279, %rs1, -1;
-	and.b16  	%rs280, %rs279, 255;
-	setp.gt.u16 	%p4, %rs280, 10;
+	setp.eq.s16 	%p4, %rs1, 0;
 	@%p4 bra 	$L__BB0_6;
 
-	cvt.u32.u16 	%r96, %rs1;
-	and.b32  	%r97, %r96, 255;
-	mul.wide.u32 	%rd24, %r97, 4;
+	cvt.u32.u16 	%r95, %rs1;
+	mul.wide.u32 	%rd24, %r95, 4;
 	add.s64 	%rd25, %rd2, %rd24;
-	ld.local.u32 	%r98, [%rd25];
-	add.s32 	%r99, %r98, 1;
-	st.local.u32 	[%rd25], %r99;
+	ld.local.u32 	%r96, [%rd25];
+	add.s32 	%r97, %r96, 1;
+	st.local.u32 	[%rd25], %r97;
 
 $L__BB0_6:
 	ld.shared.u8 	%rs2, [_ZZ21slzHuffBuildLutKernelE12code_lengths+1];
-	add.s16 	%rs281, %rs2, -1;
-	and.b16  	%rs282, %rs281, 255;
-	setp.gt.u16 	%p5, %rs282, 10;
+	setp.eq.s16 	%p5, %rs2, 0;
 	@%p5 bra 	$L__BB0_8;
 
-	cvt.u32.u16 	%r100, %rs2;
-	and.b32  	%r101, %r100, 255;
-	mul.wide.u32 	%rd26, %r101, 4;
+	cvt.u32.u16 	%r98, %rs2;
+	mul.wide.u32 	%rd26, %r98, 4;
 	add.s64 	%rd27, %rd2, %rd26;
-	ld.local.u32 	%r102, [%rd27];
-	add.s32 	%r103, %r102, 1;
-	st.local.u32 	[%rd27], %r103;
+	ld.local.u32 	%r99, [%rd27];
+	add.s32 	%r100, %r99, 1;
+	st.local.u32 	[%rd27], %r100;
 
 $L__BB0_8:
 	ld.shared.u8 	%rs3, [_ZZ21slzHuffBuildLutKernelE12code_lengths+2];
-	add.s16 	%rs283, %rs3, -1;
-	and.b16  	%rs284, %rs283, 255;
-	setp.gt.u16 	%p6, %rs284, 10;
+	setp.eq.s16 	%p6, %rs3, 0;
 	@%p6 bra 	$L__BB0_10;
 
-	cvt.u32.u16 	%r104, %rs3;
-	and.b32  	%r105, %r104, 255;
-	mul.wide.u32 	%rd28, %r105, 4;
+	cvt.u32.u16 	%r101, %rs3;
+	mul.wide.u32 	%rd28, %r101, 4;
 	add.s64 	%rd29, %rd2, %rd28;
-	ld.local.u32 	%r106, [%rd29];
-	add.s32 	%r107, %r106, 1;
-	st.local.u32 	[%rd29], %r107;
+	ld.local.u32 	%r102, [%rd29];
+	add.s32 	%r103, %r102, 1;
+	st.local.u32 	[%rd29], %r103;
 
 $L__BB0_10:
 	ld.shared.u8 	%rs4, [_ZZ21slzHuffBuildLutKernelE12code_lengths+3];
-	add.s16 	%rs285, %rs4, -1;
-	and.b16  	%rs286, %rs285, 255;
-	setp.gt.u16 	%p7, %rs286, 10;
+	setp.eq.s16 	%p7, %rs4, 0;
 	@%p7 bra 	$L__BB0_12;
 
-	cvt.u32.u16 	%r108, %rs4;
-	and.b32  	%r109, %r108, 255;
-	mul.wide.u32 	%rd30, %r109, 4;
+	cvt.u32.u16 	%r104, %rs4;
+	mul.wide.u32 	%rd30, %r104, 4;
 	add.s64 	%rd31, %rd2, %rd30;
-	ld.local.u32 	%r110, [%rd31];
-	add.s32 	%r111, %r110, 1;
-	st.local.u32 	[%rd31], %r111;
+	ld.local.u32 	%r105, [%rd31];
+	add.s32 	%r106, %r105, 1;
+	st.local.u32 	[%rd31], %r106;
 
 $L__BB0_12:
 	ld.shared.u8 	%rs5, [_ZZ21slzHuffBuildLutKernelE12code_lengths+4];
-	add.s16 	%rs287, %rs5, -1;
-	and.b16  	%rs288, %rs287, 255;
-	setp.gt.u16 	%p8, %rs288, 10;
+	setp.eq.s16 	%p8, %rs5, 0;
 	@%p8 bra 	$L__BB0_14;
 
-	cvt.u32.u16 	%r112, %rs5;
-	and.b32  	%r113, %r112, 255;
-	mul.wide.u32 	%rd32, %r113, 4;
+	cvt.u32.u16 	%r107, %rs5;
+	mul.wide.u32 	%rd32, %r107, 4;
 	add.s64 	%rd33, %rd2, %rd32;
-	ld.local.u32 	%r114, [%rd33];
-	add.s32 	%r115, %r114, 1;
-	st.local.u32 	[%rd33], %r115;
+	ld.local.u32 	%r108, [%rd33];
+	add.s32 	%r109, %r108, 1;
+	st.local.u32 	[%rd33], %r109;
 
 $L__BB0_14:
 	ld.shared.u8 	%rs6, [_ZZ21slzHuffBuildLutKernelE12code_lengths+5];
-	add.s16 	%rs289, %rs6, -1;
-	and.b16  	%rs290, %rs289, 255;
-	setp.gt.u16 	%p9, %rs290, 10;
+	setp.eq.s16 	%p9, %rs6, 0;
 	@%p9 bra 	$L__BB0_16;
 
-	cvt.u32.u16 	%r116, %rs6;
-	and.b32  	%r117, %r116, 255;
-	mul.wide.u32 	%rd34, %r117, 4;
+	cvt.u32.u16 	%r110, %rs6;
+	mul.wide.u32 	%rd34, %r110, 4;
 	add.s64 	%rd35, %rd2, %rd34;
-	ld.local.u32 	%r118, [%rd35];
-	add.s32 	%r119, %r118, 1;
-	st.local.u32 	[%rd35], %r119;
+	ld.local.u32 	%r111, [%rd35];
+	add.s32 	%r112, %r111, 1;
+	st.local.u32 	[%rd35], %r112;
 
 $L__BB0_16:
 	ld.shared.u8 	%rs7, [_ZZ21slzHuffBuildLutKernelE12code_lengths+6];
-	add.s16 	%rs291, %rs7, -1;
-	and.b16  	%rs292, %rs291, 255;
-	setp.gt.u16 	%p10, %rs292, 10;
+	setp.eq.s16 	%p10, %rs7, 0;
 	@%p10 bra 	$L__BB0_18;
 
-	cvt.u32.u16 	%r120, %rs7;
-	and.b32  	%r121, %r120, 255;
-	mul.wide.u32 	%rd36, %r121, 4;
+	cvt.u32.u16 	%r113, %rs7;
+	mul.wide.u32 	%rd36, %r113, 4;
 	add.s64 	%rd37, %rd2, %rd36;
-	ld.local.u32 	%r122, [%rd37];
-	add.s32 	%r123, %r122, 1;
-	st.local.u32 	[%rd37], %r123;
+	ld.local.u32 	%r114, [%rd37];
+	add.s32 	%r115, %r114, 1;
+	st.local.u32 	[%rd37], %r115;
 
 $L__BB0_18:
 	ld.shared.u8 	%rs8, [_ZZ21slzHuffBuildLutKernelE12code_lengths+7];
-	add.s16 	%rs293, %rs8, -1;
-	and.b16  	%rs294, %rs293, 255;
-	setp.gt.u16 	%p11, %rs294, 10;
+	setp.eq.s16 	%p11, %rs8, 0;
 	@%p11 bra 	$L__BB0_20;
 
-	cvt.u32.u16 	%r124, %rs8;
-	and.b32  	%r125, %r124, 255;
-	mul.wide.u32 	%rd38, %r125, 4;
+	cvt.u32.u16 	%r116, %rs8;
+	mul.wide.u32 	%rd38, %r116, 4;
 	add.s64 	%rd39, %rd2, %rd38;
-	ld.local.u32 	%r126, [%rd39];
-	add.s32 	%r127, %r126, 1;
-	st.local.u32 	[%rd39], %r127;
+	ld.local.u32 	%r117, [%rd39];
+	add.s32 	%r118, %r117, 1;
+	st.local.u32 	[%rd39], %r118;
 
 $L__BB0_20:
 	ld.shared.u8 	%rs9, [_ZZ21slzHuffBuildLutKernelE12code_lengths+8];
-	add.s16 	%rs295, %rs9, -1;
-	and.b16  	%rs296, %rs295, 255;
-	setp.gt.u16 	%p12, %rs296, 10;
+	setp.eq.s16 	%p12, %rs9, 0;
 	@%p12 bra 	$L__BB0_22;
 
-	cvt.u32.u16 	%r128, %rs9;
-	and.b32  	%r129, %r128, 255;
-	mul.wide.u32 	%rd40, %r129, 4;
+	cvt.u32.u16 	%r119, %rs9;
+	mul.wide.u32 	%rd40, %r119, 4;
 	add.s64 	%rd41, %rd2, %rd40;
-	ld.local.u32 	%r130, [%rd41];
-	add.s32 	%r131, %r130, 1;
-	st.local.u32 	[%rd41], %r131;
+	ld.local.u32 	%r120, [%rd41];
+	add.s32 	%r121, %r120, 1;
+	st.local.u32 	[%rd41], %r121;
 
 $L__BB0_22:
 	ld.shared.u8 	%rs10, [_ZZ21slzHuffBuildLutKernelE12code_lengths+9];
-	add.s16 	%rs297, %rs10, -1;
-	and.b16  	%rs298, %rs297, 255;
-	setp.gt.u16 	%p13, %rs298, 10;
+	setp.eq.s16 	%p13, %rs10, 0;
 	@%p13 bra 	$L__BB0_24;
 
-	cvt.u32.u16 	%r132, %rs10;
-	and.b32  	%r133, %r132, 255;
-	mul.wide.u32 	%rd42, %r133, 4;
+	cvt.u32.u16 	%r122, %rs10;
+	mul.wide.u32 	%rd42, %r122, 4;
 	add.s64 	%rd43, %rd2, %rd42;
-	ld.local.u32 	%r134, [%rd43];
-	add.s32 	%r135, %r134, 1;
-	st.local.u32 	[%rd43], %r135;
+	ld.local.u32 	%r123, [%rd43];
+	add.s32 	%r124, %r123, 1;
+	st.local.u32 	[%rd43], %r124;
 
 $L__BB0_24:
 	ld.shared.u8 	%rs11, [_ZZ21slzHuffBuildLutKernelE12code_lengths+10];
-	add.s16 	%rs299, %rs11, -1;
-	and.b16  	%rs300, %rs299, 255;
-	setp.gt.u16 	%p14, %rs300, 10;
+	setp.eq.s16 	%p14, %rs11, 0;
 	@%p14 bra 	$L__BB0_26;
 
-	cvt.u32.u16 	%r136, %rs11;
-	and.b32  	%r137, %r136, 255;
-	mul.wide.u32 	%rd44, %r137, 4;
+	cvt.u32.u16 	%r125, %rs11;
+	mul.wide.u32 	%rd44, %r125, 4;
 	add.s64 	%rd45, %rd2, %rd44;
-	ld.local.u32 	%r138, [%rd45];
-	add.s32 	%r139, %r138, 1;
-	st.local.u32 	[%rd45], %r139;
+	ld.local.u32 	%r126, [%rd45];
+	add.s32 	%r127, %r126, 1;
+	st.local.u32 	[%rd45], %r127;
 
 $L__BB0_26:
 	ld.shared.u8 	%rs12, [_ZZ21slzHuffBuildLutKernelE12code_lengths+11];
-	add.s16 	%rs301, %rs12, -1;
-	and.b16  	%rs302, %rs301, 255;
-	setp.gt.u16 	%p15, %rs302, 10;
+	setp.eq.s16 	%p15, %rs12, 0;
 	@%p15 bra 	$L__BB0_28;
 
-	cvt.u32.u16 	%r140, %rs12;
-	and.b32  	%r141, %r140, 255;
-	mul.wide.u32 	%rd46, %r141, 4;
+	cvt.u32.u16 	%r128, %rs12;
+	mul.wide.u32 	%rd46, %r128, 4;
 	add.s64 	%rd47, %rd2, %rd46;
-	ld.local.u32 	%r142, [%rd47];
-	add.s32 	%r143, %r142, 1;
-	st.local.u32 	[%rd47], %r143;
+	ld.local.u32 	%r129, [%rd47];
+	add.s32 	%r130, %r129, 1;
+	st.local.u32 	[%rd47], %r130;
 
 $L__BB0_28:
 	ld.shared.u8 	%rs13, [_ZZ21slzHuffBuildLutKernelE12code_lengths+12];
-	add.s16 	%rs303, %rs13, -1;
-	and.b16  	%rs304, %rs303, 255;
-	setp.gt.u16 	%p16, %rs304, 10;
+	setp.eq.s16 	%p16, %rs13, 0;
 	@%p16 bra 	$L__BB0_30;
 
-	cvt.u32.u16 	%r144, %rs13;
-	and.b32  	%r145, %r144, 255;
-	mul.wide.u32 	%rd48, %r145, 4;
+	cvt.u32.u16 	%r131, %rs13;
+	mul.wide.u32 	%rd48, %r131, 4;
 	add.s64 	%rd49, %rd2, %rd48;
-	ld.local.u32 	%r146, [%rd49];
-	add.s32 	%r147, %r146, 1;
-	st.local.u32 	[%rd49], %r147;
+	ld.local.u32 	%r132, [%rd49];
+	add.s32 	%r133, %r132, 1;
+	st.local.u32 	[%rd49], %r133;
 
 $L__BB0_30:
 	ld.shared.u8 	%rs14, [_ZZ21slzHuffBuildLutKernelE12code_lengths+13];
-	add.s16 	%rs305, %rs14, -1;
-	and.b16  	%rs306, %rs305, 255;
-	setp.gt.u16 	%p17, %rs306, 10;
+	setp.eq.s16 	%p17, %rs14, 0;
 	@%p17 bra 	$L__BB0_32;
 
-	cvt.u32.u16 	%r148, %rs14;
-	and.b32  	%r149, %r148, 255;
-	mul.wide.u32 	%rd50, %r149, 4;
+	cvt.u32.u16 	%r134, %rs14;
+	mul.wide.u32 	%rd50, %r134, 4;
 	add.s64 	%rd51, %rd2, %rd50;
-	ld.local.u32 	%r150, [%rd51];
-	add.s32 	%r151, %r150, 1;
-	st.local.u32 	[%rd51], %r151;
+	ld.local.u32 	%r135, [%rd51];
+	add.s32 	%r136, %r135, 1;
+	st.local.u32 	[%rd51], %r136;
 
 $L__BB0_32:
 	ld.shared.u8 	%rs15, [_ZZ21slzHuffBuildLutKernelE12code_lengths+14];
-	add.s16 	%rs307, %rs15, -1;
-	and.b16  	%rs308, %rs307, 255;
-	setp.gt.u16 	%p18, %rs308, 10;
+	setp.eq.s16 	%p18, %rs15, 0;
 	@%p18 bra 	$L__BB0_34;
 
-	cvt.u32.u16 	%r152, %rs15;
-	and.b32  	%r153, %r152, 255;
-	mul.wide.u32 	%rd52, %r153, 4;
+	cvt.u32.u16 	%r137, %rs15;
+	mul.wide.u32 	%rd52, %r137, 4;
 	add.s64 	%rd53, %rd2, %rd52;
-	ld.local.u32 	%r154, [%rd53];
-	add.s32 	%r155, %r154, 1;
-	st.local.u32 	[%rd53], %r155;
+	ld.local.u32 	%r138, [%rd53];
+	add.s32 	%r139, %r138, 1;
+	st.local.u32 	[%rd53], %r139;
 
 $L__BB0_34:
 	ld.shared.u8 	%rs16, [_ZZ21slzHuffBuildLutKernelE12code_lengths+15];
-	add.s16 	%rs309, %rs16, -1;
-	and.b16  	%rs310, %rs309, 255;
-	setp.gt.u16 	%p19, %rs310, 10;
+	setp.eq.s16 	%p19, %rs16, 0;
 	@%p19 bra 	$L__BB0_36;
 
-	cvt.u32.u16 	%r156, %rs16;
-	and.b32  	%r157, %r156, 255;
-	mul.wide.u32 	%rd54, %r157, 4;
+	cvt.u32.u16 	%r140, %rs16;
+	mul.wide.u32 	%rd54, %r140, 4;
 	add.s64 	%rd55, %rd2, %rd54;
-	ld.local.u32 	%r158, [%rd55];
-	add.s32 	%r159, %r158, 1;
-	st.local.u32 	[%rd55], %r159;
+	ld.local.u32 	%r141, [%rd55];
+	add.s32 	%r142, %r141, 1;
+	st.local.u32 	[%rd55], %r142;
 
 $L__BB0_36:
 	ld.shared.u8 	%rs17, [_ZZ21slzHuffBuildLutKernelE12code_lengths+16];
-	add.s16 	%rs311, %rs17, -1;
-	and.b16  	%rs312, %rs311, 255;
-	setp.gt.u16 	%p20, %rs312, 10;
+	setp.eq.s16 	%p20, %rs17, 0;
 	@%p20 bra 	$L__BB0_38;
 
-	cvt.u32.u16 	%r160, %rs17;
-	and.b32  	%r161, %r160, 255;
-	mul.wide.u32 	%rd56, %r161, 4;
+	cvt.u32.u16 	%r143, %rs17;
+	mul.wide.u32 	%rd56, %r143, 4;
 	add.s64 	%rd57, %rd2, %rd56;
-	ld.local.u32 	%r162, [%rd57];
-	add.s32 	%r163, %r162, 1;
-	st.local.u32 	[%rd57], %r163;
+	ld.local.u32 	%r144, [%rd57];
+	add.s32 	%r145, %r144, 1;
+	st.local.u32 	[%rd57], %r145;
 
 $L__BB0_38:
 	ld.shared.u8 	%rs18, [_ZZ21slzHuffBuildLutKernelE12code_lengths+17];
-	add.s16 	%rs313, %rs18, -1;
-	and.b16  	%rs314, %rs313, 255;
-	setp.gt.u16 	%p21, %rs314, 10;
+	setp.eq.s16 	%p21, %rs18, 0;
 	@%p21 bra 	$L__BB0_40;
 
-	cvt.u32.u16 	%r164, %rs18;
-	and.b32  	%r165, %r164, 255;
-	mul.wide.u32 	%rd58, %r165, 4;
+	cvt.u32.u16 	%r146, %rs18;
+	mul.wide.u32 	%rd58, %r146, 4;
 	add.s64 	%rd59, %rd2, %rd58;
-	ld.local.u32 	%r166, [%rd59];
-	add.s32 	%r167, %r166, 1;
-	st.local.u32 	[%rd59], %r167;
+	ld.local.u32 	%r147, [%rd59];
+	add.s32 	%r148, %r147, 1;
+	st.local.u32 	[%rd59], %r148;
 
 $L__BB0_40:
 	ld.shared.u8 	%rs19, [_ZZ21slzHuffBuildLutKernelE12code_lengths+18];
-	add.s16 	%rs315, %rs19, -1;
-	and.b16  	%rs316, %rs315, 255;
-	setp.gt.u16 	%p22, %rs316, 10;
+	setp.eq.s16 	%p22, %rs19, 0;
 	@%p22 bra 	$L__BB0_42;
 
-	cvt.u32.u16 	%r168, %rs19;
-	and.b32  	%r169, %r168, 255;
-	mul.wide.u32 	%rd60, %r169, 4;
+	cvt.u32.u16 	%r149, %rs19;
+	mul.wide.u32 	%rd60, %r149, 4;
 	add.s64 	%rd61, %rd2, %rd60;
-	ld.local.u32 	%r170, [%rd61];
-	add.s32 	%r171, %r170, 1;
-	st.local.u32 	[%rd61], %r171;
+	ld.local.u32 	%r150, [%rd61];
+	add.s32 	%r151, %r150, 1;
+	st.local.u32 	[%rd61], %r151;
 
 $L__BB0_42:
 	ld.shared.u8 	%rs20, [_ZZ21slzHuffBuildLutKernelE12code_lengths+19];
-	add.s16 	%rs317, %rs20, -1;
-	and.b16  	%rs318, %rs317, 255;
-	setp.gt.u16 	%p23, %rs318, 10;
+	setp.eq.s16 	%p23, %rs20, 0;
 	@%p23 bra 	$L__BB0_44;
 
-	cvt.u32.u16 	%r172, %rs20;
-	and.b32  	%r173, %r172, 255;
-	mul.wide.u32 	%rd62, %r173, 4;
+	cvt.u32.u16 	%r152, %rs20;
+	mul.wide.u32 	%rd62, %r152, 4;
 	add.s64 	%rd63, %rd2, %rd62;
-	ld.local.u32 	%r174, [%rd63];
-	add.s32 	%r175, %r174, 1;
-	st.local.u32 	[%rd63], %r175;
+	ld.local.u32 	%r153, [%rd63];
+	add.s32 	%r154, %r153, 1;
+	st.local.u32 	[%rd63], %r154;
 
 $L__BB0_44:
 	ld.shared.u8 	%rs21, [_ZZ21slzHuffBuildLutKernelE12code_lengths+20];
-	add.s16 	%rs319, %rs21, -1;
-	and.b16  	%rs320, %rs319, 255;
-	setp.gt.u16 	%p24, %rs320, 10;
+	setp.eq.s16 	%p24, %rs21, 0;
 	@%p24 bra 	$L__BB0_46;
 
-	cvt.u32.u16 	%r176, %rs21;
-	and.b32  	%r177, %r176, 255;
-	mul.wide.u32 	%rd64, %r177, 4;
+	cvt.u32.u16 	%r155, %rs21;
+	mul.wide.u32 	%rd64, %r155, 4;
 	add.s64 	%rd65, %rd2, %rd64;
-	ld.local.u32 	%r178, [%rd65];
-	add.s32 	%r179, %r178, 1;
-	st.local.u32 	[%rd65], %r179;
+	ld.local.u32 	%r156, [%rd65];
+	add.s32 	%r157, %r156, 1;
+	st.local.u32 	[%rd65], %r157;
 
 $L__BB0_46:
 	ld.shared.u8 	%rs22, [_ZZ21slzHuffBuildLutKernelE12code_lengths+21];
-	add.s16 	%rs321, %rs22, -1;
-	and.b16  	%rs322, %rs321, 255;
-	setp.gt.u16 	%p25, %rs322, 10;
+	setp.eq.s16 	%p25, %rs22, 0;
 	@%p25 bra 	$L__BB0_48;
 
-	cvt.u32.u16 	%r180, %rs22;
-	and.b32  	%r181, %r180, 255;
-	mul.wide.u32 	%rd66, %r181, 4;
+	cvt.u32.u16 	%r158, %rs22;
+	mul.wide.u32 	%rd66, %r158, 4;
 	add.s64 	%rd67, %rd2, %rd66;
-	ld.local.u32 	%r182, [%rd67];
-	add.s32 	%r183, %r182, 1;
-	st.local.u32 	[%rd67], %r183;
+	ld.local.u32 	%r159, [%rd67];
+	add.s32 	%r160, %r159, 1;
+	st.local.u32 	[%rd67], %r160;
 
 $L__BB0_48:
 	ld.shared.u8 	%rs23, [_ZZ21slzHuffBuildLutKernelE12code_lengths+22];
-	add.s16 	%rs323, %rs23, -1;
-	and.b16  	%rs324, %rs323, 255;
-	setp.gt.u16 	%p26, %rs324, 10;
+	setp.eq.s16 	%p26, %rs23, 0;
 	@%p26 bra 	$L__BB0_50;
 
-	cvt.u32.u16 	%r184, %rs23;
-	and.b32  	%r185, %r184, 255;
-	mul.wide.u32 	%rd68, %r185, 4;
+	cvt.u32.u16 	%r161, %rs23;
+	mul.wide.u32 	%rd68, %r161, 4;
 	add.s64 	%rd69, %rd2, %rd68;
-	ld.local.u32 	%r186, [%rd69];
-	add.s32 	%r187, %r186, 1;
-	st.local.u32 	[%rd69], %r187;
+	ld.local.u32 	%r162, [%rd69];
+	add.s32 	%r163, %r162, 1;
+	st.local.u32 	[%rd69], %r163;
 
 $L__BB0_50:
 	ld.shared.u8 	%rs24, [_ZZ21slzHuffBuildLutKernelE12code_lengths+23];
-	add.s16 	%rs325, %rs24, -1;
-	and.b16  	%rs326, %rs325, 255;
-	setp.gt.u16 	%p27, %rs326, 10;
+	setp.eq.s16 	%p27, %rs24, 0;
 	@%p27 bra 	$L__BB0_52;
 
-	cvt.u32.u16 	%r188, %rs24;
-	and.b32  	%r189, %r188, 255;
-	mul.wide.u32 	%rd70, %r189, 4;
+	cvt.u32.u16 	%r164, %rs24;
+	mul.wide.u32 	%rd70, %r164, 4;
 	add.s64 	%rd71, %rd2, %rd70;
-	ld.local.u32 	%r190, [%rd71];
-	add.s32 	%r191, %r190, 1;
-	st.local.u32 	[%rd71], %r191;
+	ld.local.u32 	%r165, [%rd71];
+	add.s32 	%r166, %r165, 1;
+	st.local.u32 	[%rd71], %r166;
 
 $L__BB0_52:
 	ld.shared.u8 	%rs25, [_ZZ21slzHuffBuildLutKernelE12code_lengths+24];
-	add.s16 	%rs327, %rs25, -1;
-	and.b16  	%rs328, %rs327, 255;
-	setp.gt.u16 	%p28, %rs328, 10;
+	setp.eq.s16 	%p28, %rs25, 0;
 	@%p28 bra 	$L__BB0_54;
 
-	cvt.u32.u16 	%r192, %rs25;
-	and.b32  	%r193, %r192, 255;
-	mul.wide.u32 	%rd72, %r193, 4;
+	cvt.u32.u16 	%r167, %rs25;
+	mul.wide.u32 	%rd72, %r167, 4;
 	add.s64 	%rd73, %rd2, %rd72;
-	ld.local.u32 	%r194, [%rd73];
-	add.s32 	%r195, %r194, 1;
-	st.local.u32 	[%rd73], %r195;
+	ld.local.u32 	%r168, [%rd73];
+	add.s32 	%r169, %r168, 1;
+	st.local.u32 	[%rd73], %r169;
 
 $L__BB0_54:
 	ld.shared.u8 	%rs26, [_ZZ21slzHuffBuildLutKernelE12code_lengths+25];
-	add.s16 	%rs329, %rs26, -1;
-	and.b16  	%rs330, %rs329, 255;
-	setp.gt.u16 	%p29, %rs330, 10;
+	setp.eq.s16 	%p29, %rs26, 0;
 	@%p29 bra 	$L__BB0_56;
 
-	cvt.u32.u16 	%r196, %rs26;
-	and.b32  	%r197, %r196, 255;
-	mul.wide.u32 	%rd74, %r197, 4;
+	cvt.u32.u16 	%r170, %rs26;
+	mul.wide.u32 	%rd74, %r170, 4;
 	add.s64 	%rd75, %rd2, %rd74;
-	ld.local.u32 	%r198, [%rd75];
-	add.s32 	%r199, %r198, 1;
-	st.local.u32 	[%rd75], %r199;
+	ld.local.u32 	%r171, [%rd75];
+	add.s32 	%r172, %r171, 1;
+	st.local.u32 	[%rd75], %r172;
 
 $L__BB0_56:
 	ld.shared.u8 	%rs27, [_ZZ21slzHuffBuildLutKernelE12code_lengths+26];
-	add.s16 	%rs331, %rs27, -1;
-	and.b16  	%rs332, %rs331, 255;
-	setp.gt.u16 	%p30, %rs332, 10;
+	setp.eq.s16 	%p30, %rs27, 0;
 	@%p30 bra 	$L__BB0_58;
 
-	cvt.u32.u16 	%r200, %rs27;
-	and.b32  	%r201, %r200, 255;
-	mul.wide.u32 	%rd76, %r201, 4;
+	cvt.u32.u16 	%r173, %rs27;
+	mul.wide.u32 	%rd76, %r173, 4;
 	add.s64 	%rd77, %rd2, %rd76;
-	ld.local.u32 	%r202, [%rd77];
-	add.s32 	%r203, %r202, 1;
-	st.local.u32 	[%rd77], %r203;
+	ld.local.u32 	%r174, [%rd77];
+	add.s32 	%r175, %r174, 1;
+	st.local.u32 	[%rd77], %r175;
 
 $L__BB0_58:
 	ld.shared.u8 	%rs28, [_ZZ21slzHuffBuildLutKernelE12code_lengths+27];
-	add.s16 	%rs333, %rs28, -1;
-	and.b16  	%rs334, %rs333, 255;
-	setp.gt.u16 	%p31, %rs334, 10;
+	setp.eq.s16 	%p31, %rs28, 0;
 	@%p31 bra 	$L__BB0_60;
 
-	cvt.u32.u16 	%r204, %rs28;
-	and.b32  	%r205, %r204, 255;
-	mul.wide.u32 	%rd78, %r205, 4;
+	cvt.u32.u16 	%r176, %rs28;
+	mul.wide.u32 	%rd78, %r176, 4;
 	add.s64 	%rd79, %rd2, %rd78;
-	ld.local.u32 	%r206, [%rd79];
-	add.s32 	%r207, %r206, 1;
-	st.local.u32 	[%rd79], %r207;
+	ld.local.u32 	%r177, [%rd79];
+	add.s32 	%r178, %r177, 1;
+	st.local.u32 	[%rd79], %r178;
 
 $L__BB0_60:
 	ld.shared.u8 	%rs29, [_ZZ21slzHuffBuildLutKernelE12code_lengths+28];
-	add.s16 	%rs335, %rs29, -1;
-	and.b16  	%rs336, %rs335, 255;
-	setp.gt.u16 	%p32, %rs336, 10;
+	setp.eq.s16 	%p32, %rs29, 0;
 	@%p32 bra 	$L__BB0_62;
 
-	cvt.u32.u16 	%r208, %rs29;
-	and.b32  	%r209, %r208, 255;
-	mul.wide.u32 	%rd80, %r209, 4;
+	cvt.u32.u16 	%r179, %rs29;
+	mul.wide.u32 	%rd80, %r179, 4;
 	add.s64 	%rd81, %rd2, %rd80;
-	ld.local.u32 	%r210, [%rd81];
-	add.s32 	%r211, %r210, 1;
-	st.local.u32 	[%rd81], %r211;
+	ld.local.u32 	%r180, [%rd81];
+	add.s32 	%r181, %r180, 1;
+	st.local.u32 	[%rd81], %r181;
 
 $L__BB0_62:
 	ld.shared.u8 	%rs30, [_ZZ21slzHuffBuildLutKernelE12code_lengths+29];
-	add.s16 	%rs337, %rs30, -1;
-	and.b16  	%rs338, %rs337, 255;
-	setp.gt.u16 	%p33, %rs338, 10;
+	setp.eq.s16 	%p33, %rs30, 0;
 	@%p33 bra 	$L__BB0_64;
 
-	cvt.u32.u16 	%r212, %rs30;
-	and.b32  	%r213, %r212, 255;
-	mul.wide.u32 	%rd82, %r213, 4;
+	cvt.u32.u16 	%r182, %rs30;
+	mul.wide.u32 	%rd82, %r182, 4;
 	add.s64 	%rd83, %rd2, %rd82;
-	ld.local.u32 	%r214, [%rd83];
-	add.s32 	%r215, %r214, 1;
-	st.local.u32 	[%rd83], %r215;
+	ld.local.u32 	%r183, [%rd83];
+	add.s32 	%r184, %r183, 1;
+	st.local.u32 	[%rd83], %r184;
 
 $L__BB0_64:
 	ld.shared.u8 	%rs31, [_ZZ21slzHuffBuildLutKernelE12code_lengths+30];
-	add.s16 	%rs339, %rs31, -1;
-	and.b16  	%rs340, %rs339, 255;
-	setp.gt.u16 	%p34, %rs340, 10;
+	setp.eq.s16 	%p34, %rs31, 0;
 	@%p34 bra 	$L__BB0_66;
 
-	cvt.u32.u16 	%r216, %rs31;
-	and.b32  	%r217, %r216, 255;
-	mul.wide.u32 	%rd84, %r217, 4;
+	cvt.u32.u16 	%r185, %rs31;
+	mul.wide.u32 	%rd84, %r185, 4;
 	add.s64 	%rd85, %rd2, %rd84;
-	ld.local.u32 	%r218, [%rd85];
-	add.s32 	%r219, %r218, 1;
-	st.local.u32 	[%rd85], %r219;
+	ld.local.u32 	%r186, [%rd85];
+	add.s32 	%r187, %r186, 1;
+	st.local.u32 	[%rd85], %r187;
 
 $L__BB0_66:
 	ld.shared.u8 	%rs32, [_ZZ21slzHuffBuildLutKernelE12code_lengths+31];
-	add.s16 	%rs341, %rs32, -1;
-	and.b16  	%rs342, %rs341, 255;
-	setp.gt.u16 	%p35, %rs342, 10;
+	setp.eq.s16 	%p35, %rs32, 0;
 	@%p35 bra 	$L__BB0_68;
 
-	cvt.u32.u16 	%r220, %rs32;
-	and.b32  	%r221, %r220, 255;
-	mul.wide.u32 	%rd86, %r221, 4;
+	cvt.u32.u16 	%r188, %rs32;
+	mul.wide.u32 	%rd86, %r188, 4;
 	add.s64 	%rd87, %rd2, %rd86;
-	ld.local.u32 	%r222, [%rd87];
-	add.s32 	%r223, %r222, 1;
-	st.local.u32 	[%rd87], %r223;
+	ld.local.u32 	%r189, [%rd87];
+	add.s32 	%r190, %r189, 1;
+	st.local.u32 	[%rd87], %r190;
 
 $L__BB0_68:
 	ld.shared.u8 	%rs33, [_ZZ21slzHuffBuildLutKernelE12code_lengths+32];
-	add.s16 	%rs343, %rs33, -1;
-	and.b16  	%rs344, %rs343, 255;
-	setp.gt.u16 	%p36, %rs344, 10;
+	setp.eq.s16 	%p36, %rs33, 0;
 	@%p36 bra 	$L__BB0_70;
 
-	cvt.u32.u16 	%r224, %rs33;
-	and.b32  	%r225, %r224, 255;
-	mul.wide.u32 	%rd88, %r225, 4;
+	cvt.u32.u16 	%r191, %rs33;
+	mul.wide.u32 	%rd88, %r191, 4;
 	add.s64 	%rd89, %rd2, %rd88;
-	ld.local.u32 	%r226, [%rd89];
-	add.s32 	%r227, %r226, 1;
-	st.local.u32 	[%rd89], %r227;
+	ld.local.u32 	%r192, [%rd89];
+	add.s32 	%r193, %r192, 1;
+	st.local.u32 	[%rd89], %r193;
 
 $L__BB0_70:
 	ld.shared.u8 	%rs34, [_ZZ21slzHuffBuildLutKernelE12code_lengths+33];
-	add.s16 	%rs345, %rs34, -1;
-	and.b16  	%rs346, %rs345, 255;
-	setp.gt.u16 	%p37, %rs346, 10;
+	setp.eq.s16 	%p37, %rs34, 0;
 	@%p37 bra 	$L__BB0_72;
 
-	cvt.u32.u16 	%r228, %rs34;
-	and.b32  	%r229, %r228, 255;
-	mul.wide.u32 	%rd90, %r229, 4;
+	cvt.u32.u16 	%r194, %rs34;
+	mul.wide.u32 	%rd90, %r194, 4;
 	add.s64 	%rd91, %rd2, %rd90;
-	ld.local.u32 	%r230, [%rd91];
-	add.s32 	%r231, %r230, 1;
-	st.local.u32 	[%rd91], %r231;
+	ld.local.u32 	%r195, [%rd91];
+	add.s32 	%r196, %r195, 1;
+	st.local.u32 	[%rd91], %r196;
 
 $L__BB0_72:
 	ld.shared.u8 	%rs35, [_ZZ21slzHuffBuildLutKernelE12code_lengths+34];
-	add.s16 	%rs347, %rs35, -1;
-	and.b16  	%rs348, %rs347, 255;
-	setp.gt.u16 	%p38, %rs348, 10;
+	setp.eq.s16 	%p38, %rs35, 0;
 	@%p38 bra 	$L__BB0_74;
 
-	cvt.u32.u16 	%r232, %rs35;
-	and.b32  	%r233, %r232, 255;
-	mul.wide.u32 	%rd92, %r233, 4;
+	cvt.u32.u16 	%r197, %rs35;
+	mul.wide.u32 	%rd92, %r197, 4;
 	add.s64 	%rd93, %rd2, %rd92;
-	ld.local.u32 	%r234, [%rd93];
-	add.s32 	%r235, %r234, 1;
-	st.local.u32 	[%rd93], %r235;
+	ld.local.u32 	%r198, [%rd93];
+	add.s32 	%r199, %r198, 1;
+	st.local.u32 	[%rd93], %r199;
 
 $L__BB0_74:
 	ld.shared.u8 	%rs36, [_ZZ21slzHuffBuildLutKernelE12code_lengths+35];
-	add.s16 	%rs349, %rs36, -1;
-	and.b16  	%rs350, %rs349, 255;
-	setp.gt.u16 	%p39, %rs350, 10;
+	setp.eq.s16 	%p39, %rs36, 0;
 	@%p39 bra 	$L__BB0_76;
 
-	cvt.u32.u16 	%r236, %rs36;
-	and.b32  	%r237, %r236, 255;
-	mul.wide.u32 	%rd94, %r237, 4;
+	cvt.u32.u16 	%r200, %rs36;
+	mul.wide.u32 	%rd94, %r200, 4;
 	add.s64 	%rd95, %rd2, %rd94;
-	ld.local.u32 	%r238, [%rd95];
-	add.s32 	%r239, %r238, 1;
-	st.local.u32 	[%rd95], %r239;
+	ld.local.u32 	%r201, [%rd95];
+	add.s32 	%r202, %r201, 1;
+	st.local.u32 	[%rd95], %r202;
 
 $L__BB0_76:
 	ld.shared.u8 	%rs37, [_ZZ21slzHuffBuildLutKernelE12code_lengths+36];
-	add.s16 	%rs351, %rs37, -1;
-	and.b16  	%rs352, %rs351, 255;
-	setp.gt.u16 	%p40, %rs352, 10;
+	setp.eq.s16 	%p40, %rs37, 0;
 	@%p40 bra 	$L__BB0_78;
 
-	cvt.u32.u16 	%r240, %rs37;
-	and.b32  	%r241, %r240, 255;
-	mul.wide.u32 	%rd96, %r241, 4;
+	cvt.u32.u16 	%r203, %rs37;
+	mul.wide.u32 	%rd96, %r203, 4;
 	add.s64 	%rd97, %rd2, %rd96;
-	ld.local.u32 	%r242, [%rd97];
-	add.s32 	%r243, %r242, 1;
-	st.local.u32 	[%rd97], %r243;
+	ld.local.u32 	%r204, [%rd97];
+	add.s32 	%r205, %r204, 1;
+	st.local.u32 	[%rd97], %r205;
 
 $L__BB0_78:
 	ld.shared.u8 	%rs38, [_ZZ21slzHuffBuildLutKernelE12code_lengths+37];
-	add.s16 	%rs353, %rs38, -1;
-	and.b16  	%rs354, %rs353, 255;
-	setp.gt.u16 	%p41, %rs354, 10;
+	setp.eq.s16 	%p41, %rs38, 0;
 	@%p41 bra 	$L__BB0_80;
 
-	cvt.u32.u16 	%r244, %rs38;
-	and.b32  	%r245, %r244, 255;
-	mul.wide.u32 	%rd98, %r245, 4;
+	cvt.u32.u16 	%r206, %rs38;
+	mul.wide.u32 	%rd98, %r206, 4;
 	add.s64 	%rd99, %rd2, %rd98;
-	ld.local.u32 	%r246, [%rd99];
-	add.s32 	%r247, %r246, 1;
-	st.local.u32 	[%rd99], %r247;
+	ld.local.u32 	%r207, [%rd99];
+	add.s32 	%r208, %r207, 1;
+	st.local.u32 	[%rd99], %r208;
 
 $L__BB0_80:
 	ld.shared.u8 	%rs39, [_ZZ21slzHuffBuildLutKernelE12code_lengths+38];
-	add.s16 	%rs355, %rs39, -1;
-	and.b16  	%rs356, %rs355, 255;
-	setp.gt.u16 	%p42, %rs356, 10;
+	setp.eq.s16 	%p42, %rs39, 0;
 	@%p42 bra 	$L__BB0_82;
 
-	cvt.u32.u16 	%r248, %rs39;
-	and.b32  	%r249, %r248, 255;
-	mul.wide.u32 	%rd100, %r249, 4;
+	cvt.u32.u16 	%r209, %rs39;
+	mul.wide.u32 	%rd100, %r209, 4;
 	add.s64 	%rd101, %rd2, %rd100;
-	ld.local.u32 	%r250, [%rd101];
-	add.s32 	%r251, %r250, 1;
-	st.local.u32 	[%rd101], %r251;
+	ld.local.u32 	%r210, [%rd101];
+	add.s32 	%r211, %r210, 1;
+	st.local.u32 	[%rd101], %r211;
 
 $L__BB0_82:
 	ld.shared.u8 	%rs40, [_ZZ21slzHuffBuildLutKernelE12code_lengths+39];
-	add.s16 	%rs357, %rs40, -1;
-	and.b16  	%rs358, %rs357, 255;
-	setp.gt.u16 	%p43, %rs358, 10;
+	setp.eq.s16 	%p43, %rs40, 0;
 	@%p43 bra 	$L__BB0_84;
 
-	cvt.u32.u16 	%r252, %rs40;
-	and.b32  	%r253, %r252, 255;
-	mul.wide.u32 	%rd102, %r253, 4;
+	cvt.u32.u16 	%r212, %rs40;
+	mul.wide.u32 	%rd102, %r212, 4;
 	add.s64 	%rd103, %rd2, %rd102;
-	ld.local.u32 	%r254, [%rd103];
-	add.s32 	%r255, %r254, 1;
-	st.local.u32 	[%rd103], %r255;
+	ld.local.u32 	%r213, [%rd103];
+	add.s32 	%r214, %r213, 1;
+	st.local.u32 	[%rd103], %r214;
 
 $L__BB0_84:
 	ld.shared.u8 	%rs41, [_ZZ21slzHuffBuildLutKernelE12code_lengths+40];
-	add.s16 	%rs359, %rs41, -1;
-	and.b16  	%rs360, %rs359, 255;
-	setp.gt.u16 	%p44, %rs360, 10;
+	setp.eq.s16 	%p44, %rs41, 0;
 	@%p44 bra 	$L__BB0_86;
 
-	cvt.u32.u16 	%r256, %rs41;
-	and.b32  	%r257, %r256, 255;
-	mul.wide.u32 	%rd104, %r257, 4;
+	cvt.u32.u16 	%r215, %rs41;
+	mul.wide.u32 	%rd104, %r215, 4;
 	add.s64 	%rd105, %rd2, %rd104;
-	ld.local.u32 	%r258, [%rd105];
-	add.s32 	%r259, %r258, 1;
-	st.local.u32 	[%rd105], %r259;
+	ld.local.u32 	%r216, [%rd105];
+	add.s32 	%r217, %r216, 1;
+	st.local.u32 	[%rd105], %r217;
 
 $L__BB0_86:
 	ld.shared.u8 	%rs42, [_ZZ21slzHuffBuildLutKernelE12code_lengths+41];
-	add.s16 	%rs361, %rs42, -1;
-	and.b16  	%rs362, %rs361, 255;
-	setp.gt.u16 	%p45, %rs362, 10;
+	setp.eq.s16 	%p45, %rs42, 0;
 	@%p45 bra 	$L__BB0_88;
 
-	cvt.u32.u16 	%r260, %rs42;
-	and.b32  	%r261, %r260, 255;
-	mul.wide.u32 	%rd106, %r261, 4;
+	cvt.u32.u16 	%r218, %rs42;
+	mul.wide.u32 	%rd106, %r218, 4;
 	add.s64 	%rd107, %rd2, %rd106;
-	ld.local.u32 	%r262, [%rd107];
-	add.s32 	%r263, %r262, 1;
-	st.local.u32 	[%rd107], %r263;
+	ld.local.u32 	%r219, [%rd107];
+	add.s32 	%r220, %r219, 1;
+	st.local.u32 	[%rd107], %r220;
 
 $L__BB0_88:
 	ld.shared.u8 	%rs43, [_ZZ21slzHuffBuildLutKernelE12code_lengths+42];
-	add.s16 	%rs363, %rs43, -1;
-	and.b16  	%rs364, %rs363, 255;
-	setp.gt.u16 	%p46, %rs364, 10;
+	setp.eq.s16 	%p46, %rs43, 0;
 	@%p46 bra 	$L__BB0_90;
 
-	cvt.u32.u16 	%r264, %rs43;
-	and.b32  	%r265, %r264, 255;
-	mul.wide.u32 	%rd108, %r265, 4;
+	cvt.u32.u16 	%r221, %rs43;
+	mul.wide.u32 	%rd108, %r221, 4;
 	add.s64 	%rd109, %rd2, %rd108;
-	ld.local.u32 	%r266, [%rd109];
-	add.s32 	%r267, %r266, 1;
-	st.local.u32 	[%rd109], %r267;
+	ld.local.u32 	%r222, [%rd109];
+	add.s32 	%r223, %r222, 1;
+	st.local.u32 	[%rd109], %r223;
 
 $L__BB0_90:
 	ld.shared.u8 	%rs44, [_ZZ21slzHuffBuildLutKernelE12code_lengths+43];
-	add.s16 	%rs365, %rs44, -1;
-	and.b16  	%rs366, %rs365, 255;
-	setp.gt.u16 	%p47, %rs366, 10;
+	setp.eq.s16 	%p47, %rs44, 0;
 	@%p47 bra 	$L__BB0_92;
 
-	cvt.u32.u16 	%r268, %rs44;
-	and.b32  	%r269, %r268, 255;
-	mul.wide.u32 	%rd110, %r269, 4;
+	cvt.u32.u16 	%r224, %rs44;
+	mul.wide.u32 	%rd110, %r224, 4;
 	add.s64 	%rd111, %rd2, %rd110;
-	ld.local.u32 	%r270, [%rd111];
-	add.s32 	%r271, %r270, 1;
-	st.local.u32 	[%rd111], %r271;
+	ld.local.u32 	%r225, [%rd111];
+	add.s32 	%r226, %r225, 1;
+	st.local.u32 	[%rd111], %r226;
 
 $L__BB0_92:
 	ld.shared.u8 	%rs45, [_ZZ21slzHuffBuildLutKernelE12code_lengths+44];
-	add.s16 	%rs367, %rs45, -1;
-	and.b16  	%rs368, %rs367, 255;
-	setp.gt.u16 	%p48, %rs368, 10;
+	setp.eq.s16 	%p48, %rs45, 0;
 	@%p48 bra 	$L__BB0_94;
 
-	cvt.u32.u16 	%r272, %rs45;
-	and.b32  	%r273, %r272, 255;
-	mul.wide.u32 	%rd112, %r273, 4;
+	cvt.u32.u16 	%r227, %rs45;
+	mul.wide.u32 	%rd112, %r227, 4;
 	add.s64 	%rd113, %rd2, %rd112;
-	ld.local.u32 	%r274, [%rd113];
-	add.s32 	%r275, %r274, 1;
-	st.local.u32 	[%rd113], %r275;
+	ld.local.u32 	%r228, [%rd113];
+	add.s32 	%r229, %r228, 1;
+	st.local.u32 	[%rd113], %r229;
 
 $L__BB0_94:
 	ld.shared.u8 	%rs46, [_ZZ21slzHuffBuildLutKernelE12code_lengths+45];
-	add.s16 	%rs369, %rs46, -1;
-	and.b16  	%rs370, %rs369, 255;
-	setp.gt.u16 	%p49, %rs370, 10;
+	setp.eq.s16 	%p49, %rs46, 0;
 	@%p49 bra 	$L__BB0_96;
 
-	cvt.u32.u16 	%r276, %rs46;
-	and.b32  	%r277, %r276, 255;
-	mul.wide.u32 	%rd114, %r277, 4;
+	cvt.u32.u16 	%r230, %rs46;
+	mul.wide.u32 	%rd114, %r230, 4;
 	add.s64 	%rd115, %rd2, %rd114;
-	ld.local.u32 	%r278, [%rd115];
-	add.s32 	%r279, %r278, 1;
-	st.local.u32 	[%rd115], %r279;
+	ld.local.u32 	%r231, [%rd115];
+	add.s32 	%r232, %r231, 1;
+	st.local.u32 	[%rd115], %r232;
 
 $L__BB0_96:
 	ld.shared.u8 	%rs47, [_ZZ21slzHuffBuildLutKernelE12code_lengths+46];
-	add.s16 	%rs371, %rs47, -1;
-	and.b16  	%rs372, %rs371, 255;
-	setp.gt.u16 	%p50, %rs372, 10;
+	setp.eq.s16 	%p50, %rs47, 0;
 	@%p50 bra 	$L__BB0_98;
 
-	cvt.u32.u16 	%r280, %rs47;
-	and.b32  	%r281, %r280, 255;
-	mul.wide.u32 	%rd116, %r281, 4;
+	cvt.u32.u16 	%r233, %rs47;
+	mul.wide.u32 	%rd116, %r233, 4;
 	add.s64 	%rd117, %rd2, %rd116;
-	ld.local.u32 	%r282, [%rd117];
-	add.s32 	%r283, %r282, 1;
-	st.local.u32 	[%rd117], %r283;
+	ld.local.u32 	%r234, [%rd117];
+	add.s32 	%r235, %r234, 1;
+	st.local.u32 	[%rd117], %r235;
 
 $L__BB0_98:
 	ld.shared.u8 	%rs48, [_ZZ21slzHuffBuildLutKernelE12code_lengths+47];
-	add.s16 	%rs373, %rs48, -1;
-	and.b16  	%rs374, %rs373, 255;
-	setp.gt.u16 	%p51, %rs374, 10;
+	setp.eq.s16 	%p51, %rs48, 0;
 	@%p51 bra 	$L__BB0_100;
 
-	cvt.u32.u16 	%r284, %rs48;
-	and.b32  	%r285, %r284, 255;
-	mul.wide.u32 	%rd118, %r285, 4;
+	cvt.u32.u16 	%r236, %rs48;
+	mul.wide.u32 	%rd118, %r236, 4;
 	add.s64 	%rd119, %rd2, %rd118;
-	ld.local.u32 	%r286, [%rd119];
-	add.s32 	%r287, %r286, 1;
-	st.local.u32 	[%rd119], %r287;
+	ld.local.u32 	%r237, [%rd119];
+	add.s32 	%r238, %r237, 1;
+	st.local.u32 	[%rd119], %r238;
 
 $L__BB0_100:
 	ld.shared.u8 	%rs49, [_ZZ21slzHuffBuildLutKernelE12code_lengths+48];
-	add.s16 	%rs375, %rs49, -1;
-	and.b16  	%rs376, %rs375, 255;
-	setp.gt.u16 	%p52, %rs376, 10;
+	setp.eq.s16 	%p52, %rs49, 0;
 	@%p52 bra 	$L__BB0_102;
 
-	cvt.u32.u16 	%r288, %rs49;
-	and.b32  	%r289, %r288, 255;
-	mul.wide.u32 	%rd120, %r289, 4;
+	cvt.u32.u16 	%r239, %rs49;
+	mul.wide.u32 	%rd120, %r239, 4;
 	add.s64 	%rd121, %rd2, %rd120;
-	ld.local.u32 	%r290, [%rd121];
-	add.s32 	%r291, %r290, 1;
-	st.local.u32 	[%rd121], %r291;
+	ld.local.u32 	%r240, [%rd121];
+	add.s32 	%r241, %r240, 1;
+	st.local.u32 	[%rd121], %r241;
 
 $L__BB0_102:
 	ld.shared.u8 	%rs50, [_ZZ21slzHuffBuildLutKernelE12code_lengths+49];
-	add.s16 	%rs377, %rs50, -1;
-	and.b16  	%rs378, %rs377, 255;
-	setp.gt.u16 	%p53, %rs378, 10;
+	setp.eq.s16 	%p53, %rs50, 0;
 	@%p53 bra 	$L__BB0_104;
 
-	cvt.u32.u16 	%r292, %rs50;
-	and.b32  	%r293, %r292, 255;
-	mul.wide.u32 	%rd122, %r293, 4;
+	cvt.u32.u16 	%r242, %rs50;
+	mul.wide.u32 	%rd122, %r242, 4;
 	add.s64 	%rd123, %rd2, %rd122;
-	ld.local.u32 	%r294, [%rd123];
-	add.s32 	%r295, %r294, 1;
-	st.local.u32 	[%rd123], %r295;
+	ld.local.u32 	%r243, [%rd123];
+	add.s32 	%r244, %r243, 1;
+	st.local.u32 	[%rd123], %r244;
 
 $L__BB0_104:
 	ld.shared.u8 	%rs51, [_ZZ21slzHuffBuildLutKernelE12code_lengths+50];
-	add.s16 	%rs379, %rs51, -1;
-	and.b16  	%rs380, %rs379, 255;
-	setp.gt.u16 	%p54, %rs380, 10;
+	setp.eq.s16 	%p54, %rs51, 0;
 	@%p54 bra 	$L__BB0_106;
 
-	cvt.u32.u16 	%r296, %rs51;
-	and.b32  	%r297, %r296, 255;
-	mul.wide.u32 	%rd124, %r297, 4;
+	cvt.u32.u16 	%r245, %rs51;
+	mul.wide.u32 	%rd124, %r245, 4;
 	add.s64 	%rd125, %rd2, %rd124;
-	ld.local.u32 	%r298, [%rd125];
-	add.s32 	%r299, %r298, 1;
-	st.local.u32 	[%rd125], %r299;
+	ld.local.u32 	%r246, [%rd125];
+	add.s32 	%r247, %r246, 1;
+	st.local.u32 	[%rd125], %r247;
 
 $L__BB0_106:
 	ld.shared.u8 	%rs52, [_ZZ21slzHuffBuildLutKernelE12code_lengths+51];
-	add.s16 	%rs381, %rs52, -1;
-	and.b16  	%rs382, %rs381, 255;
-	setp.gt.u16 	%p55, %rs382, 10;
+	setp.eq.s16 	%p55, %rs52, 0;
 	@%p55 bra 	$L__BB0_108;
 
-	cvt.u32.u16 	%r300, %rs52;
-	and.b32  	%r301, %r300, 255;
-	mul.wide.u32 	%rd126, %r301, 4;
+	cvt.u32.u16 	%r248, %rs52;
+	mul.wide.u32 	%rd126, %r248, 4;
 	add.s64 	%rd127, %rd2, %rd126;
-	ld.local.u32 	%r302, [%rd127];
-	add.s32 	%r303, %r302, 1;
-	st.local.u32 	[%rd127], %r303;
+	ld.local.u32 	%r249, [%rd127];
+	add.s32 	%r250, %r249, 1;
+	st.local.u32 	[%rd127], %r250;
 
 $L__BB0_108:
 	ld.shared.u8 	%rs53, [_ZZ21slzHuffBuildLutKernelE12code_lengths+52];
-	add.s16 	%rs383, %rs53, -1;
-	and.b16  	%rs384, %rs383, 255;
-	setp.gt.u16 	%p56, %rs384, 10;
+	setp.eq.s16 	%p56, %rs53, 0;
 	@%p56 bra 	$L__BB0_110;
 
-	cvt.u32.u16 	%r304, %rs53;
-	and.b32  	%r305, %r304, 255;
-	mul.wide.u32 	%rd128, %r305, 4;
+	cvt.u32.u16 	%r251, %rs53;
+	mul.wide.u32 	%rd128, %r251, 4;
 	add.s64 	%rd129, %rd2, %rd128;
-	ld.local.u32 	%r306, [%rd129];
-	add.s32 	%r307, %r306, 1;
-	st.local.u32 	[%rd129], %r307;
+	ld.local.u32 	%r252, [%rd129];
+	add.s32 	%r253, %r252, 1;
+	st.local.u32 	[%rd129], %r253;
 
 $L__BB0_110:
 	ld.shared.u8 	%rs54, [_ZZ21slzHuffBuildLutKernelE12code_lengths+53];
-	add.s16 	%rs385, %rs54, -1;
-	and.b16  	%rs386, %rs385, 255;
-	setp.gt.u16 	%p57, %rs386, 10;
+	setp.eq.s16 	%p57, %rs54, 0;
 	@%p57 bra 	$L__BB0_112;
 
-	cvt.u32.u16 	%r308, %rs54;
-	and.b32  	%r309, %r308, 255;
-	mul.wide.u32 	%rd130, %r309, 4;
+	cvt.u32.u16 	%r254, %rs54;
+	mul.wide.u32 	%rd130, %r254, 4;
 	add.s64 	%rd131, %rd2, %rd130;
-	ld.local.u32 	%r310, [%rd131];
-	add.s32 	%r311, %r310, 1;
-	st.local.u32 	[%rd131], %r311;
+	ld.local.u32 	%r255, [%rd131];
+	add.s32 	%r256, %r255, 1;
+	st.local.u32 	[%rd131], %r256;
 
 $L__BB0_112:
 	ld.shared.u8 	%rs55, [_ZZ21slzHuffBuildLutKernelE12code_lengths+54];
-	add.s16 	%rs387, %rs55, -1;
-	and.b16  	%rs388, %rs387, 255;
-	setp.gt.u16 	%p58, %rs388, 10;
+	setp.eq.s16 	%p58, %rs55, 0;
 	@%p58 bra 	$L__BB0_114;
 
-	cvt.u32.u16 	%r312, %rs55;
-	and.b32  	%r313, %r312, 255;
-	mul.wide.u32 	%rd132, %r313, 4;
+	cvt.u32.u16 	%r257, %rs55;
+	mul.wide.u32 	%rd132, %r257, 4;
 	add.s64 	%rd133, %rd2, %rd132;
-	ld.local.u32 	%r314, [%rd133];
-	add.s32 	%r315, %r314, 1;
-	st.local.u32 	[%rd133], %r315;
+	ld.local.u32 	%r258, [%rd133];
+	add.s32 	%r259, %r258, 1;
+	st.local.u32 	[%rd133], %r259;
 
 $L__BB0_114:
 	ld.shared.u8 	%rs56, [_ZZ21slzHuffBuildLutKernelE12code_lengths+55];
-	add.s16 	%rs389, %rs56, -1;
-	and.b16  	%rs390, %rs389, 255;
-	setp.gt.u16 	%p59, %rs390, 10;
+	setp.eq.s16 	%p59, %rs56, 0;
 	@%p59 bra 	$L__BB0_116;
 
-	cvt.u32.u16 	%r316, %rs56;
-	and.b32  	%r317, %r316, 255;
-	mul.wide.u32 	%rd134, %r317, 4;
+	cvt.u32.u16 	%r260, %rs56;
+	mul.wide.u32 	%rd134, %r260, 4;
 	add.s64 	%rd135, %rd2, %rd134;
-	ld.local.u32 	%r318, [%rd135];
-	add.s32 	%r319, %r318, 1;
-	st.local.u32 	[%rd135], %r319;
+	ld.local.u32 	%r261, [%rd135];
+	add.s32 	%r262, %r261, 1;
+	st.local.u32 	[%rd135], %r262;
 
 $L__BB0_116:
 	ld.shared.u8 	%rs57, [_ZZ21slzHuffBuildLutKernelE12code_lengths+56];
-	add.s16 	%rs391, %rs57, -1;
-	and.b16  	%rs392, %rs391, 255;
-	setp.gt.u16 	%p60, %rs392, 10;
+	setp.eq.s16 	%p60, %rs57, 0;
 	@%p60 bra 	$L__BB0_118;
 
-	cvt.u32.u16 	%r320, %rs57;
-	and.b32  	%r321, %r320, 255;
-	mul.wide.u32 	%rd136, %r321, 4;
+	cvt.u32.u16 	%r263, %rs57;
+	mul.wide.u32 	%rd136, %r263, 4;
 	add.s64 	%rd137, %rd2, %rd136;
-	ld.local.u32 	%r322, [%rd137];
-	add.s32 	%r323, %r322, 1;
-	st.local.u32 	[%rd137], %r323;
+	ld.local.u32 	%r264, [%rd137];
+	add.s32 	%r265, %r264, 1;
+	st.local.u32 	[%rd137], %r265;
 
 $L__BB0_118:
 	ld.shared.u8 	%rs58, [_ZZ21slzHuffBuildLutKernelE12code_lengths+57];
-	add.s16 	%rs393, %rs58, -1;
-	and.b16  	%rs394, %rs393, 255;
-	setp.gt.u16 	%p61, %rs394, 10;
+	setp.eq.s16 	%p61, %rs58, 0;
 	@%p61 bra 	$L__BB0_120;
 
-	cvt.u32.u16 	%r324, %rs58;
-	and.b32  	%r325, %r324, 255;
-	mul.wide.u32 	%rd138, %r325, 4;
+	cvt.u32.u16 	%r266, %rs58;
+	mul.wide.u32 	%rd138, %r266, 4;
 	add.s64 	%rd139, %rd2, %rd138;
-	ld.local.u32 	%r326, [%rd139];
-	add.s32 	%r327, %r326, 1;
-	st.local.u32 	[%rd139], %r327;
+	ld.local.u32 	%r267, [%rd139];
+	add.s32 	%r268, %r267, 1;
+	st.local.u32 	[%rd139], %r268;
 
 $L__BB0_120:
 	ld.shared.u8 	%rs59, [_ZZ21slzHuffBuildLutKernelE12code_lengths+58];
-	add.s16 	%rs395, %rs59, -1;
-	and.b16  	%rs396, %rs395, 255;
-	setp.gt.u16 	%p62, %rs396, 10;
+	setp.eq.s16 	%p62, %rs59, 0;
 	@%p62 bra 	$L__BB0_122;
 
-	cvt.u32.u16 	%r328, %rs59;
-	and.b32  	%r329, %r328, 255;
-	mul.wide.u32 	%rd140, %r329, 4;
+	cvt.u32.u16 	%r269, %rs59;
+	mul.wide.u32 	%rd140, %r269, 4;
 	add.s64 	%rd141, %rd2, %rd140;
-	ld.local.u32 	%r330, [%rd141];
-	add.s32 	%r331, %r330, 1;
-	st.local.u32 	[%rd141], %r331;
+	ld.local.u32 	%r270, [%rd141];
+	add.s32 	%r271, %r270, 1;
+	st.local.u32 	[%rd141], %r271;
 
 $L__BB0_122:
 	ld.shared.u8 	%rs60, [_ZZ21slzHuffBuildLutKernelE12code_lengths+59];
-	add.s16 	%rs397, %rs60, -1;
-	and.b16  	%rs398, %rs397, 255;
-	setp.gt.u16 	%p63, %rs398, 10;
+	setp.eq.s16 	%p63, %rs60, 0;
 	@%p63 bra 	$L__BB0_124;
 
-	cvt.u32.u16 	%r332, %rs60;
-	and.b32  	%r333, %r332, 255;
-	mul.wide.u32 	%rd142, %r333, 4;
+	cvt.u32.u16 	%r272, %rs60;
+	mul.wide.u32 	%rd142, %r272, 4;
 	add.s64 	%rd143, %rd2, %rd142;
-	ld.local.u32 	%r334, [%rd143];
-	add.s32 	%r335, %r334, 1;
-	st.local.u32 	[%rd143], %r335;
+	ld.local.u32 	%r273, [%rd143];
+	add.s32 	%r274, %r273, 1;
+	st.local.u32 	[%rd143], %r274;
 
 $L__BB0_124:
 	ld.shared.u8 	%rs61, [_ZZ21slzHuffBuildLutKernelE12code_lengths+60];
-	add.s16 	%rs399, %rs61, -1;
-	and.b16  	%rs400, %rs399, 255;
-	setp.gt.u16 	%p64, %rs400, 10;
+	setp.eq.s16 	%p64, %rs61, 0;
 	@%p64 bra 	$L__BB0_126;
 
-	cvt.u32.u16 	%r336, %rs61;
-	and.b32  	%r337, %r336, 255;
-	mul.wide.u32 	%rd144, %r337, 4;
+	cvt.u32.u16 	%r275, %rs61;
+	mul.wide.u32 	%rd144, %r275, 4;
 	add.s64 	%rd145, %rd2, %rd144;
-	ld.local.u32 	%r338, [%rd145];
-	add.s32 	%r339, %r338, 1;
-	st.local.u32 	[%rd145], %r339;
+	ld.local.u32 	%r276, [%rd145];
+	add.s32 	%r277, %r276, 1;
+	st.local.u32 	[%rd145], %r277;
 
 $L__BB0_126:
 	ld.shared.u8 	%rs62, [_ZZ21slzHuffBuildLutKernelE12code_lengths+61];
-	add.s16 	%rs401, %rs62, -1;
-	and.b16  	%rs402, %rs401, 255;
-	setp.gt.u16 	%p65, %rs402, 10;
+	setp.eq.s16 	%p65, %rs62, 0;
 	@%p65 bra 	$L__BB0_128;
 
-	cvt.u32.u16 	%r340, %rs62;
-	and.b32  	%r341, %r340, 255;
-	mul.wide.u32 	%rd146, %r341, 4;
+	cvt.u32.u16 	%r278, %rs62;
+	mul.wide.u32 	%rd146, %r278, 4;
 	add.s64 	%rd147, %rd2, %rd146;
-	ld.local.u32 	%r342, [%rd147];
-	add.s32 	%r343, %r342, 1;
-	st.local.u32 	[%rd147], %r343;
+	ld.local.u32 	%r279, [%rd147];
+	add.s32 	%r280, %r279, 1;
+	st.local.u32 	[%rd147], %r280;
 
 $L__BB0_128:
 	ld.shared.u8 	%rs63, [_ZZ21slzHuffBuildLutKernelE12code_lengths+62];
-	add.s16 	%rs403, %rs63, -1;
-	and.b16  	%rs404, %rs403, 255;
-	setp.gt.u16 	%p66, %rs404, 10;
+	setp.eq.s16 	%p66, %rs63, 0;
 	@%p66 bra 	$L__BB0_130;
 
-	cvt.u32.u16 	%r344, %rs63;
-	and.b32  	%r345, %r344, 255;
-	mul.wide.u32 	%rd148, %r345, 4;
+	cvt.u32.u16 	%r281, %rs63;
+	mul.wide.u32 	%rd148, %r281, 4;
 	add.s64 	%rd149, %rd2, %rd148;
-	ld.local.u32 	%r346, [%rd149];
-	add.s32 	%r347, %r346, 1;
-	st.local.u32 	[%rd149], %r347;
+	ld.local.u32 	%r282, [%rd149];
+	add.s32 	%r283, %r282, 1;
+	st.local.u32 	[%rd149], %r283;
 
 $L__BB0_130:
 	ld.shared.u8 	%rs64, [_ZZ21slzHuffBuildLutKernelE12code_lengths+63];
-	add.s16 	%rs405, %rs64, -1;
-	and.b16  	%rs406, %rs405, 255;
-	setp.gt.u16 	%p67, %rs406, 10;
+	setp.eq.s16 	%p67, %rs64, 0;
 	@%p67 bra 	$L__BB0_132;
 
-	cvt.u32.u16 	%r348, %rs64;
-	and.b32  	%r349, %r348, 255;
-	mul.wide.u32 	%rd150, %r349, 4;
+	cvt.u32.u16 	%r284, %rs64;
+	mul.wide.u32 	%rd150, %r284, 4;
 	add.s64 	%rd151, %rd2, %rd150;
-	ld.local.u32 	%r350, [%rd151];
-	add.s32 	%r351, %r350, 1;
-	st.local.u32 	[%rd151], %r351;
+	ld.local.u32 	%r285, [%rd151];
+	add.s32 	%r286, %r285, 1;
+	st.local.u32 	[%rd151], %r286;
 
 $L__BB0_132:
 	ld.shared.u8 	%rs65, [_ZZ21slzHuffBuildLutKernelE12code_lengths+64];
-	add.s16 	%rs407, %rs65, -1;
-	and.b16  	%rs408, %rs407, 255;
-	setp.gt.u16 	%p68, %rs408, 10;
+	setp.eq.s16 	%p68, %rs65, 0;
 	@%p68 bra 	$L__BB0_134;
 
-	cvt.u32.u16 	%r352, %rs65;
-	and.b32  	%r353, %r352, 255;
-	mul.wide.u32 	%rd152, %r353, 4;
+	cvt.u32.u16 	%r287, %rs65;
+	mul.wide.u32 	%rd152, %r287, 4;
 	add.s64 	%rd153, %rd2, %rd152;
-	ld.local.u32 	%r354, [%rd153];
-	add.s32 	%r355, %r354, 1;
-	st.local.u32 	[%rd153], %r355;
+	ld.local.u32 	%r288, [%rd153];
+	add.s32 	%r289, %r288, 1;
+	st.local.u32 	[%rd153], %r289;
 
 $L__BB0_134:
 	ld.shared.u8 	%rs66, [_ZZ21slzHuffBuildLutKernelE12code_lengths+65];
-	add.s16 	%rs409, %rs66, -1;
-	and.b16  	%rs410, %rs409, 255;
-	setp.gt.u16 	%p69, %rs410, 10;
+	setp.eq.s16 	%p69, %rs66, 0;
 	@%p69 bra 	$L__BB0_136;
 
-	cvt.u32.u16 	%r356, %rs66;
-	and.b32  	%r357, %r356, 255;
-	mul.wide.u32 	%rd154, %r357, 4;
+	cvt.u32.u16 	%r290, %rs66;
+	mul.wide.u32 	%rd154, %r290, 4;
 	add.s64 	%rd155, %rd2, %rd154;
-	ld.local.u32 	%r358, [%rd155];
-	add.s32 	%r359, %r358, 1;
-	st.local.u32 	[%rd155], %r359;
+	ld.local.u32 	%r291, [%rd155];
+	add.s32 	%r292, %r291, 1;
+	st.local.u32 	[%rd155], %r292;
 
 $L__BB0_136:
 	ld.shared.u8 	%rs67, [_ZZ21slzHuffBuildLutKernelE12code_lengths+66];
-	add.s16 	%rs411, %rs67, -1;
-	and.b16  	%rs412, %rs411, 255;
-	setp.gt.u16 	%p70, %rs412, 10;
+	setp.eq.s16 	%p70, %rs67, 0;
 	@%p70 bra 	$L__BB0_138;
 
-	cvt.u32.u16 	%r360, %rs67;
-	and.b32  	%r361, %r360, 255;
-	mul.wide.u32 	%rd156, %r361, 4;
+	cvt.u32.u16 	%r293, %rs67;
+	mul.wide.u32 	%rd156, %r293, 4;
 	add.s64 	%rd157, %rd2, %rd156;
-	ld.local.u32 	%r362, [%rd157];
-	add.s32 	%r363, %r362, 1;
-	st.local.u32 	[%rd157], %r363;
+	ld.local.u32 	%r294, [%rd157];
+	add.s32 	%r295, %r294, 1;
+	st.local.u32 	[%rd157], %r295;
 
 $L__BB0_138:
 	ld.shared.u8 	%rs68, [_ZZ21slzHuffBuildLutKernelE12code_lengths+67];
-	add.s16 	%rs413, %rs68, -1;
-	and.b16  	%rs414, %rs413, 255;
-	setp.gt.u16 	%p71, %rs414, 10;
+	setp.eq.s16 	%p71, %rs68, 0;
 	@%p71 bra 	$L__BB0_140;
 
-	cvt.u32.u16 	%r364, %rs68;
-	and.b32  	%r365, %r364, 255;
-	mul.wide.u32 	%rd158, %r365, 4;
+	cvt.u32.u16 	%r296, %rs68;
+	mul.wide.u32 	%rd158, %r296, 4;
 	add.s64 	%rd159, %rd2, %rd158;
-	ld.local.u32 	%r366, [%rd159];
-	add.s32 	%r367, %r366, 1;
-	st.local.u32 	[%rd159], %r367;
+	ld.local.u32 	%r297, [%rd159];
+	add.s32 	%r298, %r297, 1;
+	st.local.u32 	[%rd159], %r298;
 
 $L__BB0_140:
 	ld.shared.u8 	%rs69, [_ZZ21slzHuffBuildLutKernelE12code_lengths+68];
-	add.s16 	%rs415, %rs69, -1;
-	and.b16  	%rs416, %rs415, 255;
-	setp.gt.u16 	%p72, %rs416, 10;
+	setp.eq.s16 	%p72, %rs69, 0;
 	@%p72 bra 	$L__BB0_142;
 
-	cvt.u32.u16 	%r368, %rs69;
-	and.b32  	%r369, %r368, 255;
-	mul.wide.u32 	%rd160, %r369, 4;
+	cvt.u32.u16 	%r299, %rs69;
+	mul.wide.u32 	%rd160, %r299, 4;
 	add.s64 	%rd161, %rd2, %rd160;
-	ld.local.u32 	%r370, [%rd161];
-	add.s32 	%r371, %r370, 1;
-	st.local.u32 	[%rd161], %r371;
+	ld.local.u32 	%r300, [%rd161];
+	add.s32 	%r301, %r300, 1;
+	st.local.u32 	[%rd161], %r301;
 
 $L__BB0_142:
 	ld.shared.u8 	%rs70, [_ZZ21slzHuffBuildLutKernelE12code_lengths+69];
-	add.s16 	%rs417, %rs70, -1;
-	and.b16  	%rs418, %rs417, 255;
-	setp.gt.u16 	%p73, %rs418, 10;
+	setp.eq.s16 	%p73, %rs70, 0;
 	@%p73 bra 	$L__BB0_144;
 
-	cvt.u32.u16 	%r372, %rs70;
-	and.b32  	%r373, %r372, 255;
-	mul.wide.u32 	%rd162, %r373, 4;
+	cvt.u32.u16 	%r302, %rs70;
+	mul.wide.u32 	%rd162, %r302, 4;
 	add.s64 	%rd163, %rd2, %rd162;
-	ld.local.u32 	%r374, [%rd163];
-	add.s32 	%r375, %r374, 1;
-	st.local.u32 	[%rd163], %r375;
+	ld.local.u32 	%r303, [%rd163];
+	add.s32 	%r304, %r303, 1;
+	st.local.u32 	[%rd163], %r304;
 
 $L__BB0_144:
 	ld.shared.u8 	%rs71, [_ZZ21slzHuffBuildLutKernelE12code_lengths+70];
-	add.s16 	%rs419, %rs71, -1;
-	and.b16  	%rs420, %rs419, 255;
-	setp.gt.u16 	%p74, %rs420, 10;
+	setp.eq.s16 	%p74, %rs71, 0;
 	@%p74 bra 	$L__BB0_146;
 
-	cvt.u32.u16 	%r376, %rs71;
-	and.b32  	%r377, %r376, 255;
-	mul.wide.u32 	%rd164, %r377, 4;
+	cvt.u32.u16 	%r305, %rs71;
+	mul.wide.u32 	%rd164, %r305, 4;
 	add.s64 	%rd165, %rd2, %rd164;
-	ld.local.u32 	%r378, [%rd165];
-	add.s32 	%r379, %r378, 1;
-	st.local.u32 	[%rd165], %r379;
+	ld.local.u32 	%r306, [%rd165];
+	add.s32 	%r307, %r306, 1;
+	st.local.u32 	[%rd165], %r307;
 
 $L__BB0_146:
 	ld.shared.u8 	%rs72, [_ZZ21slzHuffBuildLutKernelE12code_lengths+71];
-	add.s16 	%rs421, %rs72, -1;
-	and.b16  	%rs422, %rs421, 255;
-	setp.gt.u16 	%p75, %rs422, 10;
+	setp.eq.s16 	%p75, %rs72, 0;
 	@%p75 bra 	$L__BB0_148;
 
-	cvt.u32.u16 	%r380, %rs72;
-	and.b32  	%r381, %r380, 255;
-	mul.wide.u32 	%rd166, %r381, 4;
+	cvt.u32.u16 	%r308, %rs72;
+	mul.wide.u32 	%rd166, %r308, 4;
 	add.s64 	%rd167, %rd2, %rd166;
-	ld.local.u32 	%r382, [%rd167];
-	add.s32 	%r383, %r382, 1;
-	st.local.u32 	[%rd167], %r383;
+	ld.local.u32 	%r309, [%rd167];
+	add.s32 	%r310, %r309, 1;
+	st.local.u32 	[%rd167], %r310;
 
 $L__BB0_148:
 	ld.shared.u8 	%rs73, [_ZZ21slzHuffBuildLutKernelE12code_lengths+72];
-	add.s16 	%rs423, %rs73, -1;
-	and.b16  	%rs424, %rs423, 255;
-	setp.gt.u16 	%p76, %rs424, 10;
+	setp.eq.s16 	%p76, %rs73, 0;
 	@%p76 bra 	$L__BB0_150;
 
-	cvt.u32.u16 	%r384, %rs73;
-	and.b32  	%r385, %r384, 255;
-	mul.wide.u32 	%rd168, %r385, 4;
+	cvt.u32.u16 	%r311, %rs73;
+	mul.wide.u32 	%rd168, %r311, 4;
 	add.s64 	%rd169, %rd2, %rd168;
-	ld.local.u32 	%r386, [%rd169];
-	add.s32 	%r387, %r386, 1;
-	st.local.u32 	[%rd169], %r387;
+	ld.local.u32 	%r312, [%rd169];
+	add.s32 	%r313, %r312, 1;
+	st.local.u32 	[%rd169], %r313;
 
 $L__BB0_150:
 	ld.shared.u8 	%rs74, [_ZZ21slzHuffBuildLutKernelE12code_lengths+73];
-	add.s16 	%rs425, %rs74, -1;
-	and.b16  	%rs426, %rs425, 255;
-	setp.gt.u16 	%p77, %rs426, 10;
+	setp.eq.s16 	%p77, %rs74, 0;
 	@%p77 bra 	$L__BB0_152;
 
-	cvt.u32.u16 	%r388, %rs74;
-	and.b32  	%r389, %r388, 255;
-	mul.wide.u32 	%rd170, %r389, 4;
+	cvt.u32.u16 	%r314, %rs74;
+	mul.wide.u32 	%rd170, %r314, 4;
 	add.s64 	%rd171, %rd2, %rd170;
-	ld.local.u32 	%r390, [%rd171];
-	add.s32 	%r391, %r390, 1;
-	st.local.u32 	[%rd171], %r391;
+	ld.local.u32 	%r315, [%rd171];
+	add.s32 	%r316, %r315, 1;
+	st.local.u32 	[%rd171], %r316;
 
 $L__BB0_152:
 	ld.shared.u8 	%rs75, [_ZZ21slzHuffBuildLutKernelE12code_lengths+74];
-	add.s16 	%rs427, %rs75, -1;
-	and.b16  	%rs428, %rs427, 255;
-	setp.gt.u16 	%p78, %rs428, 10;
+	setp.eq.s16 	%p78, %rs75, 0;
 	@%p78 bra 	$L__BB0_154;
 
-	cvt.u32.u16 	%r392, %rs75;
-	and.b32  	%r393, %r392, 255;
-	mul.wide.u32 	%rd172, %r393, 4;
+	cvt.u32.u16 	%r317, %rs75;
+	mul.wide.u32 	%rd172, %r317, 4;
 	add.s64 	%rd173, %rd2, %rd172;
-	ld.local.u32 	%r394, [%rd173];
-	add.s32 	%r395, %r394, 1;
-	st.local.u32 	[%rd173], %r395;
+	ld.local.u32 	%r318, [%rd173];
+	add.s32 	%r319, %r318, 1;
+	st.local.u32 	[%rd173], %r319;
 
 $L__BB0_154:
 	ld.shared.u8 	%rs76, [_ZZ21slzHuffBuildLutKernelE12code_lengths+75];
-	add.s16 	%rs429, %rs76, -1;
-	and.b16  	%rs430, %rs429, 255;
-	setp.gt.u16 	%p79, %rs430, 10;
+	setp.eq.s16 	%p79, %rs76, 0;
 	@%p79 bra 	$L__BB0_156;
 
-	cvt.u32.u16 	%r396, %rs76;
-	and.b32  	%r397, %r396, 255;
-	mul.wide.u32 	%rd174, %r397, 4;
+	cvt.u32.u16 	%r320, %rs76;
+	mul.wide.u32 	%rd174, %r320, 4;
 	add.s64 	%rd175, %rd2, %rd174;
-	ld.local.u32 	%r398, [%rd175];
-	add.s32 	%r399, %r398, 1;
-	st.local.u32 	[%rd175], %r399;
+	ld.local.u32 	%r321, [%rd175];
+	add.s32 	%r322, %r321, 1;
+	st.local.u32 	[%rd175], %r322;
 
 $L__BB0_156:
 	ld.shared.u8 	%rs77, [_ZZ21slzHuffBuildLutKernelE12code_lengths+76];
-	add.s16 	%rs431, %rs77, -1;
-	and.b16  	%rs432, %rs431, 255;
-	setp.gt.u16 	%p80, %rs432, 10;
+	setp.eq.s16 	%p80, %rs77, 0;
 	@%p80 bra 	$L__BB0_158;
 
-	cvt.u32.u16 	%r400, %rs77;
-	and.b32  	%r401, %r400, 255;
-	mul.wide.u32 	%rd176, %r401, 4;
+	cvt.u32.u16 	%r323, %rs77;
+	mul.wide.u32 	%rd176, %r323, 4;
 	add.s64 	%rd177, %rd2, %rd176;
-	ld.local.u32 	%r402, [%rd177];
-	add.s32 	%r403, %r402, 1;
-	st.local.u32 	[%rd177], %r403;
+	ld.local.u32 	%r324, [%rd177];
+	add.s32 	%r325, %r324, 1;
+	st.local.u32 	[%rd177], %r325;
 
 $L__BB0_158:
 	ld.shared.u8 	%rs78, [_ZZ21slzHuffBuildLutKernelE12code_lengths+77];
-	add.s16 	%rs433, %rs78, -1;
-	and.b16  	%rs434, %rs433, 255;
-	setp.gt.u16 	%p81, %rs434, 10;
+	setp.eq.s16 	%p81, %rs78, 0;
 	@%p81 bra 	$L__BB0_160;
 
-	cvt.u32.u16 	%r404, %rs78;
-	and.b32  	%r405, %r404, 255;
-	mul.wide.u32 	%rd178, %r405, 4;
+	cvt.u32.u16 	%r326, %rs78;
+	mul.wide.u32 	%rd178, %r326, 4;
 	add.s64 	%rd179, %rd2, %rd178;
-	ld.local.u32 	%r406, [%rd179];
-	add.s32 	%r407, %r406, 1;
-	st.local.u32 	[%rd179], %r407;
+	ld.local.u32 	%r327, [%rd179];
+	add.s32 	%r328, %r327, 1;
+	st.local.u32 	[%rd179], %r328;
 
 $L__BB0_160:
 	ld.shared.u8 	%rs79, [_ZZ21slzHuffBuildLutKernelE12code_lengths+78];
-	add.s16 	%rs435, %rs79, -1;
-	and.b16  	%rs436, %rs435, 255;
-	setp.gt.u16 	%p82, %rs436, 10;
+	setp.eq.s16 	%p82, %rs79, 0;
 	@%p82 bra 	$L__BB0_162;
 
-	cvt.u32.u16 	%r408, %rs79;
-	and.b32  	%r409, %r408, 255;
-	mul.wide.u32 	%rd180, %r409, 4;
+	cvt.u32.u16 	%r329, %rs79;
+	mul.wide.u32 	%rd180, %r329, 4;
 	add.s64 	%rd181, %rd2, %rd180;
-	ld.local.u32 	%r410, [%rd181];
-	add.s32 	%r411, %r410, 1;
-	st.local.u32 	[%rd181], %r411;
+	ld.local.u32 	%r330, [%rd181];
+	add.s32 	%r331, %r330, 1;
+	st.local.u32 	[%rd181], %r331;
 
 $L__BB0_162:
 	ld.shared.u8 	%rs80, [_ZZ21slzHuffBuildLutKernelE12code_lengths+79];
-	add.s16 	%rs437, %rs80, -1;
-	and.b16  	%rs438, %rs437, 255;
-	setp.gt.u16 	%p83, %rs438, 10;
+	setp.eq.s16 	%p83, %rs80, 0;
 	@%p83 bra 	$L__BB0_164;
 
-	cvt.u32.u16 	%r412, %rs80;
-	and.b32  	%r413, %r412, 255;
-	mul.wide.u32 	%rd182, %r413, 4;
+	cvt.u32.u16 	%r332, %rs80;
+	mul.wide.u32 	%rd182, %r332, 4;
 	add.s64 	%rd183, %rd2, %rd182;
-	ld.local.u32 	%r414, [%rd183];
-	add.s32 	%r415, %r414, 1;
-	st.local.u32 	[%rd183], %r415;
+	ld.local.u32 	%r333, [%rd183];
+	add.s32 	%r334, %r333, 1;
+	st.local.u32 	[%rd183], %r334;
 
 $L__BB0_164:
 	ld.shared.u8 	%rs81, [_ZZ21slzHuffBuildLutKernelE12code_lengths+80];
-	add.s16 	%rs439, %rs81, -1;
-	and.b16  	%rs440, %rs439, 255;
-	setp.gt.u16 	%p84, %rs440, 10;
+	setp.eq.s16 	%p84, %rs81, 0;
 	@%p84 bra 	$L__BB0_166;
 
-	cvt.u32.u16 	%r416, %rs81;
-	and.b32  	%r417, %r416, 255;
-	mul.wide.u32 	%rd184, %r417, 4;
+	cvt.u32.u16 	%r335, %rs81;
+	mul.wide.u32 	%rd184, %r335, 4;
 	add.s64 	%rd185, %rd2, %rd184;
-	ld.local.u32 	%r418, [%rd185];
-	add.s32 	%r419, %r418, 1;
-	st.local.u32 	[%rd185], %r419;
+	ld.local.u32 	%r336, [%rd185];
+	add.s32 	%r337, %r336, 1;
+	st.local.u32 	[%rd185], %r337;
 
 $L__BB0_166:
 	ld.shared.u8 	%rs82, [_ZZ21slzHuffBuildLutKernelE12code_lengths+81];
-	add.s16 	%rs441, %rs82, -1;
-	and.b16  	%rs442, %rs441, 255;
-	setp.gt.u16 	%p85, %rs442, 10;
+	setp.eq.s16 	%p85, %rs82, 0;
 	@%p85 bra 	$L__BB0_168;
 
-	cvt.u32.u16 	%r420, %rs82;
-	and.b32  	%r421, %r420, 255;
-	mul.wide.u32 	%rd186, %r421, 4;
+	cvt.u32.u16 	%r338, %rs82;
+	mul.wide.u32 	%rd186, %r338, 4;
 	add.s64 	%rd187, %rd2, %rd186;
-	ld.local.u32 	%r422, [%rd187];
-	add.s32 	%r423, %r422, 1;
-	st.local.u32 	[%rd187], %r423;
+	ld.local.u32 	%r339, [%rd187];
+	add.s32 	%r340, %r339, 1;
+	st.local.u32 	[%rd187], %r340;
 
 $L__BB0_168:
 	ld.shared.u8 	%rs83, [_ZZ21slzHuffBuildLutKernelE12code_lengths+82];
-	add.s16 	%rs443, %rs83, -1;
-	and.b16  	%rs444, %rs443, 255;
-	setp.gt.u16 	%p86, %rs444, 10;
+	setp.eq.s16 	%p86, %rs83, 0;
 	@%p86 bra 	$L__BB0_170;
 
-	cvt.u32.u16 	%r424, %rs83;
-	and.b32  	%r425, %r424, 255;
-	mul.wide.u32 	%rd188, %r425, 4;
+	cvt.u32.u16 	%r341, %rs83;
+	mul.wide.u32 	%rd188, %r341, 4;
 	add.s64 	%rd189, %rd2, %rd188;
-	ld.local.u32 	%r426, [%rd189];
-	add.s32 	%r427, %r426, 1;
-	st.local.u32 	[%rd189], %r427;
+	ld.local.u32 	%r342, [%rd189];
+	add.s32 	%r343, %r342, 1;
+	st.local.u32 	[%rd189], %r343;
 
 $L__BB0_170:
 	ld.shared.u8 	%rs84, [_ZZ21slzHuffBuildLutKernelE12code_lengths+83];
-	add.s16 	%rs445, %rs84, -1;
-	and.b16  	%rs446, %rs445, 255;
-	setp.gt.u16 	%p87, %rs446, 10;
+	setp.eq.s16 	%p87, %rs84, 0;
 	@%p87 bra 	$L__BB0_172;
 
-	cvt.u32.u16 	%r428, %rs84;
-	and.b32  	%r429, %r428, 255;
-	mul.wide.u32 	%rd190, %r429, 4;
+	cvt.u32.u16 	%r344, %rs84;
+	mul.wide.u32 	%rd190, %r344, 4;
 	add.s64 	%rd191, %rd2, %rd190;
-	ld.local.u32 	%r430, [%rd191];
-	add.s32 	%r431, %r430, 1;
-	st.local.u32 	[%rd191], %r431;
+	ld.local.u32 	%r345, [%rd191];
+	add.s32 	%r346, %r345, 1;
+	st.local.u32 	[%rd191], %r346;
 
 $L__BB0_172:
 	ld.shared.u8 	%rs85, [_ZZ21slzHuffBuildLutKernelE12code_lengths+84];
-	add.s16 	%rs447, %rs85, -1;
-	and.b16  	%rs448, %rs447, 255;
-	setp.gt.u16 	%p88, %rs448, 10;
+	setp.eq.s16 	%p88, %rs85, 0;
 	@%p88 bra 	$L__BB0_174;
 
-	cvt.u32.u16 	%r432, %rs85;
-	and.b32  	%r433, %r432, 255;
-	mul.wide.u32 	%rd192, %r433, 4;
+	cvt.u32.u16 	%r347, %rs85;
+	mul.wide.u32 	%rd192, %r347, 4;
 	add.s64 	%rd193, %rd2, %rd192;
-	ld.local.u32 	%r434, [%rd193];
-	add.s32 	%r435, %r434, 1;
-	st.local.u32 	[%rd193], %r435;
+	ld.local.u32 	%r348, [%rd193];
+	add.s32 	%r349, %r348, 1;
+	st.local.u32 	[%rd193], %r349;
 
 $L__BB0_174:
 	ld.shared.u8 	%rs86, [_ZZ21slzHuffBuildLutKernelE12code_lengths+85];
-	add.s16 	%rs449, %rs86, -1;
-	and.b16  	%rs450, %rs449, 255;
-	setp.gt.u16 	%p89, %rs450, 10;
+	setp.eq.s16 	%p89, %rs86, 0;
 	@%p89 bra 	$L__BB0_176;
 
-	cvt.u32.u16 	%r436, %rs86;
-	and.b32  	%r437, %r436, 255;
-	mul.wide.u32 	%rd194, %r437, 4;
+	cvt.u32.u16 	%r350, %rs86;
+	mul.wide.u32 	%rd194, %r350, 4;
 	add.s64 	%rd195, %rd2, %rd194;
-	ld.local.u32 	%r438, [%rd195];
-	add.s32 	%r439, %r438, 1;
-	st.local.u32 	[%rd195], %r439;
+	ld.local.u32 	%r351, [%rd195];
+	add.s32 	%r352, %r351, 1;
+	st.local.u32 	[%rd195], %r352;
 
 $L__BB0_176:
 	ld.shared.u8 	%rs87, [_ZZ21slzHuffBuildLutKernelE12code_lengths+86];
-	add.s16 	%rs451, %rs87, -1;
-	and.b16  	%rs452, %rs451, 255;
-	setp.gt.u16 	%p90, %rs452, 10;
+	setp.eq.s16 	%p90, %rs87, 0;
 	@%p90 bra 	$L__BB0_178;
 
-	cvt.u32.u16 	%r440, %rs87;
-	and.b32  	%r441, %r440, 255;
-	mul.wide.u32 	%rd196, %r441, 4;
+	cvt.u32.u16 	%r353, %rs87;
+	mul.wide.u32 	%rd196, %r353, 4;
 	add.s64 	%rd197, %rd2, %rd196;
-	ld.local.u32 	%r442, [%rd197];
-	add.s32 	%r443, %r442, 1;
-	st.local.u32 	[%rd197], %r443;
+	ld.local.u32 	%r354, [%rd197];
+	add.s32 	%r355, %r354, 1;
+	st.local.u32 	[%rd197], %r355;
 
 $L__BB0_178:
 	ld.shared.u8 	%rs88, [_ZZ21slzHuffBuildLutKernelE12code_lengths+87];
-	add.s16 	%rs453, %rs88, -1;
-	and.b16  	%rs454, %rs453, 255;
-	setp.gt.u16 	%p91, %rs454, 10;
+	setp.eq.s16 	%p91, %rs88, 0;
 	@%p91 bra 	$L__BB0_180;
 
-	cvt.u32.u16 	%r444, %rs88;
-	and.b32  	%r445, %r444, 255;
-	mul.wide.u32 	%rd198, %r445, 4;
+	cvt.u32.u16 	%r356, %rs88;
+	mul.wide.u32 	%rd198, %r356, 4;
 	add.s64 	%rd199, %rd2, %rd198;
-	ld.local.u32 	%r446, [%rd199];
-	add.s32 	%r447, %r446, 1;
-	st.local.u32 	[%rd199], %r447;
+	ld.local.u32 	%r357, [%rd199];
+	add.s32 	%r358, %r357, 1;
+	st.local.u32 	[%rd199], %r358;
 
 $L__BB0_180:
 	ld.shared.u8 	%rs89, [_ZZ21slzHuffBuildLutKernelE12code_lengths+88];
-	add.s16 	%rs455, %rs89, -1;
-	and.b16  	%rs456, %rs455, 255;
-	setp.gt.u16 	%p92, %rs456, 10;
+	setp.eq.s16 	%p92, %rs89, 0;
 	@%p92 bra 	$L__BB0_182;
 
-	cvt.u32.u16 	%r448, %rs89;
-	and.b32  	%r449, %r448, 255;
-	mul.wide.u32 	%rd200, %r449, 4;
+	cvt.u32.u16 	%r359, %rs89;
+	mul.wide.u32 	%rd200, %r359, 4;
 	add.s64 	%rd201, %rd2, %rd200;
-	ld.local.u32 	%r450, [%rd201];
-	add.s32 	%r451, %r450, 1;
-	st.local.u32 	[%rd201], %r451;
+	ld.local.u32 	%r360, [%rd201];
+	add.s32 	%r361, %r360, 1;
+	st.local.u32 	[%rd201], %r361;
 
 $L__BB0_182:
 	ld.shared.u8 	%rs90, [_ZZ21slzHuffBuildLutKernelE12code_lengths+89];
-	add.s16 	%rs457, %rs90, -1;
-	and.b16  	%rs458, %rs457, 255;
-	setp.gt.u16 	%p93, %rs458, 10;
+	setp.eq.s16 	%p93, %rs90, 0;
 	@%p93 bra 	$L__BB0_184;
 
-	cvt.u32.u16 	%r452, %rs90;
-	and.b32  	%r453, %r452, 255;
-	mul.wide.u32 	%rd202, %r453, 4;
+	cvt.u32.u16 	%r362, %rs90;
+	mul.wide.u32 	%rd202, %r362, 4;
 	add.s64 	%rd203, %rd2, %rd202;
-	ld.local.u32 	%r454, [%rd203];
-	add.s32 	%r455, %r454, 1;
-	st.local.u32 	[%rd203], %r455;
+	ld.local.u32 	%r363, [%rd203];
+	add.s32 	%r364, %r363, 1;
+	st.local.u32 	[%rd203], %r364;
 
 $L__BB0_184:
 	ld.shared.u8 	%rs91, [_ZZ21slzHuffBuildLutKernelE12code_lengths+90];
-	add.s16 	%rs459, %rs91, -1;
-	and.b16  	%rs460, %rs459, 255;
-	setp.gt.u16 	%p94, %rs460, 10;
+	setp.eq.s16 	%p94, %rs91, 0;
 	@%p94 bra 	$L__BB0_186;
 
-	cvt.u32.u16 	%r456, %rs91;
-	and.b32  	%r457, %r456, 255;
-	mul.wide.u32 	%rd204, %r457, 4;
+	cvt.u32.u16 	%r365, %rs91;
+	mul.wide.u32 	%rd204, %r365, 4;
 	add.s64 	%rd205, %rd2, %rd204;
-	ld.local.u32 	%r458, [%rd205];
-	add.s32 	%r459, %r458, 1;
-	st.local.u32 	[%rd205], %r459;
+	ld.local.u32 	%r366, [%rd205];
+	add.s32 	%r367, %r366, 1;
+	st.local.u32 	[%rd205], %r367;
 
 $L__BB0_186:
 	ld.shared.u8 	%rs92, [_ZZ21slzHuffBuildLutKernelE12code_lengths+91];
-	add.s16 	%rs461, %rs92, -1;
-	and.b16  	%rs462, %rs461, 255;
-	setp.gt.u16 	%p95, %rs462, 10;
+	setp.eq.s16 	%p95, %rs92, 0;
 	@%p95 bra 	$L__BB0_188;
 
-	cvt.u32.u16 	%r460, %rs92;
-	and.b32  	%r461, %r460, 255;
-	mul.wide.u32 	%rd206, %r461, 4;
+	cvt.u32.u16 	%r368, %rs92;
+	mul.wide.u32 	%rd206, %r368, 4;
 	add.s64 	%rd207, %rd2, %rd206;
-	ld.local.u32 	%r462, [%rd207];
-	add.s32 	%r463, %r462, 1;
-	st.local.u32 	[%rd207], %r463;
+	ld.local.u32 	%r369, [%rd207];
+	add.s32 	%r370, %r369, 1;
+	st.local.u32 	[%rd207], %r370;
 
 $L__BB0_188:
 	ld.shared.u8 	%rs93, [_ZZ21slzHuffBuildLutKernelE12code_lengths+92];
-	add.s16 	%rs463, %rs93, -1;
-	and.b16  	%rs464, %rs463, 255;
-	setp.gt.u16 	%p96, %rs464, 10;
+	setp.eq.s16 	%p96, %rs93, 0;
 	@%p96 bra 	$L__BB0_190;
 
-	cvt.u32.u16 	%r464, %rs93;
-	and.b32  	%r465, %r464, 255;
-	mul.wide.u32 	%rd208, %r465, 4;
+	cvt.u32.u16 	%r371, %rs93;
+	mul.wide.u32 	%rd208, %r371, 4;
 	add.s64 	%rd209, %rd2, %rd208;
-	ld.local.u32 	%r466, [%rd209];
-	add.s32 	%r467, %r466, 1;
-	st.local.u32 	[%rd209], %r467;
+	ld.local.u32 	%r372, [%rd209];
+	add.s32 	%r373, %r372, 1;
+	st.local.u32 	[%rd209], %r373;
 
 $L__BB0_190:
 	ld.shared.u8 	%rs94, [_ZZ21slzHuffBuildLutKernelE12code_lengths+93];
-	add.s16 	%rs465, %rs94, -1;
-	and.b16  	%rs466, %rs465, 255;
-	setp.gt.u16 	%p97, %rs466, 10;
+	setp.eq.s16 	%p97, %rs94, 0;
 	@%p97 bra 	$L__BB0_192;
 
-	cvt.u32.u16 	%r468, %rs94;
-	and.b32  	%r469, %r468, 255;
-	mul.wide.u32 	%rd210, %r469, 4;
+	cvt.u32.u16 	%r374, %rs94;
+	mul.wide.u32 	%rd210, %r374, 4;
 	add.s64 	%rd211, %rd2, %rd210;
-	ld.local.u32 	%r470, [%rd211];
-	add.s32 	%r471, %r470, 1;
-	st.local.u32 	[%rd211], %r471;
+	ld.local.u32 	%r375, [%rd211];
+	add.s32 	%r376, %r375, 1;
+	st.local.u32 	[%rd211], %r376;
 
 $L__BB0_192:
 	ld.shared.u8 	%rs95, [_ZZ21slzHuffBuildLutKernelE12code_lengths+94];
-	add.s16 	%rs467, %rs95, -1;
-	and.b16  	%rs468, %rs467, 255;
-	setp.gt.u16 	%p98, %rs468, 10;
+	setp.eq.s16 	%p98, %rs95, 0;
 	@%p98 bra 	$L__BB0_194;
 
-	cvt.u32.u16 	%r472, %rs95;
-	and.b32  	%r473, %r472, 255;
-	mul.wide.u32 	%rd212, %r473, 4;
+	cvt.u32.u16 	%r377, %rs95;
+	mul.wide.u32 	%rd212, %r377, 4;
 	add.s64 	%rd213, %rd2, %rd212;
-	ld.local.u32 	%r474, [%rd213];
-	add.s32 	%r475, %r474, 1;
-	st.local.u32 	[%rd213], %r475;
+	ld.local.u32 	%r378, [%rd213];
+	add.s32 	%r379, %r378, 1;
+	st.local.u32 	[%rd213], %r379;
 
 $L__BB0_194:
 	ld.shared.u8 	%rs96, [_ZZ21slzHuffBuildLutKernelE12code_lengths+95];
-	add.s16 	%rs469, %rs96, -1;
-	and.b16  	%rs470, %rs469, 255;
-	setp.gt.u16 	%p99, %rs470, 10;
+	setp.eq.s16 	%p99, %rs96, 0;
 	@%p99 bra 	$L__BB0_196;
 
-	cvt.u32.u16 	%r476, %rs96;
-	and.b32  	%r477, %r476, 255;
-	mul.wide.u32 	%rd214, %r477, 4;
+	cvt.u32.u16 	%r380, %rs96;
+	mul.wide.u32 	%rd214, %r380, 4;
 	add.s64 	%rd215, %rd2, %rd214;
-	ld.local.u32 	%r478, [%rd215];
-	add.s32 	%r479, %r478, 1;
-	st.local.u32 	[%rd215], %r479;
+	ld.local.u32 	%r381, [%rd215];
+	add.s32 	%r382, %r381, 1;
+	st.local.u32 	[%rd215], %r382;
 
 $L__BB0_196:
 	ld.shared.u8 	%rs97, [_ZZ21slzHuffBuildLutKernelE12code_lengths+96];
-	add.s16 	%rs471, %rs97, -1;
-	and.b16  	%rs472, %rs471, 255;
-	setp.gt.u16 	%p100, %rs472, 10;
+	setp.eq.s16 	%p100, %rs97, 0;
 	@%p100 bra 	$L__BB0_198;
 
-	cvt.u32.u16 	%r480, %rs97;
-	and.b32  	%r481, %r480, 255;
-	mul.wide.u32 	%rd216, %r481, 4;
+	cvt.u32.u16 	%r383, %rs97;
+	mul.wide.u32 	%rd216, %r383, 4;
 	add.s64 	%rd217, %rd2, %rd216;
-	ld.local.u32 	%r482, [%rd217];
-	add.s32 	%r483, %r482, 1;
-	st.local.u32 	[%rd217], %r483;
+	ld.local.u32 	%r384, [%rd217];
+	add.s32 	%r385, %r384, 1;
+	st.local.u32 	[%rd217], %r385;
 
 $L__BB0_198:
 	ld.shared.u8 	%rs98, [_ZZ21slzHuffBuildLutKernelE12code_lengths+97];
-	add.s16 	%rs473, %rs98, -1;
-	and.b16  	%rs474, %rs473, 255;
-	setp.gt.u16 	%p101, %rs474, 10;
+	setp.eq.s16 	%p101, %rs98, 0;
 	@%p101 bra 	$L__BB0_200;
 
-	cvt.u32.u16 	%r484, %rs98;
-	and.b32  	%r485, %r484, 255;
-	mul.wide.u32 	%rd218, %r485, 4;
+	cvt.u32.u16 	%r386, %rs98;
+	mul.wide.u32 	%rd218, %r386, 4;
 	add.s64 	%rd219, %rd2, %rd218;
-	ld.local.u32 	%r486, [%rd219];
-	add.s32 	%r487, %r486, 1;
-	st.local.u32 	[%rd219], %r487;
+	ld.local.u32 	%r387, [%rd219];
+	add.s32 	%r388, %r387, 1;
+	st.local.u32 	[%rd219], %r388;
 
 $L__BB0_200:
 	ld.shared.u8 	%rs99, [_ZZ21slzHuffBuildLutKernelE12code_lengths+98];
-	add.s16 	%rs475, %rs99, -1;
-	and.b16  	%rs476, %rs475, 255;
-	setp.gt.u16 	%p102, %rs476, 10;
+	setp.eq.s16 	%p102, %rs99, 0;
 	@%p102 bra 	$L__BB0_202;
 
-	cvt.u32.u16 	%r488, %rs99;
-	and.b32  	%r489, %r488, 255;
-	mul.wide.u32 	%rd220, %r489, 4;
+	cvt.u32.u16 	%r389, %rs99;
+	mul.wide.u32 	%rd220, %r389, 4;
 	add.s64 	%rd221, %rd2, %rd220;
-	ld.local.u32 	%r490, [%rd221];
-	add.s32 	%r491, %r490, 1;
-	st.local.u32 	[%rd221], %r491;
+	ld.local.u32 	%r390, [%rd221];
+	add.s32 	%r391, %r390, 1;
+	st.local.u32 	[%rd221], %r391;
 
 $L__BB0_202:
 	ld.shared.u8 	%rs100, [_ZZ21slzHuffBuildLutKernelE12code_lengths+99];
-	add.s16 	%rs477, %rs100, -1;
-	and.b16  	%rs478, %rs477, 255;
-	setp.gt.u16 	%p103, %rs478, 10;
+	setp.eq.s16 	%p103, %rs100, 0;
 	@%p103 bra 	$L__BB0_204;
 
-	cvt.u32.u16 	%r492, %rs100;
-	and.b32  	%r493, %r492, 255;
-	mul.wide.u32 	%rd222, %r493, 4;
+	cvt.u32.u16 	%r392, %rs100;
+	mul.wide.u32 	%rd222, %r392, 4;
 	add.s64 	%rd223, %rd2, %rd222;
-	ld.local.u32 	%r494, [%rd223];
-	add.s32 	%r495, %r494, 1;
-	st.local.u32 	[%rd223], %r495;
+	ld.local.u32 	%r393, [%rd223];
+	add.s32 	%r394, %r393, 1;
+	st.local.u32 	[%rd223], %r394;
 
 $L__BB0_204:
 	ld.shared.u8 	%rs101, [_ZZ21slzHuffBuildLutKernelE12code_lengths+100];
-	add.s16 	%rs479, %rs101, -1;
-	and.b16  	%rs480, %rs479, 255;
-	setp.gt.u16 	%p104, %rs480, 10;
+	setp.eq.s16 	%p104, %rs101, 0;
 	@%p104 bra 	$L__BB0_206;
 
-	cvt.u32.u16 	%r496, %rs101;
-	and.b32  	%r497, %r496, 255;
-	mul.wide.u32 	%rd224, %r497, 4;
+	cvt.u32.u16 	%r395, %rs101;
+	mul.wide.u32 	%rd224, %r395, 4;
 	add.s64 	%rd225, %rd2, %rd224;
-	ld.local.u32 	%r498, [%rd225];
-	add.s32 	%r499, %r498, 1;
-	st.local.u32 	[%rd225], %r499;
+	ld.local.u32 	%r396, [%rd225];
+	add.s32 	%r397, %r396, 1;
+	st.local.u32 	[%rd225], %r397;
 
 $L__BB0_206:
 	ld.shared.u8 	%rs102, [_ZZ21slzHuffBuildLutKernelE12code_lengths+101];
-	add.s16 	%rs481, %rs102, -1;
-	and.b16  	%rs482, %rs481, 255;
-	setp.gt.u16 	%p105, %rs482, 10;
+	setp.eq.s16 	%p105, %rs102, 0;
 	@%p105 bra 	$L__BB0_208;
 
-	cvt.u32.u16 	%r500, %rs102;
-	and.b32  	%r501, %r500, 255;
-	mul.wide.u32 	%rd226, %r501, 4;
+	cvt.u32.u16 	%r398, %rs102;
+	mul.wide.u32 	%rd226, %r398, 4;
 	add.s64 	%rd227, %rd2, %rd226;
-	ld.local.u32 	%r502, [%rd227];
-	add.s32 	%r503, %r502, 1;
-	st.local.u32 	[%rd227], %r503;
+	ld.local.u32 	%r399, [%rd227];
+	add.s32 	%r400, %r399, 1;
+	st.local.u32 	[%rd227], %r400;
 
 $L__BB0_208:
 	ld.shared.u8 	%rs103, [_ZZ21slzHuffBuildLutKernelE12code_lengths+102];
-	add.s16 	%rs483, %rs103, -1;
-	and.b16  	%rs484, %rs483, 255;
-	setp.gt.u16 	%p106, %rs484, 10;
+	setp.eq.s16 	%p106, %rs103, 0;
 	@%p106 bra 	$L__BB0_210;
 
-	cvt.u32.u16 	%r504, %rs103;
-	and.b32  	%r505, %r504, 255;
-	mul.wide.u32 	%rd228, %r505, 4;
+	cvt.u32.u16 	%r401, %rs103;
+	mul.wide.u32 	%rd228, %r401, 4;
 	add.s64 	%rd229, %rd2, %rd228;
-	ld.local.u32 	%r506, [%rd229];
-	add.s32 	%r507, %r506, 1;
-	st.local.u32 	[%rd229], %r507;
+	ld.local.u32 	%r402, [%rd229];
+	add.s32 	%r403, %r402, 1;
+	st.local.u32 	[%rd229], %r403;
 
 $L__BB0_210:
 	ld.shared.u8 	%rs104, [_ZZ21slzHuffBuildLutKernelE12code_lengths+103];
-	add.s16 	%rs485, %rs104, -1;
-	and.b16  	%rs486, %rs485, 255;
-	setp.gt.u16 	%p107, %rs486, 10;
+	setp.eq.s16 	%p107, %rs104, 0;
 	@%p107 bra 	$L__BB0_212;
 
-	cvt.u32.u16 	%r508, %rs104;
-	and.b32  	%r509, %r508, 255;
-	mul.wide.u32 	%rd230, %r509, 4;
+	cvt.u32.u16 	%r404, %rs104;
+	mul.wide.u32 	%rd230, %r404, 4;
 	add.s64 	%rd231, %rd2, %rd230;
-	ld.local.u32 	%r510, [%rd231];
-	add.s32 	%r511, %r510, 1;
-	st.local.u32 	[%rd231], %r511;
+	ld.local.u32 	%r405, [%rd231];
+	add.s32 	%r406, %r405, 1;
+	st.local.u32 	[%rd231], %r406;
 
 $L__BB0_212:
 	ld.shared.u8 	%rs105, [_ZZ21slzHuffBuildLutKernelE12code_lengths+104];
-	add.s16 	%rs487, %rs105, -1;
-	and.b16  	%rs488, %rs487, 255;
-	setp.gt.u16 	%p108, %rs488, 10;
+	setp.eq.s16 	%p108, %rs105, 0;
 	@%p108 bra 	$L__BB0_214;
 
-	cvt.u32.u16 	%r512, %rs105;
-	and.b32  	%r513, %r512, 255;
-	mul.wide.u32 	%rd232, %r513, 4;
+	cvt.u32.u16 	%r407, %rs105;
+	mul.wide.u32 	%rd232, %r407, 4;
 	add.s64 	%rd233, %rd2, %rd232;
-	ld.local.u32 	%r514, [%rd233];
-	add.s32 	%r515, %r514, 1;
-	st.local.u32 	[%rd233], %r515;
+	ld.local.u32 	%r408, [%rd233];
+	add.s32 	%r409, %r408, 1;
+	st.local.u32 	[%rd233], %r409;
 
 $L__BB0_214:
 	ld.shared.u8 	%rs106, [_ZZ21slzHuffBuildLutKernelE12code_lengths+105];
-	add.s16 	%rs489, %rs106, -1;
-	and.b16  	%rs490, %rs489, 255;
-	setp.gt.u16 	%p109, %rs490, 10;
+	setp.eq.s16 	%p109, %rs106, 0;
 	@%p109 bra 	$L__BB0_216;
 
-	cvt.u32.u16 	%r516, %rs106;
-	and.b32  	%r517, %r516, 255;
-	mul.wide.u32 	%rd234, %r517, 4;
+	cvt.u32.u16 	%r410, %rs106;
+	mul.wide.u32 	%rd234, %r410, 4;
 	add.s64 	%rd235, %rd2, %rd234;
-	ld.local.u32 	%r518, [%rd235];
-	add.s32 	%r519, %r518, 1;
-	st.local.u32 	[%rd235], %r519;
+	ld.local.u32 	%r411, [%rd235];
+	add.s32 	%r412, %r411, 1;
+	st.local.u32 	[%rd235], %r412;
 
 $L__BB0_216:
 	ld.shared.u8 	%rs107, [_ZZ21slzHuffBuildLutKernelE12code_lengths+106];
-	add.s16 	%rs491, %rs107, -1;
-	and.b16  	%rs492, %rs491, 255;
-	setp.gt.u16 	%p110, %rs492, 10;
+	setp.eq.s16 	%p110, %rs107, 0;
 	@%p110 bra 	$L__BB0_218;
 
-	cvt.u32.u16 	%r520, %rs107;
-	and.b32  	%r521, %r520, 255;
-	mul.wide.u32 	%rd236, %r521, 4;
+	cvt.u32.u16 	%r413, %rs107;
+	mul.wide.u32 	%rd236, %r413, 4;
 	add.s64 	%rd237, %rd2, %rd236;
-	ld.local.u32 	%r522, [%rd237];
-	add.s32 	%r523, %r522, 1;
-	st.local.u32 	[%rd237], %r523;
+	ld.local.u32 	%r414, [%rd237];
+	add.s32 	%r415, %r414, 1;
+	st.local.u32 	[%rd237], %r415;
 
 $L__BB0_218:
 	ld.shared.u8 	%rs108, [_ZZ21slzHuffBuildLutKernelE12code_lengths+107];
-	add.s16 	%rs493, %rs108, -1;
-	and.b16  	%rs494, %rs493, 255;
-	setp.gt.u16 	%p111, %rs494, 10;
+	setp.eq.s16 	%p111, %rs108, 0;
 	@%p111 bra 	$L__BB0_220;
 
-	cvt.u32.u16 	%r524, %rs108;
-	and.b32  	%r525, %r524, 255;
-	mul.wide.u32 	%rd238, %r525, 4;
+	cvt.u32.u16 	%r416, %rs108;
+	mul.wide.u32 	%rd238, %r416, 4;
 	add.s64 	%rd239, %rd2, %rd238;
-	ld.local.u32 	%r526, [%rd239];
-	add.s32 	%r527, %r526, 1;
-	st.local.u32 	[%rd239], %r527;
+	ld.local.u32 	%r417, [%rd239];
+	add.s32 	%r418, %r417, 1;
+	st.local.u32 	[%rd239], %r418;
 
 $L__BB0_220:
 	ld.shared.u8 	%rs109, [_ZZ21slzHuffBuildLutKernelE12code_lengths+108];
-	add.s16 	%rs495, %rs109, -1;
-	and.b16  	%rs496, %rs495, 255;
-	setp.gt.u16 	%p112, %rs496, 10;
+	setp.eq.s16 	%p112, %rs109, 0;
 	@%p112 bra 	$L__BB0_222;
 
-	cvt.u32.u16 	%r528, %rs109;
-	and.b32  	%r529, %r528, 255;
-	mul.wide.u32 	%rd240, %r529, 4;
+	cvt.u32.u16 	%r419, %rs109;
+	mul.wide.u32 	%rd240, %r419, 4;
 	add.s64 	%rd241, %rd2, %rd240;
-	ld.local.u32 	%r530, [%rd241];
-	add.s32 	%r531, %r530, 1;
-	st.local.u32 	[%rd241], %r531;
+	ld.local.u32 	%r420, [%rd241];
+	add.s32 	%r421, %r420, 1;
+	st.local.u32 	[%rd241], %r421;
 
 $L__BB0_222:
 	ld.shared.u8 	%rs110, [_ZZ21slzHuffBuildLutKernelE12code_lengths+109];
-	add.s16 	%rs497, %rs110, -1;
-	and.b16  	%rs498, %rs497, 255;
-	setp.gt.u16 	%p113, %rs498, 10;
+	setp.eq.s16 	%p113, %rs110, 0;
 	@%p113 bra 	$L__BB0_224;
 
-	cvt.u32.u16 	%r532, %rs110;
-	and.b32  	%r533, %r532, 255;
-	mul.wide.u32 	%rd242, %r533, 4;
+	cvt.u32.u16 	%r422, %rs110;
+	mul.wide.u32 	%rd242, %r422, 4;
 	add.s64 	%rd243, %rd2, %rd242;
-	ld.local.u32 	%r534, [%rd243];
-	add.s32 	%r535, %r534, 1;
-	st.local.u32 	[%rd243], %r535;
+	ld.local.u32 	%r423, [%rd243];
+	add.s32 	%r424, %r423, 1;
+	st.local.u32 	[%rd243], %r424;
 
 $L__BB0_224:
 	ld.shared.u8 	%rs111, [_ZZ21slzHuffBuildLutKernelE12code_lengths+110];
-	add.s16 	%rs499, %rs111, -1;
-	and.b16  	%rs500, %rs499, 255;
-	setp.gt.u16 	%p114, %rs500, 10;
+	setp.eq.s16 	%p114, %rs111, 0;
 	@%p114 bra 	$L__BB0_226;
 
-	cvt.u32.u16 	%r536, %rs111;
-	and.b32  	%r537, %r536, 255;
-	mul.wide.u32 	%rd244, %r537, 4;
+	cvt.u32.u16 	%r425, %rs111;
+	mul.wide.u32 	%rd244, %r425, 4;
 	add.s64 	%rd245, %rd2, %rd244;
-	ld.local.u32 	%r538, [%rd245];
-	add.s32 	%r539, %r538, 1;
-	st.local.u32 	[%rd245], %r539;
+	ld.local.u32 	%r426, [%rd245];
+	add.s32 	%r427, %r426, 1;
+	st.local.u32 	[%rd245], %r427;
 
 $L__BB0_226:
 	ld.shared.u8 	%rs112, [_ZZ21slzHuffBuildLutKernelE12code_lengths+111];
-	add.s16 	%rs501, %rs112, -1;
-	and.b16  	%rs502, %rs501, 255;
-	setp.gt.u16 	%p115, %rs502, 10;
+	setp.eq.s16 	%p115, %rs112, 0;
 	@%p115 bra 	$L__BB0_228;
 
-	cvt.u32.u16 	%r540, %rs112;
-	and.b32  	%r541, %r540, 255;
-	mul.wide.u32 	%rd246, %r541, 4;
+	cvt.u32.u16 	%r428, %rs112;
+	mul.wide.u32 	%rd246, %r428, 4;
 	add.s64 	%rd247, %rd2, %rd246;
-	ld.local.u32 	%r542, [%rd247];
-	add.s32 	%r543, %r542, 1;
-	st.local.u32 	[%rd247], %r543;
+	ld.local.u32 	%r429, [%rd247];
+	add.s32 	%r430, %r429, 1;
+	st.local.u32 	[%rd247], %r430;
 
 $L__BB0_228:
 	ld.shared.u8 	%rs113, [_ZZ21slzHuffBuildLutKernelE12code_lengths+112];
-	add.s16 	%rs503, %rs113, -1;
-	and.b16  	%rs504, %rs503, 255;
-	setp.gt.u16 	%p116, %rs504, 10;
+	setp.eq.s16 	%p116, %rs113, 0;
 	@%p116 bra 	$L__BB0_230;
 
-	cvt.u32.u16 	%r544, %rs113;
-	and.b32  	%r545, %r544, 255;
-	mul.wide.u32 	%rd248, %r545, 4;
+	cvt.u32.u16 	%r431, %rs113;
+	mul.wide.u32 	%rd248, %r431, 4;
 	add.s64 	%rd249, %rd2, %rd248;
-	ld.local.u32 	%r546, [%rd249];
-	add.s32 	%r547, %r546, 1;
-	st.local.u32 	[%rd249], %r547;
+	ld.local.u32 	%r432, [%rd249];
+	add.s32 	%r433, %r432, 1;
+	st.local.u32 	[%rd249], %r433;
 
 $L__BB0_230:
 	ld.shared.u8 	%rs114, [_ZZ21slzHuffBuildLutKernelE12code_lengths+113];
-	add.s16 	%rs505, %rs114, -1;
-	and.b16  	%rs506, %rs505, 255;
-	setp.gt.u16 	%p117, %rs506, 10;
+	setp.eq.s16 	%p117, %rs114, 0;
 	@%p117 bra 	$L__BB0_232;
 
-	cvt.u32.u16 	%r548, %rs114;
-	and.b32  	%r549, %r548, 255;
-	mul.wide.u32 	%rd250, %r549, 4;
+	cvt.u32.u16 	%r434, %rs114;
+	mul.wide.u32 	%rd250, %r434, 4;
 	add.s64 	%rd251, %rd2, %rd250;
-	ld.local.u32 	%r550, [%rd251];
-	add.s32 	%r551, %r550, 1;
-	st.local.u32 	[%rd251], %r551;
+	ld.local.u32 	%r435, [%rd251];
+	add.s32 	%r436, %r435, 1;
+	st.local.u32 	[%rd251], %r436;
 
 $L__BB0_232:
 	ld.shared.u8 	%rs115, [_ZZ21slzHuffBuildLutKernelE12code_lengths+114];
-	add.s16 	%rs507, %rs115, -1;
-	and.b16  	%rs508, %rs507, 255;
-	setp.gt.u16 	%p118, %rs508, 10;
+	setp.eq.s16 	%p118, %rs115, 0;
 	@%p118 bra 	$L__BB0_234;
 
-	cvt.u32.u16 	%r552, %rs115;
-	and.b32  	%r553, %r552, 255;
-	mul.wide.u32 	%rd252, %r553, 4;
+	cvt.u32.u16 	%r437, %rs115;
+	mul.wide.u32 	%rd252, %r437, 4;
 	add.s64 	%rd253, %rd2, %rd252;
-	ld.local.u32 	%r554, [%rd253];
-	add.s32 	%r555, %r554, 1;
-	st.local.u32 	[%rd253], %r555;
+	ld.local.u32 	%r438, [%rd253];
+	add.s32 	%r439, %r438, 1;
+	st.local.u32 	[%rd253], %r439;
 
 $L__BB0_234:
 	ld.shared.u8 	%rs116, [_ZZ21slzHuffBuildLutKernelE12code_lengths+115];
-	add.s16 	%rs509, %rs116, -1;
-	and.b16  	%rs510, %rs509, 255;
-	setp.gt.u16 	%p119, %rs510, 10;
+	setp.eq.s16 	%p119, %rs116, 0;
 	@%p119 bra 	$L__BB0_236;
 
-	cvt.u32.u16 	%r556, %rs116;
-	and.b32  	%r557, %r556, 255;
-	mul.wide.u32 	%rd254, %r557, 4;
+	cvt.u32.u16 	%r440, %rs116;
+	mul.wide.u32 	%rd254, %r440, 4;
 	add.s64 	%rd255, %rd2, %rd254;
-	ld.local.u32 	%r558, [%rd255];
-	add.s32 	%r559, %r558, 1;
-	st.local.u32 	[%rd255], %r559;
+	ld.local.u32 	%r441, [%rd255];
+	add.s32 	%r442, %r441, 1;
+	st.local.u32 	[%rd255], %r442;
 
 $L__BB0_236:
 	ld.shared.u8 	%rs117, [_ZZ21slzHuffBuildLutKernelE12code_lengths+116];
-	add.s16 	%rs511, %rs117, -1;
-	and.b16  	%rs512, %rs511, 255;
-	setp.gt.u16 	%p120, %rs512, 10;
+	setp.eq.s16 	%p120, %rs117, 0;
 	@%p120 bra 	$L__BB0_238;
 
-	cvt.u32.u16 	%r560, %rs117;
-	and.b32  	%r561, %r560, 255;
-	mul.wide.u32 	%rd256, %r561, 4;
+	cvt.u32.u16 	%r443, %rs117;
+	mul.wide.u32 	%rd256, %r443, 4;
 	add.s64 	%rd257, %rd2, %rd256;
-	ld.local.u32 	%r562, [%rd257];
-	add.s32 	%r563, %r562, 1;
-	st.local.u32 	[%rd257], %r563;
+	ld.local.u32 	%r444, [%rd257];
+	add.s32 	%r445, %r444, 1;
+	st.local.u32 	[%rd257], %r445;
 
 $L__BB0_238:
 	ld.shared.u8 	%rs118, [_ZZ21slzHuffBuildLutKernelE12code_lengths+117];
-	add.s16 	%rs513, %rs118, -1;
-	and.b16  	%rs514, %rs513, 255;
-	setp.gt.u16 	%p121, %rs514, 10;
+	setp.eq.s16 	%p121, %rs118, 0;
 	@%p121 bra 	$L__BB0_240;
 
-	cvt.u32.u16 	%r564, %rs118;
-	and.b32  	%r565, %r564, 255;
-	mul.wide.u32 	%rd258, %r565, 4;
+	cvt.u32.u16 	%r446, %rs118;
+	mul.wide.u32 	%rd258, %r446, 4;
 	add.s64 	%rd259, %rd2, %rd258;
-	ld.local.u32 	%r566, [%rd259];
-	add.s32 	%r567, %r566, 1;
-	st.local.u32 	[%rd259], %r567;
+	ld.local.u32 	%r447, [%rd259];
+	add.s32 	%r448, %r447, 1;
+	st.local.u32 	[%rd259], %r448;
 
 $L__BB0_240:
 	ld.shared.u8 	%rs119, [_ZZ21slzHuffBuildLutKernelE12code_lengths+118];
-	add.s16 	%rs515, %rs119, -1;
-	and.b16  	%rs516, %rs515, 255;
-	setp.gt.u16 	%p122, %rs516, 10;
+	setp.eq.s16 	%p122, %rs119, 0;
 	@%p122 bra 	$L__BB0_242;
 
-	cvt.u32.u16 	%r568, %rs119;
-	and.b32  	%r569, %r568, 255;
-	mul.wide.u32 	%rd260, %r569, 4;
+	cvt.u32.u16 	%r449, %rs119;
+	mul.wide.u32 	%rd260, %r449, 4;
 	add.s64 	%rd261, %rd2, %rd260;
-	ld.local.u32 	%r570, [%rd261];
-	add.s32 	%r571, %r570, 1;
-	st.local.u32 	[%rd261], %r571;
+	ld.local.u32 	%r450, [%rd261];
+	add.s32 	%r451, %r450, 1;
+	st.local.u32 	[%rd261], %r451;
 
 $L__BB0_242:
 	ld.shared.u8 	%rs120, [_ZZ21slzHuffBuildLutKernelE12code_lengths+119];
-	add.s16 	%rs517, %rs120, -1;
-	and.b16  	%rs518, %rs517, 255;
-	setp.gt.u16 	%p123, %rs518, 10;
+	setp.eq.s16 	%p123, %rs120, 0;
 	@%p123 bra 	$L__BB0_244;
 
-	cvt.u32.u16 	%r572, %rs120;
-	and.b32  	%r573, %r572, 255;
-	mul.wide.u32 	%rd262, %r573, 4;
+	cvt.u32.u16 	%r452, %rs120;
+	mul.wide.u32 	%rd262, %r452, 4;
 	add.s64 	%rd263, %rd2, %rd262;
-	ld.local.u32 	%r574, [%rd263];
-	add.s32 	%r575, %r574, 1;
-	st.local.u32 	[%rd263], %r575;
+	ld.local.u32 	%r453, [%rd263];
+	add.s32 	%r454, %r453, 1;
+	st.local.u32 	[%rd263], %r454;
 
 $L__BB0_244:
 	ld.shared.u8 	%rs121, [_ZZ21slzHuffBuildLutKernelE12code_lengths+120];
-	add.s16 	%rs519, %rs121, -1;
-	and.b16  	%rs520, %rs519, 255;
-	setp.gt.u16 	%p124, %rs520, 10;
+	setp.eq.s16 	%p124, %rs121, 0;
 	@%p124 bra 	$L__BB0_246;
 
-	cvt.u32.u16 	%r576, %rs121;
-	and.b32  	%r577, %r576, 255;
-	mul.wide.u32 	%rd264, %r577, 4;
+	cvt.u32.u16 	%r455, %rs121;
+	mul.wide.u32 	%rd264, %r455, 4;
 	add.s64 	%rd265, %rd2, %rd264;
-	ld.local.u32 	%r578, [%rd265];
-	add.s32 	%r579, %r578, 1;
-	st.local.u32 	[%rd265], %r579;
+	ld.local.u32 	%r456, [%rd265];
+	add.s32 	%r457, %r456, 1;
+	st.local.u32 	[%rd265], %r457;
 
 $L__BB0_246:
 	ld.shared.u8 	%rs122, [_ZZ21slzHuffBuildLutKernelE12code_lengths+121];
-	add.s16 	%rs521, %rs122, -1;
-	and.b16  	%rs522, %rs521, 255;
-	setp.gt.u16 	%p125, %rs522, 10;
+	setp.eq.s16 	%p125, %rs122, 0;
 	@%p125 bra 	$L__BB0_248;
 
-	cvt.u32.u16 	%r580, %rs122;
-	and.b32  	%r581, %r580, 255;
-	mul.wide.u32 	%rd266, %r581, 4;
+	cvt.u32.u16 	%r458, %rs122;
+	mul.wide.u32 	%rd266, %r458, 4;
 	add.s64 	%rd267, %rd2, %rd266;
-	ld.local.u32 	%r582, [%rd267];
-	add.s32 	%r583, %r582, 1;
-	st.local.u32 	[%rd267], %r583;
+	ld.local.u32 	%r459, [%rd267];
+	add.s32 	%r460, %r459, 1;
+	st.local.u32 	[%rd267], %r460;
 
 $L__BB0_248:
 	ld.shared.u8 	%rs123, [_ZZ21slzHuffBuildLutKernelE12code_lengths+122];
-	add.s16 	%rs523, %rs123, -1;
-	and.b16  	%rs524, %rs523, 255;
-	setp.gt.u16 	%p126, %rs524, 10;
+	setp.eq.s16 	%p126, %rs123, 0;
 	@%p126 bra 	$L__BB0_250;
 
-	cvt.u32.u16 	%r584, %rs123;
-	and.b32  	%r585, %r584, 255;
-	mul.wide.u32 	%rd268, %r585, 4;
+	cvt.u32.u16 	%r461, %rs123;
+	mul.wide.u32 	%rd268, %r461, 4;
 	add.s64 	%rd269, %rd2, %rd268;
-	ld.local.u32 	%r586, [%rd269];
-	add.s32 	%r587, %r586, 1;
-	st.local.u32 	[%rd269], %r587;
+	ld.local.u32 	%r462, [%rd269];
+	add.s32 	%r463, %r462, 1;
+	st.local.u32 	[%rd269], %r463;
 
 $L__BB0_250:
 	ld.shared.u8 	%rs124, [_ZZ21slzHuffBuildLutKernelE12code_lengths+123];
-	add.s16 	%rs525, %rs124, -1;
-	and.b16  	%rs526, %rs525, 255;
-	setp.gt.u16 	%p127, %rs526, 10;
+	setp.eq.s16 	%p127, %rs124, 0;
 	@%p127 bra 	$L__BB0_252;
 
-	cvt.u32.u16 	%r588, %rs124;
-	and.b32  	%r589, %r588, 255;
-	mul.wide.u32 	%rd270, %r589, 4;
+	cvt.u32.u16 	%r464, %rs124;
+	mul.wide.u32 	%rd270, %r464, 4;
 	add.s64 	%rd271, %rd2, %rd270;
-	ld.local.u32 	%r590, [%rd271];
-	add.s32 	%r591, %r590, 1;
-	st.local.u32 	[%rd271], %r591;
+	ld.local.u32 	%r465, [%rd271];
+	add.s32 	%r466, %r465, 1;
+	st.local.u32 	[%rd271], %r466;
 
 $L__BB0_252:
 	ld.shared.u8 	%rs125, [_ZZ21slzHuffBuildLutKernelE12code_lengths+124];
-	add.s16 	%rs527, %rs125, -1;
-	and.b16  	%rs528, %rs527, 255;
-	setp.gt.u16 	%p128, %rs528, 10;
+	setp.eq.s16 	%p128, %rs125, 0;
 	@%p128 bra 	$L__BB0_254;
 
-	cvt.u32.u16 	%r592, %rs125;
-	and.b32  	%r593, %r592, 255;
-	mul.wide.u32 	%rd272, %r593, 4;
+	cvt.u32.u16 	%r467, %rs125;
+	mul.wide.u32 	%rd272, %r467, 4;
 	add.s64 	%rd273, %rd2, %rd272;
-	ld.local.u32 	%r594, [%rd273];
-	add.s32 	%r595, %r594, 1;
-	st.local.u32 	[%rd273], %r595;
+	ld.local.u32 	%r468, [%rd273];
+	add.s32 	%r469, %r468, 1;
+	st.local.u32 	[%rd273], %r469;
 
 $L__BB0_254:
 	ld.shared.u8 	%rs126, [_ZZ21slzHuffBuildLutKernelE12code_lengths+125];
-	add.s16 	%rs529, %rs126, -1;
-	and.b16  	%rs530, %rs529, 255;
-	setp.gt.u16 	%p129, %rs530, 10;
+	setp.eq.s16 	%p129, %rs126, 0;
 	@%p129 bra 	$L__BB0_256;
 
-	cvt.u32.u16 	%r596, %rs126;
-	and.b32  	%r597, %r596, 255;
-	mul.wide.u32 	%rd274, %r597, 4;
+	cvt.u32.u16 	%r470, %rs126;
+	mul.wide.u32 	%rd274, %r470, 4;
 	add.s64 	%rd275, %rd2, %rd274;
-	ld.local.u32 	%r598, [%rd275];
-	add.s32 	%r599, %r598, 1;
-	st.local.u32 	[%rd275], %r599;
+	ld.local.u32 	%r471, [%rd275];
+	add.s32 	%r472, %r471, 1;
+	st.local.u32 	[%rd275], %r472;
 
 $L__BB0_256:
 	ld.shared.u8 	%rs127, [_ZZ21slzHuffBuildLutKernelE12code_lengths+126];
-	add.s16 	%rs531, %rs127, -1;
-	and.b16  	%rs532, %rs531, 255;
-	setp.gt.u16 	%p130, %rs532, 10;
+	setp.eq.s16 	%p130, %rs127, 0;
 	@%p130 bra 	$L__BB0_258;
 
-	cvt.u32.u16 	%r600, %rs127;
-	and.b32  	%r601, %r600, 255;
-	mul.wide.u32 	%rd276, %r601, 4;
+	cvt.u32.u16 	%r473, %rs127;
+	mul.wide.u32 	%rd276, %r473, 4;
 	add.s64 	%rd277, %rd2, %rd276;
-	ld.local.u32 	%r602, [%rd277];
-	add.s32 	%r603, %r602, 1;
-	st.local.u32 	[%rd277], %r603;
+	ld.local.u32 	%r474, [%rd277];
+	add.s32 	%r475, %r474, 1;
+	st.local.u32 	[%rd277], %r475;
 
 $L__BB0_258:
 	ld.shared.u8 	%rs128, [_ZZ21slzHuffBuildLutKernelE12code_lengths+127];
-	add.s16 	%rs533, %rs128, -1;
-	and.b16  	%rs534, %rs533, 255;
-	setp.gt.u16 	%p131, %rs534, 10;
+	setp.eq.s16 	%p131, %rs128, 0;
 	@%p131 bra 	$L__BB0_260;
 
-	cvt.u32.u16 	%r604, %rs128;
-	and.b32  	%r605, %r604, 255;
-	mul.wide.u32 	%rd278, %r605, 4;
+	cvt.u32.u16 	%r476, %rs128;
+	mul.wide.u32 	%rd278, %r476, 4;
 	add.s64 	%rd279, %rd2, %rd278;
-	ld.local.u32 	%r606, [%rd279];
-	add.s32 	%r607, %r606, 1;
-	st.local.u32 	[%rd279], %r607;
+	ld.local.u32 	%r477, [%rd279];
+	add.s32 	%r478, %r477, 1;
+	st.local.u32 	[%rd279], %r478;
 
 $L__BB0_260:
 	ld.shared.u8 	%rs129, [_ZZ21slzHuffBuildLutKernelE12code_lengths+128];
-	add.s16 	%rs535, %rs129, -1;
-	and.b16  	%rs536, %rs535, 255;
-	setp.gt.u16 	%p132, %rs536, 10;
+	setp.eq.s16 	%p132, %rs129, 0;
 	@%p132 bra 	$L__BB0_262;
 
-	cvt.u32.u16 	%r608, %rs129;
-	and.b32  	%r609, %r608, 255;
-	mul.wide.u32 	%rd280, %r609, 4;
+	cvt.u32.u16 	%r479, %rs129;
+	mul.wide.u32 	%rd280, %r479, 4;
 	add.s64 	%rd281, %rd2, %rd280;
-	ld.local.u32 	%r610, [%rd281];
-	add.s32 	%r611, %r610, 1;
-	st.local.u32 	[%rd281], %r611;
+	ld.local.u32 	%r480, [%rd281];
+	add.s32 	%r481, %r480, 1;
+	st.local.u32 	[%rd281], %r481;
 
 $L__BB0_262:
 	ld.shared.u8 	%rs130, [_ZZ21slzHuffBuildLutKernelE12code_lengths+129];
-	add.s16 	%rs537, %rs130, -1;
-	and.b16  	%rs538, %rs537, 255;
-	setp.gt.u16 	%p133, %rs538, 10;
+	setp.eq.s16 	%p133, %rs130, 0;
 	@%p133 bra 	$L__BB0_264;
 
-	cvt.u32.u16 	%r612, %rs130;
-	and.b32  	%r613, %r612, 255;
-	mul.wide.u32 	%rd282, %r613, 4;
+	cvt.u32.u16 	%r482, %rs130;
+	mul.wide.u32 	%rd282, %r482, 4;
 	add.s64 	%rd283, %rd2, %rd282;
-	ld.local.u32 	%r614, [%rd283];
-	add.s32 	%r615, %r614, 1;
-	st.local.u32 	[%rd283], %r615;
+	ld.local.u32 	%r483, [%rd283];
+	add.s32 	%r484, %r483, 1;
+	st.local.u32 	[%rd283], %r484;
 
 $L__BB0_264:
 	ld.shared.u8 	%rs131, [_ZZ21slzHuffBuildLutKernelE12code_lengths+130];
-	add.s16 	%rs539, %rs131, -1;
-	and.b16  	%rs540, %rs539, 255;
-	setp.gt.u16 	%p134, %rs540, 10;
+	setp.eq.s16 	%p134, %rs131, 0;
 	@%p134 bra 	$L__BB0_266;
 
-	cvt.u32.u16 	%r616, %rs131;
-	and.b32  	%r617, %r616, 255;
-	mul.wide.u32 	%rd284, %r617, 4;
+	cvt.u32.u16 	%r485, %rs131;
+	mul.wide.u32 	%rd284, %r485, 4;
 	add.s64 	%rd285, %rd2, %rd284;
-	ld.local.u32 	%r618, [%rd285];
-	add.s32 	%r619, %r618, 1;
-	st.local.u32 	[%rd285], %r619;
+	ld.local.u32 	%r486, [%rd285];
+	add.s32 	%r487, %r486, 1;
+	st.local.u32 	[%rd285], %r487;
 
 $L__BB0_266:
 	ld.shared.u8 	%rs132, [_ZZ21slzHuffBuildLutKernelE12code_lengths+131];
-	add.s16 	%rs541, %rs132, -1;
-	and.b16  	%rs542, %rs541, 255;
-	setp.gt.u16 	%p135, %rs542, 10;
+	setp.eq.s16 	%p135, %rs132, 0;
 	@%p135 bra 	$L__BB0_268;
 
-	cvt.u32.u16 	%r620, %rs132;
-	and.b32  	%r621, %r620, 255;
-	mul.wide.u32 	%rd286, %r621, 4;
+	cvt.u32.u16 	%r488, %rs132;
+	mul.wide.u32 	%rd286, %r488, 4;
 	add.s64 	%rd287, %rd2, %rd286;
-	ld.local.u32 	%r622, [%rd287];
-	add.s32 	%r623, %r622, 1;
-	st.local.u32 	[%rd287], %r623;
+	ld.local.u32 	%r489, [%rd287];
+	add.s32 	%r490, %r489, 1;
+	st.local.u32 	[%rd287], %r490;
 
 $L__BB0_268:
 	ld.shared.u8 	%rs133, [_ZZ21slzHuffBuildLutKernelE12code_lengths+132];
-	add.s16 	%rs543, %rs133, -1;
-	and.b16  	%rs544, %rs543, 255;
-	setp.gt.u16 	%p136, %rs544, 10;
+	setp.eq.s16 	%p136, %rs133, 0;
 	@%p136 bra 	$L__BB0_270;
 
-	cvt.u32.u16 	%r624, %rs133;
-	and.b32  	%r625, %r624, 255;
-	mul.wide.u32 	%rd288, %r625, 4;
+	cvt.u32.u16 	%r491, %rs133;
+	mul.wide.u32 	%rd288, %r491, 4;
 	add.s64 	%rd289, %rd2, %rd288;
-	ld.local.u32 	%r626, [%rd289];
-	add.s32 	%r627, %r626, 1;
-	st.local.u32 	[%rd289], %r627;
+	ld.local.u32 	%r492, [%rd289];
+	add.s32 	%r493, %r492, 1;
+	st.local.u32 	[%rd289], %r493;
 
 $L__BB0_270:
 	ld.shared.u8 	%rs134, [_ZZ21slzHuffBuildLutKernelE12code_lengths+133];
-	add.s16 	%rs545, %rs134, -1;
-	and.b16  	%rs546, %rs545, 255;
-	setp.gt.u16 	%p137, %rs546, 10;
+	setp.eq.s16 	%p137, %rs134, 0;
 	@%p137 bra 	$L__BB0_272;
 
-	cvt.u32.u16 	%r628, %rs134;
-	and.b32  	%r629, %r628, 255;
-	mul.wide.u32 	%rd290, %r629, 4;
+	cvt.u32.u16 	%r494, %rs134;
+	mul.wide.u32 	%rd290, %r494, 4;
 	add.s64 	%rd291, %rd2, %rd290;
-	ld.local.u32 	%r630, [%rd291];
-	add.s32 	%r631, %r630, 1;
-	st.local.u32 	[%rd291], %r631;
+	ld.local.u32 	%r495, [%rd291];
+	add.s32 	%r496, %r495, 1;
+	st.local.u32 	[%rd291], %r496;
 
 $L__BB0_272:
 	ld.shared.u8 	%rs135, [_ZZ21slzHuffBuildLutKernelE12code_lengths+134];
-	add.s16 	%rs547, %rs135, -1;
-	and.b16  	%rs548, %rs547, 255;
-	setp.gt.u16 	%p138, %rs548, 10;
+	setp.eq.s16 	%p138, %rs135, 0;
 	@%p138 bra 	$L__BB0_274;
 
-	cvt.u32.u16 	%r632, %rs135;
-	and.b32  	%r633, %r632, 255;
-	mul.wide.u32 	%rd292, %r633, 4;
+	cvt.u32.u16 	%r497, %rs135;
+	mul.wide.u32 	%rd292, %r497, 4;
 	add.s64 	%rd293, %rd2, %rd292;
-	ld.local.u32 	%r634, [%rd293];
-	add.s32 	%r635, %r634, 1;
-	st.local.u32 	[%rd293], %r635;
+	ld.local.u32 	%r498, [%rd293];
+	add.s32 	%r499, %r498, 1;
+	st.local.u32 	[%rd293], %r499;
 
 $L__BB0_274:
 	ld.shared.u8 	%rs136, [_ZZ21slzHuffBuildLutKernelE12code_lengths+135];
-	add.s16 	%rs549, %rs136, -1;
-	and.b16  	%rs550, %rs549, 255;
-	setp.gt.u16 	%p139, %rs550, 10;
+	setp.eq.s16 	%p139, %rs136, 0;
 	@%p139 bra 	$L__BB0_276;
 
-	cvt.u32.u16 	%r636, %rs136;
-	and.b32  	%r637, %r636, 255;
-	mul.wide.u32 	%rd294, %r637, 4;
+	cvt.u32.u16 	%r500, %rs136;
+	mul.wide.u32 	%rd294, %r500, 4;
 	add.s64 	%rd295, %rd2, %rd294;
-	ld.local.u32 	%r638, [%rd295];
-	add.s32 	%r639, %r638, 1;
-	st.local.u32 	[%rd295], %r639;
+	ld.local.u32 	%r501, [%rd295];
+	add.s32 	%r502, %r501, 1;
+	st.local.u32 	[%rd295], %r502;
 
 $L__BB0_276:
 	ld.shared.u8 	%rs137, [_ZZ21slzHuffBuildLutKernelE12code_lengths+136];
-	add.s16 	%rs551, %rs137, -1;
-	and.b16  	%rs552, %rs551, 255;
-	setp.gt.u16 	%p140, %rs552, 10;
+	setp.eq.s16 	%p140, %rs137, 0;
 	@%p140 bra 	$L__BB0_278;
 
-	cvt.u32.u16 	%r640, %rs137;
-	and.b32  	%r641, %r640, 255;
-	mul.wide.u32 	%rd296, %r641, 4;
+	cvt.u32.u16 	%r503, %rs137;
+	mul.wide.u32 	%rd296, %r503, 4;
 	add.s64 	%rd297, %rd2, %rd296;
-	ld.local.u32 	%r642, [%rd297];
-	add.s32 	%r643, %r642, 1;
-	st.local.u32 	[%rd297], %r643;
+	ld.local.u32 	%r504, [%rd297];
+	add.s32 	%r505, %r504, 1;
+	st.local.u32 	[%rd297], %r505;
 
 $L__BB0_278:
 	ld.shared.u8 	%rs138, [_ZZ21slzHuffBuildLutKernelE12code_lengths+137];
-	add.s16 	%rs553, %rs138, -1;
-	and.b16  	%rs554, %rs553, 255;
-	setp.gt.u16 	%p141, %rs554, 10;
+	setp.eq.s16 	%p141, %rs138, 0;
 	@%p141 bra 	$L__BB0_280;
 
-	cvt.u32.u16 	%r644, %rs138;
-	and.b32  	%r645, %r644, 255;
-	mul.wide.u32 	%rd298, %r645, 4;
+	cvt.u32.u16 	%r506, %rs138;
+	mul.wide.u32 	%rd298, %r506, 4;
 	add.s64 	%rd299, %rd2, %rd298;
-	ld.local.u32 	%r646, [%rd299];
-	add.s32 	%r647, %r646, 1;
-	st.local.u32 	[%rd299], %r647;
+	ld.local.u32 	%r507, [%rd299];
+	add.s32 	%r508, %r507, 1;
+	st.local.u32 	[%rd299], %r508;
 
 $L__BB0_280:
 	ld.shared.u8 	%rs139, [_ZZ21slzHuffBuildLutKernelE12code_lengths+138];
-	add.s16 	%rs555, %rs139, -1;
-	and.b16  	%rs556, %rs555, 255;
-	setp.gt.u16 	%p142, %rs556, 10;
+	setp.eq.s16 	%p142, %rs139, 0;
 	@%p142 bra 	$L__BB0_282;
 
-	cvt.u32.u16 	%r648, %rs139;
-	and.b32  	%r649, %r648, 255;
-	mul.wide.u32 	%rd300, %r649, 4;
+	cvt.u32.u16 	%r509, %rs139;
+	mul.wide.u32 	%rd300, %r509, 4;
 	add.s64 	%rd301, %rd2, %rd300;
-	ld.local.u32 	%r650, [%rd301];
-	add.s32 	%r651, %r650, 1;
-	st.local.u32 	[%rd301], %r651;
+	ld.local.u32 	%r510, [%rd301];
+	add.s32 	%r511, %r510, 1;
+	st.local.u32 	[%rd301], %r511;
 
 $L__BB0_282:
 	ld.shared.u8 	%rs140, [_ZZ21slzHuffBuildLutKernelE12code_lengths+139];
-	add.s16 	%rs557, %rs140, -1;
-	and.b16  	%rs558, %rs557, 255;
-	setp.gt.u16 	%p143, %rs558, 10;
+	setp.eq.s16 	%p143, %rs140, 0;
 	@%p143 bra 	$L__BB0_284;
 
-	cvt.u32.u16 	%r652, %rs140;
-	and.b32  	%r653, %r652, 255;
-	mul.wide.u32 	%rd302, %r653, 4;
+	cvt.u32.u16 	%r512, %rs140;
+	mul.wide.u32 	%rd302, %r512, 4;
 	add.s64 	%rd303, %rd2, %rd302;
-	ld.local.u32 	%r654, [%rd303];
-	add.s32 	%r655, %r654, 1;
-	st.local.u32 	[%rd303], %r655;
+	ld.local.u32 	%r513, [%rd303];
+	add.s32 	%r514, %r513, 1;
+	st.local.u32 	[%rd303], %r514;
 
 $L__BB0_284:
 	ld.shared.u8 	%rs141, [_ZZ21slzHuffBuildLutKernelE12code_lengths+140];
-	add.s16 	%rs559, %rs141, -1;
-	and.b16  	%rs560, %rs559, 255;
-	setp.gt.u16 	%p144, %rs560, 10;
+	setp.eq.s16 	%p144, %rs141, 0;
 	@%p144 bra 	$L__BB0_286;
 
-	cvt.u32.u16 	%r656, %rs141;
-	and.b32  	%r657, %r656, 255;
-	mul.wide.u32 	%rd304, %r657, 4;
+	cvt.u32.u16 	%r515, %rs141;
+	mul.wide.u32 	%rd304, %r515, 4;
 	add.s64 	%rd305, %rd2, %rd304;
-	ld.local.u32 	%r658, [%rd305];
-	add.s32 	%r659, %r658, 1;
-	st.local.u32 	[%rd305], %r659;
+	ld.local.u32 	%r516, [%rd305];
+	add.s32 	%r517, %r516, 1;
+	st.local.u32 	[%rd305], %r517;
 
 $L__BB0_286:
 	ld.shared.u8 	%rs142, [_ZZ21slzHuffBuildLutKernelE12code_lengths+141];
-	add.s16 	%rs561, %rs142, -1;
-	and.b16  	%rs562, %rs561, 255;
-	setp.gt.u16 	%p145, %rs562, 10;
+	setp.eq.s16 	%p145, %rs142, 0;
 	@%p145 bra 	$L__BB0_288;
 
-	cvt.u32.u16 	%r660, %rs142;
-	and.b32  	%r661, %r660, 255;
-	mul.wide.u32 	%rd306, %r661, 4;
+	cvt.u32.u16 	%r518, %rs142;
+	mul.wide.u32 	%rd306, %r518, 4;
 	add.s64 	%rd307, %rd2, %rd306;
-	ld.local.u32 	%r662, [%rd307];
-	add.s32 	%r663, %r662, 1;
-	st.local.u32 	[%rd307], %r663;
+	ld.local.u32 	%r519, [%rd307];
+	add.s32 	%r520, %r519, 1;
+	st.local.u32 	[%rd307], %r520;
 
 $L__BB0_288:
 	ld.shared.u8 	%rs143, [_ZZ21slzHuffBuildLutKernelE12code_lengths+142];
-	add.s16 	%rs563, %rs143, -1;
-	and.b16  	%rs564, %rs563, 255;
-	setp.gt.u16 	%p146, %rs564, 10;
+	setp.eq.s16 	%p146, %rs143, 0;
 	@%p146 bra 	$L__BB0_290;
 
-	cvt.u32.u16 	%r664, %rs143;
-	and.b32  	%r665, %r664, 255;
-	mul.wide.u32 	%rd308, %r665, 4;
+	cvt.u32.u16 	%r521, %rs143;
+	mul.wide.u32 	%rd308, %r521, 4;
 	add.s64 	%rd309, %rd2, %rd308;
-	ld.local.u32 	%r666, [%rd309];
-	add.s32 	%r667, %r666, 1;
-	st.local.u32 	[%rd309], %r667;
+	ld.local.u32 	%r522, [%rd309];
+	add.s32 	%r523, %r522, 1;
+	st.local.u32 	[%rd309], %r523;
 
 $L__BB0_290:
 	ld.shared.u8 	%rs144, [_ZZ21slzHuffBuildLutKernelE12code_lengths+143];
-	add.s16 	%rs565, %rs144, -1;
-	and.b16  	%rs566, %rs565, 255;
-	setp.gt.u16 	%p147, %rs566, 10;
+	setp.eq.s16 	%p147, %rs144, 0;
 	@%p147 bra 	$L__BB0_292;
 
-	cvt.u32.u16 	%r668, %rs144;
-	and.b32  	%r669, %r668, 255;
-	mul.wide.u32 	%rd310, %r669, 4;
+	cvt.u32.u16 	%r524, %rs144;
+	mul.wide.u32 	%rd310, %r524, 4;
 	add.s64 	%rd311, %rd2, %rd310;
-	ld.local.u32 	%r670, [%rd311];
-	add.s32 	%r671, %r670, 1;
-	st.local.u32 	[%rd311], %r671;
+	ld.local.u32 	%r525, [%rd311];
+	add.s32 	%r526, %r525, 1;
+	st.local.u32 	[%rd311], %r526;
 
 $L__BB0_292:
 	ld.shared.u8 	%rs145, [_ZZ21slzHuffBuildLutKernelE12code_lengths+144];
-	add.s16 	%rs567, %rs145, -1;
-	and.b16  	%rs568, %rs567, 255;
-	setp.gt.u16 	%p148, %rs568, 10;
+	setp.eq.s16 	%p148, %rs145, 0;
 	@%p148 bra 	$L__BB0_294;
 
-	cvt.u32.u16 	%r672, %rs145;
-	and.b32  	%r673, %r672, 255;
-	mul.wide.u32 	%rd312, %r673, 4;
+	cvt.u32.u16 	%r527, %rs145;
+	mul.wide.u32 	%rd312, %r527, 4;
 	add.s64 	%rd313, %rd2, %rd312;
-	ld.local.u32 	%r674, [%rd313];
-	add.s32 	%r675, %r674, 1;
-	st.local.u32 	[%rd313], %r675;
+	ld.local.u32 	%r528, [%rd313];
+	add.s32 	%r529, %r528, 1;
+	st.local.u32 	[%rd313], %r529;
 
 $L__BB0_294:
 	ld.shared.u8 	%rs146, [_ZZ21slzHuffBuildLutKernelE12code_lengths+145];
-	add.s16 	%rs569, %rs146, -1;
-	and.b16  	%rs570, %rs569, 255;
-	setp.gt.u16 	%p149, %rs570, 10;
+	setp.eq.s16 	%p149, %rs146, 0;
 	@%p149 bra 	$L__BB0_296;
 
-	cvt.u32.u16 	%r676, %rs146;
-	and.b32  	%r677, %r676, 255;
-	mul.wide.u32 	%rd314, %r677, 4;
+	cvt.u32.u16 	%r530, %rs146;
+	mul.wide.u32 	%rd314, %r530, 4;
 	add.s64 	%rd315, %rd2, %rd314;
-	ld.local.u32 	%r678, [%rd315];
-	add.s32 	%r679, %r678, 1;
-	st.local.u32 	[%rd315], %r679;
+	ld.local.u32 	%r531, [%rd315];
+	add.s32 	%r532, %r531, 1;
+	st.local.u32 	[%rd315], %r532;
 
 $L__BB0_296:
 	ld.shared.u8 	%rs147, [_ZZ21slzHuffBuildLutKernelE12code_lengths+146];
-	add.s16 	%rs571, %rs147, -1;
-	and.b16  	%rs572, %rs571, 255;
-	setp.gt.u16 	%p150, %rs572, 10;
+	setp.eq.s16 	%p150, %rs147, 0;
 	@%p150 bra 	$L__BB0_298;
 
-	cvt.u32.u16 	%r680, %rs147;
-	and.b32  	%r681, %r680, 255;
-	mul.wide.u32 	%rd316, %r681, 4;
+	cvt.u32.u16 	%r533, %rs147;
+	mul.wide.u32 	%rd316, %r533, 4;
 	add.s64 	%rd317, %rd2, %rd316;
-	ld.local.u32 	%r682, [%rd317];
-	add.s32 	%r683, %r682, 1;
-	st.local.u32 	[%rd317], %r683;
+	ld.local.u32 	%r534, [%rd317];
+	add.s32 	%r535, %r534, 1;
+	st.local.u32 	[%rd317], %r535;
 
 $L__BB0_298:
 	ld.shared.u8 	%rs148, [_ZZ21slzHuffBuildLutKernelE12code_lengths+147];
-	add.s16 	%rs573, %rs148, -1;
-	and.b16  	%rs574, %rs573, 255;
-	setp.gt.u16 	%p151, %rs574, 10;
+	setp.eq.s16 	%p151, %rs148, 0;
 	@%p151 bra 	$L__BB0_300;
 
-	cvt.u32.u16 	%r684, %rs148;
-	and.b32  	%r685, %r684, 255;
-	mul.wide.u32 	%rd318, %r685, 4;
+	cvt.u32.u16 	%r536, %rs148;
+	mul.wide.u32 	%rd318, %r536, 4;
 	add.s64 	%rd319, %rd2, %rd318;
-	ld.local.u32 	%r686, [%rd319];
-	add.s32 	%r687, %r686, 1;
-	st.local.u32 	[%rd319], %r687;
+	ld.local.u32 	%r537, [%rd319];
+	add.s32 	%r538, %r537, 1;
+	st.local.u32 	[%rd319], %r538;
 
 $L__BB0_300:
 	ld.shared.u8 	%rs149, [_ZZ21slzHuffBuildLutKernelE12code_lengths+148];
-	add.s16 	%rs575, %rs149, -1;
-	and.b16  	%rs576, %rs575, 255;
-	setp.gt.u16 	%p152, %rs576, 10;
+	setp.eq.s16 	%p152, %rs149, 0;
 	@%p152 bra 	$L__BB0_302;
 
-	cvt.u32.u16 	%r688, %rs149;
-	and.b32  	%r689, %r688, 255;
-	mul.wide.u32 	%rd320, %r689, 4;
+	cvt.u32.u16 	%r539, %rs149;
+	mul.wide.u32 	%rd320, %r539, 4;
 	add.s64 	%rd321, %rd2, %rd320;
-	ld.local.u32 	%r690, [%rd321];
-	add.s32 	%r691, %r690, 1;
-	st.local.u32 	[%rd321], %r691;
+	ld.local.u32 	%r540, [%rd321];
+	add.s32 	%r541, %r540, 1;
+	st.local.u32 	[%rd321], %r541;
 
 $L__BB0_302:
 	ld.shared.u8 	%rs150, [_ZZ21slzHuffBuildLutKernelE12code_lengths+149];
-	add.s16 	%rs577, %rs150, -1;
-	and.b16  	%rs578, %rs577, 255;
-	setp.gt.u16 	%p153, %rs578, 10;
+	setp.eq.s16 	%p153, %rs150, 0;
 	@%p153 bra 	$L__BB0_304;
 
-	cvt.u32.u16 	%r692, %rs150;
-	and.b32  	%r693, %r692, 255;
-	mul.wide.u32 	%rd322, %r693, 4;
+	cvt.u32.u16 	%r542, %rs150;
+	mul.wide.u32 	%rd322, %r542, 4;
 	add.s64 	%rd323, %rd2, %rd322;
-	ld.local.u32 	%r694, [%rd323];
-	add.s32 	%r695, %r694, 1;
-	st.local.u32 	[%rd323], %r695;
+	ld.local.u32 	%r543, [%rd323];
+	add.s32 	%r544, %r543, 1;
+	st.local.u32 	[%rd323], %r544;
 
 $L__BB0_304:
 	ld.shared.u8 	%rs151, [_ZZ21slzHuffBuildLutKernelE12code_lengths+150];
-	add.s16 	%rs579, %rs151, -1;
-	and.b16  	%rs580, %rs579, 255;
-	setp.gt.u16 	%p154, %rs580, 10;
+	setp.eq.s16 	%p154, %rs151, 0;
 	@%p154 bra 	$L__BB0_306;
 
-	cvt.u32.u16 	%r696, %rs151;
-	and.b32  	%r697, %r696, 255;
-	mul.wide.u32 	%rd324, %r697, 4;
+	cvt.u32.u16 	%r545, %rs151;
+	mul.wide.u32 	%rd324, %r545, 4;
 	add.s64 	%rd325, %rd2, %rd324;
-	ld.local.u32 	%r698, [%rd325];
-	add.s32 	%r699, %r698, 1;
-	st.local.u32 	[%rd325], %r699;
+	ld.local.u32 	%r546, [%rd325];
+	add.s32 	%r547, %r546, 1;
+	st.local.u32 	[%rd325], %r547;
 
 $L__BB0_306:
 	ld.shared.u8 	%rs152, [_ZZ21slzHuffBuildLutKernelE12code_lengths+151];
-	add.s16 	%rs581, %rs152, -1;
-	and.b16  	%rs582, %rs581, 255;
-	setp.gt.u16 	%p155, %rs582, 10;
+	setp.eq.s16 	%p155, %rs152, 0;
 	@%p155 bra 	$L__BB0_308;
 
-	cvt.u32.u16 	%r700, %rs152;
-	and.b32  	%r701, %r700, 255;
-	mul.wide.u32 	%rd326, %r701, 4;
+	cvt.u32.u16 	%r548, %rs152;
+	mul.wide.u32 	%rd326, %r548, 4;
 	add.s64 	%rd327, %rd2, %rd326;
-	ld.local.u32 	%r702, [%rd327];
-	add.s32 	%r703, %r702, 1;
-	st.local.u32 	[%rd327], %r703;
+	ld.local.u32 	%r549, [%rd327];
+	add.s32 	%r550, %r549, 1;
+	st.local.u32 	[%rd327], %r550;
 
 $L__BB0_308:
 	ld.shared.u8 	%rs153, [_ZZ21slzHuffBuildLutKernelE12code_lengths+152];
-	add.s16 	%rs583, %rs153, -1;
-	and.b16  	%rs584, %rs583, 255;
-	setp.gt.u16 	%p156, %rs584, 10;
+	setp.eq.s16 	%p156, %rs153, 0;
 	@%p156 bra 	$L__BB0_310;
 
-	cvt.u32.u16 	%r704, %rs153;
-	and.b32  	%r705, %r704, 255;
-	mul.wide.u32 	%rd328, %r705, 4;
+	cvt.u32.u16 	%r551, %rs153;
+	mul.wide.u32 	%rd328, %r551, 4;
 	add.s64 	%rd329, %rd2, %rd328;
-	ld.local.u32 	%r706, [%rd329];
-	add.s32 	%r707, %r706, 1;
-	st.local.u32 	[%rd329], %r707;
+	ld.local.u32 	%r552, [%rd329];
+	add.s32 	%r553, %r552, 1;
+	st.local.u32 	[%rd329], %r553;
 
 $L__BB0_310:
 	ld.shared.u8 	%rs154, [_ZZ21slzHuffBuildLutKernelE12code_lengths+153];
-	add.s16 	%rs585, %rs154, -1;
-	and.b16  	%rs586, %rs585, 255;
-	setp.gt.u16 	%p157, %rs586, 10;
+	setp.eq.s16 	%p157, %rs154, 0;
 	@%p157 bra 	$L__BB0_312;
 
-	cvt.u32.u16 	%r708, %rs154;
-	and.b32  	%r709, %r708, 255;
-	mul.wide.u32 	%rd330, %r709, 4;
+	cvt.u32.u16 	%r554, %rs154;
+	mul.wide.u32 	%rd330, %r554, 4;
 	add.s64 	%rd331, %rd2, %rd330;
-	ld.local.u32 	%r710, [%rd331];
-	add.s32 	%r711, %r710, 1;
-	st.local.u32 	[%rd331], %r711;
+	ld.local.u32 	%r555, [%rd331];
+	add.s32 	%r556, %r555, 1;
+	st.local.u32 	[%rd331], %r556;
 
 $L__BB0_312:
 	ld.shared.u8 	%rs155, [_ZZ21slzHuffBuildLutKernelE12code_lengths+154];
-	add.s16 	%rs587, %rs155, -1;
-	and.b16  	%rs588, %rs587, 255;
-	setp.gt.u16 	%p158, %rs588, 10;
+	setp.eq.s16 	%p158, %rs155, 0;
 	@%p158 bra 	$L__BB0_314;
 
-	cvt.u32.u16 	%r712, %rs155;
-	and.b32  	%r713, %r712, 255;
-	mul.wide.u32 	%rd332, %r713, 4;
+	cvt.u32.u16 	%r557, %rs155;
+	mul.wide.u32 	%rd332, %r557, 4;
 	add.s64 	%rd333, %rd2, %rd332;
-	ld.local.u32 	%r714, [%rd333];
-	add.s32 	%r715, %r714, 1;
-	st.local.u32 	[%rd333], %r715;
+	ld.local.u32 	%r558, [%rd333];
+	add.s32 	%r559, %r558, 1;
+	st.local.u32 	[%rd333], %r559;
 
 $L__BB0_314:
 	ld.shared.u8 	%rs156, [_ZZ21slzHuffBuildLutKernelE12code_lengths+155];
-	add.s16 	%rs589, %rs156, -1;
-	and.b16  	%rs590, %rs589, 255;
-	setp.gt.u16 	%p159, %rs590, 10;
+	setp.eq.s16 	%p159, %rs156, 0;
 	@%p159 bra 	$L__BB0_316;
 
-	cvt.u32.u16 	%r716, %rs156;
-	and.b32  	%r717, %r716, 255;
-	mul.wide.u32 	%rd334, %r717, 4;
+	cvt.u32.u16 	%r560, %rs156;
+	mul.wide.u32 	%rd334, %r560, 4;
 	add.s64 	%rd335, %rd2, %rd334;
-	ld.local.u32 	%r718, [%rd335];
-	add.s32 	%r719, %r718, 1;
-	st.local.u32 	[%rd335], %r719;
+	ld.local.u32 	%r561, [%rd335];
+	add.s32 	%r562, %r561, 1;
+	st.local.u32 	[%rd335], %r562;
 
 $L__BB0_316:
 	ld.shared.u8 	%rs157, [_ZZ21slzHuffBuildLutKernelE12code_lengths+156];
-	add.s16 	%rs591, %rs157, -1;
-	and.b16  	%rs592, %rs591, 255;
-	setp.gt.u16 	%p160, %rs592, 10;
+	setp.eq.s16 	%p160, %rs157, 0;
 	@%p160 bra 	$L__BB0_318;
 
-	cvt.u32.u16 	%r720, %rs157;
-	and.b32  	%r721, %r720, 255;
-	mul.wide.u32 	%rd336, %r721, 4;
+	cvt.u32.u16 	%r563, %rs157;
+	mul.wide.u32 	%rd336, %r563, 4;
 	add.s64 	%rd337, %rd2, %rd336;
-	ld.local.u32 	%r722, [%rd337];
-	add.s32 	%r723, %r722, 1;
-	st.local.u32 	[%rd337], %r723;
+	ld.local.u32 	%r564, [%rd337];
+	add.s32 	%r565, %r564, 1;
+	st.local.u32 	[%rd337], %r565;
 
 $L__BB0_318:
 	ld.shared.u8 	%rs158, [_ZZ21slzHuffBuildLutKernelE12code_lengths+157];
-	add.s16 	%rs593, %rs158, -1;
-	and.b16  	%rs594, %rs593, 255;
-	setp.gt.u16 	%p161, %rs594, 10;
+	setp.eq.s16 	%p161, %rs158, 0;
 	@%p161 bra 	$L__BB0_320;
 
-	cvt.u32.u16 	%r724, %rs158;
-	and.b32  	%r725, %r724, 255;
-	mul.wide.u32 	%rd338, %r725, 4;
+	cvt.u32.u16 	%r566, %rs158;
+	mul.wide.u32 	%rd338, %r566, 4;
 	add.s64 	%rd339, %rd2, %rd338;
-	ld.local.u32 	%r726, [%rd339];
-	add.s32 	%r727, %r726, 1;
-	st.local.u32 	[%rd339], %r727;
+	ld.local.u32 	%r567, [%rd339];
+	add.s32 	%r568, %r567, 1;
+	st.local.u32 	[%rd339], %r568;
 
 $L__BB0_320:
 	ld.shared.u8 	%rs159, [_ZZ21slzHuffBuildLutKernelE12code_lengths+158];
-	add.s16 	%rs595, %rs159, -1;
-	and.b16  	%rs596, %rs595, 255;
-	setp.gt.u16 	%p162, %rs596, 10;
+	setp.eq.s16 	%p162, %rs159, 0;
 	@%p162 bra 	$L__BB0_322;
 
-	cvt.u32.u16 	%r728, %rs159;
-	and.b32  	%r729, %r728, 255;
-	mul.wide.u32 	%rd340, %r729, 4;
+	cvt.u32.u16 	%r569, %rs159;
+	mul.wide.u32 	%rd340, %r569, 4;
 	add.s64 	%rd341, %rd2, %rd340;
-	ld.local.u32 	%r730, [%rd341];
-	add.s32 	%r731, %r730, 1;
-	st.local.u32 	[%rd341], %r731;
+	ld.local.u32 	%r570, [%rd341];
+	add.s32 	%r571, %r570, 1;
+	st.local.u32 	[%rd341], %r571;
 
 $L__BB0_322:
 	ld.shared.u8 	%rs160, [_ZZ21slzHuffBuildLutKernelE12code_lengths+159];
-	add.s16 	%rs597, %rs160, -1;
-	and.b16  	%rs598, %rs597, 255;
-	setp.gt.u16 	%p163, %rs598, 10;
+	setp.eq.s16 	%p163, %rs160, 0;
 	@%p163 bra 	$L__BB0_324;
 
-	cvt.u32.u16 	%r732, %rs160;
-	and.b32  	%r733, %r732, 255;
-	mul.wide.u32 	%rd342, %r733, 4;
+	cvt.u32.u16 	%r572, %rs160;
+	mul.wide.u32 	%rd342, %r572, 4;
 	add.s64 	%rd343, %rd2, %rd342;
-	ld.local.u32 	%r734, [%rd343];
-	add.s32 	%r735, %r734, 1;
-	st.local.u32 	[%rd343], %r735;
+	ld.local.u32 	%r573, [%rd343];
+	add.s32 	%r574, %r573, 1;
+	st.local.u32 	[%rd343], %r574;
 
 $L__BB0_324:
 	ld.shared.u8 	%rs161, [_ZZ21slzHuffBuildLutKernelE12code_lengths+160];
-	add.s16 	%rs599, %rs161, -1;
-	and.b16  	%rs600, %rs599, 255;
-	setp.gt.u16 	%p164, %rs600, 10;
+	setp.eq.s16 	%p164, %rs161, 0;
 	@%p164 bra 	$L__BB0_326;
 
-	cvt.u32.u16 	%r736, %rs161;
-	and.b32  	%r737, %r736, 255;
-	mul.wide.u32 	%rd344, %r737, 4;
+	cvt.u32.u16 	%r575, %rs161;
+	mul.wide.u32 	%rd344, %r575, 4;
 	add.s64 	%rd345, %rd2, %rd344;
-	ld.local.u32 	%r738, [%rd345];
-	add.s32 	%r739, %r738, 1;
-	st.local.u32 	[%rd345], %r739;
+	ld.local.u32 	%r576, [%rd345];
+	add.s32 	%r577, %r576, 1;
+	st.local.u32 	[%rd345], %r577;
 
 $L__BB0_326:
 	ld.shared.u8 	%rs162, [_ZZ21slzHuffBuildLutKernelE12code_lengths+161];
-	add.s16 	%rs601, %rs162, -1;
-	and.b16  	%rs602, %rs601, 255;
-	setp.gt.u16 	%p165, %rs602, 10;
+	setp.eq.s16 	%p165, %rs162, 0;
 	@%p165 bra 	$L__BB0_328;
 
-	cvt.u32.u16 	%r740, %rs162;
-	and.b32  	%r741, %r740, 255;
-	mul.wide.u32 	%rd346, %r741, 4;
+	cvt.u32.u16 	%r578, %rs162;
+	mul.wide.u32 	%rd346, %r578, 4;
 	add.s64 	%rd347, %rd2, %rd346;
-	ld.local.u32 	%r742, [%rd347];
-	add.s32 	%r743, %r742, 1;
-	st.local.u32 	[%rd347], %r743;
+	ld.local.u32 	%r579, [%rd347];
+	add.s32 	%r580, %r579, 1;
+	st.local.u32 	[%rd347], %r580;
 
 $L__BB0_328:
 	ld.shared.u8 	%rs163, [_ZZ21slzHuffBuildLutKernelE12code_lengths+162];
-	add.s16 	%rs603, %rs163, -1;
-	and.b16  	%rs604, %rs603, 255;
-	setp.gt.u16 	%p166, %rs604, 10;
+	setp.eq.s16 	%p166, %rs163, 0;
 	@%p166 bra 	$L__BB0_330;
 
-	cvt.u32.u16 	%r744, %rs163;
-	and.b32  	%r745, %r744, 255;
-	mul.wide.u32 	%rd348, %r745, 4;
+	cvt.u32.u16 	%r581, %rs163;
+	mul.wide.u32 	%rd348, %r581, 4;
 	add.s64 	%rd349, %rd2, %rd348;
-	ld.local.u32 	%r746, [%rd349];
-	add.s32 	%r747, %r746, 1;
-	st.local.u32 	[%rd349], %r747;
+	ld.local.u32 	%r582, [%rd349];
+	add.s32 	%r583, %r582, 1;
+	st.local.u32 	[%rd349], %r583;
 
 $L__BB0_330:
 	ld.shared.u8 	%rs164, [_ZZ21slzHuffBuildLutKernelE12code_lengths+163];
-	add.s16 	%rs605, %rs164, -1;
-	and.b16  	%rs606, %rs605, 255;
-	setp.gt.u16 	%p167, %rs606, 10;
+	setp.eq.s16 	%p167, %rs164, 0;
 	@%p167 bra 	$L__BB0_332;
 
-	cvt.u32.u16 	%r748, %rs164;
-	and.b32  	%r749, %r748, 255;
-	mul.wide.u32 	%rd350, %r749, 4;
+	cvt.u32.u16 	%r584, %rs164;
+	mul.wide.u32 	%rd350, %r584, 4;
 	add.s64 	%rd351, %rd2, %rd350;
-	ld.local.u32 	%r750, [%rd351];
-	add.s32 	%r751, %r750, 1;
-	st.local.u32 	[%rd351], %r751;
+	ld.local.u32 	%r585, [%rd351];
+	add.s32 	%r586, %r585, 1;
+	st.local.u32 	[%rd351], %r586;
 
 $L__BB0_332:
 	ld.shared.u8 	%rs165, [_ZZ21slzHuffBuildLutKernelE12code_lengths+164];
-	add.s16 	%rs607, %rs165, -1;
-	and.b16  	%rs608, %rs607, 255;
-	setp.gt.u16 	%p168, %rs608, 10;
+	setp.eq.s16 	%p168, %rs165, 0;
 	@%p168 bra 	$L__BB0_334;
 
-	cvt.u32.u16 	%r752, %rs165;
-	and.b32  	%r753, %r752, 255;
-	mul.wide.u32 	%rd352, %r753, 4;
+	cvt.u32.u16 	%r587, %rs165;
+	mul.wide.u32 	%rd352, %r587, 4;
 	add.s64 	%rd353, %rd2, %rd352;
-	ld.local.u32 	%r754, [%rd353];
-	add.s32 	%r755, %r754, 1;
-	st.local.u32 	[%rd353], %r755;
+	ld.local.u32 	%r588, [%rd353];
+	add.s32 	%r589, %r588, 1;
+	st.local.u32 	[%rd353], %r589;
 
 $L__BB0_334:
 	ld.shared.u8 	%rs166, [_ZZ21slzHuffBuildLutKernelE12code_lengths+165];
-	add.s16 	%rs609, %rs166, -1;
-	and.b16  	%rs610, %rs609, 255;
-	setp.gt.u16 	%p169, %rs610, 10;
+	setp.eq.s16 	%p169, %rs166, 0;
 	@%p169 bra 	$L__BB0_336;
 
-	cvt.u32.u16 	%r756, %rs166;
-	and.b32  	%r757, %r756, 255;
-	mul.wide.u32 	%rd354, %r757, 4;
+	cvt.u32.u16 	%r590, %rs166;
+	mul.wide.u32 	%rd354, %r590, 4;
 	add.s64 	%rd355, %rd2, %rd354;
-	ld.local.u32 	%r758, [%rd355];
-	add.s32 	%r759, %r758, 1;
-	st.local.u32 	[%rd355], %r759;
+	ld.local.u32 	%r591, [%rd355];
+	add.s32 	%r592, %r591, 1;
+	st.local.u32 	[%rd355], %r592;
 
 $L__BB0_336:
 	ld.shared.u8 	%rs167, [_ZZ21slzHuffBuildLutKernelE12code_lengths+166];
-	add.s16 	%rs611, %rs167, -1;
-	and.b16  	%rs612, %rs611, 255;
-	setp.gt.u16 	%p170, %rs612, 10;
+	setp.eq.s16 	%p170, %rs167, 0;
 	@%p170 bra 	$L__BB0_338;
 
-	cvt.u32.u16 	%r760, %rs167;
-	and.b32  	%r761, %r760, 255;
-	mul.wide.u32 	%rd356, %r761, 4;
+	cvt.u32.u16 	%r593, %rs167;
+	mul.wide.u32 	%rd356, %r593, 4;
 	add.s64 	%rd357, %rd2, %rd356;
-	ld.local.u32 	%r762, [%rd357];
-	add.s32 	%r763, %r762, 1;
-	st.local.u32 	[%rd357], %r763;
+	ld.local.u32 	%r594, [%rd357];
+	add.s32 	%r595, %r594, 1;
+	st.local.u32 	[%rd357], %r595;
 
 $L__BB0_338:
 	ld.shared.u8 	%rs168, [_ZZ21slzHuffBuildLutKernelE12code_lengths+167];
-	add.s16 	%rs613, %rs168, -1;
-	and.b16  	%rs614, %rs613, 255;
-	setp.gt.u16 	%p171, %rs614, 10;
+	setp.eq.s16 	%p171, %rs168, 0;
 	@%p171 bra 	$L__BB0_340;
 
-	cvt.u32.u16 	%r764, %rs168;
-	and.b32  	%r765, %r764, 255;
-	mul.wide.u32 	%rd358, %r765, 4;
+	cvt.u32.u16 	%r596, %rs168;
+	mul.wide.u32 	%rd358, %r596, 4;
 	add.s64 	%rd359, %rd2, %rd358;
-	ld.local.u32 	%r766, [%rd359];
-	add.s32 	%r767, %r766, 1;
-	st.local.u32 	[%rd359], %r767;
+	ld.local.u32 	%r597, [%rd359];
+	add.s32 	%r598, %r597, 1;
+	st.local.u32 	[%rd359], %r598;
 
 $L__BB0_340:
 	ld.shared.u8 	%rs169, [_ZZ21slzHuffBuildLutKernelE12code_lengths+168];
-	add.s16 	%rs615, %rs169, -1;
-	and.b16  	%rs616, %rs615, 255;
-	setp.gt.u16 	%p172, %rs616, 10;
+	setp.eq.s16 	%p172, %rs169, 0;
 	@%p172 bra 	$L__BB0_342;
 
-	cvt.u32.u16 	%r768, %rs169;
-	and.b32  	%r769, %r768, 255;
-	mul.wide.u32 	%rd360, %r769, 4;
+	cvt.u32.u16 	%r599, %rs169;
+	mul.wide.u32 	%rd360, %r599, 4;
 	add.s64 	%rd361, %rd2, %rd360;
-	ld.local.u32 	%r770, [%rd361];
-	add.s32 	%r771, %r770, 1;
-	st.local.u32 	[%rd361], %r771;
+	ld.local.u32 	%r600, [%rd361];
+	add.s32 	%r601, %r600, 1;
+	st.local.u32 	[%rd361], %r601;
 
 $L__BB0_342:
 	ld.shared.u8 	%rs170, [_ZZ21slzHuffBuildLutKernelE12code_lengths+169];
-	add.s16 	%rs617, %rs170, -1;
-	and.b16  	%rs618, %rs617, 255;
-	setp.gt.u16 	%p173, %rs618, 10;
+	setp.eq.s16 	%p173, %rs170, 0;
 	@%p173 bra 	$L__BB0_344;
 
-	cvt.u32.u16 	%r772, %rs170;
-	and.b32  	%r773, %r772, 255;
-	mul.wide.u32 	%rd362, %r773, 4;
+	cvt.u32.u16 	%r602, %rs170;
+	mul.wide.u32 	%rd362, %r602, 4;
 	add.s64 	%rd363, %rd2, %rd362;
-	ld.local.u32 	%r774, [%rd363];
-	add.s32 	%r775, %r774, 1;
-	st.local.u32 	[%rd363], %r775;
+	ld.local.u32 	%r603, [%rd363];
+	add.s32 	%r604, %r603, 1;
+	st.local.u32 	[%rd363], %r604;
 
 $L__BB0_344:
 	ld.shared.u8 	%rs171, [_ZZ21slzHuffBuildLutKernelE12code_lengths+170];
-	add.s16 	%rs619, %rs171, -1;
-	and.b16  	%rs620, %rs619, 255;
-	setp.gt.u16 	%p174, %rs620, 10;
+	setp.eq.s16 	%p174, %rs171, 0;
 	@%p174 bra 	$L__BB0_346;
 
-	cvt.u32.u16 	%r776, %rs171;
-	and.b32  	%r777, %r776, 255;
-	mul.wide.u32 	%rd364, %r777, 4;
+	cvt.u32.u16 	%r605, %rs171;
+	mul.wide.u32 	%rd364, %r605, 4;
 	add.s64 	%rd365, %rd2, %rd364;
-	ld.local.u32 	%r778, [%rd365];
-	add.s32 	%r779, %r778, 1;
-	st.local.u32 	[%rd365], %r779;
+	ld.local.u32 	%r606, [%rd365];
+	add.s32 	%r607, %r606, 1;
+	st.local.u32 	[%rd365], %r607;
 
 $L__BB0_346:
 	ld.shared.u8 	%rs172, [_ZZ21slzHuffBuildLutKernelE12code_lengths+171];
-	add.s16 	%rs621, %rs172, -1;
-	and.b16  	%rs622, %rs621, 255;
-	setp.gt.u16 	%p175, %rs622, 10;
+	setp.eq.s16 	%p175, %rs172, 0;
 	@%p175 bra 	$L__BB0_348;
 
-	cvt.u32.u16 	%r780, %rs172;
-	and.b32  	%r781, %r780, 255;
-	mul.wide.u32 	%rd366, %r781, 4;
+	cvt.u32.u16 	%r608, %rs172;
+	mul.wide.u32 	%rd366, %r608, 4;
 	add.s64 	%rd367, %rd2, %rd366;
-	ld.local.u32 	%r782, [%rd367];
-	add.s32 	%r783, %r782, 1;
-	st.local.u32 	[%rd367], %r783;
+	ld.local.u32 	%r609, [%rd367];
+	add.s32 	%r610, %r609, 1;
+	st.local.u32 	[%rd367], %r610;
 
 $L__BB0_348:
 	ld.shared.u8 	%rs173, [_ZZ21slzHuffBuildLutKernelE12code_lengths+172];
-	add.s16 	%rs623, %rs173, -1;
-	and.b16  	%rs624, %rs623, 255;
-	setp.gt.u16 	%p176, %rs624, 10;
+	setp.eq.s16 	%p176, %rs173, 0;
 	@%p176 bra 	$L__BB0_350;
 
-	cvt.u32.u16 	%r784, %rs173;
-	and.b32  	%r785, %r784, 255;
-	mul.wide.u32 	%rd368, %r785, 4;
+	cvt.u32.u16 	%r611, %rs173;
+	mul.wide.u32 	%rd368, %r611, 4;
 	add.s64 	%rd369, %rd2, %rd368;
-	ld.local.u32 	%r786, [%rd369];
-	add.s32 	%r787, %r786, 1;
-	st.local.u32 	[%rd369], %r787;
+	ld.local.u32 	%r612, [%rd369];
+	add.s32 	%r613, %r612, 1;
+	st.local.u32 	[%rd369], %r613;
 
 $L__BB0_350:
 	ld.shared.u8 	%rs174, [_ZZ21slzHuffBuildLutKernelE12code_lengths+173];
-	add.s16 	%rs625, %rs174, -1;
-	and.b16  	%rs626, %rs625, 255;
-	setp.gt.u16 	%p177, %rs626, 10;
+	setp.eq.s16 	%p177, %rs174, 0;
 	@%p177 bra 	$L__BB0_352;
 
-	cvt.u32.u16 	%r788, %rs174;
-	and.b32  	%r789, %r788, 255;
-	mul.wide.u32 	%rd370, %r789, 4;
+	cvt.u32.u16 	%r614, %rs174;
+	mul.wide.u32 	%rd370, %r614, 4;
 	add.s64 	%rd371, %rd2, %rd370;
-	ld.local.u32 	%r790, [%rd371];
-	add.s32 	%r791, %r790, 1;
-	st.local.u32 	[%rd371], %r791;
+	ld.local.u32 	%r615, [%rd371];
+	add.s32 	%r616, %r615, 1;
+	st.local.u32 	[%rd371], %r616;
 
 $L__BB0_352:
 	ld.shared.u8 	%rs175, [_ZZ21slzHuffBuildLutKernelE12code_lengths+174];
-	add.s16 	%rs627, %rs175, -1;
-	and.b16  	%rs628, %rs627, 255;
-	setp.gt.u16 	%p178, %rs628, 10;
+	setp.eq.s16 	%p178, %rs175, 0;
 	@%p178 bra 	$L__BB0_354;
 
-	cvt.u32.u16 	%r792, %rs175;
-	and.b32  	%r793, %r792, 255;
-	mul.wide.u32 	%rd372, %r793, 4;
+	cvt.u32.u16 	%r617, %rs175;
+	mul.wide.u32 	%rd372, %r617, 4;
 	add.s64 	%rd373, %rd2, %rd372;
-	ld.local.u32 	%r794, [%rd373];
-	add.s32 	%r795, %r794, 1;
-	st.local.u32 	[%rd373], %r795;
+	ld.local.u32 	%r618, [%rd373];
+	add.s32 	%r619, %r618, 1;
+	st.local.u32 	[%rd373], %r619;
 
 $L__BB0_354:
 	ld.shared.u8 	%rs176, [_ZZ21slzHuffBuildLutKernelE12code_lengths+175];
-	add.s16 	%rs629, %rs176, -1;
-	and.b16  	%rs630, %rs629, 255;
-	setp.gt.u16 	%p179, %rs630, 10;
+	setp.eq.s16 	%p179, %rs176, 0;
 	@%p179 bra 	$L__BB0_356;
 
-	cvt.u32.u16 	%r796, %rs176;
-	and.b32  	%r797, %r796, 255;
-	mul.wide.u32 	%rd374, %r797, 4;
+	cvt.u32.u16 	%r620, %rs176;
+	mul.wide.u32 	%rd374, %r620, 4;
 	add.s64 	%rd375, %rd2, %rd374;
-	ld.local.u32 	%r798, [%rd375];
-	add.s32 	%r799, %r798, 1;
-	st.local.u32 	[%rd375], %r799;
+	ld.local.u32 	%r621, [%rd375];
+	add.s32 	%r622, %r621, 1;
+	st.local.u32 	[%rd375], %r622;
 
 $L__BB0_356:
 	ld.shared.u8 	%rs177, [_ZZ21slzHuffBuildLutKernelE12code_lengths+176];
-	add.s16 	%rs631, %rs177, -1;
-	and.b16  	%rs632, %rs631, 255;
-	setp.gt.u16 	%p180, %rs632, 10;
+	setp.eq.s16 	%p180, %rs177, 0;
 	@%p180 bra 	$L__BB0_358;
 
-	cvt.u32.u16 	%r800, %rs177;
-	and.b32  	%r801, %r800, 255;
-	mul.wide.u32 	%rd376, %r801, 4;
+	cvt.u32.u16 	%r623, %rs177;
+	mul.wide.u32 	%rd376, %r623, 4;
 	add.s64 	%rd377, %rd2, %rd376;
-	ld.local.u32 	%r802, [%rd377];
-	add.s32 	%r803, %r802, 1;
-	st.local.u32 	[%rd377], %r803;
+	ld.local.u32 	%r624, [%rd377];
+	add.s32 	%r625, %r624, 1;
+	st.local.u32 	[%rd377], %r625;
 
 $L__BB0_358:
 	ld.shared.u8 	%rs178, [_ZZ21slzHuffBuildLutKernelE12code_lengths+177];
-	add.s16 	%rs633, %rs178, -1;
-	and.b16  	%rs634, %rs633, 255;
-	setp.gt.u16 	%p181, %rs634, 10;
+	setp.eq.s16 	%p181, %rs178, 0;
 	@%p181 bra 	$L__BB0_360;
 
-	cvt.u32.u16 	%r804, %rs178;
-	and.b32  	%r805, %r804, 255;
-	mul.wide.u32 	%rd378, %r805, 4;
+	cvt.u32.u16 	%r626, %rs178;
+	mul.wide.u32 	%rd378, %r626, 4;
 	add.s64 	%rd379, %rd2, %rd378;
-	ld.local.u32 	%r806, [%rd379];
-	add.s32 	%r807, %r806, 1;
-	st.local.u32 	[%rd379], %r807;
+	ld.local.u32 	%r627, [%rd379];
+	add.s32 	%r628, %r627, 1;
+	st.local.u32 	[%rd379], %r628;
 
 $L__BB0_360:
 	ld.shared.u8 	%rs179, [_ZZ21slzHuffBuildLutKernelE12code_lengths+178];
-	add.s16 	%rs635, %rs179, -1;
-	and.b16  	%rs636, %rs635, 255;
-	setp.gt.u16 	%p182, %rs636, 10;
+	setp.eq.s16 	%p182, %rs179, 0;
 	@%p182 bra 	$L__BB0_362;
 
-	cvt.u32.u16 	%r808, %rs179;
-	and.b32  	%r809, %r808, 255;
-	mul.wide.u32 	%rd380, %r809, 4;
+	cvt.u32.u16 	%r629, %rs179;
+	mul.wide.u32 	%rd380, %r629, 4;
 	add.s64 	%rd381, %rd2, %rd380;
-	ld.local.u32 	%r810, [%rd381];
-	add.s32 	%r811, %r810, 1;
-	st.local.u32 	[%rd381], %r811;
+	ld.local.u32 	%r630, [%rd381];
+	add.s32 	%r631, %r630, 1;
+	st.local.u32 	[%rd381], %r631;
 
 $L__BB0_362:
 	ld.shared.u8 	%rs180, [_ZZ21slzHuffBuildLutKernelE12code_lengths+179];
-	add.s16 	%rs637, %rs180, -1;
-	and.b16  	%rs638, %rs637, 255;
-	setp.gt.u16 	%p183, %rs638, 10;
+	setp.eq.s16 	%p183, %rs180, 0;
 	@%p183 bra 	$L__BB0_364;
 
-	cvt.u32.u16 	%r812, %rs180;
-	and.b32  	%r813, %r812, 255;
-	mul.wide.u32 	%rd382, %r813, 4;
+	cvt.u32.u16 	%r632, %rs180;
+	mul.wide.u32 	%rd382, %r632, 4;
 	add.s64 	%rd383, %rd2, %rd382;
-	ld.local.u32 	%r814, [%rd383];
-	add.s32 	%r815, %r814, 1;
-	st.local.u32 	[%rd383], %r815;
+	ld.local.u32 	%r633, [%rd383];
+	add.s32 	%r634, %r633, 1;
+	st.local.u32 	[%rd383], %r634;
 
 $L__BB0_364:
 	ld.shared.u8 	%rs181, [_ZZ21slzHuffBuildLutKernelE12code_lengths+180];
-	add.s16 	%rs639, %rs181, -1;
-	and.b16  	%rs640, %rs639, 255;
-	setp.gt.u16 	%p184, %rs640, 10;
+	setp.eq.s16 	%p184, %rs181, 0;
 	@%p184 bra 	$L__BB0_366;
 
-	cvt.u32.u16 	%r816, %rs181;
-	and.b32  	%r817, %r816, 255;
-	mul.wide.u32 	%rd384, %r817, 4;
+	cvt.u32.u16 	%r635, %rs181;
+	mul.wide.u32 	%rd384, %r635, 4;
 	add.s64 	%rd385, %rd2, %rd384;
-	ld.local.u32 	%r818, [%rd385];
-	add.s32 	%r819, %r818, 1;
-	st.local.u32 	[%rd385], %r819;
+	ld.local.u32 	%r636, [%rd385];
+	add.s32 	%r637, %r636, 1;
+	st.local.u32 	[%rd385], %r637;
 
 $L__BB0_366:
 	ld.shared.u8 	%rs182, [_ZZ21slzHuffBuildLutKernelE12code_lengths+181];
-	add.s16 	%rs641, %rs182, -1;
-	and.b16  	%rs642, %rs641, 255;
-	setp.gt.u16 	%p185, %rs642, 10;
+	setp.eq.s16 	%p185, %rs182, 0;
 	@%p185 bra 	$L__BB0_368;
 
-	cvt.u32.u16 	%r820, %rs182;
-	and.b32  	%r821, %r820, 255;
-	mul.wide.u32 	%rd386, %r821, 4;
+	cvt.u32.u16 	%r638, %rs182;
+	mul.wide.u32 	%rd386, %r638, 4;
 	add.s64 	%rd387, %rd2, %rd386;
-	ld.local.u32 	%r822, [%rd387];
-	add.s32 	%r823, %r822, 1;
-	st.local.u32 	[%rd387], %r823;
+	ld.local.u32 	%r639, [%rd387];
+	add.s32 	%r640, %r639, 1;
+	st.local.u32 	[%rd387], %r640;
 
 $L__BB0_368:
 	ld.shared.u8 	%rs183, [_ZZ21slzHuffBuildLutKernelE12code_lengths+182];
-	add.s16 	%rs643, %rs183, -1;
-	and.b16  	%rs644, %rs643, 255;
-	setp.gt.u16 	%p186, %rs644, 10;
+	setp.eq.s16 	%p186, %rs183, 0;
 	@%p186 bra 	$L__BB0_370;
 
-	cvt.u32.u16 	%r824, %rs183;
-	and.b32  	%r825, %r824, 255;
-	mul.wide.u32 	%rd388, %r825, 4;
+	cvt.u32.u16 	%r641, %rs183;
+	mul.wide.u32 	%rd388, %r641, 4;
 	add.s64 	%rd389, %rd2, %rd388;
-	ld.local.u32 	%r826, [%rd389];
-	add.s32 	%r827, %r826, 1;
-	st.local.u32 	[%rd389], %r827;
+	ld.local.u32 	%r642, [%rd389];
+	add.s32 	%r643, %r642, 1;
+	st.local.u32 	[%rd389], %r643;
 
 $L__BB0_370:
 	ld.shared.u8 	%rs184, [_ZZ21slzHuffBuildLutKernelE12code_lengths+183];
-	add.s16 	%rs645, %rs184, -1;
-	and.b16  	%rs646, %rs645, 255;
-	setp.gt.u16 	%p187, %rs646, 10;
+	setp.eq.s16 	%p187, %rs184, 0;
 	@%p187 bra 	$L__BB0_372;
 
-	cvt.u32.u16 	%r828, %rs184;
-	and.b32  	%r829, %r828, 255;
-	mul.wide.u32 	%rd390, %r829, 4;
+	cvt.u32.u16 	%r644, %rs184;
+	mul.wide.u32 	%rd390, %r644, 4;
 	add.s64 	%rd391, %rd2, %rd390;
-	ld.local.u32 	%r830, [%rd391];
-	add.s32 	%r831, %r830, 1;
-	st.local.u32 	[%rd391], %r831;
+	ld.local.u32 	%r645, [%rd391];
+	add.s32 	%r646, %r645, 1;
+	st.local.u32 	[%rd391], %r646;
 
 $L__BB0_372:
 	ld.shared.u8 	%rs185, [_ZZ21slzHuffBuildLutKernelE12code_lengths+184];
-	add.s16 	%rs647, %rs185, -1;
-	and.b16  	%rs648, %rs647, 255;
-	setp.gt.u16 	%p188, %rs648, 10;
+	setp.eq.s16 	%p188, %rs185, 0;
 	@%p188 bra 	$L__BB0_374;
 
-	cvt.u32.u16 	%r832, %rs185;
-	and.b32  	%r833, %r832, 255;
-	mul.wide.u32 	%rd392, %r833, 4;
+	cvt.u32.u16 	%r647, %rs185;
+	mul.wide.u32 	%rd392, %r647, 4;
 	add.s64 	%rd393, %rd2, %rd392;
-	ld.local.u32 	%r834, [%rd393];
-	add.s32 	%r835, %r834, 1;
-	st.local.u32 	[%rd393], %r835;
+	ld.local.u32 	%r648, [%rd393];
+	add.s32 	%r649, %r648, 1;
+	st.local.u32 	[%rd393], %r649;
 
 $L__BB0_374:
 	ld.shared.u8 	%rs186, [_ZZ21slzHuffBuildLutKernelE12code_lengths+185];
-	add.s16 	%rs649, %rs186, -1;
-	and.b16  	%rs650, %rs649, 255;
-	setp.gt.u16 	%p189, %rs650, 10;
+	setp.eq.s16 	%p189, %rs186, 0;
 	@%p189 bra 	$L__BB0_376;
 
-	cvt.u32.u16 	%r836, %rs186;
-	and.b32  	%r837, %r836, 255;
-	mul.wide.u32 	%rd394, %r837, 4;
+	cvt.u32.u16 	%r650, %rs186;
+	mul.wide.u32 	%rd394, %r650, 4;
 	add.s64 	%rd395, %rd2, %rd394;
-	ld.local.u32 	%r838, [%rd395];
-	add.s32 	%r839, %r838, 1;
-	st.local.u32 	[%rd395], %r839;
+	ld.local.u32 	%r651, [%rd395];
+	add.s32 	%r652, %r651, 1;
+	st.local.u32 	[%rd395], %r652;
 
 $L__BB0_376:
 	ld.shared.u8 	%rs187, [_ZZ21slzHuffBuildLutKernelE12code_lengths+186];
-	add.s16 	%rs651, %rs187, -1;
-	and.b16  	%rs652, %rs651, 255;
-	setp.gt.u16 	%p190, %rs652, 10;
+	setp.eq.s16 	%p190, %rs187, 0;
 	@%p190 bra 	$L__BB0_378;
 
-	cvt.u32.u16 	%r840, %rs187;
-	and.b32  	%r841, %r840, 255;
-	mul.wide.u32 	%rd396, %r841, 4;
+	cvt.u32.u16 	%r653, %rs187;
+	mul.wide.u32 	%rd396, %r653, 4;
 	add.s64 	%rd397, %rd2, %rd396;
-	ld.local.u32 	%r842, [%rd397];
-	add.s32 	%r843, %r842, 1;
-	st.local.u32 	[%rd397], %r843;
+	ld.local.u32 	%r654, [%rd397];
+	add.s32 	%r655, %r654, 1;
+	st.local.u32 	[%rd397], %r655;
 
 $L__BB0_378:
 	ld.shared.u8 	%rs188, [_ZZ21slzHuffBuildLutKernelE12code_lengths+187];
-	add.s16 	%rs653, %rs188, -1;
-	and.b16  	%rs654, %rs653, 255;
-	setp.gt.u16 	%p191, %rs654, 10;
+	setp.eq.s16 	%p191, %rs188, 0;
 	@%p191 bra 	$L__BB0_380;
 
-	cvt.u32.u16 	%r844, %rs188;
-	and.b32  	%r845, %r844, 255;
-	mul.wide.u32 	%rd398, %r845, 4;
+	cvt.u32.u16 	%r656, %rs188;
+	mul.wide.u32 	%rd398, %r656, 4;
 	add.s64 	%rd399, %rd2, %rd398;
-	ld.local.u32 	%r846, [%rd399];
-	add.s32 	%r847, %r846, 1;
-	st.local.u32 	[%rd399], %r847;
+	ld.local.u32 	%r657, [%rd399];
+	add.s32 	%r658, %r657, 1;
+	st.local.u32 	[%rd399], %r658;
 
 $L__BB0_380:
 	ld.shared.u8 	%rs189, [_ZZ21slzHuffBuildLutKernelE12code_lengths+188];
-	add.s16 	%rs655, %rs189, -1;
-	and.b16  	%rs656, %rs655, 255;
-	setp.gt.u16 	%p192, %rs656, 10;
+	setp.eq.s16 	%p192, %rs189, 0;
 	@%p192 bra 	$L__BB0_382;
 
-	cvt.u32.u16 	%r848, %rs189;
-	and.b32  	%r849, %r848, 255;
-	mul.wide.u32 	%rd400, %r849, 4;
+	cvt.u32.u16 	%r659, %rs189;
+	mul.wide.u32 	%rd400, %r659, 4;
 	add.s64 	%rd401, %rd2, %rd400;
-	ld.local.u32 	%r850, [%rd401];
-	add.s32 	%r851, %r850, 1;
-	st.local.u32 	[%rd401], %r851;
+	ld.local.u32 	%r660, [%rd401];
+	add.s32 	%r661, %r660, 1;
+	st.local.u32 	[%rd401], %r661;
 
 $L__BB0_382:
 	ld.shared.u8 	%rs190, [_ZZ21slzHuffBuildLutKernelE12code_lengths+189];
-	add.s16 	%rs657, %rs190, -1;
-	and.b16  	%rs658, %rs657, 255;
-	setp.gt.u16 	%p193, %rs658, 10;
+	setp.eq.s16 	%p193, %rs190, 0;
 	@%p193 bra 	$L__BB0_384;
 
-	cvt.u32.u16 	%r852, %rs190;
-	and.b32  	%r853, %r852, 255;
-	mul.wide.u32 	%rd402, %r853, 4;
+	cvt.u32.u16 	%r662, %rs190;
+	mul.wide.u32 	%rd402, %r662, 4;
 	add.s64 	%rd403, %rd2, %rd402;
-	ld.local.u32 	%r854, [%rd403];
-	add.s32 	%r855, %r854, 1;
-	st.local.u32 	[%rd403], %r855;
+	ld.local.u32 	%r663, [%rd403];
+	add.s32 	%r664, %r663, 1;
+	st.local.u32 	[%rd403], %r664;
 
 $L__BB0_384:
 	ld.shared.u8 	%rs191, [_ZZ21slzHuffBuildLutKernelE12code_lengths+190];
-	add.s16 	%rs659, %rs191, -1;
-	and.b16  	%rs660, %rs659, 255;
-	setp.gt.u16 	%p194, %rs660, 10;
+	setp.eq.s16 	%p194, %rs191, 0;
 	@%p194 bra 	$L__BB0_386;
 
-	cvt.u32.u16 	%r856, %rs191;
-	and.b32  	%r857, %r856, 255;
-	mul.wide.u32 	%rd404, %r857, 4;
+	cvt.u32.u16 	%r665, %rs191;
+	mul.wide.u32 	%rd404, %r665, 4;
 	add.s64 	%rd405, %rd2, %rd404;
-	ld.local.u32 	%r858, [%rd405];
-	add.s32 	%r859, %r858, 1;
-	st.local.u32 	[%rd405], %r859;
+	ld.local.u32 	%r666, [%rd405];
+	add.s32 	%r667, %r666, 1;
+	st.local.u32 	[%rd405], %r667;
 
 $L__BB0_386:
 	ld.shared.u8 	%rs192, [_ZZ21slzHuffBuildLutKernelE12code_lengths+191];
-	add.s16 	%rs661, %rs192, -1;
-	and.b16  	%rs662, %rs661, 255;
-	setp.gt.u16 	%p195, %rs662, 10;
+	setp.eq.s16 	%p195, %rs192, 0;
 	@%p195 bra 	$L__BB0_388;
 
-	cvt.u32.u16 	%r860, %rs192;
-	and.b32  	%r861, %r860, 255;
-	mul.wide.u32 	%rd406, %r861, 4;
+	cvt.u32.u16 	%r668, %rs192;
+	mul.wide.u32 	%rd406, %r668, 4;
 	add.s64 	%rd407, %rd2, %rd406;
-	ld.local.u32 	%r862, [%rd407];
-	add.s32 	%r863, %r862, 1;
-	st.local.u32 	[%rd407], %r863;
+	ld.local.u32 	%r669, [%rd407];
+	add.s32 	%r670, %r669, 1;
+	st.local.u32 	[%rd407], %r670;
 
 $L__BB0_388:
 	ld.shared.u8 	%rs193, [_ZZ21slzHuffBuildLutKernelE12code_lengths+192];
-	add.s16 	%rs663, %rs193, -1;
-	and.b16  	%rs664, %rs663, 255;
-	setp.gt.u16 	%p196, %rs664, 10;
+	setp.eq.s16 	%p196, %rs193, 0;
 	@%p196 bra 	$L__BB0_390;
 
-	cvt.u32.u16 	%r864, %rs193;
-	and.b32  	%r865, %r864, 255;
-	mul.wide.u32 	%rd408, %r865, 4;
+	cvt.u32.u16 	%r671, %rs193;
+	mul.wide.u32 	%rd408, %r671, 4;
 	add.s64 	%rd409, %rd2, %rd408;
-	ld.local.u32 	%r866, [%rd409];
-	add.s32 	%r867, %r866, 1;
-	st.local.u32 	[%rd409], %r867;
+	ld.local.u32 	%r672, [%rd409];
+	add.s32 	%r673, %r672, 1;
+	st.local.u32 	[%rd409], %r673;
 
 $L__BB0_390:
 	ld.shared.u8 	%rs194, [_ZZ21slzHuffBuildLutKernelE12code_lengths+193];
-	add.s16 	%rs665, %rs194, -1;
-	and.b16  	%rs666, %rs665, 255;
-	setp.gt.u16 	%p197, %rs666, 10;
+	setp.eq.s16 	%p197, %rs194, 0;
 	@%p197 bra 	$L__BB0_392;
 
-	cvt.u32.u16 	%r868, %rs194;
-	and.b32  	%r869, %r868, 255;
-	mul.wide.u32 	%rd410, %r869, 4;
+	cvt.u32.u16 	%r674, %rs194;
+	mul.wide.u32 	%rd410, %r674, 4;
 	add.s64 	%rd411, %rd2, %rd410;
-	ld.local.u32 	%r870, [%rd411];
-	add.s32 	%r871, %r870, 1;
-	st.local.u32 	[%rd411], %r871;
+	ld.local.u32 	%r675, [%rd411];
+	add.s32 	%r676, %r675, 1;
+	st.local.u32 	[%rd411], %r676;
 
 $L__BB0_392:
 	ld.shared.u8 	%rs195, [_ZZ21slzHuffBuildLutKernelE12code_lengths+194];
-	add.s16 	%rs667, %rs195, -1;
-	and.b16  	%rs668, %rs667, 255;
-	setp.gt.u16 	%p198, %rs668, 10;
+	setp.eq.s16 	%p198, %rs195, 0;
 	@%p198 bra 	$L__BB0_394;
 
-	cvt.u32.u16 	%r872, %rs195;
-	and.b32  	%r873, %r872, 255;
-	mul.wide.u32 	%rd412, %r873, 4;
+	cvt.u32.u16 	%r677, %rs195;
+	mul.wide.u32 	%rd412, %r677, 4;
 	add.s64 	%rd413, %rd2, %rd412;
-	ld.local.u32 	%r874, [%rd413];
-	add.s32 	%r875, %r874, 1;
-	st.local.u32 	[%rd413], %r875;
+	ld.local.u32 	%r678, [%rd413];
+	add.s32 	%r679, %r678, 1;
+	st.local.u32 	[%rd413], %r679;
 
 $L__BB0_394:
 	ld.shared.u8 	%rs196, [_ZZ21slzHuffBuildLutKernelE12code_lengths+195];
-	add.s16 	%rs669, %rs196, -1;
-	and.b16  	%rs670, %rs669, 255;
-	setp.gt.u16 	%p199, %rs670, 10;
+	setp.eq.s16 	%p199, %rs196, 0;
 	@%p199 bra 	$L__BB0_396;
 
-	cvt.u32.u16 	%r876, %rs196;
-	and.b32  	%r877, %r876, 255;
-	mul.wide.u32 	%rd414, %r877, 4;
+	cvt.u32.u16 	%r680, %rs196;
+	mul.wide.u32 	%rd414, %r680, 4;
 	add.s64 	%rd415, %rd2, %rd414;
-	ld.local.u32 	%r878, [%rd415];
-	add.s32 	%r879, %r878, 1;
-	st.local.u32 	[%rd415], %r879;
+	ld.local.u32 	%r681, [%rd415];
+	add.s32 	%r682, %r681, 1;
+	st.local.u32 	[%rd415], %r682;
 
 $L__BB0_396:
 	ld.shared.u8 	%rs197, [_ZZ21slzHuffBuildLutKernelE12code_lengths+196];
-	add.s16 	%rs671, %rs197, -1;
-	and.b16  	%rs672, %rs671, 255;
-	setp.gt.u16 	%p200, %rs672, 10;
+	setp.eq.s16 	%p200, %rs197, 0;
 	@%p200 bra 	$L__BB0_398;
 
-	cvt.u32.u16 	%r880, %rs197;
-	and.b32  	%r881, %r880, 255;
-	mul.wide.u32 	%rd416, %r881, 4;
+	cvt.u32.u16 	%r683, %rs197;
+	mul.wide.u32 	%rd416, %r683, 4;
 	add.s64 	%rd417, %rd2, %rd416;
-	ld.local.u32 	%r882, [%rd417];
-	add.s32 	%r883, %r882, 1;
-	st.local.u32 	[%rd417], %r883;
+	ld.local.u32 	%r684, [%rd417];
+	add.s32 	%r685, %r684, 1;
+	st.local.u32 	[%rd417], %r685;
 
 $L__BB0_398:
 	ld.shared.u8 	%rs198, [_ZZ21slzHuffBuildLutKernelE12code_lengths+197];
-	add.s16 	%rs673, %rs198, -1;
-	and.b16  	%rs674, %rs673, 255;
-	setp.gt.u16 	%p201, %rs674, 10;
+	setp.eq.s16 	%p201, %rs198, 0;
 	@%p201 bra 	$L__BB0_400;
 
-	cvt.u32.u16 	%r884, %rs198;
-	and.b32  	%r885, %r884, 255;
-	mul.wide.u32 	%rd418, %r885, 4;
+	cvt.u32.u16 	%r686, %rs198;
+	mul.wide.u32 	%rd418, %r686, 4;
 	add.s64 	%rd419, %rd2, %rd418;
-	ld.local.u32 	%r886, [%rd419];
-	add.s32 	%r887, %r886, 1;
-	st.local.u32 	[%rd419], %r887;
+	ld.local.u32 	%r687, [%rd419];
+	add.s32 	%r688, %r687, 1;
+	st.local.u32 	[%rd419], %r688;
 
 $L__BB0_400:
 	ld.shared.u8 	%rs199, [_ZZ21slzHuffBuildLutKernelE12code_lengths+198];
-	add.s16 	%rs675, %rs199, -1;
-	and.b16  	%rs676, %rs675, 255;
-	setp.gt.u16 	%p202, %rs676, 10;
+	setp.eq.s16 	%p202, %rs199, 0;
 	@%p202 bra 	$L__BB0_402;
 
-	cvt.u32.u16 	%r888, %rs199;
-	and.b32  	%r889, %r888, 255;
-	mul.wide.u32 	%rd420, %r889, 4;
+	cvt.u32.u16 	%r689, %rs199;
+	mul.wide.u32 	%rd420, %r689, 4;
 	add.s64 	%rd421, %rd2, %rd420;
-	ld.local.u32 	%r890, [%rd421];
-	add.s32 	%r891, %r890, 1;
-	st.local.u32 	[%rd421], %r891;
+	ld.local.u32 	%r690, [%rd421];
+	add.s32 	%r691, %r690, 1;
+	st.local.u32 	[%rd421], %r691;
 
 $L__BB0_402:
 	ld.shared.u8 	%rs200, [_ZZ21slzHuffBuildLutKernelE12code_lengths+199];
-	add.s16 	%rs677, %rs200, -1;
-	and.b16  	%rs678, %rs677, 255;
-	setp.gt.u16 	%p203, %rs678, 10;
+	setp.eq.s16 	%p203, %rs200, 0;
 	@%p203 bra 	$L__BB0_404;
 
-	cvt.u32.u16 	%r892, %rs200;
-	and.b32  	%r893, %r892, 255;
-	mul.wide.u32 	%rd422, %r893, 4;
+	cvt.u32.u16 	%r692, %rs200;
+	mul.wide.u32 	%rd422, %r692, 4;
 	add.s64 	%rd423, %rd2, %rd422;
-	ld.local.u32 	%r894, [%rd423];
-	add.s32 	%r895, %r894, 1;
-	st.local.u32 	[%rd423], %r895;
+	ld.local.u32 	%r693, [%rd423];
+	add.s32 	%r694, %r693, 1;
+	st.local.u32 	[%rd423], %r694;
 
 $L__BB0_404:
 	ld.shared.u8 	%rs201, [_ZZ21slzHuffBuildLutKernelE12code_lengths+200];
-	add.s16 	%rs679, %rs201, -1;
-	and.b16  	%rs680, %rs679, 255;
-	setp.gt.u16 	%p204, %rs680, 10;
+	setp.eq.s16 	%p204, %rs201, 0;
 	@%p204 bra 	$L__BB0_406;
 
-	cvt.u32.u16 	%r896, %rs201;
-	and.b32  	%r897, %r896, 255;
-	mul.wide.u32 	%rd424, %r897, 4;
+	cvt.u32.u16 	%r695, %rs201;
+	mul.wide.u32 	%rd424, %r695, 4;
 	add.s64 	%rd425, %rd2, %rd424;
-	ld.local.u32 	%r898, [%rd425];
-	add.s32 	%r899, %r898, 1;
-	st.local.u32 	[%rd425], %r899;
+	ld.local.u32 	%r696, [%rd425];
+	add.s32 	%r697, %r696, 1;
+	st.local.u32 	[%rd425], %r697;
 
 $L__BB0_406:
 	ld.shared.u8 	%rs202, [_ZZ21slzHuffBuildLutKernelE12code_lengths+201];
-	add.s16 	%rs681, %rs202, -1;
-	and.b16  	%rs682, %rs681, 255;
-	setp.gt.u16 	%p205, %rs682, 10;
+	setp.eq.s16 	%p205, %rs202, 0;
 	@%p205 bra 	$L__BB0_408;
 
-	cvt.u32.u16 	%r900, %rs202;
-	and.b32  	%r901, %r900, 255;
-	mul.wide.u32 	%rd426, %r901, 4;
+	cvt.u32.u16 	%r698, %rs202;
+	mul.wide.u32 	%rd426, %r698, 4;
 	add.s64 	%rd427, %rd2, %rd426;
-	ld.local.u32 	%r902, [%rd427];
-	add.s32 	%r903, %r902, 1;
-	st.local.u32 	[%rd427], %r903;
+	ld.local.u32 	%r699, [%rd427];
+	add.s32 	%r700, %r699, 1;
+	st.local.u32 	[%rd427], %r700;
 
 $L__BB0_408:
 	ld.shared.u8 	%rs203, [_ZZ21slzHuffBuildLutKernelE12code_lengths+202];
-	add.s16 	%rs683, %rs203, -1;
-	and.b16  	%rs684, %rs683, 255;
-	setp.gt.u16 	%p206, %rs684, 10;
+	setp.eq.s16 	%p206, %rs203, 0;
 	@%p206 bra 	$L__BB0_410;
 
-	cvt.u32.u16 	%r904, %rs203;
-	and.b32  	%r905, %r904, 255;
-	mul.wide.u32 	%rd428, %r905, 4;
+	cvt.u32.u16 	%r701, %rs203;
+	mul.wide.u32 	%rd428, %r701, 4;
 	add.s64 	%rd429, %rd2, %rd428;
-	ld.local.u32 	%r906, [%rd429];
-	add.s32 	%r907, %r906, 1;
-	st.local.u32 	[%rd429], %r907;
+	ld.local.u32 	%r702, [%rd429];
+	add.s32 	%r703, %r702, 1;
+	st.local.u32 	[%rd429], %r703;
 
 $L__BB0_410:
 	ld.shared.u8 	%rs204, [_ZZ21slzHuffBuildLutKernelE12code_lengths+203];
-	add.s16 	%rs685, %rs204, -1;
-	and.b16  	%rs686, %rs685, 255;
-	setp.gt.u16 	%p207, %rs686, 10;
+	setp.eq.s16 	%p207, %rs204, 0;
 	@%p207 bra 	$L__BB0_412;
 
-	cvt.u32.u16 	%r908, %rs204;
-	and.b32  	%r909, %r908, 255;
-	mul.wide.u32 	%rd430, %r909, 4;
+	cvt.u32.u16 	%r704, %rs204;
+	mul.wide.u32 	%rd430, %r704, 4;
 	add.s64 	%rd431, %rd2, %rd430;
-	ld.local.u32 	%r910, [%rd431];
-	add.s32 	%r911, %r910, 1;
-	st.local.u32 	[%rd431], %r911;
+	ld.local.u32 	%r705, [%rd431];
+	add.s32 	%r706, %r705, 1;
+	st.local.u32 	[%rd431], %r706;
 
 $L__BB0_412:
 	ld.shared.u8 	%rs205, [_ZZ21slzHuffBuildLutKernelE12code_lengths+204];
-	add.s16 	%rs687, %rs205, -1;
-	and.b16  	%rs688, %rs687, 255;
-	setp.gt.u16 	%p208, %rs688, 10;
+	setp.eq.s16 	%p208, %rs205, 0;
 	@%p208 bra 	$L__BB0_414;
 
-	cvt.u32.u16 	%r912, %rs205;
-	and.b32  	%r913, %r912, 255;
-	mul.wide.u32 	%rd432, %r913, 4;
+	cvt.u32.u16 	%r707, %rs205;
+	mul.wide.u32 	%rd432, %r707, 4;
 	add.s64 	%rd433, %rd2, %rd432;
-	ld.local.u32 	%r914, [%rd433];
-	add.s32 	%r915, %r914, 1;
-	st.local.u32 	[%rd433], %r915;
+	ld.local.u32 	%r708, [%rd433];
+	add.s32 	%r709, %r708, 1;
+	st.local.u32 	[%rd433], %r709;
 
 $L__BB0_414:
 	ld.shared.u8 	%rs206, [_ZZ21slzHuffBuildLutKernelE12code_lengths+205];
-	add.s16 	%rs689, %rs206, -1;
-	and.b16  	%rs690, %rs689, 255;
-	setp.gt.u16 	%p209, %rs690, 10;
+	setp.eq.s16 	%p209, %rs206, 0;
 	@%p209 bra 	$L__BB0_416;
 
-	cvt.u32.u16 	%r916, %rs206;
-	and.b32  	%r917, %r916, 255;
-	mul.wide.u32 	%rd434, %r917, 4;
+	cvt.u32.u16 	%r710, %rs206;
+	mul.wide.u32 	%rd434, %r710, 4;
 	add.s64 	%rd435, %rd2, %rd434;
-	ld.local.u32 	%r918, [%rd435];
-	add.s32 	%r919, %r918, 1;
-	st.local.u32 	[%rd435], %r919;
+	ld.local.u32 	%r711, [%rd435];
+	add.s32 	%r712, %r711, 1;
+	st.local.u32 	[%rd435], %r712;
 
 $L__BB0_416:
 	ld.shared.u8 	%rs207, [_ZZ21slzHuffBuildLutKernelE12code_lengths+206];
-	add.s16 	%rs691, %rs207, -1;
-	and.b16  	%rs692, %rs691, 255;
-	setp.gt.u16 	%p210, %rs692, 10;
+	setp.eq.s16 	%p210, %rs207, 0;
 	@%p210 bra 	$L__BB0_418;
 
-	cvt.u32.u16 	%r920, %rs207;
-	and.b32  	%r921, %r920, 255;
-	mul.wide.u32 	%rd436, %r921, 4;
+	cvt.u32.u16 	%r713, %rs207;
+	mul.wide.u32 	%rd436, %r713, 4;
 	add.s64 	%rd437, %rd2, %rd436;
-	ld.local.u32 	%r922, [%rd437];
-	add.s32 	%r923, %r922, 1;
-	st.local.u32 	[%rd437], %r923;
+	ld.local.u32 	%r714, [%rd437];
+	add.s32 	%r715, %r714, 1;
+	st.local.u32 	[%rd437], %r715;
 
 $L__BB0_418:
 	ld.shared.u8 	%rs208, [_ZZ21slzHuffBuildLutKernelE12code_lengths+207];
-	add.s16 	%rs693, %rs208, -1;
-	and.b16  	%rs694, %rs693, 255;
-	setp.gt.u16 	%p211, %rs694, 10;
+	setp.eq.s16 	%p211, %rs208, 0;
 	@%p211 bra 	$L__BB0_420;
 
-	cvt.u32.u16 	%r924, %rs208;
-	and.b32  	%r925, %r924, 255;
-	mul.wide.u32 	%rd438, %r925, 4;
+	cvt.u32.u16 	%r716, %rs208;
+	mul.wide.u32 	%rd438, %r716, 4;
 	add.s64 	%rd439, %rd2, %rd438;
-	ld.local.u32 	%r926, [%rd439];
-	add.s32 	%r927, %r926, 1;
-	st.local.u32 	[%rd439], %r927;
+	ld.local.u32 	%r717, [%rd439];
+	add.s32 	%r718, %r717, 1;
+	st.local.u32 	[%rd439], %r718;
 
 $L__BB0_420:
 	ld.shared.u8 	%rs209, [_ZZ21slzHuffBuildLutKernelE12code_lengths+208];
-	add.s16 	%rs695, %rs209, -1;
-	and.b16  	%rs696, %rs695, 255;
-	setp.gt.u16 	%p212, %rs696, 10;
+	setp.eq.s16 	%p212, %rs209, 0;
 	@%p212 bra 	$L__BB0_422;
 
-	cvt.u32.u16 	%r928, %rs209;
-	and.b32  	%r929, %r928, 255;
-	mul.wide.u32 	%rd440, %r929, 4;
+	cvt.u32.u16 	%r719, %rs209;
+	mul.wide.u32 	%rd440, %r719, 4;
 	add.s64 	%rd441, %rd2, %rd440;
-	ld.local.u32 	%r930, [%rd441];
-	add.s32 	%r931, %r930, 1;
-	st.local.u32 	[%rd441], %r931;
+	ld.local.u32 	%r720, [%rd441];
+	add.s32 	%r721, %r720, 1;
+	st.local.u32 	[%rd441], %r721;
 
 $L__BB0_422:
 	ld.shared.u8 	%rs210, [_ZZ21slzHuffBuildLutKernelE12code_lengths+209];
-	add.s16 	%rs697, %rs210, -1;
-	and.b16  	%rs698, %rs697, 255;
-	setp.gt.u16 	%p213, %rs698, 10;
+	setp.eq.s16 	%p213, %rs210, 0;
 	@%p213 bra 	$L__BB0_424;
 
-	cvt.u32.u16 	%r932, %rs210;
-	and.b32  	%r933, %r932, 255;
-	mul.wide.u32 	%rd442, %r933, 4;
+	cvt.u32.u16 	%r722, %rs210;
+	mul.wide.u32 	%rd442, %r722, 4;
 	add.s64 	%rd443, %rd2, %rd442;
-	ld.local.u32 	%r934, [%rd443];
-	add.s32 	%r935, %r934, 1;
-	st.local.u32 	[%rd443], %r935;
+	ld.local.u32 	%r723, [%rd443];
+	add.s32 	%r724, %r723, 1;
+	st.local.u32 	[%rd443], %r724;
 
 $L__BB0_424:
 	ld.shared.u8 	%rs211, [_ZZ21slzHuffBuildLutKernelE12code_lengths+210];
-	add.s16 	%rs699, %rs211, -1;
-	and.b16  	%rs700, %rs699, 255;
-	setp.gt.u16 	%p214, %rs700, 10;
+	setp.eq.s16 	%p214, %rs211, 0;
 	@%p214 bra 	$L__BB0_426;
 
-	cvt.u32.u16 	%r936, %rs211;
-	and.b32  	%r937, %r936, 255;
-	mul.wide.u32 	%rd444, %r937, 4;
+	cvt.u32.u16 	%r725, %rs211;
+	mul.wide.u32 	%rd444, %r725, 4;
 	add.s64 	%rd445, %rd2, %rd444;
-	ld.local.u32 	%r938, [%rd445];
-	add.s32 	%r939, %r938, 1;
-	st.local.u32 	[%rd445], %r939;
+	ld.local.u32 	%r726, [%rd445];
+	add.s32 	%r727, %r726, 1;
+	st.local.u32 	[%rd445], %r727;
 
 $L__BB0_426:
 	ld.shared.u8 	%rs212, [_ZZ21slzHuffBuildLutKernelE12code_lengths+211];
-	add.s16 	%rs701, %rs212, -1;
-	and.b16  	%rs702, %rs701, 255;
-	setp.gt.u16 	%p215, %rs702, 10;
+	setp.eq.s16 	%p215, %rs212, 0;
 	@%p215 bra 	$L__BB0_428;
 
-	cvt.u32.u16 	%r940, %rs212;
-	and.b32  	%r941, %r940, 255;
-	mul.wide.u32 	%rd446, %r941, 4;
+	cvt.u32.u16 	%r728, %rs212;
+	mul.wide.u32 	%rd446, %r728, 4;
 	add.s64 	%rd447, %rd2, %rd446;
-	ld.local.u32 	%r942, [%rd447];
-	add.s32 	%r943, %r942, 1;
-	st.local.u32 	[%rd447], %r943;
+	ld.local.u32 	%r729, [%rd447];
+	add.s32 	%r730, %r729, 1;
+	st.local.u32 	[%rd447], %r730;
 
 $L__BB0_428:
 	ld.shared.u8 	%rs213, [_ZZ21slzHuffBuildLutKernelE12code_lengths+212];
-	add.s16 	%rs703, %rs213, -1;
-	and.b16  	%rs704, %rs703, 255;
-	setp.gt.u16 	%p216, %rs704, 10;
+	setp.eq.s16 	%p216, %rs213, 0;
 	@%p216 bra 	$L__BB0_430;
 
-	cvt.u32.u16 	%r944, %rs213;
-	and.b32  	%r945, %r944, 255;
-	mul.wide.u32 	%rd448, %r945, 4;
+	cvt.u32.u16 	%r731, %rs213;
+	mul.wide.u32 	%rd448, %r731, 4;
 	add.s64 	%rd449, %rd2, %rd448;
-	ld.local.u32 	%r946, [%rd449];
-	add.s32 	%r947, %r946, 1;
-	st.local.u32 	[%rd449], %r947;
+	ld.local.u32 	%r732, [%rd449];
+	add.s32 	%r733, %r732, 1;
+	st.local.u32 	[%rd449], %r733;
 
 $L__BB0_430:
 	ld.shared.u8 	%rs214, [_ZZ21slzHuffBuildLutKernelE12code_lengths+213];
-	add.s16 	%rs705, %rs214, -1;
-	and.b16  	%rs706, %rs705, 255;
-	setp.gt.u16 	%p217, %rs706, 10;
+	setp.eq.s16 	%p217, %rs214, 0;
 	@%p217 bra 	$L__BB0_432;
 
-	cvt.u32.u16 	%r948, %rs214;
-	and.b32  	%r949, %r948, 255;
-	mul.wide.u32 	%rd450, %r949, 4;
+	cvt.u32.u16 	%r734, %rs214;
+	mul.wide.u32 	%rd450, %r734, 4;
 	add.s64 	%rd451, %rd2, %rd450;
-	ld.local.u32 	%r950, [%rd451];
-	add.s32 	%r951, %r950, 1;
-	st.local.u32 	[%rd451], %r951;
+	ld.local.u32 	%r735, [%rd451];
+	add.s32 	%r736, %r735, 1;
+	st.local.u32 	[%rd451], %r736;
 
 $L__BB0_432:
 	ld.shared.u8 	%rs215, [_ZZ21slzHuffBuildLutKernelE12code_lengths+214];
-	add.s16 	%rs707, %rs215, -1;
-	and.b16  	%rs708, %rs707, 255;
-	setp.gt.u16 	%p218, %rs708, 10;
+	setp.eq.s16 	%p218, %rs215, 0;
 	@%p218 bra 	$L__BB0_434;
 
-	cvt.u32.u16 	%r952, %rs215;
-	and.b32  	%r953, %r952, 255;
-	mul.wide.u32 	%rd452, %r953, 4;
+	cvt.u32.u16 	%r737, %rs215;
+	mul.wide.u32 	%rd452, %r737, 4;
 	add.s64 	%rd453, %rd2, %rd452;
-	ld.local.u32 	%r954, [%rd453];
-	add.s32 	%r955, %r954, 1;
-	st.local.u32 	[%rd453], %r955;
+	ld.local.u32 	%r738, [%rd453];
+	add.s32 	%r739, %r738, 1;
+	st.local.u32 	[%rd453], %r739;
 
 $L__BB0_434:
 	ld.shared.u8 	%rs216, [_ZZ21slzHuffBuildLutKernelE12code_lengths+215];
-	add.s16 	%rs709, %rs216, -1;
-	and.b16  	%rs710, %rs709, 255;
-	setp.gt.u16 	%p219, %rs710, 10;
+	setp.eq.s16 	%p219, %rs216, 0;
 	@%p219 bra 	$L__BB0_436;
 
-	cvt.u32.u16 	%r956, %rs216;
-	and.b32  	%r957, %r956, 255;
-	mul.wide.u32 	%rd454, %r957, 4;
+	cvt.u32.u16 	%r740, %rs216;
+	mul.wide.u32 	%rd454, %r740, 4;
 	add.s64 	%rd455, %rd2, %rd454;
-	ld.local.u32 	%r958, [%rd455];
-	add.s32 	%r959, %r958, 1;
-	st.local.u32 	[%rd455], %r959;
+	ld.local.u32 	%r741, [%rd455];
+	add.s32 	%r742, %r741, 1;
+	st.local.u32 	[%rd455], %r742;
 
 $L__BB0_436:
 	ld.shared.u8 	%rs217, [_ZZ21slzHuffBuildLutKernelE12code_lengths+216];
-	add.s16 	%rs711, %rs217, -1;
-	and.b16  	%rs712, %rs711, 255;
-	setp.gt.u16 	%p220, %rs712, 10;
+	setp.eq.s16 	%p220, %rs217, 0;
 	@%p220 bra 	$L__BB0_438;
 
-	cvt.u32.u16 	%r960, %rs217;
-	and.b32  	%r961, %r960, 255;
-	mul.wide.u32 	%rd456, %r961, 4;
+	cvt.u32.u16 	%r743, %rs217;
+	mul.wide.u32 	%rd456, %r743, 4;
 	add.s64 	%rd457, %rd2, %rd456;
-	ld.local.u32 	%r962, [%rd457];
-	add.s32 	%r963, %r962, 1;
-	st.local.u32 	[%rd457], %r963;
+	ld.local.u32 	%r744, [%rd457];
+	add.s32 	%r745, %r744, 1;
+	st.local.u32 	[%rd457], %r745;
 
 $L__BB0_438:
 	ld.shared.u8 	%rs218, [_ZZ21slzHuffBuildLutKernelE12code_lengths+217];
-	add.s16 	%rs713, %rs218, -1;
-	and.b16  	%rs714, %rs713, 255;
-	setp.gt.u16 	%p221, %rs714, 10;
+	setp.eq.s16 	%p221, %rs218, 0;
 	@%p221 bra 	$L__BB0_440;
 
-	cvt.u32.u16 	%r964, %rs218;
-	and.b32  	%r965, %r964, 255;
-	mul.wide.u32 	%rd458, %r965, 4;
+	cvt.u32.u16 	%r746, %rs218;
+	mul.wide.u32 	%rd458, %r746, 4;
 	add.s64 	%rd459, %rd2, %rd458;
-	ld.local.u32 	%r966, [%rd459];
-	add.s32 	%r967, %r966, 1;
-	st.local.u32 	[%rd459], %r967;
+	ld.local.u32 	%r747, [%rd459];
+	add.s32 	%r748, %r747, 1;
+	st.local.u32 	[%rd459], %r748;
 
 $L__BB0_440:
 	ld.shared.u8 	%rs219, [_ZZ21slzHuffBuildLutKernelE12code_lengths+218];
-	add.s16 	%rs715, %rs219, -1;
-	and.b16  	%rs716, %rs715, 255;
-	setp.gt.u16 	%p222, %rs716, 10;
+	setp.eq.s16 	%p222, %rs219, 0;
 	@%p222 bra 	$L__BB0_442;
 
-	cvt.u32.u16 	%r968, %rs219;
-	and.b32  	%r969, %r968, 255;
-	mul.wide.u32 	%rd460, %r969, 4;
+	cvt.u32.u16 	%r749, %rs219;
+	mul.wide.u32 	%rd460, %r749, 4;
 	add.s64 	%rd461, %rd2, %rd460;
-	ld.local.u32 	%r970, [%rd461];
-	add.s32 	%r971, %r970, 1;
-	st.local.u32 	[%rd461], %r971;
+	ld.local.u32 	%r750, [%rd461];
+	add.s32 	%r751, %r750, 1;
+	st.local.u32 	[%rd461], %r751;
 
 $L__BB0_442:
 	ld.shared.u8 	%rs220, [_ZZ21slzHuffBuildLutKernelE12code_lengths+219];
-	add.s16 	%rs717, %rs220, -1;
-	and.b16  	%rs718, %rs717, 255;
-	setp.gt.u16 	%p223, %rs718, 10;
+	setp.eq.s16 	%p223, %rs220, 0;
 	@%p223 bra 	$L__BB0_444;
 
-	cvt.u32.u16 	%r972, %rs220;
-	and.b32  	%r973, %r972, 255;
-	mul.wide.u32 	%rd462, %r973, 4;
+	cvt.u32.u16 	%r752, %rs220;
+	mul.wide.u32 	%rd462, %r752, 4;
 	add.s64 	%rd463, %rd2, %rd462;
-	ld.local.u32 	%r974, [%rd463];
-	add.s32 	%r975, %r974, 1;
-	st.local.u32 	[%rd463], %r975;
+	ld.local.u32 	%r753, [%rd463];
+	add.s32 	%r754, %r753, 1;
+	st.local.u32 	[%rd463], %r754;
 
 $L__BB0_444:
 	ld.shared.u8 	%rs221, [_ZZ21slzHuffBuildLutKernelE12code_lengths+220];
-	add.s16 	%rs719, %rs221, -1;
-	and.b16  	%rs720, %rs719, 255;
-	setp.gt.u16 	%p224, %rs720, 10;
+	setp.eq.s16 	%p224, %rs221, 0;
 	@%p224 bra 	$L__BB0_446;
 
-	cvt.u32.u16 	%r976, %rs221;
-	and.b32  	%r977, %r976, 255;
-	mul.wide.u32 	%rd464, %r977, 4;
+	cvt.u32.u16 	%r755, %rs221;
+	mul.wide.u32 	%rd464, %r755, 4;
 	add.s64 	%rd465, %rd2, %rd464;
-	ld.local.u32 	%r978, [%rd465];
-	add.s32 	%r979, %r978, 1;
-	st.local.u32 	[%rd465], %r979;
+	ld.local.u32 	%r756, [%rd465];
+	add.s32 	%r757, %r756, 1;
+	st.local.u32 	[%rd465], %r757;
 
 $L__BB0_446:
 	ld.shared.u8 	%rs222, [_ZZ21slzHuffBuildLutKernelE12code_lengths+221];
-	add.s16 	%rs721, %rs222, -1;
-	and.b16  	%rs722, %rs721, 255;
-	setp.gt.u16 	%p225, %rs722, 10;
+	setp.eq.s16 	%p225, %rs222, 0;
 	@%p225 bra 	$L__BB0_448;
 
-	cvt.u32.u16 	%r980, %rs222;
-	and.b32  	%r981, %r980, 255;
-	mul.wide.u32 	%rd466, %r981, 4;
+	cvt.u32.u16 	%r758, %rs222;
+	mul.wide.u32 	%rd466, %r758, 4;
 	add.s64 	%rd467, %rd2, %rd466;
-	ld.local.u32 	%r982, [%rd467];
-	add.s32 	%r983, %r982, 1;
-	st.local.u32 	[%rd467], %r983;
+	ld.local.u32 	%r759, [%rd467];
+	add.s32 	%r760, %r759, 1;
+	st.local.u32 	[%rd467], %r760;
 
 $L__BB0_448:
 	ld.shared.u8 	%rs223, [_ZZ21slzHuffBuildLutKernelE12code_lengths+222];
-	add.s16 	%rs723, %rs223, -1;
-	and.b16  	%rs724, %rs723, 255;
-	setp.gt.u16 	%p226, %rs724, 10;
+	setp.eq.s16 	%p226, %rs223, 0;
 	@%p226 bra 	$L__BB0_450;
 
-	cvt.u32.u16 	%r984, %rs223;
-	and.b32  	%r985, %r984, 255;
-	mul.wide.u32 	%rd468, %r985, 4;
+	cvt.u32.u16 	%r761, %rs223;
+	mul.wide.u32 	%rd468, %r761, 4;
 	add.s64 	%rd469, %rd2, %rd468;
-	ld.local.u32 	%r986, [%rd469];
-	add.s32 	%r987, %r986, 1;
-	st.local.u32 	[%rd469], %r987;
+	ld.local.u32 	%r762, [%rd469];
+	add.s32 	%r763, %r762, 1;
+	st.local.u32 	[%rd469], %r763;
 
 $L__BB0_450:
 	ld.shared.u8 	%rs224, [_ZZ21slzHuffBuildLutKernelE12code_lengths+223];
-	add.s16 	%rs725, %rs224, -1;
-	and.b16  	%rs726, %rs725, 255;
-	setp.gt.u16 	%p227, %rs726, 10;
+	setp.eq.s16 	%p227, %rs224, 0;
 	@%p227 bra 	$L__BB0_452;
 
-	cvt.u32.u16 	%r988, %rs224;
-	and.b32  	%r989, %r988, 255;
-	mul.wide.u32 	%rd470, %r989, 4;
+	cvt.u32.u16 	%r764, %rs224;
+	mul.wide.u32 	%rd470, %r764, 4;
 	add.s64 	%rd471, %rd2, %rd470;
-	ld.local.u32 	%r990, [%rd471];
-	add.s32 	%r991, %r990, 1;
-	st.local.u32 	[%rd471], %r991;
+	ld.local.u32 	%r765, [%rd471];
+	add.s32 	%r766, %r765, 1;
+	st.local.u32 	[%rd471], %r766;
 
 $L__BB0_452:
 	ld.shared.u8 	%rs225, [_ZZ21slzHuffBuildLutKernelE12code_lengths+224];
-	add.s16 	%rs727, %rs225, -1;
-	and.b16  	%rs728, %rs727, 255;
-	setp.gt.u16 	%p228, %rs728, 10;
+	setp.eq.s16 	%p228, %rs225, 0;
 	@%p228 bra 	$L__BB0_454;
 
-	cvt.u32.u16 	%r992, %rs225;
-	and.b32  	%r993, %r992, 255;
-	mul.wide.u32 	%rd472, %r993, 4;
+	cvt.u32.u16 	%r767, %rs225;
+	mul.wide.u32 	%rd472, %r767, 4;
 	add.s64 	%rd473, %rd2, %rd472;
-	ld.local.u32 	%r994, [%rd473];
-	add.s32 	%r995, %r994, 1;
-	st.local.u32 	[%rd473], %r995;
+	ld.local.u32 	%r768, [%rd473];
+	add.s32 	%r769, %r768, 1;
+	st.local.u32 	[%rd473], %r769;
 
 $L__BB0_454:
 	ld.shared.u8 	%rs226, [_ZZ21slzHuffBuildLutKernelE12code_lengths+225];
-	add.s16 	%rs729, %rs226, -1;
-	and.b16  	%rs730, %rs729, 255;
-	setp.gt.u16 	%p229, %rs730, 10;
+	setp.eq.s16 	%p229, %rs226, 0;
 	@%p229 bra 	$L__BB0_456;
 
-	cvt.u32.u16 	%r996, %rs226;
-	and.b32  	%r997, %r996, 255;
-	mul.wide.u32 	%rd474, %r997, 4;
+	cvt.u32.u16 	%r770, %rs226;
+	mul.wide.u32 	%rd474, %r770, 4;
 	add.s64 	%rd475, %rd2, %rd474;
-	ld.local.u32 	%r998, [%rd475];
-	add.s32 	%r999, %r998, 1;
-	st.local.u32 	[%rd475], %r999;
+	ld.local.u32 	%r771, [%rd475];
+	add.s32 	%r772, %r771, 1;
+	st.local.u32 	[%rd475], %r772;
 
 $L__BB0_456:
 	ld.shared.u8 	%rs227, [_ZZ21slzHuffBuildLutKernelE12code_lengths+226];
-	add.s16 	%rs731, %rs227, -1;
-	and.b16  	%rs732, %rs731, 255;
-	setp.gt.u16 	%p230, %rs732, 10;
+	setp.eq.s16 	%p230, %rs227, 0;
 	@%p230 bra 	$L__BB0_458;
 
-	cvt.u32.u16 	%r1000, %rs227;
-	and.b32  	%r1001, %r1000, 255;
-	mul.wide.u32 	%rd476, %r1001, 4;
+	cvt.u32.u16 	%r773, %rs227;
+	mul.wide.u32 	%rd476, %r773, 4;
 	add.s64 	%rd477, %rd2, %rd476;
-	ld.local.u32 	%r1002, [%rd477];
-	add.s32 	%r1003, %r1002, 1;
-	st.local.u32 	[%rd477], %r1003;
+	ld.local.u32 	%r774, [%rd477];
+	add.s32 	%r775, %r774, 1;
+	st.local.u32 	[%rd477], %r775;
 
 $L__BB0_458:
 	ld.shared.u8 	%rs228, [_ZZ21slzHuffBuildLutKernelE12code_lengths+227];
-	add.s16 	%rs733, %rs228, -1;
-	and.b16  	%rs734, %rs733, 255;
-	setp.gt.u16 	%p231, %rs734, 10;
+	setp.eq.s16 	%p231, %rs228, 0;
 	@%p231 bra 	$L__BB0_460;
 
-	cvt.u32.u16 	%r1004, %rs228;
-	and.b32  	%r1005, %r1004, 255;
-	mul.wide.u32 	%rd478, %r1005, 4;
+	cvt.u32.u16 	%r776, %rs228;
+	mul.wide.u32 	%rd478, %r776, 4;
 	add.s64 	%rd479, %rd2, %rd478;
-	ld.local.u32 	%r1006, [%rd479];
-	add.s32 	%r1007, %r1006, 1;
-	st.local.u32 	[%rd479], %r1007;
+	ld.local.u32 	%r777, [%rd479];
+	add.s32 	%r778, %r777, 1;
+	st.local.u32 	[%rd479], %r778;
 
 $L__BB0_460:
 	ld.shared.u8 	%rs229, [_ZZ21slzHuffBuildLutKernelE12code_lengths+228];
-	add.s16 	%rs735, %rs229, -1;
-	and.b16  	%rs736, %rs735, 255;
-	setp.gt.u16 	%p232, %rs736, 10;
+	setp.eq.s16 	%p232, %rs229, 0;
 	@%p232 bra 	$L__BB0_462;
 
-	cvt.u32.u16 	%r1008, %rs229;
-	and.b32  	%r1009, %r1008, 255;
-	mul.wide.u32 	%rd480, %r1009, 4;
+	cvt.u32.u16 	%r779, %rs229;
+	mul.wide.u32 	%rd480, %r779, 4;
 	add.s64 	%rd481, %rd2, %rd480;
-	ld.local.u32 	%r1010, [%rd481];
-	add.s32 	%r1011, %r1010, 1;
-	st.local.u32 	[%rd481], %r1011;
+	ld.local.u32 	%r780, [%rd481];
+	add.s32 	%r781, %r780, 1;
+	st.local.u32 	[%rd481], %r781;
 
 $L__BB0_462:
 	ld.shared.u8 	%rs230, [_ZZ21slzHuffBuildLutKernelE12code_lengths+229];
-	add.s16 	%rs737, %rs230, -1;
-	and.b16  	%rs738, %rs737, 255;
-	setp.gt.u16 	%p233, %rs738, 10;
+	setp.eq.s16 	%p233, %rs230, 0;
 	@%p233 bra 	$L__BB0_464;
 
-	cvt.u32.u16 	%r1012, %rs230;
-	and.b32  	%r1013, %r1012, 255;
-	mul.wide.u32 	%rd482, %r1013, 4;
+	cvt.u32.u16 	%r782, %rs230;
+	mul.wide.u32 	%rd482, %r782, 4;
 	add.s64 	%rd483, %rd2, %rd482;
-	ld.local.u32 	%r1014, [%rd483];
-	add.s32 	%r1015, %r1014, 1;
-	st.local.u32 	[%rd483], %r1015;
+	ld.local.u32 	%r783, [%rd483];
+	add.s32 	%r784, %r783, 1;
+	st.local.u32 	[%rd483], %r784;
 
 $L__BB0_464:
 	ld.shared.u8 	%rs231, [_ZZ21slzHuffBuildLutKernelE12code_lengths+230];
-	add.s16 	%rs739, %rs231, -1;
-	and.b16  	%rs740, %rs739, 255;
-	setp.gt.u16 	%p234, %rs740, 10;
+	setp.eq.s16 	%p234, %rs231, 0;
 	@%p234 bra 	$L__BB0_466;
 
-	cvt.u32.u16 	%r1016, %rs231;
-	and.b32  	%r1017, %r1016, 255;
-	mul.wide.u32 	%rd484, %r1017, 4;
+	cvt.u32.u16 	%r785, %rs231;
+	mul.wide.u32 	%rd484, %r785, 4;
 	add.s64 	%rd485, %rd2, %rd484;
-	ld.local.u32 	%r1018, [%rd485];
-	add.s32 	%r1019, %r1018, 1;
-	st.local.u32 	[%rd485], %r1019;
+	ld.local.u32 	%r786, [%rd485];
+	add.s32 	%r787, %r786, 1;
+	st.local.u32 	[%rd485], %r787;
 
 $L__BB0_466:
 	ld.shared.u8 	%rs232, [_ZZ21slzHuffBuildLutKernelE12code_lengths+231];
-	add.s16 	%rs741, %rs232, -1;
-	and.b16  	%rs742, %rs741, 255;
-	setp.gt.u16 	%p235, %rs742, 10;
+	setp.eq.s16 	%p235, %rs232, 0;
 	@%p235 bra 	$L__BB0_468;
 
-	cvt.u32.u16 	%r1020, %rs232;
-	and.b32  	%r1021, %r1020, 255;
-	mul.wide.u32 	%rd486, %r1021, 4;
+	cvt.u32.u16 	%r788, %rs232;
+	mul.wide.u32 	%rd486, %r788, 4;
 	add.s64 	%rd487, %rd2, %rd486;
-	ld.local.u32 	%r1022, [%rd487];
-	add.s32 	%r1023, %r1022, 1;
-	st.local.u32 	[%rd487], %r1023;
+	ld.local.u32 	%r789, [%rd487];
+	add.s32 	%r790, %r789, 1;
+	st.local.u32 	[%rd487], %r790;
 
 $L__BB0_468:
 	ld.shared.u8 	%rs233, [_ZZ21slzHuffBuildLutKernelE12code_lengths+232];
-	add.s16 	%rs743, %rs233, -1;
-	and.b16  	%rs744, %rs743, 255;
-	setp.gt.u16 	%p236, %rs744, 10;
+	setp.eq.s16 	%p236, %rs233, 0;
 	@%p236 bra 	$L__BB0_470;
 
-	cvt.u32.u16 	%r1024, %rs233;
-	and.b32  	%r1025, %r1024, 255;
-	mul.wide.u32 	%rd488, %r1025, 4;
+	cvt.u32.u16 	%r791, %rs233;
+	mul.wide.u32 	%rd488, %r791, 4;
 	add.s64 	%rd489, %rd2, %rd488;
-	ld.local.u32 	%r1026, [%rd489];
-	add.s32 	%r1027, %r1026, 1;
-	st.local.u32 	[%rd489], %r1027;
+	ld.local.u32 	%r792, [%rd489];
+	add.s32 	%r793, %r792, 1;
+	st.local.u32 	[%rd489], %r793;
 
 $L__BB0_470:
 	ld.shared.u8 	%rs234, [_ZZ21slzHuffBuildLutKernelE12code_lengths+233];
-	add.s16 	%rs745, %rs234, -1;
-	and.b16  	%rs746, %rs745, 255;
-	setp.gt.u16 	%p237, %rs746, 10;
+	setp.eq.s16 	%p237, %rs234, 0;
 	@%p237 bra 	$L__BB0_472;
 
-	cvt.u32.u16 	%r1028, %rs234;
-	and.b32  	%r1029, %r1028, 255;
-	mul.wide.u32 	%rd490, %r1029, 4;
+	cvt.u32.u16 	%r794, %rs234;
+	mul.wide.u32 	%rd490, %r794, 4;
 	add.s64 	%rd491, %rd2, %rd490;
-	ld.local.u32 	%r1030, [%rd491];
-	add.s32 	%r1031, %r1030, 1;
-	st.local.u32 	[%rd491], %r1031;
+	ld.local.u32 	%r795, [%rd491];
+	add.s32 	%r796, %r795, 1;
+	st.local.u32 	[%rd491], %r796;
 
 $L__BB0_472:
 	ld.shared.u8 	%rs235, [_ZZ21slzHuffBuildLutKernelE12code_lengths+234];
-	add.s16 	%rs747, %rs235, -1;
-	and.b16  	%rs748, %rs747, 255;
-	setp.gt.u16 	%p238, %rs748, 10;
+	setp.eq.s16 	%p238, %rs235, 0;
 	@%p238 bra 	$L__BB0_474;
 
-	cvt.u32.u16 	%r1032, %rs235;
-	and.b32  	%r1033, %r1032, 255;
-	mul.wide.u32 	%rd492, %r1033, 4;
+	cvt.u32.u16 	%r797, %rs235;
+	mul.wide.u32 	%rd492, %r797, 4;
 	add.s64 	%rd493, %rd2, %rd492;
-	ld.local.u32 	%r1034, [%rd493];
-	add.s32 	%r1035, %r1034, 1;
-	st.local.u32 	[%rd493], %r1035;
+	ld.local.u32 	%r798, [%rd493];
+	add.s32 	%r799, %r798, 1;
+	st.local.u32 	[%rd493], %r799;
 
 $L__BB0_474:
 	ld.shared.u8 	%rs236, [_ZZ21slzHuffBuildLutKernelE12code_lengths+235];
-	add.s16 	%rs749, %rs236, -1;
-	and.b16  	%rs750, %rs749, 255;
-	setp.gt.u16 	%p239, %rs750, 10;
+	setp.eq.s16 	%p239, %rs236, 0;
 	@%p239 bra 	$L__BB0_476;
 
-	cvt.u32.u16 	%r1036, %rs236;
-	and.b32  	%r1037, %r1036, 255;
-	mul.wide.u32 	%rd494, %r1037, 4;
+	cvt.u32.u16 	%r800, %rs236;
+	mul.wide.u32 	%rd494, %r800, 4;
 	add.s64 	%rd495, %rd2, %rd494;
-	ld.local.u32 	%r1038, [%rd495];
-	add.s32 	%r1039, %r1038, 1;
-	st.local.u32 	[%rd495], %r1039;
+	ld.local.u32 	%r801, [%rd495];
+	add.s32 	%r802, %r801, 1;
+	st.local.u32 	[%rd495], %r802;
 
 $L__BB0_476:
 	ld.shared.u8 	%rs237, [_ZZ21slzHuffBuildLutKernelE12code_lengths+236];
-	add.s16 	%rs751, %rs237, -1;
-	and.b16  	%rs752, %rs751, 255;
-	setp.gt.u16 	%p240, %rs752, 10;
+	setp.eq.s16 	%p240, %rs237, 0;
 	@%p240 bra 	$L__BB0_478;
 
-	cvt.u32.u16 	%r1040, %rs237;
-	and.b32  	%r1041, %r1040, 255;
-	mul.wide.u32 	%rd496, %r1041, 4;
+	cvt.u32.u16 	%r803, %rs237;
+	mul.wide.u32 	%rd496, %r803, 4;
 	add.s64 	%rd497, %rd2, %rd496;
-	ld.local.u32 	%r1042, [%rd497];
-	add.s32 	%r1043, %r1042, 1;
-	st.local.u32 	[%rd497], %r1043;
+	ld.local.u32 	%r804, [%rd497];
+	add.s32 	%r805, %r804, 1;
+	st.local.u32 	[%rd497], %r805;
 
 $L__BB0_478:
 	ld.shared.u8 	%rs238, [_ZZ21slzHuffBuildLutKernelE12code_lengths+237];
-	add.s16 	%rs753, %rs238, -1;
-	and.b16  	%rs754, %rs753, 255;
-	setp.gt.u16 	%p241, %rs754, 10;
+	setp.eq.s16 	%p241, %rs238, 0;
 	@%p241 bra 	$L__BB0_480;
 
-	cvt.u32.u16 	%r1044, %rs238;
-	and.b32  	%r1045, %r1044, 255;
-	mul.wide.u32 	%rd498, %r1045, 4;
+	cvt.u32.u16 	%r806, %rs238;
+	mul.wide.u32 	%rd498, %r806, 4;
 	add.s64 	%rd499, %rd2, %rd498;
-	ld.local.u32 	%r1046, [%rd499];
-	add.s32 	%r1047, %r1046, 1;
-	st.local.u32 	[%rd499], %r1047;
+	ld.local.u32 	%r807, [%rd499];
+	add.s32 	%r808, %r807, 1;
+	st.local.u32 	[%rd499], %r808;
 
 $L__BB0_480:
 	ld.shared.u8 	%rs239, [_ZZ21slzHuffBuildLutKernelE12code_lengths+238];
-	add.s16 	%rs755, %rs239, -1;
-	and.b16  	%rs756, %rs755, 255;
-	setp.gt.u16 	%p242, %rs756, 10;
+	setp.eq.s16 	%p242, %rs239, 0;
 	@%p242 bra 	$L__BB0_482;
 
-	cvt.u32.u16 	%r1048, %rs239;
-	and.b32  	%r1049, %r1048, 255;
-	mul.wide.u32 	%rd500, %r1049, 4;
+	cvt.u32.u16 	%r809, %rs239;
+	mul.wide.u32 	%rd500, %r809, 4;
 	add.s64 	%rd501, %rd2, %rd500;
-	ld.local.u32 	%r1050, [%rd501];
-	add.s32 	%r1051, %r1050, 1;
-	st.local.u32 	[%rd501], %r1051;
+	ld.local.u32 	%r810, [%rd501];
+	add.s32 	%r811, %r810, 1;
+	st.local.u32 	[%rd501], %r811;
 
 $L__BB0_482:
 	ld.shared.u8 	%rs240, [_ZZ21slzHuffBuildLutKernelE12code_lengths+239];
-	add.s16 	%rs757, %rs240, -1;
-	and.b16  	%rs758, %rs757, 255;
-	setp.gt.u16 	%p243, %rs758, 10;
+	setp.eq.s16 	%p243, %rs240, 0;
 	@%p243 bra 	$L__BB0_484;
 
-	cvt.u32.u16 	%r1052, %rs240;
-	and.b32  	%r1053, %r1052, 255;
-	mul.wide.u32 	%rd502, %r1053, 4;
+	cvt.u32.u16 	%r812, %rs240;
+	mul.wide.u32 	%rd502, %r812, 4;
 	add.s64 	%rd503, %rd2, %rd502;
-	ld.local.u32 	%r1054, [%rd503];
-	add.s32 	%r1055, %r1054, 1;
-	st.local.u32 	[%rd503], %r1055;
+	ld.local.u32 	%r813, [%rd503];
+	add.s32 	%r814, %r813, 1;
+	st.local.u32 	[%rd503], %r814;
 
 $L__BB0_484:
 	ld.shared.u8 	%rs241, [_ZZ21slzHuffBuildLutKernelE12code_lengths+240];
-	add.s16 	%rs759, %rs241, -1;
-	and.b16  	%rs760, %rs759, 255;
-	setp.gt.u16 	%p244, %rs760, 10;
+	setp.eq.s16 	%p244, %rs241, 0;
 	@%p244 bra 	$L__BB0_486;
 
-	cvt.u32.u16 	%r1056, %rs241;
-	and.b32  	%r1057, %r1056, 255;
-	mul.wide.u32 	%rd504, %r1057, 4;
+	cvt.u32.u16 	%r815, %rs241;
+	mul.wide.u32 	%rd504, %r815, 4;
 	add.s64 	%rd505, %rd2, %rd504;
-	ld.local.u32 	%r1058, [%rd505];
-	add.s32 	%r1059, %r1058, 1;
-	st.local.u32 	[%rd505], %r1059;
+	ld.local.u32 	%r816, [%rd505];
+	add.s32 	%r817, %r816, 1;
+	st.local.u32 	[%rd505], %r817;
 
 $L__BB0_486:
 	ld.shared.u8 	%rs242, [_ZZ21slzHuffBuildLutKernelE12code_lengths+241];
-	add.s16 	%rs761, %rs242, -1;
-	and.b16  	%rs762, %rs761, 255;
-	setp.gt.u16 	%p245, %rs762, 10;
+	setp.eq.s16 	%p245, %rs242, 0;
 	@%p245 bra 	$L__BB0_488;
 
-	cvt.u32.u16 	%r1060, %rs242;
-	and.b32  	%r1061, %r1060, 255;
-	mul.wide.u32 	%rd506, %r1061, 4;
+	cvt.u32.u16 	%r818, %rs242;
+	mul.wide.u32 	%rd506, %r818, 4;
 	add.s64 	%rd507, %rd2, %rd506;
-	ld.local.u32 	%r1062, [%rd507];
-	add.s32 	%r1063, %r1062, 1;
-	st.local.u32 	[%rd507], %r1063;
+	ld.local.u32 	%r819, [%rd507];
+	add.s32 	%r820, %r819, 1;
+	st.local.u32 	[%rd507], %r820;
 
 $L__BB0_488:
 	ld.shared.u8 	%rs243, [_ZZ21slzHuffBuildLutKernelE12code_lengths+242];
-	add.s16 	%rs763, %rs243, -1;
-	and.b16  	%rs764, %rs763, 255;
-	setp.gt.u16 	%p246, %rs764, 10;
+	setp.eq.s16 	%p246, %rs243, 0;
 	@%p246 bra 	$L__BB0_490;
 
-	cvt.u32.u16 	%r1064, %rs243;
-	and.b32  	%r1065, %r1064, 255;
-	mul.wide.u32 	%rd508, %r1065, 4;
+	cvt.u32.u16 	%r821, %rs243;
+	mul.wide.u32 	%rd508, %r821, 4;
 	add.s64 	%rd509, %rd2, %rd508;
-	ld.local.u32 	%r1066, [%rd509];
-	add.s32 	%r1067, %r1066, 1;
-	st.local.u32 	[%rd509], %r1067;
+	ld.local.u32 	%r822, [%rd509];
+	add.s32 	%r823, %r822, 1;
+	st.local.u32 	[%rd509], %r823;
 
 $L__BB0_490:
 	ld.shared.u8 	%rs244, [_ZZ21slzHuffBuildLutKernelE12code_lengths+243];
-	add.s16 	%rs765, %rs244, -1;
-	and.b16  	%rs766, %rs765, 255;
-	setp.gt.u16 	%p247, %rs766, 10;
+	setp.eq.s16 	%p247, %rs244, 0;
 	@%p247 bra 	$L__BB0_492;
 
-	cvt.u32.u16 	%r1068, %rs244;
-	and.b32  	%r1069, %r1068, 255;
-	mul.wide.u32 	%rd510, %r1069, 4;
+	cvt.u32.u16 	%r824, %rs244;
+	mul.wide.u32 	%rd510, %r824, 4;
 	add.s64 	%rd511, %rd2, %rd510;
-	ld.local.u32 	%r1070, [%rd511];
-	add.s32 	%r1071, %r1070, 1;
-	st.local.u32 	[%rd511], %r1071;
+	ld.local.u32 	%r825, [%rd511];
+	add.s32 	%r826, %r825, 1;
+	st.local.u32 	[%rd511], %r826;
 
 $L__BB0_492:
 	ld.shared.u8 	%rs245, [_ZZ21slzHuffBuildLutKernelE12code_lengths+244];
-	add.s16 	%rs767, %rs245, -1;
-	and.b16  	%rs768, %rs767, 255;
-	setp.gt.u16 	%p248, %rs768, 10;
+	setp.eq.s16 	%p248, %rs245, 0;
 	@%p248 bra 	$L__BB0_494;
 
-	cvt.u32.u16 	%r1072, %rs245;
-	and.b32  	%r1073, %r1072, 255;
-	mul.wide.u32 	%rd512, %r1073, 4;
+	cvt.u32.u16 	%r827, %rs245;
+	mul.wide.u32 	%rd512, %r827, 4;
 	add.s64 	%rd513, %rd2, %rd512;
-	ld.local.u32 	%r1074, [%rd513];
-	add.s32 	%r1075, %r1074, 1;
-	st.local.u32 	[%rd513], %r1075;
+	ld.local.u32 	%r828, [%rd513];
+	add.s32 	%r829, %r828, 1;
+	st.local.u32 	[%rd513], %r829;
 
 $L__BB0_494:
 	ld.shared.u8 	%rs246, [_ZZ21slzHuffBuildLutKernelE12code_lengths+245];
-	add.s16 	%rs769, %rs246, -1;
-	and.b16  	%rs770, %rs769, 255;
-	setp.gt.u16 	%p249, %rs770, 10;
+	setp.eq.s16 	%p249, %rs246, 0;
 	@%p249 bra 	$L__BB0_496;
 
-	cvt.u32.u16 	%r1076, %rs246;
-	and.b32  	%r1077, %r1076, 255;
-	mul.wide.u32 	%rd514, %r1077, 4;
+	cvt.u32.u16 	%r830, %rs246;
+	mul.wide.u32 	%rd514, %r830, 4;
 	add.s64 	%rd515, %rd2, %rd514;
-	ld.local.u32 	%r1078, [%rd515];
-	add.s32 	%r1079, %r1078, 1;
-	st.local.u32 	[%rd515], %r1079;
+	ld.local.u32 	%r831, [%rd515];
+	add.s32 	%r832, %r831, 1;
+	st.local.u32 	[%rd515], %r832;
 
 $L__BB0_496:
 	ld.shared.u8 	%rs247, [_ZZ21slzHuffBuildLutKernelE12code_lengths+246];
-	add.s16 	%rs771, %rs247, -1;
-	and.b16  	%rs772, %rs771, 255;
-	setp.gt.u16 	%p250, %rs772, 10;
+	setp.eq.s16 	%p250, %rs247, 0;
 	@%p250 bra 	$L__BB0_498;
 
-	cvt.u32.u16 	%r1080, %rs247;
-	and.b32  	%r1081, %r1080, 255;
-	mul.wide.u32 	%rd516, %r1081, 4;
+	cvt.u32.u16 	%r833, %rs247;
+	mul.wide.u32 	%rd516, %r833, 4;
 	add.s64 	%rd517, %rd2, %rd516;
-	ld.local.u32 	%r1082, [%rd517];
-	add.s32 	%r1083, %r1082, 1;
-	st.local.u32 	[%rd517], %r1083;
+	ld.local.u32 	%r834, [%rd517];
+	add.s32 	%r835, %r834, 1;
+	st.local.u32 	[%rd517], %r835;
 
 $L__BB0_498:
 	ld.shared.u8 	%rs248, [_ZZ21slzHuffBuildLutKernelE12code_lengths+247];
-	add.s16 	%rs773, %rs248, -1;
-	and.b16  	%rs774, %rs773, 255;
-	setp.gt.u16 	%p251, %rs774, 10;
+	setp.eq.s16 	%p251, %rs248, 0;
 	@%p251 bra 	$L__BB0_500;
 
-	cvt.u32.u16 	%r1084, %rs248;
-	and.b32  	%r1085, %r1084, 255;
-	mul.wide.u32 	%rd518, %r1085, 4;
+	cvt.u32.u16 	%r836, %rs248;
+	mul.wide.u32 	%rd518, %r836, 4;
 	add.s64 	%rd519, %rd2, %rd518;
-	ld.local.u32 	%r1086, [%rd519];
-	add.s32 	%r1087, %r1086, 1;
-	st.local.u32 	[%rd519], %r1087;
+	ld.local.u32 	%r837, [%rd519];
+	add.s32 	%r838, %r837, 1;
+	st.local.u32 	[%rd519], %r838;
 
 $L__BB0_500:
 	ld.shared.u8 	%rs249, [_ZZ21slzHuffBuildLutKernelE12code_lengths+248];
-	add.s16 	%rs775, %rs249, -1;
-	and.b16  	%rs776, %rs775, 255;
-	setp.gt.u16 	%p252, %rs776, 10;
+	setp.eq.s16 	%p252, %rs249, 0;
 	@%p252 bra 	$L__BB0_502;
 
-	cvt.u32.u16 	%r1088, %rs249;
-	and.b32  	%r1089, %r1088, 255;
-	mul.wide.u32 	%rd520, %r1089, 4;
+	cvt.u32.u16 	%r839, %rs249;
+	mul.wide.u32 	%rd520, %r839, 4;
 	add.s64 	%rd521, %rd2, %rd520;
-	ld.local.u32 	%r1090, [%rd521];
-	add.s32 	%r1091, %r1090, 1;
-	st.local.u32 	[%rd521], %r1091;
+	ld.local.u32 	%r840, [%rd521];
+	add.s32 	%r841, %r840, 1;
+	st.local.u32 	[%rd521], %r841;
 
 $L__BB0_502:
 	ld.shared.u8 	%rs250, [_ZZ21slzHuffBuildLutKernelE12code_lengths+249];
-	add.s16 	%rs777, %rs250, -1;
-	and.b16  	%rs778, %rs777, 255;
-	setp.gt.u16 	%p253, %rs778, 10;
+	setp.eq.s16 	%p253, %rs250, 0;
 	@%p253 bra 	$L__BB0_504;
 
-	cvt.u32.u16 	%r1092, %rs250;
-	and.b32  	%r1093, %r1092, 255;
-	mul.wide.u32 	%rd522, %r1093, 4;
+	cvt.u32.u16 	%r842, %rs250;
+	mul.wide.u32 	%rd522, %r842, 4;
 	add.s64 	%rd523, %rd2, %rd522;
-	ld.local.u32 	%r1094, [%rd523];
-	add.s32 	%r1095, %r1094, 1;
-	st.local.u32 	[%rd523], %r1095;
+	ld.local.u32 	%r843, [%rd523];
+	add.s32 	%r844, %r843, 1;
+	st.local.u32 	[%rd523], %r844;
 
 $L__BB0_504:
 	ld.shared.u8 	%rs251, [_ZZ21slzHuffBuildLutKernelE12code_lengths+250];
-	add.s16 	%rs779, %rs251, -1;
-	and.b16  	%rs780, %rs779, 255;
-	setp.gt.u16 	%p254, %rs780, 10;
+	setp.eq.s16 	%p254, %rs251, 0;
 	@%p254 bra 	$L__BB0_506;
 
-	cvt.u32.u16 	%r1096, %rs251;
-	and.b32  	%r1097, %r1096, 255;
-	mul.wide.u32 	%rd524, %r1097, 4;
+	cvt.u32.u16 	%r845, %rs251;
+	mul.wide.u32 	%rd524, %r845, 4;
 	add.s64 	%rd525, %rd2, %rd524;
-	ld.local.u32 	%r1098, [%rd525];
-	add.s32 	%r1099, %r1098, 1;
-	st.local.u32 	[%rd525], %r1099;
+	ld.local.u32 	%r846, [%rd525];
+	add.s32 	%r847, %r846, 1;
+	st.local.u32 	[%rd525], %r847;
 
 $L__BB0_506:
 	ld.shared.u8 	%rs252, [_ZZ21slzHuffBuildLutKernelE12code_lengths+251];
-	add.s16 	%rs781, %rs252, -1;
-	and.b16  	%rs782, %rs781, 255;
-	setp.gt.u16 	%p255, %rs782, 10;
+	setp.eq.s16 	%p255, %rs252, 0;
 	@%p255 bra 	$L__BB0_508;
 
-	cvt.u32.u16 	%r1100, %rs252;
-	and.b32  	%r1101, %r1100, 255;
-	mul.wide.u32 	%rd526, %r1101, 4;
+	cvt.u32.u16 	%r848, %rs252;
+	mul.wide.u32 	%rd526, %r848, 4;
 	add.s64 	%rd527, %rd2, %rd526;
-	ld.local.u32 	%r1102, [%rd527];
-	add.s32 	%r1103, %r1102, 1;
-	st.local.u32 	[%rd527], %r1103;
+	ld.local.u32 	%r849, [%rd527];
+	add.s32 	%r850, %r849, 1;
+	st.local.u32 	[%rd527], %r850;
 
 $L__BB0_508:
 	ld.shared.u8 	%rs253, [_ZZ21slzHuffBuildLutKernelE12code_lengths+252];
-	add.s16 	%rs783, %rs253, -1;
-	and.b16  	%rs784, %rs783, 255;
-	setp.gt.u16 	%p256, %rs784, 10;
+	setp.eq.s16 	%p256, %rs253, 0;
 	@%p256 bra 	$L__BB0_510;
 
-	cvt.u32.u16 	%r1104, %rs253;
-	and.b32  	%r1105, %r1104, 255;
-	mul.wide.u32 	%rd528, %r1105, 4;
+	cvt.u32.u16 	%r851, %rs253;
+	mul.wide.u32 	%rd528, %r851, 4;
 	add.s64 	%rd529, %rd2, %rd528;
-	ld.local.u32 	%r1106, [%rd529];
-	add.s32 	%r1107, %r1106, 1;
-	st.local.u32 	[%rd529], %r1107;
+	ld.local.u32 	%r852, [%rd529];
+	add.s32 	%r853, %r852, 1;
+	st.local.u32 	[%rd529], %r853;
 
 $L__BB0_510:
 	ld.shared.u8 	%rs254, [_ZZ21slzHuffBuildLutKernelE12code_lengths+253];
-	add.s16 	%rs785, %rs254, -1;
-	and.b16  	%rs786, %rs785, 255;
-	setp.gt.u16 	%p257, %rs786, 10;
+	setp.eq.s16 	%p257, %rs254, 0;
 	@%p257 bra 	$L__BB0_512;
 
-	cvt.u32.u16 	%r1108, %rs254;
-	and.b32  	%r1109, %r1108, 255;
-	mul.wide.u32 	%rd530, %r1109, 4;
+	cvt.u32.u16 	%r854, %rs254;
+	mul.wide.u32 	%rd530, %r854, 4;
 	add.s64 	%rd531, %rd2, %rd530;
-	ld.local.u32 	%r1110, [%rd531];
-	add.s32 	%r1111, %r1110, 1;
-	st.local.u32 	[%rd531], %r1111;
+	ld.local.u32 	%r855, [%rd531];
+	add.s32 	%r856, %r855, 1;
+	st.local.u32 	[%rd531], %r856;
 
 $L__BB0_512:
 	ld.shared.u8 	%rs255, [_ZZ21slzHuffBuildLutKernelE12code_lengths+254];
-	add.s16 	%rs787, %rs255, -1;
-	and.b16  	%rs788, %rs787, 255;
-	setp.gt.u16 	%p258, %rs788, 10;
+	setp.eq.s16 	%p258, %rs255, 0;
 	@%p258 bra 	$L__BB0_514;
 
-	cvt.u32.u16 	%r1112, %rs255;
-	and.b32  	%r1113, %r1112, 255;
-	mul.wide.u32 	%rd532, %r1113, 4;
+	cvt.u32.u16 	%r857, %rs255;
+	mul.wide.u32 	%rd532, %r857, 4;
 	add.s64 	%rd533, %rd2, %rd532;
-	ld.local.u32 	%r1114, [%rd533];
-	add.s32 	%r1115, %r1114, 1;
-	st.local.u32 	[%rd533], %r1115;
+	ld.local.u32 	%r858, [%rd533];
+	add.s32 	%r859, %r858, 1;
+	st.local.u32 	[%rd533], %r859;
 
 $L__BB0_514:
 	ld.shared.u8 	%rs256, [_ZZ21slzHuffBuildLutKernelE12code_lengths+255];
-	add.s16 	%rs789, %rs256, -1;
-	and.b16  	%rs790, %rs789, 255;
-	setp.gt.u16 	%p259, %rs790, 10;
+	setp.eq.s16 	%p259, %rs256, 0;
 	@%p259 bra 	$L__BB0_516;
 
-	cvt.u32.u16 	%r1116, %rs256;
-	and.b32  	%r1117, %r1116, 255;
-	mul.wide.u32 	%rd534, %r1117, 4;
+	cvt.u32.u16 	%r860, %rs256;
+	mul.wide.u32 	%rd534, %r860, 4;
 	add.s64 	%rd535, %rd2, %rd534;
-	ld.local.u32 	%r1118, [%rd535];
-	add.s32 	%r1119, %r1118, 1;
-	st.local.u32 	[%rd535], %r1119;
+	ld.local.u32 	%r861, [%rd535];
+	add.s32 	%r862, %r861, 1;
+	st.local.u32 	[%rd535], %r862;
 
 $L__BB0_516:
-	mov.u32 	%r1120, 0;
-	st.local.u32 	[%rd2], %r1120;
-	st.local.u32 	[%rd3], %r1120;
-	st.local.u32 	[%rd3+4], %r1120;
-	ld.local.u32 	%r1121, [%rd2+4];
-	shl.b32 	%r1122, %r1121, 1;
-	st.local.u32 	[%rd3+8], %r1122;
-	ld.local.u32 	%r1123, [%rd2+8];
-	add.s32 	%r1124, %r1123, %r1122;
-	shl.b32 	%r1125, %r1124, 1;
-	st.local.u32 	[%rd3+12], %r1125;
-	ld.local.u32 	%r1126, [%rd2+12];
-	add.s32 	%r1127, %r1126, %r1125;
-	shl.b32 	%r1128, %r1127, 1;
-	st.local.u32 	[%rd3+16], %r1128;
-	ld.local.u32 	%r1129, [%rd2+16];
-	add.s32 	%r1130, %r1129, %r1128;
-	shl.b32 	%r1131, %r1130, 1;
-	st.local.u32 	[%rd3+20], %r1131;
-	ld.local.u32 	%r1132, [%rd2+20];
-	add.s32 	%r1133, %r1132, %r1131;
-	shl.b32 	%r1134, %r1133, 1;
-	st.local.u32 	[%rd3+24], %r1134;
-	ld.local.u32 	%r1135, [%rd2+24];
-	add.s32 	%r1136, %r1135, %r1134;
-	shl.b32 	%r1137, %r1136, 1;
-	st.local.u32 	[%rd3+28], %r1137;
-	ld.local.u32 	%r1138, [%rd2+28];
-	add.s32 	%r1139, %r1138, %r1137;
-	shl.b32 	%r1140, %r1139, 1;
-	st.local.u32 	[%rd3+32], %r1140;
-	ld.local.u32 	%r1141, [%rd2+32];
-	add.s32 	%r1142, %r1141, %r1140;
-	shl.b32 	%r1143, %r1142, 1;
-	st.local.u32 	[%rd3+36], %r1143;
-	ld.local.u32 	%r1144, [%rd2+36];
-	add.s32 	%r1145, %r1144, %r1143;
-	shl.b32 	%r1146, %r1145, 1;
-	st.local.u32 	[%rd3+40], %r1146;
-	ld.local.u32 	%r1147, [%rd2+40];
-	add.s32 	%r1148, %r1147, %r1146;
-	shl.b32 	%r1149, %r1148, 1;
-	st.local.u32 	[%rd3+44], %r1149;
-	ld.local.u32 	%r1150, [%rd2+44];
-	add.s32 	%r1151, %r1150, %r1149;
-	shl.b32 	%r1152, %r1151, 1;
-	st.local.u32 	[%rd3+48], %r1152;
-	mov.u32 	%r1376, %r1120;
+	mov.u32 	%r863, 0;
+	st.local.u32 	[%rd2], %r863;
+	st.local.u32 	[%rd3], %r863;
+	st.local.u32 	[%rd3+48], %r863;
+	st.local.u32 	[%rd3+4], %r863;
+	ld.local.u32 	%r864, [%rd2+4];
+	shl.b32 	%r865, %r864, 1;
+	st.local.u32 	[%rd3+8], %r865;
+	ld.local.u32 	%r866, [%rd2+8];
+	add.s32 	%r867, %r866, %r865;
+	shl.b32 	%r868, %r867, 1;
+	st.local.u32 	[%rd3+12], %r868;
+	ld.local.u32 	%r869, [%rd2+12];
+	add.s32 	%r870, %r869, %r868;
+	shl.b32 	%r871, %r870, 1;
+	st.local.u32 	[%rd3+16], %r871;
+	ld.local.u32 	%r872, [%rd2+16];
+	add.s32 	%r873, %r872, %r871;
+	shl.b32 	%r874, %r873, 1;
+	st.local.u32 	[%rd3+20], %r874;
+	ld.local.u32 	%r875, [%rd2+20];
+	add.s32 	%r876, %r875, %r874;
+	shl.b32 	%r877, %r876, 1;
+	st.local.u32 	[%rd3+24], %r877;
+	ld.local.u32 	%r878, [%rd2+24];
+	add.s32 	%r879, %r878, %r877;
+	shl.b32 	%r880, %r879, 1;
+	st.local.u32 	[%rd3+28], %r880;
+	ld.local.u32 	%r881, [%rd2+28];
+	add.s32 	%r882, %r881, %r880;
+	shl.b32 	%r883, %r882, 1;
+	st.local.u32 	[%rd3+32], %r883;
+	ld.local.u32 	%r884, [%rd2+32];
+	add.s32 	%r885, %r884, %r883;
+	shl.b32 	%r886, %r885, 1;
+	st.local.u32 	[%rd3+36], %r886;
+	ld.local.u32 	%r887, [%rd2+36];
+	add.s32 	%r888, %r887, %r886;
+	shl.b32 	%r889, %r888, 1;
+	st.local.u32 	[%rd3+40], %r889;
+	ld.local.u32 	%r890, [%rd2+40];
+	add.s32 	%r891, %r890, %r889;
+	shl.b32 	%r892, %r891, 1;
+	st.local.u32 	[%rd3+44], %r892;
+	mov.u32 	%r1106, %r863;
 
 $L__BB0_517:
-	add.s32 	%r9, %r93, %r1376;
+	add.s32 	%r9, %r92, %r1106;
 	ld.shared.u8 	%rs257, [%r9];
 	setp.eq.s16 	%p260, %rs257, 0;
-	mov.u32 	%r1377, %r1120;
+	mov.u32 	%r1107, %r863;
 	@%p260 bra 	$L__BB0_519;
 
-	cvt.u32.u16 	%r1155, %rs257;
-	mul.wide.u32 	%rd536, %r1155, 4;
+	cvt.u32.u16 	%r895, %rs257;
+	mul.wide.u32 	%rd536, %r895, 4;
 	add.s64 	%rd537, %rd3, %rd536;
-	ld.local.u32 	%r1377, [%rd537];
-	add.s32 	%r1156, %r1377, 1;
-	st.local.u32 	[%rd537], %r1156;
+	ld.local.u32 	%r1107, [%rd537];
+	add.s32 	%r896, %r1107, 1;
+	st.local.u32 	[%rd537], %r896;
 
 $L__BB0_519:
-	shl.b32 	%r1158, %r1376, 2;
-	mov.u32 	%r1159, _ZZ21slzHuffBuildLutKernelE5codes;
-	add.s32 	%r12, %r1159, %r1158;
-	mov.u32 	%r1379, 0;
-	st.shared.u32 	[%r12], %r1377;
+	shl.b32 	%r898, %r1106, 2;
+	mov.u32 	%r899, _ZZ21slzHuffBuildLutKernelE5codes;
+	add.s32 	%r12, %r899, %r898;
+	mov.u32 	%r1109, 0;
+	st.shared.u32 	[%r12], %r1107;
 	ld.shared.u8 	%rs258, [%r9+1];
 	setp.eq.s16 	%p261, %rs258, 0;
-	mov.u32 	%r1378, %r1379;
+	mov.u32 	%r1108, %r1109;
 	@%p261 bra 	$L__BB0_521;
 
-	cvt.u32.u16 	%r1160, %rs258;
-	mul.wide.u32 	%rd538, %r1160, 4;
+	cvt.u32.u16 	%r900, %rs258;
+	mul.wide.u32 	%rd538, %r900, 4;
 	add.s64 	%rd539, %rd3, %rd538;
-	ld.local.u32 	%r1378, [%rd539];
-	add.s32 	%r1161, %r1378, 1;
-	st.local.u32 	[%rd539], %r1161;
+	ld.local.u32 	%r1108, [%rd539];
+	add.s32 	%r901, %r1108, 1;
+	st.local.u32 	[%rd539], %r901;
 
 $L__BB0_521:
-	st.shared.u32 	[%r12+4], %r1378;
+	st.shared.u32 	[%r12+4], %r1108;
 	ld.shared.u8 	%rs259, [%r9+2];
 	setp.eq.s16 	%p262, %rs259, 0;
 	@%p262 bra 	$L__BB0_523;
 
-	cvt.u32.u16 	%r1163, %rs259;
-	mul.wide.u32 	%rd540, %r1163, 4;
+	cvt.u32.u16 	%r903, %rs259;
+	mul.wide.u32 	%rd540, %r903, 4;
 	add.s64 	%rd541, %rd3, %rd540;
-	ld.local.u32 	%r1379, [%rd541];
-	add.s32 	%r1164, %r1379, 1;
-	st.local.u32 	[%rd541], %r1164;
+	ld.local.u32 	%r1109, [%rd541];
+	add.s32 	%r904, %r1109, 1;
+	st.local.u32 	[%rd541], %r904;
 
 $L__BB0_523:
-	mov.u32 	%r1381, 0;
-	st.shared.u32 	[%r12+8], %r1379;
+	mov.u32 	%r1111, 0;
+	st.shared.u32 	[%r12+8], %r1109;
 	ld.shared.u8 	%rs260, [%r9+3];
 	setp.eq.s16 	%p263, %rs260, 0;
-	mov.u32 	%r1380, %r1381;
+	mov.u32 	%r1110, %r1111;
 	@%p263 bra 	$L__BB0_525;
 
-	cvt.u32.u16 	%r1166, %rs260;
-	mul.wide.u32 	%rd542, %r1166, 4;
+	cvt.u32.u16 	%r906, %rs260;
+	mul.wide.u32 	%rd542, %r906, 4;
 	add.s64 	%rd543, %rd3, %rd542;
-	ld.local.u32 	%r1380, [%rd543];
-	add.s32 	%r1167, %r1380, 1;
-	st.local.u32 	[%rd543], %r1167;
+	ld.local.u32 	%r1110, [%rd543];
+	add.s32 	%r907, %r1110, 1;
+	st.local.u32 	[%rd543], %r907;
 
 $L__BB0_525:
-	st.shared.u32 	[%r12+12], %r1380;
+	st.shared.u32 	[%r12+12], %r1110;
 	ld.shared.u8 	%rs261, [%r9+4];
 	setp.eq.s16 	%p264, %rs261, 0;
 	@%p264 bra 	$L__BB0_527;
 
-	cvt.u32.u16 	%r1169, %rs261;
-	mul.wide.u32 	%rd544, %r1169, 4;
+	cvt.u32.u16 	%r909, %rs261;
+	mul.wide.u32 	%rd544, %r909, 4;
 	add.s64 	%rd545, %rd3, %rd544;
-	ld.local.u32 	%r1381, [%rd545];
-	add.s32 	%r1170, %r1381, 1;
-	st.local.u32 	[%rd545], %r1170;
+	ld.local.u32 	%r1111, [%rd545];
+	add.s32 	%r910, %r1111, 1;
+	st.local.u32 	[%rd545], %r910;
 
 $L__BB0_527:
-	mov.u32 	%r1383, 0;
-	st.shared.u32 	[%r12+16], %r1381;
+	mov.u32 	%r1113, 0;
+	st.shared.u32 	[%r12+16], %r1111;
 	ld.shared.u8 	%rs262, [%r9+5];
 	setp.eq.s16 	%p265, %rs262, 0;
-	mov.u32 	%r1382, %r1383;
+	mov.u32 	%r1112, %r1113;
 	@%p265 bra 	$L__BB0_529;
 
-	cvt.u32.u16 	%r1172, %rs262;
-	mul.wide.u32 	%rd546, %r1172, 4;
+	cvt.u32.u16 	%r912, %rs262;
+	mul.wide.u32 	%rd546, %r912, 4;
 	add.s64 	%rd547, %rd3, %rd546;
-	ld.local.u32 	%r1382, [%rd547];
-	add.s32 	%r1173, %r1382, 1;
-	st.local.u32 	[%rd547], %r1173;
+	ld.local.u32 	%r1112, [%rd547];
+	add.s32 	%r913, %r1112, 1;
+	st.local.u32 	[%rd547], %r913;
 
 $L__BB0_529:
-	st.shared.u32 	[%r12+20], %r1382;
+	st.shared.u32 	[%r12+20], %r1112;
 	ld.shared.u8 	%rs263, [%r9+6];
 	setp.eq.s16 	%p266, %rs263, 0;
 	@%p266 bra 	$L__BB0_531;
 
-	cvt.u32.u16 	%r1175, %rs263;
-	mul.wide.u32 	%rd548, %r1175, 4;
+	cvt.u32.u16 	%r915, %rs263;
+	mul.wide.u32 	%rd548, %r915, 4;
 	add.s64 	%rd549, %rd3, %rd548;
-	ld.local.u32 	%r1383, [%rd549];
-	add.s32 	%r1176, %r1383, 1;
-	st.local.u32 	[%rd549], %r1176;
+	ld.local.u32 	%r1113, [%rd549];
+	add.s32 	%r916, %r1113, 1;
+	st.local.u32 	[%rd549], %r916;
 
 $L__BB0_531:
-	mov.u32 	%r1385, 0;
-	st.shared.u32 	[%r12+24], %r1383;
+	mov.u32 	%r1115, 0;
+	st.shared.u32 	[%r12+24], %r1113;
 	ld.shared.u8 	%rs264, [%r9+7];
 	setp.eq.s16 	%p267, %rs264, 0;
-	mov.u32 	%r1384, %r1385;
+	mov.u32 	%r1114, %r1115;
 	@%p267 bra 	$L__BB0_533;
 
-	cvt.u32.u16 	%r1178, %rs264;
-	mul.wide.u32 	%rd550, %r1178, 4;
+	cvt.u32.u16 	%r918, %rs264;
+	mul.wide.u32 	%rd550, %r918, 4;
 	add.s64 	%rd551, %rd3, %rd550;
-	ld.local.u32 	%r1384, [%rd551];
-	add.s32 	%r1179, %r1384, 1;
-	st.local.u32 	[%rd551], %r1179;
+	ld.local.u32 	%r1114, [%rd551];
+	add.s32 	%r919, %r1114, 1;
+	st.local.u32 	[%rd551], %r919;
 
 $L__BB0_533:
-	st.shared.u32 	[%r12+28], %r1384;
+	st.shared.u32 	[%r12+28], %r1114;
 	ld.shared.u8 	%rs265, [%r9+8];
 	setp.eq.s16 	%p268, %rs265, 0;
 	@%p268 bra 	$L__BB0_535;
 
-	cvt.u32.u16 	%r1181, %rs265;
-	mul.wide.u32 	%rd552, %r1181, 4;
+	cvt.u32.u16 	%r921, %rs265;
+	mul.wide.u32 	%rd552, %r921, 4;
 	add.s64 	%rd553, %rd3, %rd552;
-	ld.local.u32 	%r1385, [%rd553];
-	add.s32 	%r1182, %r1385, 1;
-	st.local.u32 	[%rd553], %r1182;
+	ld.local.u32 	%r1115, [%rd553];
+	add.s32 	%r922, %r1115, 1;
+	st.local.u32 	[%rd553], %r922;
 
 $L__BB0_535:
-	mov.u32 	%r1387, 0;
-	st.shared.u32 	[%r12+32], %r1385;
+	mov.u32 	%r1117, 0;
+	st.shared.u32 	[%r12+32], %r1115;
 	ld.shared.u8 	%rs266, [%r9+9];
 	setp.eq.s16 	%p269, %rs266, 0;
-	mov.u32 	%r1386, %r1387;
+	mov.u32 	%r1116, %r1117;
 	@%p269 bra 	$L__BB0_537;
 
-	cvt.u32.u16 	%r1184, %rs266;
-	mul.wide.u32 	%rd554, %r1184, 4;
+	cvt.u32.u16 	%r924, %rs266;
+	mul.wide.u32 	%rd554, %r924, 4;
 	add.s64 	%rd555, %rd3, %rd554;
-	ld.local.u32 	%r1386, [%rd555];
-	add.s32 	%r1185, %r1386, 1;
-	st.local.u32 	[%rd555], %r1185;
+	ld.local.u32 	%r1116, [%rd555];
+	add.s32 	%r925, %r1116, 1;
+	st.local.u32 	[%rd555], %r925;
 
 $L__BB0_537:
-	st.shared.u32 	[%r12+36], %r1386;
+	st.shared.u32 	[%r12+36], %r1116;
 	ld.shared.u8 	%rs267, [%r9+10];
 	setp.eq.s16 	%p270, %rs267, 0;
 	@%p270 bra 	$L__BB0_539;
 
-	cvt.u32.u16 	%r1187, %rs267;
-	mul.wide.u32 	%rd556, %r1187, 4;
+	cvt.u32.u16 	%r927, %rs267;
+	mul.wide.u32 	%rd556, %r927, 4;
 	add.s64 	%rd557, %rd3, %rd556;
-	ld.local.u32 	%r1387, [%rd557];
-	add.s32 	%r1188, %r1387, 1;
-	st.local.u32 	[%rd557], %r1188;
+	ld.local.u32 	%r1117, [%rd557];
+	add.s32 	%r928, %r1117, 1;
+	st.local.u32 	[%rd557], %r928;
 
 $L__BB0_539:
-	mov.u32 	%r1389, 0;
-	st.shared.u32 	[%r12+40], %r1387;
+	mov.u32 	%r1119, 0;
+	st.shared.u32 	[%r12+40], %r1117;
 	ld.shared.u8 	%rs268, [%r9+11];
 	setp.eq.s16 	%p271, %rs268, 0;
-	mov.u32 	%r1388, %r1389;
+	mov.u32 	%r1118, %r1119;
 	@%p271 bra 	$L__BB0_541;
 
-	cvt.u32.u16 	%r1190, %rs268;
-	mul.wide.u32 	%rd558, %r1190, 4;
+	cvt.u32.u16 	%r930, %rs268;
+	mul.wide.u32 	%rd558, %r930, 4;
 	add.s64 	%rd559, %rd3, %rd558;
-	ld.local.u32 	%r1388, [%rd559];
-	add.s32 	%r1191, %r1388, 1;
-	st.local.u32 	[%rd559], %r1191;
+	ld.local.u32 	%r1118, [%rd559];
+	add.s32 	%r931, %r1118, 1;
+	st.local.u32 	[%rd559], %r931;
 
 $L__BB0_541:
-	st.shared.u32 	[%r12+44], %r1388;
+	st.shared.u32 	[%r12+44], %r1118;
 	ld.shared.u8 	%rs269, [%r9+12];
 	setp.eq.s16 	%p272, %rs269, 0;
 	@%p272 bra 	$L__BB0_543;
 
-	cvt.u32.u16 	%r1193, %rs269;
-	mul.wide.u32 	%rd560, %r1193, 4;
+	cvt.u32.u16 	%r933, %rs269;
+	mul.wide.u32 	%rd560, %r933, 4;
 	add.s64 	%rd561, %rd3, %rd560;
-	ld.local.u32 	%r1389, [%rd561];
-	add.s32 	%r1194, %r1389, 1;
-	st.local.u32 	[%rd561], %r1194;
+	ld.local.u32 	%r1119, [%rd561];
+	add.s32 	%r934, %r1119, 1;
+	st.local.u32 	[%rd561], %r934;
 
 $L__BB0_543:
-	mov.u32 	%r1391, 0;
-	st.shared.u32 	[%r12+48], %r1389;
+	mov.u32 	%r1121, 0;
+	st.shared.u32 	[%r12+48], %r1119;
 	ld.shared.u8 	%rs270, [%r9+13];
 	setp.eq.s16 	%p273, %rs270, 0;
-	mov.u32 	%r1390, %r1391;
+	mov.u32 	%r1120, %r1121;
 	@%p273 bra 	$L__BB0_545;
 
-	cvt.u32.u16 	%r1196, %rs270;
-	mul.wide.u32 	%rd562, %r1196, 4;
+	cvt.u32.u16 	%r936, %rs270;
+	mul.wide.u32 	%rd562, %r936, 4;
 	add.s64 	%rd563, %rd3, %rd562;
-	ld.local.u32 	%r1390, [%rd563];
-	add.s32 	%r1197, %r1390, 1;
-	st.local.u32 	[%rd563], %r1197;
+	ld.local.u32 	%r1120, [%rd563];
+	add.s32 	%r937, %r1120, 1;
+	st.local.u32 	[%rd563], %r937;
 
 $L__BB0_545:
-	st.shared.u32 	[%r12+52], %r1390;
+	st.shared.u32 	[%r12+52], %r1120;
 	ld.shared.u8 	%rs271, [%r9+14];
 	setp.eq.s16 	%p274, %rs271, 0;
 	@%p274 bra 	$L__BB0_547;
 
-	cvt.u32.u16 	%r1199, %rs271;
-	mul.wide.u32 	%rd564, %r1199, 4;
+	cvt.u32.u16 	%r939, %rs271;
+	mul.wide.u32 	%rd564, %r939, 4;
 	add.s64 	%rd565, %rd3, %rd564;
-	ld.local.u32 	%r1391, [%rd565];
-	add.s32 	%r1200, %r1391, 1;
-	st.local.u32 	[%rd565], %r1200;
+	ld.local.u32 	%r1121, [%rd565];
+	add.s32 	%r940, %r1121, 1;
+	st.local.u32 	[%rd565], %r940;
 
 $L__BB0_547:
-	mov.u32 	%r1392, 0;
-	st.shared.u32 	[%r12+56], %r1391;
+	mov.u32 	%r1122, 0;
+	st.shared.u32 	[%r12+56], %r1121;
 	ld.shared.u8 	%rs272, [%r9+15];
 	setp.eq.s16 	%p275, %rs272, 0;
 	@%p275 bra 	$L__BB0_549;
 
-	cvt.u32.u16 	%r1202, %rs272;
-	mul.wide.u32 	%rd566, %r1202, 4;
+	cvt.u32.u16 	%r942, %rs272;
+	mul.wide.u32 	%rd566, %r942, 4;
 	add.s64 	%rd567, %rd3, %rd566;
-	ld.local.u32 	%r1392, [%rd567];
-	add.s32 	%r1203, %r1392, 1;
-	st.local.u32 	[%rd567], %r1203;
+	ld.local.u32 	%r1122, [%rd567];
+	add.s32 	%r943, %r1122, 1;
+	st.local.u32 	[%rd567], %r943;
 
 $L__BB0_549:
-	st.shared.u32 	[%r12+60], %r1392;
-	add.s32 	%r1376, %r1376, 16;
-	setp.ne.s32 	%p276, %r1376, 256;
+	st.shared.u32 	[%r12+60], %r1122;
+	add.s32 	%r1106, %r1106, 16;
+	setp.ne.s32 	%p276, %r1106, 256;
 	@%p276 bra 	$L__BB0_517;
 
 $L__BB0_550:
 	bar.warp.sync 	-1;
-	and.b32  	%r1393, %r88, 31;
+	mov.u32 	%r1123, %r1128;
 
 $L__BB0_551:
-	cvt.s64.s32 	%rd568, %r1393;
+	cvt.s64.s32 	%rd568, %r1123;
 	add.s64 	%rd569, %rd568, %rd4;
 	shl.b64 	%rd570, %rd569, 2;
 	add.s64 	%rd571, %rd1, %rd570;
-	mov.u32 	%r1205, 0;
-	st.global.u32 	[%rd571], %r1205;
-	st.global.u32 	[%rd571+128], %r1205;
-	st.global.u32 	[%rd571+256], %r1205;
-	st.global.u32 	[%rd571+384], %r1205;
-	add.s32 	%r1393, %r1393, 128;
-	setp.lt.s32 	%p277, %r1393, 1024;
+	mov.u32 	%r944, 0;
+	st.global.u32 	[%rd571], %r944;
+	st.global.u32 	[%rd571+128], %r944;
+	st.global.u32 	[%rd571+256], %r944;
+	st.global.u32 	[%rd571+384], %r944;
+	add.s32 	%r1123, %r1123, 128;
+	setp.lt.s32 	%p277, %r1123, 1024;
 	@%p277 bra 	$L__BB0_551;
 
 	bar.warp.sync 	-1;
-	and.b32  	%r1394, %r88, 31;
+	mov.u32 	%r1124, %r1128;
 
 $L__BB0_553:
-	add.s32 	%r1208, %r93, %r1394;
-	ld.shared.u8 	%rs273, [%r1208];
-	add.s16 	%rs791, %rs273, -1;
-	and.b16  	%rs792, %rs791, 255;
-	setp.gt.u16 	%p278, %rs792, 9;
+	add.s32 	%r946, %r92, %r1124;
+	ld.shared.u8 	%rs273, [%r946];
+	add.s16 	%rs278, %rs273, -1;
+	and.b16  	%rs279, %rs278, 255;
+	setp.gt.u16 	%p278, %rs279, 9;
 	@%p278 bra 	$L__BB0_561;
 
-	cvt.u32.u16 	%r1210, %rs273;
-	and.b32  	%r1211, %r1210, 255;
-	shl.b32 	%r1212, %r1394, 2;
-	mov.u32 	%r1213, _ZZ21slzHuffBuildLutKernelE5codes;
-	add.s32 	%r1214, %r1213, %r1212;
-	mov.u32 	%r1215, 10;
-	sub.s32 	%r1216, %r1215, %r1211;
-	ld.shared.u32 	%r1217, [%r1214];
-	mov.u32 	%r1397, 0;
-	shl.b32 	%r51, %r1217, %r1216;
-	mov.u32 	%r1218, 1;
-	shl.b32 	%r1219, %r1218, %r1216;
-	and.b32  	%r1220, %r1394, 255;
-	prmt.b32 	%r1221, %r1210, %r1220, 28756;
-	or.b32  	%r52, %r1221, 16777216;
-	max.u32 	%r53, %r1219, 1;
-	add.s32 	%r1222, %r53, -1;
-	and.b32  	%r54, %r53, 3;
-	setp.lt.u32 	%p279, %r1222, 3;
+	cvt.u32.u16 	%r948, %rs273;
+	and.b32  	%r949, %r948, 255;
+	shl.b32 	%r950, %r1124, 2;
+	mov.u32 	%r951, _ZZ21slzHuffBuildLutKernelE5codes;
+	add.s32 	%r952, %r951, %r950;
+	mov.u32 	%r953, 10;
+	sub.s32 	%r954, %r953, %r949;
+	ld.shared.u32 	%r955, [%r952];
+	mov.u32 	%r1127, 0;
+	shl.b32 	%r49, %r955, %r954;
+	mov.u32 	%r956, 1;
+	shl.b32 	%r957, %r956, %r954;
+	and.b32  	%r958, %r1124, 255;
+	prmt.b32 	%r959, %r948, %r958, 28756;
+	or.b32  	%r50, %r959, 16777216;
+	max.u32 	%r51, %r957, 1;
+	add.s32 	%r960, %r51, -1;
+	and.b32  	%r52, %r51, 3;
+	setp.lt.u32 	%p279, %r960, 3;
 	@%p279 bra 	$L__BB0_557;
 
-	sub.s32 	%r1396, %r53, %r54;
-	mov.u32 	%r1397, 0;
+	sub.s32 	%r1126, %r51, %r52;
+	mov.u32 	%r1127, 0;
 
 $L__BB0_556:
-	add.s32 	%r1224, %r1397, %r51;
-	cvt.u64.u32 	%rd572, %r1224;
+	add.s32 	%r962, %r1127, %r49;
+	cvt.u64.u32 	%rd572, %r962;
 	add.s64 	%rd573, %rd572, %rd4;
 	shl.b64 	%rd574, %rd573, 2;
 	add.s64 	%rd575, %rd1, %rd574;
-	st.global.u32 	[%rd575], %r52;
-	add.s32 	%r1225, %r1224, 1;
-	cvt.u64.u32 	%rd576, %r1225;
+	st.global.u32 	[%rd575], %r50;
+	add.s32 	%r963, %r962, 1;
+	cvt.u64.u32 	%rd576, %r963;
 	add.s64 	%rd577, %rd576, %rd4;
 	shl.b64 	%rd578, %rd577, 2;
 	add.s64 	%rd579, %rd1, %rd578;
-	st.global.u32 	[%rd579], %r52;
-	add.s32 	%r1226, %r1224, 2;
-	cvt.u64.u32 	%rd580, %r1226;
+	st.global.u32 	[%rd579], %r50;
+	add.s32 	%r964, %r962, 2;
+	cvt.u64.u32 	%rd580, %r964;
 	add.s64 	%rd581, %rd580, %rd4;
 	shl.b64 	%rd582, %rd581, 2;
 	add.s64 	%rd583, %rd1, %rd582;
-	st.global.u32 	[%rd583], %r52;
-	add.s32 	%r1227, %r1224, 3;
-	cvt.u64.u32 	%rd584, %r1227;
+	st.global.u32 	[%rd583], %r50;
+	add.s32 	%r965, %r962, 3;
+	cvt.u64.u32 	%rd584, %r965;
 	add.s64 	%rd585, %rd584, %rd4;
 	shl.b64 	%rd586, %rd585, 2;
 	add.s64 	%rd587, %rd1, %rd586;
-	st.global.u32 	[%rd587], %r52;
-	add.s32 	%r1397, %r1397, 4;
-	add.s32 	%r1396, %r1396, -4;
-	setp.ne.s32 	%p280, %r1396, 0;
+	st.global.u32 	[%rd587], %r50;
+	add.s32 	%r1127, %r1127, 4;
+	add.s32 	%r1126, %r1126, -4;
+	setp.ne.s32 	%p280, %r1126, 0;
 	@%p280 bra 	$L__BB0_556;
 
 $L__BB0_557:
-	setp.eq.s32 	%p281, %r54, 0;
+	setp.eq.s32 	%p281, %r52, 0;
 	@%p281 bra 	$L__BB0_561;
 
-	add.s32 	%r61, %r1397, %r51;
-	cvt.u64.u32 	%rd588, %r61;
+	add.s32 	%r59, %r1127, %r49;
+	cvt.u64.u32 	%rd588, %r59;
 	add.s64 	%rd589, %rd588, %rd4;
 	shl.b64 	%rd590, %rd589, 2;
 	add.s64 	%rd591, %rd1, %rd590;
-	st.global.u32 	[%rd591], %r52;
-	setp.eq.s32 	%p282, %r54, 1;
+	st.global.u32 	[%rd591], %r50;
+	setp.eq.s32 	%p282, %r52, 1;
 	@%p282 bra 	$L__BB0_561;
 
-	add.s32 	%r1228, %r61, 1;
-	cvt.u64.u32 	%rd592, %r1228;
+	add.s32 	%r966, %r59, 1;
+	cvt.u64.u32 	%rd592, %r966;
 	add.s64 	%rd593, %rd592, %rd4;
 	shl.b64 	%rd594, %rd593, 2;
 	add.s64 	%rd595, %rd1, %rd594;
-	st.global.u32 	[%rd595], %r52;
-	setp.eq.s32 	%p283, %r54, 2;
+	st.global.u32 	[%rd595], %r50;
+	setp.eq.s32 	%p283, %r52, 2;
 	@%p283 bra 	$L__BB0_561;
 
-	add.s32 	%r1229, %r61, 2;
-	cvt.u64.u32 	%rd596, %r1229;
+	add.s32 	%r967, %r59, 2;
+	cvt.u64.u32 	%rd596, %r967;
 	add.s64 	%rd597, %rd596, %rd4;
 	shl.b64 	%rd598, %rd597, 2;
 	add.s64 	%rd599, %rd1, %rd598;
-	st.global.u32 	[%rd599], %r52;
+	st.global.u32 	[%rd599], %r50;
 
 $L__BB0_561:
-	add.s32 	%r1394, %r1394, 32;
-	setp.lt.s32 	%p284, %r1394, 256;
+	add.s32 	%r1124, %r1124, 32;
+	setp.lt.s32 	%p284, %r1124, 256;
 	@%p284 bra 	$L__BB0_553;
 
 	bar.warp.sync 	-1;
-	and.b32  	%r1398, %r88, 31;
 
 $L__BB0_563:
-	add.s32 	%r1232, %r93, %r1398;
-	ld.shared.u8 	%rs274, [%r1232];
-	add.s16 	%rs793, %rs274, -1;
-	and.b16  	%rs794, %rs793, 255;
-	setp.gt.u16 	%p285, %rs794, 8;
+	add.s32 	%r969, %r92, %r1128;
+	ld.shared.u8 	%rs280, [%r969];
+	cvt.u32.u16 	%r970, %rs280;
+	and.b32  	%r62, %r970, 255;
+	add.s16 	%rs281, %rs280, -1;
+	and.b16  	%rs282, %rs281, 255;
+	setp.gt.u16 	%p285, %rs282, 8;
 	@%p285 bra 	$L__BB0_575;
 
-	shl.b32 	%r1234, %r1398, 2;
-	mov.u32 	%r1235, _ZZ21slzHuffBuildLutKernelE5codes;
-	add.s32 	%r1236, %r1235, %r1234;
-	cvt.u32.u16 	%r1237, %rs274;
-	and.b32  	%r1238, %r1237, 255;
-	mov.u32 	%r1239, 10;
-	sub.s32 	%r1240, %r1239, %r1238;
-	ld.shared.u32 	%r1241, [%r1236];
-	mov.u32 	%r1399, 0;
-	shl.b32 	%r65, %r1241, %r1240;
+	shl.b32 	%r972, %r1128, 2;
+	mov.u32 	%r973, _ZZ21slzHuffBuildLutKernelE5codes;
+	add.s32 	%r974, %r973, %r972;
+	mov.u32 	%r975, 10;
+	sub.s32 	%r63, %r975, %r62;
+	ld.shared.u32 	%r976, [%r974];
+	mov.u32 	%r1129, 0;
+	shl.b32 	%r64, %r976, %r63;
 
 $L__BB0_565:
-	add.s32 	%r1243, %r93, %r1399;
-	ld.shared.u8 	%r67, [%r1243];
-	setp.eq.s32 	%p286, %r67, 0;
+	add.s32 	%r978, %r92, %r1129;
+	ld.shared.u8 	%r66, [%r978];
+	setp.eq.s32 	%p286, %r66, 0;
 	@%p286 bra 	$L__BB0_574;
 
-	add.s32 	%r68, %r67, %r1238;
-	setp.gt.u32 	%p287, %r68, 10;
+	add.s32 	%r67, %r66, %r62;
+	setp.gt.u32 	%p287, %r67, 10;
 	@%p287 bra 	$L__BB0_574;
 
-	shl.b32 	%r1247, %r1399, 2;
-	add.s32 	%r1249, %r1235, %r1247;
-	mov.u32 	%r1252, 10;
-	sub.s32 	%r1253, %r1252, %r1238;
-	sub.s32 	%r1254, %r1253, %r67;
-	ld.shared.u32 	%r1255, [%r1249];
-	mov.u32 	%r1402, 0;
-	shl.b32 	%r1256, %r1255, %r1254;
-	or.b32  	%r69, %r1256, %r65;
-	sub.s32 	%r1257, %r1252, %r68;
-	mov.u32 	%r1258, 1;
-	shl.b32 	%r1259, %r1258, %r1257;
-	and.b32  	%r1260, %r68, 255;
-	and.b32  	%r1261, %r1399, 255;
-	and.b32  	%r1262, %r1398, 255;
-	prmt.b32 	%r1263, %r1261, %r1262, 30212;
-	prmt.b32 	%r1264, %r1260, %r1263, 28756;
-	or.b32  	%r70, %r1264, 33554432;
-	max.u32 	%r71, %r1259, 1;
-	add.s32 	%r1265, %r71, -1;
-	and.b32  	%r72, %r71, 3;
-	setp.lt.u32 	%p288, %r1265, 3;
+	shl.b32 	%r980, %r1129, 2;
+	add.s32 	%r982, %r973, %r980;
+	sub.s32 	%r983, %r63, %r66;
+	ld.shared.u32 	%r984, [%r982];
+	mov.u32 	%r1132, 0;
+	shl.b32 	%r985, %r984, %r983;
+	or.b32  	%r68, %r985, %r64;
+	mov.u32 	%r986, 10;
+	sub.s32 	%r987, %r986, %r67;
+	mov.u32 	%r988, 1;
+	shl.b32 	%r989, %r988, %r987;
+	and.b32  	%r990, %r67, 255;
+	and.b32  	%r991, %r1129, 255;
+	and.b32  	%r992, %r1128, 255;
+	prmt.b32 	%r993, %r991, %r992, 30212;
+	prmt.b32 	%r994, %r990, %r993, 28756;
+	or.b32  	%r69, %r994, 33554432;
+	max.u32 	%r70, %r989, 1;
+	add.s32 	%r995, %r70, -1;
+	and.b32  	%r71, %r70, 3;
+	setp.lt.u32 	%p288, %r995, 3;
 	@%p288 bra 	$L__BB0_570;
 
-	add.s32 	%r1400, %r69, 3;
-	sub.s32 	%r74, %r72, %r71;
-	mov.u32 	%r1402, 0;
+	add.s32 	%r1130, %r68, 3;
+	sub.s32 	%r73, %r71, %r70;
+	mov.u32 	%r1132, 0;
 
 $L__BB0_569:
-	add.s32 	%r1267, %r1400, -3;
-	cvt.u64.u32 	%rd600, %r1267;
+	add.s32 	%r997, %r1130, -3;
+	cvt.u64.u32 	%rd600, %r997;
 	add.s64 	%rd601, %rd600, %rd4;
 	shl.b64 	%rd602, %rd601, 2;
 	add.s64 	%rd603, %rd1, %rd602;
-	st.global.u32 	[%rd603], %r70;
-	add.s32 	%r1268, %r1400, -2;
-	cvt.u64.u32 	%rd604, %r1268;
+	st.global.u32 	[%rd603], %r69;
+	add.s32 	%r998, %r1130, -2;
+	cvt.u64.u32 	%rd604, %r998;
 	add.s64 	%rd605, %rd604, %rd4;
 	shl.b64 	%rd606, %rd605, 2;
 	add.s64 	%rd607, %rd1, %rd606;
-	st.global.u32 	[%rd607], %r70;
-	add.s32 	%r1269, %r1400, -1;
-	cvt.u64.u32 	%rd608, %r1269;
+	st.global.u32 	[%rd607], %r69;
+	add.s32 	%r999, %r1130, -1;
+	cvt.u64.u32 	%rd608, %r999;
 	add.s64 	%rd609, %rd608, %rd4;
 	shl.b64 	%rd610, %rd609, 2;
 	add.s64 	%rd611, %rd1, %rd610;
-	st.global.u32 	[%rd611], %r70;
-	cvt.u64.u32 	%rd612, %r1400;
+	st.global.u32 	[%rd611], %r69;
+	cvt.u64.u32 	%rd612, %r1130;
 	add.s64 	%rd613, %rd612, %rd4;
 	shl.b64 	%rd614, %rd613, 2;
 	add.s64 	%rd615, %rd1, %rd614;
-	st.global.u32 	[%rd615], %r70;
-	add.s32 	%r1400, %r1400, 4;
-	add.s32 	%r1402, %r1402, 4;
-	add.s32 	%r1270, %r74, %r1402;
-	setp.ne.s32 	%p289, %r1270, 0;
+	st.global.u32 	[%rd615], %r69;
+	add.s32 	%r1130, %r1130, 4;
+	add.s32 	%r1132, %r1132, 4;
+	add.s32 	%r1000, %r73, %r1132;
+	setp.ne.s32 	%p289, %r1000, 0;
 	@%p289 bra 	$L__BB0_569;
 
 $L__BB0_570:
-	setp.eq.s32 	%p290, %r72, 0;
+	setp.eq.s32 	%p290, %r71, 0;
 	@%p290 bra 	$L__BB0_574;
 
-	add.s32 	%r80, %r1402, %r69;
-	cvt.u64.u32 	%rd616, %r80;
+	add.s32 	%r79, %r1132, %r68;
+	cvt.u64.u32 	%rd616, %r79;
 	add.s64 	%rd617, %rd616, %rd4;
 	shl.b64 	%rd618, %rd617, 2;
 	add.s64 	%rd619, %rd1, %rd618;
-	st.global.u32 	[%rd619], %r70;
-	setp.eq.s32 	%p291, %r72, 1;
+	st.global.u32 	[%rd619], %r69;
+	setp.eq.s32 	%p291, %r71, 1;
 	@%p291 bra 	$L__BB0_574;
 
-	add.s32 	%r1271, %r80, 1;
-	cvt.u64.u32 	%rd620, %r1271;
+	add.s32 	%r1001, %r79, 1;
+	cvt.u64.u32 	%rd620, %r1001;
 	add.s64 	%rd621, %rd620, %rd4;
 	shl.b64 	%rd622, %rd621, 2;
 	add.s64 	%rd623, %rd1, %rd622;
-	st.global.u32 	[%rd623], %r70;
-	setp.eq.s32 	%p292, %r72, 2;
+	st.global.u32 	[%rd623], %r69;
+	setp.eq.s32 	%p292, %r71, 2;
 	@%p292 bra 	$L__BB0_574;
 
-	add.s32 	%r1272, %r80, 2;
-	cvt.u64.u32 	%rd624, %r1272;
+	add.s32 	%r1002, %r79, 2;
+	cvt.u64.u32 	%rd624, %r1002;
 	add.s64 	%rd625, %rd624, %rd4;
 	shl.b64 	%rd626, %rd625, 2;
 	add.s64 	%rd627, %rd1, %rd626;
-	st.global.u32 	[%rd627], %r70;
+	st.global.u32 	[%rd627], %r69;
 
 $L__BB0_574:
-	add.s32 	%r1399, %r1399, 1;
-	setp.lt.u32 	%p293, %r1399, 256;
+	add.s32 	%r1129, %r1129, 1;
+	setp.lt.u32 	%p293, %r1129, 256;
 	@%p293 bra 	$L__BB0_565;
 
 $L__BB0_575:
-	add.s32 	%r1398, %r1398, 32;
-	setp.lt.s32 	%p294, %r1398, 256;
+	add.s32 	%r1128, %r1128, 32;
+	setp.lt.s32 	%p294, %r1128, 256;
 	@%p294 bra 	$L__BB0_563;
 
-	and.b32  	%r1274, %r88, 31;
-	setp.ne.s32 	%p295, %r1274, 0;
+	and.b32  	%r1004, %r87, 31;
+	setp.ne.s32 	%p295, %r1004, 0;
 	bar.warp.sync 	-1;
 	@%p295 bra 	$L__BB0_595;
 
-	mov.u32 	%r1403, 0;
-	mov.u32 	%r1278, _ZZ21slzHuffBuildLutKernelE5codes;
+	mov.u32 	%r1133, 0;
+	mov.u32 	%r1008, _ZZ21slzHuffBuildLutKernelE5codes;
 
 $L__BB0_578:
-	add.s32 	%r84, %r93, %r1403;
-	ld.shared.u8 	%rs795, [%r84];
-	setp.ne.s16 	%p296, %rs795, 11;
-	shl.b32 	%r1277, %r1403, 2;
-	add.s32 	%r85, %r1278, %r1277;
+	add.s32 	%r83, %r92, %r1133;
+	ld.shared.u8 	%rs283, [%r83];
+	setp.ne.s16 	%p296, %rs283, 11;
+	shl.b32 	%r1007, %r1133, 2;
+	add.s32 	%r84, %r1008, %r1007;
 	@%p296 bra 	$L__BB0_580;
 
-	ld.shared.u32 	%r1279, [%r85];
-	shr.u32 	%r1280, %r1279, 1;
-	cvt.u64.u32 	%rd628, %r1280;
+	ld.shared.u32 	%r1009, [%r84];
+	shr.u32 	%r1010, %r1009, 1;
+	cvt.u64.u32 	%rd628, %r1010;
 	add.s64 	%rd629, %rd628, %rd4;
 	shl.b64 	%rd630, %rd629, 2;
 	add.s64 	%rd631, %rd1, %rd630;
-	ld.global.u32 	%r1281, [%rd631];
-	shr.u32 	%r1282, %r1281, 8;
-	and.b32  	%r1283, %r1279, 1;
-	setp.eq.b32 	%p297, %r1283, 1;
-	selp.b32 	%r1284, %r1281, %r1403, %p297;
-	selp.b32 	%r1285, %r1403, %r1282, %p297;
-	and.b32  	%r1286, %r1285, 255;
-	and.b32  	%r1287, %r1284, 255;
-	prmt.b32 	%r1288, %r1286, %r1287, 30212;
-	or.b32  	%r1289, %r1288, 51052544;
-	st.global.u32 	[%rd631], %r1289;
+	ld.global.u32 	%r1011, [%rd631];
+	shr.u32 	%r1012, %r1011, 8;
+	and.b32  	%r1013, %r1009, 1;
+	setp.eq.b32 	%p297, %r1013, 1;
+	selp.b32 	%r1014, %r1011, %r1133, %p297;
+	selp.b32 	%r1015, %r1133, %r1012, %p297;
+	and.b32  	%r1016, %r1015, 255;
+	and.b32  	%r1017, %r1014, 255;
+	prmt.b32 	%r1018, %r1016, %r1017, 30212;
+	or.b32  	%r1019, %r1018, 51052544;
+	st.global.u32 	[%rd631], %r1019;
 
 $L__BB0_580:
-	ld.shared.u8 	%rs796, [%r84+1];
-	setp.ne.s16 	%p298, %rs796, 11;
+	ld.shared.u8 	%rs284, [%r83+1];
+	setp.ne.s16 	%p298, %rs284, 11;
 	@%p298 bra 	$L__BB0_582;
 
-	add.s32 	%r1290, %r1403, 1;
-	ld.shared.u32 	%r1291, [%r85+4];
-	shr.u32 	%r1292, %r1291, 1;
-	cvt.u64.u32 	%rd632, %r1292;
+	add.s32 	%r1020, %r1133, 1;
+	ld.shared.u32 	%r1021, [%r84+4];
+	shr.u32 	%r1022, %r1021, 1;
+	cvt.u64.u32 	%rd632, %r1022;
 	add.s64 	%rd633, %rd632, %rd4;
 	shl.b64 	%rd634, %rd633, 2;
 	add.s64 	%rd635, %rd1, %rd634;
-	ld.global.u32 	%r1293, [%rd635];
-	shr.u32 	%r1294, %r1293, 8;
-	and.b32  	%r1295, %r1291, 1;
-	setp.eq.b32 	%p299, %r1295, 1;
-	selp.b32 	%r1296, %r1293, %r1290, %p299;
-	selp.b32 	%r1297, %r1290, %r1294, %p299;
-	and.b32  	%r1298, %r1297, 255;
-	and.b32  	%r1299, %r1296, 255;
-	prmt.b32 	%r1300, %r1298, %r1299, 30212;
-	or.b32  	%r1301, %r1300, 51052544;
-	st.global.u32 	[%rd635], %r1301;
+	ld.global.u32 	%r1023, [%rd635];
+	shr.u32 	%r1024, %r1023, 8;
+	and.b32  	%r1025, %r1021, 1;
+	setp.eq.b32 	%p299, %r1025, 1;
+	selp.b32 	%r1026, %r1023, %r1020, %p299;
+	selp.b32 	%r1027, %r1020, %r1024, %p299;
+	and.b32  	%r1028, %r1027, 255;
+	and.b32  	%r1029, %r1026, 255;
+	prmt.b32 	%r1030, %r1028, %r1029, 30212;
+	or.b32  	%r1031, %r1030, 51052544;
+	st.global.u32 	[%rd635], %r1031;
 
 $L__BB0_582:
-	ld.shared.u8 	%rs797, [%r84+2];
-	setp.ne.s16 	%p300, %rs797, 11;
+	ld.shared.u8 	%rs285, [%r83+2];
+	setp.ne.s16 	%p300, %rs285, 11;
 	@%p300 bra 	$L__BB0_584;
 
-	add.s32 	%r1302, %r1403, 2;
-	ld.shared.u32 	%r1303, [%r85+8];
-	shr.u32 	%r1304, %r1303, 1;
-	cvt.u64.u32 	%rd636, %r1304;
+	add.s32 	%r1032, %r1133, 2;
+	ld.shared.u32 	%r1033, [%r84+8];
+	shr.u32 	%r1034, %r1033, 1;
+	cvt.u64.u32 	%rd636, %r1034;
 	add.s64 	%rd637, %rd636, %rd4;
 	shl.b64 	%rd638, %rd637, 2;
 	add.s64 	%rd639, %rd1, %rd638;
-	ld.global.u32 	%r1305, [%rd639];
-	shr.u32 	%r1306, %r1305, 8;
-	and.b32  	%r1307, %r1303, 1;
-	setp.eq.b32 	%p301, %r1307, 1;
-	selp.b32 	%r1308, %r1305, %r1302, %p301;
-	selp.b32 	%r1309, %r1302, %r1306, %p301;
-	and.b32  	%r1310, %r1309, 255;
-	and.b32  	%r1311, %r1308, 255;
-	prmt.b32 	%r1312, %r1310, %r1311, 30212;
-	or.b32  	%r1313, %r1312, 51052544;
-	st.global.u32 	[%rd639], %r1313;
+	ld.global.u32 	%r1035, [%rd639];
+	shr.u32 	%r1036, %r1035, 8;
+	and.b32  	%r1037, %r1033, 1;
+	setp.eq.b32 	%p301, %r1037, 1;
+	selp.b32 	%r1038, %r1035, %r1032, %p301;
+	selp.b32 	%r1039, %r1032, %r1036, %p301;
+	and.b32  	%r1040, %r1039, 255;
+	and.b32  	%r1041, %r1038, 255;
+	prmt.b32 	%r1042, %r1040, %r1041, 30212;
+	or.b32  	%r1043, %r1042, 51052544;
+	st.global.u32 	[%rd639], %r1043;
 
 $L__BB0_584:
-	ld.shared.u8 	%rs798, [%r84+3];
-	setp.ne.s16 	%p302, %rs798, 11;
+	ld.shared.u8 	%rs286, [%r83+3];
+	setp.ne.s16 	%p302, %rs286, 11;
 	@%p302 bra 	$L__BB0_586;
 
-	add.s32 	%r1314, %r1403, 3;
-	ld.shared.u32 	%r1315, [%r85+12];
-	shr.u32 	%r1316, %r1315, 1;
-	cvt.u64.u32 	%rd640, %r1316;
+	add.s32 	%r1044, %r1133, 3;
+	ld.shared.u32 	%r1045, [%r84+12];
+	shr.u32 	%r1046, %r1045, 1;
+	cvt.u64.u32 	%rd640, %r1046;
 	add.s64 	%rd641, %rd640, %rd4;
 	shl.b64 	%rd642, %rd641, 2;
 	add.s64 	%rd643, %rd1, %rd642;
-	ld.global.u32 	%r1317, [%rd643];
-	shr.u32 	%r1318, %r1317, 8;
-	and.b32  	%r1319, %r1315, 1;
-	setp.eq.b32 	%p303, %r1319, 1;
-	selp.b32 	%r1320, %r1317, %r1314, %p303;
-	selp.b32 	%r1321, %r1314, %r1318, %p303;
-	and.b32  	%r1322, %r1321, 255;
-	and.b32  	%r1323, %r1320, 255;
-	prmt.b32 	%r1324, %r1322, %r1323, 30212;
-	or.b32  	%r1325, %r1324, 51052544;
-	st.global.u32 	[%rd643], %r1325;
+	ld.global.u32 	%r1047, [%rd643];
+	shr.u32 	%r1048, %r1047, 8;
+	and.b32  	%r1049, %r1045, 1;
+	setp.eq.b32 	%p303, %r1049, 1;
+	selp.b32 	%r1050, %r1047, %r1044, %p303;
+	selp.b32 	%r1051, %r1044, %r1048, %p303;
+	and.b32  	%r1052, %r1051, 255;
+	and.b32  	%r1053, %r1050, 255;
+	prmt.b32 	%r1054, %r1052, %r1053, 30212;
+	or.b32  	%r1055, %r1054, 51052544;
+	st.global.u32 	[%rd643], %r1055;
 
 $L__BB0_586:
-	ld.shared.u8 	%rs799, [%r84+4];
-	setp.ne.s16 	%p304, %rs799, 11;
+	ld.shared.u8 	%rs287, [%r83+4];
+	setp.ne.s16 	%p304, %rs287, 11;
 	@%p304 bra 	$L__BB0_588;
 
-	add.s32 	%r1326, %r1403, 4;
-	ld.shared.u32 	%r1327, [%r85+16];
-	shr.u32 	%r1328, %r1327, 1;
-	cvt.u64.u32 	%rd644, %r1328;
+	add.s32 	%r1056, %r1133, 4;
+	ld.shared.u32 	%r1057, [%r84+16];
+	shr.u32 	%r1058, %r1057, 1;
+	cvt.u64.u32 	%rd644, %r1058;
 	add.s64 	%rd645, %rd644, %rd4;
 	shl.b64 	%rd646, %rd645, 2;
 	add.s64 	%rd647, %rd1, %rd646;
-	ld.global.u32 	%r1329, [%rd647];
-	shr.u32 	%r1330, %r1329, 8;
-	and.b32  	%r1331, %r1327, 1;
-	setp.eq.b32 	%p305, %r1331, 1;
-	selp.b32 	%r1332, %r1329, %r1326, %p305;
-	selp.b32 	%r1333, %r1326, %r1330, %p305;
-	and.b32  	%r1334, %r1333, 255;
-	and.b32  	%r1335, %r1332, 255;
-	prmt.b32 	%r1336, %r1334, %r1335, 30212;
-	or.b32  	%r1337, %r1336, 51052544;
-	st.global.u32 	[%rd647], %r1337;
+	ld.global.u32 	%r1059, [%rd647];
+	shr.u32 	%r1060, %r1059, 8;
+	and.b32  	%r1061, %r1057, 1;
+	setp.eq.b32 	%p305, %r1061, 1;
+	selp.b32 	%r1062, %r1059, %r1056, %p305;
+	selp.b32 	%r1063, %r1056, %r1060, %p305;
+	and.b32  	%r1064, %r1063, 255;
+	and.b32  	%r1065, %r1062, 255;
+	prmt.b32 	%r1066, %r1064, %r1065, 30212;
+	or.b32  	%r1067, %r1066, 51052544;
+	st.global.u32 	[%rd647], %r1067;
 
 $L__BB0_588:
-	ld.shared.u8 	%rs800, [%r84+5];
-	setp.ne.s16 	%p306, %rs800, 11;
+	ld.shared.u8 	%rs288, [%r83+5];
+	setp.ne.s16 	%p306, %rs288, 11;
 	@%p306 bra 	$L__BB0_590;
 
-	add.s32 	%r1338, %r1403, 5;
-	ld.shared.u32 	%r1339, [%r85+20];
-	shr.u32 	%r1340, %r1339, 1;
-	cvt.u64.u32 	%rd648, %r1340;
+	add.s32 	%r1068, %r1133, 5;
+	ld.shared.u32 	%r1069, [%r84+20];
+	shr.u32 	%r1070, %r1069, 1;
+	cvt.u64.u32 	%rd648, %r1070;
 	add.s64 	%rd649, %rd648, %rd4;
 	shl.b64 	%rd650, %rd649, 2;
 	add.s64 	%rd651, %rd1, %rd650;
-	ld.global.u32 	%r1341, [%rd651];
-	shr.u32 	%r1342, %r1341, 8;
-	and.b32  	%r1343, %r1339, 1;
-	setp.eq.b32 	%p307, %r1343, 1;
-	selp.b32 	%r1344, %r1341, %r1338, %p307;
-	selp.b32 	%r1345, %r1338, %r1342, %p307;
-	and.b32  	%r1346, %r1345, 255;
-	and.b32  	%r1347, %r1344, 255;
-	prmt.b32 	%r1348, %r1346, %r1347, 30212;
-	or.b32  	%r1349, %r1348, 51052544;
-	st.global.u32 	[%rd651], %r1349;
+	ld.global.u32 	%r1071, [%rd651];
+	shr.u32 	%r1072, %r1071, 8;
+	and.b32  	%r1073, %r1069, 1;
+	setp.eq.b32 	%p307, %r1073, 1;
+	selp.b32 	%r1074, %r1071, %r1068, %p307;
+	selp.b32 	%r1075, %r1068, %r1072, %p307;
+	and.b32  	%r1076, %r1075, 255;
+	and.b32  	%r1077, %r1074, 255;
+	prmt.b32 	%r1078, %r1076, %r1077, 30212;
+	or.b32  	%r1079, %r1078, 51052544;
+	st.global.u32 	[%rd651], %r1079;
 
 $L__BB0_590:
-	ld.shared.u8 	%rs801, [%r84+6];
-	setp.ne.s16 	%p308, %rs801, 11;
+	ld.shared.u8 	%rs289, [%r83+6];
+	setp.ne.s16 	%p308, %rs289, 11;
 	@%p308 bra 	$L__BB0_592;
 
-	add.s32 	%r1350, %r1403, 6;
-	ld.shared.u32 	%r1351, [%r85+24];
-	shr.u32 	%r1352, %r1351, 1;
-	cvt.u64.u32 	%rd652, %r1352;
+	add.s32 	%r1080, %r1133, 6;
+	ld.shared.u32 	%r1081, [%r84+24];
+	shr.u32 	%r1082, %r1081, 1;
+	cvt.u64.u32 	%rd652, %r1082;
 	add.s64 	%rd653, %rd652, %rd4;
 	shl.b64 	%rd654, %rd653, 2;
 	add.s64 	%rd655, %rd1, %rd654;
-	ld.global.u32 	%r1353, [%rd655];
-	shr.u32 	%r1354, %r1353, 8;
-	and.b32  	%r1355, %r1351, 1;
-	setp.eq.b32 	%p309, %r1355, 1;
-	selp.b32 	%r1356, %r1353, %r1350, %p309;
-	selp.b32 	%r1357, %r1350, %r1354, %p309;
-	and.b32  	%r1358, %r1357, 255;
-	and.b32  	%r1359, %r1356, 255;
-	prmt.b32 	%r1360, %r1358, %r1359, 30212;
-	or.b32  	%r1361, %r1360, 51052544;
-	st.global.u32 	[%rd655], %r1361;
+	ld.global.u32 	%r1083, [%rd655];
+	shr.u32 	%r1084, %r1083, 8;
+	and.b32  	%r1085, %r1081, 1;
+	setp.eq.b32 	%p309, %r1085, 1;
+	selp.b32 	%r1086, %r1083, %r1080, %p309;
+	selp.b32 	%r1087, %r1080, %r1084, %p309;
+	and.b32  	%r1088, %r1087, 255;
+	and.b32  	%r1089, %r1086, 255;
+	prmt.b32 	%r1090, %r1088, %r1089, 30212;
+	or.b32  	%r1091, %r1090, 51052544;
+	st.global.u32 	[%rd655], %r1091;
 
 $L__BB0_592:
-	ld.shared.u8 	%rs802, [%r84+7];
-	setp.ne.s16 	%p310, %rs802, 11;
+	ld.shared.u8 	%rs290, [%r83+7];
+	setp.ne.s16 	%p310, %rs290, 11;
 	@%p310 bra 	$L__BB0_594;
 
-	add.s32 	%r1362, %r1403, 7;
-	ld.shared.u32 	%r1363, [%r85+28];
-	shr.u32 	%r1364, %r1363, 1;
-	cvt.u64.u32 	%rd656, %r1364;
+	add.s32 	%r1092, %r1133, 7;
+	ld.shared.u32 	%r1093, [%r84+28];
+	shr.u32 	%r1094, %r1093, 1;
+	cvt.u64.u32 	%rd656, %r1094;
 	add.s64 	%rd657, %rd656, %rd4;
 	shl.b64 	%rd658, %rd657, 2;
 	add.s64 	%rd659, %rd1, %rd658;
-	ld.global.u32 	%r1365, [%rd659];
-	shr.u32 	%r1366, %r1365, 8;
-	and.b32  	%r1367, %r1363, 1;
-	setp.eq.b32 	%p311, %r1367, 1;
-	selp.b32 	%r1368, %r1365, %r1362, %p311;
-	selp.b32 	%r1369, %r1362, %r1366, %p311;
-	and.b32  	%r1370, %r1369, 255;
-	and.b32  	%r1371, %r1368, 255;
-	prmt.b32 	%r1372, %r1370, %r1371, 30212;
-	or.b32  	%r1373, %r1372, 51052544;
-	st.global.u32 	[%rd659], %r1373;
+	ld.global.u32 	%r1095, [%rd659];
+	shr.u32 	%r1096, %r1095, 8;
+	and.b32  	%r1097, %r1093, 1;
+	setp.eq.b32 	%p311, %r1097, 1;
+	selp.b32 	%r1098, %r1095, %r1092, %p311;
+	selp.b32 	%r1099, %r1092, %r1096, %p311;
+	and.b32  	%r1100, %r1099, 255;
+	and.b32  	%r1101, %r1098, 255;
+	prmt.b32 	%r1102, %r1100, %r1101, 30212;
+	or.b32  	%r1103, %r1102, 51052544;
+	st.global.u32 	[%rd659], %r1103;
 
 $L__BB0_594:
-	add.s32 	%r1403, %r1403, 8;
-	setp.ne.s32 	%p312, %r1403, 256;
+	add.s32 	%r1133, %r1133, 8;
+	setp.ne.s32 	%p312, %r1133, 256;
 	@%p312 bra 	$L__BB0_578;
 
 $L__BB0_595:

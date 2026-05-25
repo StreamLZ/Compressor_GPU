@@ -100,8 +100,8 @@ __device__ static RawStreams parseRaw(const uint8_t* raw, uint32_t raw_size,
     const uint8_t* off32_start = raw + rp;
     const uint32_t packed = readLE24(raw + rp);
     rp += 3;
-    uint32_t c1 = (packed >> 12) & 0xFFF;
-    uint32_t c2 = packed & 0xFFF;
+    uint32_t c1 = (packed >> OFF32_COUNT_FIELD_BITS) & OFF32_COUNT_PACK_MAX;
+    uint32_t c2 = packed & OFF32_COUNT_PACK_MAX;
     uint32_t hdr_plus_extra = 3;
     if (c1 >= OFF32_COUNT_PACK_MAX) {
         if (rp + 2 > raw_size) return s;

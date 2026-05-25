@@ -127,13 +127,16 @@ __device__ void decodeSubChunkGeneral(
             }
 
             // ── Broadcast parsed values from lane 0 to all lanes ──
+            // token_type/lit_len/match_len/match_offset/use_recent: parsed
+            // on lane 0 only. cmd_pos/off16_pos/off32_pos: incremented on
+            // lane 0 only. `lit_pos` is already coherent (mutated below by
+            // `lit_pos += lit_len` on every lane), so no shfl needed for it.
             token_type   = __shfl_sync(FULL_WARP_MASK, token_type, 0);
             lit_len      = __shfl_sync(FULL_WARP_MASK, lit_len, 0);
             match_len    = __shfl_sync(FULL_WARP_MASK, match_len, 0);
             match_offset = __shfl_sync(FULL_WARP_MASK, match_offset, 0);
             use_recent   = __shfl_sync(FULL_WARP_MASK, use_recent, 0);
             cmd_pos      = __shfl_sync(FULL_WARP_MASK, cmd_pos, 0);
-            lit_pos      = __shfl_sync(FULL_WARP_MASK, lit_pos, 0);
             off16_pos    = __shfl_sync(FULL_WARP_MASK, off16_pos, 0);
             off32_pos    = __shfl_sync(FULL_WARP_MASK, off32_pos, 0);
 
@@ -167,8 +170,9 @@ __device__ void decodeSubChunkGeneral(
                 dst_pos += match_len;
             }
 
-            dst_pos   = __shfl_sync(FULL_WARP_MASK, dst_pos, 0);
-            lit_pos   = __shfl_sync(FULL_WARP_MASK, lit_pos, 0);
+            // dst_pos / lit_pos are coherent here: every lane added the
+            // broadcast lit_len / match_len above. recent_offset is mutated
+            // on lane 0 (conditional on use_recent) and needs broadcast.
             if (!use_recent && (token_type != 1)) recent_offset = match_offset;
             recent_offset = __shfl_sync(FULL_WARP_MASK, recent_offset, 0);
             length_offset = __shfl_sync(FULL_WARP_MASK, length_offset, 0);
@@ -176,8 +180,6 @@ __device__ void decodeSubChunkGeneral(
 
         // ── Per-block trailing literals (at 64KB boundary) ──
         __syncwarp();
-        dst_pos = __shfl_sync(FULL_WARP_MASK, dst_pos, 0);
-        lit_pos = __shfl_sync(FULL_WARP_MASK, lit_pos, 0);
         {
             uint32_t block_end = block_dst_start + LZ_BLOCK_SIZE;
             if (block_end > dst_end_abs) block_end = dst_end_abs;
@@ -208,9 +210,9 @@ __device__ void decodeSubChunkGeneral(
     }
 
     // ── Final trailing literals ──
+    // dst_pos / lit_pos remain coherent across lanes — every cooperative
+    // copy above advances them by a lane-broadcast count.
     __syncwarp();
-    dst_pos = __shfl_sync(FULL_WARP_MASK, dst_pos, 0);
-    lit_pos = __shfl_sync(FULL_WARP_MASK, lit_pos, 0);
     uint32_t trailing = (lit_size > lit_pos) ? (lit_size - lit_pos) : 0;
     if (mode == 0) {
         for (uint32_t i = lane; i < trailing; i += WARP_SIZE)

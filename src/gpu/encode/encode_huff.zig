@@ -136,10 +136,11 @@ pub fn gpuEncodeOff16HuffImpl(
     const num_descs = n * 2;
     var descs = allocator.alloc(HuffEncDesc, num_descs) catch return false;
     defer allocator.free(descs);
+    // Function returns `bool`, not `!bool`, so an errdefer would never
+    // fire. Cleanup on subsequent failure is handled by the explicit
+    // `allocator.free(...)` calls in each `catch { ... }` block below.
     var hi_offsets = allocator.alloc(u32, n) catch return false;
-    errdefer allocator.free(hi_offsets);
     var lo_offsets = allocator.alloc(u32, n) catch return false;
-    errdefer allocator.free(lo_offsets);
 
     var total: u32 = 0;
     for (0..n) |i| {
@@ -287,8 +288,9 @@ pub fn gpuEncodeLiteralsHuffImpl(
 
     var descs = allocator.alloc(HuffEncDesc, n) catch return false;
     defer allocator.free(descs);
+    // bool-return function — errdefer would never fire; cleanup lives
+    // in the explicit catch blocks below.
     var offsets = allocator.alloc(u32, n) catch return false;
-    errdefer allocator.free(offsets);
 
     var total: u32 = 0;
     for (0..n) |i| {
@@ -379,8 +381,9 @@ pub fn gpuEncodeTokensHuffImpl(
 
     var descs = allocator.alloc(HuffEncDesc, n) catch return false;
     defer allocator.free(descs);
+    // bool-return function — errdefer would never fire; cleanup lives
+    // in the explicit catch blocks below.
     var offsets = allocator.alloc(u32, n) catch return false;
-    errdefer allocator.free(offsets);
 
     var total: u32 = 0;
     for (0..n) |i| {

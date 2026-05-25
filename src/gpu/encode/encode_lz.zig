@@ -69,11 +69,11 @@ pub fn gpuCompressImpl(
     // populate d_input_persist via a D2D copy (no PCIe) instead of the
     // H2D from the host `input` slice.
     if (self.d_input_override != 0) {
-        if (ffi.cuMemcpyDtoDAsync_fn) |d2d| {
-            if (d2d(d_input, self.d_input_override, input.len, 0) != ffi.CUDA_SUCCESS) return false;
-        } else {
-            if (h2d_fn(d_input, @ptrCast(input.ptr), input.len) != ffi.CUDA_SUCCESS) return false;
-        }
+        // Caller's data is already GPU-resident; the host `input` slice
+        // may be a sentinel (per `EncodeContext.d_input_override` doc).
+        // If D2D-async is unavailable, fail rather than H2D-ing a stub.
+        const d2d = ffi.cuMemcpyDtoDAsync_fn orelse return false;
+        if (d2d(d_input, self.d_input_override, input.len, 0) != ffi.CUDA_SUCCESS) return false;
     } else {
         if (h2d_fn(d_input, @ptrCast(input.ptr), input.len) != ffi.CUDA_SUCCESS) return false;
     }
