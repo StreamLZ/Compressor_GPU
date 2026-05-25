@@ -15,6 +15,15 @@
 
 #include "lz_decode_core.cuh"
 
+// Intentionally NOT __noinline__: an experiment in this session
+// confirmed the attribute is a net negative here. With it,
+// slzLzDecodeKernel STACK grew 192 -> 208 and slzLzDecodeRawKernel
+// STACK grew 72 -> 80, while REG stayed at 40 in both. The raw
+// decoder's sibling banner explains why __noinline__ helps THERE (the
+// register-pressure consideration is real for that function); the
+// general decoder is large enough that nvcc already places it
+// out-of-line implicitly, and forcing the attribute only adds spill
+// slots.
 __device__ void decodeSubChunkGeneral(
     const uint8_t* __restrict__ cmd, uint32_t cmd_size,
     const uint8_t* __restrict__ lit, uint32_t lit_size,
