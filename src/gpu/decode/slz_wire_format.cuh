@@ -179,45 +179,79 @@ __device__ inline uint32_t readLength(const uint8_t* length_stream,
     return v;
 }
 
-// ── Type-0 (raw) stream-size parser ────────────────────────────
-// Reads a 2- or 3-byte big-endian size prefix from the compressed
-// stream, advances src past the prefix, and returns the raw size.
-__device__ inline uint32_t parseRawStreamSize(const uint8_t*& src) {
-    if (src[0] >= HEADER_LONG_FORM_BIT) {
-        uint32_t sz = (((uint32_t)src[0] << 8) | src[1]) & TYPE0_SHORT_SIZE_MASK;
-        src += 2;
-        return sz;
+// ── Cursor-free header field parsers ────────────────────────────
+// The struct/field accessors below decode header bytes WITHOUT moving
+// any cursor. They are the shared core of both the decoder-side
+// parsers (which advance a `src` pointer past header + payload for the
+// inner LZ-decode loop) and the scan kernel (which keeps an explicit
+// `pos` offset so it can bounds-check each step against `chunk_len`).
+// The caller is responsible for having verified that the right number
+// of bytes are readable at the address — `Type0` needs >= 3 bytes,
+// `EntropyHdr` needs >= 5 bytes — before invoking.
+
+struct Type0HdrFields {
+    uint32_t size;         // raw byte count
+    uint32_t header_bytes; // 2 (short form) or 3 (long form)
+};
+
+__device__ __forceinline__ Type0HdrFields parseType0HdrFields(const uint8_t* p) {
+    Type0HdrFields h;
+    if (p[0] >= HEADER_LONG_FORM_BIT) {
+        h.size = (((uint32_t)p[0] << 8) | p[1]) & TYPE0_SHORT_SIZE_MASK;
+        h.header_bytes = 2;
     } else {
-        uint32_t sz = readBE24(src);
-        src += 3;
-        return sz;
+        h.size = readBE24(p);
+        h.header_bytes = 3;
     }
+    return h;
+}
+
+struct EntropyHdrFields {
+    uint32_t comp_size;
+    uint32_t dst_size;
+    uint32_t header_bytes; // ENTROPY_HEADER_SHORT_BYTES or ENTROPY_HEADER_LONG_BYTES
+};
+
+__device__ __forceinline__ EntropyHdrFields parseEntropyHdrFields(const uint8_t* p) {
+    EntropyHdrFields h;
+    if (p[0] >= HEADER_LONG_FORM_BIT) {
+        uint32_t bits = readBE24(p);
+        h.comp_size    = bits & ENTROPY_SHORT_COMP_MASK;
+        h.dst_size     = h.comp_size
+                       + ((bits >> ENTROPY_SHORT_DELTA_SHIFT) & ENTROPY_SHORT_DELTA_MASK) + 1;
+        h.header_bytes = ENTROPY_HEADER_SHORT_BYTES;
+    } else {
+        uint32_t bits = readU32BE(p + 1);
+        h.comp_size    = bits & ENTROPY_LONG_SIZE_MASK;
+        h.dst_size     = (((bits >> ENTROPY_LONG_DELTA_SHIFT)
+                        | ((uint32_t)p[0] << ENTROPY_LONG_HI_SHIFT)) & ENTROPY_LONG_SIZE_MASK) + 1;
+        h.header_bytes = ENTROPY_HEADER_LONG_BYTES;
+    }
+    return h;
+}
+
+// ── Type-0 (raw) stream-size parser ────────────────────────────
+// Cursor-advancing wrapper used by the per-warp decoder. Reads a 2- or
+// 3-byte big-endian size prefix, advances src past the prefix, and
+// returns the raw size.
+__device__ inline uint32_t parseRawStreamSize(const uint8_t*& src) {
+    Type0HdrFields h = parseType0HdrFields(src);
+    src += h.header_bytes;
+    return h.size;
 }
 
 // ── 3/5-byte entropy header parser ─────────────────────────────
-// Parses the short (3-byte) or long (5-byte) header shared by every
-// entropy-coded chunk type (GPU emits type 4 Huffman; decoder also
-// accepts legacy types 1 and 6 in older frames). Advances src past the
-// header + payload and returns the decompressed size; the compressed
-// size is written to out_comp_size.
+// Cursor-advancing wrapper used by the per-warp decoder. Parses the
+// header shared by every entropy-coded chunk type (GPU emits type 4
+// Huffman; decoder also accepts legacy types 1 and 6 in older frames),
+// advances src past the header + payload, and returns the decompressed
+// size; the compressed size is written to out_comp_size.
 __device__ inline uint32_t parseEntropyHeader(const uint8_t*& src,
                                               uint32_t& out_comp_size) {
-    uint32_t comp_size, dst_size;
-    if (src[0] >= HEADER_LONG_FORM_BIT) {
-        uint32_t bits = readBE24(src);
-        comp_size = bits & ENTROPY_SHORT_COMP_MASK;
-        dst_size = comp_size
-                 + ((bits >> ENTROPY_SHORT_DELTA_SHIFT) & ENTROPY_SHORT_DELTA_MASK) + 1;
-        src += ENTROPY_HEADER_SHORT_BYTES + comp_size;
-    } else {
-        uint32_t bits = readU32BE(src + 1);
-        comp_size = bits & ENTROPY_LONG_SIZE_MASK;
-        dst_size = ((((bits >> ENTROPY_LONG_DELTA_SHIFT)
-                   | ((uint32_t)src[0] << ENTROPY_LONG_HI_SHIFT)) & ENTROPY_LONG_SIZE_MASK)) + 1;
-        src += ENTROPY_HEADER_LONG_BYTES + comp_size;
-    }
-    out_comp_size = comp_size;
-    return dst_size;
+    EntropyHdrFields h = parseEntropyHdrFields(src);
+    src += h.header_bytes + h.comp_size;
+    out_comp_size = h.comp_size;
+    return h.dst_size;
 }
 
 // ── Paired-primary inner-stream skip ───────────────────────────
@@ -227,13 +261,8 @@ __device__ inline uint32_t parseEntropyHeader(const uint8_t*& src,
 __device__ inline uint32_t skipPairedPrimary(const uint8_t*& src) {
     uint32_t count_a = readBE24(src + 1);
     const uint8_t* inner = src + PAIRED_PRIMARY_HEADER_BYTES;
-    if (inner[0] >= HEADER_LONG_FORM_BIT) {
-        uint32_t bits = readBE24(inner);
-        src = inner + ENTROPY_HEADER_SHORT_BYTES + (bits & ENTROPY_SHORT_COMP_MASK);
-    } else {
-        uint32_t bits = readU32BE(inner + 1);
-        src = inner + ENTROPY_HEADER_LONG_BYTES + (bits & ENTROPY_LONG_SIZE_MASK);
-    }
+    EntropyHdrFields h = parseEntropyHdrFields(inner);
+    src = inner + h.header_bytes + h.comp_size;
     return count_a;
 }
 

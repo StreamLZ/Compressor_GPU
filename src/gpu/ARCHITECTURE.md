@@ -36,7 +36,7 @@ itself has 32 lanes. Most of the work done while decoding a single
 chunk is not token parsing; it is copying bytes. The literal copy
 ("paste these 50 bytes into the output") and the match copy ("paste
 those 50 bytes from earlier into the output") are bulk operations
-that a 32-lane warp can complete in `ceil(50 / 32)` iterations
+that a 32-lane warp can complete in `(50 + 31) / 32 = 2` iterations
 rather than 50. Token parsing remains roughly serial, but it now
 runs in a small fraction of the warp time because the byte-copy
 phase is so much faster.

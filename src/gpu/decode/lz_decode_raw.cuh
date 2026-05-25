@@ -78,7 +78,10 @@ __device__ __noinline__ void decodeSubChunkRawMode(
 
                 uint32_t fresh_mask = __ballot_sync(FULL_WARP_MASK, my_consumes_off16 != 0);
                 // Compute src_lane on every lane (must call __shfl_sync uniformly).
-                uint32_t my_prefix = fresh_mask & ((1u << (lane + 1)) - 1u);
+                // `(1u << (lane + 1)) - 1u` would be undefined when lane == 31
+                // (shift count >= u32 width); `(2u << lane) - 1u` produces the
+                // same inclusive-prefix mask without UB.
+                uint32_t my_prefix = fresh_mask & ((2u << lane) - 1u);
                 int src_lane = (my_prefix != 0) ? (31 - __clz(my_prefix)) : 0;
                 int32_t shuffled_off = __shfl_sync(FULL_WARP_MASK, my_match_offset, src_lane);
                 if (my_use_recent && my_prefix != 0) {

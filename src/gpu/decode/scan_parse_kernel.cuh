@@ -29,41 +29,29 @@ static constexpr uint32_t SCAN_SUBCHUNK_SLOT = (uint32_t)ENTROPY_SCRATCH_SLOT_BY
 static constexpr uint32_t SCAN_OFF16_LO_SLOT = OFF16_HILO_SPLIT_OFFSET;
 
 // These three parsers (scanParseHuffHeader / scanParseType0 /
-// scanSkipStreamHeader) deliberately re-implement the entropy / raw
-// header walk that slz_wire_format.cuh exposes via parseEntropyHeader /
-// parseRawStreamSize / skipEntropyStream. The shared helpers mutate a
-// `const uint8_t*& src` cursor and are called from inside the per-warp
-// decoder; the scan kernel is single-threaded per chunk and needs to
-// stay on (pos: uint32_t) offsets so it can do explicit bounds checks
-// against `chunk_len` after every step (truncated frames must return
-// 0xFFFFFFFFu, not deref past the buffer). They share the wire-format
-// constants via gpu_wire_format.cuh / slz_wire_format.cuh; only the
-// cursor-passing convention differs.
+// scanSkipStreamHeader) are the single-threaded scan kernel's
+// position-based mirrors of slz_wire_format.cuh's
+// parseEntropyHeader / parseRawStreamSize / skipEntropyStream. They
+// share the actual bit-parsing core (parseEntropyHdrFields,
+// parseType0HdrFields) but keep the (pos: uint32_t, chunk_len) shape
+// because the scan must reject truncated frames by returning
+// 0xFFFFFFFFu rather than dereferencing past the chunk end the way the
+// per-warp decoder's cursor-passing helpers do.
 
 // Parse a chunk_type=4 Huffman header at `pos` within chunk_src.
 __device__ static bool scanParseHuffHeader(
     const uint8_t* chunk_src, uint32_t chunk_len, uint32_t pos,
     uint32_t src_offset_base, uint32_t dst_off, SlzScanHuffDesc& out) {
     if (pos >= chunk_len) return false;
-    const uint8_t first = chunk_src[pos];
-    uint32_t comp_size, dst_size, payload_off;
-    if (first >= HEADER_LONG_FORM_BIT) {
-        if (pos + ENTROPY_HEADER_SHORT_BYTES > chunk_len) return false;
-        const uint32_t bits = readBE24(chunk_src + pos);
-        comp_size = bits & ENTROPY_SHORT_COMP_MASK;
-        dst_size  = comp_size + ((bits >> ENTROPY_SHORT_DELTA_SHIFT) & ENTROPY_SHORT_DELTA_MASK) + 1;
-        payload_off = src_offset_base + pos + ENTROPY_HEADER_SHORT_BYTES;
-    } else {
-        if (pos + ENTROPY_HEADER_LONG_BYTES > chunk_len) return false;
-        const uint32_t bits = readU32BE(chunk_src + pos + 1);
-        comp_size = bits & ENTROPY_LONG_SIZE_MASK;
-        dst_size  = (((bits >> ENTROPY_LONG_DELTA_SHIFT)
-                   | ((uint32_t)chunk_src[pos] << ENTROPY_LONG_HI_SHIFT)) & ENTROPY_LONG_SIZE_MASK) + 1;
-        payload_off = src_offset_base + pos + ENTROPY_HEADER_LONG_BYTES;
-    }
-    out.in_offset = payload_off; out.in_size = comp_size;
-    out.out_offset = dst_off;    out.out_size = dst_size;
-    out.valid = 1;
+    const bool long_form = chunk_src[pos] >= HEADER_LONG_FORM_BIT;
+    const uint32_t need = long_form ? ENTROPY_HEADER_LONG_BYTES : ENTROPY_HEADER_SHORT_BYTES;
+    if (pos + need > chunk_len) return false;
+    const EntropyHdrFields h = parseEntropyHdrFields(chunk_src + pos);
+    out.in_offset  = src_offset_base + pos + h.header_bytes;
+    out.in_size    = h.comp_size;
+    out.out_offset = dst_off;
+    out.out_size   = h.dst_size;
+    out.valid      = 1;
     return true;
 }
 
@@ -72,16 +60,12 @@ __device__ static bool scanParseType0(
     const uint8_t* chunk_src, uint32_t chunk_len, uint32_t pos,
     uint32_t& data_off, uint32_t& size) {
     if (pos >= chunk_len) return false;
-    const uint8_t first = chunk_src[pos];
-    if (first >= HEADER_LONG_FORM_BIT) {
-        if (pos + 2 > chunk_len) return false;
-        size = (((uint32_t)chunk_src[pos] << 8) | (uint32_t)chunk_src[pos + 1]) & TYPE0_SHORT_SIZE_MASK;
-        data_off = pos + 2;
-    } else {
-        if (pos + 3 > chunk_len) return false;
-        size = readBE24(chunk_src + pos);
-        data_off = pos + 3;
-    }
+    const bool long_form = chunk_src[pos] >= HEADER_LONG_FORM_BIT;
+    const uint32_t need = long_form ? 3u : 2u;
+    if (pos + need > chunk_len) return false;
+    const Type0HdrFields h = parseType0HdrFields(chunk_src + pos);
+    size = h.size;
+    data_off = pos + h.header_bytes;
     return data_off != 0;
 }
 
@@ -90,24 +74,18 @@ __device__ static uint32_t scanSkipStreamHeader(
     const uint8_t* chunk_src, uint32_t chunk_len, uint32_t pos) {
     if (pos >= chunk_len) return 0xFFFFFFFFu;
     const uint8_t first = chunk_src[pos];
-    const uint32_t ct = (first >> 4) & 0x7;
+    const uint32_t ct = (first >> CHUNK_TYPE_SHIFT) & CHUNK_TYPE_MASK;
     if (ct == 0) {
-        if (first >= HEADER_LONG_FORM_BIT) {
-            if (pos + 2 > chunk_len) return 0xFFFFFFFFu;
-            const uint32_t sz = (((uint32_t)chunk_src[pos] << 8) | (uint32_t)chunk_src[pos + 1]) & TYPE0_SHORT_SIZE_MASK;
-            return pos + 2 + sz;
-        }
-        if (pos + 3 > chunk_len) return 0xFFFFFFFFu;
-        return pos + 3 + readBE24(chunk_src + pos);
+        const uint32_t need = (first >= HEADER_LONG_FORM_BIT) ? 2u : 3u;
+        if (pos + need > chunk_len) return 0xFFFFFFFFu;
+        const Type0HdrFields h = parseType0HdrFields(chunk_src + pos);
+        return pos + h.header_bytes + h.size;
     } else if (ct == 1 || ct == 2 || ct == 4 || ct == 6) {
-        if (first >= HEADER_LONG_FORM_BIT) {
-            if (pos + ENTROPY_HEADER_SHORT_BYTES > chunk_len) return 0xFFFFFFFFu;
-            return pos + ENTROPY_HEADER_SHORT_BYTES
-                 + (readBE24(chunk_src + pos) & ENTROPY_SHORT_COMP_MASK);
-        }
-        if (pos + ENTROPY_HEADER_LONG_BYTES > chunk_len) return 0xFFFFFFFFu;
-        const uint32_t bits = readU32BE(chunk_src + pos + 1);
-        return pos + ENTROPY_HEADER_LONG_BYTES + (bits & ENTROPY_LONG_SIZE_MASK);
+        const uint32_t need = (first >= HEADER_LONG_FORM_BIT)
+            ? ENTROPY_HEADER_SHORT_BYTES : ENTROPY_HEADER_LONG_BYTES;
+        if (pos + need > chunk_len) return 0xFFFFFFFFu;
+        const EntropyHdrFields h = parseEntropyHdrFields(chunk_src + pos);
+        return pos + h.header_bytes + h.comp_size;
     } else if (ct == 5) {
         if (pos + 7 > chunk_len) return 0xFFFFFFFFu;
         return pos + 7;
