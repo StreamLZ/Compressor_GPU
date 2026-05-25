@@ -128,7 +128,7 @@ back to the CPU path.
 
 ## Performance
 
-Measured 2026-05-25 on an RTX 4060 Ti (`sm_89`), HEAD `9768f19`, `-gpu`
+Measured 2026-05-25 on an RTX 4060 Ti (`sm_89`), HEAD `893e043`, `-gpu`
 mode (64 KB sub-chunks). Corpora: enwik8 (100 MB text), silesia
 (212.8 MB mixed). Decode figures are best-of-30 (`streamlz -db -r 30`,
 sequential per the no-parallel-benchmarks rule); all times in milliseconds.

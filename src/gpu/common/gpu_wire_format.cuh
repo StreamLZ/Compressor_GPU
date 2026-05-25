@@ -58,7 +58,7 @@ static constexpr uint32_t OFF32_COUNT_FIELD_BITS    = 12;
 static constexpr uint32_t OFF32_COUNT_PACK_MAX      = (1u << OFF32_COUNT_FIELD_BITS) - 1; // 4095
 
 // Off32 entries are 3-byte triples by default. The "long-entry" tag byte
-// (high byte of the third byte, value ≥ OFF32_LONG_ENTRY_TAG) flags a
+// (high byte of the third byte, value >= OFF32_LONG_ENTRY_TAG) flags a
 // 4-byte entry carrying an extended 22-bit offset. The relationship to
 // the encode-side mask is:
 //   OFF32_LONG_ENTRY_TAG == (OFF32_LARGE_TAG >> 16)

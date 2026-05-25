@@ -2,7 +2,7 @@
 //!
 //! Owns the host side of the per-chunk LZ kernel launch: uploads input,
 //! descriptors, and (level-dependent) global hash tables, fires
-//! `slzLzCompressKernel`, then downloads `comp_sizes` plus the actual
+//! `slzLzEncodeKernel`, then downloads `comp_sizes` plus the actual
 //! compressed bytes per block. Reads the per-level policy from
 //! `levels.zig` and the persistent device buffers from the supplied
 //! `EncodeContext`.
@@ -110,7 +110,7 @@ pub fn gpuCompressImpl(
     var extra = [_]?*anyopaque{null};
 
     const shared_bytes: u32 = if (global or chain) 0 else @intCast(hash_size * 4);
-    const t_lz = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzCompressKernel", 0);
+    const t_lz = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzEncodeKernel", 0);
     if (launch_fn(module_loader.kernel_fn, num_chunks, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra) != ffi.CUDA_SUCCESS)
         return false;
     gpu_decode.endKernelTiming(t_lz, 0);

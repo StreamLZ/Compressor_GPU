@@ -1384,6 +1384,7 @@ pub fn compressFramedOne(
 
             const total_frame_size = gpu_enc.gpuFrameAssembleImpl(
                 enc_ctx,
+                allocator,
                 @intCast(n_chunks),
                 @intCast(eff_chunk),
                 @intCast(src.len),

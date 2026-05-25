@@ -175,6 +175,7 @@ pub fn gpuAssembleFrameImpl(
 /// produces.
 pub fn gpuFrameAssembleImpl(
     self: *EncodeContext,
+    allocator: std.mem.Allocator,
     n_chunks: u32,
     eff_chunk_size: u32,
     src_len: u32,
@@ -196,8 +197,8 @@ pub fn gpuFrameAssembleImpl(
     const sync = ffi.cuCtxSynchronize_fn orelse return null;
 
     // Build per-chunk dst offset table on host (prefix sum of 6 + asm_size).
-    var per_chunk_dst_buf: [16384]u32 = undefined;
-    if (n_chunks > per_chunk_dst_buf.len) return null;
+    const per_chunk_dst_buf = allocator.alloc(u32, n_chunks) catch return null;
+    defer allocator.free(per_chunk_dst_buf);
     var pos: u32 = @intCast(prefix_bytes.len);
     for (0..n_chunks) |i| {
         per_chunk_dst_buf[i] = pos;
@@ -216,7 +217,7 @@ pub fn gpuFrameAssembleImpl(
     if (!ec.ensureBuf(&self.d_frame_asm_chunk_sz, &self.d_frame_asm_chunk_sz_size, ent_bytes)) return null;
     if (!ec.ensureBuf(&self.d_frame_prefix_bytes, &self.d_frame_prefix_bytes_size, prefix_bytes.len)) return null;
 
-    _ = h2d(self.d_frame_chunk_dst, @ptrCast(&per_chunk_dst_buf), ent_bytes);
+    _ = h2d(self.d_frame_chunk_dst, @ptrCast(per_chunk_dst_buf.ptr), ent_bytes);
     _ = h2d(self.d_frame_asm_offsets, @ptrCast(per_chunk_asm_off.ptr), ent_bytes);
     _ = h2d(self.d_frame_asm_chunk_sz, @ptrCast(per_chunk_asm_size.ptr), ent_bytes);
     _ = h2d(self.d_frame_prefix_bytes, @ptrCast(prefix_bytes.ptr), prefix_bytes.len);
