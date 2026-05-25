@@ -285,8 +285,9 @@ fn skipStreamHeader(chunk_src: []const u8, pos: u32) ?u32 {
             return pos + 3 + sz;
         }
     } else if (ct == 1 or ct == 2 or ct == 4 or ct == 6) {
-        // tANS (1) / Huffman (2, 4) / 32-lane tANS (6):
-        // 3 or 5 byte header + compressed payload.
+        // Entropy chunk types — Huffman (4) is GPU-emitted; types 1, 2, 6
+        // are legacy and parsed for forward compat. 3 or 5 byte header +
+        // compressed payload.
         if (first_byte >= 0x80) {
             if (pos + 3 > chunk_src.len) return null;
             const bits: u32 = (@as(u32, chunk_src[pos]) << 16) | (@as(u32, chunk_src[pos + 1]) << 8) | @as(u32, chunk_src[pos + 2]);

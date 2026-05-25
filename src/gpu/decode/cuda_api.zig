@@ -71,12 +71,6 @@ pub const FnEventRecord = *const fn (usize, usize) callconv(.c) CUresult;
 pub const FnEventSynchronize = *const fn (usize) callconv(.c) CUresult;
 pub const FnEventElapsedTime = *const fn (*f32, usize, usize) callconv(.c) CUresult;
 pub const FnEventDestroy = *const fn (usize) callconv(.c) CUresult;
-// cuFuncSetAttribute(CUfunction, CUfunction_attribute, int). Used to set
-// CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 0 (max L1, min
-// shared). NCU post-PP showed L1 hit rate dropped 81.6→64% — forcing
-// max L1 carveout reclaims capacity for the back-reference reads.
-pub const FnFuncSetAttribute = *const fn (usize, c_int, c_int) callconv(.c) CUresult;
-pub const CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT: c_int = 9;
 
 pub var cuInit_fn: ?FnInit = null;
 pub var cuDeviceGet_fn: ?FnDeviceGet = null;
@@ -104,7 +98,6 @@ pub var cuEventRecord_fn: ?FnEventRecord = null;
 pub var cuEventSynchronize_fn: ?FnEventSynchronize = null;
 pub var cuEventElapsedTime_fn: ?FnEventElapsedTime = null;
 pub var cuEventDestroy_fn: ?FnEventDestroy = null;
-pub var cuFuncSetAttribute_fn: ?FnFuncSetAttribute = null;
 
 /// Pipeline streams (persistent, created once in init). Owned by each
 /// DecodeContext; the numeric width drives `DecodeContext.pipeline_streams`.

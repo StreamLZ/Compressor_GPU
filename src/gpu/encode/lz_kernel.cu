@@ -76,12 +76,6 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
     uint32_t use_chain,
     uint32_t l4_features
 ) {
-    // Vestigial shared-memory hash fallback: the driver always passes a
-    // non-null global_hash (useGlobalHash returns true for every level),
-    // so this storage is currently unreachable. Kept only so a future
-    // caller could opt into a shared-mem table by passing global_hash=null.
-    extern __shared__ uint32_t shared_ht[];
-
     const uint32_t chunk_id = blockIdx.x;
     const uint32_t lane = threadIdx.x & LANE_MASK;
     if (chunk_id >= total_chunks) return;
@@ -161,11 +155,9 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
         }
     } else {
         // ── Greedy parser mode (default) ─────────────────────────
-        // Use global per-chunk tables when available, else the shared
-        // fallback (currently unreachable — see shared_ht above).
-        uint32_t* ht = (global_hash != nullptr)
-            ? global_hash + (uint64_t)chunk_id * hash_size
-            : shared_ht;
+        // useGlobalHash() returns true for every level, so the driver
+        // always passes a non-null global_hash.
+        uint32_t* ht = global_hash + (uint64_t)chunk_id * hash_size;
 
         for (uint32_t i = lane; i < hash_size; i += WARP_SIZE)
             ht[i] = HASH_EMPTY;

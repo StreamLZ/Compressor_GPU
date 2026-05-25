@@ -12,8 +12,9 @@
 // ── Production kernel: slzLzDecodeKernel ───────────────────────
 // Full GPU LZ kernel: 1 block per SC group, parses raw compressed
 // chunks on-GPU. WARPS_PER_BLOCK warps per block for SM occupancy.
-// Entropy streams (tANS / Huffman) are decoded by a separate kernel
-// (Pass 1) into the *_scratch buffers before this kernel runs (Pass 2).
+// Entropy streams (GPU emits Huffman; decoder also accepts legacy
+// entropy types) are decoded by a separate kernel (Pass 1) into the
+// *_scratch buffers before this kernel runs (Pass 2).
 //
 // Parameters:
 //   compressed         compressed input blob

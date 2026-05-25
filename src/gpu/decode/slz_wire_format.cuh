@@ -63,7 +63,9 @@ static constexpr uint32_t HEADER_LONG_FORM_BIT  = 0x80;
 // Type-0 (raw) header sizes.
 static constexpr uint32_t TYPE0_SHORT_SIZE_MASK = 0xFFF;  // 12-bit size, short form
 
-// Entropy (tANS / Huffman / tANS32) header field layout.
+// Entropy chunk-header field layout. GPU emits only type 4 (Huffman); the
+// same short/long format is also used by legacy types 1/6 that the decoder
+// must still skip when reading older frames.
 static constexpr uint32_t ENTROPY_HEADER_SHORT_BYTES = 3;
 static constexpr uint32_t ENTROPY_HEADER_LONG_BYTES  = 5;
 static constexpr uint32_t ENTROPY_SHORT_COMP_MASK    = 0x3FF;   // 10-bit comp size
@@ -193,10 +195,11 @@ __device__ inline uint32_t parseRawStreamSize(const uint8_t*& src) {
 }
 
 // ── 3/5-byte entropy header parser ─────────────────────────────
-// Parses the short (3-byte) or long (5-byte) header shared by tANS,
-// Huffman, and tANS32 streams. Advances src past the header + payload
-// and returns the decompressed size; the compressed size is written to
-// out_comp_size.
+// Parses the short (3-byte) or long (5-byte) header shared by every
+// entropy-coded chunk type (GPU emits type 4 Huffman; decoder also
+// accepts legacy types 1 and 6 in older frames). Advances src past the
+// header + payload and returns the decompressed size; the compressed
+// size is written to out_comp_size.
 __device__ inline uint32_t parseEntropyHeader(const uint8_t*& src,
                                               uint32_t& out_comp_size) {
     uint32_t comp_size, dst_size;
@@ -239,11 +242,11 @@ __device__ inline uint32_t skipPairedPrimary(const uint8_t*& src) {
 // ── Helper: skip an entropy-coded stream header + payload ──────
 // Reads the header at *src, advances src past the header + payload, and
 // returns the decompressed (or count) size for the stream's chunk type:
-//   type 0    raw                    — returns raw size
-//   type 1    tANS                   — returns dst size
-//   type 7    paired-primary         — returns countA
-//   type 5    paired-secondary       — returns countB
-//   type 2/4/6 Huffman / tANS32      — returns dst size
+//   type 0    raw                          — returns raw size
+//   type 4    Huffman                      — returns dst size (GPU encoder emits)
+//   type 1, 2, 6  legacy entropy (decoder-skip-only) — returns dst size
+//   type 7    paired-primary               — returns countA
+//   type 5    paired-secondary             — returns countB
 __device__ inline uint32_t skipEntropyStream(const uint8_t*& src) {
     uint32_t ct = (src[0] >> CHUNK_TYPE_SHIFT) & CHUNK_TYPE_MASK;
     if (ct == 0) {
@@ -261,7 +264,7 @@ __device__ inline uint32_t skipEntropyStream(const uint8_t*& src) {
         src += PAIRED_SECONDARY_HEADER_BYTES;
         return count_b;
     } else {
-        // Huffman type 2/4 or tANS32 type 6 — parse header to skip.
+        // Huffman type 4 (GPU emits) or legacy entropy types 2/6 — parse header to skip.
         uint32_t comp_size;
         return parseEntropyHeader(src, comp_size);
     }

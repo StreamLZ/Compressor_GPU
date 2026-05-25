@@ -5,9 +5,10 @@
 //! `fast_framed.zig` engine-level caps so GPU L1..L5 produce hash
 //! distributions equivalent to the CPU encoder modulo warp-parallel scan.
 
-/// Hash bits per level. Mirrors CPU `fast_framed.zig:955-963` engine-level
-/// cap so GPU L1/L2/L3/L4/L5 produce hash distributions equivalent to CPU
-/// L1/L2/L3/L4/L5 (modulo warp-parallel scan).
+/// Hash bits per level. Mirrors the `engine_level_cap` switch inside
+/// `fast_framed.compressFramedOne` so GPU L1/L2/L3/L4/L5 produce hash
+/// distributions equivalent to CPU L1/L2/L3/L4/L5 (modulo warp-parallel
+/// scan).
 ///
 /// User L1 -> engine -2 -> cap 17
 /// User L2 -> engine -1 -> cap 18

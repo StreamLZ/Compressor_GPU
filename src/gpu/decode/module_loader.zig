@@ -71,7 +71,6 @@ pub fn init() bool {
     cuda.cuEventSynchronize_fn = cuda.getProc(cuda.FnEventSynchronize, "cuEventSynchronize");
     cuda.cuEventElapsedTime_fn = cuda.getProc(cuda.FnEventElapsedTime, "cuEventElapsedTime");
     cuda.cuEventDestroy_fn = cuda.getProc(cuda.FnEventDestroy, "cuEventDestroy_v2");
-    cuda.cuFuncSetAttribute_fn = cuda.getProc(cuda.FnFuncSetAttribute, "cuFuncSetAttribute");
 
     if ((cuda.cuInit_fn orelse return false)(0) != CUDA_SUCCESS) return false;
 

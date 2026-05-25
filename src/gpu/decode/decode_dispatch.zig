@@ -410,8 +410,7 @@ pub fn fullGpuLaunchImpl(
 
     // ── Scan for entropy chunks (Huffman + raw off16) ─────────
     // scanForEntropyChunks fills both the Huffman descriptor buffers and the
-    // raw-off16 gather list. tANS is retired, so the scan only produces
-    // Huffman + raw outputs.
+    // raw-off16 gather list. GPU produces only Huffman + raw outputs.
     var scan: ScanResult = .{ .num_raw_off16 = 0 };
 
     if (ml.huff_build_fn != 0) {
@@ -483,8 +482,7 @@ pub fn fullGpuLaunchImpl(
     }
 
     // ── Pipeline: split into N groups, overlap entropy with LZ ───
-    // tANS is retired; the pipeline path now overlaps Huffman pre-decode
-    // with the LZ kernel. It no longer depends on the tANS kernels.
+    // The pipeline path overlaps Huffman pre-decode with the LZ kernel.
     const total_chunks: u32 = @intCast(chunk_descs.len);
     const use_pipeline = self.pipeline_streams_created and total_chunks >= NUM_PIPELINE_STREAMS;
     // When the caller is slzDecompressAsync, work_stream is the caller's
@@ -702,10 +700,9 @@ pub fn fullGpuLaunchImpl(
         }
     } else {
         // ── Non-pipelined fallback (original sequential path) ─────
-        // tANS is retired; this branch runs LZ only. Huffman pre-decode
-        // requires the pipelined path; when chunk count is below
-        // NUM_PIPELINE_STREAMS this branch sees L1/L2-only inputs
-        // (n_huff == 0).
+        // This branch runs LZ only. Huffman pre-decode requires the
+        // pipelined path; when chunk count is below NUM_PIPELINE_STREAMS
+        // this branch sees L1/L2-only inputs (n_huff == 0).
         const t_before_kern = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
 
         // Fast path: when there's no entropy work (L1/L2 inputs), use the

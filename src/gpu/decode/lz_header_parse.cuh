@@ -53,25 +53,28 @@ static __device__ void parseLiteralStreamHeader(
             lit_ptr = entropy_lit_scratch;
             lit_pre_decoded = 1;
         } else if (chunk_type == 7 && entropy_lit_scratch != nullptr) {
-            // Paired-primary: [0x70][countA:u24 BE][inner type-6 tANS stream].
+            // Paired-primary (legacy): [0x70][countA:u24 BE][inner stream].
             // This unit's literals are countA symbols at the start of the
-            // decoded combined buffer (the tANS kernel split-wrote them here).
+            // pre-decoded combined buffer (the legacy entropy kernel split-
+            // wrote them here).
             lit_size = skipPairedPrimary(src);
             lit_ptr = entropy_lit_scratch;
             lit_pre_decoded = 1;
         } else if (chunk_type == 5 && entropy_lit_scratch != nullptr) {
-            // Paired-secondary: [0x50][countA:u24 BE][countB:u24 BE], no payload.
-            // This unit's literals are countB symbols, split-written by the
-            // tANS kernel into this chunk's region (dst_offset_b).
+            // Paired-secondary (legacy): [0x50][countA:u24 BE][countB:u24 BE],
+            // no payload. This unit's literals are countB symbols, split-
+            // written by the legacy entropy kernel into this chunk's region
+            // (dst_offset_b).
             uint32_t count_b = readBE24(src + 4);
             src += PAIRED_SECONDARY_HEADER_BYTES;
             lit_ptr = entropy_lit_scratch;
             lit_size = count_b;
             lit_pre_decoded = 1;
         } else if (chunk_type == 4 && entropy_lit_scratch != nullptr) {
-            // Huffman: same 3/5-byte header convention as type 1/6 tANS;
-            // payload is [128 B weights][9 B sub-header][4 streams].
-            // Pre-decoded into entropy_lit_scratch by slzHuffDecode4StreamKernel.
+            // Huffman (GPU-emitted): same 3/5-byte header convention as the
+            // legacy entropy types; payload is [128 B weights][9 B sub-header]
+            // [4 streams]. Pre-decoded into entropy_lit_scratch by
+            // slzHuffDecode4StreamKernel.
             uint32_t comp_size;
             lit_size = parseEntropyHeader(src, comp_size);
             lit_ptr = entropy_lit_scratch;
@@ -108,7 +111,7 @@ static __device__ void parseCommandStreamHeader(
             cmd_ptr = src;
             src += cmd_size;
         } else if ((ct == 1 || ct == 6) && entropy_tok_scratch != nullptr) {
-            // tANS-encoded token stream: skip compressed data, use pre-decoded buffer
+            // Legacy entropy-encoded token stream: skip compressed data, use pre-decoded buffer
             uint32_t comp_size;
             cmd_size = parseEntropyHeader(src, comp_size);
             cmd_ptr = entropy_tok_scratch;
@@ -126,8 +129,9 @@ static __device__ void parseCommandStreamHeader(
             cmd_size = count_b;
             cmd_pre_decoded = 1;
         } else if (ct == 4 && entropy_tok_scratch != nullptr) {
-            // Huffman token stream — pre-decoded by slzHuffDecode4StreamKernel
-            // into entropy_tok_scratch. Same wire format as type-1 tANS.
+            // Huffman token stream (GPU-emitted) — pre-decoded by
+            // slzHuffDecode4StreamKernel into entropy_tok_scratch. Same
+            // 3/5-byte wire format as the legacy entropy types.
             uint32_t comp_size;
             cmd_size = parseEntropyHeader(src, comp_size);
             cmd_ptr = entropy_tok_scratch;
@@ -272,8 +276,9 @@ static __device__ void parseOff32StreamHeaders(
 // broadcastSrc before the next header is parsed.
 //
 // entropy_lit/tok/off16 scratch buffers hold the pre-decoded output of
-// the entropy kernels (tANS or Huffman); when a stream's chunk type is
-// entropy-coded its ParsedStreams pointer is redirected into scratch.
+// the entropy kernels (GPU emits Huffman type 4; legacy types 1/6 are
+// also accepted); when a stream's chunk type is entropy-coded its
+// ParsedStreams pointer is redirected into scratch.
 __device__ __noinline__ void parseSubChunkHeaders(
     const uint8_t* sc_src,
     uint32_t sc_comp_size,

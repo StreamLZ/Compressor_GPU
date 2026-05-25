@@ -3,8 +3,8 @@
 //! Kept free of CUDA bindings on purpose — sub-modules import this for the
 //! struct shapes and the few constants without dragging in `cuda_api.zig`.
 //! `extern struct` layouts here MUST stay in sync with the C/CUDA mirrors
-//! in `src/gpu/decode/slz_wire_format.cuh` and `lz_kernels.cuh` (each has
-//! its own `static_assert` on sizeof).
+//! in `src/gpu/decode/slz_wire_format.cuh` and the `*_kernel.cuh` headers
+//! that consume them (each has its own `static_assert` on sizeof).
 
 const std = @import("std");
 
@@ -49,10 +49,11 @@ pub const PendingTiming = struct {
 };
 
 // Staged decode-scan output — mirror SlzScanHuffDesc / SlzScanRawDesc in
-// lz_kernels.cuh. slzScanParseKernel fills one entry per stream type per
-// global sub-chunk index; `valid` marks an entropy-coded / raw stream
-// present. gpuScanChunks compacts the valid slots into the merged
-// HuffDecChunkDesc / RawOff16Desc arrays.
+// scan_parse_kernel.cuh (filled) and compact_descs_kernels.cuh (compacted).
+// slzScanParseKernel fills one entry per stream type per global sub-chunk
+// index; `valid` marks an entropy-coded / raw stream present. gpuScanChunks
+// compacts the valid slots into the merged HuffDecChunkDesc / RawOff16Desc
+// arrays.
 pub const ScanHuffDesc = extern struct {
     in_offset: u32 = 0,
     in_size: u32 = 0,

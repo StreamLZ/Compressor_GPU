@@ -16,9 +16,9 @@ const CUDA_SUCCESS = cuda.CUDA_SUCCESS;
 
 // The four `last_*_ns` telemetry vars and `g_default` live in driver.zig
 // (the facade) because Zig cannot expose a `pub var` from another module
-// through a `pub const` alias — external callers reading `gpu.last_kernel_ns`
-// must reach actual storage in the facade. Sub-modules write back via
-// `@import("driver.zig").last_kernel_ns = ...`.
+// through a `pub const` alias — external callers reading
+// `gpu_decode.last_kernel_ns` must reach actual storage in the facade.
+// Sub-modules write back via `@import("driver.zig").last_kernel_ns = ...`.
 
 pub fn ensureDeviceBuf(ptr: *CUdeviceptr, current_size: *usize, needed: usize) bool {
     if (current_size.* >= needed) return true;
@@ -267,7 +267,7 @@ pub const DecodeContext = struct {
     huff_off16lo_host_buf: [4096]d.HuffDecChunkDesc = undefined,
 
     // Pipeline streams (persistent, created once in init)
-    pipeline_streams: [16]usize = .{0} ** 16,
+    pipeline_streams: [cuda.NUM_PIPELINE_STREAMS]usize = .{0} ** cuda.NUM_PIPELINE_STREAMS,
     pipeline_streams_created: bool = false,
 
     // Per-kernel timing (slzDecompressOpts_t.enable_profiling). When true,
