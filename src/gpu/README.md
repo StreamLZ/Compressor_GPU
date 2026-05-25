@@ -29,7 +29,7 @@ decode/                         GPU decode
                                 HUFF_LUT_ENTRIES, walk_max_chunks
   decode_context.zig            DecodeContext + ensure/alloc/copy helpers
                                 + kernel-event profiling plumbing
-  scan_host.zig                 CPU-side scanForEntropyChunks fallback
+  scan_host.zig                 CPU scanForEntropyChunks (H2D entry path)
   scan_gpu.zig                  GPU walk / prefix-sum / scan / compact orchestration
   decode_dispatch.zig           fullGpuLaunch / fullGpuLaunchImpl + per-decode
                                 helpers (dumpScanIfRequested, emitE2eTrace,

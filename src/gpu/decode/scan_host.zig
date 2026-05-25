@@ -2,10 +2,15 @@
 //! emits HuffDecChunkDesc / RawOff16Desc arrays for the GPU pre-decode
 //! kernels.
 //!
-//! The fallback path when `scan_parse_fn` (slzScanParseKernel) isn't
-//! loaded or when SLZ_GPU_SCAN is off. Stays in lock-step with the GPU
-//! port in `scan_gpu.zig` so the post-compaction descriptor arrays are
-//! byte-equivalent regardless of which scan ran.
+//! This is the scanner used by the H2D entry point (the caller's
+//! compressed bytes start on host disk / in host memory). The D2D entry
+//! point forces the GPU scan (`scan_gpu.zig`) because the CPU has no
+//! readable copy of the bytes. Either scanner produces byte-equivalent
+//! post-compaction descriptor arrays, so the rest of the pipeline does
+//! not need to know which one ran.
+//!
+//! Also serves as the fallback if `scan_parse_fn` is missing or the GPU
+//! scan returns null at runtime.
 
 const std = @import("std");
 
