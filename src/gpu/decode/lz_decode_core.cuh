@@ -54,3 +54,36 @@ __device__ __forceinline__ void warpMatchCopy(
             dst[dst_pos + i] = dst[match_src + i];
     }
 }
+
+// ── Bounded warp-cooperative copy primitives ──────────────────────
+// The general decoder writes into a window where the last store may
+// land past the legal dst_end_abs (encoder may overcommit dst_size
+// when a sub-chunk's effective decode size shrinks). Each store is
+// guarded by `dst_pos + i < dst_end_abs`. Literal copies additionally
+// guard against running past lit_size when the encoder wrote a
+// shorter literal stream than the token sequence implies.
+__device__ __forceinline__ void warpLiteralCopyBounded(
+    uint8_t* __restrict__ dst, uint32_t dst_pos,
+    const uint8_t* __restrict__ lit, uint32_t lit_pos,
+    uint32_t lit_len, uint32_t dst_end_abs, uint32_t lit_size, int lane
+) {
+    for (uint32_t i = lane; i < lit_len; i += WARP_SIZE)
+        if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size)
+            dst[dst_pos + i] = lit[lit_pos + i];
+}
+
+__device__ __forceinline__ void warpMatchCopyBounded(
+    uint8_t* __restrict__ dst, uint32_t dst_pos,
+    uint32_t match_src, uint32_t match_len, int32_t match_dist,
+    uint32_t dst_end_abs, int lane
+) {
+    if (match_dist >= (int32_t)match_len && match_len > MIN_PARALLEL_MATCH_LEN - 1) {
+        for (uint32_t i = lane; i < match_len; i += WARP_SIZE)
+            if (dst_pos + i < dst_end_abs)
+                dst[dst_pos + i] = dst[match_src + i];
+    } else if (lane == 0) {
+        for (uint32_t i = 0; i < match_len; i++)
+            if (dst_pos + i < dst_end_abs)
+                dst[dst_pos + i] = dst[match_src + i];
+    }
+}

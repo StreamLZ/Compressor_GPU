@@ -131,15 +131,17 @@ __device__ void decodeSubChunkGeneral(
             // ── Warp-cooperative literal copy ──
             if (lit_len > 0) {
                 if (mode == 0) {
+                    // Delta-literal mode: dst[i] = lit[i] + dst[i + recent_offset].
+                    // Not extractable into a generic helper because of the
+                    // additive recent-offset back-reference.
                     for (uint32_t i = lane; i < lit_len; i += WARP_SIZE)
                         if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size) {
                             uint32_t match_src = (uint32_t)((int32_t)(dst_pos + i) + recent_offset);
                             dst[dst_pos + i] = lit[lit_pos + i] + dst[match_src];
                         }
                 } else {
-                    for (uint32_t i = lane; i < lit_len; i += WARP_SIZE)
-                        if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size)
-                            dst[dst_pos + i] = lit[lit_pos + i];
+                    warpLiteralCopyBounded(dst, dst_pos, lit, lit_pos,
+                                           lit_len, dst_end_abs, lit_size, lane);
                 }
                 __syncwarp();
                 dst_pos += lit_len;
@@ -150,19 +152,8 @@ __device__ void decodeSubChunkGeneral(
             if (match_len > 0) {
                 uint32_t match_src = (uint32_t)((int32_t)dst_pos + match_offset);
                 int32_t match_dist = -match_offset;
-                // Parallel copy is only safe for non-overlapping matches:
-                // an overlapping match (match_dist < match_len) would have
-                // a lane read a dst byte another lane has not written yet.
-                if (match_dist >= (int32_t)match_len && match_len > MIN_PARALLEL_MATCH_LEN - 1) {
-                    for (uint32_t i = lane; i < match_len; i += WARP_SIZE)
-                        if (dst_pos + i < dst_end_abs)
-                            dst[dst_pos + i] = dst[match_src + i];
-                } else {
-                    if (lane == 0)
-                        for (uint32_t i = 0; i < match_len; i++)
-                            if (dst_pos + i < dst_end_abs)
-                                dst[dst_pos + i] = dst[match_src + i];
-                }
+                warpMatchCopyBounded(dst, dst_pos, match_src, match_len,
+                                     match_dist, dst_end_abs, lane);
                 __syncwarp();
                 dst_pos += match_len;
             }
@@ -189,9 +180,8 @@ __device__ void decodeSubChunkGeneral(
                         dst[dst_pos + i] = lit[lit_pos + i] + dst[match_src];
                     }
             } else {
-                for (uint32_t i = lane; i < block_trailing; i += WARP_SIZE)
-                    if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size)
-                        dst[dst_pos + i] = lit[lit_pos + i];
+                warpLiteralCopyBounded(dst, dst_pos, lit, lit_pos,
+                                       block_trailing, dst_end_abs, lit_size, lane);
             }
             __syncwarp();
             dst_pos += block_trailing;
@@ -220,6 +210,9 @@ __device__ void decodeSubChunkGeneral(
                 dst[dst_pos + i] = lit[lit_pos + i] + dst[match_src];
             }
     } else {
+        // The final trailing literal copy lacks the lit_pos bound check
+        // (the trailing count itself derives from lit_size), so the
+        // bounded literal helper would add a guard the original did not.
         for (uint32_t i = lane; i < trailing; i += WARP_SIZE)
             if (dst_pos + i < dst_end_abs)
                 dst[dst_pos + i] = lit[lit_pos + i];
