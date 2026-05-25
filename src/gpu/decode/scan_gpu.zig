@@ -37,7 +37,7 @@ pub fn gpuWalkFrameImpl(
     const chunks_bytes: usize = @as(usize, d.walk_max_chunks) * @sizeOf(d.ChunkDesc);
     if (!ensureDeviceBuf(&self.d_walk_chunks, &self.d_walk_chunks_size, chunks_bytes)) return null;
     if (!ensureDeviceBuf(&self.d_walk_meta, &self.d_walk_meta_size, d.walk_meta_offsets.bytes)) return null;
-    _ = memset(self.d_walk_meta, 0, d.walk_meta_offsets.bytes);
+    if (memset(self.d_walk_meta, 0, d.walk_meta_offsets.bytes) != CUDA_SUCCESS) return null;
 
     var k_frame = d_frame;
     var k_size = frame_size;
@@ -107,7 +107,7 @@ pub fn gpuPrefixSumChunksImpl(
 pub fn walkMetaToHost(d_meta: u64) ?d.WalkMeta {
     const d2h = cuda.cuMemcpyDtoH_fn orelse return null;
     var m: [6]u32 = .{0} ** 6;
-    _ = d2h(@ptrCast(&m), d_meta, d.walk_meta_offsets.bytes);
+    if (d2h(@ptrCast(&m), d_meta, d.walk_meta_offsets.bytes) != CUDA_SUCCESS) return null;
     return .{
         .n_chunks = m[0], .decomp_size = m[1], .sub_chunk_cap = m[2],
         .block_start = m[3], .block_size = m[4], .status = m[5],
@@ -150,7 +150,7 @@ pub fn gpuScanChunks(
     const staged_bytes: usize = huff_arr_bytes * 4 + raw_arr_bytes * 2;
     if (!ensureDeviceBuf(&self.d_scan_staged, &self.d_scan_staged_size, staged_bytes)) return null;
     // Zero so sub-chunk slots no thread reaches keep valid=0.
-    _ = memset(self.d_scan_staged, 0, staged_bytes);
+    if (memset(self.d_scan_staged, 0, staged_bytes) != CUDA_SUCCESS) return null;
 
     const base = self.d_scan_staged;
     var k_block = self.d_comp_persist;
@@ -165,7 +165,7 @@ pub fn gpuScanChunks(
     // into d_n_chunks_scratch (4 B H2D).
     if (!ensureDeviceBuf(&self.d_n_chunks_scratch, &self.d_n_chunks_scratch_size, 4)) return null;
     var host_n_chunks: u32 = n;
-    _ = h2d(self.d_n_chunks_scratch, @ptrCast(&host_n_chunks), 4);
+    if (h2d(self.d_n_chunks_scratch, @ptrCast(&host_n_chunks), 4) != CUDA_SUCCESS) return null;
     var k_n: u64 = self.d_n_chunks_scratch;
     var k_cap = sub_chunk_cap;
     var k_lit = base;
@@ -217,7 +217,7 @@ pub fn gpuScanChunks(
         // 6 u32: [n_lit, n_tok, n_hi, n_lo, n_raw, n_merged]. n_merged is
         // written by slzMergeHuffDescsKernel in step 6c.
         if (!ensureDeviceBuf(&self.d_compact_counts, &self.d_compact_counts_size, 6 * 4)) return null;
-        _ = memset(self.d_compact_counts, 0, 6 * 4);
+        if (memset(self.d_compact_counts, 0, 6 * 4) != CUDA_SUCCESS) return null;
 
         const huff_streams = [_]struct { staged_off: usize, dst: u64, n_off: u32 }{
             .{ .staged_off = 0,                  .dst = self.d_compact_lit, .n_off = 0 },
@@ -265,7 +265,7 @@ pub fn gpuScanChunks(
 
         // The 5 counts come back as a single 20 B D2H.
         var counts: [5]u32 = .{ 0, 0, 0, 0, 0 };
-        _ = d2h(@ptrCast(&counts), self.d_compact_counts, 5 * 4);
+        if (d2h(@ptrCast(&counts), self.d_compact_counts, 5 * 4) != CUDA_SUCCESS) return null;
         num_lit = counts[0];
         num_tok = counts[1];
         num_hi = counts[2];
@@ -279,22 +279,22 @@ pub fn gpuScanChunks(
         // case; populate host arrays only as a true fallback path.
         if (ml.merge_huff_descs_fn == 0) {
             if (num_lit > 0 and num_lit <= huff_lit_descs.len)
-                _ = d2h(@ptrCast(huff_lit_descs.ptr), self.d_compact_lit, @as(usize, num_lit) * @sizeOf(d.HuffDecChunkDesc));
+                if (d2h(@ptrCast(huff_lit_descs.ptr), self.d_compact_lit, @as(usize, num_lit) * @sizeOf(d.HuffDecChunkDesc)) != CUDA_SUCCESS) return null;
             if (num_tok > 0 and num_tok <= huff_tok_descs.len)
-                _ = d2h(@ptrCast(huff_tok_descs.ptr), self.d_compact_tok, @as(usize, num_tok) * @sizeOf(d.HuffDecChunkDesc));
+                if (d2h(@ptrCast(huff_tok_descs.ptr), self.d_compact_tok, @as(usize, num_tok) * @sizeOf(d.HuffDecChunkDesc)) != CUDA_SUCCESS) return null;
             if (num_hi > 0 and num_hi <= huff_off16hi_descs.len)
-                _ = d2h(@ptrCast(huff_off16hi_descs.ptr), self.d_compact_hi, @as(usize, num_hi) * @sizeOf(d.HuffDecChunkDesc));
+                if (d2h(@ptrCast(huff_off16hi_descs.ptr), self.d_compact_hi, @as(usize, num_hi) * @sizeOf(d.HuffDecChunkDesc)) != CUDA_SUCCESS) return null;
             if (num_lo > 0 and num_lo <= huff_off16lo_descs.len)
-                _ = d2h(@ptrCast(huff_off16lo_descs.ptr), self.d_compact_lo, @as(usize, num_lo) * @sizeOf(d.HuffDecChunkDesc));
+                if (d2h(@ptrCast(huff_off16lo_descs.ptr), self.d_compact_lo, @as(usize, num_lo) * @sizeOf(d.HuffDecChunkDesc)) != CUDA_SUCCESS) return null;
             if (num_raw > 0 and num_raw <= raw_off16_descs.len)
-                _ = d2h(@ptrCast(raw_off16_descs.ptr), self.d_compact_raw, @as(usize, num_raw) * @sizeOf(d.RawOff16Desc));
+                if (d2h(@ptrCast(raw_off16_descs.ptr), self.d_compact_raw, @as(usize, num_raw) * @sizeOf(d.RawOff16Desc)) != CUDA_SUCCESS) return null;
         }
     } else {
         // Fallback: D2H the staged arrays and compact on host.
         const alloc = std.heap.page_allocator;
         const staged = alloc.alloc(u8, staged_bytes) catch return null;
         defer alloc.free(staged);
-        _ = d2h(@ptrCast(staged.ptr), base, staged_bytes);
+        if (d2h(@ptrCast(staged.ptr), base, staged_bytes) != CUDA_SUCCESS) return null;
 
         const lit_st: [*]const d.ScanHuffDesc = @ptrCast(@alignCast(staged.ptr));
         const tok_st: [*]const d.ScanHuffDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes));

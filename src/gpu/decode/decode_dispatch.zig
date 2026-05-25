@@ -81,8 +81,7 @@ fn mergeHuffDescs(
         };
         var m_extra = [_]?*anyopaque{null};
         const t_merge = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzMergeHuffDescsKernel", 0);
-        if (launch_fn(ml.merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, 0, &m_params, &m_extra) != CUDA_SUCCESS)
-            return error.BadMode;
+        try cudaCall(launch_fn(ml.merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, 0, &m_params, &m_extra));
         endKernelTiming(t_merge, 0);
         try cudaCall(sync_fn());
         return;
@@ -531,8 +530,7 @@ pub fn fullGpuLaunchImpl(
                 };
                 var extra = [_]?*anyopaque{null};
                 const t_hb = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffBuildLutKernel", huff_stream);
-                if (launch_fn(ml.huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra) != CUDA_SUCCESS)
-                    return error.BadMode;
+                try cudaCall(launch_fn(ml.huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra));
                 endKernelTiming(t_hb, huff_stream);
             }
             // Split fence: time the LUT build separately from the decode.
@@ -556,8 +554,7 @@ pub fn fullGpuLaunchImpl(
                 var extra = [_]?*anyopaque{null};
                 const shared_bytes: c_uint = HUFF_LUT_ENTRIES * @sizeOf(u32);
                 const t_hd = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffDecode4StreamKernel", huff_stream);
-                if (launch_fn(ml.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, shared_bytes, huff_stream, &params, &extra) != CUDA_SUCCESS)
-                    return error.BadMode;
+                try cudaCall(launch_fn(ml.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, shared_bytes, huff_stream, &params, &extra));
                 endKernelTiming(t_hd, huff_stream);
             }
         }
@@ -628,8 +625,7 @@ pub fn fullGpuLaunchImpl(
                 };
                 var raw_extra = [_]?*anyopaque{null};
                 const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", stream);
-                if (launch_fn(ml.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra) != CUDA_SUCCESS)
-                    return error.BadMode;
+                try cudaCall(launch_fn(ml.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra));
                 endKernelTiming(t_lzr, stream);
             } else {
                 var p_comp = self.d_comp_persist;
@@ -657,8 +653,7 @@ pub fn fullGpuLaunchImpl(
                 var lz_extra = [_]?*anyopaque{null};
 
                 const t_lz = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeKernel", stream);
-                if (launch_fn(ml.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra) != CUDA_SUCCESS)
-                    return error.BadMode;
+                try cudaCall(launch_fn(ml.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra));
                 endKernelTiming(t_lz, stream);
             }
 
@@ -734,8 +729,7 @@ pub fn fullGpuLaunchImpl(
             };
             var raw_extra = [_]?*anyopaque{null};
             const t_lzr2 = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", 0);
-            if (launch_fn(ml.kernel_raw_fn, grid_x, 1, 1, 32, 2, 1, 0, 0, &raw_params, &raw_extra) != CUDA_SUCCESS)
-                return error.BadMode;
+            try cudaCall(launch_fn(ml.kernel_raw_fn, grid_x, 1, 1, 32, 2, 1, 0, 0, &raw_params, &raw_extra));
             endKernelTiming(t_lzr2, 0);
         } else {
             var p_comp = self.d_comp_persist;
@@ -761,12 +755,11 @@ pub fn fullGpuLaunchImpl(
             };
             var extra = [_]?*anyopaque{null};
             const t_lz2 = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeKernel", 0);
-            if (launch_fn(ml.kernel_fn, grid_x, 1, 1, 32, 2, 1, 0, 0, &params, &extra) != CUDA_SUCCESS)
-                return error.BadMode;
+            try cudaCall(launch_fn(ml.kernel_fn, grid_x, 1, 1, 32, 2, 1, 0, 0, &params, &extra));
             endKernelTiming(t_lz2, 0);
         }
 
-        if (sync_fn() != CUDA_SUCCESS) return error.BadMode;
+        try cudaCall(sync_fn());
 
         if (t_before_kern) |t_start| {
             if (io) |io_val| {
