@@ -43,10 +43,7 @@ __device__ static bool scanParseHuffHeader(
         payload_off = src_offset_base + pos + 3;
     } else {
         if (pos + 5 > chunk_len) return false;
-        const uint32_t bits = ((uint32_t)chunk_src[pos + 1] << 24)
-                            | ((uint32_t)chunk_src[pos + 2] << 16)
-                            | ((uint32_t)chunk_src[pos + 3] << 8)
-                            | (uint32_t)chunk_src[pos + 4];
+        const uint32_t bits = readU32BE(chunk_src + pos + 1);
         comp_size = bits & 0x3FFFF;
         dst_size  = (((bits >> 18) | ((uint32_t)chunk_src[pos] << 14)) & 0x3FFFF) + 1;
         payload_off = src_offset_base + pos + 5;
@@ -95,10 +92,7 @@ __device__ static uint32_t scanSkipStreamHeader(
             return pos + 3 + (readBE24(chunk_src + pos) & 0x3FF);
         }
         if (pos + 5 > chunk_len) return 0xFFFFFFFFu;
-        const uint32_t bits = ((uint32_t)chunk_src[pos + 1] << 24)
-                            | ((uint32_t)chunk_src[pos + 2] << 16)
-                            | ((uint32_t)chunk_src[pos + 3] << 8)
-                            | (uint32_t)chunk_src[pos + 4];
+        const uint32_t bits = readU32BE(chunk_src + pos + 1);
         return pos + 5 + (bits & 0x3FFFF);
     } else if (ct == 5) {
         if (pos + 7 > chunk_len) return 0xFFFFFFFFu;

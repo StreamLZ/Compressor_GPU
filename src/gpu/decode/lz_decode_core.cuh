@@ -191,7 +191,7 @@ __device__ __noinline__ void decodeSubChunkRawMode(
                     if (OFF16_SPLIT) {
                         v = (uint16_t)off16_lo[off16_pos] | ((uint16_t)off16_hi[off16_pos] << 8);
                     } else {
-                        memcpy(&v, off16_raw + off16_pos * OFF16_ENTRY_BYTES, OFF16_ENTRY_BYTES);
+                        v = readU16LE(off16_raw + off16_pos * OFF16_ENTRY_BYTES);
                     }
                     match_offset = -(int32_t)v;
                     off16_pos++;
@@ -208,7 +208,7 @@ __device__ __noinline__ void decodeSubChunkRawMode(
                     if (OFF16_SPLIT) {
                         v = (uint16_t)off16_lo[off16_pos] | ((uint16_t)off16_hi[off16_pos] << 8);
                     } else {
-                        memcpy(&v, off16_raw + off16_pos * OFF16_ENTRY_BYTES, OFF16_ENTRY_BYTES);
+                        v = readU16LE(off16_raw + off16_pos * OFF16_ENTRY_BYTES);
                     }
                     match_offset = -(int32_t)v; off16_pos++;
                 }

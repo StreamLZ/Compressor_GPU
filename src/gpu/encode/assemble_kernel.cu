@@ -90,7 +90,7 @@ __device__ static RawStreams parseRaw(const uint8_t* raw, uint32_t raw_size,
     }
 
     if (rp + 2 > raw_size) return s;
-    s.off16_count = (uint32_t)raw[rp] | ((uint32_t)raw[rp + 1] << 8); rp += 2;
+    s.off16_count = readU16LE(raw + rp); rp += 2;
     const uint32_t off16_bytes = s.off16_count * 2;
     if (rp + off16_bytes > raw_size) return s;
     s.off16 = raw + rp; rp += off16_bytes;
@@ -98,20 +98,19 @@ __device__ static RawStreams parseRaw(const uint8_t* raw, uint32_t raw_size,
     // off32: 3-byte LE-packed header (+ 0/2/4 extra), then variable data.
     if (rp + 3 > raw_size) return s;
     const uint8_t* off32_start = raw + rp;
-    const uint32_t packed = (uint32_t)raw[rp] | ((uint32_t)raw[rp + 1] << 8)
-                          | ((uint32_t)raw[rp + 2] << 16);
+    const uint32_t packed = readLE24(raw + rp);
     rp += 3;
     uint32_t c1 = (packed >> 12) & 0xFFF;
     uint32_t c2 = packed & 0xFFF;
     uint32_t hdr_plus_extra = 3;
     if (c1 >= OFF32_COUNT_PACK_MAX) {
         if (rp + 2 > raw_size) return s;
-        c1 = (uint32_t)raw[rp] | ((uint32_t)raw[rp + 1] << 8);
+        c1 = readU16LE(raw + rp);
         rp += 2; hdr_plus_extra += 2;
     }
     if (c2 >= OFF32_COUNT_PACK_MAX) {
         if (rp + 2 > raw_size) return s;
-        c2 = (uint32_t)raw[rp] | ((uint32_t)raw[rp + 1] << 8);
+        c2 = readU16LE(raw + rp);
         rp += 2; hdr_plus_extra += 2;
     }
     // Scan c1+c2 entries; each is 3 bytes, or 4 when byte[2] >= 0xC0.
@@ -140,12 +139,8 @@ __device__ static RawStreams parseRaw(const uint8_t* raw, uint32_t raw_size,
 }
 
 // ── Header writers ──────────────────────────────────────────────────
-// type-0 raw chunk header: 3-byte big-endian size.
-__device__ __forceinline__ void writeRawChunkHdr(uint8_t* d, uint32_t size) {
-    d[0] = (uint8_t)((size >> 16) & 0xFF);
-    d[1] = (uint8_t)((size >> 8) & 0xFF);
-    d[2] = (uint8_t)(size & 0xFF);
-}
+// type-0 raw chunk header is just `writeBE24` (3-byte big-endian size);
+// every caller invokes the helper directly.
 
 // type-4 non-compact 5-byte header (entropy_encoder.zig writeNonCompactChunkHeader).
 __device__ __forceinline__ void writeHuffChunkHdr(uint8_t* d, uint32_t comp_size,
@@ -182,7 +177,7 @@ __device__ static uint32_t emitEntropyStream(
         return HUFF_CHUNK_HDR_BYTES + huff_size;
     }
     if (out) {
-        if (lane == 0) writeRawChunkHdr(out, raw_count);
+        if (lane == 0) writeBE24(out, raw_count);
         __syncwarp();
         warpCopy(out + RAW_CHUNK_HDR_BYTES, raw_bytes, raw_count, lane);
     }
@@ -242,10 +237,7 @@ __device__ static uint32_t assembleSubChunk(
         const uint32_t split_total = hi_chunk + lo_chunk;
         if (split_total < off16_bytes) {
             // [u16 marker][hi chunk][lo chunk]
-            if (out && lane == 0) {
-                out[wp] = (uint8_t)(OFF16_ENTROPY_MARKER & 0xFF);
-                out[wp + 1] = (uint8_t)(OFF16_ENTROPY_MARKER >> 8);
-            }
+            if (out && lane == 0) storeU16LE(out + wp, OFF16_ENTROPY_MARKER);
             wp += 2;
             // hi
             if (hi_huff) {
@@ -253,7 +245,7 @@ __device__ static uint32_t assembleSubChunk(
                 if (out) { __syncwarp(); warpCopy(out + wp + HUFF_CHUNK_HDR_BYTES, hi, hi_sz, lane); }
                 wp += HUFF_CHUNK_HDR_BYTES + hi_sz;
             } else {
-                if (out && lane == 0) writeRawChunkHdr(out + wp, s.off16_count);
+                if (out && lane == 0) writeBE24(out + wp, s.off16_count);
                 if (out) {
                     __syncwarp();
                     for (uint32_t i = lane; i < s.off16_count; i += WARP_SIZE)
@@ -267,7 +259,7 @@ __device__ static uint32_t assembleSubChunk(
                 if (out) { __syncwarp(); warpCopy(out + wp + HUFF_CHUNK_HDR_BYTES, lo, lo_sz, lane); }
                 wp += HUFF_CHUNK_HDR_BYTES + lo_sz;
             } else {
-                if (out && lane == 0) writeRawChunkHdr(out + wp, s.off16_count);
+                if (out && lane == 0) writeBE24(out + wp, s.off16_count);
                 if (out) {
                     __syncwarp();
                     for (uint32_t i = lane; i < s.off16_count; i += WARP_SIZE)
@@ -277,20 +269,14 @@ __device__ static uint32_t assembleSubChunk(
             }
         } else {
             // raw: [u16 off16_count][off16 data]
-            if (out && lane == 0) {
-                out[wp] = (uint8_t)(s.off16_count & 0xFF);
-                out[wp + 1] = (uint8_t)((s.off16_count >> 8) & 0xFF);
-            }
+            if (out && lane == 0) storeU16LE(out + wp, (uint16_t)s.off16_count);
             wp += 2;
             if (out) { __syncwarp(); warpCopy(out + wp, s.off16, off16_bytes, lane); }
             wp += off16_bytes;
         }
     } else {
         // small off16: [u16 off16_count][off16 data]
-        if (out && lane == 0) {
-            out[wp] = (uint8_t)(s.off16_count & 0xFF);
-            out[wp + 1] = (uint8_t)((s.off16_count >> 8) & 0xFF);
-        }
+        if (out && lane == 0) storeU16LE(out + wp, (uint16_t)s.off16_count);
         wp += 2;
         if (out) { __syncwarp(); warpCopy(out + wp, s.off16, off16_bytes, lane); }
         wp += off16_bytes;

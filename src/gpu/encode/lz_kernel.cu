@@ -195,14 +195,10 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
             out_pos = INITIAL_LITERAL_COPY_BYTES;
         }
 
-        dst[out_pos] = (uint8_t)((streams.lit_count >> 16) & 0xFF);
-        dst[out_pos + 1] = (uint8_t)((streams.lit_count >> 8) & 0xFF);
-        dst[out_pos + 2] = (uint8_t)(streams.lit_count & 0xFF);
+        writeBE24(dst + out_pos, streams.lit_count);
         out_pos += STREAM_HEADER_BYTES + streams.lit_count;
 
-        dst[out_pos] = (uint8_t)((streams.token_count >> 16) & 0xFF);
-        dst[out_pos + 1] = (uint8_t)((streams.token_count >> 8) & 0xFF);
-        dst[out_pos + 2] = (uint8_t)(streams.token_count & 0xFF);
+        writeBE24(dst + out_pos, streams.token_count);
         out_pos += STREAM_HEADER_BYTES;
         memcpy(dst + out_pos, streams.token_buf, streams.token_count);
         out_pos += streams.token_count;
@@ -214,8 +210,7 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
             out_pos += 2;
         }
 
-        dst[out_pos] = (uint8_t)(streams.off16_count & 0xFF);
-        dst[out_pos + 1] = (uint8_t)((streams.off16_count >> 8) & 0xFF);
+        storeU16LE(dst + out_pos, (uint16_t)streams.off16_count);
         out_pos += OFF16_HEADER_BYTES;
         memcpy(dst + out_pos, streams.off16_buf, streams.off16_count * 2);
         out_pos += streams.off16_count * 2;
@@ -226,9 +221,8 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
             ? off32_count_block2 : OFF32_COUNT_PACK_MAX;
         uint32_t packed_off32_counts = (off32_count1_clamped << OFF32_COUNT_FIELD_BITS)
                                      | off32_count2_clamped;
-        dst[out_pos++] = (uint8_t)(packed_off32_counts & 0xFF);
-        dst[out_pos++] = (uint8_t)((packed_off32_counts >> 8) & 0xFF);
-        dst[out_pos++] = (uint8_t)((packed_off32_counts >> 16) & 0xFF);
+        writeLE24(dst + out_pos, packed_off32_counts);
+        out_pos += 3;
         if (off32_count_block1 >= OFF32_COUNT_PACK_MAX) {
             storeU16LE(dst + out_pos, (uint16_t)off32_count_block1);
             out_pos += 2;

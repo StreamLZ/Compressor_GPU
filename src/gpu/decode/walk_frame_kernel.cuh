@@ -45,16 +45,9 @@ static constexpr uint8_t  SLZ_INT_BLOCK_MAGIC      = 0x05;
 static constexpr uint8_t  SLZ_DECODER_FAST         = 1;
 static constexpr uint8_t  SLZ_DECODER_TURBO        = 2;
 
-__device__ __forceinline__ uint32_t walkReadU32LE(const uint8_t* p) {
-    return ((uint32_t)p[0])
-         | ((uint32_t)p[1] << 8)
-         | ((uint32_t)p[2] << 16)
-         | ((uint32_t)p[3] << 24);
-}
-
 __device__ __forceinline__ float walkReadF32LE(const uint8_t* p) {
     union { uint32_t u; float f; } u;
-    u.u = walkReadU32LE(p);
+    u.u = readU32LE(p);
     return u.f;
 }
 
@@ -85,7 +78,7 @@ extern "C" __global__ void slzWalkFrameKernel(
 
     if (frame_size < SLZ_FRAME_MIN_HDR_SIZE) { *d_status = 12; return; }
 
-    if (walkReadU32LE(d_frame) != SLZ_FRAME_MAGIC) { *d_status = 1; return; }
+    if (readU32LE(d_frame) != SLZ_FRAME_MAGIC) { *d_status = 1; return; }
     const uint8_t version = d_frame[4];
     if (version != SLZ_FRAME_VERSION) { *d_status = 2; return; }
     const uint8_t flags = d_frame[5];
@@ -117,10 +110,10 @@ extern "C" __global__ void slzWalkFrameKernel(
     uint32_t blocks_seen = 0;
 
     while (pos + 4 <= frame_size) {
-        const uint32_t w0 = walkReadU32LE(d_frame + pos);
+        const uint32_t w0 = readU32LE(d_frame + pos);
         if (w0 == SLZ_FRAME_END_MARK) { break; }
         if (pos + 8 > frame_size) { *d_status = 6; return; }
-        const uint32_t decomp_size = walkReadU32LE(d_frame + pos + 4);
+        const uint32_t decomp_size = readU32LE(d_frame + pos + 4);
         const bool uncompressed_block = (w0 & SLZ_BLOCK_UNCOMP_FLAG) != 0;
         const bool pdm_block          = (w0 & SLZ_BLOCK_PDM_FLAG) != 0;
         const uint32_t comp_size = w0 & ~(SLZ_BLOCK_UNCOMP_FLAG | SLZ_BLOCK_PDM_FLAG);
@@ -177,7 +170,7 @@ extern "C" __global__ void slzWalkFrameKernel(
             const uint32_t dst_this = (dst_remaining < eff_chunk_size) ? dst_remaining : eff_chunk_size;
 
             if (pos + 4 > block_end) { *d_status = 9; return; }
-            const uint32_t v = walkReadU32LE(d_frame + pos);
+            const uint32_t v = readU32LE(d_frame + pos);
             const uint32_t size_field = v & SLZ_CHUNK_SIZE_MASK;
             const uint32_t chunk_type = (v >> SLZ_CHUNK_TYPE_SHIFT) & 3u;
 

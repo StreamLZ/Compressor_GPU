@@ -14,10 +14,23 @@
 
 #include <cstdint>
 
-// ── 24-bit big-endian read ──────────────────────────────────────
+// ── 24-bit big-endian read / write ──────────────────────────────
 // LZ stream headers store sub-stream counts big-endian.
 __device__ __forceinline__ uint32_t readBE24(const uint8_t* p) {
     return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+}
+
+__device__ __forceinline__ void writeBE24(uint8_t* p, uint32_t value) {
+    p[0] = (uint8_t)((value >> 16) & 0xFF);
+    p[1] = (uint8_t)((value >> 8) & 0xFF);
+    p[2] = (uint8_t)(value & 0xFF);
+}
+
+// ── 32-bit big-endian read ──────────────────────────────────────
+// Entropy long-form headers load 4 bytes as a single BE word.
+__device__ __forceinline__ uint32_t readU32BE(const uint8_t* p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+         | ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
 }
 
 // ── 24-bit little-endian codec ──────────────────────────────────

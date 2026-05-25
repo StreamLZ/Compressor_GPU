@@ -210,8 +210,7 @@ __device__ inline uint32_t parseEntropyHeader(const uint8_t*& src,
                  + ((bits >> ENTROPY_SHORT_DELTA_SHIFT) & ENTROPY_SHORT_DELTA_MASK) + 1;
         src += ENTROPY_HEADER_SHORT_BYTES + comp_size;
     } else {
-        uint32_t bits = ((uint32_t)src[1] << 24) | ((uint32_t)src[2] << 16)
-                      | ((uint32_t)src[3] << 8) | src[4];
+        uint32_t bits = readU32BE(src + 1);
         comp_size = bits & ENTROPY_LONG_SIZE_MASK;
         dst_size = ((((bits >> ENTROPY_LONG_DELTA_SHIFT)
                    | ((uint32_t)src[0] << ENTROPY_LONG_HI_SHIFT)) & ENTROPY_LONG_SIZE_MASK)) + 1;
@@ -232,8 +231,7 @@ __device__ inline uint32_t skipPairedPrimary(const uint8_t*& src) {
         uint32_t bits = readBE24(inner);
         src = inner + ENTROPY_HEADER_SHORT_BYTES + (bits & ENTROPY_SHORT_COMP_MASK);
     } else {
-        uint32_t bits = ((uint32_t)inner[1] << 24) | ((uint32_t)inner[2] << 16)
-                      | ((uint32_t)inner[3] << 8) | inner[4];
+        uint32_t bits = readU32BE(inner + 1);
         src = inner + ENTROPY_HEADER_LONG_BYTES + (bits & ENTROPY_LONG_SIZE_MASK);
     }
     return count_a;
