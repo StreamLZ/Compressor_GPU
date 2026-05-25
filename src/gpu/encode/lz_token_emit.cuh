@@ -74,14 +74,12 @@ __device__ void writeLengthValue(uint8_t* len_buf, uint32_t &len_count, uint32_t
 __device__ void writeOffset32(uint8_t* off32_buf, uint32_t &off32_pos, uint32_t offset) {
     if (offset >= LARGE_OFFSET_THRESHOLD) {
         uint32_t truncated = (offset & OFF32_LOW22_MASK) | OFF32_LARGE_TAG;
-        off32_buf[off32_pos++] = (uint8_t)(truncated & 0xFF);
-        off32_buf[off32_pos++] = (uint8_t)((truncated >> 8) & 0xFF);
-        off32_buf[off32_pos++] = (uint8_t)((truncated >> 16) & 0xFF);
+        writeLE24(off32_buf + off32_pos, truncated);
+        off32_pos += 3;
         off32_buf[off32_pos++] = (uint8_t)((offset - truncated) >> OFF32_LOW_BITS);
     } else {
-        off32_buf[off32_pos++] = (uint8_t)(offset & 0xFF);
-        off32_buf[off32_pos++] = (uint8_t)((offset >> 8) & 0xFF);
-        off32_buf[off32_pos++] = (uint8_t)((offset >> 16) & 0xFF);
+        writeLE24(off32_buf + off32_pos, offset);
+        off32_pos += 3;
     }
 }
 

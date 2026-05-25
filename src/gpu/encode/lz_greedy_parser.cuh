@@ -307,14 +307,7 @@ __device__ void scanBlock(
             if (ri < match_len) {
                 uint32_t rp = match_pos + ri;
                 if (rp + 8 <= src_size) {
-                    uint64_t rk = (uint64_t)src[rp]
-                                | ((uint64_t)src[rp+1] << 8)
-                                | ((uint64_t)src[rp+2] << 16)
-                                | ((uint64_t)src[rp+3] << 24)
-                                | ((uint64_t)src[rp+4] << 32)
-                                | ((uint64_t)src[rp+5] << 40)
-                                | ((uint64_t)src[rp+6] << 48)
-                                | ((uint64_t)src[rp+7] << 56);
+                    uint64_t rk = readU64LE(src + rp);
                     ht[hashKey6(rk, hash_bits, hash_mask)] = rp;
                 }
             }

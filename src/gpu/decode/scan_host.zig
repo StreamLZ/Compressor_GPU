@@ -16,6 +16,14 @@ const std = @import("std");
 
 const d = @import("descriptors.zig");
 
+/// 24-bit big-endian read from a slice at `off`. Mirrors `readBE24` in
+/// common/gpu_byteio.cuh. Caller must have verified `off + 3 <= src.len`.
+fn readBE24(src: []const u8, off: u32) u32 {
+    return (@as(u32, src[off]) << 16) |
+        (@as(u32, src[off + 1]) << 8) |
+        @as(u32, src[off + 2]);
+}
+
 pub fn scanForEntropyChunks(
     chunk_descs: []const d.ChunkDesc,
     compressed_block: []const u8,
@@ -69,9 +77,7 @@ pub fn scanForEntropyChunks(
         var remaining_decomp: u32 = ch.decomp_size;
         var sub_local_idx: u32 = 0;
         while (remaining_decomp > 0 and sub_pos + 3 <= chunk_src.len) {
-            const sub_hdr: u32 = (@as(u32, chunk_src[sub_pos]) << 16) |
-                (@as(u32, chunk_src[sub_pos + 1]) << 8) |
-                @as(u32, chunk_src[sub_pos + 2]);
+            const sub_hdr: u32 = readBE24(chunk_src, sub_pos);
             if ((sub_hdr & 0x800000) == 0) break; // not LZ
             const sc_comp_size: u32 = sub_hdr & 0x7FFFF;
             const sub_end = sub_pos + 3 + sc_comp_size;
@@ -79,10 +85,11 @@ pub fn scanForEntropyChunks(
             const sub_decomp: u32 = @min(remaining_decomp, cap_safe);
 
             // Global sub-chunk index for this sub-chunk's entropy descriptors.
-            // Slot size = 131072 (sub_chunk_cap) so the largest sub-chunk's
-            // literal/token streams fit. off16-lo lives at +65536 within slot.
+            // Slot is ENTROPY_SCRATCH_SLOT_BYTES (128KB) so the largest
+            // sub-chunk fits; off16-lo lives at +OFF16_HILO_SPLIT_OFFSET
+            // (64KB) within the slot.
             const sub_idx: u32 = chunk_first_sub + sub_local_idx;
-            const sub_dst_off: usize = @as(usize, sub_idx) * 131072;
+            const sub_dst_off: usize = @as(usize, sub_idx) * @as(usize, @intCast(d.ENTROPY_SCRATCH_SLOT_BYTES));
 
             // 8 init bytes only on the very first sub-chunk of the FRAME
             // (sub_idx == 0). All later sub-chunks (including each chunk's
@@ -97,7 +104,7 @@ pub fn scanForEntropyChunks(
 
                 // ── Stream 1: Literals ──
                 const lit_first = chunk_src[pos];
-                const lit_type = (lit_first >> 4) & 0x7;
+                const lit_type = (lit_first >> d.CHUNK_TYPE_SHIFT) & d.CHUNK_TYPE_MASK;
                 if (lit_type == 4) {
                     // Huffman literal stream. Payload after the header is
                     // [128 B weights][9 B sub-header][4 streams].
@@ -112,7 +119,7 @@ pub fn scanForEntropyChunks(
 
                 // ── Stream 2: Tokens (command stream) ──
                 const tok_first = chunk_src[pos];
-                const tok_type = (tok_first >> 4) & 0x7;
+                const tok_type = (tok_first >> d.CHUNK_TYPE_SHIFT) & d.CHUNK_TYPE_MASK;
                 if (tok_type == 4) {
                     // Huffman token stream — record sub_dst_off; driver adds
                     // tok_offset later when merging into the unified descriptor array.
@@ -141,7 +148,7 @@ pub fn scanForEntropyChunks(
 
                 // ── Off16 hi stream ──
                 const hi_first = chunk_src[pos];
-                const hi_type = (hi_first >> 4) & 0x7;
+                const hi_type = (hi_first >> d.CHUNK_TYPE_SHIFT) & d.CHUNK_TYPE_MASK;
                 if (hi_type == 0) {
                     const raw_info = parseType0StreamInfo(chunk_src, pos);
                     if (raw_info.data_offset != 0 and num_raw < raw_off16_descs.len) {
@@ -164,21 +171,22 @@ pub fn scanForEntropyChunks(
 
                 // ── Off16 lo stream ──
                 const lo_first = chunk_src[pos];
-                const lo_type = (lo_first >> 4) & 0x7;
+                const lo_type = (lo_first >> d.CHUNK_TYPE_SHIFT) & d.CHUNK_TYPE_MASK;
                 if (lo_type == 0) {
                     const raw_info = parseType0StreamInfo(chunk_src, pos);
                     if (raw_info.data_offset != 0 and num_raw < raw_off16_descs.len) {
                         raw_off16_descs[num_raw] = .{
                             .src_offset = ch.src_offset + raw_info.data_offset,
                             .size = raw_info.size,
-                            .gpu_offset = @intCast(sub_dst_off + 65536),
+                            .gpu_offset = @intCast(sub_dst_off + d.OFF16_HILO_SPLIT_OFFSET),
                         };
                         num_raw += 1;
                     }
                 } else if (lo_type == 4) {
-                    // Huff lo stream → scratch slot + 65536 (lo half of off16 slot).
-                    // Encode sub_dst_off + 65536 here; merge phase adds off16_offset.
-                    parseHuffHeader(chunk_src, pos, ch.src_offset, sub_dst_off + 65536,
+                    // Huff lo stream → scratch slot + OFF16_HILO_SPLIT_OFFSET
+                    // (lo half of off16 slot). Encode sub_dst_off + offset here;
+                    // merge phase adds off16_offset.
+                    parseHuffHeader(chunk_src, pos, ch.src_offset, sub_dst_off + d.OFF16_HILO_SPLIT_OFFSET,
                                     huff_off16lo_descs, &num_huff_lo);
                 }
             } // walk
@@ -228,9 +236,7 @@ fn parseHuffHeader(
     var payload_off: u32 = 0;
     if (first_byte >= 0x80) {
         if (lit_off + 3 > chunk_src.len) return;
-        const bits: u32 = (@as(u32, chunk_src[lit_off]) << 16) |
-            (@as(u32, chunk_src[lit_off + 1]) << 8) |
-            @as(u32, chunk_src[lit_off + 2]);
+        const bits: u32 = readBE24(chunk_src, lit_off);
         comp_size = bits & 0x3FF;
         dst_size = comp_size + ((bits >> 10) & 0x3FF) + 1;
         payload_off = src_offset_base + lit_off + 3;
@@ -266,7 +272,7 @@ fn parseType0StreamInfo(chunk_src: []const u8, pos: u32) d.Type0Info {
         return .{ .data_offset = pos + 2, .size = sz };
     } else {
         if (pos + 3 > chunk_src.len) return .{ .data_offset = 0, .size = 0 };
-        const sz: u32 = (@as(u32, chunk_src[pos]) << 16) | (@as(u32, chunk_src[pos + 1]) << 8) | @as(u32, chunk_src[pos + 2]);
+        const sz: u32 = readBE24(chunk_src, pos);
         return .{ .data_offset = pos + 3, .size = sz };
     }
 }
@@ -276,7 +282,7 @@ fn parseType0StreamInfo(chunk_src: []const u8, pos: u32) d.Type0Info {
 fn skipStreamHeader(chunk_src: []const u8, pos: u32) ?u32 {
     if (pos >= chunk_src.len) return null;
     const first_byte = chunk_src[pos];
-    const ct = (first_byte >> 4) & 0x7;
+    const ct = (first_byte >> d.CHUNK_TYPE_SHIFT) & d.CHUNK_TYPE_MASK;
 
     if (ct == 0) {
         // Type 0: memcpy, 2 or 3 byte header
@@ -286,7 +292,7 @@ fn skipStreamHeader(chunk_src: []const u8, pos: u32) ?u32 {
             return pos + 2 + sz;
         } else {
             if (pos + 3 > chunk_src.len) return null;
-            const sz: u32 = (@as(u32, chunk_src[pos]) << 16) | (@as(u32, chunk_src[pos + 1]) << 8) | @as(u32, chunk_src[pos + 2]);
+            const sz: u32 = readBE24(chunk_src, pos);
             return pos + 3 + sz;
         }
     } else if (ct == 1 or ct == 2 or ct == 4 or ct == 6) {
@@ -295,7 +301,7 @@ fn skipStreamHeader(chunk_src: []const u8, pos: u32) ?u32 {
         // compressed payload.
         if (first_byte >= 0x80) {
             if (pos + 3 > chunk_src.len) return null;
-            const bits: u32 = (@as(u32, chunk_src[pos]) << 16) | (@as(u32, chunk_src[pos + 1]) << 8) | @as(u32, chunk_src[pos + 2]);
+            const bits: u32 = readBE24(chunk_src, pos);
             const comp_size = bits & 0x3FF;
             return pos + 3 + comp_size;
         } else {

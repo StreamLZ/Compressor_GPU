@@ -343,9 +343,7 @@ extern "C" __global__ void slzAssembleWriteKernel(
     // mode=1 here selects the LZ-with-entropy decoder path.
     if (lane == 0) {
         const uint32_t sc_hdr = enc_n | (1u << SUBCHUNK_MODE_SHIFT) | SUBCHUNK_LZ_FLAG_BIT;
-        hdr[0] = (uint8_t)((sc_hdr >> 16) & 0xFF);
-        hdr[1] = (uint8_t)((sc_hdr >> 8) & 0xFF);
-        hdr[2] = (uint8_t)(sc_hdr & 0xFF);
+        writeBE24(hdr, sc_hdr);
     }
 }
 
@@ -395,10 +393,7 @@ extern "C" __global__ void slzFrameAssembleKernel(
             d_output[dst_off + 0] = internal_hdr0;
             d_output[dst_off + 1] = internal_hdr1;
             const uint32_t hdr_u32 = asm_total - 1;  // chunk_hdr LE u32
-            d_output[dst_off + 2] = (uint8_t)(hdr_u32 & 0xFF);
-            d_output[dst_off + 3] = (uint8_t)((hdr_u32 >> 8) & 0xFF);
-            d_output[dst_off + 4] = (uint8_t)((hdr_u32 >> 16) & 0xFF);
-            d_output[dst_off + 5] = (uint8_t)((hdr_u32 >> 24) & 0xFF);
+            writeU32LE(d_output + dst_off + 2, hdr_u32);
         }
         // Cooperative copy of the assembled sub-chunk block(s).
         const uint32_t payload_dst = dst_off + 6;
@@ -430,8 +425,8 @@ extern "C" __global__ void slzFrameAssembleKernel(
             }
         }
 
-        // End mark: 4 zero bytes.
-        if (lane < 4) d_output[end_mark_off + lane] = 0;
+        // End mark: 4 zero bytes (single lane-0 u32 store).
+        if (lane == 0) writeU32LE(d_output + end_mark_off, 0u);
         return;
     }
 }

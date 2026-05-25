@@ -46,6 +46,12 @@ pub const MAX_RAW_OFF16_DESCS: u32 = 8192;
 pub const ENTROPY_SCRATCH_SLOT_BYTES: u64 = 131072;
 pub const OFF16_HILO_SPLIT_OFFSET: u32 = 65536;
 
+// ── Chunk-header type field ─────────────────────────────────────
+// Mirror common/gpu_wire_format.cuh:
+//   ct = (chunk_header_byte >> CHUNK_TYPE_SHIFT) & CHUNK_TYPE_MASK
+pub const CHUNK_TYPE_SHIFT: u3 = 4;
+pub const CHUNK_TYPE_MASK: u8 = 0x7;
+
 // ── Per-kernel timing infrastructure ─────────────────────────────
 // When `enable_profiling` is set on a DecodeContext, each kernel launch
 // is wrapped in a cuEvent pair. After the final sync, finalizeProfiling
