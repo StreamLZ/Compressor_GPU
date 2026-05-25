@@ -28,6 +28,18 @@
 static constexpr uint32_t SCAN_SUBCHUNK_SLOT = (uint32_t)ENTROPY_SCRATCH_SLOT_BYTES;
 static constexpr uint32_t SCAN_OFF16_LO_SLOT = OFF16_HILO_SPLIT_OFFSET;
 
+// These three parsers (scanParseHuffHeader / scanParseType0 /
+// scanSkipStreamHeader) deliberately re-implement the entropy / raw
+// header walk that slz_wire_format.cuh exposes via parseEntropyHeader /
+// parseRawStreamSize / skipEntropyStream. The shared helpers mutate a
+// `const uint8_t*& src` cursor and are called from inside the per-warp
+// decoder; the scan kernel is single-threaded per chunk and needs to
+// stay on (pos: uint32_t) offsets so it can do explicit bounds checks
+// against `chunk_len` after every step (truncated frames must return
+// 0xFFFFFFFFu, not deref past the buffer). They share the wire-format
+// constants via gpu_wire_format.cuh / slz_wire_format.cuh; only the
+// cursor-passing convention differs.
+
 // Parse a chunk_type=4 Huffman header at `pos` within chunk_src.
 __device__ static bool scanParseHuffHeader(
     const uint8_t* chunk_src, uint32_t chunk_len, uint32_t pos,
