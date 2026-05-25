@@ -110,10 +110,10 @@ pub fn gpuCompressImpl(
     var extra = [_]?*anyopaque{null};
 
     const shared_bytes: u32 = if (global or chain) 0 else @intCast(hash_size * 4);
-    const _t_lz = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzCompressKernel", 0);
+    const t_lz = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzCompressKernel", 0);
     if (launch_fn(module_loader.kernel_fn, num_chunks, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra) != ffi.CUDA_SUCCESS)
         return false;
-    gpu_decode.endKernelTiming(_t_lz, 0);
+    gpu_decode.endKernelTiming(t_lz, 0);
 
     if (sync_fn() != ffi.CUDA_SUCCESS) return false;
 

@@ -102,9 +102,9 @@ pub fn gpuAssembleFrameImpl(
         @ptrCast(&p_ho),    @ptrCast(&p_descs), @ptrCast(&p_sizes),
         @ptrCast(&p_n),
     };
-    const _t_am = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleMeasureKernel", 0);
+    const t_am = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleMeasureKernel", 0);
     if (launch(module_loader.assemble_measure_fn, n, 1, 1, 32, 1, 1, 0, 0, &m_params, &extra) != ffi.CUDA_SUCCESS) return false;
-    gpu_decode.endKernelTiming(_t_am, 0);
+    gpu_decode.endKernelTiming(t_am, 0);
     if (sync() != ffi.CUDA_SUCCESS) return false;
 
     const enc_sizes = allocator.alloc(u32, n) catch return false;
@@ -128,9 +128,9 @@ pub fn gpuAssembleFrameImpl(
         @ptrCast(&p_ho),    @ptrCast(&p_descs), @ptrCast(&p_out),
         @ptrCast(&p_n),
     };
-    const _t_aw = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleWriteKernel", 0);
+    const t_aw = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleWriteKernel", 0);
     if (launch(module_loader.assemble_write_fn, n, 1, 1, 32, 1, 1, 0, 0, &w_params, &extra) != ffi.CUDA_SUCCESS) return false;
-    gpu_decode.endKernelTiming(_t_aw, 0);
+    gpu_decode.endKernelTiming(t_aw, 0);
     if (sync() != ffi.CUDA_SUCCESS) return false;
 
     // Download the assembled blocks; publish the host-side result.
@@ -253,9 +253,9 @@ pub fn gpuFrameAssembleImpl(
     // work_stream so cudaStreamSynchronize on it waits for the frame
     // bytes to be in d_output.
     const heavy_stream: usize = self.work_stream;
-    const _t_fa = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzFrameAssembleKernel", heavy_stream);
+    const t_fa = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzFrameAssembleKernel", heavy_stream);
     if (launch(module_loader.frame_assemble_fn, grid_x, 1, 1, 128, 1, 1, 0, heavy_stream, &params, &extra) != ffi.CUDA_SUCCESS) return null;
-    gpu_decode.endKernelTiming(_t_fa, heavy_stream);
+    gpu_decode.endKernelTiming(t_fa, heavy_stream);
     // In async mode we leave the kernel in flight on the caller's stream
     // (their cudaStreamSynchronize is the sync point); else block here.
     if (heavy_stream == 0) {

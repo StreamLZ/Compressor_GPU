@@ -86,10 +86,10 @@ pub fn gpuEncodeHuffImpl(
         @ptrCast(&p_codes), @ptrCast(&p_stride), @ptrCast(&p_n),
     };
     var extra = [_]?*anyopaque{null};
-    const _t_htbl = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, profile_names[0], 0);
+    const t_htbl = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, profile_names[0], 0);
     if (launch_fn(module_loader.huff_tables_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &tbl_params, &extra) != ffi.CUDA_SUCCESS)
         return false;
-    gpu_decode.endKernelTiming(_t_htbl, 0);
+    gpu_decode.endKernelTiming(t_htbl, 0);
 
     // Kernel 2: pack each sub-chunk into a chunk_type=4 body. Device-
     // resident mode writes straight into the caller's buffer.
@@ -103,10 +103,10 @@ pub fn gpuEncodeHuffImpl(
         @ptrCast(&p_sizes),   @ptrCast(&p_sps), @ptrCast(&p_stride),
         @ptrCast(&p_n),
     };
-    const _t_henc = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, profile_names[1], 0);
+    const t_henc = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, profile_names[1], 0);
     if (launch_fn(module_loader.huff_encode_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &enc_params, &extra) != ffi.CUDA_SUCCESS)
         return false;
-    gpu_decode.endKernelTiming(_t_henc, 0);
+    gpu_decode.endKernelTiming(t_henc, 0);
     if (sync_fn() != ffi.CUDA_SUCCESS) return false;
 
     _ = d2h_fn(@ptrCast(out_sizes.ptr), self.d_huff_sizes_persist, sizes_bytes);

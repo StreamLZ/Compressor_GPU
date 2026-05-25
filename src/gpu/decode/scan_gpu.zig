@@ -183,9 +183,9 @@ pub fn gpuScanChunks(
     var extra = [_]?*anyopaque{null};
     const tpb: u32 = 256;
     const blocks: u32 = (n + tpb - 1) / tpb;
-    const _t_scan = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzScanParseKernel", 0);
+    const t_scan = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzScanParseKernel", 0);
     if (launch(ml.scan_parse_fn, blocks, 1, 1, tpb, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return null;
-    dec_ctx.endKernelTiming(_t_scan, 0);
+    dec_ctx.endKernelTiming(t_scan, 0);
     if (sync() != CUDA_SUCCESS) return null;
 
     // ── Step 6b: device-side compaction ─────────────────────────────
@@ -241,9 +241,9 @@ pub fn gpuScanChunks(
                 @ptrCast(&k_dst), @ptrCast(&k_count),
             };
             var c_extra = [_]?*anyopaque{null};
-            const _t_ch = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, compact_names[ci], 0);
+            const t_ch = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, compact_names[ci], 0);
             if (launch(ml.compact_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, 0, &c_params, &c_extra) != CUDA_SUCCESS) return null;
-            dec_ctx.endKernelTiming(_t_ch, 0);
+            dec_ctx.endKernelTiming(t_ch, 0);
         }
         // Raw compact.
         {
@@ -257,9 +257,9 @@ pub fn gpuScanChunks(
                 @ptrCast(&cr_dst), @ptrCast(&cr_count),
             };
             var cr_extra = [_]?*anyopaque{null};
-            const _t_cr = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzCompactRawDescsKernel", 0);
+            const t_cr = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzCompactRawDescsKernel", 0);
             if (launch(ml.compact_raw_descs_fn, 1, 1, 1, 1, 1, 1, 0, 0, &cr_params, &cr_extra) != CUDA_SUCCESS) return null;
-            dec_ctx.endKernelTiming(_t_cr, 0);
+            dec_ctx.endKernelTiming(t_cr, 0);
         }
         if (sync() != CUDA_SUCCESS) return null;
 
