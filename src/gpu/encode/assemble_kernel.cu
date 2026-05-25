@@ -20,7 +20,7 @@
 
 #include <cstdint>
 #include "../common/gpu_warp.cuh"          // WARP_SIZE, laneId()
-#include "../common/gpu_byteio.cuh"        // (kept for parity with sibling kernels)
+#include "../common/gpu_byteio.cuh"        // readBE24
 #include "../common/gpu_wire_format.cuh"   // LZ_BLOCK_SIZE, HUFF_CHUNK_TYPE, OFF16_ENTROPY_MARKER,
                                            // OFF32_COUNT_PACK_MAX, OFF32_LONG_ENTRY_TAG,
                                            // SUBCHUNK_LZ_FLAG_BIT, SUBCHUNK_MODE_SHIFT, SUBCHUNK_HDR_BYTES
@@ -63,10 +63,6 @@ struct RawStreams {
     bool ok;
 };
 
-__device__ __forceinline__ uint32_t readU24BE(const uint8_t* p) {
-    return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2];
-}
-
 // Parse a raw sub-chunk payload into its component streams. Mirrors the
 // parsing half of reencodeGpuWithEntropy.
 __device__ static RawStreams parseRaw(const uint8_t* raw, uint32_t raw_size,
@@ -76,12 +72,12 @@ __device__ static RawStreams parseRaw(const uint8_t* raw, uint32_t raw_size,
     uint32_t rp = 0;
 
     if (rp + 3 > raw_size) return s;
-    s.lit_count = readU24BE(raw + rp); rp += 3;
+    s.lit_count = readBE24(raw + rp); rp += 3;
     if (rp + s.lit_count > raw_size) return s;
     s.lit = raw + rp; rp += s.lit_count;
 
     if (rp + 3 > raw_size) return s;
-    s.tok_count = readU24BE(raw + rp); rp += 3;
+    s.tok_count = readBE24(raw + rp); rp += 3;
     if (rp + s.tok_count > raw_size) return s;
     s.tok = raw + rp; rp += s.tok_count;
 

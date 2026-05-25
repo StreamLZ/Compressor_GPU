@@ -165,8 +165,7 @@ __device__ __noinline__ void parseSubChunkHeaders(
     // block2_cmd_offset
     uint32_t block2_cmd_offset = cmd_size;
     if (lane == 0 && sc_decomp_size > LZ_BLOCK_SIZE) {
-        uint16_t v; memcpy(&v, src, 2);
-        block2_cmd_offset = v;
+        block2_cmd_offset = readU16LE(src);
         src += 2;
     }
     block2_cmd_offset = __shfl_sync(FULL_WARP_MASK, block2_cmd_offset, 0);
@@ -181,7 +180,7 @@ __device__ __noinline__ void parseSubChunkHeaders(
     uint32_t off16_is_entropy = 0;
     uint32_t off16_is_split = 0;
     if (lane == 0) {
-        uint16_t cnt; memcpy(&cnt, src, 2);
+        uint16_t cnt = readU16LE(src);
         if (cnt == OFF16_ENTROPY_MARKER && entropy_off16_scratch != nullptr) {
             // Entropy-coded off16: skip the two encoded sub-streams,
             // read pre-decoded hi/lo bytes from entropy off16 scratch
@@ -229,13 +228,13 @@ __device__ __noinline__ void parseSubChunkHeaders(
     uint32_t len_avail = 0;
 
     if (lane == 0) {
-        uint32_t tmp = (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16);
+        uint32_t tmp = readLE24(src);
         src += 3;
         if (tmp != 0) {
             off32_count1 = tmp >> OFF32_COUNT1_SHIFT;
             off32_count2 = tmp & OFF32_COUNT2_MASK;
-            if (off32_count1 == OFF32_COUNT_PACK_MAX) { uint16_t v; memcpy(&v, src, 2); off32_count1 = v; src += 2; }
-            if (off32_count2 == OFF32_COUNT_PACK_MAX) { uint16_t v; memcpy(&v, src, 2); off32_count2 = v; src += 2; }
+            if (off32_count1 == OFF32_COUNT_PACK_MAX) { off32_count1 = readU16LE(src); src += 2; }
+            if (off32_count2 == OFF32_COUNT_PACK_MAX) { off32_count2 = readU16LE(src); src += 2; }
             off32_raw1 = src;
             src += off32_count1 * OFF32_ENTRY_BYTES;
             off32_raw2 = src;

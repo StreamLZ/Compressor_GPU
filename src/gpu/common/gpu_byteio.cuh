@@ -32,7 +32,11 @@ __device__ __forceinline__ void writeLE24(uint8_t* p, uint32_t value) {
     p[2] = (uint8_t)((value >> 16) & 0xFF);
 }
 
-// ── 16-bit little-endian store (unaligned-safe) ─────────────────
+// ── 16-bit little-endian load / store (unaligned-safe) ──────────
+__device__ __forceinline__ uint16_t readU16LE(const uint8_t* p) {
+    uint16_t v; memcpy(&v, p, 2); return v;
+}
+
 __device__ __forceinline__ void storeU16LE(uint8_t* dst, uint16_t value) {
     memcpy(dst, &value, 2);
 }

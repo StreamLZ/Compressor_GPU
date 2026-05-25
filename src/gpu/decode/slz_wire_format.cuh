@@ -169,8 +169,7 @@ __device__ inline uint32_t readLength(const uint8_t* length_stream,
             length_offset++;
             return v;
         }
-        uint16_t extra;
-        memcpy(&extra, length_stream + length_offset + 1, EXT_LENGTH_EXTRA_BYTES);
+        const uint16_t extra = readU16LE(length_stream + length_offset + 1);
         v += (uint32_t)extra * EXT_LENGTH_SCALE;
         length_offset += EXT_LENGTH_EXTRA_BYTES;
     }

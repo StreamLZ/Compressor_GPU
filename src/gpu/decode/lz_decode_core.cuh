@@ -83,7 +83,7 @@ __device__ __noinline__ void decodeSubChunkRawMode(
                             v = (uint16_t)off16_lo[entry_idx] |
                                 ((uint16_t)off16_hi[entry_idx] << 8);
                         } else {
-                            memcpy(&v, off16_raw + entry_idx * OFF16_ENTRY_BYTES, OFF16_ENTRY_BYTES);
+                            v = readU16LE(off16_raw + entry_idx * OFF16_ENTRY_BYTES);
                         }
                         my_match_offset = -(int32_t)v;
                     }
@@ -299,7 +299,7 @@ __device__ void decodeSubChunkGeneral(
                         if (off16_split) {
                             v = (uint16_t)off16_lo[off16_pos] | ((uint16_t)off16_hi[off16_pos] << 8);
                         } else {
-                            memcpy(&v, off16_raw + off16_pos * OFF16_ENTRY_BYTES, OFF16_ENTRY_BYTES);
+                            v = readU16LE(off16_raw + off16_pos * OFF16_ENTRY_BYTES);
                         }
                         match_offset = -(int32_t)v;
                         off16_pos++;
@@ -317,7 +317,7 @@ __device__ void decodeSubChunkGeneral(
                         if (off16_split) {
                             v = (uint16_t)off16_lo[off16_pos] | ((uint16_t)off16_hi[off16_pos] << 8);
                         } else {
-                            memcpy(&v, off16_raw + off16_pos * OFF16_ENTRY_BYTES, OFF16_ENTRY_BYTES);
+                            v = readU16LE(off16_raw + off16_pos * OFF16_ENTRY_BYTES);
                         }
                         match_offset = -(int32_t)v; off16_pos++;
                     }
@@ -329,7 +329,7 @@ __device__ void decodeSubChunkGeneral(
                     if (off32_pos < off32_block_count) {
                         // off32 entries are 3 bytes each (encoder writes byte triples).
                         const uint8_t* p = off32_block + off32_pos * OFF32_ENTRY_BYTES;
-                        uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+                        uint32_t v = readLE24(p);
                         match_offset = (int32_t)block_dst_start - (int32_t)v - (int32_t)dst_pos;
                         off32_pos++;
                     }
@@ -340,7 +340,7 @@ __device__ void decodeSubChunkGeneral(
                     if (off32_pos < off32_block_count) {
                         // off32 entries are 3 bytes each (encoder writes byte triples).
                         const uint8_t* p = off32_block + off32_pos * OFF32_ENTRY_BYTES;
-                        uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+                        uint32_t v = readLE24(p);
                         match_offset = (int32_t)block_dst_start - (int32_t)v - (int32_t)dst_pos;
                         off32_pos++;
                     }

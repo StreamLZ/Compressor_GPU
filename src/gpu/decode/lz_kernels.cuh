@@ -71,8 +71,7 @@ __device__ void parseAndDecodeSubChunkRaw(
     // block2_cmd_offset present only for sub-chunks > 64KB.
     uint32_t block2_cmd_offset = cmd_size;
     if (lane == 0 && sc_decomp_size > LZ_BLOCK_SIZE) {
-        uint16_t v; memcpy(&v, src, 2);
-        block2_cmd_offset = v;
+        block2_cmd_offset = readU16LE(src);
         src += 2;
     }
     block2_cmd_offset = __shfl_sync(FULL_WARP_MASK, block2_cmd_offset, 0);
@@ -82,8 +81,7 @@ __device__ void parseAndDecodeSubChunkRaw(
     const uint8_t* off16_raw;
     uint32_t off16_count = 0;
     if (lane == 0) {
-        uint16_t cnt; memcpy(&cnt, src, 2);
-        off16_count = cnt;
+        off16_count = readU16LE(src);
         off16_raw = src + 2;
         src += 2 + off16_count * OFF16_ENTRY_BYTES;
     }
@@ -101,13 +99,13 @@ __device__ void parseAndDecodeSubChunkRaw(
     uint32_t len_avail = 0;
 
     if (lane == 0) {
-        uint32_t tmp = (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16);
+        uint32_t tmp = readLE24(src);
         src += 3;
         if (tmp != 0) {
             off32_count1 = tmp >> OFF32_COUNT1_SHIFT;
             off32_count2 = tmp & OFF32_COUNT2_MASK;
-            if (off32_count1 == OFF32_COUNT_PACK_MAX) { uint16_t v; memcpy(&v, src, 2); off32_count1 = v; src += 2; }
-            if (off32_count2 == OFF32_COUNT_PACK_MAX) { uint16_t v; memcpy(&v, src, 2); off32_count2 = v; src += 2; }
+            if (off32_count1 == OFF32_COUNT_PACK_MAX) { off32_count1 = readU16LE(src); src += 2; }
+            if (off32_count2 == OFF32_COUNT_PACK_MAX) { off32_count2 = readU16LE(src); src += 2; }
             off32_raw1 = src;
             src += off32_count1 * OFF32_ENTRY_BYTES;
             off32_raw2 = src;
@@ -855,14 +853,12 @@ extern "C" __global__ void slzPrefixSumChunksKernel(
 // SlzScanHuffDesc + SlzScanRawDesc defined earlier in the compact
 // section so the compact kernels can reference them.
 
-static constexpr uint32_t SCAN_SUBCHUNK_SLOT = 131072; // sub_dst_off stride
-static constexpr uint32_t SCAN_OFF16_LO_SLOT = 65536;  // lo half within slot
-static constexpr uint32_t SCAN_SUBCHUNK_64K  = 0x10000;
-static constexpr uint32_t SCAN_OFF16_MARKER  = 0xFFFF;
-
-__device__ __forceinline__ uint32_t scanReadU24BE(const uint8_t* p) {
-    return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2];
-}
+// Scan-local aliases for the shared wire-format slot offsets. Cast to
+// uint32 here: a single sub-chunk's slot index never overflows u32, but
+// the canonical ENTROPY_SCRATCH_SLOT_BYTES is u64 because it multiplies
+// the global sub-chunk index in the LZ decode path.
+static constexpr uint32_t SCAN_SUBCHUNK_SLOT = (uint32_t)ENTROPY_SCRATCH_SLOT_BYTES;
+static constexpr uint32_t SCAN_OFF16_LO_SLOT = OFF16_HILO_SPLIT_OFFSET;
 
 // Parse a chunk_type=4 Huffman header at `pos` within chunk_src.
 __device__ static bool scanParseHuffHeader(
@@ -873,7 +869,7 @@ __device__ static bool scanParseHuffHeader(
     uint32_t comp_size, dst_size, payload_off;
     if (first >= 0x80) {
         if (pos + 3 > chunk_len) return false;
-        const uint32_t bits = scanReadU24BE(chunk_src + pos);
+        const uint32_t bits = readBE24(chunk_src + pos);
         comp_size = bits & 0x3FF;
         dst_size  = comp_size + ((bits >> 10) & 0x3FF) + 1;
         payload_off = src_offset_base + pos + 3;
@@ -905,7 +901,7 @@ __device__ static bool scanParseType0(
         data_off = pos + 2;
     } else {
         if (pos + 3 > chunk_len) return false;
-        size = scanReadU24BE(chunk_src + pos);
+        size = readBE24(chunk_src + pos);
         data_off = pos + 3;
     }
     return data_off != 0;
@@ -924,11 +920,11 @@ __device__ static uint32_t scanSkipStreamHeader(
             return pos + 2 + sz;
         }
         if (pos + 3 > chunk_len) return 0xFFFFFFFFu;
-        return pos + 3 + scanReadU24BE(chunk_src + pos);
+        return pos + 3 + readBE24(chunk_src + pos);
     } else if (ct == 1 || ct == 2 || ct == 4 || ct == 6) {
         if (first >= 0x80) {
             if (pos + 3 > chunk_len) return 0xFFFFFFFFu;
-            return pos + 3 + (scanReadU24BE(chunk_src + pos) & 0x3FF);
+            return pos + 3 + (readBE24(chunk_src + pos) & 0x3FF);
         }
         if (pos + 5 > chunk_len) return 0xFFFFFFFFu;
         const uint32_t bits = ((uint32_t)chunk_src[pos + 1] << 24)
@@ -1002,7 +998,7 @@ extern "C" __global__ void slzScanParseKernel(
         st_raw_lo[sub_idx].valid = 0;
 
         if (chunk_len < 3) break;
-        const uint32_t sub_hdr = scanReadU24BE(chunk_src + sub_pos);
+        const uint32_t sub_hdr = readBE24(chunk_src + sub_pos);
         if ((sub_hdr & SUBCHUNK_LZ_FLAG_BIT) == 0) break;
         const uint32_t sc_comp = sub_hdr & 0x7FFFFu;
         const uint32_t sub_end = sub_pos + 3 + sc_comp;
@@ -1030,13 +1026,13 @@ extern "C" __global__ void slzScanParseKernel(
             pos = nxt;
             if (pos >= end) break;
 
-            if (sub_decomp > SCAN_SUBCHUNK_64K) {
+            if (sub_decomp > LZ_BLOCK_SIZE) {
                 if (pos + 2 > end) break;
                 pos += 2;
             }
             if (pos + 2 > end) break;
             const uint32_t marker = (uint32_t)chunk_src[pos] | ((uint32_t)chunk_src[pos + 1] << 8);
-            if (marker != SCAN_OFF16_MARKER) break;
+            if (marker != OFF16_ENTROPY_MARKER) break;
             pos += 2;
             if (pos >= end) break;
 
