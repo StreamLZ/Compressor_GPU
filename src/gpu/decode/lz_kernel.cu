@@ -24,7 +24,14 @@
 //   slzLzDecodeRawKernel    — raw L1/L2 fast-path kernel
 //   slzGatherRawOff16Kernel — raw off16 scatter (1 block per stream)
 
-#include "slz_wire_format.cuh"   // constants, descriptor structs, header parsers
-#include "lz_decode_core.cuh"    // decodeSubChunkRawMode / decodeSubChunkGeneral
-#include "lz_header_parse.cuh"   // parseSubChunkHeaders
-#include "lz_kernels.cuh"        // parse-and-dispatch helpers + the __global__ kernels
+#include "slz_wire_format.cuh"           // constants, descriptor structs, header parsers
+#include "lz_decode_core.cuh"            // decodeSubChunkRawMode / decodeSubChunkGeneral
+#include "lz_header_parse.cuh"           // parseSubChunkHeaders
+#include "lz_dispatch.cuh"               // parseAndDecodeSubChunk{,Raw}
+#include "lz_decode_kernels.cuh"         // slzLzDecodeKernel, slzLzDecodeRawKernel
+#include "gather_raw_off16_kernel.cuh"   // slzGatherRawOff16Kernel
+#include "walk_frame_kernel.cuh"         // slzWalkFrameKernel + walkRead* + SLZ_FRAME_*
+#include "compact_descs_kernels.cuh"     // SlzHuffDecChunkDesc / SlzScan{Huff,Raw}Desc + compact kernels
+#include "merge_huff_descs_kernel.cuh"   // slzMergeHuffDescsKernel
+#include "prefix_sum_chunks_kernel.cuh"  // slzPrefixSumChunksKernel
+#include "scan_parse_kernel.cuh"         // slzScanParseKernel + scan* helpers

@@ -1,0 +1,141 @@
+//! GPU LZ-encode launcher.
+//!
+//! Owns the host side of the per-chunk LZ kernel launch: uploads input,
+//! descriptors, and (level-dependent) global hash tables, fires
+//! `slzLzCompressKernel`, then downloads `comp_sizes` plus the actual
+//! compressed bytes per block. Reads the per-level policy from
+//! `levels.zig` and the persistent device buffers from the supplied
+//! `EncodeContext`.
+
+const std = @import("std");
+const ffi = @import("cuda_ffi.zig");
+const module_loader = @import("module_loader.zig");
+const ec = @import("encode_context.zig");
+const levels = @import("levels.zig");
+const gpu_decode = @import("../decode/driver.zig");
+
+const CUdeviceptr = ffi.CUdeviceptr;
+const EncodeContext = ec.EncodeContext;
+const CompressChunkDesc = ec.CompressChunkDesc;
+
+pub fn gpuCompressImpl(
+    self: *EncodeContext,
+    input: []const u8,
+    output: []u8,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes_out: []u32,
+    io: ?std.Io,
+    level: u8,
+) bool {
+    if (!module_loader.init()) return false;
+
+    const h2d_fn = ffi.cuMemcpyHtoD_fn orelse return false;
+    const d2h_fn = ffi.cuMemcpyDtoH_fn orelse return false;
+    const launch_fn = ffi.cuLaunchKernel_fn orelse return false;
+    const sync_fn = ffi.cuCtxSynchronize_fn orelse return false;
+
+    const num_chunks: u32 = @intCast(chunk_descs.len);
+    const desc_bytes = chunk_descs.len * @sizeOf(CompressChunkDesc);
+    const sizes_bytes = @as(usize, num_chunks) * 4;
+    const hash_bits: u32 = levels.hashBitsForLevel(level);
+    const hash_size: usize = @as(usize, 1) << @intCast(hash_bits);
+    const global = levels.useGlobalHash(level);
+    const chain = levels.useChainParser(level);
+
+    if (!ec.ensureBuf(&self.d_input_persist, &self.d_input_size, input.len)) return false;
+    if (!ec.ensureBuf(&self.d_output_persist, &self.d_output_size, output.len)) return false;
+    if (!ec.ensureBuf(&self.d_descs_persist, &self.d_descs_size, desc_bytes)) return false;
+    if (!ec.ensureBuf(&self.d_sizes_persist, &self.d_sizes_size, sizes_bytes)) return false;
+
+    // Global hash tables — chain mode uses 3 tables per block:
+    //   first_hash (hash_size u32) + long_hash (hash_size u32) + next_hash (32768 u16 = 16384 u32)
+    if (chain) {
+        const next_hash_words: usize = 65536 / 2; // 65536 u16 entries = 32768 u32 words
+        const table_stride = hash_size + hash_size + next_hash_words;
+        const hash_bytes = @as(usize, num_chunks) * table_stride * 4;
+        if (!ec.ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) return false;
+    } else if (global) {
+        const hash_bytes = @as(usize, num_chunks) * hash_size * 4;
+        if (!ec.ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) return false;
+    }
+
+    const d_input = self.d_input_persist;
+    const d_output = self.d_output_persist;
+    const d_descs = self.d_descs_persist;
+    const d_sizes = self.d_sizes_persist;
+
+    // Upload input + descriptors, zero sizes. 4d Phase 3: when the
+    // caller's data is already GPU-resident at `d_input_override`,
+    // populate d_input_persist via a D2D copy (no PCIe) instead of the
+    // H2D from the host `input` slice.
+    if (self.d_input_override != 0) {
+        if (ffi.cuMemcpyDtoDAsync_fn) |d2d| {
+            _ = d2d(d_input, self.d_input_override, input.len, 0);
+        } else {
+            _ = h2d_fn(d_input, @ptrCast(input.ptr), input.len);
+        }
+    } else {
+        _ = h2d_fn(d_input, @ptrCast(input.ptr), input.len);
+    }
+    _ = h2d_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes);
+    if (ffi.cuMemsetD8_fn) |memset_fn| _ = memset_fn(d_sizes, 0, sizes_bytes);
+    _ = sync_fn();
+
+    const t_before = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
+
+    var p_input = d_input;
+    var p_output = d_output;
+    var p_descs = d_descs;
+    var p_global_hash: CUdeviceptr = if (global or chain) self.d_hash_persist else 0;
+    var p_sizes = d_sizes;
+    var p_total = num_chunks;
+    var p_hash_bits = hash_bits;
+    var p_use_chain: u32 = if (chain) 1 else 0;
+    // L4+ enables the greedy parser's match-range rehash (CPU engine_level>=2).
+    // L3 stays without it — that is the L3/L4 distinction. L5 uses the chain
+    // parser so the flag is inert there.
+    var p_l4: u32 = if (level >= 4) 1 else 0;
+
+    var params = [_]?*anyopaque{
+        @ptrCast(&p_input),
+        @ptrCast(&p_output),
+        @ptrCast(&p_descs),
+        @ptrCast(&p_global_hash),
+        @ptrCast(&p_sizes),
+        @ptrCast(&p_total),
+        @ptrCast(&p_hash_bits),
+        @ptrCast(&p_use_chain),
+        @ptrCast(&p_l4),
+    };
+    var extra = [_]?*anyopaque{null};
+
+    const shared_bytes: u32 = if (global or chain) 0 else @intCast(hash_size * 4);
+    const _t_lz = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzCompressKernel", 0);
+    if (launch_fn(module_loader.kernel_fn, num_chunks, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra) != ffi.CUDA_SUCCESS)
+        return false;
+    gpu_decode.endKernelTiming(_t_lz, 0);
+
+    if (sync_fn() != ffi.CUDA_SUCCESS) return false;
+
+    if (t_before) |t_start| {
+        if (io) |io_val| {
+            // Storage lives on the facade so external callers reach it
+            // unchanged via `gpu_enc.last_kernel_ns`.
+            const driver = @import("driver.zig");
+            driver.last_kernel_ns = @intCast(t_start.untilNow(io_val, .awake).toNanoseconds());
+        }
+    }
+
+    // Download comp_sizes first, then only the actual compressed bytes per block
+    _ = d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes);
+
+    for (0..chunk_descs.len) |i| {
+        const cs = comp_sizes_out[i];
+        if (cs > 0) {
+            const dst_off = chunk_descs[i].dst_offset;
+            _ = d2h_fn(@ptrCast(output.ptr + dst_off), d_output + dst_off, cs);
+        }
+    }
+
+    return true;
+}
