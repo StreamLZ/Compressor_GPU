@@ -101,13 +101,13 @@ slzLzDecodeKernel(
                 sub_chunk_header = readBE24(chunk_src);
             sub_chunk_header = __shfl_sync(FULL_WARP_MASK, sub_chunk_header, 0);
 
-            if (!(sub_chunk_header & SUBCHUNK_LZ_FLAG_BIT)) {
+            if (!subchunkIsLz(sub_chunk_header)) {
                 // Non-LZ sub-chunk (entropy-only) — skip for now
                 break;
             }
 
-            uint32_t sc_comp_size = sub_chunk_header & SUBCHUNK_COMP_SIZE_MASK;
-            uint32_t sc_mode = (sub_chunk_header >> SUBCHUNK_MODE_SHIFT) & SUBCHUNK_MODE_MASK;
+            uint32_t sc_comp_size = subchunkCompSize(sub_chunk_header);
+            uint32_t sc_mode = subchunkMode(sub_chunk_header);
             const uint8_t* sc_payload = chunk_src + 3;
 
             if (sc_comp_size < sc_size) {
@@ -207,9 +207,9 @@ slzLzDecodeRawKernel(
                 sub_chunk_header = readBE24(chunk_src);
             sub_chunk_header = __shfl_sync(FULL_WARP_MASK, sub_chunk_header, 0);
 
-            if (!(sub_chunk_header & SUBCHUNK_LZ_FLAG_BIT)) break;
+            if (!subchunkIsLz(sub_chunk_header)) break;
 
-            uint32_t sc_comp_size = sub_chunk_header & SUBCHUNK_COMP_SIZE_MASK;
+            uint32_t sc_comp_size = subchunkCompSize(sub_chunk_header);
             const uint8_t* sc_payload = chunk_src + 3;
 
             if (sc_comp_size < sc_size) {

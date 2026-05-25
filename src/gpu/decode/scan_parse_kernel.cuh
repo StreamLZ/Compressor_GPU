@@ -153,8 +153,8 @@ extern "C" __global__ void slzScanParseKernel(
 
         if (chunk_len < 3) break;
         const uint32_t sub_hdr = readBE24(chunk_src + sub_pos);
-        if ((sub_hdr & SUBCHUNK_LZ_FLAG_BIT) == 0) break;
-        const uint32_t sc_comp = sub_hdr & SUBCHUNK_COMP_SIZE_MASK;
+        if (!subchunkIsLz(sub_hdr)) break;
+        const uint32_t sc_comp = subchunkCompSize(sub_hdr);
         const uint32_t sub_end = sub_pos + 3 + sc_comp;
         if (sub_end > chunk_len) break;
         const uint32_t sub_decomp = remaining < cap_safe ? remaining : cap_safe;

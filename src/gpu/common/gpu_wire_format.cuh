@@ -44,6 +44,11 @@ static constexpr uint32_t SUBCHUNK_MODE_SHIFT       = 19;
 static constexpr uint32_t SUBCHUNK_MODE_MASK        = 0xFu;
 static constexpr uint32_t SUBCHUNK_COMP_SIZE_MASK   = 0x7FFFFu;
 
+// Field accessors over the 3-byte sub-chunk header (read as readBE24).
+__device__ __forceinline__ bool     subchunkIsLz      (uint32_t hdr) { return (hdr & SUBCHUNK_LZ_FLAG_BIT) != 0; }
+__device__ __forceinline__ uint32_t subchunkMode      (uint32_t hdr) { return (hdr >> SUBCHUNK_MODE_SHIFT) & SUBCHUNK_MODE_MASK; }
+__device__ __forceinline__ uint32_t subchunkCompSize  (uint32_t hdr) { return hdr & SUBCHUNK_COMP_SIZE_MASK; }
+
 // ── Off16 stream — entropy-coded marker ─────────────────────────────
 // A leading count of OFF16_ENTROPY_MARKER tells the parser the off16
 // stream is split into hi/lo halves (each its own entropy chunk).

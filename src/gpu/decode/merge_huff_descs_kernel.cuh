@@ -20,6 +20,24 @@
 // Stream regions (4 entries): each {src, n, region_off}. Each block
 // handles one region in its lane-0; per-block prefix is computed via a
 // pre-pass on lane 0.
+// Append one region's compacted descs into d_merged, adding region_off
+// to each desc's out_offset and assigning sequential lut_offsets.
+static __device__ inline void appendRegion(
+    SlzHuffDecChunkDesc* __restrict__       d_merged,
+    uint32_t&                               lut_slot,
+    const SlzHuffDecChunkDesc* __restrict__ src,
+    uint32_t                                n,
+    uint32_t                                region_off
+) {
+    for (uint32_t i = 0; i < n; i++) {
+        SlzHuffDecChunkDesc d = src[i];
+        d.out_offset += region_off;
+        d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
+        d_merged[lut_slot] = d;
+        lut_slot++;
+    }
+}
+
 extern "C" __global__ void slzMergeHuffDescsKernel(
     const SlzHuffDecChunkDesc* __restrict__ d_lit,
     const SlzHuffDecChunkDesc* __restrict__ d_tok,
@@ -35,37 +53,10 @@ extern "C" __global__ void slzMergeHuffDescsKernel(
     uint32_t* __restrict__                  d_n_merged)
 {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    const uint32_t n_lit = *d_n_lit;
-    const uint32_t n_tok = *d_n_tok;
-    const uint32_t n_hi  = *d_n_hi;
-    const uint32_t n_lo  = *d_n_lo;
     uint32_t lut_slot = 0;
-    for (uint32_t i = 0; i < n_lit; i++) {
-        SlzHuffDecChunkDesc d = d_lit[i];
-        d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
-        d_merged[lut_slot] = d;
-        lut_slot++;
-    }
-    for (uint32_t i = 0; i < n_tok; i++) {
-        SlzHuffDecChunkDesc d = d_tok[i];
-        d.out_offset += tok_region_off;
-        d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
-        d_merged[lut_slot] = d;
-        lut_slot++;
-    }
-    for (uint32_t i = 0; i < n_hi; i++) {
-        SlzHuffDecChunkDesc d = d_hi[i];
-        d.out_offset += off16_region_off;
-        d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
-        d_merged[lut_slot] = d;
-        lut_slot++;
-    }
-    for (uint32_t i = 0; i < n_lo; i++) {
-        SlzHuffDecChunkDesc d = d_lo[i];
-        d.out_offset += off16_region_off;
-        d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
-        d_merged[lut_slot] = d;
-        lut_slot++;
-    }
+    appendRegion(d_merged, lut_slot, d_lit, *d_n_lit, 0);
+    appendRegion(d_merged, lut_slot, d_tok, *d_n_tok, tok_region_off);
+    appendRegion(d_merged, lut_slot, d_hi,  *d_n_hi,  off16_region_off);
+    appendRegion(d_merged, lut_slot, d_lo,  *d_n_lo,  off16_region_off);
     *d_n_merged = lut_slot;
 }

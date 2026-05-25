@@ -183,10 +183,9 @@ common path. On real workloads where short tokens are the
 overwhelming majority, the parallel-parse path covers roughly 80%
 of tokens.
 
-The measured impact was a 17 to 25 percent reduction in D2D
-wall-clock across every compression level and both test corpora.
-The enwik8 L1 decode dropped from 3.8 milliseconds to 2.92
-milliseconds, a 23 percent gain on its own.
+The measured impact was a meaningful reduction in D2D wall-clock
+across every compression level and both test corpora; see the
+performance table in the README for the current numbers.
 
 ## Warp-cooperative byte copies
 
@@ -242,9 +241,9 @@ parser at its own entry point, lets the parser finish and return,
 and then enters the decoder with a fresh smaller register set.
 
 This was confirmed empirically. Removing `__noinline__` and rebuilding
-moved the LZ decode kernel from 40 registers per thread to 56,
-which crossed an occupancy threshold and dropped measured throughput
-by roughly 8 percent. The attribute stays.
+inflated the LZ decode kernel's per-thread register footprint enough
+to cross an occupancy threshold and visibly drop measured throughput.
+The attribute stays.
 
 ## The four-stream Huffman decoder
 

@@ -91,17 +91,22 @@ Every CUDA kernel resolved by the Zig drivers via `cuModuleGetFunction`.
 | encode | `slzAssembleMeasureKernel` | `encode/assemble_kernel.cu` |
 | encode | `slzAssembleWriteKernel` | `encode/assemble_kernel.cu` |
 | encode | `slzFrameAssembleKernel` | `encode/assemble_kernel.cu` |
-| decode | `slzLzDecodeKernel` | `decode/lz_decode_kernels.cuh` |
-| decode | `slzLzDecodeRawKernel` | `decode/lz_decode_kernels.cuh` |
-| decode | `slzWalkFrameKernel` | `decode/walk_frame_kernel.cuh` |
-| decode | `slzPrefixSumChunksKernel` | `decode/prefix_sum_chunks_kernel.cuh` |
-| decode | `slzScanParseKernel` | `decode/scan_parse_kernel.cuh` |
-| decode | `slzCompactHuffDescsKernel` | `decode/compact_descs_kernels.cuh` |
-| decode | `slzCompactRawDescsKernel` | `decode/compact_descs_kernels.cuh` |
-| decode | `slzMergeHuffDescsKernel` | `decode/merge_huff_descs_kernel.cuh` |
-| decode | `slzGatherRawOff16Kernel` | `decode/gather_raw_off16_kernel.cuh` |
+| decode | `slzLzDecodeKernel` | `decode/lz_kernel.cu` |
+| decode | `slzLzDecodeRawKernel` | `decode/lz_kernel.cu` |
+| decode | `slzWalkFrameKernel` | `decode/lz_kernel.cu` |
+| decode | `slzPrefixSumChunksKernel` | `decode/lz_kernel.cu` |
+| decode | `slzScanParseKernel` | `decode/lz_kernel.cu` |
+| decode | `slzCompactHuffDescsKernel` | `decode/lz_kernel.cu` |
+| decode | `slzCompactRawDescsKernel` | `decode/lz_kernel.cu` |
+| decode | `slzMergeHuffDescsKernel` | `decode/lz_kernel.cu` |
+| decode | `slzGatherRawOff16Kernel` | `decode/lz_kernel.cu` |
 | decode | `slzHuffBuildLutKernel` | `decode/huffman_kernel.cu` |
 | decode | `slzHuffDecode4StreamKernel` | `decode/huffman_kernel.cu` |
+
+Decode LZ-aggregator kernels live in their per-kernel `.cuh` headers
+(`lz_decode_kernels.cuh`, `walk_frame_kernel.cuh`, etc.) which the
+single `decode/lz_kernel.cu` aggregator includes; only the `.cu`
+emits a `.ptx`, hence the source column.
 
 ## Build
 
@@ -189,7 +194,7 @@ kernels run as a separate pass and are not included).
 | L2 | 78 | 142 |
 | L3 | 81 | 158 |
 | L4 | 112 | 203 |
-| L5 | 296 | 4502 † |
+| L5 | 296 | n/a † |
 
 † silesia L5 is a known pathological slow path in the serial chain
 parser; not representative.
