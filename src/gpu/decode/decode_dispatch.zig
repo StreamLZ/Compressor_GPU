@@ -284,7 +284,6 @@ pub fn fullGpuLaunch(
     dst_full: [*]u8,
     dst_start_off: usize,
     decompressed_size: usize,
-    num_groups: u32,
     chunks_per_group: u32,
     sub_chunk_cap: u32,
     io: ?std.Io,
@@ -296,7 +295,6 @@ pub fn fullGpuLaunch(
         dst_full,
         dst_start_off,
         decompressed_size,
-        num_groups,
         chunks_per_group,
         sub_chunk_cap,
         io,
@@ -312,7 +310,6 @@ pub fn fullGpuLaunchImpl(
     dst_full: [*]u8,
     dst_start_off: usize,
     decompressed_size: usize,
-    num_groups: u32,
     chunks_per_group: u32,
     sub_chunk_cap: u32,
     io: ?std.Io,
@@ -483,13 +480,18 @@ pub fn fullGpuLaunchImpl(
     // ── Pipeline: split into N groups, overlap entropy with LZ ───
     // The pipeline path overlaps Huffman pre-decode with the LZ kernel.
     const total_chunks: u32 = @intCast(chunk_descs.len);
-    const use_pipeline = self.pipeline_streams_created and total_chunks >= NUM_PIPELINE_STREAMS;
+    // pipeline_streams_created is the contract for the launch path below:
+    // it owns the Huffman pre-decode and the LZ kernel launch. Without it,
+    // Huffman would silently skip and L3+ would decode zero literals. The
+    // caller (fullGpuLaunch via ensurePipelineStreams) creates the streams
+    // lazily; this is just the guard against a stream-create failure.
+    if (!self.pipeline_streams_created) return error.BadMode;
     // When the caller is slzDecompressAsync, work_stream is the caller's
     // CUstream so its cudaStreamSynchronize waits for the decompress to
     // land in d_output. The sync wrapper leaves work_stream at 0 and
     // falls back to the library's own pipeline_streams[0].
     const heavy_stream: usize = if (self.work_stream != 0) self.work_stream else self.pipeline_streams[0];
-    if (use_pipeline) {
+    {
         const pipe_chunk_count = (total_chunks + NUM_PIPELINE_STREAMS - 1) / NUM_PIPELINE_STREAMS;
         try cudaCall(sync_fn());
 
@@ -691,79 +693,6 @@ pub fn fullGpuLaunchImpl(
                     facade.last_lz_kernel_ns = 0;
                     facade.last_huff_kernel_ns = 0;
                 }
-            }
-        }
-    } else {
-        // ── Non-pipelined fallback (original sequential path) ─────
-        // This branch runs LZ only. Huffman pre-decode requires the
-        // pipelined path; when chunk count is below NUM_PIPELINE_STREAMS
-        // this branch sees L1/L2-only inputs (n_huff == 0).
-        const t_before_kern = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
-
-        // Fast path: when there's no entropy work (L1/L2 inputs), use the
-        // dedicated 6-param kernel — same shape as the May-9 22 GB/s era.
-        const use_raw_kernel = n_huff == 0 and ml.kernel_raw_fn != 0;
-
-        const grid_x = (num_groups + 1) / 2;
-
-        // Step 7: LZ kernels self-gate on `*d_total_chunks`. Stage the
-        // frame-wide total_chunks into d_n_groups_scratch (4 B H2D).
-        if (!ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4)) return error.BadMode;
-        var host_total_chunks: u32 = total_chunks;
-        try cudaCall(h2d_fn(self.d_n_groups_scratch, @ptrCast(&host_total_chunks), 4));
-
-        if (use_raw_kernel) {
-            var p_comp = self.d_comp_persist;
-            var p_descs_dev = self.d_descs_persist;
-            var p_dst = self.d_output;
-            var p_cpg = chunks_per_group;
-            var p_total = self.d_n_groups_scratch;
-            var p_sc_cap = sub_chunk_cap;
-            var raw_params = [_]?*anyopaque{
-                @ptrCast(&p_comp),
-                @ptrCast(&p_descs_dev),
-                @ptrCast(&p_dst),
-                @ptrCast(&p_cpg),
-                @ptrCast(&p_total),
-                @ptrCast(&p_sc_cap),
-            };
-            var raw_extra = [_]?*anyopaque{null};
-            const t_lzr2 = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", 0);
-            try cudaCall(launch_fn(ml.kernel_raw_fn, grid_x, 1, 1, 32, 2, 1, 0, 0, &raw_params, &raw_extra));
-            endKernelTiming(t_lzr2, 0);
-        } else {
-            var p_comp = self.d_comp_persist;
-            var p_descs_dev = self.d_descs_persist;
-            var p_dst = self.d_output;
-            var p_cpg = chunks_per_group;
-            var p_total = self.d_n_groups_scratch;
-            var p_sc_cap = sub_chunk_cap;
-            var p_entropy_scratch = self.d_entropy_scratch;
-            var p_entropy_slot_stride: u64 = @as(u64, total_subchunks) * 131072;
-            var p_first_sub_idx: CUdeviceptr = self.d_first_subchunk_idx;
-
-            var params = [_]?*anyopaque{
-                @ptrCast(&p_comp),
-                @ptrCast(&p_descs_dev),
-                @ptrCast(&p_dst),
-                @ptrCast(&p_cpg),
-                @ptrCast(&p_total),
-                @ptrCast(&p_sc_cap),
-                @ptrCast(&p_entropy_scratch),
-                @ptrCast(&p_entropy_slot_stride),
-                @ptrCast(&p_first_sub_idx),
-            };
-            var extra = [_]?*anyopaque{null};
-            const t_lz2 = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeKernel", 0);
-            try cudaCall(launch_fn(ml.kernel_fn, grid_x, 1, 1, 32, 2, 1, 0, 0, &params, &extra));
-            endKernelTiming(t_lz2, 0);
-        }
-
-        try cudaCall(sync_fn());
-
-        if (t_before_kern) |t_start| {
-            if (io) |io_val| {
-                facade.last_kernel_ns = @intCast(t_start.untilNow(io_val, .awake).toNanoseconds());
             }
         }
     }

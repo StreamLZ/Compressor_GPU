@@ -124,7 +124,6 @@ pub fn decompressFramedFromDevice(
     if (std.c.getenv("SLZ_E2E_TIMER") != null)
         std.debug.print("[walk] n_chunks={d} decomp={d} block_start={d} block_size={d} status={d}\n", .{ meta.n_chunks, meta.decomp_size, meta.block_start, meta.block_size, meta.status });
 
-    const num_groups: u32 = meta.n_chunks;
     const chunks_per_group: u32 = 1;
 
     // src_offsets in chunks are block-payload-relative — matches the CPU
@@ -142,7 +141,6 @@ pub fn decompressFramedFromDevice(
         @ptrCast(&dst_dummy),
         0,
         meta.decomp_size,
-        num_groups,
         chunks_per_group,
         meta.sub_chunk_cap,
         io,
@@ -1075,7 +1073,6 @@ fn gpuBatchDecode(
     // each chunk is its own group (fractional means sub-chunk-level SC).
     const sc_grp_chunks: usize = if (sc_group_size_in >= 1.0) @max(1, @as(usize, @intFromFloat(sc_group_size_in))) else 1;
     const effective_group_size = if (block_is_sc and sc_grp_chunks < num_chunks) sc_grp_chunks else num_chunks;
-    const num_groups: u32 = @intCast((num_chunks + effective_group_size - 1) / effective_group_size);
     const chunks_per_group: u32 = @intCast(effective_group_size);
 
     var chunk_descs = alloc.alloc(gpu.ChunkDesc, num_chunks) catch return error.OutOfMemory;
@@ -1179,7 +1176,6 @@ fn gpuBatchDecode(
         dst.ptr,
         dst_start_off,
         decompressed_size,
-        num_groups,
         chunks_per_group,
         eff_sc_cap,
         io_opt,
