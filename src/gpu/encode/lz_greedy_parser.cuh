@@ -104,10 +104,7 @@ __device__ void scanBlock(
                 // No intra-warp overwrite — pre-warp ht[h] is what CPU sees.
                 uint32_t ref_val = ht[h];
                 if (ref_val != HASH_EMPTY && ref_val + 8 <= my_pos) {
-                    uint32_t rk = (uint32_t)src[ref_val] |
-                                 ((uint32_t)src[ref_val+1] << 8) |
-                                 ((uint32_t)src[ref_val+2] << 16) |
-                                 ((uint32_t)src[ref_val+3] << 24);
+                    uint32_t rk = readU32LE(src + ref_val);
                     if (rk == key4) {
                         hash_match = true;
                         hash_ref = ref_val;
@@ -132,10 +129,7 @@ __device__ void scanBlock(
             uint32_t ro_dist = (uint32_t)(-recent_offset);
             if (my_pos >= ro_dist) {
                 uint32_t ref = my_pos - ro_dist;
-                uint32_t recent_word = (uint32_t)src[ref] |
-                                      ((uint32_t)src[ref+1] << 8) |
-                                      ((uint32_t)src[ref+2] << 16) |
-                                      ((uint32_t)src[ref+3] << 24);
+                uint32_t recent_word = readU32LE(src + ref);
                 uint32_t xor_v = key4 ^ recent_word;
                 if ((xor_v & XOR_PATTERN_BYTES123_MASK) == 0) {
                     // Bytes 1..3 of cursor == bytes 1..3 of cursor+recent_offset.
@@ -149,10 +143,7 @@ __device__ void scanBlock(
         }
         if (is_active && !hash_match && !xor_match && my_pos >= MIN_HASH_MATCH_OFFSET) {
             uint32_t eight_ref = my_pos - MIN_HASH_MATCH_OFFSET;
-            uint32_t eight_word = (uint32_t)src[eight_ref] |
-                                 ((uint32_t)src[eight_ref+1] << 8) |
-                                 ((uint32_t)src[eight_ref+2] << 16) |
-                                 ((uint32_t)src[eight_ref+3] << 24);
+            uint32_t eight_word = readU32LE(src + eight_ref);
             if (eight_word == key4) eight_match = true;
         }
 
