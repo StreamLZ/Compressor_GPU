@@ -174,16 +174,16 @@ pub const DecodeContext = struct {
     // Holds the Huffman pre-decode output that the LZ kernel reads.
     // Layout per sub-chunk slot: [lit][tok at +tok_offset][off16 at +off16_offset].
     // off16 sub-region: hi bytes at chunk_idx*131072, lo bytes at +65536.
-    d_tans_scratch: CUdeviceptr = 0,
-    d_tans_scratch_size: usize = 0,
+    d_entropy_scratch: CUdeviceptr = 0,
+    d_entropy_scratch_size: usize = 0,
 
     h_pinned_output: ?[*]u8 = null,
     h_pinned_output_size: usize = 0,
 
-    // Off16 scratch view = d_tans_scratch + off16_offset (set in fullGpuLaunchImpl).
+    // Off16 scratch view = d_entropy_scratch + off16_offset (set in fullGpuLaunchImpl).
     // Used by the raw-off16 gather kernel and the D2D/H2D fallback loops.
-    d_tans_off16_scratch: CUdeviceptr = 0,
-    d_tans_off16_scratch_size: usize = 0,
+    d_entropy_off16_scratch: CUdeviceptr = 0,
+    d_entropy_off16_scratch_size: usize = 0,
 
     // Raw off16 gather descriptors (one per raw off16 sub-stream).
     d_raw_off16_descs: CUdeviceptr = 0,

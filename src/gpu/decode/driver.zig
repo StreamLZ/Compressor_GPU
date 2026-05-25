@@ -18,7 +18,7 @@
 //!                          walk_max_chunks, GpuError
 //!   decode_context.zig   — DecodeContext, ensureDeviceBuf / Output,
 //!                          alloc/free/copy helpers, profiling fns
-//!   scan_host.zig        — scanForTansChunks + local header parsers
+//!   scan_host.zig        — scanForEntropyChunks + local header parsers
 //!   scan_gpu.zig         — gpuWalkFrameImpl, gpuPrefixSumChunksImpl,
 //!                          walkMetaToHost, gpuScanChunks
 //!   decode_dispatch.zig  — fullGpuLaunch / fullGpuLaunchImpl + the
@@ -86,8 +86,5 @@ pub var g_default: DecodeContext = .{};
 /// full GPU launch window; the split vars are populated when
 /// `SLZ_SPLIT_TIMER=1` separates Huff pre-decode from LZ decode.
 pub var last_kernel_ns: i64 = 0;
-/// Retained for ABI compatibility with src/cli.zig consumers; GPU tANS
-/// is retired, so this is always 0.
-pub var last_tans_kernel_ns: i64 = 0;
 pub var last_lz_kernel_ns: i64 = 0;
 pub var last_huff_kernel_ns: i64 = 0;

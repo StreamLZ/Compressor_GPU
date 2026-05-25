@@ -11,7 +11,7 @@ const std = @import("std");
 
 const d = @import("descriptors.zig");
 
-pub fn scanForTansChunks(
+pub fn scanForEntropyChunks(
     chunk_descs: []const d.ChunkDesc,
     compressed_block: []const u8,
     sub_chunk_cap: u32,

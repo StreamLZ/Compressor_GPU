@@ -71,7 +71,7 @@ pub const ScanRawDesc = extern struct {
 pub const RawOff16Desc = struct {
     src_offset: u32, // offset of raw bytes in compressed buffer
     size: u32, // number of bytes
-    gpu_offset: u32, // offset in d_tans_off16_scratch
+    gpu_offset: u32, // offset in d_entropy_off16_scratch
 };
 
 pub const ScanResult = struct {
@@ -140,3 +140,11 @@ pub const PrefixSumResultDev = struct {
 pub const GpuError = error{
     BadMode,
 };
+
+/// Funnel any CUDA Driver API return code into the GpuError surface so
+/// callers can `try cudaCall(cuMemcpyHtoD_fn(...))` instead of dropping
+/// the result with `_ = ...`. The decode path's only failure mode is
+/// `BadMode`; this keeps every silent-corruption surface one `try` away.
+pub fn cudaCall(rc: c_int) GpuError!void {
+    if (rc != 0) return error.BadMode; // CUDA_SUCCESS == 0
+}

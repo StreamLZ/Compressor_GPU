@@ -42,8 +42,8 @@ pub const AssembleDesc = extern struct {
 };
 
 /// GPU Huffman encode descriptor — matches `HuffEncDesc` in
-/// gpu_huff_kernel.cu. Same field layout as Tans32EncDesc: `src_stride`
-/// is 1 for a contiguous stream or 2 to encode one off16 byte plane.
+/// gpu_huff_kernel.cu. `src_stride` is 1 for a contiguous stream or 2
+/// to encode one off16 byte plane.
 pub const HuffEncDesc = extern struct {
     src_offset: u32,
     src_size: u32,
@@ -158,10 +158,6 @@ pub const EncodeContext = struct {
     // operation writes its downloaded host-side payloads here; the frame
     // assembler reads them back. Moved into the context so the compress
     // path is reentrant per handle.
-    tans_lit_sizes: ?[]u32 = null,
-    tans_lit_data: ?[]u8 = null,
-    tans_lit_offsets: ?[]u32 = null,
-
     huff_off16hi_sizes: ?[]u32 = null,
     huff_off16hi_data: ?[]u8 = null,
     huff_off16hi_offsets: ?[]u32 = null,

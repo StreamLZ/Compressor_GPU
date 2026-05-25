@@ -1469,30 +1469,10 @@ pub fn compressFramedOne(
                     // bytes in its payload (matches CPU encoder convention).
                     const init_bytes: usize = if (gpu_bi_idx == 0 and dict_len == 0) 8 else 0;
 
-                    // Check if GPU tANS produced smaller literal encoding
-                    const tans_lits: ?[]const u8 = if (enc_ctx.tans_lit_sizes) |tsizes| blk: {
-                        if (gpu_bi_idx >= tsizes.len) break :blk null;
-                        const tsz = tsizes[gpu_bi_idx];
-                        const is_raw = (tsz & 0x80000000) != 0;
-                        const actual_sz = tsz & 0x7FFFFFFF;
-                        if (is_raw or actual_sz == 0) break :blk null;
-                        // Parse raw literal count from the sub-chunk
-                        if (raw_cs <= init_bytes + 3) break :blk null;
-                        const raw_lit_count: usize = (@as(usize, raw_payload[init_bytes]) << 16) |
-                            (@as(usize, raw_payload[init_bytes + 1]) << 8) |
-                            raw_payload[init_bytes + 2];
-                        // tANS worthwhile? 5-byte header + data < 3-byte header + raw
-                        if (actual_sz + 5 >= raw_lit_count + 3) break :blk null;
-                        if (enc_ctx.tans_lit_data) |tdata| {
-                            if (enc_ctx.tans_lit_offsets) |toffs| {
-                                const off = toffs[gpu_bi_idx];
-                                if (off + actual_sz <= tdata.len) {
-                                    break :blk tdata[off..][0..actual_sz];
-                                }
-                            }
-                        }
-                        break :blk null;
-                    } else null;
+                    // GPU tANS literal override was retired with the GPU tANS
+                    // encoder (2026-05-21 / commit fbc7644). The
+                    // tans_lits_override parameter to reencodeGpuWithEntropy
+                    // is always null on this path now.
 
                     // Re-encode all streams with CPU entropy (tANS literals + Huffman tokens/off16).
                     // The GPU scan walks every sub-chunk per chunk and the LZ kernel
@@ -1599,7 +1579,7 @@ pub fn compressFramedOne(
                             0.0, // minimize size, not speed
                             init_bytes, sub_size,
                             gpu_lit_pre,
-                            if (tans_lits) |t| t else null,
+                            null, // GPU tANS literal override — retired
                             gpu_tok_pre,
                             gpu_off16hi_pre,
                             gpu_off16lo_pre,

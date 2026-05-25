@@ -28,6 +28,7 @@ const HuffDecChunkDesc = d.HuffDecChunkDesc;
 const RawOff16Desc = d.RawOff16Desc;
 const ScanResult = d.ScanResult;
 const GpuError = d.GpuError;
+const cudaCall = d.cudaCall;
 const HUFF_LUT_ENTRIES = d.HUFF_LUT_ENTRIES;
 
 const DecodeContext = dec_ctx.DecodeContext;
@@ -83,7 +84,7 @@ fn mergeHuffDescs(
         if (launch_fn(ml.merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, 0, &m_params, &m_extra) != CUDA_SUCCESS)
             return error.BadMode;
         endKernelTiming(t_merge, 0);
-        _ = sync_fn();
+        try cudaCall(sync_fn());
         return;
     }
     // CPU merge fallback: used by the non-pure-D2D / CPU-scan paths.
@@ -110,8 +111,8 @@ fn mergeHuffDescs(
     append(&merged_huff, &m, &lut_slot, self.huff_off16hi_host_buf[0..scan.num_huff_off16hi], @intCast(off16_offset));
     append(&merged_huff, &m, &lut_slot, self.huff_off16lo_host_buf[0..scan.num_huff_off16lo], @intCast(off16_offset));
 
-    _ = h2d_fn(self.d_huff_descs, @ptrCast(&merged_huff), @as(usize, m) * @sizeOf(HuffDecChunkDesc));
-    _ = sync_fn();
+    try cudaCall(h2d_fn(self.d_huff_descs, @ptrCast(&merged_huff), @as(usize, m) * @sizeOf(HuffDecChunkDesc)));
+    try cudaCall(sync_fn());
 }
 
 /// Place raw (type 0) off16 sub-streams into the off16 scratch. The bytes
@@ -126,7 +127,7 @@ fn gatherRawOff16(
     h2d_fn: anytype,
     sync_fn: anytype,
     launch_fn: anytype,
-) void {
+) GpuError!void {
     if (scan.num_raw_off16 == 0) return;
     if (ml.gather_off16_fn != 0) gather_blk: {
         const ndesc: u32 = scan.num_raw_off16;
@@ -138,7 +139,7 @@ fn gatherRawOff16(
             const dbytes: usize = @as(usize, ndesc) * @sizeOf(RawOff16Desc);
             if (!ensureDeviceBuf(&self.d_raw_off16_descs, &self.d_raw_off16_descs_size, dbytes))
                 break :gather_blk;
-            _ = h2d_fn(self.d_raw_off16_descs, @ptrCast(&self.raw_off16_buf), dbytes);
+            try cudaCall(h2d_fn(self.d_raw_off16_descs, @ptrCast(&self.raw_off16_buf), dbytes));
             break :d_raw self.d_raw_off16_descs;
         };
         // Step 7: kernel self-gates on `*d_count`. Use the n_raw slot of
@@ -150,13 +151,13 @@ fn gatherRawOff16(
             if (!ensureDeviceBuf(&self.d_n_raw_scratch, &self.d_n_raw_scratch_size, 4))
                 break :gather_blk;
             var host_n: u32 = ndesc;
-            _ = h2d_fn(self.d_n_raw_scratch, @ptrCast(&host_n), 4);
+            try cudaCall(h2d_fn(self.d_n_raw_scratch, @ptrCast(&host_n), 4));
             break :d_cnt self.d_n_raw_scratch;
         };
         {
             var p_comp = self.d_comp_persist;
             var p_comp_len: u32 = @intCast(compressed_block.len);
-            var p_scratch = self.d_tans_off16_scratch;
+            var p_scratch = self.d_entropy_off16_scratch;
             var p_descs = desc_dev;
             var p_count = d_count;
             var params = [_]?*anyopaque{
@@ -170,7 +171,7 @@ fn gatherRawOff16(
             const t_gather = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzGatherRawOff16Kernel", 0);
             if (launch_fn(ml.gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, 0, &params, &extra) == CUDA_SUCCESS) {
                 endKernelTiming(t_gather, 0);
-                _ = sync_fn();
+                try cudaCall(sync_fn());
                 return;
             }
             endKernelTiming(t_gather, 0);
@@ -181,14 +182,14 @@ fn gatherRawOff16(
         for (0..scan.num_raw_off16) |ri| {
             const rd = self.raw_off16_buf[ri];
             if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len)
-                _ = d2d(self.d_tans_off16_scratch + rd.gpu_offset, self.d_comp_persist + rd.src_offset, rd.size, 0);
+                try cudaCall(d2d(self.d_entropy_off16_scratch + rd.gpu_offset, self.d_comp_persist + rd.src_offset, rd.size, 0));
         }
-        _ = sync_fn();
+        try cudaCall(sync_fn());
     } else {
         for (0..scan.num_raw_off16) |ri| {
             const rd = self.raw_off16_buf[ri];
             if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len)
-                _ = h2d_fn(self.d_tans_off16_scratch + rd.gpu_offset, @ptrCast(compressed_block.ptr + rd.src_offset), rd.size);
+                try cudaCall(h2d_fn(self.d_entropy_off16_scratch + rd.gpu_offset, @ptrCast(compressed_block.ptr + rd.src_offset), rd.size));
         }
     }
 }
@@ -346,7 +347,7 @@ pub fn fullGpuLaunchImpl(
     if (!ensureDeviceOutput(self, total_output + 64)) return error.BadMode;
 
     if (dst_start_off > 0)
-        _ = h2d_fn(self.d_output, @ptrCast(dst_full), dst_start_off);
+        try cudaCall(h2d_fn(self.d_output, @ptrCast(dst_full), dst_start_off));
 
     const comp_bytes = if (compressed_block.len > 0) compressed_block.len else 4;
     const desc_bytes = chunk_descs.len * @sizeOf(ChunkDesc);
@@ -357,16 +358,16 @@ pub fn fullGpuLaunchImpl(
     // Chunk descs must be on device before the prefix-sum kernel reads
     // them. The lower H2D path is still present and unconditionally
     // re-uploads; this hoist is what feeds the prefix-sum kernel.
-    _ = h2d_fn(self.d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes);
-    _ = sync_fn();
+    try cudaCall(h2d_fn(self.d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes));
+    try cudaCall(sync_fn());
 
     // 4d Phase 3 step 6: prefix-sum runs on device. The 4-byte D2H of
-    // total_subchunks below is launch-plumbing — needed to size the tans
-    // scratch + compute region offsets host-side; no per-chunk CPU work
-    // remains.
+    // total_subchunks below is launch-plumbing — needed to size the
+    // entropy scratch + compute region offsets host-side; no per-chunk
+    // CPU work remains.
     _ = scan_gpu_mod.gpuPrefixSumChunksImpl(self, self.d_descs_persist, @intCast(chunk_descs.len), sub_chunk_cap) orelse return error.BadMode;
     var total_subchunks: u32 = 0;
-    _ = d2h_fn(@ptrCast(&total_subchunks), self.d_total_subchunks_buf, 4);
+    try cudaCall(d2h_fn(@ptrCast(&total_subchunks), self.d_total_subchunks_buf, 4));
     self.d_first_subchunk_idx = self.d_first_sub_idx_persist;
     // CPU mirror for the pipeline branch — NUM_PIPELINE_STREAMS==1
     // reads only index 0 (= 0). Zero-init suffices; bumping the stream
@@ -377,16 +378,16 @@ pub fn fullGpuLaunchImpl(
     // lit/tok streams; off16-hi at +0, off16-lo at +65536 within each slot.
     // Layout: [lit: total*128K] [tok: total*128K] [off16: total*128K].
     const per_subchunk_scratch: usize = 131072;
-    const tans_scratch_bytes = @as(usize, total_subchunks) * per_subchunk_scratch * 3;
-    if (!ensureDeviceBuf(&self.d_tans_scratch, &self.d_tans_scratch_size, tans_scratch_bytes)) return error.BadMode;
+    const entropy_scratch_bytes = @as(usize, total_subchunks) * per_subchunk_scratch * 3;
+    if (!ensureDeviceBuf(&self.d_entropy_scratch, &self.d_entropy_scratch_size, entropy_scratch_bytes)) return error.BadMode;
     const tok_offset = @as(usize, total_subchunks) * per_subchunk_scratch;
     const off16_offset = @as(usize, total_subchunks) * per_subchunk_scratch * 2;
-    self.d_tans_off16_scratch = self.d_tans_scratch + off16_offset;
+    self.d_entropy_off16_scratch = self.d_entropy_scratch + off16_offset;
 
     const need_first_sub_idx = total_subchunks != @as(u32, @intCast(chunk_descs.len));
     if (need_first_sub_idx) {
         const fs_bytes: usize = chunk_descs.len * @sizeOf(u32);
-        _ = d2h_fn(@ptrCast(&first_subchunk_idx_buf), self.d_first_sub_idx_persist, fs_bytes);
+        try cudaCall(d2h_fn(@ptrCast(&first_subchunk_idx_buf), self.d_first_sub_idx_persist, fs_bytes));
     } else {
         self.d_first_subchunk_idx = 0;
     }
@@ -396,19 +397,19 @@ pub fn fullGpuLaunchImpl(
     if (compressed_block.len > 0) {
         if (d_compressed_src) |dev_src| {
             const d2d = cuda.cuMemcpyDtoDAsync_fn orelse return error.BadMode;
-            _ = d2d(self.d_comp_persist, dev_src, compressed_block.len, 0);
+            try cudaCall(d2d(self.d_comp_persist, dev_src, compressed_block.len, 0));
         } else {
-            _ = h2d_fn(self.d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len);
+            try cudaCall(h2d_fn(self.d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len));
         }
     }
-    _ = sync_fn();
+    try cudaCall(sync_fn());
     if (t_e2e0) |t0| if (io) |iv| {
         e2e_cum.h2d = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
         e2e_cum.prescan = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
     };
 
     // ── Scan for entropy chunks (Huffman + raw off16) ─────────
-    // scanForTansChunks fills both the Huffman descriptor buffers and the
+    // scanForEntropyChunks fills both the Huffman descriptor buffers and the
     // raw-off16 gather list. tANS is retired, so the scan only produces
     // Huffman + raw outputs.
     var scan: ScanResult = .{ .num_raw_off16 = 0 };
@@ -439,7 +440,7 @@ pub fn fullGpuLaunchImpl(
         else
             null;
 
-        scan = gpu_scan orelse scan_host_mod.scanForTansChunks(
+        scan = gpu_scan orelse scan_host_mod.scanForEntropyChunks(
             chunk_descs,
             compressed_block,
             sub_chunk_cap,
@@ -457,7 +458,7 @@ pub fn fullGpuLaunchImpl(
             e2e_cum.postscan = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
         };
 
-        gatherRawOff16(self, scan, compressed_block, h2d_fn, sync_fn, launch_fn);
+        try gatherRawOff16(self, scan, compressed_block, h2d_fn, sync_fn, launch_fn);
     }
 
     if (t_e2e0) |t0| if (io) |iv| {
@@ -493,7 +494,7 @@ pub fn fullGpuLaunchImpl(
     const heavy_stream: usize = if (self.work_stream != 0) self.work_stream else self.pipeline_streams[0];
     if (use_pipeline) {
         const pipe_chunk_count = (total_chunks + NUM_PIPELINE_STREAMS - 1) / NUM_PIPELINE_STREAMS;
-        _ = sync_fn();
+        try cudaCall(sync_fn());
 
         // ── KERNEL TIMER: only pure GPU kernel time from here ──
         const t_before_kern = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
@@ -518,7 +519,7 @@ pub fn fullGpuLaunchImpl(
             else d_nh: {
                 if (!ensureDeviceBuf(&self.d_n_huff_scratch, &self.d_n_huff_scratch_size, 4)) return error.BadMode;
                 var host_n_huff: u32 = n_huff;
-                _ = h2d_fn(self.d_n_huff_scratch, @ptrCast(&host_n_huff), 4);
+                try cudaCall(h2d_fn(self.d_n_huff_scratch, @ptrCast(&host_n_huff), 4));
                 break :d_nh self.d_n_huff_scratch;
             };
             {
@@ -548,7 +549,7 @@ pub fn fullGpuLaunchImpl(
                 var p_comp = self.d_comp_persist;
                 var p_descs = self.d_huff_descs;
                 var p_lut = self.d_huff_lut;
-                var p_out = self.d_tans_scratch;
+                var p_out = self.d_entropy_scratch;
                 var p_n = d_n_huff;
                 var params = [_]?*anyopaque{
                     @ptrCast(&p_comp), @ptrCast(&p_descs),
@@ -573,7 +574,7 @@ pub fn fullGpuLaunchImpl(
         // Close Huff time slice: sync the pipeline stream so the LZ
         // measurement excludes Huff time.
         if (split_timer and have_huff) {
-            _ = stream_sync_fn(self.pipeline_streams[0]);
+            try cudaCall(stream_sync_fn(self.pipeline_streams[0]));
             if (t_huff_start) |hs| {
                 if (io) |io_val| {
                     split_huff_ns = @intCast(hs.untilNow(io_val, .awake).toNanoseconds());
@@ -606,10 +607,10 @@ pub fn fullGpuLaunchImpl(
             // per-pipeline-group count into d_n_groups_scratch (4 B H2D).
             if (!ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4)) return error.BadMode;
             var host_per_group_total: u32 = chunk_end - chunk_start;
-            _ = h2d_fn(self.d_n_groups_scratch, @ptrCast(&host_per_group_total), 4);
+            try cudaCall(h2d_fn(self.d_n_groups_scratch, @ptrCast(&host_per_group_total), 4));
 
             // Fast path: no entropy in this scan → use lean L1/L2 raw kernel.
-            // Huffman literals require the general kernel (it reads tans_scratch).
+            // Huffman literals require the general kernel (it reads entropy_scratch).
             const use_raw_kernel = n_huff == 0 and ml.kernel_raw_fn != 0;
 
             if (use_raw_kernel) {
@@ -639,8 +640,8 @@ pub fn fullGpuLaunchImpl(
                 var p_cpg = chunks_per_group;
                 var p_total = self.d_n_groups_scratch;
                 var p_sc_cap = sub_chunk_cap;
-                var p_tans_scratch = self.d_tans_scratch;
-                var p_tans_slot_stride: u64 = @as(u64, total_subchunks) * 131072;
+                var p_entropy_scratch = self.d_entropy_scratch;
+                var p_entropy_slot_stride: u64 = @as(u64, total_subchunks) * 131072;
                 var p_first_sub_idx: CUdeviceptr = self.d_first_subchunk_idx +
                     if (self.d_first_subchunk_idx != 0) @as(u64, chunk_start) * @sizeOf(u32) else 0;
 
@@ -651,8 +652,8 @@ pub fn fullGpuLaunchImpl(
                     @ptrCast(&p_cpg),
                     @ptrCast(&p_total),
                     @ptrCast(&p_sc_cap),
-                    @ptrCast(&p_tans_scratch),
-                    @ptrCast(&p_tans_slot_stride),
+                    @ptrCast(&p_entropy_scratch),
+                    @ptrCast(&p_entropy_slot_stride),
                     @ptrCast(&p_first_sub_idx),
                 };
                 var lz_extra = [_]?*anyopaque{null};
@@ -664,7 +665,7 @@ pub fn fullGpuLaunchImpl(
             }
 
             if (split_timer) {
-                _ = stream_sync_fn(stream);
+                try cudaCall(stream_sync_fn(stream));
                 if (t_lz_start) |ts_start| {
                     if (io) |io_val| {
                         split_lz_ns += @intCast(ts_start.untilNow(io_val, .awake).toNanoseconds());
@@ -717,7 +718,7 @@ pub fn fullGpuLaunchImpl(
         // frame-wide total_chunks into d_n_groups_scratch (4 B H2D).
         if (!ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4)) return error.BadMode;
         var host_total_chunks: u32 = total_chunks;
-        _ = h2d_fn(self.d_n_groups_scratch, @ptrCast(&host_total_chunks), 4);
+        try cudaCall(h2d_fn(self.d_n_groups_scratch, @ptrCast(&host_total_chunks), 4));
 
         if (use_raw_kernel) {
             var p_comp = self.d_comp_persist;
@@ -746,8 +747,8 @@ pub fn fullGpuLaunchImpl(
             var p_cpg = chunks_per_group;
             var p_total = self.d_n_groups_scratch;
             var p_sc_cap = sub_chunk_cap;
-            var p_tans_scratch = self.d_tans_scratch;
-            var p_tans_slot_stride: u64 = @as(u64, total_subchunks) * 131072;
+            var p_entropy_scratch = self.d_entropy_scratch;
+            var p_entropy_slot_stride: u64 = @as(u64, total_subchunks) * 131072;
             var p_first_sub_idx: CUdeviceptr = self.d_first_subchunk_idx;
 
             var params = [_]?*anyopaque{
@@ -757,8 +758,8 @@ pub fn fullGpuLaunchImpl(
                 @ptrCast(&p_cpg),
                 @ptrCast(&p_total),
                 @ptrCast(&p_sc_cap),
-                @ptrCast(&p_tans_scratch),
-                @ptrCast(&p_tans_slot_stride),
+                @ptrCast(&p_entropy_scratch),
+                @ptrCast(&p_entropy_slot_stride),
                 @ptrCast(&p_first_sub_idx),
             };
             var extra = [_]?*anyopaque{null};
@@ -787,13 +788,13 @@ pub fn fullGpuLaunchImpl(
     // stream waits for the result).
     if (d_output_target) |dev_target| {
         if (cuda.cuMemcpyDtoDAsync_fn) |d2d| {
-            _ = d2d(dev_target + dst_start_off, self.d_output + dst_start_off, decompressed_size, heavy_stream);
-            if (self.work_stream == 0) _ = sync_fn();
+            try cudaCall(d2d(dev_target + dst_start_off, self.d_output + dst_start_off, decompressed_size, heavy_stream));
+            if (self.work_stream == 0) try cudaCall(sync_fn());
         } else {
             return error.BadMode;
         }
     } else {
-        _ = d2h_fn(@ptrCast(dst_full + dst_start_off), self.d_output + dst_start_off, decompressed_size);
+        try cudaCall(d2h_fn(@ptrCast(dst_full + dst_start_off), self.d_output + dst_start_off, decompressed_size));
     }
 
     // Profiling: drain pending cuEvent pairs into last_timings. Skip in

@@ -105,7 +105,7 @@ pub fn init() bool {
     // is present. Failing to load is fine; falls back to general kernel.
     _ = get_fn(&kernel_raw_fn, module, "slzLzDecodeRawKernel");
     // Optional GPU decode-scan kernel (roadmap 4d Phase 2). Absent → the
-    // driver keeps the CPU scanForTansChunks path.
+    // driver keeps the CPU scanForEntropyChunks path.
     _ = get_fn(&scan_parse_fn, module, "slzScanParseKernel");
     // Optional GPU frame-walk kernel (roadmap 4d Phase 3). Absent → the
     // D2D decompress path falls back to host bounce.

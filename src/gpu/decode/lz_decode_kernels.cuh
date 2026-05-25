@@ -22,9 +22,9 @@
 //   chunks_per_group   number of chunks decoded by one warp
 //   total_chunks       number of valid entries in `chunks`
 //   sub_chunk_cap      max decompressed size of a sub-chunk
-//   tans_scratch       entropy-scratch base (lit/tok/off16 sub-slots)
-//   tans_slot_stride   byte stride between the lit, tok, and off16
-//                      sub-slots of tans_scratch; 0 when no scratch
+//   entropy_scratch       entropy-scratch base (lit/tok/off16 sub-slots)
+//   entropy_slot_stride   byte stride between the lit, tok, and off16
+//                      sub-slots of entropy_scratch; 0 when no scratch
 //   first_subchunk_idx global sub-chunk index of each chunk's sub-chunk 0;
 //                      nullptr → fall back to chunk_idx (legacy)
 extern "C" __global__ void
@@ -36,8 +36,8 @@ slzLzDecodeKernel(
     uint32_t chunks_per_group,
     const uint32_t* __restrict__ d_total_chunks,
     uint32_t sub_chunk_cap,
-    uint8_t* __restrict__ tans_scratch,
-    uint64_t tans_slot_stride,
+    uint8_t* __restrict__ entropy_scratch,
+    uint64_t entropy_slot_stride,
     const uint32_t* __restrict__ first_subchunk_idx
 ) {
     // WARPS_PER_BLOCK warps per block: warp 0 = threadIdx.y==0, etc.
@@ -82,12 +82,12 @@ slzLzDecodeKernel(
         // Per-sub-chunk slot size = ENTROPY_SCRATCH_SLOT_BYTES, large
         // enough for the biggest sub-chunk's lit/tok streams. off16-hi at
         // offset 0, off16-lo at +65536 within each slot. tok and off16
-        // sub-buffers live at +tans_slot_stride and +2*tans_slot_stride
+        // sub-buffers live at +entropy_slot_stride and +2*entropy_slot_stride
         // from the lit slot.
         uint32_t global_subchunk_index =
             first_subchunk_idx ? first_subchunk_idx[chunk_idx] : chunk_idx;
-        uint8_t* subchunk_scratch_base = tans_scratch
-            ? (tans_scratch + (uint64_t)global_subchunk_index * ENTROPY_SCRATCH_SLOT_BYTES)
+        uint8_t* subchunk_scratch_base = entropy_scratch
+            ? (entropy_scratch + (uint64_t)global_subchunk_index * ENTROPY_SCRATCH_SLOT_BYTES)
             : nullptr;
 
         while (sc_remaining > 0) {
@@ -112,9 +112,9 @@ slzLzDecodeKernel(
             if (sc_comp_size < sc_size) {
                 // Derive tok/off16 sub-slots on demand from base + stride.
                 uint8_t* tok_slot = subchunk_scratch_base
-                    ? (subchunk_scratch_base + tans_slot_stride) : nullptr;
+                    ? (subchunk_scratch_base + entropy_slot_stride) : nullptr;
                 uint8_t* off16_slot = subchunk_scratch_base
-                    ? (subchunk_scratch_base + 2 * tans_slot_stride) : nullptr;
+                    ? (subchunk_scratch_base + 2 * entropy_slot_stride) : nullptr;
                 // Pass the absolute sc_dst_off as base_offset, so only the
                 // sub-chunk at output offset 0 (the very first sub-chunk in
                 // the frame) triggers the 8-byte initial copy. Per-chunk

@@ -116,11 +116,10 @@ pub fn gpuEncodeHuffImpl(
     return true;
 }
 
-/// GPU-Huffman counterpart of gpuEncodeOff16Tans32: entropy-codes the
-/// off16 hi/lo byte planes with the GPU Huffman encoder (chunk_type=4).
-/// Same off16 parse + `>= 32` gate as the tANS path. Populates the
-/// `huff_off16{hi,lo}_*` pub vars on success; the bodies carry no 5-byte
-/// chunk header (the frame assembler prepends it).
+/// Entropy-codes off16 hi/lo byte planes with the GPU Huffman encoder
+/// (chunk_type=4). The `>= 32` gate skips streams too short to amortize
+/// the 5-byte Huffman chunk header. Populates `huff_off16{hi,lo}_*` on
+/// the context; the bodies carry no header (the frame assembler prepends it).
 pub fn gpuEncodeOff16HuffImpl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
@@ -271,9 +270,8 @@ pub fn gpuEncodeOff16HuffImpl(
     return true;
 }
 
-/// GPU-Huffman counterpart of gpuEncodeLiteralsTans32: entropy-codes
-/// each sub-chunk's literal stream with the GPU Huffman encoder
-/// (chunk_type=4). Populates the `huff_lit_*` pub vars on success.
+/// Entropy-codes each sub-chunk's literal stream with the GPU Huffman
+/// encoder (chunk_type=4). Populates `huff_lit_*` on the context.
 pub fn gpuEncodeLiteralsHuffImpl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
@@ -364,9 +362,8 @@ pub fn gpuEncodeLiteralsHuffImpl(
     return true;
 }
 
-/// GPU-Huffman counterpart of gpuEncodeTokensTans32: entropy-codes each
-/// sub-chunk's token stream with the GPU Huffman encoder (chunk_type=4).
-/// Populates the `huff_tok_*` pub vars on success.
+/// Entropy-codes each sub-chunk's token stream with the GPU Huffman
+/// encoder (chunk_type=4). Populates `huff_tok_*` on the context.
 pub fn gpuEncodeTokensHuffImpl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
