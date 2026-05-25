@@ -6,6 +6,16 @@
 //! launch a kernel reads its handle from this file (e.g.
 //! `module_loader.kernel_fn`).
 //!
+//! Encode `init()` always defers to the decode driver's `init()` first so
+//! exactly one CUDA context is created per process. A second
+//! `cuCtxCreate` would clobber decode's existing allocations. After that,
+//! encode loads its own `nvcuda.dll` handle and resolves encode-specific
+//! entries (cuMemsetD8, cuMemcpyDtoDAsync) that decode does not use.
+//!
+//! Consequence: encode cannot stand alone. Importing only `gpu/encode/`
+//! still works because the encode init explicitly imports
+//! `../decode/driver.zig`, but the binary still links the decode driver.
+//!
 //! The PTX `@embedFile` calls *must* live in a file located in
 //! `src/gpu/encode/` so the relative paths resolve to the .ptx blobs
 //! that the build emits alongside the .cu sources.
@@ -13,10 +23,8 @@
 const std = @import("std");
 const ffi = @import("cuda_ffi.zig");
 
-// CUDA context + per-module handles. `ctx` is unused once the decode
-// driver's context is bound, but kept for symmetry with future paths
-// that may want to create their own.
-pub var ctx: usize = 0;
+// Per-module handles. CUDA context comes from the decode driver — see
+// the file-level doc above.
 pub var module: usize = 0;
 pub var kernel_fn: usize = 0;
 pub var huff_module: usize = 0;
@@ -32,8 +40,8 @@ pub fn init() bool {
     if (initialized) return kernel_fn != 0;
     initialized = true;
 
-    // Reuse CUDA context from the decode driver if available.
-    // This avoids creating a second context which would clobber the first.
+    // Reuse the CUDA context the decode driver creates — see the
+    // file-level doc on why encode does not own context creation.
     const dec_gpu = @import("../decode/driver.zig");
     if (!dec_gpu.init()) return false;
 

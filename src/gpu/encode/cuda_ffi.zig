@@ -5,6 +5,14 @@
 //! loader (`module_loader.zig`) populates at init time. Every other
 //! sub-module reads the function pointers from here so we have exactly
 //! one definition site for each driver entrypoint.
+//!
+//! The encode side does NOT own CUDA context creation: `module_loader.init`
+//! calls into the decode driver first so that exactly one cuCtxCreate runs
+//! per process (a second context would clobber the decode side's
+//! allocations). Encode loads its own `nvcuda.dll` handle + function
+//! pointers because it needs encode-specific entries that decode does not
+//! (e.g. memset, async D2D). There are no `cuInit_fn`, `cuDeviceGet_fn`,
+//! or `cuCtxCreate_fn` slots here on purpose — encode never resolves them.
 
 const std = @import("std");
 
@@ -21,9 +29,6 @@ pub const CUDA_SUCCESS: CUresult = 0;
 // nvcuda.dll handle — populated by module_loader.init().
 pub var lib: ?*anyopaque = null;
 
-pub const FnInit = *const fn (c_uint) callconv(.c) CUresult;
-pub const FnDeviceGet = *const fn (*CUdevice, c_int) callconv(.c) CUresult;
-pub const FnCtxCreate = *const fn (*usize, c_uint, CUdevice) callconv(.c) CUresult;
 pub const FnModuleLoadData = *const fn (*usize, [*]const u8) callconv(.c) CUresult;
 pub const FnModuleGetFunction = *const fn (*usize, usize, [*:0]const u8) callconv(.c) CUresult;
 pub const FnMemAlloc = *const fn (*CUdeviceptr, usize) callconv(.c) CUresult;
@@ -35,9 +40,6 @@ pub const FnLaunchKernel = *const fn (usize, c_uint, c_uint, c_uint, c_uint, c_u
 pub const FnCtxSync = *const fn () callconv(.c) CUresult;
 pub const FnMemsetD8 = *const fn (CUdeviceptr, u8, usize) callconv(.c) CUresult;
 
-pub var cuInit_fn: ?FnInit = null;
-pub var cuDeviceGet_fn: ?FnDeviceGet = null;
-pub var cuCtxCreate_fn: ?FnCtxCreate = null;
 pub var cuModuleLoadData_fn: ?FnModuleLoadData = null;
 pub var cuModuleGetFunction_fn: ?FnModuleGetFunction = null;
 pub var cuMemAlloc_fn: ?FnMemAlloc = null;
