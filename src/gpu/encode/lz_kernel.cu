@@ -31,10 +31,10 @@
 #include "lz_chain_parser.cuh"
 
 // ── Output framing constants ────────────────────────────────────
+// OFF32_COUNT_FIELD_BITS / OFF32_COUNT_PACK_MAX come from
+// ../common/gpu_wire_format.cuh (transitively via lz_format.cuh).
 static constexpr uint32_t STREAM_HEADER_BYTES = 3;  // 3-byte big-endian sub-stream count header
 static constexpr uint32_t OFF16_HEADER_BYTES  = 2;  // 2-byte off16 count header
-static constexpr uint32_t OFF32_COUNT_FIELD_BITS = 12;  // packed off32-count field width
-static constexpr uint32_t OFF32_COUNT_PACK_MAX = (1u << OFF32_COUNT_FIELD_BITS) - 1;  // 4095; overflow spills to a 2-byte extension
 
 // ── slzLzEncodeKernel ───────────────────────────────────────────
 // LZ encode kernel entry point. One block per chunk, one warp (32
@@ -56,10 +56,10 @@ static constexpr uint32_t OFF32_COUNT_PACK_MAX = (1u << OFF32_COUNT_FIELD_BITS) 
 //
 // Output layout written by lane 0 (consumed by driver.zig and the
 // decode kernels — this is a format contract):
-//   [INITIAL_COPY verbatim bytes]   (only if desc.is_first)
+//   [INITIAL_LITERAL_COPY_BYTES verbatim bytes]   (only if desc.is_first)
 //   [3-byte BE lit_count][literals]
 //   [3-byte BE token_count][tokens]
-//   [2-byte LE cmd_stream2_offset]  (only if src_size > BLOCK1_SIZE)
+//   [2-byte LE cmd_stream2_offset]  (only if src_size > LZ_BLOCK_SIZE)
 //   [2-byte LE off16_count][off16 stream]
 //   [3-byte packed off32 block-1/2 counts]
 //   [2-byte LE block-1 off32 ext]   (only if count >= OFF32_COUNT_PACK_MAX)
@@ -94,7 +94,7 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
     const uint32_t src_size = desc.src_size;
 
     uint8_t* dst = output + desc.dst_offset;
-    const uint32_t lit_data_start = (desc.is_first ? INITIAL_COPY : 0) + STREAM_HEADER_BYTES;
+    const uint32_t lit_data_start = (desc.is_first ? INITIAL_LITERAL_COPY_BYTES : 0) + STREAM_HEADER_BYTES;
 
     // Sub-stream working buffers carved out of dst. The /4 and /2
     // divisors size each region for its worst case relative to src_size.
@@ -113,7 +113,7 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
 
     uint32_t off32_count_block1 = 0, off32_count_block2 = 0;
     uint32_t cmd_stream2_offset = 0;
-    uint32_t anchor = desc.is_first ? INITIAL_COPY : 0;
+    uint32_t anchor = desc.is_first ? INITIAL_LITERAL_COPY_BYTES : 0;
     int32_t recent_offset = -8;
 
     if (use_chain) {
@@ -136,7 +136,7 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
 
         // ── Block 1 pass ────
         {
-            uint32_t block1_end = (src_size < BLOCK1_SIZE) ? src_size : BLOCK1_SIZE;
+            uint32_t block1_end = (src_size < LZ_BLOCK_SIZE) ? src_size : LZ_BLOCK_SIZE;
             scanBlockChain(src, src_size,
                            chain_first_hash, chain_long_hash, chain_next_hash,
                            hash_bits, hash_mask,
@@ -148,15 +148,15 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
         }
 
         // ── Block 2 pass ────
-        if (src_size > BLOCK1_SIZE) {
+        if (src_size > LZ_BLOCK_SIZE) {
             cmd_stream2_offset = streams.token_count;
-            uint32_t block2_start_pos = (anchor > BLOCK1_SIZE) ? anchor : BLOCK1_SIZE;
+            uint32_t block2_start_pos = (anchor > LZ_BLOCK_SIZE) ? anchor : LZ_BLOCK_SIZE;
             scanBlockChain(src, src_size,
                            chain_first_hash, chain_long_hash, chain_next_hash,
                            hash_bits, hash_mask,
                            streams,
                            anchor, recent_offset,
-                           block2_start_pos, src_size, /*block2_start=*/BLOCK1_SIZE);
+                           block2_start_pos, src_size, /*block2_start=*/LZ_BLOCK_SIZE);
             off32_count_block2 = streams.off32_count;
         }
     } else {
@@ -173,7 +173,7 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
 
         // ── Block 1 pass ────
         {
-            uint32_t block1_end = (src_size < BLOCK1_SIZE) ? src_size : BLOCK1_SIZE;
+            uint32_t block1_end = (src_size < LZ_BLOCK_SIZE) ? src_size : LZ_BLOCK_SIZE;
             scanBlock(src, src_size, ht, hash_bits, hash_mask,
                       streams,
                       anchor, recent_offset,
@@ -183,13 +183,13 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
         }
 
         // ── Block 2 pass ────
-        if (src_size > BLOCK1_SIZE) {
+        if (src_size > LZ_BLOCK_SIZE) {
             cmd_stream2_offset = streams.token_count;
-            uint32_t block2_start_pos = (anchor > BLOCK1_SIZE) ? anchor : BLOCK1_SIZE;
+            uint32_t block2_start_pos = (anchor > LZ_BLOCK_SIZE) ? anchor : LZ_BLOCK_SIZE;
             scanBlock(src, src_size, ht, hash_bits, hash_mask,
                       streams,
                       anchor, recent_offset,
-                      block2_start_pos, src_size, /*block2_start=*/BLOCK1_SIZE, l4_features);
+                      block2_start_pos, src_size, /*block2_start=*/LZ_BLOCK_SIZE, l4_features);
             off32_count_block2 = streams.off32_count;
         }
     }
@@ -199,8 +199,8 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
     if (lane == 0) {
         uint32_t out_pos = 0;
         if (desc.is_first) {
-            memcpy(dst, src, INITIAL_COPY);
-            out_pos = INITIAL_COPY;
+            memcpy(dst, src, INITIAL_LITERAL_COPY_BYTES);
+            out_pos = INITIAL_LITERAL_COPY_BYTES;
         }
 
         dst[out_pos] = (uint8_t)((streams.lit_count >> 16) & 0xFF);
@@ -215,7 +215,7 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
         memcpy(dst + out_pos, streams.token_buf, streams.token_count);
         out_pos += streams.token_count;
 
-        if (src_size > BLOCK1_SIZE) {
+        if (src_size > LZ_BLOCK_SIZE) {
             uint16_t cs2o = (cmd_stream2_offset > 0)
                 ? (uint16_t)cmd_stream2_offset : (uint16_t)streams.token_count;
             storeU16LE(dst + out_pos, cs2o);

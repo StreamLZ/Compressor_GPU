@@ -7,16 +7,18 @@
 #pragma once
 
 #include <cstdint>
-#include "../common/gpu_warp.cuh"     // WARP_SIZE, LANE_MASK, U32_BITS, U64_BITS, BITS_PER_BYTE
-#include "../common/gpu_byteio.cuh"   // read8safe
+#include "../common/gpu_warp.cuh"          // WARP_SIZE, LANE_MASK, U32_BITS, U64_BITS, BITS_PER_BYTE
+#include "../common/gpu_byteio.cuh"        // read8safe
+#include "../common/gpu_wire_format.cuh"   // LZ_BLOCK_SIZE, INITIAL_LITERAL_COPY_BYTES, OFF32_LONG_ENTRY_TAG, ...
 
 // ── Match / format constants ────────────────────────────────────
-static constexpr uint32_t MIN_MATCH    = 4;       // shortest LZ match
-static constexpr uint32_t INITIAL_COPY = 8;       // verbatim prefix on the first chunk
-static constexpr uint32_t HASH_EMPTY   = 0xFFFFFFFFu;  // empty greedy hash-table slot
-static constexpr uint32_t BLOCK1_SIZE  = 0x10000u;     // 64KB block boundary
-static constexpr uint32_t CHAIN_MAX_STEPS = 8;    // chain-parser walk depth
-static constexpr uint32_t NEXT_HASH_SIZE  = 65536;  // 2^16 entries of uint16_t (matches CPU c_bits=16)
+// LZ_BLOCK_SIZE (the 64KB block boundary) and INITIAL_LITERAL_COPY_BYTES
+// (the 8-byte verbatim prefix on the first chunk) come from
+// ../common/gpu_wire_format.cuh — the encode/decode-shared contract.
+static constexpr uint32_t MIN_MATCH        = 4;            // shortest LZ match
+static constexpr uint32_t HASH_EMPTY       = 0xFFFFFFFFu;  // empty greedy hash-table slot
+static constexpr uint32_t CHAIN_MAX_STEPS  = 8;            // chain-parser walk depth
+static constexpr uint32_t NEXT_HASH_SIZE   = 65536;        // 2^16 entries of uint16_t (matches CPU c_bits=16)
 
 // Warp layout: the kernel runs exactly one warp per chunk. The warp /
 // bit-width constants (WARP_SIZE, LANE_MASK, U32_BITS, U64_BITS,

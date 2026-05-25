@@ -106,8 +106,8 @@ __device__ void parseAndDecodeSubChunkRaw(
         if (tmp != 0) {
             off32_count1 = tmp >> OFF32_COUNT1_SHIFT;
             off32_count2 = tmp & OFF32_COUNT2_MASK;
-            if (off32_count1 == OFF32_COUNT_ESCAPE) { uint16_t v; memcpy(&v, src, 2); off32_count1 = v; src += 2; }
-            if (off32_count2 == OFF32_COUNT_ESCAPE) { uint16_t v; memcpy(&v, src, 2); off32_count2 = v; src += 2; }
+            if (off32_count1 == OFF32_COUNT_PACK_MAX) { uint16_t v; memcpy(&v, src, 2); off32_count1 = v; src += 2; }
+            if (off32_count2 == OFF32_COUNT_PACK_MAX) { uint16_t v; memcpy(&v, src, 2); off32_count2 = v; src += 2; }
             off32_raw1 = src;
             src += off32_count1 * OFF32_ENTRY_BYTES;
             off32_raw2 = src;
@@ -1003,7 +1003,7 @@ extern "C" __global__ void slzScanParseKernel(
 
         if (chunk_len < 3) break;
         const uint32_t sub_hdr = scanReadU24BE(chunk_src + sub_pos);
-        if ((sub_hdr & 0x800000u) == 0) break;
+        if ((sub_hdr & SUBCHUNK_LZ_FLAG_BIT) == 0) break;
         const uint32_t sc_comp = sub_hdr & 0x7FFFFu;
         const uint32_t sub_end = sub_pos + 3 + sc_comp;
         if (sub_end > chunk_len) break;

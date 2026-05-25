@@ -19,17 +19,19 @@
 // length stream are copied verbatim from the raw payload.
 
 #include <cstdint>
-#include "../common/gpu_warp.cuh"     // WARP_SIZE, laneId()
-#include "../common/gpu_byteio.cuh"   // (kept for parity with sibling kernels)
+#include "../common/gpu_warp.cuh"          // WARP_SIZE, laneId()
+#include "../common/gpu_byteio.cuh"        // (kept for parity with sibling kernels)
+#include "../common/gpu_wire_format.cuh"   // LZ_BLOCK_SIZE, HUFF_CHUNK_TYPE, OFF16_ENTROPY_MARKER,
+                                           // OFF32_COUNT_PACK_MAX, OFF32_LONG_ENTRY_TAG,
+                                           // SUBCHUNK_LZ_FLAG_BIT, SUBCHUNK_MODE_SHIFT, SUBCHUNK_HDR_BYTES
 
-// ── Wire-format constants ───────────────────────────────────────────
-static constexpr uint32_t SUBCHUNK_64K          = 0x10000;   // cmd2 present above this
-static constexpr int      RAW_CHUNK_HDR_BYTES   = 3;         // type-0 [u24 BE size]
-static constexpr int      HUFF_CHUNK_HDR_BYTES  = 5;         // type-4 non-compact header
-static constexpr int      OFF16_ENTROPY_MIN     = 32;        // entropy-code off16 at/above
-static constexpr uint16_t OFF16_ENTROPY_MARKER  = 0xFFFF;    // fast_constants.entropy_coded_16_marker
-static constexpr int      HUFF_CHUNK_TYPE       = 4;
-static constexpr uint8_t  OFF32_LONG_ENTRY_TAG  = 0xC0;      // raw[scan+2] >= this → 4-byte entry
+// ── Wire-format constants (assembler-private) ───────────────────────
+// LZ_BLOCK_SIZE, HUFF_CHUNK_TYPE, OFF16_ENTROPY_MARKER, OFF32_COUNT_PACK_MAX,
+// OFF32_LONG_ENTRY_TAG, and the SUBCHUNK_* family come from
+// ../common/gpu_wire_format.cuh — the encode/decode-shared contract.
+static constexpr int      RAW_CHUNK_HDR_BYTES   = 3;   // type-0 [u24 BE size]
+static constexpr int      HUFF_CHUNK_HDR_BYTES  = 5;   // type-4 non-compact header
+static constexpr int      OFF16_ENTROPY_MIN     = 32;  // entropy-code off16 at/above this count
 
 // ── Per-sub-chunk descriptor — mirrors Zig AssembleDesc in driver.zig ─
 // Offsets are byte offsets into the corresponding device base buffer.
@@ -83,7 +85,7 @@ __device__ static RawStreams parseRaw(const uint8_t* raw, uint32_t raw_size,
     if (rp + s.tok_count > raw_size) return s;
     s.tok = raw + rp; rp += s.tok_count;
 
-    s.cmd2_present = (sub_decomp_size > SUBCHUNK_64K);
+    s.cmd2_present = (sub_decomp_size > LZ_BLOCK_SIZE);
     if (s.cmd2_present) {
         if (rp + 2 > raw_size) return s;
         s.cmd2 = raw + rp; rp += 2;
@@ -106,12 +108,12 @@ __device__ static RawStreams parseRaw(const uint8_t* raw, uint32_t raw_size,
     uint32_t c1 = (packed >> 12) & 0xFFF;
     uint32_t c2 = packed & 0xFFF;
     uint32_t hdr_plus_extra = 3;
-    if (c1 >= 4095) {
+    if (c1 >= OFF32_COUNT_PACK_MAX) {
         if (rp + 2 > raw_size) return s;
         c1 = (uint32_t)raw[rp] | ((uint32_t)raw[rp + 1] << 8);
         rp += 2; hdr_plus_extra += 2;
     }
-    if (c2 >= 4095) {
+    if (c2 >= OFF32_COUNT_PACK_MAX) {
         if (rp + 2 > raw_size) return s;
         c2 = (uint32_t)raw[rp] | ((uint32_t)raw[rp + 1] << 8);
         rp += 2; hdr_plus_extra += 2;
@@ -348,12 +350,14 @@ extern "C" __global__ void slzAssembleWriteKernel(
     const AssembleDesc desc = descs[i];
 
     uint8_t* hdr = d_frame + desc.out_offset;
-    uint8_t* payload = hdr + 3;
+    uint8_t* payload = hdr + SUBCHUNK_HDR_BYTES;
     const uint32_t enc_n = assembleSubChunk(d_raw, d_huff_lit, d_huff_tok,
                                             d_huff_off16, desc, payload, lane);
-    // 3-byte BE sub-chunk header: enc_n | (1<<19) | compressed-flag.
+    // 3-byte BE sub-chunk header: comp_size | (mode << SUBCHUNK_MODE_SHIFT)
+    //                                       | SUBCHUNK_LZ_FLAG_BIT.
+    // mode=1 here selects the LZ-with-entropy decoder path.
     if (lane == 0) {
-        const uint32_t sc_hdr = enc_n | (1u << 19) | 0x800000u;
+        const uint32_t sc_hdr = enc_n | (1u << SUBCHUNK_MODE_SHIFT) | SUBCHUNK_LZ_FLAG_BIT;
         hdr[0] = (uint8_t)((sc_hdr >> 16) & 0xFF);
         hdr[1] = (uint8_t)((sc_hdr >> 8) & 0xFF);
         hdr[2] = (uint8_t)(sc_hdr & 0xFF);

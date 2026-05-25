@@ -61,7 +61,7 @@ __device__ bool isBetterThanRecentMatch(int32_t recent_match_length, int32_t mat
     return recent_match_length < RECENT_MATCH_MIN ||
         (recent_match_length + RECENT_LEN_MARGIN < match_length &&
          (recent_match_length + RECENT_LEN_MARGIN_FAR < match_length ||
-          match_offset < (int32_t)(NEAR_OFFSET_MAX + 1)));
+          match_offset <= (int32_t)NEAR_OFFSET_MAX));
 }
 
 // ── findMatchChain ──────────────────────────────────────────────
@@ -148,7 +148,7 @@ __device__ ChainMatch findMatchChain(
             if (candidate_offset != 0) {
                 uint32_t chain_steps = CHAIN_MAX_STEPS;
                 uint32_t hash_value = head;
-                while (candidate_offset < BLOCK1_SIZE) {  // stays within 64KB block
+                while (candidate_offset < LZ_BLOCK_SIZE) {  // stays within 64KB block
                     if (candidate_offset > MIN_HASH_MATCH_OFFSET) {
                         if (candidate_offset <= pos) {
                             uint32_t ref = pos - candidate_offset;
@@ -190,7 +190,7 @@ __device__ ChainMatch findMatchChain(
                     if (candidate_offset <= previous_offset) break;
                 }
             }
-        } else if (candidate_offset <= pos && candidate_offset < BLOCK1_SIZE) {
+        } else if (candidate_offset <= pos && candidate_offset < LZ_BLOCK_SIZE) {
             // Far first-hash hit (> NEAR_OFFSET_MAX but within dictionary)
             uint32_t ref = pos - candidate_offset;
             uint32_t ref_word = (uint32_t)src[ref]

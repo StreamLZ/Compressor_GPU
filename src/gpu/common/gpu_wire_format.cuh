@@ -1,0 +1,66 @@
+// ── StreamLZ GPU — shared LZ wire-format constants ──────────────────
+// The contract between encode-side (lz_kernel.cu, assemble_kernel.cu)
+// and decode-side (lz_kernel.cu, huffman_kernel.cu) kernels. Anything
+// that the encoder writes and the decoder reads (or vice versa) lives
+// here so the two paths cannot drift.
+//
+// Pure header: #pragma once, constants only, no kernels, no host code.
+// Decoder-private helpers (parsers, descriptor structs) stay in
+// decode/slz_wire_format.cuh; encoder-private hash constants stay in
+// encode/lz_format.cuh.
+#pragma once
+
+#include <cstdint>
+
+// ── Block geometry ──────────────────────────────────────────────────
+// LZ matches and literal runs never cross a 64KB block boundary; off32
+// offsets reset, and per-block trailing literals flush at each multiple
+// of LZ_BLOCK_SIZE. A single sub-chunk decodes into at most
+// MAX_BLOCKS_PER_SUBCHUNK such blocks (i.e. up to 128KB).
+static constexpr uint32_t LZ_BLOCK_SIZE              = 0x10000u; // 64KB
+static constexpr int      MAX_BLOCKS_PER_SUBCHUNK    = 2;
+
+// First 8 bytes of the frame's first sub-chunk are raw literals copied
+// straight to the output. INITIAL_RECENT_OFFSET is the matching seed
+// value for `recent_offset` so the first token can use it.
+static constexpr uint32_t INITIAL_LITERAL_COPY_BYTES = 8;
+static constexpr int32_t  INITIAL_RECENT_OFFSET      = -8;
+
+// ── Chunk types (chunk_header byte high nibble >> CHUNK_TYPE_SHIFT) ──
+// On GPU we only emit raw (0) and Huffman (4); tANS (1, 6) and paired
+// (5, 7) types were retired with the GPU tANS encoder.
+static constexpr uint32_t CHUNK_TYPE_SHIFT      = 4;
+static constexpr uint32_t CHUNK_TYPE_MASK       = 7;
+static constexpr uint8_t  RAW_CHUNK_TYPE        = 0;
+static constexpr uint8_t  HUFF_CHUNK_TYPE       = 4;
+
+// ── Sub-chunk header (3-byte big-endian) ────────────────────────────
+// Bit 23      : LZ-compressed (set by encoder, gates LZ decode path)
+// Bits 22..19 : decode mode (4 bits, identifies entropy form)
+// Bits 18..0  : compressed size (19 bits = up to 512KB)
+static constexpr uint32_t SUBCHUNK_HDR_BYTES        = 3;
+static constexpr uint32_t SUBCHUNK_LZ_FLAG_BIT      = 0x800000u;
+static constexpr uint32_t SUBCHUNK_MODE_SHIFT       = 19;
+static constexpr uint32_t SUBCHUNK_MODE_MASK        = 0xFu;
+static constexpr uint32_t SUBCHUNK_COMP_SIZE_MASK   = 0x7FFFFu;
+
+// ── Off16 stream — entropy-coded marker ─────────────────────────────
+// A leading count of OFF16_ENTROPY_MARKER tells the parser the off16
+// stream is split into hi/lo halves (each its own entropy chunk).
+static constexpr uint32_t OFF16_ENTROPY_MARKER      = 0xFFFFu;
+
+// ── Off32 stream — packed count header ──────────────────────────────
+// The 3-byte off32 header packs two 12-bit counts (block-0 in the high
+// 12 bits, block-1 in the low 12 bits). A count field of
+// OFF32_COUNT_PACK_MAX (= 4095) escapes to a following u16 carrying the
+// real count.
+static constexpr uint32_t OFF32_COUNT_FIELD_BITS    = 12;
+static constexpr uint32_t OFF32_COUNT_PACK_MAX      = (1u << OFF32_COUNT_FIELD_BITS) - 1; // 4095
+
+// Off32 entries are 3-byte triples by default. The "long-entry" tag byte
+// (high byte of the third byte, value ≥ OFF32_LONG_ENTRY_TAG) flags a
+// 4-byte entry carrying an extended 22-bit offset. The relationship to
+// the encode-side mask is:
+//   OFF32_LONG_ENTRY_TAG == (OFF32_LARGE_TAG >> 16)
+// where OFF32_LARGE_TAG lives in encode/lz_format.cuh.
+static constexpr uint8_t  OFF32_LONG_ENTRY_TAG      = 0xC0;
