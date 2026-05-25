@@ -70,9 +70,9 @@ pub fn gpuEncodeHuffImpl(
     if (out_dev == 0 and !ec.ensureBuf(&self.d_huff_out_persist, &self.d_huff_out_size, total_dst_bytes)) return false;
     if (!ec.ensureBuf(&self.d_huff_sizes_persist, &self.d_huff_sizes_size, sizes_bytes)) return false;
 
-    _ = h2d_fn(self.d_huff_descs_persist, @ptrCast(descs.ptr), desc_bytes);
-    _ = memset_fn(self.d_huff_sizes_persist, 0, sizes_bytes);
-    _ = sync_fn();
+    if (h2d_fn(self.d_huff_descs_persist, @ptrCast(descs.ptr), desc_bytes) != ffi.CUDA_SUCCESS) return false;
+    if (memset_fn(self.d_huff_sizes_persist, 0, sizes_bytes) != ffi.CUDA_SUCCESS) return false;
+    if (sync_fn() != ffi.CUDA_SUCCESS) return false;
 
     // Kernel 1: build per-block Huffman tables from the source streams.
     var p_src = self.d_output_persist;
@@ -109,10 +109,11 @@ pub fn gpuEncodeHuffImpl(
     gpu_decode.endKernelTiming(t_henc, 0);
     if (sync_fn() != ffi.CUDA_SUCCESS) return false;
 
-    _ = d2h_fn(@ptrCast(out_sizes.ptr), self.d_huff_sizes_persist, sizes_bytes);
+    if (d2h_fn(@ptrCast(out_sizes.ptr), self.d_huff_sizes_persist, sizes_bytes) != ffi.CUDA_SUCCESS) return false;
     // Device-resident mode leaves the bodies on the GPU — only the small
     // sizes array comes back. Else download the full body buffer.
-    if (out_dev == 0) _ = d2h_fn(@ptrCast(out_bytes.ptr), self.d_huff_out_persist, total_dst_bytes);
+    if (out_dev == 0)
+        if (d2h_fn(@ptrCast(out_bytes.ptr), self.d_huff_out_persist, total_dst_bytes) != ffi.CUDA_SUCCESS) return false;
     return true;
 }
 

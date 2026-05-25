@@ -70,16 +70,17 @@ pub fn gpuCompressImpl(
     // H2D from the host `input` slice.
     if (self.d_input_override != 0) {
         if (ffi.cuMemcpyDtoDAsync_fn) |d2d| {
-            _ = d2d(d_input, self.d_input_override, input.len, 0);
+            if (d2d(d_input, self.d_input_override, input.len, 0) != ffi.CUDA_SUCCESS) return false;
         } else {
-            _ = h2d_fn(d_input, @ptrCast(input.ptr), input.len);
+            if (h2d_fn(d_input, @ptrCast(input.ptr), input.len) != ffi.CUDA_SUCCESS) return false;
         }
     } else {
-        _ = h2d_fn(d_input, @ptrCast(input.ptr), input.len);
+        if (h2d_fn(d_input, @ptrCast(input.ptr), input.len) != ffi.CUDA_SUCCESS) return false;
     }
-    _ = h2d_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes);
-    if (ffi.cuMemsetD8_fn) |memset_fn| _ = memset_fn(d_sizes, 0, sizes_bytes);
-    _ = sync_fn();
+    if (h2d_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes) != ffi.CUDA_SUCCESS) return false;
+    if (ffi.cuMemsetD8_fn) |memset_fn|
+        if (memset_fn(d_sizes, 0, sizes_bytes) != ffi.CUDA_SUCCESS) return false;
+    if (sync_fn() != ffi.CUDA_SUCCESS) return false;
 
     const t_before = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
 
@@ -127,13 +128,13 @@ pub fn gpuCompressImpl(
     }
 
     // Download comp_sizes first, then only the actual compressed bytes per block
-    _ = d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes);
+    if (d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes) != ffi.CUDA_SUCCESS) return false;
 
     for (0..chunk_descs.len) |i| {
         const cs = comp_sizes_out[i];
         if (cs > 0) {
             const dst_off = chunk_descs[i].dst_offset;
-            _ = d2h_fn(@ptrCast(output.ptr + dst_off), d_output + dst_off, cs);
+            if (d2h_fn(@ptrCast(output.ptr + dst_off), d_output + dst_off, cs) != ffi.CUDA_SUCCESS) return false;
         }
     }
 

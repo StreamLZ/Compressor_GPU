@@ -84,8 +84,8 @@ pub fn gpuAssembleFrameImpl(
     const sizes_bytes: usize = @as(usize, n) * 4;
     if (!ec.ensureBuf(&self.d_asm_descs, &self.d_asm_descs_size, desc_bytes)) return false;
     if (!ec.ensureBuf(&self.d_asm_sizes, &self.d_asm_sizes_size, sizes_bytes)) return false;
-    _ = h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes);
-    _ = sync();
+    if (h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes) != ffi.CUDA_SUCCESS) return false;
+    if (sync() != ffi.CUDA_SUCCESS) return false;
 
     var p_raw = self.d_output_persist;
     var p_hl = self.d_asm_huff_lit;
@@ -109,7 +109,7 @@ pub fn gpuAssembleFrameImpl(
 
     const enc_sizes = allocator.alloc(u32, n) catch return false;
     defer allocator.free(enc_sizes);
-    _ = d2h(@ptrCast(enc_sizes.ptr), self.d_asm_sizes, sizes_bytes);
+    if (d2h(@ptrCast(enc_sizes.ptr), self.d_asm_sizes, sizes_bytes) != ffi.CUDA_SUCCESS) return false;
 
     // Prefix-sum: each sub-chunk block is 3 (header) + enc_n bytes.
     var total: u32 = 0;
@@ -120,7 +120,7 @@ pub fn gpuAssembleFrameImpl(
     }
 
     // Pass 2 — write [3-byte header][payload] for every sub-chunk.
-    _ = h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes);
+    if (h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes) != ffi.CUDA_SUCCESS) return false;
     if (!ec.ensureBuf(&self.d_asm_out, &self.d_asm_out_size, @max(total, 1))) return false;
     var p_out = self.d_asm_out;
     var w_params = [_]?*anyopaque{
@@ -144,7 +144,12 @@ pub fn gpuAssembleFrameImpl(
         allocator.free(off);
         return false;
     };
-    _ = d2h(@ptrCast(assembled.ptr), self.d_asm_out, total);
+    if (d2h(@ptrCast(assembled.ptr), self.d_asm_out, total) != ffi.CUDA_SUCCESS) {
+        allocator.free(assembled);
+        allocator.free(off);
+        allocator.free(sz);
+        return false;
+    }
     for (0..n) |i| {
         off[i] = descs[i].out_offset;
         sz[i] = 3 + enc_sizes[i];
@@ -217,10 +222,10 @@ pub fn gpuFrameAssembleImpl(
     if (!ec.ensureBuf(&self.d_frame_asm_chunk_sz, &self.d_frame_asm_chunk_sz_size, ent_bytes)) return null;
     if (!ec.ensureBuf(&self.d_frame_prefix_bytes, &self.d_frame_prefix_bytes_size, prefix_bytes.len)) return null;
 
-    _ = h2d(self.d_frame_chunk_dst, @ptrCast(per_chunk_dst_buf.ptr), ent_bytes);
-    _ = h2d(self.d_frame_asm_offsets, @ptrCast(per_chunk_asm_off.ptr), ent_bytes);
-    _ = h2d(self.d_frame_asm_chunk_sz, @ptrCast(per_chunk_asm_size.ptr), ent_bytes);
-    _ = h2d(self.d_frame_prefix_bytes, @ptrCast(prefix_bytes.ptr), prefix_bytes.len);
+    if (h2d(self.d_frame_chunk_dst, @ptrCast(per_chunk_dst_buf.ptr), ent_bytes) != ffi.CUDA_SUCCESS) return null;
+    if (h2d(self.d_frame_asm_offsets, @ptrCast(per_chunk_asm_off.ptr), ent_bytes) != ffi.CUDA_SUCCESS) return null;
+    if (h2d(self.d_frame_asm_chunk_sz, @ptrCast(per_chunk_asm_size.ptr), ent_bytes) != ffi.CUDA_SUCCESS) return null;
+    if (h2d(self.d_frame_prefix_bytes, @ptrCast(prefix_bytes.ptr), prefix_bytes.len) != ffi.CUDA_SUCCESS) return null;
 
     var k_input = d_input_dev;
     var k_asm_out = self.d_asm_out;

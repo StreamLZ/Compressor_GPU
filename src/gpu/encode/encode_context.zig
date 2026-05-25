@@ -158,11 +158,18 @@ pub const EncodeContext = struct {
     // operation writes its downloaded host-side payloads here; the frame
     // assembler reads them back. Moved into the context so the compress
     // path is reentrant per handle.
+    // OWNERSHIP RULE: huff_off16hi_data and huff_off16lo_data share
+    // one allocation (a flat byte buffer indexed by hi_offsets and
+    // lo_offsets respectively). `huff_off16hi_data` is the owner;
+    // `huff_off16lo_data` is a non-owning alias of the SAME slice. The
+    // only legal free is `allocator.free(huff_off16hi_data); set both
+    // to null` (see fast_framed.zig). Anyone introducing a new free
+    // site must honor that rule or the alias double-frees.
     huff_off16hi_sizes: ?[]u32 = null,
-    huff_off16hi_data: ?[]u8 = null,
+    huff_off16hi_data: ?[]u8 = null, // OWNS the shared buffer
     huff_off16hi_offsets: ?[]u32 = null,
     huff_off16lo_sizes: ?[]u32 = null,
-    huff_off16lo_data: ?[]u8 = null,
+    huff_off16lo_data: ?[]u8 = null, // NON-OWNING alias of huff_off16hi_data
     huff_off16lo_offsets: ?[]u32 = null,
 
     huff_lit_sizes: ?[]u32 = null,

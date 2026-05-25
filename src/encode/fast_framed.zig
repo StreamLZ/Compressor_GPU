@@ -1218,7 +1218,13 @@ pub fn compressFramedOne(
             else
                 false;
         defer if (gpu_off16_huff_encoded) {
-            // hi_data and lo_data share the same backing buffer; free once.
+            // hi_data OWNS the shared buffer; lo_data is a non-owning
+            // alias (see EncodeContext field-level OWNERSHIP RULE).
+            // Assert the alias contract so a future code path that
+            // hands lo_data its own allocation trips here instead of
+            // silently double-freeing.
+            if (enc_ctx.huff_off16hi_data) |hi| if (enc_ctx.huff_off16lo_data) |lo|
+                std.debug.assert(hi.ptr == lo.ptr);
             if (enc_ctx.huff_off16hi_sizes) |s| allocator.free(s);
             if (enc_ctx.huff_off16lo_sizes) |s| allocator.free(s);
             if (enc_ctx.huff_off16hi_offsets) |o| allocator.free(o);
