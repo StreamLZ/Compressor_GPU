@@ -1166,56 +1166,10 @@ pub fn compressFramedOne(
         if (!gpu_enc.gpuCompressImpl(enc_ctx, effective_src, gpu_out, descs, comp_sizes, io, opts.level))
             break :gpu_compress;
 
-        // lit/tok/off16 are Huffman-coded on the GPU (chunk_type=4). The
-        // GPU tANS passes are retired — kept false so the tANS branches
-        // below are dead and can be removed.
+        // lit/tok/off16 are Huffman-coded on the GPU (chunk_type=4).
+        // GPU tANS encode was retired 2026-05-21; all entropy coding
+        // for GPU paths runs through the Huffman pipeline below.
         const slz_gpu_huff = true;
-
-        // ── GPU 32-lane tANS encode of TOKEN + off16 streams ────
-        // For L3+ only (matches the reencode entropy gate). Populates
-        // enc_ctx.tans32_tok_* and enc_ctx.tans32_off16{hi,lo}_*.
-        const gpu_tok_pre_encoded: bool = if (opts.level >= 3 and !slz_gpu_huff)
-            gpu_enc.gpuEncodeTokensTans32Impl(enc_ctx, allocator, gpu_out, descs, comp_sizes)
-        else
-            false;
-        defer if (gpu_tok_pre_encoded) {
-            if (enc_ctx.tans32_tok_sizes) |s| allocator.free(s);
-            if (enc_ctx.tans32_tok_data) |d| allocator.free(d);
-            if (enc_ctx.tans32_tok_offsets) |o| allocator.free(o);
-            enc_ctx.tans32_tok_sizes = null;
-            enc_ctx.tans32_tok_data = null;
-            enc_ctx.tans32_tok_offsets = null;
-        };
-        const gpu_lit_pre_encoded: bool = if (opts.level >= 3 and !slz_gpu_huff)
-            gpu_enc.gpuEncodeLiteralsTans32Impl(enc_ctx, allocator, gpu_out, descs, comp_sizes)
-        else
-            false;
-        defer if (gpu_lit_pre_encoded) {
-            if (enc_ctx.tans32_lit_sizes) |s| allocator.free(s);
-            if (enc_ctx.tans32_lit_data) |d| allocator.free(d);
-            if (enc_ctx.tans32_lit_offsets) |o| allocator.free(o);
-            enc_ctx.tans32_lit_sizes = null;
-            enc_ctx.tans32_lit_data = null;
-            enc_ctx.tans32_lit_offsets = null;
-        };
-        const gpu_off16_pre_encoded: bool = if (opts.level >= 3 and !slz_gpu_huff)
-            gpu_enc.gpuEncodeOff16Tans32Impl(enc_ctx, allocator, gpu_out, descs, comp_sizes)
-        else
-            false;
-        defer if (gpu_off16_pre_encoded) {
-            // hi_data and lo_data share the same backing buffer; free once.
-            if (enc_ctx.tans32_off16hi_sizes) |s| allocator.free(s);
-            if (enc_ctx.tans32_off16lo_sizes) |s| allocator.free(s);
-            if (enc_ctx.tans32_off16hi_offsets) |o| allocator.free(o);
-            if (enc_ctx.tans32_off16lo_offsets) |o| allocator.free(o);
-            if (enc_ctx.tans32_off16hi_data) |d| allocator.free(d);
-            enc_ctx.tans32_off16hi_sizes = null;
-            enc_ctx.tans32_off16hi_data = null;
-            enc_ctx.tans32_off16hi_offsets = null;
-            enc_ctx.tans32_off16lo_sizes = null;
-            enc_ctx.tans32_off16lo_data = null;
-            enc_ctx.tans32_off16lo_offsets = null;
-        };
 
         // 4d device-resident compress: when SLZ_GPU_ASSEMBLE is set the
         // three GPU Huffman passes keep their bodies device-resident
@@ -1579,61 +1533,13 @@ pub fn compressFramedOne(
                         if (off16hi_ov == .primary) enc_buf_sz += off16hi_ov.primary.combined_stream.len;
                         const enc_buf = allocator.alloc(u8, enc_buf_sz) catch break :blk_reencode false;
                         defer allocator.free(enc_buf);
-                        // GPU-pre-encoded literals (32-lane tANS) — body only.
-                        const gpu_lit_pre: ?[]const u8 = blk_gpu_lit: {
-                            if (!gpu_lit_pre_encoded) break :blk_gpu_lit null;
-                            const sizes = enc_ctx.tans32_lit_sizes orelse break :blk_gpu_lit null;
-                            const data = enc_ctx.tans32_lit_data orelse break :blk_gpu_lit null;
-                            const offs = enc_ctx.tans32_lit_offsets orelse break :blk_gpu_lit null;
-                            if (gpu_bi_idx >= sizes.len) break :blk_gpu_lit null;
-                            const sz = sizes[gpu_bi_idx];
-                            if ((sz & 0x80000000) != 0) break :blk_gpu_lit null;
-                            if (sz == 0) break :blk_gpu_lit null;
-                            const off = offs[gpu_bi_idx];
-                            if (off + sz > data.len) break :blk_gpu_lit null;
-                            break :blk_gpu_lit data[off..][0..sz];
-                        };
-                        // GPU-pre-encoded tokens (32-lane tANS) — body only.
-                        // sizes[gpu_bi_idx] MSB set → raw fallback (skip).
-                        const gpu_tok_pre: ?[]const u8 = blk_gpu_tok: {
-                            if (!gpu_tok_pre_encoded) break :blk_gpu_tok null;
-                            const sizes = enc_ctx.tans32_tok_sizes orelse break :blk_gpu_tok null;
-                            const data = enc_ctx.tans32_tok_data orelse break :blk_gpu_tok null;
-                            const offs = enc_ctx.tans32_tok_offsets orelse break :blk_gpu_tok null;
-                            if (gpu_bi_idx >= sizes.len) break :blk_gpu_tok null;
-                            const sz = sizes[gpu_bi_idx];
-                            if ((sz & 0x80000000) != 0) break :blk_gpu_tok null;
-                            if (sz == 0) break :blk_gpu_tok null;
-                            const off = offs[gpu_bi_idx];
-                            if (off + sz > data.len) break :blk_gpu_tok null;
-                            break :blk_gpu_tok data[off..][0..sz];
-                        };
-                        const gpu_off16hi_pre: ?[]const u8 = blk_hi: {
-                            if (!gpu_off16_pre_encoded) break :blk_hi null;
-                            const sizes = enc_ctx.tans32_off16hi_sizes orelse break :blk_hi null;
-                            const data = enc_ctx.tans32_off16hi_data orelse break :blk_hi null;
-                            const offs = enc_ctx.tans32_off16hi_offsets orelse break :blk_hi null;
-                            if (gpu_bi_idx >= sizes.len) break :blk_hi null;
-                            const sz = sizes[gpu_bi_idx];
-                            if ((sz & 0x80000000) != 0) break :blk_hi null;
-                            if (sz == 0) break :blk_hi null;
-                            const off = offs[gpu_bi_idx];
-                            if (off + sz > data.len) break :blk_hi null;
-                            break :blk_hi data[off..][0..sz];
-                        };
-                        const gpu_off16lo_pre: ?[]const u8 = blk_lo: {
-                            if (!gpu_off16_pre_encoded) break :blk_lo null;
-                            const sizes = enc_ctx.tans32_off16lo_sizes orelse break :blk_lo null;
-                            const data = enc_ctx.tans32_off16lo_data orelse break :blk_lo null;
-                            const offs = enc_ctx.tans32_off16lo_offsets orelse break :blk_lo null;
-                            if (gpu_bi_idx >= sizes.len) break :blk_lo null;
-                            const sz = sizes[gpu_bi_idx];
-                            if ((sz & 0x80000000) != 0) break :blk_lo null;
-                            if (sz == 0) break :blk_lo null;
-                            const off = offs[gpu_bi_idx];
-                            if (off + sz > data.len) break :blk_lo null;
-                            break :blk_lo data[off..][0..sz];
-                        };
+                        // GPU 32-lane tANS pre-encode paths were retired
+                        // 2026-05-21; entropy coding for GPU runs through
+                        // the Huffman slices populated below.
+                        const gpu_lit_pre: ?[]const u8 = null;
+                        const gpu_tok_pre: ?[]const u8 = null;
+                        const gpu_off16hi_pre: ?[]const u8 = null;
+                        const gpu_off16lo_pre: ?[]const u8 = null;
                         // GPU-Huffman lit/tok bodies for this sub-chunk
                         // (chunk_type=4 body, no 5-byte header). sz == 0
                         // marks an empty descriptor — fall back to CPU.

@@ -356,7 +356,7 @@ slzLzDecodeKernel(
 // coding, all chunk_type 0). Lean parameter list, single parsing path,
 // all parsed values flow in registers (no ParsedStreams struct, no
 // chunk_type dispatch). The driver picks this kernel when
-// scan.use_tans32 == false; the general slzLzDecodeKernel
+// no entropy is present; the general slzLzDecodeKernel
 // handles L3+ entropy.
 //
 // Parameters: compressed input blob, per-chunk descriptors, output
