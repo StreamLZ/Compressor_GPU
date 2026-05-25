@@ -166,6 +166,12 @@ fn gatherRawOff16(
             var extra = [_]?*anyopaque{null};
             // ndesc is exact (host already knows the count); no over-launch.
             // The self-gate inside the kernel makes over-launch safe regardless.
+            // We do NOT propagate a launch failure here — the D2D/H2D
+            // fallback below is byte-equivalent and always available, so
+            // treating the launch as a best-effort fast path is correct
+            // and the failure mode is "slower, not wrong". If you change
+            // that contract, replace the if-success-return below with
+            // `try cudaCall(launch_fn(...))`.
             const grid_x: u32 = ndesc;
             const t_gather = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzGatherRawOff16Kernel", 0);
             if (launch_fn(ml.gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, 0, &params, &extra) == CUDA_SUCCESS) {
@@ -537,7 +543,7 @@ pub fn fullGpuLaunchImpl(
             }
             // Split fence: time the LUT build separately from the decode.
             if (split_timer) {
-                if (cuda.cuStreamSync_fn) |sf| _ = sf(huff_stream);
+                if (cuda.cuStreamSync_fn) |sf| try cudaCall(sf(huff_stream));
                 if (t_huff_start) |hs| {
                     if (io) |io_val|
                         split_huff_build_ns = @intCast(hs.untilNow(io_val, .awake).toNanoseconds());

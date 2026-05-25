@@ -38,25 +38,27 @@ static constexpr uint32_t SCAN_OFF16_LO_SLOT = OFF16_HILO_SPLIT_OFFSET;
 // 0xFFFFFFFFu rather than dereferencing past the chunk end the way the
 // per-warp decoder's cursor-passing helpers do.
 
-// Parse a chunk_type=4 Huffman header at `pos` within chunk_src.
-__device__ static bool scanParseHuffHeader(
+// Parse a chunk_type=4 Huffman header at `pos` within chunk_src. The
+// caller pre-clears out.valid; on any bounds-failure path here we
+// simply leave it cleared (no callers consume the bool return), so the
+// function returns void.
+__device__ static void scanParseHuffHeader(
     const uint8_t* chunk_src, uint32_t chunk_len, uint32_t pos,
     uint32_t src_offset_base, uint32_t dst_off, SlzScanHuffDesc& out) {
-    if (pos >= chunk_len) return false;
+    if (pos >= chunk_len) return;
     // HEADER_LONG_FORM_BIT is named for the high bit that, when SET,
     // selects the SHORT (3-byte) header form. The 5-byte LONG form has
     // the bit clear. parseEntropyHdrFields encodes that contract via
     // h.header_bytes; this guard must match it byte-for-byte.
     const bool short_form = chunk_src[pos] >= HEADER_LONG_FORM_BIT;
     const uint32_t need = short_form ? ENTROPY_HEADER_SHORT_BYTES : ENTROPY_HEADER_LONG_BYTES;
-    if (pos + need > chunk_len) return false;
+    if (pos + need > chunk_len) return;
     const EntropyHdrFields h = parseEntropyHdrFields(chunk_src + pos);
     out.in_offset  = src_offset_base + pos + h.header_bytes;
     out.in_size    = h.comp_size;
     out.out_offset = dst_off;
     out.out_size   = h.dst_size;
     out.valid      = 1;
-    return true;
 }
 
 // Parse a type-0 (memcpy) stream header → data offset + size.
