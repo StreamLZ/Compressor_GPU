@@ -27,10 +27,16 @@ pub fn qpcNow() i64 {
     _ = win32.QueryPerformanceCounter(&c);
     return c;
 }
+// QueryPerformanceFrequency is fixed for the process lifetime — cache
+// the first read so qpcMs avoids the syscall on every call.
+var cached_qpc_freq: i64 = 0;
 pub fn qpcMs(from: i64, to: i64) f64 {
-    var freq: i64 = 1;
-    _ = win32.QueryPerformanceFrequency(&freq);
-    if (freq == 0) freq = 1;
+    var freq = cached_qpc_freq;
+    if (freq == 0) {
+        _ = win32.QueryPerformanceFrequency(&freq);
+        if (freq == 0) freq = 1;
+        cached_qpc_freq = freq;
+    }
     return @as(f64, @floatFromInt(to - from)) * 1000.0 / @as(f64, @floatFromInt(freq));
 }
 

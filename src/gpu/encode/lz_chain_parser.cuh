@@ -92,7 +92,7 @@ __device__ ChainMatch findMatchChain(
     // Read 4 bytes at current position
     uint32_t bytes_at_pos = readU32LE(src + pos);
 
-    uint64_t at_src = read8safe(src + pos, pos, src_size);
+    uint64_t at_src = read8safe(src, pos, src_size);
     uint32_t ha = hashTableA(hash_bits, hash_mask, at_src);
     uint32_t hb = hashTableB(hash_bits, hash_mask, at_src);
     uint32_t hb_tag = hashTagB(at_src);
@@ -283,7 +283,7 @@ __device__ void insertChainRange(
         uint32_t i = 0;
         while (i < len) {
             uint32_t p = from + i;
-            uint64_t at = read8safe(src + p, p, src_size);
+            uint64_t at = read8safe(src, p, src_size);
             uint32_t hb = hashTableB(hash_bits, hash_mask, at);
             uint32_t hb_tag = hashTagB(at);
             long_hash[hb] = (hb_tag & LONG_HASH_TAG_MASK) | (p << LONG_HASH_TAG_BITS);
@@ -293,7 +293,7 @@ __device__ void insertChainRange(
 
     // firstHash + nextHash at every position
     for (uint32_t p = from; p < to; p++) {
-        uint64_t at = read8safe(src + p, p, src_size);
+        uint64_t at = read8safe(src, p, src_size);
         uint32_t ha = hashTableA(hash_bits, hash_mask, at);
         uint32_t prev_head = first_hash[ha];
         next_hash[p & NEXT_HASH_INDEX_MASK] = (uint16_t)(prev_head & NEXT_HASH_INDEX_MASK);

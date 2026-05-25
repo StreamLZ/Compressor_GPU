@@ -19,7 +19,7 @@
 // length stream are copied verbatim from the raw payload.
 
 #include <cstdint>
-#include "../common/gpu_warp.cuh"          // WARP_SIZE, laneId()
+#include "../common/gpu_warp.cuh"          // WARP_SIZE, LANE_MASK
 #include "../common/gpu_byteio.cuh"        // readBE24
 #include "../common/gpu_wire_format.cuh"   // LZ_BLOCK_SIZE, HUFF_CHUNK_TYPE, OFF16_ENTROPY_MARKER,
                                            // OFF32_COUNT_PACK_MAX, OFF32_LONG_ENTRY_TAG,
@@ -307,7 +307,7 @@ extern "C" __global__ void slzAssembleMeasureKernel(
 {
     const uint32_t i = blockIdx.x;
     if (i >= n_subchunks) return;
-    const int lane = laneId();
+    const int lane = threadIdx.x & LANE_MASK;
     const uint32_t n = assembleSubChunk(d_raw, d_huff_lit, d_huff_tok,
                                         d_huff_off16, descs[i], nullptr, lane);
     if (lane == 0) enc_sizes[i] = n;
@@ -328,7 +328,7 @@ extern "C" __global__ void slzAssembleWriteKernel(
 {
     const uint32_t i = blockIdx.x;
     if (i >= n_subchunks) return;
-    const int lane = laneId();
+    const int lane = threadIdx.x & LANE_MASK;
     const AssembleDesc desc = descs[i];
 
     uint8_t* hdr = d_frame + desc.out_offset;

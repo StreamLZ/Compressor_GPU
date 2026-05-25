@@ -87,8 +87,8 @@ fn mergeHuffDescs(
         return;
     }
     // CPU merge fallback: used by the non-pure-D2D / CPU-scan paths.
-    // Capacity = 4 buffers × 4096.
-    var merged_huff: [4096 * 4]HuffDecChunkDesc = undefined;
+    // Capacity = 4 buffers × d.MAX_HUFF_DESCS_PER_STREAM.
+    var merged_huff: [d.MAX_HUFF_DESCS_PER_STREAM * 4]HuffDecChunkDesc = undefined;
     var m: u32 = 0;
     var lut_slot: u32 = 0;
     const append = struct {
@@ -369,11 +369,11 @@ pub fn fullGpuLaunchImpl(
     // reads only index 0 (= 0). Zero-init suffices; bumping the stream
     // count would need a selective D2H of group boundaries from
     // d_first_sub_idx_persist.
-    var first_subchunk_idx_buf: [16384]u32 = .{0} ** 16384;
-    // Slot size = 131072 (sub_chunk_cap) holds the largest sub-chunk's
-    // lit/tok streams; off16-hi at +0, off16-lo at +65536 within each slot.
-    // Layout: [lit: total*128K] [tok: total*128K] [off16: total*128K].
-    const per_subchunk_scratch: usize = 131072;
+    var first_subchunk_idx_buf: [d.walk_max_chunks]u32 = .{0} ** d.walk_max_chunks;
+    // d.ENTROPY_SCRATCH_SLOT_BYTES holds the largest sub-chunk's lit/tok
+    // streams; off16-hi at +0, off16-lo at +d.OFF16_HILO_SPLIT_OFFSET
+    // within each slot. Layout: [lit: total*slot] [tok: total*slot] [off16: total*slot].
+    const per_subchunk_scratch: usize = @intCast(d.ENTROPY_SCRATCH_SLOT_BYTES);
     const entropy_scratch_bytes = @as(usize, total_subchunks) * per_subchunk_scratch * 3;
     if (!ensureDeviceBuf(&self.d_entropy_scratch, &self.d_entropy_scratch_size, entropy_scratch_bytes)) return error.BadMode;
     const tok_offset = @as(usize, total_subchunks) * per_subchunk_scratch;
@@ -637,7 +637,7 @@ pub fn fullGpuLaunchImpl(
                 var p_total = self.d_n_groups_scratch;
                 var p_sc_cap = sub_chunk_cap;
                 var p_entropy_scratch = self.d_entropy_scratch;
-                var p_entropy_slot_stride: u64 = @as(u64, total_subchunks) * 131072;
+                var p_entropy_slot_stride: u64 = @as(u64, total_subchunks) * d.ENTROPY_SCRATCH_SLOT_BYTES;
                 var p_first_sub_idx: CUdeviceptr = self.d_first_subchunk_idx +
                     if (self.d_first_subchunk_idx != 0) @as(u64, chunk_start) * @sizeOf(u32) else 0;
 

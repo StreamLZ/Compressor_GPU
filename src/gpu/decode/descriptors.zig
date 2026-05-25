@@ -32,6 +32,20 @@ pub const HuffDecChunkDesc = extern struct {
 
 pub const HUFF_LUT_ENTRIES: usize = 1024; // matches MAX_CODE_LEN=10 (10-bit escape LUT) in kernel
 
+// ── Per-context buffer caps ─────────────────────────────────────
+// Host-side max counts; sized for the largest frame the GPU codec
+// can produce (walk_max_chunks chunks * sub-chunks-per-chunk).
+pub const MAX_HUFF_DESCS_PER_STREAM: u32 = 4096;
+pub const MAX_RAW_OFF16_DESCS: u32 = 8192;
+
+// ── Per-sub-chunk entropy scratch geometry ──────────────────────
+// Mirror the C-side constants in decode/slz_wire_format.cuh:
+//   ENTROPY_SCRATCH_SLOT_BYTES = 131072 — one per global sub-chunk
+//   OFF16_HILO_SPLIT_OFFSET    = 65536  — hi bytes start, lo bytes at +offset
+// (Sub-chunks decompress up to 128KB; the slot is sized for that.)
+pub const ENTROPY_SCRATCH_SLOT_BYTES: u64 = 131072;
+pub const OFF16_HILO_SPLIT_OFFSET: u32 = 65536;
+
 // ── Per-kernel timing infrastructure ─────────────────────────────
 // When `enable_profiling` is set on a DecodeContext, each kernel launch
 // is wrapped in a cuEvent pair. After the final sync, finalizeProfiling

@@ -173,7 +173,8 @@ pub const DecodeContext = struct {
     // ── Entropy-decoded scratch ────────────────────────────────
     // Holds the Huffman pre-decode output that the LZ kernel reads.
     // Layout per sub-chunk slot: [lit][tok at +tok_offset][off16 at +off16_offset].
-    // off16 sub-region: hi bytes at chunk_idx*131072, lo bytes at +65536.
+    // off16 sub-region: hi bytes at chunk_idx*d.ENTROPY_SCRATCH_SLOT_BYTES,
+    // lo bytes at +d.OFF16_HILO_SPLIT_OFFSET.
     d_entropy_scratch: CUdeviceptr = 0,
     d_entropy_scratch_size: usize = 0,
 
@@ -195,7 +196,7 @@ pub const DecodeContext = struct {
     d_first_subchunk_idx: CUdeviceptr = 0,
     d_first_subchunk_idx_size: usize = 0,
 
-    raw_off16_buf: [8192]d.RawOff16Desc = undefined,
+    raw_off16_buf: [d.MAX_RAW_OFF16_DESCS]d.RawOff16Desc = undefined,
 
     // GPU decode-scan staged buffers (roadmap 4d Phase 2). d_scan_staged
     // packs the six staged arrays (lit/tok/hi/lo huff + raw hi/lo);
@@ -261,10 +262,10 @@ pub const DecodeContext = struct {
     d_huff_lut_size: usize = 0,
     // One host buffer per stream type — scanner appends to each; fullGpuLaunch
     // merges them into one device array with per-type out_offset added.
-    huff_lit_host_buf: [4096]d.HuffDecChunkDesc = undefined,
-    huff_tok_host_buf: [4096]d.HuffDecChunkDesc = undefined,
-    huff_off16hi_host_buf: [4096]d.HuffDecChunkDesc = undefined,
-    huff_off16lo_host_buf: [4096]d.HuffDecChunkDesc = undefined,
+    huff_lit_host_buf: [d.MAX_HUFF_DESCS_PER_STREAM]d.HuffDecChunkDesc = undefined,
+    huff_tok_host_buf: [d.MAX_HUFF_DESCS_PER_STREAM]d.HuffDecChunkDesc = undefined,
+    huff_off16hi_host_buf: [d.MAX_HUFF_DESCS_PER_STREAM]d.HuffDecChunkDesc = undefined,
+    huff_off16lo_host_buf: [d.MAX_HUFF_DESCS_PER_STREAM]d.HuffDecChunkDesc = undefined,
 
     // Pipeline streams (persistent, created once in init)
     pipeline_streams: [cuda.NUM_PIPELINE_STREAMS]usize = .{0} ** cuda.NUM_PIPELINE_STREAMS,

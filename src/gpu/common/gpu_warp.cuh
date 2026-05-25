@@ -23,8 +23,3 @@ static constexpr uint32_t FULL_WARP_MASK = 0xFFFFFFFFu;     // all 32 lanes acti
 static constexpr uint32_t BITS_PER_BYTE = 8;
 static constexpr uint32_t U32_BITS      = 32;
 static constexpr uint32_t U64_BITS      = 64;
-
-// Lane index of the calling thread within its warp.
-__device__ __forceinline__ int laneId() {
-    return threadIdx.x & (int)LANE_MASK;
-}

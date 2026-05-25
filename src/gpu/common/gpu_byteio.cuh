@@ -62,11 +62,13 @@ __device__ __forceinline__ uint32_t readU32LE(const uint8_t* p) {
 }
 
 // ── Read up to 8 bytes, zero-padding past src_size ──────────────
-// Generic zero-padded tail read used by the LZ encode hash path.
-__device__ __forceinline__ uint64_t read8safe(const uint8_t* p, uint32_t pos,
+// Generic zero-padded tail read used by the LZ encode hash path. Reads
+// 8 bytes from `base + pos` when in-range, or `src_size - pos` bytes
+// followed by zero-padding when the tail is short.
+__device__ __forceinline__ uint64_t read8safe(const uint8_t* base, uint32_t pos,
                                               uint32_t src_size) {
     uint64_t v = 0;
     uint32_t avail = (pos + 8 <= src_size) ? 8 : (src_size > pos ? src_size - pos : 0);
-    memcpy(&v, p, avail);
+    memcpy(&v, base + pos, avail);
     return v;
 }
