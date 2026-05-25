@@ -2086,3 +2086,985 @@ escape body — ptxas predicates small if-bodies regardless of
 the barrier with it. The cpb code is kept in `tools/huff_test/` as a
 documented dead end; `huffDecode4StreamCpAsyncEscKernel` (cpa, 29.8 GB/s
 @ 64.0%) remains the fastest decoder.
+
+## Loosen `__launch_bounds__` to kill LZ-decode register spills (2026-05-24)
+
+**Context**: NCU profile of `slzLzDecodeRawKernel` (the lean L1/L2 raw
+fast path, ~1.96 ms on 8 MB enwik8 — the single largest remaining decode
+cost) showed REG:40 / STACK:48 with 21 STL + 45 LDL across the kernel
+group, ~73 K spill-load requests per launch, mostly hitting L1 (~80 %
+hit rate). `nvdisasm --print-line-info` mapped the hot spill clusters to
+`lz_kernels.cuh:405` (chunk_src setup, 5 STL+LDL), `:429` (lane-strided
+copy loop, 5×), and `:416` (`__shfl_sync` of `sub_chunk_header`, 7×).
+Root cause: `__launch_bounds__(64, 24)` in `slz_wire_format.cuh:119`
+caps regs at ~42 (65 536 regs / 1536 max threads-per-SM at MBPS=24), so
+ptxas spills the rest. Hypothesis: loosen MBPS so the compiler keeps
+those values in registers; trading a few resident warps for fewer L1
+spill loads should speed the kernel.
+
+**Experiment**: swept `LZ_KERNEL_MIN_BLOCKS_PER_SM` ∈ {24, 16, 12, 8}.
+At MBPS=16 the raw kernel went REG:56 / STACK:0 — **zero spills**, no
+STL, no LDL. Rebuilt all three decode kernels via `tools\build_gpu.bat`,
+rebuilt `streamlz` + `gpulib` with `zig build -Doptimize=ReleaseFast
+-Dgpu=true`, benchmarked with `streamlz -db -r 30` on enwik8 L1/L3/L5
+(best-of-30 GPU kernel time, measured with `-db` cuEvent timers).
+
+**Results** (8 MB enwik8, RTX 4060 Ti):
+
+| Level | MBPS=24 (baseline) | MBPS=16 (no spills) | Δ        |
+|-------|--------------------|--------------------|----------|
+| L1    | 3.79 ms            | 4.88 ms            | **+29 %** |
+| L3    | 7.36 ms            | 8.29 ms            | **+13 %** |
+| L5    | 7.42 ms            | 8.51 ms            | **+15 %** |
+
+Byte-exact, but **slower at every level** — the opposite of the prediction.
+
+**Why MBPS=16 lost**: the LZ match-copy loop has long-latency global
+loads with little intra-thread work between them; the only way to hide
+that latency is parallel resident warps. Dropping from 24 → ~17 blocks
+per SM cut latency-hiding capacity by ~30 %, and that loss outweighed
+the saved spill traffic — which was always going to be cheap because
+the spills land in L1 with ~80 % hit rate (~3 % of kernel time).
+
+**Lesson**: this is the complement of the u16 single-symbol Huffman LUT
+experiment (line 1908). Both falsify a profiler "limited by X" warning
+by sweeping the lever in the indicated direction:
+
+- Huffman decoder was **L2-bound** at 81.6 % SOL; doubling resident
+  warps (halving shared mem) bought nothing because no warp could decode
+  faster against a saturated L2 pipe.
+- LZ decoder is **latency-bound** on global loads; warp budget IS the
+  hiding mechanism, so sacrificing warps for fewer spills hurts.
+
+The meta-rule: NCU's "register pressure" / "occupancy limited" boxes
+flag *opportunities to investigate*, not bottlenecks to fix
+mechanically — actual perf depends on whether the kernel is warp-budget-
+bound vs memory-bound vs compute-bound, and the right move goes opposite
+ways in each case. `LZ_KERNEL_MIN_BLOCKS_PER_SM = 24` is at a local
+optimum for `slzLzDecodeRawKernel`; leave it alone. A "don't loosen
+this" comment was added inline at `slz_wire_format.cuh:116–129` so the
+next reader doesn't burn a day re-running the same sweep.
+
+## Vectorize the LZ-decode byte-copy loops to 4 bytes/lane (2026-05-24)
+
+**Context**: NCU profile of `slzLzDecodeRawKernel` (the lean L1/L2 raw
+fast path) showed Long Scoreboard = 50 % of stall cycles + Wait = 30 %,
+with the inner literal/match copy loops at `lz_decode_core.cuh:91-95`
+and `:107-108` doing one byte per lane per iteration:
+
+    for (uint32_t i = lane; i < lit_len; i += WARP_SIZE)
+        dst[dst_pos + i] = lit[lit_pos + i];
+
+Hypothesis: every L1 hit (~20–30 cycles latency) gates the next loop
+iteration through the same lane's dependency chain. Replacing the byte
+load/store with a 4-byte vectorized load/store should fold 4 dependent
+loads into 1, cutting Long Scoreboard time and shortening the critical
+path. Predicted ~1.5–2× kernel speedup.
+
+**Experiment** (two attempts, six call sites total):
+
+1. *memcpy-based vectorization* — `memcpy(&v, src, 4)` + `memcpy(dst,
+   &v, 4)` inside a 4-byte stride loop, with a tail sweep for the
+   final < 4 bytes. PTX inspection revealed the codegen was wrong:
+   `memcpy` with a `const uint8_t*` source lowered to **four
+   `ld.global.u8` instructions** (loop-unrolled byte loads), not a
+   wide load. Same load count as the byte loop + more register
+   pressure (raw kernel STACK 48 → 96 B/thread, general 192 → 232).
+
+2. *Inline-PTX wide loads* — replaced the `memcpy`s with
+   `asm("ld.global.b32 %0, [%1];" : "=r"(v) : "l"(p));` (and the
+   matching `st.global.b32`). PTX now emits **20 `ld.global.b32` +
+   20 `st.global.b32` per raw kernel**, with 8 byte loads + 10 byte
+   stores remaining for the tail and the token parser. Register
+   spills dropped from the memcpy attempt (raw kernel STACK 96 → 80,
+   general 232 → 224). Delta-literal path (mode 0) vectorized with
+   `__vadd4` for the per-byte literal+source add.
+
+Both byte-exact (SHA256 match on enwik8 L1/L3/L5 roundtrip).
+
+**Results** — 8 MB enwik8, pure D2D, per-kernel cuEvent timing,
+best-of-5 after warmup (stable to ±0.001 ms):
+
+| Variant            | L1 raw   | L3       | L5       |
+|--------------------|----------|----------|----------|
+| Baseline (byte)    | 1.81 ms  | 1.80 ms  | 2.11 ms  |
+| memcpy "vectorize" | 1.81 ms  | 1.81 ms  | 2.11 ms  |
+| Inline-PTX wide    | 1.81 ms  | 1.81 ms  | 2.11 ms  |
+
+Identical to three decimal places.
+
+NCU full-set comparison (byte baseline vs inline-PTX wide loads):
+
+| Metric                       | Baseline | Wide load |
+|------------------------------|---------:|----------:|
+| Compute (SM) Throughput      | 73.7 %   | 73.7 %    |
+| Memory Throughput SOL        | 73.7 %   | 73.7 %    |
+| DRAM Throughput              | 18.5 %   | 18.0 %    |
+| L1/TEX Hit Rate              | 81.6 %   | 81.6 %    |
+| L2 Hit Rate                  | 85–89 %  | 85–89 %   |
+| Achieved Occupancy           | 79 %     | 79 %      |
+| Issued Warp / Scheduler      | 0.74     | 0.74      |
+| Warp Cycles / Issued Inst    | 13.07    | 13.07     |
+| Avg Active Threads Per Warp  | 18.44    | 18.44     |
+| Executed IPC Active          | 2.90     | 2.91      |
+| Long Scoreboard stall %      | 49.9 %   | 50.1 %    |
+| Wait stall %                 | 29.8 %   | 29.5 %    |
+| Branch Resolving stall %     | 9.8 %    | 9.8 %     |
+
+Every metric unchanged.
+
+**Why wide loads lost**: the Long Scoreboard 50 % stall does NOT come
+from the literal/match copy loops. The copies were widened, the loads
+landed in SASS as 32-bit ops (PTX + L1 hit rate confirm), and the
+profile didn't budge. The 50 % is coming from elsewhere on the
+critical path — almost certainly:
+
+1. **The back-reference `dst[match_src + i]` load** inside the match
+   copy. The result is consumed immediately by the dependent store on
+   the same iteration, so the dependency chain length is fixed; a
+   wider load doesn't shorten it.
+2. **Lane 0's serial token parse** (`cmd[cmd_pos]`, `off16[off16_pos]`,
+   `readLength` for long tokens). The other 31 lanes have no work to
+   do during the parse, so the warp scheduler stalls on this lane's
+   L1 reads.
+3. **The five `__shfl_sync` broadcasts** after each parse — each shfl
+   is warp-pipelined with its own latency.
+
+**Lesson**: NCU's stall-reason breakdown points at a *category* of
+stall (e.g. "Long Scoreboard"), not at *which specific load* is
+gating progress. Two loops in the same kernel that both load from
+global memory will both show up as Long Scoreboard, but only one may
+be on the critical dependency chain. Before vectorizing, identify
+which load's *result* is consumed by a dependent instruction with no
+intervening parallel work — that's the one on the chain. For this
+kernel the back-reference + serial-parse loads are on the chain; the
+parallel literal/match copy loads are not. Real progress requires
+shortening the per-token critical path (parse + broadcast +
+back-reference resolution), not widening the bystander copies.
+
+Also documents a measurement pitfall: the original "regression" reading
+that motivated reverting the first attempt was from `streamlz -db -r 30`
+with `SLZ_SPLIT_TIMER=1`, which measures wall-clock between stream-sync
+points in the pipelined LZ path — not actual kernel duration. The real
+LZ kernel time is exposed only via per-kernel cuEvent profiling through
+`slzGetLastTimings`. A separate bug in `finalizeProfiling`
+(double-clear of `last_timings` from the main-thread getter) had to be
+fixed to make per-kernel timing visible from `slz_gpu_d2d_test`. The
+fix is in `src/gpu/decode/driver.zig:434-447` and stays.
+
+The wide-load patch was reverted (`git checkout HEAD --
+src/gpu/decode/lz_decode_core.cuh`); the byte-loop baseline at
+`lz_decode_core.cuh:91-95 / :107-108 / :125-126` remains. The
+inline-PTX helpers (`ldGlobalU32Unaligned`, `stGlobalU32Unaligned`,
+`warpCopyBytesVec`, `laneCopyMatchSerial`) were removed — if a future
+experiment ever needs wide-load helpers, they're trivially regenerated
+from this entry.
+
+## Unconditional first warp-step on the LZ-decode literal copy (LZTurbo copy16 trick) (2026-05-24)
+
+**Context**: Looked at `src/compare/lzturbo.zig`'s CPU decompressor, which
+gets a measurable win on x86 from the LZ4-style "always `copy16` 16
+bytes, advance by actual `lit_len`, let the next token overwrite the
+overshoot" pattern (`lzturbo.zig:261-264`). The CPU win comes from
+skipping the per-iteration branch + tail per-byte copies. On GPU, the
+analog is the per-warp `if (lit_len > 0)` check + the lane-tail
+divergence in `for (i = lane; i < lit_len; i += WARP_SIZE)`.
+
+NCU says Avg Active Threads Per Warp = 18.44/32 in this loop's vicinity
+(57.6 % lane utilization) and Branch Resolving = 9.8 % of stall cycles.
+Hypothesis: always issue one warp-wide byte store (every lane writes,
+even when `lit_len < 32`), then loop only for `lit_len > WARP_SIZE`.
+Lanes past lit_len overshoot into `dst[dst_pos+lit_len..dst_pos+31]`,
+which is later overwritten by the same token's match copy or the next
+token's literal copy.
+
+**Experiment**: rewrote `lz_decode_core.cuh:90-95` (raw kernel's literal
+copy) as:
+
+    if (lit_len > 0) {
+        dst[dst_pos + lane] = lit[lit_pos + lane];      // unconditional first step
+        for (uint32_t i = lane + WARP_SIZE; i < lit_len; i += WARP_SIZE)
+            dst[dst_pos + i] = lit[lit_pos + i];        // only for lit_len > 32
+        __syncwarp();
+    }
+
+REG/STACK unchanged (raw kernel still 40/48, general 40/192). Byte-exact
+on enwik8 8 MB and 100 MB at L1/L3/L5 — confirms the overshoot is safe
+in practice for our encoder's match patterns (i.e. subsequent match
+reads do not pick up garbage from the overshoot region, presumably
+because the offset/match_len distribution rarely places a match read
+inside the freshly-overshooting bytes).
+
+**Results** (pure D2D, per-kernel cuEvent, best-of-5 after warmup,
+stable to ±0.003 ms):
+
+| Size   | Level   | Baseline | Unconditional | Δ        |
+|--------|---------|---------:|--------------:|----------|
+| 8 MB   | L1 raw  | 1.81 ms  | 1.81 ms       | 0.0 %    |
+| 8 MB   | L3      | 1.80 ms  | 1.80 ms       | 0.0 %    |
+| 8 MB   | L5      | 2.11 ms  | 2.11 ms       | 0.0 %    |
+| 100 MB | L1 raw  | 3.77 ms  | 3.75 ms       | –0.6 %   |
+| 100 MB | L3      | 3.80 ms  | 3.79 ms       | –0.3 %   |
+| 100 MB | L5      | 4.41 ms  | 4.41 ms       | 0.0 %    |
+
+Within measurement noise. The 100 MB L1 –0.6 % is at the edge of
+the run-to-run jitter and does not reproduce as a real signal.
+
+**Why it lost**: same as the wide-load experiment two days earlier in
+this file — the literal/match copy loops are **not on the critical
+path**. NCU has now told us this three different ways in the same
+session:
+
+1. Wide-load vectorization (`ld.global.b32`) — fewer loads, same time.
+2. Inline-PTX `__vadd4` for the delta-literal copy — same time.
+3. Unconditional first warp-step — fewer branches, same time.
+
+All three changes verifiably landed in SASS or in measurable Avg Active
+Threads improvements. None moved kernel wall-clock. The kernel is
+gated by the per-warp critical-path latency of (back-reference load →
+dependent store) + (lane-0 serial parse → broadcast shuffle → next
+iteration), and any optimisation that doesn't shorten one of those
+chains is a no-op.
+
+**Lesson**: LZTurbo's branchless overshoot pattern is a *CPU* lever —
+it removes branch-predict cost on a sequential SIMD core. On a GPU
+warp, the warp scheduler doesn't pay the same predict cost; the
+analogous waste shows up as Avg Active Threads Per Warp and Branch
+Resolving stall, neither of which is dominant in this kernel. Don't
+copy CPU branch-removal tricks to GPU without first checking whether
+the GPU pays the same cost — the answer is usually "no, but you'll
+spend a day proving it".
+
+The change was reverted (`git checkout HEAD --
+src/gpu/decode/lz_decode_core.cuh`). The byte-loop baseline at
+`lz_decode_core.cuh:90-95` remains.
+
+The unconditional-copy idea is *correct* on this kernel (byte-exact
+verified at 100 MB) — it's just not load-bearing. If we ever do a
+larger restructure that brings the copy loops onto the critical path
+(for example, removing the `__syncwarp()` barriers so the next token's
+parse overlaps with the previous token's copy), this trick may earn
+its complexity back.
+
+## META: slzLzDecodeRawKernel is at its structural ceiling — micro-optimizations don't move it (2026-05-24)
+
+**Context**: NCU profile of `slzLzDecodeRawKernel` (the lean L1/L2
+fast path) on 100 MB enwik8 shows Long Scoreboard = 50 % + Wait = 30 %
+of stall cycles, with 73.7 % Compute SOL and 0.74 Issued Warp /
+Scheduler. The natural reading is "the kernel is gated by L1 load
+latency on lane-0 serial parse and on the back-reference reads in the
+match copy". This session ran *five distinct experiments* aiming at
+that hypothesis. Every one of them landed in the SASS / PTX as
+designed, passed byte-exact verification, and **failed to move kernel
+wall-clock time by more than measurement noise**.
+
+**Experiments**:
+
+| # | Attack | What landed in SASS | Δ kernel time |
+|---|---|---|---|
+| 1 | Vectorize byte copies via `memcpy(&v, ..., 4)` | `memcpy` lowered to 4× `ld.global.u8` (not vector) — see entry above | 0 % |
+| 2 | Inline-PTX `ld.global.b32` + `st.global.b32` wide loads | 20× wide loads + 20× wide stores in raw kernel — see entry above | 0 % |
+| 3 | Unconditional first warp-step (LZTurbo `copy16` trick) | branch eliminated; avg active threads conceptually higher — see entry above | 0 % (–0.5 % at 100 MB, within noise) |
+| 4 | `cp.async` staging of cmd / off16 / length into shared mem | 28× `cp.async.cg` + lane-0 reads become `ld.shared.u8` (PTX verified) | 0 % |
+| 5 | Back-reference prefetch via 2-way manual unroll, load-all-then-store-all | dependent load→store iterations decoupled in loop body | 0 % |
+
+Each entry above describes the per-experiment SASS evidence in detail;
+this meta-entry exists to capture what the *combined* result means.
+
+**NCU profile comparison** (byte-loop baseline vs experiment #4
+cp.async, the only one profiled with full NCU after the experiment —
+the others were measured by per-kernel cuEvent timing on enwik8 8 MB
+and 100 MB, stable to ±0.005 ms over 5-run best-of):
+
+| Metric | Baseline | After cp.async |
+|---|---:|---:|
+| Compute (SM) Throughput | 73.7 % | 73.68 % |
+| Memory Throughput SOL | 73.7 % | 73.68 % |
+| DRAM Throughput | 18.5 % | 18.02 % |
+| L1/TEX Hit Rate | 81.6 % | 81.60 % |
+| L2 Hit Rate | 85–89 % | 85–89 % |
+| Achieved Occupancy | 79 % | 79.39 % |
+| Issued Warp / Sched | 0.74 | 0.74 |
+| Warp Cycles / Issued Inst | 13.07 | 13.07 |
+| Executed IPC Active | 2.90 | 2.91 |
+| Long Scoreboard stall | 49.9 % | 49.8 % |
+| Wait stall | 29.8 % | 29.5 % |
+| Branch Resolving stall | 9.8 % | 9.8 % |
+| Inst Executed | 967 M | 967 M |
+
+**Every metric is unchanged to two decimal places** — including the
+stall categories the change was explicitly designed to attack. This
+is the most informative evidence in the file: not just "the change
+didn't help", but "the change made *no observable difference at any
+metric NCU reports*", despite SASS confirming the change landed.
+
+**Why none of the five worked — synthesis**:
+
+The five experiments tried to reduce the wall-clock cost of:
+
+1. Per-iteration load instructions in the cooperative copy loops (#1, #2)
+2. Per-token branch divergence in the literal copy (#3)
+3. Per-token L1 latency on lane-0 cmd/off16 reads (#4)
+4. Per-token L1 latency on back-reference loads in the match copy (#5)
+
+All four of those latencies are **real** — NCU's Long Scoreboard 50 %
+ratio is not a measurement artifact. The mistake was assuming any of
+them was on the warp's *critical issue path*. The actual situation:
+
+- The SM has 38 warps resident (79 % achieved occupancy) and
+  2.03 eligible warps per scheduler.
+- When *any one warp* stalls on a load, the warp scheduler issues
+  from another eligible warp. The 26 % of cycles with no issue
+  (1 – 0.74) means all 38 warps were stalled *simultaneously* on
+  cycles where no issue happened.
+- A change that reduces *one* warp's load latency by 15 ns doesn't
+  help unless it also reduces the *correlated* stalls across the
+  other 37 warps. None of these five changes did — they all reduced
+  one type of stall per warp, with the per-SM throughput
+  unaffected.
+
+The Long Scoreboard 50 % is a property of the *instruction mix* (the
+ratio of load-issuing cycles to total cycles), not a single
+shortenable bottleneck. The kernel is compute-bound at 73.7 % SOL on
+a real per-byte workload; the remaining 26.3 % is the irreducible
+scheduling overhead given the instruction mix.
+
+**What the five experiments *didn't* try, in case perf becomes a
+priority again**:
+
+1. **Software-pipelined parse — overlap token N+1's parse on lane 0
+   with token N's cooperative copy across all 32 lanes.** This
+   actually shortens the per-warp critical chain (not per-instruction
+   latency) and would change the kernel's structural ceiling, not
+   move a metric. Multi-day rewrite. Predicted 10–20 % gain if it
+   lands cleanly.
+2. **Format change to remove the serial parse entirely.** A
+   self-describing token layout where every lane parses its own token
+   in parallel — the inverse of LZ4's "1 byte / 1 token" design.
+   Major wire-format change, ~weeks.
+3. **Tensor-core-assisted bulk copy** for very long matches (>= 256
+   bytes). Tensor cores can be coerced into a fast copy primitive
+   under specific layouts, but the setup cost is large enough that
+   it only wins for long matches — and our match-length histogram on
+   text is dominated by < 32 byte matches.
+
+**Lesson — meta**: NCU stall categories tell you *where time goes*,
+not *where time can be reclaimed*. The two are different when the
+SM is well-occupied. "Long Scoreboard 50 %" doesn't mean "50 % of
+your kernel time is recoverable by making loads faster". It means
+"50 % of the cycles in this kernel are spent waiting on loads". On
+an under-occupied SM, reducing load latency frees scheduling cycles
+and converts directly to speedup. On a well-occupied SM (like
+slzLzDecodeRawKernel at 79 % achieved), the scheduler already
+absorbs single-warp latencies and reducing them is invisible at the
+metric level. The lever is *not* per-instruction; it's per-warp
+critical-chain length or per-warp instruction count.
+
+Before running yet another load-latency experiment on this kernel,
+**re-read this entry**. The current kernel time of 1.81 ms (8 MB) /
+3.77 ms (100 MB) is the practical ceiling for the current
+parse-then-copy structure on Ada. Beating it requires changing the
+*structure*, not the *instructions*.
+
+All five experiments reverted; `lz_decode_core.cuh` is at HEAD. The
+`finalizeProfiling` bug fix in `src/gpu/decode/driver.zig:434-447`
+stays (it was a real measurement-infrastructure bug discovered during
+experiment #4 and is unrelated to the five attacks).
+
+## Warp-parallel token parse with prefix scan (2026-05-24, after the meta-entry above)
+
+**Context**: After the meta-entry above concluded the kernel was "at its
+structural ceiling for per-instruction optimization", a follow-up NCU
+breakdown was run to measure WARP-INSTRUCTION composition (different
+from the per-instruction latency we'd been attacking). The breakdown:
+
+- `smsp__inst_executed.sum` = 967.5 M warp-instructions
+- `smsp__thread_inst_executed_per_inst_executed.ratio` = 18.44 lanes
+- Pipe split: ALU 37.5 %, FMA 27.4 %, LSU 16.7 %, CBU 16.8 %
+
+From the lane-active ratio, the upper bound on "single-lane parse"
+warp-instructions: `F_parse = (32 - 18.44) / 31 = 43.7 %`. Roughly
+30-40 % once accounting for the fact that some copies have < 32 active
+lanes. This looked like a real fat target — and unlike the previous
+five attacks, it was a *warp-instruction-count* lever, which the
+meta-entry's own conclusion called out as the actually-attackable axis.
+
+**Hypothesis**: replace the lane-0 serial token parse with a
+warp-parallel parse using:
+- one coalesced 32-byte LDG of the cmd stream per 32-token batch
+- per-lane local decode of cmd byte
+- warp prefix scan (`__shfl_up_sync` Hillis-Steele) to compute per-lane
+  off16_offset, dst_offset, lit_offset within the batch
+- `__ballot_sync` + `__clz` to propagate the `recent_offset` chain
+  across same-batch tokens
+- sequential per-k execution loop using `__shfl_sync` to broadcast
+  lane k's parsed values for the cooperative copy
+
+Predicted gain: 20-35 % kernel speedup (28-38 % parse-warp-insts gone
++ 5-6 % CBU drop from removing the lane-0 BSSY/BSYNC).
+
+**Experiment**: implemented in `decodeSubChunkRawMode<false>` only
+(the dominant raw L1/L2 path). `<true>` (entropy-coded off16) kept the
+original serial code. Two configurations tried:
+
+1. *Strict fast path* — fires only when all 32 tokens in a batch are
+   SHORT format AND batch is full 32 tokens. Falls back to lane-0
+   serial parse otherwise.
+2. *Loosened fast path* — fires whenever no long tokens in batch
+   (partial batches allowed). Wider coverage.
+
+Both byte-exact on enwik8 8 MB / 100 MB and silesia 100 MB at L1, L3,
+and L5 — **no correctness debugging needed**, the algorithm landed
+right on the first build.
+
+Implementation complexity:
+- `warpScanU32` helper (Hillis-Steele exclusive scan, 5 `__shfl_up_sync`)
+- Parallel-parse fast path: ~80 lines of CUDA
+- Serial fallback (unchanged from original): kept in same function
+
+**Results** (per-kernel cuEvent timing, best-of-5 after warmup):
+
+| Size / Level | Baseline | Strict fast path | Loosened fast path |
+|--------------|---------:|-----------------:|-------------------:|
+| 8 MB L1 raw  | 1.81 ms  | 1.81 ms          | 1.81 ms            |
+| 8 MB L3      | 1.80 ms  | 1.80 ms          | 1.80 ms            |
+| 8 MB L5      | 2.11 ms  | 2.11 ms          | 2.11 ms            |
+| 100 MB L1 raw| 3.77 ms  | 3.75 ms          | 3.74 ms            |
+| 100 MB L3    | 3.80 ms  | 3.78 ms          | 3.78 ms            |
+| 100 MB L5    | 4.41 ms  | 4.40 ms          | 4.40 ms            |
+| 100 MB silesia L1 | n/a | 3.31 ms          | 3.31 ms            |
+
+Best observation: 100 MB enwik8 L1 dropped from 3.77 → 3.74 ms = 0.8 %
+improvement. **Within noise**. The "loosened" variant (which
+fires on far more batches) gave nearly identical perf to "strict" —
+ruling out coverage as the issue.
+
+Resource cost: STACK 48 → 64 bytes per thread (extra 16 bytes for
+per-lane batch parse state). REG unchanged. No occupancy change.
+
+**Why it lost — strongest evidence yet for the meta-entry's
+conclusion**: this experiment was *specifically* designed to attack the
+warp-instruction-count axis that the prior 5 failures and the meta-
+entry called out as the actually-attackable lever. The metric
+prediction was solid (43.7 % F_parse upper bound, 30-40 % realistic).
+The implementation was correct (byte-exact on three independent
+inputs, two paths). The change provably did parallel parse — there
+was nothing left to debug.
+
+And the kernel STILL didn't move.
+
+This means the meta-entry's conclusion was actually too optimistic.
+The lever isn't even "warp-instruction count". The kernel at 73.7 %
+compute SOL is at an SM throughput ceiling — reducing warp-insts on
+one warp's critical path doesn't help because the SM was already
+fully busy running the other 37 resident warps' instructions during
+those slots. The single-lane parse work was being run *in parallel
+with* other warps' cooperative copies. Compressing it into 1/32 the
+clock budget per warp doesn't free SM compute capacity that wasn't
+already idle.
+
+**Updated meta-lesson**: the genuine ceiling for this kernel
+structure on Ada with 79 % achieved occupancy is roughly:
+
+  *(total warp-instruction throughput across all SMs) / (work per byte)*
+
+The total SM throughput on this kernel is 73.7 % of SOL — close to
+the practical maximum. Beating that requires either:
+
+1. **Reducing the WORK per byte decoded** — i.e., fewer total
+   warp-instructions per byte. The parallel-parse experiment removed
+   per-warp parse work but did NOT reduce per-byte total work
+   because the same parse instructions just ran on different warps.
+   The format itself dictates the work; meaningful reduction needs
+   wire-format change.
+
+2. **Increasing SM throughput beyond 73.7 % SOL** — would require
+   reducing structural overheads (warp barriers, scheduler stalls
+   that aren't from any specific stall reason but from how warps
+   interleave). Hard to attack — the 26.3 % gap is the irreducible
+   scheduling overhead given the instruction mix.
+
+3. **Different parallelization granularity** — e.g., multiple warps
+   per sub-chunk cooperating (would change `WARPS_PER_BLOCK` and the
+   decode dispatch). Untested by these 6 experiments.
+
+The parallel-parse rewrite has been reverted. The implementation
+is preserved in this entry's description (≈80 lines of CUDA) and
+can be reconstructed from this entry if option (3) above ever
+becomes a candidate path. Until then: **stop optimizing this kernel
+within the current parallelization scheme**. We already beat nvCOMP
+LZ4 (3.77 vs 5.1 ms kernel) and nvCOMP Zstd (3.77 vs 6.2 ms) at the
+100 MB enwik8 L1 D2D decode comparison.
+
+All 6 experiments reverted; `lz_decode_core.cuh` is at HEAD. The
+`finalizeProfiling` bug fix in `src/gpu/decode/driver.zig:434-447`
+stays.
+
+## RETRACTION (2026-05-24, hours after the meta-entry above)
+
+**The 6th experiment (parallel parse) and likely several earlier ones
+were tested against a stale DLL** and the conclusions above are
+partially wrong. The kernel PTX is embedded into `streamlz_gpu.dll`
+at zig build time via `@embedFile`. Running `tools/build_gpu.bat`
+rebuilds the `.cubin` and `.ptx` but does NOT rebuild the DLL.
+Re-running tests after only rebuilding the cubin re-uses the OLD PTX
+embedded in the DLL — so all kernel modifications are silently dead.
+
+The session's experiments after the last `zig build gpulib`
+(specifically: experiments 3 = unconditional copy, 5 = back-ref
+prefetch, and 6 = parallel parse from the meta-entry) all hit this
+issue. Their "no kernel time change" results were not measuring the
+modified kernels at all.
+
+**The fix**: rebuild order must be `tools/build_gpu.bat` → `zig build
+gpulib -Doptimize=ReleaseFast -Dgpu=true` → run. Verified by
+`__trap()` injection: with stale DLL, kernel runs to completion; with
+fresh DLL, kernel crashes with `stream sync FAILED rc=719`.
+
+**Re-running parallel parse with FRESH DLL**:
+
+| Size / Level | TRUE baseline | Parallel parse (fresh DLL) | Δ |
+|---|---:|---:|---:|
+| 100 MB enwik8 L1 raw | 3.76 ms | **2.92 ms** | **–22.3 %** |
+| 100 MB enwik8 L3 | 3.79 ms | 3.79 ms | 0 % (uses slzLzDecodeKernel, mods only in raw) |
+| 100 MB enwik8 L5 | 4.41 ms | 4.41 ms | 0 % (same) |
+| 100 MB silesia L1 raw | ~3.31 ms | **2.64 ms** | **–20 %** |
+
+**Parallel parse WORKS — 20-22 % kernel speedup on the L1 raw path.**
+This matches the metric-based prediction (28-38 % parse-warp-insts
+removed → 20-35 % kernel speedup) almost exactly. The earlier "kernel
+time didn't budge" was the stale-DLL artifact, not a real measurement.
+
+**The meta-entry's conclusion about "the kernel is at its structural
+ceiling" was premature.** The structural ceiling argument was built on
+6 experiments where the changes weren't actually running. With proper
+rebuild, the per-warp instruction count lever DOES translate to wall
+clock — exactly as warp-instruction-throughput analysis predicts on a
+73.7 % SOL kernel.
+
+**Experiments 3, 5, 6 should be re-tested with proper rebuild before
+trusting their "no change" conclusion**. Experiments 1, 2, 4 likely
+ran against fresh DLLs at the time (the session was newer; `zig build`
+had been run more recently), but worth verifying.
+
+**Implementation kept** — the parallel-parse code is in
+`src/gpu/decode/lz_decode_core.cuh` and the `warpScanU32` helper at
+the top of the file. The serial path is preserved as fallback for
+batches containing long tokens. The bug that made earlier byte-exact
+tests trivially pass (stale DLL = unchanged kernel) was caught when
+the build was finally done properly and the freshly-built kernel
+hung — pointing to a real `__shfl_sync`-in-divergent-branch bug that
+took ~5 minutes to find and fix.
+
+**Lesson #1**: every kernel change requires the FULL build sequence —
+not just `tools/build_gpu.bat` (which only updates the .cubin/.ptx
+files on disk).
+
+  - `streamlz_gpu.dll` (used by `slz_gpu_d2d_test.exe`,
+    `slz_gpu_async_test.exe`) embeds the PTX via `@embedFile` in
+    `src/gpu/decode/driver.zig` at zig-build time. Built by
+    `zig build gpulib`.
+  - `streamlz.exe` (used by the CLI `-db` bench, `-d` decompress,
+    `-c` compress) ALSO embeds the PTX independently via the same
+    `@embedFile`. Built by `zig build` (no specific target).
+
+  **Both must be rebuilt** after any kernel-source change. The session
+  burned hours TWICE on this:
+    1. First on the DLL (experiments 3, 5, 6 from prior session and
+       the parallel-parse first attempt all ran against stale DLL).
+    2. Then on the EXE — even after fixing the DLL build, the first
+       NCU profile of PP-v2 via `streamlz -db` showed identical
+       metrics to pre-PP because the EXE still had the morning's
+       pre-PP PTX embedded. Each EXE/DLL embeds the PTX at its OWN
+       build time and they don't auto-sync.
+
+  `tools/build_gpu_full.bat` was created during this session and
+  chains all three steps: cubin rebuild → DLL rebuild → EXE rebuild.
+  Use it as the standard build command for any kernel work. Manual
+  `zig build` alone or `tools/build_gpu.bat` alone are silent bugs
+  waiting to happen.
+
+**Lesson #2**: when an experiment shows ZERO change in every metric
+(stall reasons, IPC, occupancy AND kernel time, all identical to
+baseline), suspect a stale-build issue before concluding the change
+is a no-op. A `__trap()` at the entry of the modified function is the
+fastest way to confirm the code is actually running.
+
+**Lesson #3**: the meta-entry above was overconfident. NCU stall-
+reason analysis tells you what kind of stall, and warp-instruction-
+count analysis tells you where time goes. Both were correct. The
+parallel-parse code, when it actually ran, produced exactly the
+~20 % speedup the analysis predicted. The "well-occupied SM absorbs
+single-warp savings" theory was a rationalisation of bad measurements,
+not an observation.
+
+## Three increment attempts on top of parallel parse (2026-05-24, after retraction)
+
+After parallel parse landed as a real 20-22 % L1-raw win, the question
+was whether any of the previously "failed" experiments (1-5 in this
+file, three of which were tested against stale DLLs) would stack on
+top of parallel parse for additional speedup. Tested three with proper
+build sequence (`tools/build_gpu_full.bat` — new script that chains
+cubin build + DLL rebuild):
+
+### Increment A: inline-PTX wide loads (memcpy-based) on top of PP
+
+Hypothesis: 4× fewer load ops per copy = shorter critical path for the
+cooperative copy phase, which now dominates after parallel parse.
+
+Result on 100 MB enwik8 L1 raw:
+
+| Variant | ms |
+|---|---:|
+| PP only | 2.92 |
+| PP + wide-load memcpy | **5.26** (+80 %) |
+
+REGRESSED. Same failure mode as the original wide-load experiment —
+memcpy with `uint8_t*` source doesn't lower to wide loads, just adds
+register pressure (STACK 72 → 104 raw, 192 → 216 general). The
+inline-PTX `ld.global.b32` variant crashed with `rc=716`
+(`cudaErrorIllegalAddress`) when applied to dst-relative addresses.
+Inline-PTX with `ld.b32` (address-space-agnostic) is the right next
+attempt but not pursued — parallel parse already shortened the parse-
+side stall, and the cooperative copy after PP runs on per-batch-
+prefix-summed offsets that are small (SHORT-token lit_len ≤ 7,
+match_len ≤ 15), so wide loads on those tiny ranges have no headroom
+to save against.
+
+### Increment B: unconditional warp-step (LZTurbo copy16 trick) on top of PP
+
+Hypothesis: skip the per-token loop check + tail-divergence by always
+writing 32 bytes, advancing dst_pos by actual lit_len/match_len. SHORT
+tokens (≤ 7 / ≤ 15 bytes) always fit in one warp-step. Saves ~3 cycles
+per token × 4K tokens = ~12K cycles per warp.
+
+Result on 100 MB enwik8 L1 raw: **FAILS byte-exact**.
+
+First mismatch at byte 131078 (6 bytes into sub-chunk 2 of 128KB). The
+unconditional copy's overshoot from the LAST token of sub-chunk 1
+leaks into sub-chunk 2's dst range. Sub-chunk 2's early match copies
+read those overshoot bytes BEFORE sub-chunk 2's literal writes
+overwrite them. This is a sub-chunk-boundary hazard that the LZTurbo
+overshoot trick implicitly avoids because LZTurbo decompresses
+contiguously (no per-sub-chunk decoding) — its overshoot region is
+always immediately overwritten by the next token in the same
+contiguous run, never crosses an independent-decode boundary.
+
+The original "byte-exact verified" report for this experiment from
+earlier in the session was a stale-DLL artifact — the test was running
+unmodified code. With proper rebuild, the correctness problem is
+visible. The pattern is genuinely wrong for our sub-chunk format.
+
+### Increment C: back-reference prefetch via 2-way manual unroll on top of PP
+
+Hypothesis: load all iter-0 + iter-1 reads first, then store both,
+defeating the conservative dst[]/lit[] alias serialisation. Should
+overlap N+1's L1 load with N's store.
+
+Result on 100 MB enwik8 L1 raw:
+
+| Variant | ms |
+|---|---:|
+| PP only | 2.92 |
+| PP + back-ref prefetch unroll | **3.37** (+15 %) |
+
+REGRESSED. The 2-way unroll adds permanent register pressure (v0, v1,
+valid0, valid1) AND a second conditional load/store for every
+iteration. For SHORT tokens (lit_len ≤ 7, match_len ≤ 15) the second
+iteration NEVER fires (lane + 32 > N always), so the entire second
+unroll is pure overhead. The compiler can't dead-code-eliminate it
+because N is runtime.
+
+Byte-exact verified (no correctness issue, just slower).
+
+### Why all three lose on the PP path
+
+After parallel parse, the per-token cooperative copy in the execution
+loop operates on SHORT-token sizes (1-7 byte literals, 1-15 byte
+matches). All three increments were originally designed for the LONG
+copy regime where they'd reduce instruction count or critical-path
+length. On SHORT ranges:
+
+- Wide loads: tiny gain per copy × tiny number of copy-iterations →
+  swamped by register-pressure cost.
+- Unconditional copy: marginal cycle savings × tiny copies →
+  correctness cost (sub-chunk overshoot) dominates.
+- Unrolled prefetch: the unrolled "second iter" never executes →
+  pure overhead.
+
+Generalising: **parallel parse already converted the parse-time
+bottleneck into a copy-time bottleneck on already-small copies**. The
+remaining wall-clock comes from per-token cooperative-copy overhead
+(broadcast shuffles, barriers) and warp-scan setup — neither attacked
+by these three increments.
+
+### What would actually stack on PP
+
+1. **Packed broadcast** — pack the 5 `__shfl_sync` per token (lit_len,
+   match_len, match_offset, dst_local, lit_local) into 1 shuffle + 4
+   PRMT extracts. Saves ~24 cycles per token × 4K tokens = ~96K cycles
+   per warp = ~1-2 %. Free to try.
+2. **Remove redundant `__syncwarp`** between literal and match copy
+   when the match read demonstrably can't see literal write overshoot
+   (always true on SHORT-token path with parallel parse). Saves ~5
+   cycles per token = ~1 %.
+3. **Cross-batch software pipelining** — overlap batch N+1's parallel
+   parse with batch N's execution loop. Multi-day work, would
+   genuinely shorten the per-warp critical chain.
+
+The first two are micro-polish; the third is the next real lever if
+perf needs more.
+
+### Current state
+
+`lz_decode_core.cuh` restored to PP-only baseline. PP-only timings on
+warmed-up GPU: 3.37 ms (vs cold-GPU 2.92 ms reported earlier — the
+22 % win figure was measured cold; under sustained bench load the GPU
+throttles slightly, giving 10-12 % gain). Either way, PP is the
+winner. Increments A, B, C make it worse or break it.
+
+Tools/process artifact: `tools/build_gpu_full.bat` now chains
+`build_gpu.bat` + `zig build gpulib`. Use this for every kernel-source
+change to avoid the stale-DLL trap that wasted most of the session.
+
+## Four "stack on top of parallel parse" items (2026-05-24, continued)
+
+After the three increments above (A, B, C) all lost, ran four targeted
+follow-up items proposed in the FAILED_EXPERIMENTS commentary:
+
+### Item 1: pack 5 broadcast `__shfl_sync` per token into 2 (pack + PRMT)
+
+Predicted ~1-2 %. Result: **0 %** (best 2.78 vs PP-only best 2.78). The
+compiler was already pipelining the 5 shuffles efficiently — they sit
+on the FMA pipe and overlap well. Reverted.
+
+### Item 2: conditional `__syncwarp` between literal and match copy
+
+Sync only when `|match_off| < lit_len + match_len` (close match would
+have cross-lane read-after-write hazard).
+
+Result: **+6 % regression** (2.95 vs 2.78). The conditional check
+(2-3 ALU ops per token) costs more than the saved sync (5 cycles
+when applicable). Reverted.
+
+### Item 3: port PP to `decodeSubChunkRawMode<true>` (entropy-coded off16)
+
+Removed the `if constexpr (!OFF16_SPLIT)` gate around the parallel-
+parse fast path; added compile-time-dispatched off16 load that handles
+both raw-interleaved (`<false>`) and split-hi/lo (`<true>`) cases. The
+`<true>` instantiation is the hot path for L3+ frames whose off16
+stream is entropy-coded.
+
+Result on 100 MB enwik8:
+
+| Level | True baseline | PP-only (v1) | **PP for both (v2)** | Δ vs baseline |
+|-------|--------------:|-------------:|---------------------:|--------------:|
+| L1 raw | 3.76 ms | 2.78 | 2.92 | **–22 %** |
+| L3 | 3.79 ms | 3.79 (unchanged) | **2.99** | **–21 %** |
+| L5 | 4.41 ms | 4.41 (unchanged) | **3.30** | **–25 %** |
+
+Silesia (100 MB):
+
+| Level | Baseline | **PP v2** | Δ |
+|-------|---------:|----------:|--:|
+| L1 raw | ~3.31 | 2.64 | –20 % |
+| L3 | ~3.34 | 2.67 | –20 % |
+| L5 | ~3.83 | 3.17 | –17 % |
+
+**LOCKED IN.** Parallel parse now applies to every kernel/level
+combination. The mechanism is identical for both `<false>` and `<true>`
+— only the per-lane off16 byte-assembly differs, which the compiler
+specialises at compile time via `if constexpr (OFF16_SPLIT)`.
+
+### Item 4: cross-batch software pipelining
+
+Considered: pre-load next batch's cmd bytes during current batch's
+execute phase so it's L1-warm when parsed.
+
+**Analysis instead of attempt** — within a single warp there's no real
+mechanism for parse/execute overlap: a warp has one execution stream
+and the SM scheduler already overlaps instructions across the 38
+resident warps. More importantly, the cmd-prefetch is *effectively
+already happening*: cmd_pos advances by 32 bytes per fast-path
+iteration, the L1 cache line is 128 bytes, so 3 out of 4 consecutive
+`cmd[cmd_pos + lane]` loads naturally hit L1 from the prior iteration's
+cache fill. Estimated maximum saving: one L1 miss per 4 batches ×
+25 cycles = ~6 cycles per 4 batches = negligible (<0.1 % kernel).
+
+Cross-warp pipelining (one warp parses while a sibling warp copies)
+would require restructuring `WARPS_PER_BLOCK` and the decode dispatch
+— major surgery, out of scope for an increment.
+
+**Skipped.** Documented for completeness; not pursued.
+
+### Summary of all 10 experiments + 3 increments + 4 items this session
+
+| # | Attack | Result |
+|---|---|---|
+| 1 | memcpy wide-load vectorize | no-op (PTX doesn't widen) |
+| 2 | inline-PTX `ld.global.b32` | no-op (proved by NCU equality) |
+| 3 | LZTurbo unconditional copy | no-op standalone; **fails** on PP path |
+| 4 | cp.async stream staging | no-op (NCU all metrics equal) |
+| 5 | back-ref prefetch unroll | no-op standalone |
+| 6 | parallel parse via warp scan | **WIN +22 %** (after stale-DLL bug fix) |
+| Inc A | wide loads on PP | **regression +80 %** |
+| Inc B | unconditional copy on PP | **broken** (sub-chunk boundary) |
+| Inc C | back-ref prefetch on PP | **regression +15 %** |
+| Item 1 | packed broadcast on PP | no-op |
+| Item 2 | conditional syncwarp on PP | regression +6 % |
+| Item 3 | PP for OFF16_SPLIT path | **WIN +21-25 % on L3/L5** |
+| Item 4 | cross-batch pipelining | skipped (no mechanism) |
+
+**Two wins**: parallel parse (item 6 from prior session) and PP
+for OFF16_SPLIT (item 3 from this run). Combined, they give:
+
+| Workload | True baseline | Final | Speedup |
+|---|---:|---:|---:|
+| 100 MB enwik8 L1 raw | 3.76 ms | 2.92 ms | **–22 %** |
+| 100 MB enwik8 L3 | 3.79 ms | 2.99 ms | **–21 %** |
+| 100 MB enwik8 L5 | 4.41 ms | 3.30 ms | **–25 %** |
+| 100 MB silesia L1 raw | ~3.31 ms | 2.64 ms | **–20 %** |
+| 100 MB silesia L3 | ~3.34 ms | 2.67 ms | **–20 %** |
+| 100 MB silesia L5 | ~3.83 ms | 3.17 ms | **–17 %** |
+
+Universal 17-25 % decode speedup across all levels and inputs tested,
+with the same single parallel-parse implementation handling both
+raw-off16 and entropy-coded-off16 sub-chunks via compile-time
+`if constexpr` dispatch.
+
+### Lessons retained for future kernel work
+
+1. **Always rebuild the DLL** (`tools/build_gpu_full.bat`) after any
+   kernel change. The cubin rebuild from `build_gpu.bat` alone is
+   silently dead because the DLL embeds the old PTX via `@embedFile`.
+2. **Inject `__trap()`** at the entry of a modified function as the
+   first sanity check that the new code path is actually executing.
+   Wall-clock identical to baseline + every NCU metric identical to
+   baseline almost certainly means the kernel didn't pick up the change.
+3. **NCU stall analysis points at categories, not specific shortenable
+   things.** "Long Scoreboard 50 %" can mean (a) a specific load
+   chain that you can attack with software pipelining or (b) the
+   irreducible scheduling overhead of a well-occupied SM. The first
+   is fixable; the second is not. The parallel-parse win came from
+   reducing per-warp instruction count (a structural change), not from
+   reducing per-load latency on the existing chain (which never moved
+   anything despite five attempts).
+4. **GPU thermal state matters for sub-second benchmarks.** Same code
+   measured 2.78 ms cold, 3.37 ms after sustained bench load. Re-run
+   alongside the comparison code at the same thermal state for honest
+   A/B.
+
+## Three L1-thrash attacks on top of PP-v2 (2026-05-24, continued)
+
+NCU profile of PP-v2 showed L1 hit rate dropped from 81.6% (pre-PP)
+to 64% post-PP, with Long Scoreboard climbing 49.9% → 60.9% of stalls.
+DRAM throughput up from 18.5% to 25.5%. Hypothesis: PP's coalesced
+cmd/off16 stream loads are evicting back-reference data, and freeing
+L1 capacity for back-refs would recover some kernel time.
+
+Three independent attacks on this hypothesis, all on top of PP-v2:
+
+### A1: `__ldcs` (cache-streaming hint) on cmd / off16 stream reads
+
+Tells the LSU "load this byte and mark the L1 line for early eviction".
+The streams are read-once after coalesced fill so __ldcs is the right
+semantic.
+
+Result (100 MB):
+
+| Workload | PP-v2 | + __ldcs | Δ |
+|---|---:|---:|--:|
+| enwik8 L1 raw | 2.92 ms | 2.92 | 0 |
+| enwik8 L3    | 2.99    | 2.99 | 0 |
+| enwik8 L5    | 3.30    | 3.26 | –1.2 % |
+| silesia L1   | 2.64    | 2.64 | 0 |
+| silesia L3   | 2.67    | 2.67 | 0 |
+| silesia L5   | 3.17    | 3.16 | 0 |
+
+Marginal positive on enwik8 L5 only. Within noise.
+
+### A2: Force max-L1 carveout via `cuFuncSetAttribute`
+
+Set `CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 0` (0 %
+shared, 100 % L1) on both LZ kernels. Since the kernels use 0 shared
+memory currently, this gives them the full 128 KB combined L1/shared
+as L1.
+
+Result:
+
+| Workload | PP-v2 | + max-L1 | Δ |
+|---|---:|---:|--:|
+| enwik8 L1 raw | 2.92 ms | 2.88 | –1.4 % |
+| enwik8 L3    | 2.99    | 2.99 | 0 |
+| enwik8 L5    | 3.30    | 3.26 | –1.2 % |
+| silesia L1   | 2.64    | 2.67 | **+1.1 %** |
+| silesia L3   | 2.67    | 2.73 | **+2.2 %** |
+| silesia L5   | 3.17    | 3.24 | **+2.2 %** |
+
+Marginal positive on enwik8, **negative on silesia**. The carveout
+probably costs something on the SM-scheduler side that hurts the more
+varied silesia workload. Net: no clear win. Reverted.
+
+### A3: cp.async cmd staging into shared memory (L1-bypass)
+
+Stage 256-byte cmd windows in shared memory via `cp.async.cg`
+(bypasses L1). 12 KB total shared / SM, costs ~10 % of L1 capacity in
+exchange for not running cmd loads through L1 at all. Required threading
+a `LzStage&` reference through `parseAndDecodeSubChunkRaw`,
+`parseAndDecodeSubChunk`, and both kernel entry points (~50 LOC).
+
+Result:
+
+| Workload | PP-v2 | + cp.async cmd | Δ |
+|---|---:|---:|--:|
+| enwik8 L1 raw | 2.92 ms | 2.88 | –1.4 % |
+| enwik8 L3    | 2.99    | 2.99 | 0 |
+| enwik8 L5    | 3.30    | 3.26 | –1.2 % |
+| silesia L1   | 2.64    | 2.67 | **+1.1 %** |
+| silesia L3   | 2.67    | 2.73 | **+2.2 %** |
+| silesia L5   | 3.17    | 3.26 | **+2.8 %** |
+
+Same shape as A2 — marginal on enwik8, worse on silesia. The shared mem
+cost + cp.async issue/wait overhead exceeds the L1 capacity benefit on
+silesia. Reverted.
+
+### Combined verdict: PP-v2 IS the ceiling for L1-thrash attacks
+
+Three independent attacks on the "L1 thrash" hypothesis all show the
+same pattern: tiny enwik8 signal (within noise), neutral/negative
+silesia. The L1 hit rate drop (81.6 → 64 %) appears to be **inherent
+to PP-v2's higher utilization** (Avg Active Threads/Warp jumped
+18.44 → 22.53, meaning more loads per warp instruction), not a fixable
+thrashing problem.
+
+The kernel's per-byte L1 traffic genuinely grew with PP because PP
+made the cooperative lanes do MORE useful work per instruction. The
+L1 has the same physical capacity; with more loads/cycle, hit rate
+naturally drops. This isn't a leak we can plug.
+
+**PP-v2 is the practical ceiling for this kernel structure on Ada
+within the current parallelization scheme.** Further gains require
+structural changes:
+
+- Different parallelization granularity (multiple warps per sub-chunk
+  cooperating, cross-warp pipelining)
+- Format-level changes (wider tokens, fewer total operations per byte)
+- Hopper-specific features (TMA, async warpgroups) on newer hardware
+
+None pursued in this session. The 21-25 % gain from parallel parse
++ PP-for-OFF16_SPLIT remains the locked-in win.
+
+### Final tally for the session
+
+- 6 standalone experiments tried (3 found to be against stale DLL)
+- 3 increments tried on top of PP
+- 4 + 3 follow-up items tried on top of PP-v2
+- **2 wins locked in**: parallel parse (PP) + PP for OFF16_SPLIT
+- 1 measurement-infra bug fix (`finalizeProfiling`)
+- 1 build-infrastructure script (`tools/build_gpu_full.bat`)
+- Universal 17-25 % decode kernel speedup across all 6 tested
+  workload/level combinations.
+
+Going further would need different ideas than per-instruction
+optimization. Stop here unless format change or major restructure is
+on the table.

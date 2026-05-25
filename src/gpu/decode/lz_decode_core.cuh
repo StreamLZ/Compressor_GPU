@@ -6,6 +6,19 @@
 
 #include "slz_wire_format.cuh"
 
+// Hillis-Steele warp exclusive scan, returns (lane's exclusive prefix, total).
+__device__ __forceinline__ void warpScanU32(uint32_t v, uint32_t& exclusive, uint32_t& total) {
+    uint32_t inclusive = v;
+    const int lane = threadIdx.x & LANE_MASK;
+    #pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        uint32_t n = __shfl_up_sync(FULL_WARP_MASK, inclusive, d);
+        if (lane >= d) inclusive += n;
+    }
+    exclusive = inclusive - v;
+    total = __shfl_sync(FULL_WARP_MASK, inclusive, 31);
+}
+
 // ── Raw-mode sub-chunk decoder ─────────────────────────────────
 // Streamlined single-LZ-block decoder: no off32, no delta literals, no
 // block split. Selected for any sub-chunk with off32_count == 0.
@@ -39,6 +52,104 @@ __device__ __noinline__ void decodeSubChunkRawMode(
     uint32_t length_offset = 0;
 
     while (cmd_pos < cmd_size) {
+        // Parallel-parse fast path. 32 tokens per outer iter: coalesced
+        // cmd LDG, per-lane decode, prefix-scan side-stream offsets,
+        // sequential cooperative copy. Compile-time dispatch on
+        // OFF16_SPLIT for the per-lane off16 load.
+        {
+            uint32_t remaining = cmd_size - cmd_pos;
+            uint32_t batch_size = remaining < WARP_SIZE ? remaining : WARP_SIZE;
+            uint8_t my_cmd = ((uint32_t)lane < batch_size) ? cmd[cmd_pos + lane] : 0;
+            bool my_is_long = ((uint32_t)lane < batch_size) && (my_cmd < TOKEN_SHORT_MIN);
+            uint32_t any_long = __ballot_sync(FULL_WARP_MASK, my_is_long);
+
+            if (any_long == 0) {
+                bool my_valid = (uint32_t)lane < batch_size;
+                uint32_t my_lit_len   = my_valid ? (uint32_t)(my_cmd & TOKEN_LIT_MASK) : 0u;
+                uint32_t my_match_len = my_valid ? (uint32_t)((my_cmd >> TOKEN_MATCH_SHIFT) & TOKEN_MATCH_MASK) : 0u;
+                uint32_t my_use_recent = my_valid ? (uint32_t)((my_cmd >> TOKEN_USE_RECENT_SHIFT) & TOKEN_USE_RECENT_MASK) : 0u;
+                uint32_t my_consumes_off16 = (my_valid && !my_use_recent) ? 1u : 0u;
+
+                uint32_t my_off16_local, total_off16_used;
+                warpScanU32(my_consumes_off16, my_off16_local, total_off16_used);
+
+                int32_t my_match_offset = recent_offset;
+                if (my_consumes_off16) {
+                    uint32_t entry_idx = off16_pos + my_off16_local;
+                    if (entry_idx < off16_count) {
+                        uint16_t v;
+                        if constexpr (OFF16_SPLIT) {
+                            // Entropy-coded off16: lo/hi in separate streams.
+                            v = (uint16_t)off16_lo[entry_idx] |
+                                ((uint16_t)off16_hi[entry_idx] << 8);
+                        } else {
+                            memcpy(&v, off16_raw + entry_idx * OFF16_ENTRY_BYTES, OFF16_ENTRY_BYTES);
+                        }
+                        my_match_offset = -(int32_t)v;
+                    }
+                }
+
+                uint32_t fresh_mask = __ballot_sync(FULL_WARP_MASK, my_consumes_off16 != 0);
+                // Compute src_lane on every lane (must call __shfl_sync uniformly).
+                uint32_t my_prefix = fresh_mask & ((1u << (lane + 1)) - 1u);
+                int src_lane = (my_prefix != 0) ? (31 - __clz(my_prefix)) : 0;
+                int32_t shuffled_off = __shfl_sync(FULL_WARP_MASK, my_match_offset, src_lane);
+                if (my_use_recent && my_prefix != 0) {
+                    my_match_offset = shuffled_off;
+                }
+
+                uint32_t my_total = my_lit_len + my_match_len;
+                uint32_t my_dst_local, total_dst;
+                warpScanU32(my_total, my_dst_local, total_dst);
+                uint32_t my_lit_local, total_lit;
+                warpScanU32(my_lit_len, my_lit_local, total_lit);
+
+                #pragma unroll 1
+                for (uint32_t k = 0; k < batch_size; k++) {
+                    uint32_t k_lit_len   = __shfl_sync(FULL_WARP_MASK, my_lit_len, k);
+                    uint32_t k_match_len = __shfl_sync(FULL_WARP_MASK, my_match_len, k);
+                    int32_t  k_match_off = __shfl_sync(FULL_WARP_MASK, my_match_offset, k);
+                    uint32_t k_dst_local = __shfl_sync(FULL_WARP_MASK, my_dst_local, k);
+                    uint32_t k_lit_local = __shfl_sync(FULL_WARP_MASK, my_lit_local, k);
+
+                    uint32_t this_dst_pos = dst_pos + k_dst_local;
+                    uint32_t this_lit_pos = lit_pos + k_lit_local;
+
+                    if (k_lit_len > 0) {
+                        for (uint32_t i = lane; i < k_lit_len; i += WARP_SIZE)
+                            dst[this_dst_pos + i] = lit[this_lit_pos + i];
+                        __syncwarp();
+                    }
+                    uint32_t copy_dst = this_dst_pos + k_lit_len;
+
+                    if (k_match_len > 0) {
+                        uint32_t match_src = (uint32_t)((int32_t)copy_dst + k_match_off);
+                        int32_t match_dist = -k_match_off;
+                        if (match_dist >= (int32_t)k_match_len && k_match_len > MIN_PARALLEL_MATCH_LEN - 1) {
+                            for (uint32_t i = lane; i < k_match_len; i += WARP_SIZE)
+                                dst[copy_dst + i] = dst[match_src + i];
+                        } else {
+                            if (lane == 0)
+                                for (uint32_t i = 0; i < k_match_len; i++)
+                                    dst[copy_dst + i] = dst[match_src + i];
+                        }
+                        __syncwarp();
+                    }
+                }
+
+                cmd_pos   += batch_size;
+                off16_pos += total_off16_used;
+                dst_pos   += total_dst;
+                lit_pos   += total_lit;
+
+                if (fresh_mask != 0) {
+                    int last_fresh = 31 - __clz(fresh_mask);
+                    recent_offset = __shfl_sync(FULL_WARP_MASK, my_match_offset, last_fresh);
+                }
+                continue;
+            }
+        }
+
         uint32_t lit_len = 0, match_len = 0;
         int32_t match_offset = recent_offset;
         uint32_t use_recent = 0;

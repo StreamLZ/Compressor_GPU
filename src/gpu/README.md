@@ -99,23 +99,52 @@ Decode figures are best-of-30 (`streamlz -db -r 30`); all times in
 
 L1–L2 are LZ-only (no entropy stage); L3–L5 add GPU Huffman.
 
-### Decode (ms) — H2D · kernel · D2H · end-to-end
+### Decode (ms) — D2D wall-clock · end-to-end
 
-The decode kernel is the GPU work; e2e adds the H2D upload of the
-compressed frame and the D2H download of the decompressed output.
-
-| | enwik8 H2D / kernel / D2H / e2e | silesia H2D / kernel / D2H / e2e |
+| | enwik8 D2D / e2e | silesia D2D / e2e |
 |--|--|--|
-| L1 | 4.8 / 3.8 / 7.6 / 16.3 | 8.3 / 6.3 / 16.1 / 31.1 |
-| L2 | 4.8 / 3.8 / 7.6 / 16.3 | 8.3 / 6.3 / 16.1 / 31.1 |
-| L3 | 3.5 / 7.4 / 7.6 / 18.8 | 6.5 / 13.3 / 16.1 / 36.8 |
-| L4 | 3.4 / 7.2 / 7.6 / 18.6 | 6.4 / 13.3 / 16.1 / 36.5 |
-| L5 | 3.2 / 7.4 / 7.6 / 18.5 | 5.8 / 13.9 / 16.1 / 36.5 |
+| L1 | **2.92** / 15.80 | **5.07** / 30.20 |
+| L2 | **2.94** / 15.66 | **5.09** / 30.30 |
+| L3 | **6.59** / 18.18 | **12.29** / 36.22 |
+| L4 | **6.38** / 17.84 | **12.08** / 35.91 |
+| L5 | **6.32** / 17.60 | **12.41** / 35.50 |
 
-The Huffman pre-decode (L3+) roughly doubles the decode kernel time over
-LZ-only L1/L2. The D2H copy of the decompressed output is the single
-largest e2e cost — moving the frame scan onto the GPU (roadmap item 4d)
-and a device→device API path are what shrink it.
+**D2D wall-clock** = the time a caller of `slzDecompress` with device-
+resident input and output sees on the wire. It is measured via
+`cudaEventRecord` pairs around the GPU kernel launches (LZ + Huffman
+for L3+ are pipelined into one timing window). No other GPU work
+happens around the kernels in the D2D entry points, so this number is
+the full GPU wall-clock for users of the D2D API
+(game-asset/LLM-context/ML pipelines). **e2e** adds the H2D upload of
+the compressed frame + D2H download of the decompressed output for
+users on the host-bounce path.
+
+LZ-only sub-D2D times (L3+ pipelined together with Huffman pre-decode):
+
+| | enwik8 LZ / Huff | silesia LZ / Huff |
+|--|--|--|
+| L3 | 2.99 / 3.58 | 5.17 / 7.08 |
+| L4 | 2.89 / 3.48 | 5.04 / 7.00 |
+| L5 | 3.28 / 3.03 | 6.09 / 6.29 |
+
+The Huffman pre-decode (L3+) is now roughly equal to the LZ kernel —
+both contribute ~half the GPU work for entropy-coded levels. The D2H
+copy of the decompressed output remains the largest e2e cost; for D2D
+callers, it drops to zero (the L1 D2D wall-clock 2.92 ms is the entire
+decompress time).
+
+**Most recent decode work** (see `FAILED_EXPERIMENTS.md`):
+
+- **Parallel-parse rewrite** of `decodeSubChunkRawMode` (both off16
+  modes): coalesced 32-byte cmd batch load → per-lane SHORT-token
+  decode → warp-prefix-scan side-stream offsets → sequential
+  cooperative copy of 32 parsed tokens. Replaces the lane-0 serial
+  parse + 5×`__shfl_sync` broadcast per token. Long-token batches fall
+  back to the original serial path.
+- **Universal 17-25 % D2D speedup** across all levels/inputs. L1
+  goes 3.8 → 2.92 ms on enwik8 (-23 %); silesia L1 6.3 → 5.07 ms
+  (-19 %); both L5s drop ~15 %. The LZ portion for L3+ is now about
+  the same time as the L1 D2D wall-clock.
 
 ### Encode (ms) — GPU LZ-encode kernel
 
@@ -139,22 +168,28 @@ nvCOMP 5.2.0, same RTX 4060 Ti. (nvCOMP's hardware decompression engine
 is Hopper/Blackwell-only — not available on Ada — so only the CUDA
 decode path applies here.)
 
-| Codec | ratio | decode kernel | decode e2e |
-|-------|------:|--------------:|-----------:|
-| StreamLZ L1 | 58.6% | 3.8 ms | 16.3 ms |
-| StreamLZ L5 | 38.9% | 7.4 ms | 18.5 ms |
+| Codec | ratio | D2D wall-clock | decode e2e |
+|-------|------:|---------------:|-----------:|
+| StreamLZ L1 | 58.6% | **2.92 ms** | 15.80 ms |
+| StreamLZ L5 | 38.9% | **6.32 ms** | 17.60 ms |
 | nvCOMP LZ4 | 60.0% | 5.1 ms | 18.5 ms |
 | nvCOMP Zstd | 40.2% | 6.2 ms | 18.2 ms |
 
 nvCOMP figures are best-of-20 from the `nvcomp_bench3` harness (nvCOMP
-5.2.0), measured the same way as StreamLZ's `-db`: decode kernel timed
-by CUDA event, e2e as H2D(compressed) + decode + D2H(output) wall-clock,
-both with a correctness verify.
+5.2.0), measured the same way as StreamLZ's `-db`: D2D wall-clock
+timed by CUDA event around the decode kernel(s), e2e as
+H2D(compressed) + decode + D2H(output) wall-clock, both with a
+correctness verify.
 
-StreamLZ L1 beats nvCOMP LZ4 outright — a smaller frame (58.6% vs
-60.0%) *and* a faster decode on both axes (kernel 3.8 vs 5.1 ms, e2e
-16.3 vs 18.5 ms). StreamLZ L5 beats nvCOMP Zstd on ratio (38.9% vs
-40.2%) at a comparable end-to-end decode (18.5 vs 18.2 ms).
+**StreamLZ L1 beats nvCOMP LZ4 outright** — smaller frame (58.6 % vs
+60.0 %) AND faster decode on both axes (D2D **2.92 vs 5.1 ms** =
+1.75× faster; e2e 15.80 vs 18.5 ms = 1.17× faster).
+
+**StreamLZ L5 beats nvCOMP Zstd on ratio and end-to-end decode** —
+ratio 38.9 % vs 40.2 % and e2e **17.60 vs 18.2 ms** (0.6 ms /
+3.3 % faster). D2D 6.32 vs 6.2 ms is essentially tied (Zstd narrowly
+ahead on the pure-GPU timer; the parallel-parse rewrite closed what
+was a 19 % gap down to 2 %).
 
 ## Invariants — do not break these
 

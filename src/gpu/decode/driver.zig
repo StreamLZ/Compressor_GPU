@@ -87,6 +87,12 @@ const FnEventRecord = *const fn (usize, usize) callconv(.c) CUresult;
 const FnEventSynchronize = *const fn (usize) callconv(.c) CUresult;
 const FnEventElapsedTime = *const fn (*f32, usize, usize) callconv(.c) CUresult;
 const FnEventDestroy = *const fn (usize) callconv(.c) CUresult;
+// cuFuncSetAttribute(CUfunction, CUfunction_attribute, int). Used to set
+// CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 0 (max L1, min
+// shared). NCU post-PP showed L1 hit rate dropped 81.6→64% — forcing
+// max L1 carveout reclaims capacity for the back-reference reads.
+const FnFuncSetAttribute = *const fn (usize, c_int, c_int) callconv(.c) CUresult;
+const CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT: c_int = 9;
 
 var cuInit_fn: ?FnInit = null;
 var cuDeviceGet_fn: ?FnDeviceGet = null;
@@ -114,6 +120,7 @@ var cuEventRecord_fn: ?FnEventRecord = null;
 var cuEventSynchronize_fn: ?FnEventSynchronize = null;
 var cuEventElapsedTime_fn: ?FnEventElapsedTime = null;
 var cuEventDestroy_fn: ?FnEventDestroy = null;
+var cuFuncSetAttribute_fn: ?FnFuncSetAttribute = null;
 
 // Pipeline streams (persistent, created once in init)
 const NUM_PIPELINE_STREAMS = 1;
@@ -166,6 +173,7 @@ pub fn init() bool {
     cuEventSynchronize_fn = getProc(FnEventSynchronize, "cuEventSynchronize");
     cuEventElapsedTime_fn = getProc(FnEventElapsedTime, "cuEventElapsedTime");
     cuEventDestroy_fn = getProc(FnEventDestroy, "cuEventDestroy_v2");
+    cuFuncSetAttribute_fn = getProc(FnFuncSetAttribute, "cuFuncSetAttribute");
 
     if ((cuInit_fn orelse return false)(0) != CUDA_SUCCESS) return false;
 
@@ -435,6 +443,12 @@ pub fn finalizeProfiling(
     pending: *std.ArrayListUnmanaged(PendingTiming),
     last_timings: *std.ArrayListUnmanaged(KernelTiming),
 ) void {
+    // Idempotent when pending is empty: leave last_timings untouched so the
+    // values populated by the prior call survive. slzGetLastTimings calls
+    // this from the main thread after the worker's fullGpuLaunchImpl has
+    // already drained pending into last_timings — wiping here would zero
+    // those timings out.
+    if (pending.items.len == 0) return;
     last_timings.clearRetainingCapacity();
     const sync_fn = cuEventSynchronize_fn orelse {
         pending.clearRetainingCapacity();
