@@ -121,9 +121,9 @@ __device__ static RawStreams parseRaw(const uint8_t* raw, uint32_t raw_size,
     uint32_t data_bytes = 0;
     uint32_t scan = rp;
     for (uint32_t i = 0; i < total_entries; i++) {
-        if (scan + 3 > raw_size) break;
+        if (scan + 3 > raw_size) return s;
         if (raw[scan + 2] >= OFF32_LONG_ENTRY_TAG) {
-            if (scan + 4 > raw_size) break;
+            if (scan + 4 > raw_size) return s;
             data_bytes += 4; scan += 4;
         } else {
             data_bytes += 3; scan += 3;
