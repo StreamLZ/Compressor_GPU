@@ -43,8 +43,12 @@ __device__ static bool scanParseHuffHeader(
     const uint8_t* chunk_src, uint32_t chunk_len, uint32_t pos,
     uint32_t src_offset_base, uint32_t dst_off, SlzScanHuffDesc& out) {
     if (pos >= chunk_len) return false;
-    const bool long_form = chunk_src[pos] >= HEADER_LONG_FORM_BIT;
-    const uint32_t need = long_form ? ENTROPY_HEADER_LONG_BYTES : ENTROPY_HEADER_SHORT_BYTES;
+    // HEADER_LONG_FORM_BIT is named for the high bit that, when SET,
+    // selects the SHORT (3-byte) header form. The 5-byte LONG form has
+    // the bit clear. parseEntropyHdrFields encodes that contract via
+    // h.header_bytes; this guard must match it byte-for-byte.
+    const bool short_form = chunk_src[pos] >= HEADER_LONG_FORM_BIT;
+    const uint32_t need = short_form ? ENTROPY_HEADER_SHORT_BYTES : ENTROPY_HEADER_LONG_BYTES;
     if (pos + need > chunk_len) return false;
     const EntropyHdrFields h = parseEntropyHdrFields(chunk_src + pos);
     out.in_offset  = src_offset_base + pos + h.header_bytes;
@@ -60,8 +64,10 @@ __device__ static bool scanParseType0(
     const uint8_t* chunk_src, uint32_t chunk_len, uint32_t pos,
     uint32_t& data_off, uint32_t& size) {
     if (pos >= chunk_len) return false;
-    const bool long_form = chunk_src[pos] >= HEADER_LONG_FORM_BIT;
-    const uint32_t need = long_form ? 3u : 2u;
+    // Short form = 2 bytes when HEADER_LONG_FORM_BIT is set; long form
+    // = 3 bytes when clear. Matches parseType0HdrFields' header_bytes.
+    const bool short_form = chunk_src[pos] >= HEADER_LONG_FORM_BIT;
+    const uint32_t need = short_form ? 2u : 3u;
     if (pos + need > chunk_len) return false;
     const Type0HdrFields h = parseType0HdrFields(chunk_src + pos);
     size = h.size;
