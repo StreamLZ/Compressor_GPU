@@ -64,3 +64,35 @@ static constexpr uint32_t OFF32_COUNT_PACK_MAX      = (1u << OFF32_COUNT_FIELD_B
 //   OFF32_LONG_ENTRY_TAG == (OFF32_LARGE_TAG >> 16)
 // where OFF32_LARGE_TAG lives in encode/lz_format.cuh.
 static constexpr uint8_t  OFF32_LONG_ENTRY_TAG      = 0xC0;
+
+// ── Frame-level wire constants (ABI surface for the decoder) ────────
+// Matched on the Zig side by `decode/driver.zig::FrameWalkStatus` and
+// the frame writer in `encode/fast_framed.zig`. Currently only the
+// walk-frame kernel consumes them on the GPU, but they are the
+// encode/decode contract and so live in the shared header.
+static constexpr uint32_t SLZ_FRAME_MAGIC           = 0x534C5A31u;
+static constexpr uint8_t  SLZ_FRAME_VERSION         = 2;
+static constexpr uint8_t  SLZ_CODEC_FAST_LZ         = 1; // Codec.fast_lz
+static constexpr uint32_t SLZ_FRAME_MIN_HDR_SIZE    = 14;
+static constexpr uint32_t SLZ_FRAME_END_MARK        = 0;
+static constexpr uint32_t SLZ_BLOCK_UNCOMP_FLAG     = 0x80000000u;
+static constexpr uint32_t SLZ_BLOCK_PDM_FLAG        = 0x40000000u;
+static constexpr uint32_t SLZ_CHUNK_SIZE_MASK       = 0x3FFFFu;   // 256KB - 1
+static constexpr uint32_t SLZ_CHUNK_TYPE_SHIFT      = 18;
+static constexpr uint32_t SLZ_CHUNK_TYPE_MASK       = 3u << SLZ_CHUNK_TYPE_SHIFT;
+static constexpr uint8_t  SLZ_INT_BLOCK_MAGIC       = 0x05;
+static constexpr uint8_t  SLZ_DECODER_FAST          = 1;
+static constexpr uint8_t  SLZ_DECODER_TURBO         = 2;
+
+// ── LZ-substream header sizes (encode side writes, decode side reads) ──
+static constexpr uint32_t STREAM_HEADER_BYTES       = 3; // big-endian count
+static constexpr uint32_t OFF16_HEADER_BYTES        = 2; // little-endian u16
+
+// ── 5-byte non-compact entropy chunk header (assemble_kernel.cu) ────
+// d[0] = [type << 4 | (dm1 >> 14) & 0xF]
+// d[1..5] = readU32BE-ordered (comp_size in low 18 bits, low 14 bits of
+//           dm1 packed above, see writeHuffChunkHdr).
+static constexpr uint32_t ENTROPY_HDR_DM1_HIGH4_SHIFT = 14;
+static constexpr uint32_t ENTROPY_HDR_DM1_HIGH_MASK   = 0xF;
+static constexpr uint32_t ENTROPY_HDR_DM1_LOW_MASK    = 0x3FFF;
+static constexpr uint32_t ENTROPY_HDR_COMP_BITS       = 18;

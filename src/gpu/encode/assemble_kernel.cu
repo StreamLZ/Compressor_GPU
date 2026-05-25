@@ -143,14 +143,14 @@ __device__ static RawStreams parseRaw(const uint8_t* raw, uint32_t raw_size,
 // every caller invokes the helper directly.
 
 // type-4 non-compact 5-byte header (entropy_encoder.zig writeNonCompactChunkHeader).
+// Field constants (ENTROPY_HDR_*) live in common/gpu_wire_format.cuh.
 __device__ __forceinline__ void writeHuffChunkHdr(uint8_t* d, uint32_t comp_size,
                                                   uint32_t decomp_size) {
     const uint32_t dm1 = decomp_size - 1;
-    d[0] = (uint8_t)(((uint32_t)HUFF_CHUNK_TYPE << 4) | ((dm1 >> 14) & 0xF));
-    const uint32_t bits = comp_size | ((dm1 & 0x3FFF) << 18);
-    d[1] = (uint8_t)((bits >> 24) & 0xFF);
-    d[2] = (uint8_t)((bits >> 16) & 0xFF);
-    d[3] = (uint8_t)((bits >> 8) & 0xFF);
+    d[0] = (uint8_t)(((uint32_t)HUFF_CHUNK_TYPE << CHUNK_TYPE_SHIFT)
+                   | ((dm1 >> ENTROPY_HDR_DM1_HIGH4_SHIFT) & ENTROPY_HDR_DM1_HIGH_MASK));
+    const uint32_t bits = comp_size | ((dm1 & ENTROPY_HDR_DM1_LOW_MASK) << ENTROPY_HDR_COMP_BITS);
+    writeBE24(d + 1, bits >> 8);
     d[4] = (uint8_t)(bits & 0xFF);
 }
 

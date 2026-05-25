@@ -31,10 +31,9 @@
 #include "lz_chain_parser.cuh"
 
 // ── Output framing constants ────────────────────────────────────
-// OFF32_COUNT_FIELD_BITS / OFF32_COUNT_PACK_MAX come from
+// All wire-format constants (STREAM_HEADER_BYTES, OFF16_HEADER_BYTES,
+// OFF32_COUNT_FIELD_BITS, OFF32_COUNT_PACK_MAX, ...) come from
 // ../common/gpu_wire_format.cuh (transitively via lz_format.cuh).
-static constexpr uint32_t STREAM_HEADER_BYTES = 3;  // 3-byte big-endian sub-stream count header
-static constexpr uint32_t OFF16_HEADER_BYTES  = 2;  // 2-byte off16 count header
 
 // ── slzLzEncodeKernel ───────────────────────────────────────────
 // LZ encode kernel entry point. One block per chunk, one warp (32

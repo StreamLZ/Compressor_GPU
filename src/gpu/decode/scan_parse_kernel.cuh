@@ -35,18 +35,19 @@ __device__ static bool scanParseHuffHeader(
     if (pos >= chunk_len) return false;
     const uint8_t first = chunk_src[pos];
     uint32_t comp_size, dst_size, payload_off;
-    if (first >= 0x80) {
-        if (pos + 3 > chunk_len) return false;
+    if (first >= HEADER_LONG_FORM_BIT) {
+        if (pos + ENTROPY_HEADER_SHORT_BYTES > chunk_len) return false;
         const uint32_t bits = readBE24(chunk_src + pos);
-        comp_size = bits & 0x3FF;
-        dst_size  = comp_size + ((bits >> 10) & 0x3FF) + 1;
-        payload_off = src_offset_base + pos + 3;
+        comp_size = bits & ENTROPY_SHORT_COMP_MASK;
+        dst_size  = comp_size + ((bits >> ENTROPY_SHORT_DELTA_SHIFT) & ENTROPY_SHORT_DELTA_MASK) + 1;
+        payload_off = src_offset_base + pos + ENTROPY_HEADER_SHORT_BYTES;
     } else {
-        if (pos + 5 > chunk_len) return false;
+        if (pos + ENTROPY_HEADER_LONG_BYTES > chunk_len) return false;
         const uint32_t bits = readU32BE(chunk_src + pos + 1);
-        comp_size = bits & 0x3FFFF;
-        dst_size  = (((bits >> 18) | ((uint32_t)chunk_src[pos] << 14)) & 0x3FFFF) + 1;
-        payload_off = src_offset_base + pos + 5;
+        comp_size = bits & ENTROPY_LONG_SIZE_MASK;
+        dst_size  = (((bits >> ENTROPY_LONG_DELTA_SHIFT)
+                   | ((uint32_t)chunk_src[pos] << ENTROPY_LONG_HI_SHIFT)) & ENTROPY_LONG_SIZE_MASK) + 1;
+        payload_off = src_offset_base + pos + ENTROPY_HEADER_LONG_BYTES;
     }
     out.in_offset = payload_off; out.in_size = comp_size;
     out.out_offset = dst_off;    out.out_size = dst_size;
@@ -60,9 +61,9 @@ __device__ static bool scanParseType0(
     uint32_t& data_off, uint32_t& size) {
     if (pos >= chunk_len) return false;
     const uint8_t first = chunk_src[pos];
-    if (first >= 0x80) {
+    if (first >= HEADER_LONG_FORM_BIT) {
         if (pos + 2 > chunk_len) return false;
-        size = (((uint32_t)chunk_src[pos] << 8) | (uint32_t)chunk_src[pos + 1]) & 0xFFF;
+        size = (((uint32_t)chunk_src[pos] << 8) | (uint32_t)chunk_src[pos + 1]) & TYPE0_SHORT_SIZE_MASK;
         data_off = pos + 2;
     } else {
         if (pos + 3 > chunk_len) return false;
@@ -79,21 +80,22 @@ __device__ static uint32_t scanSkipStreamHeader(
     const uint8_t first = chunk_src[pos];
     const uint32_t ct = (first >> 4) & 0x7;
     if (ct == 0) {
-        if (first >= 0x80) {
+        if (first >= HEADER_LONG_FORM_BIT) {
             if (pos + 2 > chunk_len) return 0xFFFFFFFFu;
-            const uint32_t sz = (((uint32_t)chunk_src[pos] << 8) | (uint32_t)chunk_src[pos + 1]) & 0xFFF;
+            const uint32_t sz = (((uint32_t)chunk_src[pos] << 8) | (uint32_t)chunk_src[pos + 1]) & TYPE0_SHORT_SIZE_MASK;
             return pos + 2 + sz;
         }
         if (pos + 3 > chunk_len) return 0xFFFFFFFFu;
         return pos + 3 + readBE24(chunk_src + pos);
     } else if (ct == 1 || ct == 2 || ct == 4 || ct == 6) {
-        if (first >= 0x80) {
-            if (pos + 3 > chunk_len) return 0xFFFFFFFFu;
-            return pos + 3 + (readBE24(chunk_src + pos) & 0x3FF);
+        if (first >= HEADER_LONG_FORM_BIT) {
+            if (pos + ENTROPY_HEADER_SHORT_BYTES > chunk_len) return 0xFFFFFFFFu;
+            return pos + ENTROPY_HEADER_SHORT_BYTES
+                 + (readBE24(chunk_src + pos) & ENTROPY_SHORT_COMP_MASK);
         }
-        if (pos + 5 > chunk_len) return 0xFFFFFFFFu;
+        if (pos + ENTROPY_HEADER_LONG_BYTES > chunk_len) return 0xFFFFFFFFu;
         const uint32_t bits = readU32BE(chunk_src + pos + 1);
-        return pos + 5 + (bits & 0x3FFFF);
+        return pos + ENTROPY_HEADER_LONG_BYTES + (bits & ENTROPY_LONG_SIZE_MASK);
     } else if (ct == 5) {
         if (pos + 7 > chunk_len) return 0xFFFFFFFFu;
         return pos + 7;
@@ -162,7 +164,7 @@ extern "C" __global__ void slzScanParseKernel(
         if (chunk_len < 3) break;
         const uint32_t sub_hdr = readBE24(chunk_src + sub_pos);
         if ((sub_hdr & SUBCHUNK_LZ_FLAG_BIT) == 0) break;
-        const uint32_t sc_comp = sub_hdr & 0x7FFFFu;
+        const uint32_t sc_comp = sub_hdr & SUBCHUNK_COMP_SIZE_MASK;
         const uint32_t sub_end = sub_pos + 3 + sc_comp;
         if (sub_end > chunk_len) break;
         const uint32_t sub_decomp = remaining < cap_safe ? remaining : cap_safe;

@@ -30,20 +30,7 @@
 //  12 = frame truncated mid-block
 //
 // Output ChunkDesc layout matches SlzChunkDesc above.
-
-static constexpr uint32_t SLZ_FRAME_MAGIC          = 0x534C5A31u;
-static constexpr uint8_t  SLZ_FRAME_VERSION        = 2;
-static constexpr uint8_t  SLZ_CODEC_FAST_LZ        = 1;  // Codec.fast_lz
-static constexpr uint32_t SLZ_FRAME_MIN_HDR_SIZE   = 14;
-static constexpr uint32_t SLZ_FRAME_END_MARK       = 0;
-static constexpr uint32_t SLZ_BLOCK_UNCOMP_FLAG    = 0x80000000u;
-static constexpr uint32_t SLZ_BLOCK_PDM_FLAG       = 0x40000000u;
-static constexpr uint32_t SLZ_CHUNK_SIZE_MASK      = 0x3FFFFu;   // 256KB - 1
-static constexpr uint32_t SLZ_CHUNK_TYPE_SHIFT     = 18;
-static constexpr uint32_t SLZ_CHUNK_TYPE_MASK      = 3u << SLZ_CHUNK_TYPE_SHIFT;
-static constexpr uint8_t  SLZ_INT_BLOCK_MAGIC      = 0x05;
-static constexpr uint8_t  SLZ_DECODER_FAST         = 1;
-static constexpr uint8_t  SLZ_DECODER_TURBO        = 2;
+// SLZ_FRAME_* constants live in common/gpu_wire_format.cuh (frame ABI).
 
 __device__ __forceinline__ float walkReadF32LE(const uint8_t* p) {
     union { uint32_t u; float f; } u;
