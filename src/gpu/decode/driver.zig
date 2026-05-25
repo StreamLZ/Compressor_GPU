@@ -835,7 +835,7 @@ fn scanForTansChunks(
 /// Parse a chunk_type=4 Huffman literal header at `lit_off` within chunk_src.
 /// Writes a HuffDecChunkDesc whose in_offset points at the FULL payload
 /// (128 B weights + 9 B sub-header + 4 streams). lut_offset is assigned by
-/// index — each descriptor owns 2048 contiguous LUT entries.
+/// index — each descriptor owns HUFF_LUT_ENTRIES contiguous LUT entries.
 fn parseHuffHeader(
     chunk_src: []const u8,
     lit_off: u32,

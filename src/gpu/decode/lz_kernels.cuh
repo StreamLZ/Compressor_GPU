@@ -679,9 +679,13 @@ extern "C" __global__ void slzWalkFrameKernel(
 // Single-threaded device-side compaction of the scan kernel's staged
 // arrays. Each (slzScanParseKernel-produced) staged entry has a `valid`
 // flag; the compaction drops invalid entries and assigns a sequential
-// lut_offset = slot * 1024 (mirrors HUFF_LUT_ENTRIES in driver.zig).
+// lut_offset = slot * HUFF_LUT_ENTRIES (defined in common/gpu_huffman.cuh,
+// mirrored as HUFF_LUT_ENTRIES in decode/driver.zig).
 // Used by the pure-D2D pipeline to eliminate the CPU compaction loop
 // that gpuScanChunks used to do after a D2H of the staged data.
+
+// Pulled in for HUFF_LUT_ENTRIES — the shared 4-stream Huffman wire format.
+#include "../common/gpu_huffman.cuh"
 
 // HuffDecChunkDesc output struct — must match the Zig HuffDecChunkDesc
 // (and huffman_kernel.cu's local definition). 5 u32 = 20 bytes.
@@ -714,7 +718,7 @@ extern "C" __global__ void slzCompactHuffDescsKernel(
             d_out[k].in_size    = s.in_size;
             d_out[k].out_offset = s.out_offset;
             d_out[k].out_size   = s.out_size;
-            d_out[k].lut_offset = k * 1024u; // HUFF_LUT_ENTRIES
+            d_out[k].lut_offset = k * HUFF_LUT_ENTRIES;
             k++;
         }
     }
@@ -783,28 +787,28 @@ extern "C" __global__ void slzMergeHuffDescsKernel(
     uint32_t lut_slot = 0;
     for (uint32_t i = 0; i < n_lit; i++) {
         SlzHuffDecChunkDesc d = d_lit[i];
-        d.lut_offset = lut_slot * 1024u;
+        d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
         d_merged[lut_slot] = d;
         lut_slot++;
     }
     for (uint32_t i = 0; i < n_tok; i++) {
         SlzHuffDecChunkDesc d = d_tok[i];
         d.out_offset += tok_region_off;
-        d.lut_offset = lut_slot * 1024u;
+        d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
         d_merged[lut_slot] = d;
         lut_slot++;
     }
     for (uint32_t i = 0; i < n_hi; i++) {
         SlzHuffDecChunkDesc d = d_hi[i];
         d.out_offset += off16_region_off;
-        d.lut_offset = lut_slot * 1024u;
+        d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
         d_merged[lut_slot] = d;
         lut_slot++;
     }
     for (uint32_t i = 0; i < n_lo; i++) {
         SlzHuffDecChunkDesc d = d_lo[i];
         d.out_offset += off16_region_off;
-        d.lut_offset = lut_slot * 1024u;
+        d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
         d_merged[lut_slot] = d;
         lut_slot++;
     }

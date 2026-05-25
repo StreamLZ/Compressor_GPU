@@ -144,9 +144,12 @@ __device__ __noinline__ void parseSubChunkHeaders(
             cmd_ptr = entropy_tok_scratch;
             cmd_pre_decoded = 1;
         } else {
-            // Huffman or other — skip the stream, zero out cmd_size
-            cmd_size = skipEntropyStream(src);
-            cmd_size = 0; // can't decode this
+            // Unsupported entropy type (chunk_type ∉ {0, 4} on GPU). Advance
+            // src past the stream so subsequent parsers see correct offsets,
+            // but signal an empty cmd to the caller — the decoder cannot
+            // consume this payload.
+            (void)skipEntropyStream(src);
+            cmd_size = 0;
         }
     }
     cmd_size = __shfl_sync(FULL_WARP_MASK, cmd_size, 0);

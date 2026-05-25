@@ -19,10 +19,9 @@
 // cannot be resolved by that prefix and instead uses an escape LUT
 // entry (the decoder then reads one extra bit). The two constants are
 // linked: the LUT index width is one bit less than the height limit.
-static constexpr int HUFF_MAX_CODE_LEN   = 11;
-static constexpr int HUFF_LUT_INDEX_BITS = HUFF_MAX_CODE_LEN - 1;   // 10
-static_assert(HUFF_LUT_INDEX_BITS == HUFF_MAX_CODE_LEN - 1,
-              "LUT index width must be one bit below the code-height limit");
+static constexpr int      HUFF_MAX_CODE_LEN   = 11;
+static constexpr int      HUFF_LUT_INDEX_BITS = HUFF_MAX_CODE_LEN - 1;   // 10
+static constexpr uint32_t HUFF_LUT_ENTRIES    = 1u << HUFF_LUT_INDEX_BITS; // 1024
 
 // Code-length histogram size: indices 0..HUFF_MAX_CODE_LEN+1 inclusive.
 static constexpr int HUFF_LEN_HIST_SIZE = HUFF_MAX_CODE_LEN + 2;    // 13
@@ -39,9 +38,6 @@ static constexpr int     HUFF_STREAM_SIZE_BYTES = 3;            // bytes per u24
 static constexpr int     HUFF_SUBHEADER_BYTES   = (HUFF_NUM_STREAMS - 1) * HUFF_STREAM_SIZE_BYTES; // 9
 static constexpr int     HUFF_BODY_HEADER_BYTES = HUFF_WEIGHTS_BYTES + HUFF_SUBHEADER_BYTES;       // 137
 static constexpr uint8_t HUFF_NIBBLE_MASK       = 0x0F;         // low-nibble mask
-
-static_assert(HUFF_SUBHEADER_BYTES == (HUFF_NUM_STREAMS - 1) * HUFF_STREAM_SIZE_BYTES,
-              "sub-header holds one u24 size per non-derived stream");
 
 // ── Weights pack / unpack ───────────────────────────────────────
 // 256 4-bit code lengths are stored in HUFF_WEIGHTS_BYTES bytes: byte i
