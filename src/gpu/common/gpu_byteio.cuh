@@ -41,6 +41,13 @@ __device__ __forceinline__ void storeU16LE(uint8_t* dst, uint16_t value) {
     memcpy(dst, &value, 2);
 }
 
+// ── 32-bit little-endian load (unaligned-safe) ──────────────────
+// Open-coded 4-byte read used by every LZ match-finder; collected here
+// so the encode hot loops can avoid restating the byte-shift idiom.
+__device__ __forceinline__ uint32_t readU32LE(const uint8_t* p) {
+    uint32_t v; memcpy(&v, p, 4); return v;
+}
+
 // ── Read up to 8 bytes, zero-padding past src_size ──────────────
 // Generic zero-padded tail read used by the LZ encode hash path.
 __device__ __forceinline__ uint64_t read8safe(const uint8_t* p, uint32_t pos,

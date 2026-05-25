@@ -19,6 +19,40 @@ __device__ __forceinline__ void warpScanU32(uint32_t v, uint32_t& exclusive, uin
     total = __shfl_sync(FULL_WARP_MASK, inclusive, 31);
 }
 
+// ── Warp-cooperative copy primitives (raw-mode, no bounds check) ──
+// The raw-mode decoder writes inside a known-safe dst_size window so per-
+// store bounds checks are unnecessary. The general decoder has its own
+// inlined copies with dst_end_abs guards.
+//
+// Match copy: a non-overlapping match (match_dist >= match_len) is
+// distributed across all 32 lanes; an overlapping match must run
+// sequentially on lane 0 because lane k would read dst[match_src+k]
+// before lane k-1 wrote it.
+//
+// Both are __forceinline__ — the prior inline bodies they replace were
+// in the decode hot loop, and nvcc lays them out identically.
+__device__ __forceinline__ void warpLiteralCopy(
+    uint8_t* __restrict__ dst, uint32_t dst_pos,
+    const uint8_t* __restrict__ lit, uint32_t lit_pos,
+    uint32_t lit_len, int lane
+) {
+    for (uint32_t i = lane; i < lit_len; i += WARP_SIZE)
+        dst[dst_pos + i] = lit[lit_pos + i];
+}
+
+__device__ __forceinline__ void warpMatchCopy(
+    uint8_t* __restrict__ dst, uint32_t dst_pos,
+    uint32_t match_src, uint32_t match_len, int32_t match_dist, int lane
+) {
+    if (match_dist >= (int32_t)match_len && match_len > MIN_PARALLEL_MATCH_LEN - 1) {
+        for (uint32_t i = lane; i < match_len; i += WARP_SIZE)
+            dst[dst_pos + i] = dst[match_src + i];
+    } else if (lane == 0) {
+        for (uint32_t i = 0; i < match_len; i++)
+            dst[dst_pos + i] = dst[match_src + i];
+    }
+}
+
 // ── Raw-mode sub-chunk decoder ─────────────────────────────────
 // Streamlined single-LZ-block decoder: no off32, no delta literals, no
 // block split. Selected for any sub-chunk with off32_count == 0.
@@ -116,23 +150,14 @@ __device__ __noinline__ void decodeSubChunkRawMode(
                     uint32_t this_lit_pos = lit_pos + k_lit_local;
 
                     if (k_lit_len > 0) {
-                        for (uint32_t i = lane; i < k_lit_len; i += WARP_SIZE)
-                            dst[this_dst_pos + i] = lit[this_lit_pos + i];
+                        warpLiteralCopy(dst, this_dst_pos, lit, this_lit_pos, k_lit_len, lane);
                         __syncwarp();
                     }
                     uint32_t copy_dst = this_dst_pos + k_lit_len;
 
                     if (k_match_len > 0) {
                         uint32_t match_src = (uint32_t)((int32_t)copy_dst + k_match_off);
-                        int32_t match_dist = -k_match_off;
-                        if (match_dist >= (int32_t)k_match_len && k_match_len > MIN_PARALLEL_MATCH_LEN - 1) {
-                            for (uint32_t i = lane; i < k_match_len; i += WARP_SIZE)
-                                dst[copy_dst + i] = dst[match_src + i];
-                        } else {
-                            if (lane == 0)
-                                for (uint32_t i = 0; i < k_match_len; i++)
-                                    dst[copy_dst + i] = dst[match_src + i];
-                        }
+                        warpMatchCopy(dst, copy_dst, match_src, k_match_len, -k_match_off, lane);
                         __syncwarp();
                     }
                 }
@@ -200,8 +225,7 @@ __device__ __noinline__ void decodeSubChunkRawMode(
 
         // ── Warp-cooperative literal copy ──
         if (lit_len > 0) {
-            for (uint32_t i = lane; i < lit_len; i += WARP_SIZE)
-                dst[dst_pos + i] = lit[lit_pos + i];
+            warpLiteralCopy(dst, dst_pos, lit, lit_pos, lit_len, lane);
             __syncwarp();
         }
         dst_pos += lit_len;
@@ -210,18 +234,7 @@ __device__ __noinline__ void decodeSubChunkRawMode(
         // ── Warp-cooperative match copy ──
         if (match_len > 0) {
             uint32_t match_src = (uint32_t)((int32_t)dst_pos + match_offset);
-            int32_t match_dist = -match_offset;
-            // Parallel copy is only safe for non-overlapping matches:
-            // an overlapping match (match_dist < match_len) would have a
-            // lane read a dst byte another lane has not written yet.
-            if (match_dist >= (int32_t)match_len && match_len > MIN_PARALLEL_MATCH_LEN - 1) {
-                for (uint32_t i = lane; i < match_len; i += WARP_SIZE)
-                    dst[dst_pos + i] = dst[match_src + i];
-            } else {
-                if (lane == 0)
-                    for (uint32_t i = 0; i < match_len; i++)
-                        dst[dst_pos + i] = dst[match_src + i];
-            }
+            warpMatchCopy(dst, dst_pos, match_src, match_len, -match_offset, lane);
             __syncwarp();
         }
         dst_pos += match_len;

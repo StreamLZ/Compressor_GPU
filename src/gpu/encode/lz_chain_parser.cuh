@@ -90,10 +90,7 @@ __device__ ChainMatch findMatchChain(
     uint32_t lit_run_length
 ) {
     // Read 4 bytes at current position
-    uint32_t bytes_at_pos = (uint32_t)src[pos]
-                          | ((uint32_t)src[pos + 1] << 8)
-                          | ((uint32_t)src[pos + 2] << 16)
-                          | ((uint32_t)src[pos + 3] << 24);
+    uint32_t bytes_at_pos = readU32LE(src + pos);
 
     uint64_t at_src = read8safe(src + pos, pos, src_size);
     uint32_t ha = hashTableA(hash_bits, hash_mask, at_src);
@@ -105,10 +102,7 @@ __device__ ChainMatch findMatchChain(
     {
         uint32_t recent_ref = (uint32_t)((int32_t)pos + recent_offset);
         if (recent_ref < pos) {  // valid backward reference
-            uint32_t recent_word = (uint32_t)src[recent_ref]
-                                 | ((uint32_t)src[recent_ref + 1] << 8)
-                                 | ((uint32_t)src[recent_ref + 2] << 16)
-                                 | ((uint32_t)src[recent_ref + 3] << 24);
+            uint32_t recent_word = readU32LE(src + recent_ref);
             uint32_t xor_val = bytes_at_pos ^ recent_word;
             if (xor_val == 0) {
                 // Full 4-byte match -- extend forward
@@ -152,10 +146,7 @@ __device__ ChainMatch findMatchChain(
                     if (candidate_offset > MIN_HASH_MATCH_OFFSET) {
                         if (candidate_offset <= pos) {
                             uint32_t ref = pos - candidate_offset;
-                            uint32_t ref_word = (uint32_t)src[ref]
-                                              | ((uint32_t)src[ref + 1] << 8)
-                                              | ((uint32_t)src[ref + 2] << 16)
-                                              | ((uint32_t)src[ref + 3] << 24);
+                            uint32_t ref_word = readU32LE(src + ref);
                             if (ref_word == bytes_at_pos) {
                                 // Three-stage filter: check byte at best_match_length
                                 bool quick_ok = true;
@@ -193,10 +184,7 @@ __device__ ChainMatch findMatchChain(
         } else if (candidate_offset <= pos && candidate_offset < LZ_BLOCK_SIZE) {
             // Far first-hash hit (> NEAR_OFFSET_MAX but within dictionary)
             uint32_t ref = pos - candidate_offset;
-            uint32_t ref_word = (uint32_t)src[ref]
-                              | ((uint32_t)src[ref + 1] << 8)
-                              | ((uint32_t)src[ref + 2] << 16)
-                              | ((uint32_t)src[ref + 3] << 24);
+            uint32_t ref_word = readU32LE(src + ref);
             if (ref_word == bytes_at_pos) {
                 uint32_t ml = 4;
                 uint32_t max_ext = end_pos - pos;
@@ -219,10 +207,7 @@ __device__ ChainMatch findMatchChain(
                 uint32_t cand_off = pos - cand_pos;
                 if (cand_off >= MIN_HASH_MATCH_OFFSET && cand_off <= NEAR_OFFSET_MAX) {
                     uint32_t ref = pos - cand_off;
-                    uint32_t ref_word = (uint32_t)src[ref]
-                                      | ((uint32_t)src[ref + 1] << 8)
-                                      | ((uint32_t)src[ref + 2] << 16)
-                                      | ((uint32_t)src[ref + 3] << 24);
+                    uint32_t ref_word = readU32LE(src + ref);
                     if (ref_word == bytes_at_pos) {
                         // Three-stage filter: check byte at best_match_length
                         bool quick_ok = true;
@@ -253,10 +238,7 @@ __device__ ChainMatch findMatchChain(
     // (d) Fixed offset-8 fallback
     if (pos >= MIN_HASH_MATCH_OFFSET) {
         uint32_t ref = pos - MIN_HASH_MATCH_OFFSET;
-        uint32_t ref_word = (uint32_t)src[ref]
-                          | ((uint32_t)src[ref + 1] << 8)
-                          | ((uint32_t)src[ref + 2] << 16)
-                          | ((uint32_t)src[ref + 3] << 24);
+        uint32_t ref_word = readU32LE(src + ref);
         if (ref_word == bytes_at_pos) {
             uint32_t ml = 4;
             uint32_t max_ext = end_pos - pos;
