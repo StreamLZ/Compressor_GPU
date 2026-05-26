@@ -370,6 +370,226 @@ pub fn fullGpuLaunch(
     });
 }
 
+/// Launches the Huffman LUT-build kernel and the 4-stream decode
+/// kernel into `heavy_stream`. Both kernels self-gate on `*d_n_huff`,
+/// so it is safe to launch them with the chunk count even if some
+/// chunks have no Huffman streams.
+///
+/// Returns the LUT-build elapsed nanoseconds when `split_timer` is
+/// set (driven by SLZ_SPLIT_TIMER); otherwise zero. The caller is
+/// responsible for computing the full huff-total time after the
+/// pipeline-stream sync.
+fn runHuffPredecode(
+    self: *DecodeContext,
+    scan: ScanResult,
+    n_huff: u32,
+    heavy_stream: usize,
+    split_timer: bool,
+    t_huff_start: anytype,
+    io: ?std.Io,
+) GpuError!i64 {
+    const h2d_fn = cuda.cuMemcpyHtoD_fn orelse return error.BackendNotAvailable;
+    const launch_fn = cuda.cuLaunchKernel_fn orelse return error.BackendNotAvailable;
+
+    const huff_stream = heavy_stream;
+    var split_huff_build_ns: i64 = 0;
+
+    // Step 7: huff kernels self-gate on `*d_n_blocks`. The GPU
+    // merge kernel writes n_merged to d_compact_counts+20; reuse
+    // that slot when GPU merge ran. CPU-merge fallback stages
+    // n_huff into d_n_huff_scratch via a 4 B H2D.
+    const d_n_huff: u64 = if (scan.device_compact_populated and ml.merge_huff_descs_fn != 0)
+        self.d_compact_counts + 20
+    else d_nh: {
+        if (!ensureDeviceBuf(&self.d_n_huff_scratch, &self.d_n_huff_scratch_size, 4)) return error.OutOfDeviceMemory;
+        var host_n_huff: u32 = n_huff;
+        try cudaCall(h2d_fn(self.d_n_huff_scratch, @ptrCast(&host_n_huff), 4), .copy);
+        break :d_nh self.d_n_huff_scratch;
+    };
+    {
+        var p_comp = self.d_comp_persist;
+        var p_descs = self.d_huff_descs;
+        var p_lut = self.d_huff_lut;
+        var p_n = d_n_huff;
+        var params = [_]?*anyopaque{
+            @ptrCast(&p_comp), @ptrCast(&p_descs),
+            @ptrCast(&p_lut), @ptrCast(&p_n),
+        };
+        var extra = [_]?*anyopaque{null};
+        const t_hb = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffBuildLutKernel", huff_stream);
+        try cudaCall(launch_fn(ml.huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra), .launch);
+        endKernelTiming(t_hb, huff_stream);
+    }
+    // Split fence: time the LUT build separately from the decode.
+    if (split_timer) {
+        if (cuda.cuStreamSync_fn) |sf| try cudaCall(sf(huff_stream), .sync);
+        if (t_huff_start) |hs| {
+            if (io) |io_val|
+                split_huff_build_ns = @intCast(hs.untilNow(io_val, .awake).toNanoseconds());
+        }
+    }
+    {
+        var p_comp = self.d_comp_persist;
+        var p_descs = self.d_huff_descs;
+        var p_lut = self.d_huff_lut;
+        var p_out = self.d_entropy_scratch;
+        var p_n = d_n_huff;
+        var params = [_]?*anyopaque{
+            @ptrCast(&p_comp), @ptrCast(&p_descs),
+            @ptrCast(&p_lut), @ptrCast(&p_out), @ptrCast(&p_n),
+        };
+        var extra = [_]?*anyopaque{null};
+        const shared_bytes: c_uint = HUFF_LUT_ENTRIES * @sizeOf(u32);
+        const t_hd = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffDecode4StreamKernel", huff_stream);
+        try cudaCall(launch_fn(ml.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, shared_bytes, huff_stream, &params, &extra), .launch);
+        endKernelTiming(t_hd, huff_stream);
+    }
+    return split_huff_build_ns;
+}
+
+/// Launches the per-pipeline-stream LZ decode kernels. Uses the lean
+/// raw kernel when no Huffman streams are present (L1/L2 path);
+/// otherwise the general kernel that consumes `d_entropy_scratch`.
+/// Operations within a stream are ordered; across streams they can
+/// overlap.
+///
+/// Returns the per-launch summed LZ elapsed nanoseconds when
+/// `split_timer` is set; otherwise zero.
+fn runLzPipeline(
+    self: *DecodeContext,
+    chunks_per_group: u32,
+    sub_chunk_cap: u32,
+    n_huff: u32,
+    total_chunks: u32,
+    total_subchunks: u32,
+    pipe_chunk_count: u32,
+    heavy_stream: usize,
+    split_timer: bool,
+    io: ?std.Io,
+) GpuError!i64 {
+    const h2d_fn = cuda.cuMemcpyHtoD_fn orelse return error.BackendNotAvailable;
+    const launch_fn = cuda.cuLaunchKernel_fn orelse return error.BackendNotAvailable;
+    const stream_sync_fn = cuda.cuStreamSync_fn orelse return error.BackendNotAvailable;
+
+    var split_lz_ns: i64 = 0;
+
+    for (0..NUM_PIPELINE_STREAMS) |g| {
+        const stream: usize = if (NUM_PIPELINE_STREAMS == 1) heavy_stream else self.pipeline_streams[g];
+        const chunk_start = @as(u32, @intCast(g)) * pipe_chunk_count;
+        const chunk_end = @min(chunk_start + pipe_chunk_count, total_chunks);
+        const group_chunks = chunk_end - chunk_start;
+        if (group_chunks == 0) continue;
+
+        const t_lz_start = if (split_timer)
+            if (io) |io_val| std.Io.Clock.awake.now(io_val) else null
+        else
+            null;
+
+        // chunks pointer = full array (NOT offset), chunk_base = chunk_start
+        // total = chunk_end so the kernel's bounds check (chunk_idx >= total) works
+        const lz_groups_in_pipe = (group_chunks + chunks_per_group - 1) / chunks_per_group;
+        const lz_grid_x = (lz_groups_in_pipe + 1) / 2;
+
+        // Step 7: LZ kernels self-gate on `*d_total_chunks`. Stage the
+        // per-pipeline-group count into d_n_groups_scratch (4 B H2D).
+        if (!ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4)) return error.OutOfDeviceMemory;
+        var host_per_group_total: u32 = chunk_end - chunk_start;
+        try cudaCall(h2d_fn(self.d_n_groups_scratch, @ptrCast(&host_per_group_total), 4), .copy);
+
+        // Fast path: no entropy in this scan → use lean L1/L2 raw kernel.
+        // Huffman literals require the general kernel (it reads entropy_scratch).
+        const use_raw_kernel = n_huff == 0 and ml.kernel_raw_fn != 0;
+
+        // The six common params shared by both LZ-decode kernel
+        // variants. Storage is a struct so each field has a stable
+        // address for the kernel-params array.
+        var common = LzCommonParams{
+            .comp = self.d_comp_persist,
+            .descs_dev = self.d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc),
+            .dst = self.d_output,
+            .cpg = chunks_per_group,
+            .total = self.d_n_groups_scratch,
+            .sc_cap = sub_chunk_cap,
+        };
+
+        if (use_raw_kernel) {
+            var raw_params = [_]?*anyopaque{
+                @ptrCast(&common.comp),
+                @ptrCast(&common.descs_dev),
+                @ptrCast(&common.dst),
+                @ptrCast(&common.cpg),
+                @ptrCast(&common.total),
+                @ptrCast(&common.sc_cap),
+            };
+            var raw_extra = [_]?*anyopaque{null};
+            const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", stream);
+            try cudaCall(launch_fn(ml.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra), .launch);
+            endKernelTiming(t_lzr, stream);
+        } else {
+            // General kernel additionally takes entropy_scratch +
+            // slot_stride + first_sub_idx (variable per launch).
+            var p_entropy_scratch = self.d_entropy_scratch;
+            var p_entropy_slot_stride: u64 = @as(u64, total_subchunks) * d.ENTROPY_SCRATCH_SLOT_BYTES;
+            var p_first_sub_idx: CUdeviceptr = self.d_first_subchunk_idx +
+                if (self.d_first_subchunk_idx != 0) @as(u64, chunk_start) * @sizeOf(u32) else 0;
+
+            var lz_params = [_]?*anyopaque{
+                @ptrCast(&common.comp),
+                @ptrCast(&common.descs_dev),
+                @ptrCast(&common.dst),
+                @ptrCast(&common.cpg),
+                @ptrCast(&common.total),
+                @ptrCast(&common.sc_cap),
+                @ptrCast(&p_entropy_scratch),
+                @ptrCast(&p_entropy_slot_stride),
+                @ptrCast(&p_first_sub_idx),
+            };
+            var lz_extra = [_]?*anyopaque{null};
+
+            const t_lz = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeKernel", stream);
+            try cudaCall(launch_fn(ml.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra), .launch);
+            endKernelTiming(t_lz, stream);
+        }
+
+        if (split_timer) {
+            try cudaCall(stream_sync_fn(stream), .sync);
+            if (t_lz_start) |ts_start| {
+                if (io) |io_val| {
+                    split_lz_ns += @intCast(ts_start.untilNow(io_val, .awake).toNanoseconds());
+                }
+            }
+        }
+    }
+
+    return split_lz_ns;
+}
+
+/// Writes the decompressed output to the caller-supplied destination.
+/// Two paths:
+///   - D2D (4d Phase 3): the caller passed a device-resident target;
+///     we issue a D2D async copy on `heavy_stream` so it serializes
+///     after the LZ kernel on the same stream. The caller's
+///     `cudaStreamSynchronize` on that stream waits for the result.
+///   - D2H: the caller wants the result on the host; the synchronous
+///     `cuMemcpyDtoH` blocks until the copy completes.
+///
+/// In sync mode (work_stream == 0) the D2D path also issues a
+/// ctx-wide sync to ensure the caller observes a settled output
+/// when this function returns.
+fn finalizeOutput(self: *DecodeContext, req: DecodeRequest, heavy_stream: usize) GpuError!void {
+    if (req.d_output_target) |dev_target| {
+        const d2d = cuda.cuMemcpyDtoDAsync_fn orelse return error.BackendNotAvailable;
+        try cudaCall(d2d(dev_target + req.dst_start_off, self.d_output + req.dst_start_off, req.decompressed_size, heavy_stream), .copy);
+        if (self.work_stream == 0) {
+            const sync_fn = cuda.cuCtxSynchronize_fn orelse return error.BackendNotAvailable;
+            try cudaCall(sync_fn(), .sync);
+        }
+    } else {
+        const d2h_fn = cuda.cuMemcpyDtoH_fn orelse return error.BackendNotAvailable;
+        try cudaCall(d2h_fn(@ptrCast(req.dst_full + req.dst_start_off), self.d_output + req.dst_start_off, req.decompressed_size), .copy);
+    }
+}
+
 pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void {
     // Shadow request fields as locals so the function body below — which
     // predates the struct-arg refactor and references the bare names —
@@ -383,7 +603,6 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     const chunks_per_group = req.chunks_per_group;
     const sub_chunk_cap = req.sub_chunk_cap;
     const io = req.io;
-    const d_output_target = req.d_output_target;
     const d_compressed_src = req.d_compressed_src;
 
     if (!ml.init()) return error.BackendNotAvailable;
@@ -592,57 +811,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             null;
         var split_huff_build_ns: i64 = 0;
         if (have_huff) {
-            const huff_stream = heavy_stream;
-            // Step 7: huff kernels self-gate on `*d_n_blocks`. The GPU
-            // merge kernel writes n_merged to d_compact_counts+20; reuse
-            // that slot when GPU merge ran. CPU-merge fallback stages
-            // n_huff into d_n_huff_scratch via a 4 B H2D.
-            const d_n_huff: u64 = if (scan.device_compact_populated and ml.merge_huff_descs_fn != 0)
-                self.d_compact_counts + 20
-            else d_nh: {
-                if (!ensureDeviceBuf(&self.d_n_huff_scratch, &self.d_n_huff_scratch_size, 4)) return error.OutOfDeviceMemory;
-                var host_n_huff: u32 = n_huff;
-                try cudaCall(h2d_fn(self.d_n_huff_scratch, @ptrCast(&host_n_huff), 4), .copy);
-                break :d_nh self.d_n_huff_scratch;
-            };
-            {
-                var p_comp = self.d_comp_persist;
-                var p_descs = self.d_huff_descs;
-                var p_lut = self.d_huff_lut;
-                var p_n = d_n_huff;
-                var params = [_]?*anyopaque{
-                    @ptrCast(&p_comp), @ptrCast(&p_descs),
-                    @ptrCast(&p_lut), @ptrCast(&p_n),
-                };
-                var extra = [_]?*anyopaque{null};
-                const t_hb = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffBuildLutKernel", huff_stream);
-                try cudaCall(launch_fn(ml.huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra), .launch);
-                endKernelTiming(t_hb, huff_stream);
-            }
-            // Split fence: time the LUT build separately from the decode.
-            if (split_timer) {
-                if (cuda.cuStreamSync_fn) |sf| try cudaCall(sf(huff_stream), .sync);
-                if (t_huff_start) |hs| {
-                    if (io) |io_val|
-                        split_huff_build_ns = @intCast(hs.untilNow(io_val, .awake).toNanoseconds());
-                }
-            }
-            {
-                var p_comp = self.d_comp_persist;
-                var p_descs = self.d_huff_descs;
-                var p_lut = self.d_huff_lut;
-                var p_out = self.d_entropy_scratch;
-                var p_n = d_n_huff;
-                var params = [_]?*anyopaque{
-                    @ptrCast(&p_comp), @ptrCast(&p_descs),
-                    @ptrCast(&p_lut), @ptrCast(&p_out), @ptrCast(&p_n),
-                };
-                var extra = [_]?*anyopaque{null};
-                const shared_bytes: c_uint = HUFF_LUT_ENTRIES * @sizeOf(u32);
-                const t_hd = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffDecode4StreamKernel", huff_stream);
-                try cudaCall(launch_fn(ml.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, shared_bytes, huff_stream, &params, &extra), .launch);
-                endKernelTiming(t_hd, huff_stream);
-            }
+            split_huff_build_ns = try runHuffPredecode(self, scan, n_huff, heavy_stream, split_timer, t_huff_start, io);
         }
 
         // Launch pipelined groups: one LZ launch per pipeline stream.
@@ -667,93 +836,18 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             });
         }
 
-        for (0..NUM_PIPELINE_STREAMS) |g| {
-            const stream: usize = if (NUM_PIPELINE_STREAMS == 1) heavy_stream else self.pipeline_streams[g];
-            const chunk_start = @as(u32, @intCast(g)) * pipe_chunk_count;
-            const chunk_end = @min(chunk_start + pipe_chunk_count, total_chunks);
-            const group_chunks = chunk_end - chunk_start;
-            if (group_chunks == 0) continue;
-
-            const t_lz_start = if (split_timer)
-                if (io) |io_val| std.Io.Clock.awake.now(io_val) else null
-            else
-                null;
-
-            // chunks pointer = full array (NOT offset), chunk_base = chunk_start
-            // total = chunk_end so the kernel's bounds check (chunk_idx >= total) works
-            const lz_groups_in_pipe = (group_chunks + chunks_per_group - 1) / chunks_per_group;
-            const lz_grid_x = (lz_groups_in_pipe + 1) / 2;
-
-            // Step 7: LZ kernels self-gate on `*d_total_chunks`. Stage the
-            // per-pipeline-group count into d_n_groups_scratch (4 B H2D).
-            if (!ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4)) return error.OutOfDeviceMemory;
-            var host_per_group_total: u32 = chunk_end - chunk_start;
-            try cudaCall(h2d_fn(self.d_n_groups_scratch, @ptrCast(&host_per_group_total), 4), .copy);
-
-            // Fast path: no entropy in this scan → use lean L1/L2 raw kernel.
-            // Huffman literals require the general kernel (it reads entropy_scratch).
-            const use_raw_kernel = n_huff == 0 and ml.kernel_raw_fn != 0;
-
-            // The six common params shared by both LZ-decode kernel
-            // variants. Storage is a struct so each field has a stable
-            // address for the kernel-params array.
-            var common = LzCommonParams{
-                .comp = self.d_comp_persist,
-                .descs_dev = self.d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc),
-                .dst = self.d_output,
-                .cpg = chunks_per_group,
-                .total = self.d_n_groups_scratch,
-                .sc_cap = sub_chunk_cap,
-            };
-
-            if (use_raw_kernel) {
-                var raw_params = [_]?*anyopaque{
-                    @ptrCast(&common.comp),
-                    @ptrCast(&common.descs_dev),
-                    @ptrCast(&common.dst),
-                    @ptrCast(&common.cpg),
-                    @ptrCast(&common.total),
-                    @ptrCast(&common.sc_cap),
-                };
-                var raw_extra = [_]?*anyopaque{null};
-                const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", stream);
-                try cudaCall(launch_fn(ml.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra), .launch);
-                endKernelTiming(t_lzr, stream);
-            } else {
-                // General kernel additionally takes entropy_scratch +
-                // slot_stride + first_sub_idx (variable per launch).
-                var p_entropy_scratch = self.d_entropy_scratch;
-                var p_entropy_slot_stride: u64 = @as(u64, total_subchunks) * d.ENTROPY_SCRATCH_SLOT_BYTES;
-                var p_first_sub_idx: CUdeviceptr = self.d_first_subchunk_idx +
-                    if (self.d_first_subchunk_idx != 0) @as(u64, chunk_start) * @sizeOf(u32) else 0;
-
-                var lz_params = [_]?*anyopaque{
-                    @ptrCast(&common.comp),
-                    @ptrCast(&common.descs_dev),
-                    @ptrCast(&common.dst),
-                    @ptrCast(&common.cpg),
-                    @ptrCast(&common.total),
-                    @ptrCast(&common.sc_cap),
-                    @ptrCast(&p_entropy_scratch),
-                    @ptrCast(&p_entropy_slot_stride),
-                    @ptrCast(&p_first_sub_idx),
-                };
-                var lz_extra = [_]?*anyopaque{null};
-
-                const t_lz = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeKernel", stream);
-                try cudaCall(launch_fn(ml.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra), .launch);
-                endKernelTiming(t_lz, stream);
-            }
-
-            if (split_timer) {
-                try cudaCall(stream_sync_fn(stream), .sync);
-                if (t_lz_start) |ts_start| {
-                    if (io) |io_val| {
-                        split_lz_ns += @intCast(ts_start.untilNow(io_val, .awake).toNanoseconds());
-                    }
-                }
-            }
-        }
+        split_lz_ns = try runLzPipeline(
+            self,
+            chunks_per_group,
+            sub_chunk_cap,
+            n_huff,
+            total_chunks,
+            total_subchunks,
+            pipe_chunk_count,
+            heavy_stream,
+            split_timer,
+            io,
+        );
 
         // Sync all pipeline streams — UNLESS the caller is async
         // (work_stream set). In async mode we leave the queued work on
@@ -786,21 +880,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     if (t_e2e0) |t0| if (io) |iv| {
         e2e_cum.predh = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
     };
-    // Device-resident output (4d Phase 3): D2D-copy the decoded bytes
-    // straight to the caller's device buffer, skipping the host bounce.
-    // Use heavy_stream so the copy serializes after the LZ kernel on
-    // the same stream (and so the user's cudaStreamSynchronize on that
-    // stream waits for the result).
-    if (d_output_target) |dev_target| {
-        if (cuda.cuMemcpyDtoDAsync_fn) |d2d| {
-            try cudaCall(d2d(dev_target + dst_start_off, self.d_output + dst_start_off, decompressed_size, heavy_stream), .copy);
-            if (self.work_stream == 0) try cudaCall(sync_fn(), .sync);
-        } else {
-            return error.BackendNotAvailable;
-        }
-    } else {
-        try cudaCall(d2h_fn(@ptrCast(dst_full + dst_start_off), self.d_output + dst_start_off, decompressed_size), .copy);
-    }
+    try finalizeOutput(self, req, heavy_stream);
 
     // Profiling: drain pending cuEvent pairs into last_timings. Skip in
     // async mode (caller hasn't synced yet; the events may still be
