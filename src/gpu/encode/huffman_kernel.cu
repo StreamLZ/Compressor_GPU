@@ -284,16 +284,14 @@ extern "C" __global__ void slzHuffEncode4StreamKernel(
         bytes = encodeStreamOneLane(my_in, my_in_size, desc.src_stride,
                                     block_code_lengths, my_codes, my_scratch);
     }
-    // Barrier covers the per-lane scratch writes before the cross-lane
-    // shuffles below; all 32 lanes reach here (the if-block has no return).
+    // Publish per-lane byte counts into shared mem so every lane reads
+    // the same view. One write per lane, one sync — cheaper than 32
+    // inline __shfl_sync broadcasts, and (more importantly) avoids the
+    // per-lane `uint32_t stream_bytes[HUFF_NUM_STREAMS]` stack array
+    // that nvcc would otherwise allocate 128 B for on every lane.
+    __shared__ uint32_t stream_bytes[HUFF_NUM_STREAMS];
+    if (lane < HUFF_NUM_STREAMS) stream_bytes[lane] = bytes;
     __syncwarp();
-
-    // Convergent shuffles — every lane participates. stream_bytes[s] holds
-    // the encoded byte count of stream s.
-    uint32_t stream_bytes[HUFF_NUM_STREAMS];
-    #pragma unroll
-    for (int s = 0; s < HUFF_NUM_STREAMS; s++)
-        stream_bytes[s] = __shfl_sync(FULL_WARP_MASK, bytes, s);
 
     uint8_t* out = output + desc.dst_offset;
 
@@ -302,29 +300,38 @@ extern "C" __global__ void slzHuffEncode4StreamKernel(
     for (int i = lane; i < HUFF_WEIGHTS_BYTES; i += WARP_SIZE)
         out[i] = packWeightByte(block_code_lengths[2 * i], block_code_lengths[2 * i + 1]);
 
+    // HUFF_SUBHEADER_BYTES sub-header at offset HUFF_WEIGHTS_BYTES
+    // ((N-1) × u24 LE; stream (N-1) size derived from total payload).
+    // Lanes 0..N-2 each emit their own size in parallel; lane N-1's
+    // size is implicit (caller derives from in_size on decode).
+    if (lane < HUFF_NUM_STREAMS - 1) {
+        writeLE24(out + HUFF_WEIGHTS_BYTES + lane * HUFF_STREAM_SIZE_BYTES, bytes);
+    }
+
+    // Body concat: warp-cooperative. Iterate over streams sequentially
+    // but each stream is byte-cooperative across the warp via warpCopy.
+    // Each lane copies every WARP_SIZE-th byte of the current stream.
+    // For typical stream sizes (~src_size/32 = ~2 KB at 64KB sub-chunks
+    // and ratio ~0.5), this is a ~32x throughput improvement over the
+    // prior lane-0 serial copy.
+    //
+    // Layout invariant matches encode_huff.zig's
+    // `scratch_bytes = descs.len * NUM_STREAMS * scratch_per_stream`
+    // sizing — strides are (NUM_STREAMS × scratch_per_stream) between
+    // blocks and scratch_per_stream between streams within a block.
+    uint8_t* body = out + HUFF_BODY_HEADER_BYTES;
+    uint32_t total_body = 0;
+    #pragma unroll 1
+    for (int s = 0; s < HUFF_NUM_STREAMS; s++) {
+        const uint8_t* src = scratch
+            + ((uint64_t)block_id * HUFF_NUM_STREAMS + s) * scratch_per_stream;
+        const uint32_t sz = stream_bytes[s];
+        warpCopy(body, src, sz, lane);
+        body += sz;
+        total_body += sz;
+    }
+
     if (lane == 0) {
-        // HUFF_SUBHEADER_BYTES sub-header at offset HUFF_WEIGHTS_BYTES
-        // ((N-1) × u24 LE; stream (N-1) size derived from total payload).
-        uint8_t* subheader = out + HUFF_WEIGHTS_BYTES;
-        for (int s = 0; s < HUFF_NUM_STREAMS - 1; s++) {
-            writeLE24(subheader + s * HUFF_STREAM_SIZE_BYTES, stream_bytes[s]);
-        }
-
-        // Concatenate the HUFF_NUM_STREAMS per-stream scratch buffers into
-        // the body. Layout invariant matches encode_huff.zig's
-        // `scratch_bytes = descs.len * NUM_STREAMS * scratch_per_stream`
-        // sizing — strides are (NUM_STREAMS × scratch_per_stream) between
-        // blocks and scratch_per_stream between streams within a block.
-        uint8_t* dst = out + HUFF_BODY_HEADER_BYTES;
-        uint32_t total_body = 0;
-        for (int s = 0; s < HUFF_NUM_STREAMS; s++) {
-            const uint8_t* src = scratch
-                + ((uint64_t)block_id * HUFF_NUM_STREAMS + s) * scratch_per_stream;
-            for (uint32_t i = 0; i < stream_bytes[s]; i++) dst[i] = src[i];
-            dst += stream_bytes[s];
-            total_body += stream_bytes[s];
-        }
-
         out_sizes[block_id] = HUFF_BODY_HEADER_BYTES + total_body;
     }
 }

@@ -44,3 +44,16 @@ static constexpr uint32_t U64_BITS      = 64;
 __device__ __forceinline__ int lastBitSet(uint32_t x) {
     return (int)(U32_BITS - 1) - __clz(x);
 }
+
+// ── Cooperative byte copy across the warp ───────────────────────
+// All 32 lanes participate, each writing every WARP_SIZE-th byte.
+// Caller must guarantee `dst` / `src` overlap is either disjoint or
+// strictly forward (each lane reads index i then writes index i — no
+// shifted-overlap support). `n` may be any positive count; lanes with
+// i >= n drop out naturally. Caller is responsible for the surrounding
+// `__syncwarp()` if the destination is read by other warp-cooperative
+// code after the copy.
+__device__ __forceinline__ void warpCopy(uint8_t* dst, const uint8_t* src,
+                                          uint32_t n, int lane) {
+    for (uint32_t i = (uint32_t)lane; i < n; i += WARP_SIZE) dst[i] = src[i];
+}

@@ -164,11 +164,9 @@ __device__ __forceinline__ void writeHuffChunkHdr(uint8_t* d, uint32_t comp_size
     d[4] = (uint8_t)(bits & 0xFF);
 }
 
-// Cooperative byte copy across the warp.
-__device__ __forceinline__ void warpCopy(uint8_t* dst, const uint8_t* src,
-                                          uint32_t n, int lane) {
-    for (uint32_t i = lane; i < n; i += WARP_SIZE) dst[i] = src[i];
-}
+// warpCopy (cooperative byte copy across the warp) moved to
+// common/gpu_warp.cuh so both encode and decode kernels share one
+// definition.
 
 // ── One entropy stream: emit type-4 (huff) or type-0 (raw) ──────────
 // Returns the emitted byte count. Writes only when `out` is non-null.
