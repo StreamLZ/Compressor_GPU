@@ -75,7 +75,7 @@ is essentially flat post-revert.
 | K5 | K5.3 Move stack buffers to DecodeContext | DONE | `b552f02` |
 | K5 | K5.4 ctx-wide sync_fn document/migrate | DONE (option B — document) | `b2641d1` |
 | K5 | K5.5 Template decodeSubChunkGeneral on OFF16_SPLIT | DEFER — needs perf evaluation |  |
-| K5 | K5.6 decodeSubChunkGeneral 17-arg → struct | DEFER — hot path, medium risk |  |
+| K5 | K5.6 decodeSubChunkGeneral 18-arg → struct (ParsedStreams + DecodeOutput) | DONE | pending |
 | K5 | K5.7 parseRawStreamSize / parseEntropyHeader SAFETY | DONE (option 2 — comments) | `b2641d1` |
 | K5 | K5.8 cached_qpc_freq → std.atomic.Value | DONE | `b552f02` |
 | K5 | K5.9 gatherRawOff16 fallback contract | DONE (option 2 — keep fallback) | `b552f02` |
@@ -919,15 +919,20 @@ ordering contract at each site or migrate to per-stream sync.
 `template <bool OFF16_SPLIT>` would specialize the general decoder
 identically. Verify PTX numbers and decide.
 
-### K5.6. `decodeSubChunkGeneral` 17-arg signature → struct
+### K5.6. `decodeSubChunkGeneral` 18-arg signature → struct
 
 [risk: med — register-pressure consideration; J4 showed __noinline__ is
-net-negative here] [effort: m]
+net-negative here] [effort: m] — DONE
 
-Group the args into:
-- `DecodeStreams { cmd, cmd_size, lit, lit_size, off16_*, off32_*, length_* }`
-- `DecodeOutput { dst, dst_size, dst_offset, initial_copy }`
-- Plus `block2_cmd_offset` and `mode` as scalar params
+Reused existing `ParsedStreams` from `slz_wire_format.cuh` (17 fields:
+lit/cmd/off16/off32 pointers + sizes, off16_split, cmd_stream2_offset,
+initial_copy) and added a 3-field `DecodeOutput { dst, dst_size,
+dst_offset }`. Signature shrank from 18 params to 3
+(`ps`, `out`, `mode`). All 20 fields hoisted into local references at
+function entry so codegen shape matches pre-K5.6. Call sites in
+`lz_dispatch.cuh` updated with positional brace-init (nvcc rejects
+C99 designated initializers). PTX REG/STACK unchanged across every
+kernel; bench L1/L3/L5 perf-flat or slightly improved.
 
 ### K5.7. `parseRawStreamSize` / `parseEntropyHeader` bounds checks
 

@@ -15,6 +15,15 @@
 
 #include "lz_decode_core.cuh"
 
+// Per-call destination region for decodeSubChunkGeneral. The decoder
+// only writes inside `dst[dst_offset .. dst_offset + dst_size)`; the
+// overflow check at function entry derives `dst_end_abs` from these.
+struct DecodeOutput {
+    uint8_t* __restrict__ dst;
+    uint32_t dst_size;
+    uint32_t dst_offset;
+};
+
 // Token-type tag values assigned by the lane-0 parser and consumed
 // after the broadcast. Only LONG_LITERAL is tested by name (it
 // suppresses the recent_offset update — long-literal tokens don't
@@ -65,20 +74,34 @@ __device__ __forceinline__ void deltaLiteralCopyBounded(
 // REG count stays at 40 either way, so the cost is scheduling /
 // memory-ordering, not register pressure. Keep the shfls.
 __device__ void decodeSubChunkGeneral(
-    const uint8_t* __restrict__ cmd, uint32_t cmd_size,
-    const uint8_t* __restrict__ lit, uint32_t lit_size,
-    const uint8_t* __restrict__ off16_raw, uint32_t off16_count,
-    const uint8_t* __restrict__ off16_hi, const uint8_t* __restrict__ off16_lo,
-    uint32_t off16_split,
-    const uint8_t* __restrict__ off32_raw1, uint32_t off32_count1,
-    const uint8_t* __restrict__ off32_raw2, uint32_t off32_count2,
-    const uint8_t* __restrict__ length_stream, uint32_t length_remaining,
-    uint8_t* __restrict__ dst, uint32_t dst_size,
-    uint32_t initial_copy,
-    uint32_t block2_cmd_offset,
-    uint32_t dst_offset,
+    const ParsedStreams& ps,
+    const DecodeOutput& out,
     uint32_t mode
 ) {
+    // Hoist field reads into locals so the hot loop addresses registers
+    // rather than restating `ps.x` everywhere. nvcc would do this anyway
+    // but the explicit form preserves the pre-K5.6 codegen shape.
+    const uint8_t* __restrict__ cmd = ps.cmd_ptr;
+    const uint32_t cmd_size = ps.cmd_size;
+    const uint8_t* __restrict__ lit = ps.lit_ptr;
+    const uint32_t lit_size = ps.lit_size;
+    const uint8_t* __restrict__ off16_raw = ps.off16_raw;
+    const uint32_t off16_count = ps.off16_count;
+    const uint8_t* __restrict__ off16_hi = ps.off16_hi;
+    const uint8_t* __restrict__ off16_lo = ps.off16_lo;
+    const uint32_t off16_split = ps.off16_split;
+    const uint8_t* __restrict__ off32_raw1 = ps.off32_raw1;
+    const uint32_t off32_count1 = ps.off32_count1;
+    const uint8_t* __restrict__ off32_raw2 = ps.off32_raw2;
+    const uint32_t off32_count2 = ps.off32_count2;
+    const uint8_t* __restrict__ length_stream = ps.len_stream;
+    const uint32_t length_remaining = ps.len_avail;
+    const uint32_t initial_copy = ps.initial_copy;
+    const uint32_t block2_cmd_offset = ps.cmd_stream2_offset;
+    uint8_t* __restrict__ dst = out.dst;
+    const uint32_t dst_size = out.dst_size;
+    const uint32_t dst_offset = out.dst_offset;
+
     const int lane = threadIdx.x & LANE_MASK;
     uint32_t cmd_pos = 0, lit_pos = 0, off16_pos = 0, off32_pos = 0;
     uint32_t dst_pos = dst_offset + initial_copy;

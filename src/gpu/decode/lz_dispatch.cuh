@@ -142,17 +142,22 @@ __device__ void parseAndDecodeSubChunkRaw(
             dst_offset
         );
     } else {
-        decodeSubChunkGeneral(
-            cmd_ptr, cmd_size,
-            lit_ptr, lit_size,
-            off16_raw, off16_count,
-            nullptr, nullptr, 0,  // off16_hi/lo/split unused for raw
-            off32_raw1, off32_count1,
-            off32_raw2, off32_count2,
-            len_stream, len_avail,
-            dst, sc_decomp_size, initial_copy, block2_cmd_offset,
-            dst_offset, /*mode=*/1
-        );
+        // Positional brace-init matches ParsedStreams field order in
+        // slz_wire_format.cuh (lit_ptr, cmd_ptr, off16_raw, off16_hi,
+        // off16_lo, off32_raw1, off32_raw2, len_stream, lit_size,
+        // cmd_size, off16_count, off16_split, off32_count1, off32_count2,
+        // len_avail, cmd_stream2_offset, initial_copy).
+        const ParsedStreams ps_raw = {
+            lit_ptr, cmd_ptr, off16_raw,
+            nullptr, nullptr, // off16_hi/lo unused (OFF16_SPLIT=false)
+            off32_raw1, off32_raw2, len_stream,
+            lit_size, cmd_size, off16_count,
+            /*off16_split=*/0u,
+            off32_count1, off32_count2, len_avail,
+            block2_cmd_offset, initial_copy,
+        };
+        const DecodeOutput out_raw = { dst, sc_decomp_size, dst_offset };
+        decodeSubChunkGeneral(ps_raw, out_raw, /*mode=*/1);
     }
 }
 
@@ -205,16 +210,7 @@ __device__ void parseAndDecodeSubChunk(
             );
         }
     } else {
-        decodeSubChunkGeneral(
-            ps.cmd_ptr, ps.cmd_size,
-            ps.lit_ptr, ps.lit_size,
-            ps.off16_raw, ps.off16_count,
-            ps.off16_hi, ps.off16_lo, ps.off16_split,
-            ps.off32_raw1, ps.off32_count1,
-            ps.off32_raw2, ps.off32_count2,
-            ps.len_stream, ps.len_avail,
-            dst, sc_decomp_size, ps.initial_copy, ps.cmd_stream2_offset,
-            dst_offset, mode
-        );
+        const DecodeOutput out_general = { dst, sc_decomp_size, dst_offset };
+        decodeSubChunkGeneral(ps, out_general, mode);
     }
 }
