@@ -38,6 +38,36 @@ const beginKernelTiming = dec_ctx.beginKernelTiming;
 const endKernelTiming = dec_ctx.endKernelTiming;
 const finalizeProfiling = dec_ctx.finalizeProfiling;
 
+/// Bundle of the CUDA Driver API function pointers used by the GPU
+/// decode pipeline. Resolved once at `fullGpuLaunchImpl` entry and
+/// threaded into the three K5.2 helpers (runHuffPredecode /
+/// runLzPipeline / finalizeOutput) so they don't each re-resolve the
+/// same `cuMemcpyHtoD_fn orelse return error.BackendNotAvailable`
+/// patterns. The required fields are non-optional; `d2d` stays
+/// optional because the host-bounce paths work without it (it's only
+/// used by the D2D-source / D2D-output / gather-off16 fallback paths,
+/// and each of those sites unwraps with its own `orelse return
+/// error.BackendNotAvailable` when entered).
+const Fns = struct {
+    h2d: cuda.FnMemcpyHtoD,
+    d2h: cuda.FnMemcpyDtoH,
+    launch: cuda.FnLaunchKernel,
+    sync: cuda.FnCtxSync,
+    stream_sync: cuda.FnStreamSync,
+    d2d: ?cuda.FnMemcpyDtoDAsync,
+
+    fn resolve() GpuError!Fns {
+        return .{
+            .h2d = cuda.cuMemcpyHtoD_fn orelse return error.BackendNotAvailable,
+            .d2h = cuda.cuMemcpyDtoH_fn orelse return error.BackendNotAvailable,
+            .launch = cuda.cuLaunchKernel_fn orelse return error.BackendNotAvailable,
+            .sync = cuda.cuCtxSynchronize_fn orelse return error.BackendNotAvailable,
+            .stream_sync = cuda.cuStreamSync_fn orelse return error.BackendNotAvailable,
+            .d2d = cuda.cuMemcpyDtoDAsync_fn,
+        };
+    }
+};
+
 /// The six params shared by both LZ-decode kernel variants (raw and
 /// general). Kept as a struct so each field has a stable address for the
 /// CUDA kernel-params array (which takes `&field` pointers).
@@ -410,6 +440,7 @@ pub fn fullGpuLaunch(
 /// pipeline-stream sync.
 fn runHuffPredecode(
     self: *DecodeContext,
+    fns: *const Fns,
     scan: ScanResult,
     n_huff: u32,
     heavy_stream: usize,
@@ -417,8 +448,8 @@ fn runHuffPredecode(
     t_huff_start: anytype,
     io: ?std.Io,
 ) GpuError!i64 {
-    const h2d_fn = cuda.cuMemcpyHtoD_fn orelse return error.BackendNotAvailable;
-    const launch_fn = cuda.cuLaunchKernel_fn orelse return error.BackendNotAvailable;
+    const h2d_fn = fns.h2d;
+    const launch_fn = fns.launch;
 
     const huff_stream = heavy_stream;
     var split_huff_build_ns: i64 = 0;
@@ -451,7 +482,7 @@ fn runHuffPredecode(
     }
     // Split fence: time the LUT build separately from the decode.
     if (split_timer) {
-        if (cuda.cuStreamSync_fn) |sf| try cudaCall(sf(huff_stream), .sync);
+        try cudaCall(fns.stream_sync(huff_stream), .sync);
         if (t_huff_start) |hs| {
             if (io) |io_val|
                 split_huff_build_ns = nsSince(hs, io_val);
@@ -486,6 +517,7 @@ fn runHuffPredecode(
 /// `split_timer` is set; otherwise zero.
 fn runLzPipeline(
     self: *DecodeContext,
+    fns: *const Fns,
     chunks_per_group: u32,
     sub_chunk_cap: u32,
     n_huff: u32,
@@ -496,9 +528,9 @@ fn runLzPipeline(
     split_timer: bool,
     io: ?std.Io,
 ) GpuError!i64 {
-    const h2d_fn = cuda.cuMemcpyHtoD_fn orelse return error.BackendNotAvailable;
-    const launch_fn = cuda.cuLaunchKernel_fn orelse return error.BackendNotAvailable;
-    const stream_sync_fn = cuda.cuStreamSync_fn orelse return error.BackendNotAvailable;
+    const h2d_fn = fns.h2d;
+    const launch_fn = fns.launch;
+    const stream_sync_fn = fns.stream_sync;
 
     var split_lz_ns: i64 = 0;
 
@@ -605,17 +637,13 @@ fn runLzPipeline(
 /// In sync mode (work_stream == 0) the D2D path also issues a
 /// ctx-wide sync to ensure the caller observes a settled output
 /// when this function returns.
-fn finalizeOutput(self: *DecodeContext, req: DecodeRequest, heavy_stream: usize) GpuError!void {
+fn finalizeOutput(self: *DecodeContext, fns: *const Fns, req: DecodeRequest, heavy_stream: usize) GpuError!void {
     if (req.d_output_target) |dev_target| {
-        const d2d = cuda.cuMemcpyDtoDAsync_fn orelse return error.BackendNotAvailable;
+        const d2d = fns.d2d orelse return error.BackendNotAvailable;
         try cudaCall(d2d(dev_target + req.dst_start_off, self.d_output + req.dst_start_off, req.decompressed_size, heavy_stream), .copy);
-        if (self.work_stream == 0) {
-            const sync_fn = cuda.cuCtxSynchronize_fn orelse return error.BackendNotAvailable;
-            try cudaCall(sync_fn(), .sync);
-        }
+        if (self.work_stream == 0) try cudaCall(fns.sync(), .sync);
     } else {
-        const d2h_fn = cuda.cuMemcpyDtoH_fn orelse return error.BackendNotAvailable;
-        try cudaCall(d2h_fn(@ptrCast(req.dst_full + req.dst_start_off), self.d_output + req.dst_start_off, req.decompressed_size), .copy);
+        try cudaCall(fns.d2h(@ptrCast(req.dst_full + req.dst_start_off), self.d_output + req.dst_start_off, req.decompressed_size), .copy);
     }
 }
 
@@ -656,10 +684,11 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         null;
     var e2e_cum: E2eCumulative = .{};
 
-    const h2d_fn = cuda.cuMemcpyHtoD_fn orelse return error.BackendNotAvailable;
-    const d2h_fn = cuda.cuMemcpyDtoH_fn orelse return error.BackendNotAvailable;
-    const launch_fn = cuda.cuLaunchKernel_fn orelse return error.BackendNotAvailable;
-    const sync_fn = cuda.cuCtxSynchronize_fn orelse return error.BackendNotAvailable;
+    const fns = try Fns.resolve();
+    const h2d_fn = fns.h2d;
+    const d2h_fn = fns.d2h;
+    const launch_fn = fns.launch;
+    const sync_fn = fns.sync;
 
     const total_output = dst_start_off + decompressed_size;
     if (!ensureDeviceOutput(self, total_output + 64)) return error.OutOfDeviceMemory;
@@ -741,7 +770,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // them into d_comp_persist (no PCIe). Else H2D from host.
     if (compressed_block.len > 0) {
         if (d_compressed_src) |dev_src| {
-            const d2d = cuda.cuMemcpyDtoDAsync_fn orelse return error.BackendNotAvailable;
+            const d2d = fns.d2d orelse return error.BackendNotAvailable;
             try cudaCall(d2d(self.d_comp_persist, dev_src, compressed_block.len, 0), .copy);
         } else {
             try cudaCall(h2d_fn(self.d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len), .copy);
@@ -864,12 +893,12 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             null;
         var split_huff_build_ns: i64 = 0;
         if (have_huff) {
-            split_huff_build_ns = try runHuffPredecode(self, scan, n_huff, heavy_stream, split_timer, t_huff_start, io);
+            split_huff_build_ns = try runHuffPredecode(self, &fns, scan, n_huff, heavy_stream, split_timer, t_huff_start, io);
         }
 
         // Launch pipelined groups: one LZ launch per pipeline stream.
         // Operations within a stream are ordered; across streams they can overlap.
-        const stream_sync_fn = cuda.cuStreamSync_fn orelse return error.BackendNotAvailable;
+        const stream_sync_fn = fns.stream_sync;
 
         var split_lz_ns: i64 = 0;
         var split_huff_ns: i64 = 0;
@@ -891,6 +920,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
 
         split_lz_ns = try runLzPipeline(
             self,
+            &fns,
             chunks_per_group,
             sub_chunk_cap,
             n_huff,
@@ -941,7 +971,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     if (t_e2e0) |t0| if (io) |iv| {
         e2e_cum.predh = nsSince(t0, iv);
     };
-    try finalizeOutput(self, req, heavy_stream);
+    try finalizeOutput(self, &fns, req, heavy_stream);
 
     // Profiling: drain pending cuEvent pairs into last_timings. Skip in
     // async mode (caller hasn't synced yet; the events may still be
