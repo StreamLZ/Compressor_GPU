@@ -57,11 +57,24 @@ pub fn gpuEncodeHuffImpl(
     // constant directly; this Zig side has to match so the scratch slab
     // has the right per-stream stride. Each stream gets src_size/N
     // symbols of ≤ 11 bits; 2 bytes/symbol is a safe bound.
-    const NUM_STREAMS: usize = 32;  // KEEP IN SYNC with HUFF_NUM_STREAMS
+    //
+    // KEEP IN SYNC: HUFF_NUM_STREAMS in src/gpu/common/gpu_huffman.cuh.
+    // There is NO compile-time check that this constant matches the .cuh
+    // side. If they drift, the encoder splits the input into the wrong
+    // number of slices while the kernel reads/writes the right number,
+    // producing silently-wrong output that the decoder may still accept
+    // as a "valid" but corrupt frame. A future safeguard would be a
+    // build-step that codegens this constant from the .cuh.
+    const NUM_STREAMS: usize = 32;
     var max_src: u32 = 0;
     for (descs) |d| {
         if (d.src_size > max_src) max_src = d.src_size;
     }
+    // +64 covers the trailing-byte flush (encoder writes one partial byte
+    // at end of stream) + height-limit rounding (codes are ≤11 bits, so
+    // one extra byte per stream is enough headroom). At N=32, per-stream
+    // slices average ~src/32 bytes, so the +64 is generous (~32x the
+    // slack the 4-stream era had at the same constant).
     const scratch_per_stream: usize = (@as(usize, max_src) / NUM_STREAMS + 64) * 2;
 
     const desc_bytes: usize = descs.len * @sizeOf(HuffEncDesc);
@@ -189,7 +202,12 @@ pub fn gpuEncodeOff16HuffImpl(
         const off16_count: u32 =
             @as(u32, output[off16_hdr]) |
             (@as(u32, output[off16_hdr + 1]) << 8);
-        if (off16_count < 32) continue; // matches CPU `>= 32` gate
+        // Below this count, the per-stream sub-header overhead would
+        // dwarf the entropy savings. CPU oracle uses the same `>= 32`
+        // gate; the literal `32` is a policy threshold, NOT a stream
+        // count (the coincidence with HUFF_NUM_STREAMS is unrelated).
+        const OFF16_HUFFMAN_MIN_COUNT: u32 = 32;
+        if (off16_count < OFF16_HUFFMAN_MIN_COUNT) continue;
         const off16_data: u32 = off16_hdr + 2;
 
         // Huffman body worst case ≈ HUFF_BODY_HEADER_BYTES (221) fixed

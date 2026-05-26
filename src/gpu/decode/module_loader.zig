@@ -141,7 +141,11 @@ pub fn init() bool {
     _ = get_fn(&merge_huff_descs_fn, module, "slzMergeHuffDescsKernel");
     const t_lz = cuda.qpcNow();
 
-    // Load Huffman decode kernels (Pass 1.5, for chunk_type=4 literals)
+    // Load Huffman decode kernels (Pass 1.5, for chunk_type=4 literals).
+    // `slzHuffDecode4StreamKernel`: the "4Stream" suffix is historical
+    // (Zig dispatch ABI introduced by the prior 4-stream design); the
+    // kernel now decodes HUFF_NUM_STREAMS = 32 streams in parallel
+    // (one per warp lane). See src/gpu/common/gpu_huffman.cuh.
     const huff_ptx = nullTerminatedPtx("huffman_kernel.ptx");
     if (load_fn(&huff_module, huff_ptx.ptr) == CUDA_SUCCESS) {
         _ = get_fn(&huff_build_fn, huff_module, "slzHuffBuildLutKernel");

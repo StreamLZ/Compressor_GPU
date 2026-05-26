@@ -195,11 +195,17 @@ fn gatherRawOff16(
             // `try cudaCall(launch_fn(...))`.
             const grid_x: u32 = ndesc;
             const t_gather = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzGatherRawOff16Kernel", 0);
-            if (launch_fn(ml.gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, 0, &params, &extra) == CUDA_SUCCESS) {
+            const launch_rc = launch_fn(ml.gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, 0, &params, &extra);
+            if (launch_rc == CUDA_SUCCESS) {
                 endKernelTiming(t_gather, 0);
                 try cudaCall(sync_fn(), .sync);
                 return;
             }
+            // Best-effort path failed; log so a genuine misconfiguration
+            // surfaces rather than silently falling back. The D2D/H2D
+            // fallback below still completes correctness; the print just
+            // makes the slow-path diagnosable.
+            std.debug.print("GPU gatherRawOff16: launch failed rc={d}; falling back to D2D/H2D\n", .{launch_rc});
             endKernelTiming(t_gather, 0);
         }
     }
@@ -269,7 +275,6 @@ fn dumpScanIfRequested(
     sub_chunk_cap: u32,
     scan: ScanResult,
 ) void {
-    if (std.c.getenv("SLZ_DUMP_SCAN") == null) return;
     // Dev-debug-only path gated on SLZ_DUMP_SCAN. Uses libc fopen so
     // no `std.Io` plumbing is needed (the rest of this fn signature has
     // no io param). The Zig 0.16 `std.Io.Dir.cwd().createFile` API does
@@ -277,10 +282,10 @@ fn dumpScanIfRequested(
     // than this debug helper warrants. Path is the value of SLZ_DUMP_SCAN
     // if it looks like a path, else "scan_dump.bin" in cwd (was
     // hard-coded "c:/tmp/scan_dump.bin", Windows-only).
+    const env = std.c.getenv("SLZ_DUMP_SCAN") orelse return;
     const cio = @cImport({
         @cInclude("stdio.h");
     });
-    const env = std.c.getenv("SLZ_DUMP_SCAN").?;
     // Treat a value of "1" / "true" / "yes" as the default path; anything
     // else is the literal path the user wants.
     const env_slice = std.mem.sliceTo(env, 0);
@@ -615,8 +620,12 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // host scan+prep / kernels / D2H. Off by default.
     const e2e_timer = std.c.getenv("SLZ_E2E_TIMER") != null;
     // SLZ_HUFF_DBG: cache once per call (otherwise getenv would run on
-    // every decode in this loop's caller).
-    const huff_dbg = std.c.getenv("SLZ_HUFF_DBG") != null;
+    // every decode in this loop's caller). NOTE: scope is per-CALL, not
+    // per-process — the env var is still re-read on every fullGpuLaunchImpl
+    // invocation. For a true once-per-process cache, lift to a module-
+    // level std.once.Once. The per-call cache is enough for the dev-only
+    // SLZ_HUFF_DBG path; flipping it across calls in one process is rare.
+    const huff_dbg_this_call = std.c.getenv("SLZ_HUFF_DBG") != null;
     const t_e2e0 = if (e2e_timer)
         (if (io) |iv| std.Io.Clock.awake.now(iv) else null)
     else
@@ -775,7 +784,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // into a single device array with correct out_offsets, then upload.
     const n_huff: u32 = scan.num_huff_lit + scan.num_huff_tok +
         scan.num_huff_off16hi + scan.num_huff_off16lo;
-    if (huff_dbg) {
+    if (huff_dbg_this_call) {
         std.debug.print("huff scan: lit={d} tok={d} hi={d} lo={d} total={d}\n", .{ scan.num_huff_lit, scan.num_huff_tok, scan.num_huff_off16hi, scan.num_huff_off16lo, n_huff });
     }
     const have_huff = n_huff > 0 and ml.huff_build_fn != 0 and ml.huff_decode_fn != 0;
@@ -791,11 +800,12 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // ── Pipeline: split into N groups, overlap entropy with LZ ───
     // The pipeline path overlaps Huffman pre-decode with the LZ kernel.
     const total_chunks: u32 = @intCast(chunk_descs.len);
-    // pipeline_streams_created is the contract for the launch path below:
-    // it owns the Huffman pre-decode and the LZ kernel launch. Without it,
-    // Huffman would silently skip and L3+ would decode zero literals. The
-    // caller (fullGpuLaunch via ensurePipelineStreams) creates the streams
-    // lazily; this is just the guard against a stream-create failure.
+    // Defensive: `try ml.ensurePipelineStreams(self)` at fullGpuLaunchImpl
+    // entry already guarantees `pipeline_streams_created == true` (it
+    // throws BackendNotAvailable on stream-create failure). This duplicate
+    // check is kept as a belt-and-suspenders against future refactors
+    // that might reorder init steps; the early return is unreachable on
+    // any path that gets here through the normal entry point.
     if (!self.pipeline_streams_created) return error.BackendNotAvailable;
     // When the caller is slzDecompressAsync, work_stream is the caller's
     // CUstream so its cudaStreamSynchronize waits for the decompress to
@@ -866,6 +876,14 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         // (work_stream set). In async mode we leave the queued work on
         // the user's stream and let them sync; blocking here would
         // defeat the purpose.
+        //
+        // Failure handling: first stream's sync failure aborts and
+        // returns; remaining streams' work is left running on the
+        // device. Safe at NUM_PIPELINE_STREAMS == 1 (only one stream
+        // exists). If the constant is ever bumped to > 1, revisit:
+        // either drain remaining streams before returning (loses the
+        // specific failing stream's rc in the print) or accept the
+        // existing first-fail-wins semantics with a clearer comment.
         if (self.work_stream == 0) {
             for (0..NUM_PIPELINE_STREAMS) |g| {
                 const sync_rc = stream_sync_fn(self.pipeline_streams[g]);

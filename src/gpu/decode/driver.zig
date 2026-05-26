@@ -3,7 +3,7 @@
 //! The decode driver was split into focused sub-modules during the GPU
 //! cleanup pass (roadmap item 5). External callers continue to import
 //! `gpu/decode/driver.zig` and reach every public symbol unchanged; this
-//! file owns the singleton `g_default` and the four `last_*_kernel_ns`
+//! file owns the singleton `g_default` and the three `last_*_kernel_ns`
 //! telemetry `pub var`s (storage must live in the facade — Zig cannot
 //! re-export a `pub var` from another module through `pub const`).
 //!
@@ -74,7 +74,7 @@ pub const fullGpuLaunch = dd.fullGpuLaunch;
 pub const fullGpuLaunchImpl = dd.fullGpuLaunchImpl;
 
 // ── Singletons ────────────────────────────────────────────────
-// `g_default` and the four `last_*_kernel_ns` telemetry vars live on
+// `g_default` and the three `last_*_kernel_ns` telemetry vars live on
 // the facade so external callers reading `gpu_decode.X` keep working.
 // Sub-modules write back via `@import("driver.zig").X = ...`.
 

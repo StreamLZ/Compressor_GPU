@@ -26,7 +26,7 @@ decode/                         GPU decode
   module_loader.zig             PTX load, kernel-handle pub vars, init /
                                 isAvailable / ensurePipelineStreams
   descriptors.zig               POD descriptor types + GpuError + cudaCall +
-                                HUFF_LUT_ENTRIES, walk_max_chunks
+                                HUFF_LUT_ENTRIES, WALK_MAX_CHUNKS
   decode_context.zig            DecodeContext + ensure/alloc/copy helpers
                                 + kernel-event profiling plumbing
   scan_host.zig                 CPU scanForEntropyChunks (H2D-bounce entry path
@@ -161,7 +161,8 @@ sequential per the no-parallel-benchmarks rule); all times in milliseconds.
 L1–L2 are LZ-only (no entropy stage); L3–L5 add GPU Huffman. The 32-stream
 Huffman wire format costs ~0.4–0.5 pp ratio at 64 KB sub-chunks (sub-header
 grew from 9 to 93 bytes per chunk) in exchange for a ~17% kernel-time win
-from running 32 active warp lanes vs the prior 4-stream / 4-lane design.
+from running 32 active warp lanes vs the prior design's 4 streams / 4
+active lanes.
 
 ### Decode (ms): D2D wall-clock and end-to-end
 
@@ -189,6 +190,13 @@ LZ-only sub-D2D times (L3+ pipelined together with Huffman pre-decode):
 | L3 | 3.12 / 1.93 | 5.37 / 3.52 |
 | L4 | 2.93 / 1.81 | 5.22 / 3.50 |
 | L5 | 3.41 / 1.58 | 6.20 / 3.01 |
+
+Note: LZ + Huff sums above are taken from SLZ_SPLIT_TIMER runs that
+fence between the two kernel groups; the unfenced D2D wall-clock above
+additionally includes scan / walk / compact-merge bookkeeping that
+SPLIT_TIMER doesn't attribute to either kernel. So sum may be slightly
+greater than (most cases) or less than (silesia L5: 9.21 < 9.35 D2D) the
+unfenced total depending on how much the unattributed portion costs.
 
 The 32-stream Huffman pre-decode (L3+) now lands at roughly one-third of
 the LZ kernel time (down from roughly equal under the 4-stream design):

@@ -28,9 +28,8 @@ static constexpr int32_t  INITIAL_RECENT_OFFSET      = -8;
 
 // ── Chunk types (chunk_header byte high nibble >> CHUNK_TYPE_SHIFT) ──
 // On GPU we only emit raw (implicitly type 0, no named constant) and
-// Huffman (type 4); tANS (1, 6) and paired (5, 7) types were retired
-// with the GPU tANS encoder. The raw type is the default-zero value so
-// no RAW_CHUNK_TYPE constant exists; code reads "ct == 0" inline.
+// Huffman (type 4). The raw type is the default-zero value so no
+// RAW_CHUNK_TYPE constant exists; code reads "ct == 0" inline.
 static constexpr uint32_t CHUNK_TYPE_SHIFT      = 4;
 static constexpr uint32_t CHUNK_TYPE_MASK       = 7;
 static constexpr uint8_t  HUFF_CHUNK_TYPE       = 4;
@@ -111,6 +110,8 @@ static constexpr uint32_t CHUNK_FLAG_MEMSET         = 0x2u;
 // by coincidence; named separately because the semantic is "fallback
 // scratch-slot stride for the scan kernel", not "block size".
 static constexpr uint32_t DEFAULT_SUB_CHUNK_CAP     = 0x10000u; // 64KB
+static_assert(DEFAULT_SUB_CHUNK_CAP == LZ_BLOCK_SIZE,
+              "naming coincidence — both are 64KB; see comment above");
 
 // LZ length-stream extended marker: bytes whose raw value exceeds
 // EXT_LENGTH_THRESHOLD trigger a 2-byte extended-length read. Encoder
@@ -122,6 +123,7 @@ static constexpr uint32_t EXT_LENGTH_THRESHOLD       = 251;
 // (BE u24). STREAM_HEADER_BYTES is the old name retained for back-compat
 // with the existing encode references; prefer the new name in new code.
 static constexpr uint32_t LZ_SUBSTREAM_COUNT_HDR_BYTES = 3;
+// DEPRECATED — use LZ_SUBSTREAM_COUNT_HDR_BYTES in new code.
 static constexpr uint32_t STREAM_HEADER_BYTES       = LZ_SUBSTREAM_COUNT_HDR_BYTES;
 static constexpr uint32_t OFF16_HEADER_BYTES        = 2; // little-endian u16
 

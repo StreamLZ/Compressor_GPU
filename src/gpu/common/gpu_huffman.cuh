@@ -27,7 +27,7 @@ static constexpr uint32_t HUFF_LUT_ENTRIES    = 1u << HUFF_LUT_INDEX_BITS; // 10
 static constexpr int HUFF_LEN_HIST_SIZE = HUFF_MAX_CODE_LEN + 2;    // 13
 
 // ── 32-stream wire-format constants ─────────────────────────────
-// chunk_type=4 body layout:
+// chunk_type=4 body layout, where N = HUFF_NUM_STREAMS = 32:
 //   [HUFF_WEIGHTS_BYTES weights — 4 bits/symbol, packed low-nibble-first]
 //   [HUFF_SUBHEADER_BYTES sub-header — (N-1) × u24 LE stream sizes;
 //                                       stream (N-1) size derived from total]
@@ -123,6 +123,8 @@ static constexpr int LUT_NSYM_SHIFT = 24;
 // num_syms field values in a packed LUT entry — these are wire-format
 // tag values stored in the LUT's high byte, not symbol counts (though
 // SINGLE=1 and DUAL=2 happen to match the count of symbols they emit).
+// ESCAPE=3 is chosen so any non-{1,2} value triggers the escape branch;
+// no encode-side meaning to the literal `3` beyond being distinct.
 static constexpr uint8_t LUT_NUM_SYMS_SINGLE   = 1;   // single-symbol entry
 static constexpr uint8_t LUT_NUM_SYMS_DUAL     = 2;   // double-symbol entry
 static constexpr uint8_t LUT_NUM_SYMS_ESCAPE   = 3;   // height-limit escape entry
@@ -141,7 +143,8 @@ __device__ __forceinline__ uint32_t packLutEntry(uint8_t sym1, uint8_t sym2,
 }
 
 // Field accessors mirroring packLutEntry — keep unpack centralized.
-// All four return uint8_t for type-consistency with packLutEntry's inputs;
+// The four single-field accessors (lutSym1/lutSym2/lutTotalLen/lutNumSyms)
+// return uint8_t for type-consistency with packLutEntry's inputs;
 // lutSymPair returns uint16_t because callers consume it as a packed
 // (sym1 in low byte, sym2 in high byte) value, e.g. for `*(uint16_t*)dst = lutSymPair(e)`.
 __device__ __forceinline__ uint8_t  lutSym1(uint32_t entry)     { return (uint8_t)(entry >> LUT_SYM1_SHIFT); }

@@ -35,8 +35,12 @@
 // escape LUT entries (num_syms == LUT_NUM_SYMS_ESCAPE) — a 1024-entry
 // LUT (4 KB shared) instead of 2048 (8 KB), roughly doubling
 // decode-kernel occupancy.
-static constexpr int MAX_CODE_LEN = HUFF_LUT_INDEX_BITS;  // 10
-static constexpr int LUT_SIZE     = 1 << MAX_CODE_LEN;    // 1024
+//
+// `LUT_SIZE` is `(int)HUFF_LUT_ENTRIES` — the shared header defines the
+// value, this file just narrows the type for the local int contexts
+// (loop bounds, shared-memory size constants).
+static constexpr int MAX_CODE_LEN = HUFF_LUT_INDEX_BITS;     // 10
+static constexpr int LUT_SIZE     = (int)HUFF_LUT_ENTRIES;   // 1024
 
 // HUFF_* wire constants, the canonical-code builder, the LUT-entry
 // pack/unpack helpers and the num_syms tags come from
@@ -253,14 +257,20 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
 
     // ── Phase 2: hot loop — 2 lookups/refill, unconditional u32 store ──
     //
+    // Naming note: `MAX_CODE_LEN` in this file is the *LUT index width*
+    // (10), an alias of `HUFF_LUT_INDEX_BITS`. The actual max code length
+    // is `HUFF_MAX_CODE_LEN == MAX_CODE_LEN + 1 == 11` (escape codes are
+    // 11 bits). The "+1"s in the analysis below all come from this.
+    //
     // The two reasons this is faster than 1-lookup-with-alignment-check:
     //
     // 1. One refill check covers 2 decodes. 2 decodes consume at most
-    //    2 × (MAX_CODE_LEN + 1) = 22 bits; the refill threshold of 22
-    //    leaves post-refill bit_count in [32, 53], strictly ≥ 22, so the
-    //    second decode never needs a mid-batch refill check. 3-lookup is
-    //    NOT safe — it could consume up to 33 bits, which exceeds the
-    //    32 a single refill can add, so it would force fallback paths.
+    //    2 × (MAX_CODE_LEN + 1) = 2 × HUFF_MAX_CODE_LEN = 22 bits; the
+    //    refill threshold of 22 leaves post-refill bit_count in [32, 53],
+    //    strictly ≥ 22, so the second decode never needs a mid-batch
+    //    refill check. 3-lookup is NOT safe — it could consume up to
+    //    3 × HUFF_MAX_CODE_LEN = 33 bits, which exceeds the 32 a single
+    //    refill can add, so it would force fallback paths.
     //
     // 2. The u32 store is unconditional. Phase 1 established the
     //    invariant that (out + written) is 4-aligned; each store here
@@ -348,6 +358,17 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
             bit_buf |= ((uint64_t)in[in_pos++]) << (BITBUF_BITS - 8 - bit_count);
             bit_count += 8;
         }
+        // Out-of-input clamp: if we drained the input mid-symbol, force
+        // bit_count up so the LUT read below doesn't shift past the end.
+        // SAFETY: the lookup may resolve a "fictitious" symbol from the
+        // zero-padded low bits, but the surrounding `out_pos < out_size`
+        // gate clips writes to valid output slots — any spurious decode
+        // either lands within the legitimate output region (where it
+        // overwrites a byte that would have been written by a properly-
+        // terminated stream) or never fires. Decoder still returns 0
+        // for an actually-corrupt LUT entry via the `total_len == 0`
+        // check below. The clamp exists to keep the LUT-shift well-
+        // defined; correctness on valid input is unaffected.
         if (bit_count < MAX_CODE_LEN + 1) bit_count = MAX_CODE_LEN + 1;
         uint32_t entry = lut[(uint32_t)(bit_buf >> (BITBUF_BITS - MAX_CODE_LEN))];
         int total_len = lutTotalLen(entry);
