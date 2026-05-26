@@ -4,12 +4,11 @@
 // state. #include'd via "../common/gpu_byteio.cuh" into the existing
 // single .cu translation units.
 //
-// Endianness rule (the two conventions used by the wire format):
-//   - LZ sub-stream count headers : BIG-endian u24  -> readBE24
-//   - Huffman 4-stream sub-header  : LITTLE-endian u24 -> readLE24 /
-//     writeLE24
-// Both are correct; keeping each call site on a named helper makes the
-// convention self-documenting.
+// The wire format mixes big-endian and little-endian fields. Each call
+// site picks a named helper from this header — readBE24 / readU32BE for
+// big-endian fields, readU16LE / readU32LE / readU64LE / readLE24 for
+// little-endian fields — so the convention is self-documenting at the
+// read/write site rather than buried in an open-coded byte shift.
 #pragma once
 
 #include <cstdint>
@@ -55,8 +54,10 @@ __device__ __forceinline__ void storeU16LE(uint8_t* dst, uint16_t value) {
 }
 
 // ── 32-bit little-endian load / store (unaligned-safe) ──────────
-// Open-coded 4-byte read used by every LZ match-finder; collected here
-// so the encode hot loops can avoid restating the byte-shift idiom.
+// readU32LE — 4-byte LE load. Used pervasively: LZ match-finder hot loop,
+// frame-walk kernel (block / chunk header fields), assemble kernel
+// (chunk-internal header). writeU32LE — 4-byte LE store, used by the
+// assemble kernel (chunk-internal header + end mark).
 __device__ __forceinline__ uint32_t readU32LE(const uint8_t* p) {
     uint32_t v; memcpy(&v, p, 4); return v;
 }
@@ -76,6 +77,11 @@ __device__ __forceinline__ uint64_t readU64LE(const uint8_t* p) {
 // Generic zero-padded tail read used by the LZ encode hash path. Reads
 // 8 bytes from `base + pos` when in-range, or `src_size - pos` bytes
 // followed by zero-padding when the tail is short.
+//
+// SAFETY: caller must guarantee `pos <= src_size` (otherwise the
+// `src_size - pos` subtraction underflows). The encode parsers satisfy
+// this because they only call read8safe inside `while (pos < src_size)`
+// loops or after a `if (pos < src_size)` guard.
 __device__ __forceinline__ uint64_t read8safe(const uint8_t* base, uint32_t pos,
                                               uint32_t src_size) {
     uint64_t v = 0;

@@ -29,14 +29,18 @@ decode/                         GPU decode
                                 HUFF_LUT_ENTRIES, walk_max_chunks
   decode_context.zig            DecodeContext + ensure/alloc/copy helpers
                                 + kernel-event profiling plumbing
-  scan_host.zig                 CPU scanForEntropyChunks (H2D entry path)
-  scan_gpu.zig                  GPU walk / prefix-sum / scan / compact orchestration
+  scan_host.zig                 CPU scanForEntropyChunks (H2D-bounce entry path
+                                + fallback when the GPU scan kernels are absent)
+  scan_gpu.zig                  GPU walk / prefix-sum / scan / compact
+                                (pure-D2D entry; CPU has no readable copy)
   decode_dispatch.zig           fullGpuLaunch / fullGpuLaunchImpl + per-decode
                                 helpers (dumpScanIfRequested, emitE2eTrace,
                                 gatherRawOff16, mergeHuffDescs)
   lz_kernel.cu                  LZ decode aggregator; #includes:
     slz_wire_format.cuh         decoder-private token formats + parsers
-    lz_decode_core.cuh          the two LZ decode hot loops + warp copy helpers
+    lz_decode_core.cuh          warp-cooperative literal / match copy helpers
+    lz_decode_raw.cuh           slzLzDecodeRawKernel inner loop (no-entropy fast path)
+    lz_decode_general.cuh       slzLzDecodeKernel inner loop (entropy + delta-literals)
     lz_dispatch.cuh             parseAndDecodeSubChunk + raw variant
     lz_header_parse.cuh         per-stream sub-chunk header parsers
     lz_decode_kernels.cuh       slzLzDecodeKernel + slzLzDecodeRawKernel
@@ -81,7 +85,7 @@ pre-decoded streams and resolving matches.
 
 ### Kernel entry points
 
-Every CUDA kernel resolved by the Zig drivers via `cuModuleGetFunction`.
+Every CUDA kernel is resolved by the Zig drivers via `cuModuleGetFunction`.
 
 | Direction | Kernel | Source |
 |-----------|--------|--------|
@@ -104,9 +108,9 @@ Every CUDA kernel resolved by the Zig drivers via `cuModuleGetFunction`.
 | decode | `slzHuffDecode4StreamKernel` | `decode/huffman_kernel.cu` |
 
 Decode LZ-aggregator kernels live in their per-kernel `.cuh` headers
-(`lz_decode_kernels.cuh`, `walk_frame_kernel.cuh`, etc.) which the
-single `decode/lz_kernel.cu` aggregator includes; only the `.cu`
-emits a `.ptx`, hence the source column.
+(see the layout block above) which the single `decode/lz_kernel.cu`
+aggregator includes; only the `.cu` emits a `.ptx`, hence the source
+column.
 
 ## Build
 
@@ -196,8 +200,15 @@ kernels run as a separate pass and are not included).
 | L4 | 112 | 203 |
 | L5 | 296 | n/a † |
 
-† silesia L5 is a known pathological slow path in the serial chain
-parser; not representative.
+† silesia L5 in the serial chain parser is the known pathological slow
+path documented in [`project_l5_silesia_pathology`](project_l5_silesia_pathology.md):
+the binary heterogeneity of silesia_all.tar (mostly text + xml + dna
+with short chain depth + a few large binaries with extremely deep chains)
+defeats the chain parser's CHAIN_MAX_STEPS guard. The encode-time number
+is dominated by a few outlier sub-chunks and not representative of the
+codec on uniform inputs (enwik8 L5 ratio 38.9% in 296 ms remains a fair
+data point). The compression *ratio* on silesia L5 is real and
+representative; only the encode-time number is misleading.
 
 ### vs nvCOMP (enwik8, 100 MB)
 
@@ -223,8 +234,8 @@ faster decode on both axes: D2D 2.92 vs 5.1 ms (1.75x faster),
 e2e 15.63 vs 18.5 ms (1.18x faster).
 
 **StreamLZ L5 vs nvCOMP Zstd.** Wins ratio (38.9% vs 40.2%) and e2e
-(17.55 vs 18.2 ms, 0.65 ms faster). D2D is essentially tied: Zstd 6.2 ms
-vs StreamLZ 6.26 ms (Zstd narrowly ahead on the pure-GPU timer).
+(17.55 vs 18.2 ms, 0.65 ms faster). On the pure-GPU D2D timer, Zstd is
+narrowly ahead: 6.2 vs 6.26 ms — Zstd faster by ~1%.
 
 ## Invariants: do not break these
 

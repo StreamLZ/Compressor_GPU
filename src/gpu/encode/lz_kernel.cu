@@ -17,7 +17,7 @@
 //   use_chain=1:           serial chain-hash lazy parser (scanBlockChain)
 //
 // This is a single translation unit: the cohesive sections live in
-// the lz_*.cuh headers below and are #include-d here so nvcc still
+// the lz_*.cuh headers above and are #include-d here so nvcc still
 // compiles ONE lz_kernel.cu into ONE lz_kernel.ptx/.cubin.
 //
 // Built to lz_kernel.ptx/.cubin by tools/build_gpu_enc.bat

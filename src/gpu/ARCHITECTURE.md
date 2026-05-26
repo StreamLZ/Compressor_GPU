@@ -37,6 +37,7 @@ chunk is not token parsing; it is copying bytes. The literal copy
 ("paste these 50 bytes into the output") and the match copy ("paste
 those 50 bytes from earlier into the output") are bulk operations
 that a 32-lane warp can complete in `(50 + 31) / 32 = 2` iterations
+(ceiling division: 50 bytes split across 32 lanes per iteration)
 rather than 50. Token parsing remains roughly serial, but it now
 runs in a small fraction of the warp time because the byte-copy
 phase is so much faster.
@@ -81,8 +82,8 @@ results back to the device.
 
 A decode call goes through six stages on the GPU. Every stage runs
 on the device. The host's only contribution after the initial launch
-is a fifty-six-byte readback of launch-plumbing counters used to
-size the next kernel's grid.
+is a 56-byte readback of launch-plumbing counters used to size the
+next kernel's grid.
 
 ```
    slzWalkFrameKernel
@@ -195,10 +196,8 @@ of the byte-copy work in the codec.
 
 The literal copy is straightforward. All 32 lanes participate, each
 copying one byte at a stride of WARP_SIZE until the run is
-exhausted. A literal of 50 bytes takes two warp iterations: lanes 0
-through 31 copy bytes 0 through 31 in the first iteration, then
-lanes 0 through 17 copy bytes 32 through 49 in the second. The
-remaining 14 lanes idle for that second iteration.
+exhausted. (See the worked 50-byte example near the top of this
+document for the iteration count.)
 
 The match copy is more delicate. A back-reference at distance d for
 length l is parallel-safe only when d is at least l. If d is smaller
@@ -236,14 +235,25 @@ compete for registers with the decode loop's working set. The
 register pressure would force lower occupancy, and the decoder would
 slow down.
 
-The keep-out attribute means the compiler allocates registers for the
-parser at its own entry point, lets the parser finish and return,
-and then enters the decoder with a fresh smaller register set.
+The `__noinline__` attribute means the compiler allocates registers
+for the parser at its own entry point, lets the parser finish and
+return, and then enters the decoder with a fresh smaller register set.
 
 This was confirmed empirically. Removing `__noinline__` and rebuilding
 inflated the LZ decode kernel's per-thread register footprint enough
 to cross an occupancy threshold and visibly drop measured throughput.
 The attribute stays.
+
+The opposite experiment also failed. The J4 cleanup tried adding
+`__noinline__` to `decodeSubChunkGeneral` (the entropy-mode decoder's
+hot loop body — much larger than the header parser). PTX STACK grew on
+both `slzLzDecodeKernel` (192 → 208) and `slzLzDecodeRawKernel` (72 →
+80) with REG unchanged, indicating the attribute forced extra spill
+slots. The header parser is small enough that out-of-lining it is a
+win; the general decoder is large enough that nvcc already places it
+out-of-line implicitly. Forcing the attribute on the general decoder
+only adds the spill slots. The lz_decode_general.cuh top-of-file
+comment captures this conclusion.
 
 ## The four-stream Huffman decoder
 
@@ -453,7 +463,8 @@ of headroom over the actual 128 KB cap.
 
 Every value that the encoder writes and the decoder reads lives in
 `common/gpu_wire_format.cuh`. The encode side includes that header.
-The decode side includes that header. There is no second copy.
+The decode side includes that header. There is no second copy. A
+short selection (see the file itself for the complete current list):
 
 ```cpp
 static constexpr uint32_t LZ_BLOCK_SIZE              = 0x10000u;
@@ -463,11 +474,8 @@ static constexpr int32_t  INITIAL_RECENT_OFFSET      = -8;
 static constexpr uint8_t  HUFF_CHUNK_TYPE            = 4;
 static constexpr uint32_t SUBCHUNK_HDR_BYTES         = 3;
 static constexpr uint32_t SUBCHUNK_LZ_FLAG_BIT       = 0x800000u;
-static constexpr uint32_t SUBCHUNK_MODE_SHIFT        = 19;
-static constexpr uint32_t SUBCHUNK_COMP_SIZE_MASK    = 0x7FFFFu;
 static constexpr uint32_t OFF16_ENTROPY_MARKER       = 0xFFFFu;
 static constexpr uint32_t OFF32_COUNT_FIELD_BITS     = 12;
-static constexpr uint32_t OFF32_COUNT_PACK_MAX       = (1u << OFF32_COUNT_FIELD_BITS) - 1;
 static constexpr uint8_t  OFF32_LONG_ENTRY_TAG       = 0xC0;
 ```
 
@@ -488,7 +496,7 @@ direction.
 
 The cleanup pass replaced the entire descriptor orchestration with
 on-device kernels. The walk kernel parses the frame header on the
-device. The prefix-sum kernel runs on the device. The scan kernel
+device. The scan kernel runs on the device. The prefix-sum kernel
 runs on the device. The compact kernels run on the device. The
 merge kernel runs on the device. The gather kernel copies raw
 off16 bytes inside the device.

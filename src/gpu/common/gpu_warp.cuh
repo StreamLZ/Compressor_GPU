@@ -12,11 +12,16 @@
 
 // ── Warp / lane geometry ────────────────────────────────────────
 // One CUDA warp is 32 lanes. LANE_MASK extracts a lane index from a
-// thread index (threadIdx.x & LANE_MASK). FULL_WARP_MASK is the
-// all-lanes-active participation mask for warp-wide intrinsics
-// (__shfl_sync / __ballot_sync / __match_any_sync).
+// thread index (threadIdx.x & LANE_MASK).
 static constexpr uint32_t WARP_SIZE      = 32;
 static constexpr uint32_t LANE_MASK      = WARP_SIZE - 1;   // threadIdx.x & 31 = lane
+
+// ── Warp-intrinsic participation mask ───────────────────────────
+// FULL_WARP_MASK is the "all 32 lanes active" mask passed to warp-wide
+// intrinsics (__shfl_sync / __ballot_sync / __match_any_sync). It is
+// orthogonal to the geometry constants above — every existing kernel in
+// src/gpu/ launches with a full warp and so only ever needs this one
+// mask.
 static constexpr uint32_t FULL_WARP_MASK = 0xFFFFFFFFu;     // all 32 lanes active
 
 // ── Scalar bit widths ───────────────────────────────────────────

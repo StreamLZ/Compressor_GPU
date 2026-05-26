@@ -8,7 +8,7 @@
 
 #include <cstdint>
 #include "../common/gpu_warp.cuh"          // WARP_SIZE, LANE_MASK, U32_BITS, U64_BITS, BITS_PER_BYTE
-#include "../common/gpu_byteio.cuh"        // read8safe
+#include "../common/gpu_byteio.cuh"        // read8safe, readU32LE, readU64LE, readBE24, writeBE24, writeLE24
 #include "../common/gpu_wire_format.cuh"   // LZ_BLOCK_SIZE, INITIAL_LITERAL_COPY_BYTES, OFF32_LONG_ENTRY_TAG, ...
 
 // ── Match / format constants ────────────────────────────────────
