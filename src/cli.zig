@@ -1193,8 +1193,17 @@ fn runBenchAll(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
     };
     var results: [11]Result = undefined;
 
+    // GPU encoder only implements L1-L5 (see src/streamlz_gpu.zig and
+    // the gpu_mode branch in src/encode/fast_framed.zig). With `-gpu`,
+    // cap the loop at L5 so we don't silently show CPU-encoded L6-L11
+    // rows labelled as GPU runs.
+    const max_level: u8 = if (args.gpu) 5 else 11;
+    if (args.gpu) {
+        try w.writeAll("(-gpu: GPU encoder implements L1-L5 only; L6-L11 skipped)\n");
+    }
+
     var level: u8 = 1;
-    while (level <= 11) : (level += 1) {
+    while (level <= max_level) : (level += 1) {
         const idx = level - 1;
 
         // Compress once, timed.
@@ -1256,7 +1265,7 @@ fn runBenchAll(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
     try w.writeAll("\nLevel | Compressed         | Ratio  | Compress   | Decompress\n");
     try w.writeAll("------+--------------------+--------+------------+-----------\n");
 
-    for (results) |res| {
+    for (results[0..max_level]) |res| {
         var bytes_buf: [32]u8 = undefined;
         const bytes_str = fmtBytes(&bytes_buf, res.comp_size);
 
