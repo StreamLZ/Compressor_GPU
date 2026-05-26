@@ -26,29 +26,41 @@ static constexpr uint32_t HUFF_LUT_ENTRIES    = 1u << HUFF_LUT_INDEX_BITS; // 10
 // Code-length histogram size: indices 0..HUFF_MAX_CODE_LEN+1 inclusive.
 static constexpr int HUFF_LEN_HIST_SIZE = HUFF_MAX_CODE_LEN + 2;    // 13
 
-// ── 32-stream wire-format constants ─────────────────────────────
+// ── 32-stream bounded-interleaved (BIL) wire-format constants ───
 // chunk_type=4 body layout, where N = HUFF_NUM_STREAMS = 32:
-//   [HUFF_WEIGHTS_BYTES weights - 4 bits/symbol, packed low-nibble-first]
-//   [HUFF_SUBHEADER_BYTES sub-header - (N-1) × u24 LE stream sizes;
-//                                       stream (N-1) size derived from total]
-//   [stream 0 | stream 1 | ... | stream N-1]
+//   [HUFF_WEIGHTS_BYTES weights — 4 bits/symbol, packed low-nibble-first]
+//   [HUFF_SUBHEADER_BYTES sub-header — N × u24 LE per-stream byte sizes]
+//   [HUFF_BIL_K_BYTES — u32 LE interleaved-word count K = min(words[s])]
+//   [interleaved area: K rows × (N × 4 bytes) = K × 128 bytes]
+//   [tail area: per-stream bytes from word K onward, concatenated by
+//               exclusive prefix-sum of per-stream tail sizes]
 //
-// 32 streams lets all 32 warp lanes decode in parallel (vs 4 lanes active
-// in the prior 4-stream format). The cost has two parts:
-//   - Sub-header byte overhead: (93-9) / chunk_size = 84 / 65536 ≈ 0.13%
-//     at 64 KB sub-chunks.
-//   - Stream-boundary entropy loss: 32 boundaries vs 4 means more
-//     trailing-byte rounding + more partial-byte flushes. Empirically
-//     this dominates the byte overhead.
-// Total measured ratio cost ≈ 0.4-0.5 pp at 64 KB sub-chunks on
-// enwik8 / silesia L3-L5 (see ratio table in src/gpu/README.md).
-// At larger sub-chunks both components shrink linearly with chunk size.
-static constexpr int     HUFF_NUM_STREAMS       = 32;           // 32-stream split (was 4)
+// 32 streams lets all 32 warp lanes decode in parallel. Bounded
+// interleave (BIL) means the first K = min(words[s] for s in 0..N-1)
+// words of each stream are stored INTERLEAVED — when 32 lanes refill at
+// the same word index, their 4-byte LDGs coalesce into one 128-byte
+// sector. Past word K, each stream's remaining bytes ("tail") go in a
+// concatenated tail area at offsets computed via exclusive prefix-sum
+// of per-stream tail sizes. This captures ~89% of refills with full
+// coalescing on natural text (enwik8); the remaining ~11% scatter as
+// they would in a plain concatenated layout. Zero padding cost —
+// shorter streams aren't forced to match the longest.
+//
+// All N sizes (not N-1) are stored explicitly so the decoder can compute
+// words[s] = (size[s] + 3) / 4 in parallel and find K without recovering
+// it from total payload. The +3 sub-header bytes vs the prior derived-
+// last-size layout buys the unconditional BIL dispatch logic.
+//
+// Measured impact vs the prior 32-stream concatenated format: +12-13%
+// decode throughput at the same compression ratio (~0.01% header growth).
+static constexpr int     HUFF_NUM_STREAMS       = 32;           // 32-stream split
 static constexpr int     HUFF_ALPHABET          = 256;          // 8-bit symbol alphabet
 static constexpr int     HUFF_WEIGHTS_BYTES     = 128;          // 256 symbols × 4-bit lengths
 static constexpr int     HUFF_STREAM_SIZE_BYTES = 3;            // bytes per u24 stream-size field
-static constexpr int     HUFF_SUBHEADER_BYTES   = (HUFF_NUM_STREAMS - 1) * HUFF_STREAM_SIZE_BYTES; // 93
-static constexpr int     HUFF_BODY_HEADER_BYTES = HUFF_WEIGHTS_BYTES + HUFF_SUBHEADER_BYTES;       // 221
+static constexpr int     HUFF_SUBHEADER_BYTES   = HUFF_NUM_STREAMS * HUFF_STREAM_SIZE_BYTES;       // 96
+static constexpr int     HUFF_BIL_K_BYTES       = 4;            // u32 LE interleaved word count K
+static constexpr int     HUFF_BODY_HEADER_BYTES = HUFF_WEIGHTS_BYTES + HUFF_SUBHEADER_BYTES + HUFF_BIL_K_BYTES; // 228
+static constexpr int     HUFF_BIL_ROW_BYTES     = HUFF_NUM_STREAMS * 4;  // 128 — one interleaved row
 static constexpr uint8_t HUFF_NIBBLE_MASK       = 0x0F;         // low-nibble mask
 
 // Both Huffman kernels assign one warp lane per stream (encoder lane k

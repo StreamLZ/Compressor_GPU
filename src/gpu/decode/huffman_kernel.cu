@@ -25,6 +25,7 @@
 // decode/driver.zig @embedFile's the PTX.
 
 #include <cstdint>
+#include <cstring>                    // memcpy (misaligned u32 refill)
 #include "../common/gpu_warp.cuh"     // WARP_SIZE
 #include "../common/gpu_byteio.cuh"   // readLE24
 #include "../common/gpu_huffman.cuh"  // HUFF_* constants, LUT pack/unpack, buildCanonicalCodes
@@ -169,9 +170,11 @@ extern "C" __global__ void slzHuffBuildLutKernel(
     }
 }
 
-// ── Single-stream decode core (one lane) ────────────────────────────
+// ── Single-stream decode core (one lane) — BIL refill ───────────────
 // Top-aligned bit buffer; 4-byte big-endian refill; double-symbol (X2)
-// LUT lookup.
+// LUT lookup. Refill source depends on the current word index:
+//   word_idx < K  → interleaved area (32-lane coalesced sector load)
+//   word_idx ≥ K  → per-lane tail (scattered, like a concat layout)
 //
 // Two-phase design:
 //   Phase 1 (preamble): byte-drain until `out + written` is 4-aligned.
@@ -180,52 +183,65 @@ extern "C" __global__ void slzHuffBuildLutKernel(
 //                       u32 stores (alignment invariant from phase 1).
 //
 // Phase 2's refill threshold is 2*(MAX_CODE_LEN+1) = 22 bits. After
-// refill, bit_count is in [32, 53] - strictly ≥ 22 - so two decodes
+// refill, bit_count is in [32, 53] — strictly ≥ 22 — so two decodes
 // always succeed without a mid-batch refill check, even when both are
 // length-11 escape codes. 3-lookup would need ≤ 33 bits which exceeds
 // the 32 bits one refill can add, forcing fallback paths.
-__device__ __forceinline__ uint32_t decodeStreamOneLane(
-    const uint8_t* __restrict__ in, uint32_t in_size,
+//
+// All refills go through one 4-byte load. In the BIL hot zone
+// (word_idx < K) all 32 lanes' loads are at `il_base + w*128 + lane*4`
+// — adjacent 4-byte slots in the same 128-byte row, coalesced into one
+// L2 sector. Past K the lanes' tails sit at independent offsets and
+// the loads scatter (~11% of refills on natural text per measurement).
+__device__ __forceinline__ uint32_t decodeStreamBoundedIL(
+    const uint8_t* __restrict__ il_base,     // start of interleaved area
+    const uint8_t* __restrict__ tail_start,  // this lane's tail start
+    int            lane,                     // 0..HUFF_NUM_STREAMS-1
+    uint32_t       K,                        // interleaved word count
+    uint32_t       my_n_words,               // this lane's total word count
     const uint32_t* __restrict__ lut,
     uint8_t* __restrict__ out, uint32_t out_size)
 {
     uint64_t bit_buf = 0;
     uint32_t bit_count = 0;
-    uint32_t in_pos = 0;
-    uint32_t out_pos = 0;     // total bytes decoded
-    uint32_t written = 0;     // bytes flushed to global
-    uint64_t acc = 0;         // pending decoded bytes (byte 0 = oldest)
+    uint32_t word_idx = 0;       // next BIL word index to refill from
+    uint32_t out_pos = 0;        // total bytes decoded
+    uint32_t written = 0;        // bytes flushed to global
+    uint64_t acc = 0;            // pending decoded bytes (byte 0 = oldest)
     uint32_t pending = 0;
 
-    // ── Phase 1: preamble - byte-drain until `out + written` is 4-aligned ──
+    // ── Phase 1: preamble — byte-drain until `out + written` is 4-aligned ──
     //
     // Phase 2's hot loop does an UNCONDITIONAL u32 store that faults on
     // a misaligned address. Each lane's output starts at
-    // `out_offset + lane * (out_size / 4)`; neither term is guaranteed
-    // 4-aligned (out_size is the decompressed chunk size and can be any
-    // byte count), so the destination's starting alignment is arbitrary.
-    // We byte-drain until aligned ONCE here, then phase 2 stays aligned
-    // for the rest of the decode - every u32 store advances `written` by
-    // exactly 4, preserving alignment.
+    // `out_offset + lane * (out_size / N)`; neither term is guaranteed
+    // 4-aligned, so the destination's starting alignment is arbitrary.
+    // We byte-drain until aligned ONCE here; phase 2 then stays aligned
+    // because every u32 store advances `written` by exactly 4.
     //
-    // A prior attempt to use this same preamble idea on the earlier
-    // 1-lookup hot loop regressed 7-10% because a 1-lookup body didn't
-    // amortize the preamble cost. The 2-lookup hot loop below does -
-    // the at-most-3 byte stores here are paid back across thousands of
-    // output bytes per lane.
-    //
-    // Cap: at most ~3 iterations of this outer loop, since each decode
-    // emits 1-2 bytes and we exit as soon as alignment is reached.
+    // Cap: at most ~3 iterations — each decode emits 1-2 bytes and we
+    // exit as soon as alignment is reached.
     while (out_pos < out_size && ((uintptr_t)(out + written) & (alignof(uint32_t) - 1)) != 0u) {
         if (bit_count < MAX_CODE_LEN + 1) {
-            if (in_pos + 4 > in_size) break;
-            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
-                       | ((uint32_t)in[in_pos + 1] << 16)
-                       | ((uint32_t)in[in_pos + 2] <<  8)
-                       | ((uint32_t)in[in_pos + 3]);
+            if (word_idx >= my_n_words) break;
+            const uint8_t* w_ptr = (word_idx < K)
+                ? (il_base + word_idx * (uint32_t)HUFF_BIL_ROW_BYTES + (uint32_t)lane * 4u)
+                : (tail_start + (word_idx - K) * 4u);
+            // Misalignment-safe refill: each entropy body sits at file
+            // offset = chunk_offset + 5 (after the type-4 chunk header),
+            // so `w_ptr` is 4-aligned only ~25% of the time. A direct
+            // u32 deref traps with CUDA_ERROR_MISALIGNED_ADDRESS the
+            // first time we hit a body whose chunk_offset isn't 3 mod 4.
+            // memcpy is the canonical alignment-agnostic load; nvcc lowers
+            // it to byte/short loads + shifts when alignment isn't provable.
+            // All three other refill sites in this function use the same
+            // memcpy pattern and reference this comment.
+            uint32_t word;
+            memcpy(&word, w_ptr, sizeof(uint32_t));
+            uint32_t v = __byte_perm(word, 0, 0x0123);   // LE u32 → BE bit-stream order
             bit_buf |= ((uint64_t)v) << (REFILL_BITS - bit_count);
             bit_count += REFILL_BITS;
-            in_pos += 4;
+            word_idx++;
         }
         uint32_t entry = lut[(uint32_t)(bit_buf >> (BITBUF_BITS - MAX_CODE_LEN))];
         int total_len = lutTotalLen(entry);
@@ -246,8 +262,6 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
         bit_count -= total_len;
         // Drain pending byte-by-byte UNTIL we're aligned - then exit the
         // outer preamble loop and let phase 2 take over with u32 stores.
-        // A dual-symbol entry can emit 2 bytes; both might be needed to
-        // reach alignment if `out + written` was at offset 2 mod 4.
         while (pending > 0 && ((uintptr_t)(out + written) & (alignof(uint32_t) - 1)) != 0u) {
             out[written++] = (uint8_t)(acc & 0xFF);
             acc >>= 8;
@@ -255,53 +269,30 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
         }
     }
 
-    // ── Phase 2: hot loop - 2 lookups/refill, unconditional u32 store ──
+    // ── Phase 2a: hot loop, INTERLEAVED area (word_idx < K) ──
     //
-    // Naming note: `MAX_CODE_LEN` in this file is the *LUT index width*
-    // (10), an alias of `HUFF_LUT_INDEX_BITS`. The actual max code length
-    // is `HUFF_MAX_CODE_LEN == MAX_CODE_LEN + 1 == 11` (escape codes are
-    // 11 bits). The "+1"s in the analysis below all come from this.
-    //
-    // The two reasons this is faster than 1-lookup-with-alignment-check:
-    //
-    // 1. One refill check covers 2 decodes. 2 decodes consume at most
-    //    2 × (MAX_CODE_LEN + 1) = 2 × HUFF_MAX_CODE_LEN = 22 bits; the
-    //    refill threshold of 22 leaves post-refill bit_count in [32, 53],
-    //    strictly ≥ 22, so the second decode never needs a mid-batch
-    //    refill check. 3-lookup is NOT safe - it could consume up to
-    //    3 × HUFF_MAX_CODE_LEN = 33 bits, which exceeds the 32 a single
-    //    refill can add, so it would force fallback paths.
-    //
-    // 2. The u32 store is unconditional. Phase 1 established the
-    //    invariant that (out + written) is 4-aligned; each store here
-    //    advances `written` by exactly 4, preserving it. The alignment
-    //    check the previous design did on every flush is now provably
-    //    dead and the removed branch is most of the speedup.
-    //
-    // out_pos headroom of 2 × LUT_MAX_SYMS_PER_STEP: each iter can emit
-    // up to 2 lookups × LUT_MAX_SYMS_PER_STEP symbols. The tail handles
-    // the trailing 0-3 bytes one decode at a time.
-    //
-    // Three linked constants in this block: the gate (2 × LUT_MAX_SYMS),
-    // the inner-loop bound `k < 2`, and the refill threshold
-    // `2 × (MAX_CODE_LEN + 1)`. If LUT_MAX_SYMS_PER_STEP is ever bumped,
-    // all three need re-derivation, and the refill-threshold bound itself
-    // would have to fit within `REFILL_BITS = 32` - a 3-lookup batch
-    // would need ≤ 32 bits of refill but can consume up to 33, so it
-    // isn't safe. The static_assert locks the assumption.
+    // 2 LUT lookups/refill, unconditional u32 store. Loads are at
+    // `il_base + w*128 + lane*4` — all 32 warp lanes' loads in the same
+    // iteration coalesce into one 128-byte L2 sector access. The
+    // refill-threshold analysis matches the prior 32-stream design:
+    // 2 × (MAX_CODE_LEN + 1) = 22 bits worst case per batch; post-refill
+    // bit_count ∈ [32, 53] is strictly ≥ 22. 3-lookup would need ≤ 33
+    // bits but a single 32-bit refill can only add 32, so it would force
+    // fallback paths and isn't done.
     static_assert(LUT_MAX_SYMS_PER_STEP == 2,
                   "phase-2 hot loop is hard-wired to a 2-lookup batch; "
                   "see refill-threshold analysis above");
-    while (out_pos + 2 * LUT_MAX_SYMS_PER_STEP <= out_size) {
+    while (out_pos + 2 * LUT_MAX_SYMS_PER_STEP <= out_size && word_idx < K) {
         if (bit_count < 2 * (MAX_CODE_LEN + 1)) {
-            if (in_pos + 4 > in_size) break;
-            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
-                       | ((uint32_t)in[in_pos + 1] << 16)
-                       | ((uint32_t)in[in_pos + 2] <<  8)
-                       | ((uint32_t)in[in_pos + 3]);
+            const uint8_t* w_ptr = il_base
+                + word_idx * (uint32_t)HUFF_BIL_ROW_BYTES
+                + (uint32_t)lane * 4u;
+            uint32_t word;
+            memcpy(&word, w_ptr, sizeof(uint32_t));  // misalignment-safe refill — see phase-1 comment
+            uint32_t v = __byte_perm(word, 0, 0x0123);
             bit_buf |= ((uint64_t)v) << (REFILL_BITS - bit_count);
             bit_count += REFILL_BITS;
-            in_pos += 4;
+            word_idx++;
         }
         #pragma unroll
         for (int k = 0; k < 2; k++) {
@@ -309,7 +300,7 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
             int total_len = lutTotalLen(entry);
             int num_syms  = lutNumSyms(entry);
             if (total_len == 0) return 0;
-            if (num_syms == LUT_NUM_SYMS_ESCAPE) {  // length-11 code: the 11th bit picks sym1 vs sym2
+            if (num_syms == LUT_NUM_SYMS_ESCAPE) {
                 uint32_t b11 = (uint32_t)((bit_buf >> (BITBUF_BITS - 1 - MAX_CODE_LEN)) & 1u);
                 uint32_t sym = b11 ? lutSym2(entry) : lutSym1(entry);
                 acc |= (uint64_t)sym << (pending * 8);
@@ -322,10 +313,52 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
             }
             bit_buf <<= total_len;
             bit_count -= total_len;
-            // Unconditional u32 store - alignment invariant holds from
-            // phase 1. Each store cuts L2 store traffic ~4× vs a byte
-            // store and the dropped branch is the bulk of the speedup
-            // over the previous design.
+            if (pending >= sizeof(uint32_t)) {
+                *reinterpret_cast<uint32_t*>(out + written) = (uint32_t)acc;
+                acc >>= 32;
+                written += (uint32_t)sizeof(uint32_t);
+                pending -= (uint32_t)sizeof(uint32_t);
+            }
+        }
+    }
+
+    // ── Phase 2b: hot loop, TAIL area (word_idx ≥ K) ──
+    //
+    // Same 2-lookup body as phase 2a; only the refill source changes.
+    // Tail loads scatter across lanes (different streams, different
+    // tail offsets) and don't coalesce — but tails are short (typically
+    // ~10% of total refills on natural text), so the scatter cost is
+    // bounded.
+    while (out_pos + 2 * LUT_MAX_SYMS_PER_STEP <= out_size) {
+        if (bit_count < 2 * (MAX_CODE_LEN + 1)) {
+            if (word_idx >= my_n_words) break;
+            const uint8_t* w_ptr = tail_start + (word_idx - K) * 4u;
+            uint32_t word;
+            memcpy(&word, w_ptr, sizeof(uint32_t));  // misalignment-safe refill — see phase-1 comment
+            uint32_t v = __byte_perm(word, 0, 0x0123);
+            bit_buf |= ((uint64_t)v) << (REFILL_BITS - bit_count);
+            bit_count += REFILL_BITS;
+            word_idx++;
+        }
+        #pragma unroll
+        for (int k = 0; k < 2; k++) {
+            uint32_t entry = lut[(uint32_t)(bit_buf >> (BITBUF_BITS - MAX_CODE_LEN))];
+            int total_len = lutTotalLen(entry);
+            int num_syms  = lutNumSyms(entry);
+            if (total_len == 0) return 0;
+            if (num_syms == LUT_NUM_SYMS_ESCAPE) {
+                uint32_t b11 = (uint32_t)((bit_buf >> (BITBUF_BITS - 1 - MAX_CODE_LEN)) & 1u);
+                uint32_t sym = b11 ? lutSym2(entry) : lutSym1(entry);
+                acc |= (uint64_t)sym << (pending * 8);
+                pending += 1;
+                out_pos += 1;
+            } else {
+                acc |= (uint64_t)lutSymPair(entry) << (pending * 8);
+                pending += num_syms;
+                out_pos += num_syms;
+            }
+            bit_buf <<= total_len;
+            bit_count -= total_len;
             if (pending >= sizeof(uint32_t)) {
                 *reinterpret_cast<uint32_t*>(out + written) = (uint32_t)acc;
                 acc >>= 32;
@@ -342,33 +375,30 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
         pending -= 1;
     }
 
-    // Tail: handles the trailing 1-2 bytes the X2 hot loop leaves;
-    // clamps dual entries to single.
+    // ── Phase 3: tail — single-symbol decode, dual-source refill ──
+    // Handles the trailing 1-2 bytes the X2 hot loop leaves; clamps
+    // dual entries to single. No byte-at-a-time refill fallback: BIL
+    // always reads full 4-byte words, and the encoder zero-pads each
+    // stream's trailing partial word, so refill is always a clean 4-byte
+    // load (no need to scrape a final 1-3 bytes from input).
     while (out_pos < out_size) {
-        if (bit_count <= REFILL_BITS && in_pos + 4 <= in_size) {
-            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
-                       | ((uint32_t)in[in_pos + 1] << 16)
-                       | ((uint32_t)in[in_pos + 2] <<  8)
-                       | ((uint32_t)in[in_pos + 3]);
+        if (bit_count <= REFILL_BITS && word_idx < my_n_words) {
+            const uint8_t* w_ptr = (word_idx < K)
+                ? (il_base + word_idx * (uint32_t)HUFF_BIL_ROW_BYTES + (uint32_t)lane * 4u)
+                : (tail_start + (word_idx - K) * 4u);
+            uint32_t word;
+            memcpy(&word, w_ptr, sizeof(uint32_t));  // misalignment-safe refill — see phase-1 comment
+            uint32_t v = __byte_perm(word, 0, 0x0123);
             bit_buf |= ((uint64_t)v) << (REFILL_BITS - bit_count);
             bit_count += REFILL_BITS;
-            in_pos += 4;
+            word_idx++;
         }
-        while (bit_count < MAX_CODE_LEN + 1 && in_pos < in_size) {
-            bit_buf |= ((uint64_t)in[in_pos++]) << (BITBUF_BITS - 8 - bit_count);
-            bit_count += 8;
-        }
-        // Out-of-input clamp: if we drained the input mid-symbol, force
-        // bit_count up so the LUT read below doesn't shift past the end.
-        // SAFETY: the lookup may resolve a "fictitious" symbol from the
-        // zero-padded low bits, but the surrounding `out_pos < out_size`
-        // gate clips writes to valid output slots - any spurious decode
-        // either lands within the legitimate output region (where it
-        // overwrites a byte that would have been written by a properly-
-        // terminated stream) or never fires. Decoder still returns 0
-        // for an actually-corrupt LUT entry via the `total_len == 0`
-        // check below. The clamp exists to keep the LUT-shift well-
-        // defined; correctness on valid input is unaffected.
+        // Out-of-input clamp: if we drained the bit-stream mid-symbol,
+        // force bit_count up so the LUT shift below stays well-defined.
+        // Stream-padding zeros may produce a "fictitious" decode here,
+        // but the surrounding `out_pos < out_size` gate clips writes
+        // to valid output slots — and the `total_len == 0` check below
+        // still catches an actually-corrupt LUT entry.
         if (bit_count < MAX_CODE_LEN + 1) bit_count = MAX_CODE_LEN + 1;
         uint32_t entry = lut[(uint32_t)(bit_buf >> (BITBUF_BITS - MAX_CODE_LEN))];
         int total_len = lutTotalLen(entry);
@@ -389,22 +419,27 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
     return out_pos;
 }
 
-// ── 32-stream decode kernel ─────────────────────────────────────────
-// Grid: (n_blocks, 1, 1). Block: (WARP_SIZE, 1, 1) - one warp per block.
-// All 32 lanes decode in parallel (one stream each) - 8× the active-lane
-// throughput vs the prior 4-stream design.
-// Layout (after the 128 B weights, which this kernel skips via in_offset+128):
-//   [HUFF_SUBHEADER_BYTES sub-header: (N-1) × u24 LE stream sizes;
-//                                      stream (N-1) = payload - sum]
-//   [stream 0 | stream 1 | ... | stream N-1]
+// ── 32-stream BIL decode kernel ─────────────────────────────────────
+// Grid: (n_blocks, 1, 1). Block: (WARP_SIZE, 1, 1) — one warp per block.
+// All 32 lanes decode in parallel (one stream each). Coalesced refills
+// in the interleaved area; scatter refills in the tail (~11% of words).
+// Layout (after the 128 B weights, skipped via in_offset+HUFF_WEIGHTS_BYTES):
+//   [HUFF_SUBHEADER_BYTES — N × u24 LE per-stream byte sizes]
+//   [HUFF_BIL_K_BYTES — u32 LE interleaved word count K]
+//   [interleaved area — K × HUFF_BIL_ROW_BYTES bytes]
+//   [tail area — per-stream tails at exclusive-prefix-sum offsets]
 //
-// `in_offset` points at the 128 B weights (full payload start); the
-// decode kernel skips them internally to reach the sub-header.
+// `__launch_bounds__(32, 8)` tells nvcc the exact block size (32 threads)
+// and to leave register-budget headroom for at least 8 blocks per SM.
+// Codegen-specialization win (~+0.5-1% measured); we're shared-mem-
+// limited on occupancy at typically 18-24 blocks/SM, well above the 8
+// floor, so the directive doesn't constrain runtime occupancy.
 //
 // Name retained (slzHuffDecode4StreamKernel) for ABI compatibility with
-// the existing Zig dispatch - it now decodes HUFF_NUM_STREAMS streams,
-// not literally 4.
-extern "C" __global__ void slzHuffDecode4StreamKernel(
+// the existing Zig dispatch — it now decodes HUFF_NUM_STREAMS streams
+// in the BIL format, not literally 4 streams concatenated.
+extern "C" __launch_bounds__(32, 8) __global__
+void slzHuffDecode4StreamKernel(
     const uint8_t* __restrict__ comp,
     const HuffDecChunkDesc* __restrict__ descs,
     const uint32_t* __restrict__ luts,
@@ -423,46 +458,37 @@ extern "C" __global__ void slzHuffDecode4StreamKernel(
     for (int i = lane; i < LUT_SIZE; i += WARP_SIZE) shared_lut[i] = src_lut[i];
     __syncwarp();
 
-    // 32-stream dispatch: every lane decodes one stream. The sub-header
-    // carries 31 × u24 LE sizes; lane k reads its own size (or derives
-    // size[31] from the payload remainder via a warp reduce). Per-lane
-    // input offset is an exclusive prefix sum via warp shuffles - O(log N)
-    // instead of the O(N) linear scan a 4-stream design could afford.
-
+    // BIL header parse. Every lane reads its OWN size (all N sizes are
+    // stored explicitly now, no derived-from-total). Then read K, which
+    // is a block-uniform u32 — every lane reads it (cheap; cached).
     const uint8_t* hdr = comp + desc.in_offset + HUFF_WEIGHTS_BYTES;
-    uint32_t my_size;
-    if (lane < HUFF_NUM_STREAMS - 1) {
-        my_size = readLE24(hdr + lane * HUFF_STREAM_SIZE_BYTES);
-    } else {
-        my_size = 0;  // filled in below from total - sum
-    }
-    // Warp reduce: sum of stream sizes 0..HUFF_NUM_STREAMS-2. Lane
-    // HUFF_NUM_STREAMS-1 (whose `my_size` is still 0) gets the total,
-    // then derives its real size from in_size.
-    uint32_t sum = my_size;
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, off);
-    }
-    if (lane == HUFF_NUM_STREAMS - 1) {
-        // Underflow guard: a malformed descriptor where in_size < hdr or
-        // the stored sizes already exceed the payload would otherwise
-        // produce a giant unsigned size and OOB read.
-        const uint32_t payload = (desc.in_size >= (uint32_t)HUFF_BODY_HEADER_BYTES)
-                               ? (desc.in_size - HUFF_BODY_HEADER_BYTES)
-                               : 0u;
-        my_size = (sum <= payload) ? (payload - sum) : 0u;
-    }
+    uint32_t my_size = readLE24(hdr + lane * HUFF_STREAM_SIZE_BYTES);
 
-    // Exclusive prefix sum of stream sizes → this lane's input offset.
-    uint32_t in_off = my_size;
+    // K immediately after the sub-header (u32 LE).
+    const uint8_t* k_ptr = hdr + HUFF_SUBHEADER_BYTES;
+    uint32_t K = ((uint32_t)k_ptr[0])
+               | ((uint32_t)k_ptr[1] << 8)
+               | ((uint32_t)k_ptr[2] << 16)
+               | ((uint32_t)k_ptr[3] << 24);
+
+    // Body bases. il_base is the start of the interleaved area; tails
+    // follow immediately after.
+    const uint8_t* il_base = hdr + HUFF_SUBHEADER_BYTES + HUFF_BIL_K_BYTES;
+    const uint8_t* tail_area = il_base + (size_t)K * (uint32_t)HUFF_BIL_ROW_BYTES;
+
+    // Per-lane word count and tail-bytes count.
+    uint32_t my_n_words = (my_size + 3u) / 4u;
+    uint32_t my_tail_bytes = (my_n_words > K) ? (my_n_words - K) * 4u : 0u;
+
+    // Exclusive prefix sum of per-lane tail bytes → this lane's tail offset.
+    uint32_t tail_off = my_tail_bytes;
     #pragma unroll
     for (int off = 1; off < 32; off <<= 1) {
-        uint32_t v = __shfl_up_sync(0xFFFFFFFFu, in_off, off);
-        if (lane >= off) in_off += v;
+        uint32_t v = __shfl_up_sync(0xFFFFFFFFu, tail_off, off);
+        if (lane >= off) tail_off += v;
     }
-    in_off -= my_size;  // exclusive
-    const uint8_t* my_in = hdr + HUFF_SUBHEADER_BYTES + in_off;
+    tail_off -= my_tail_bytes;  // exclusive
+    const uint8_t* my_tail_start = tail_area + tail_off;
 
     // Per-lane output region: 32 contiguous slices. Lane (N-1) absorbs
     // the remainder when out_size isn't divisible by HUFF_NUM_STREAMS.
@@ -475,5 +501,7 @@ extern "C" __global__ void slzHuffDecode4StreamKernel(
                           : (desc.out_size - (HUFF_NUM_STREAMS - 1) * q);
     uint8_t* my_out = output + desc.out_offset + my_out_start;
 
-    (void)decodeStreamOneLane(my_in, my_size, shared_lut, my_out, my_out_size);
+    (void)decodeStreamBoundedIL(
+        il_base, my_tail_start, lane, K, my_n_words,
+        shared_lut, my_out, my_out_size);
 }

@@ -15,6 +15,33 @@ const EncodeContext = ec.EncodeContext;
 const HuffEncDesc = ec.HuffEncDesc;
 const CompressChunkDesc = ec.CompressChunkDesc;
 
+// Per-block dst capacity fixed component for the BIL Huffman encoder.
+// Each entropy-stream descriptor sizes its `dst_capacity` as
+// `bilDstCap(count)` which both covers the per-stream entropy bits
+// (≤ 2 bytes/symbol since codes are ≤ 11 bits) and rounds the result
+// up to a 4-byte boundary so consecutive blocks' `dst_offset` values
+// stay 4-aligned. The BIL encode kernel writes the interleaved area
+// with `*(uint32_t*)dst = ...` where `dst = out + dst_offset + 228 +
+// w*128 + lane*4`; a misaligned `dst_offset` makes the store trap
+// (CUDA_ERROR_MISALIGNED_ADDRESS / rc=716) the second a sub-chunk has
+// an odd input `count`.
+//
+// Breakdown of the fixed component:
+//   - HUFF_BODY_HEADER_BYTES = 228 (weights 128 + sub-header 96 + K 4)
+//   - 4 × N rounding tax: each of the 32 streams rounds its encoded
+//     byte count up to a 4-byte BIL word, costing ≤ 3 bytes per stream
+//     = ≤ 96 bytes per block.
+//   - 32 bytes of slack against minor estimate drift.
+// Total = 228 + 96 + 32 = 356. KEEP IN SYNC with HUFF_BODY_HEADER_BYTES
+// and HUFF_NUM_STREAMS in src/gpu/common/gpu_huffman.cuh.
+const HUFF_BODY_FIXED_BYTES: u32 = 356;
+
+/// Per-block dst slot size, 4-byte aligned so cumulative `dst_offset`
+/// stays aligned for the BIL kernel's `*(uint32_t*)dst = ...` writes.
+inline fn bilDstCap(count: u32) u32 {
+    return (count * 2 + HUFF_BODY_FIXED_BYTES + 3) & ~@as(u32, 3);
+}
+
 // ── GPU Huffman encode pass ────────────────────────────────────
 
 /// `out_dev`: when non-zero, the encoder writes Huffman bodies straight
@@ -74,7 +101,17 @@ pub fn gpuEncodeHuffImpl(
     // one extra byte per stream is enough headroom). At N=32, per-stream
     // slices average ~src/32 bytes, so the +64 is generous (~32x the
     // slack the 4-stream era had at the same constant).
-    const scratch_per_stream: usize = (@as(usize, max_src) / NUM_STREAMS + 64) * 2;
+    //
+    // BIL alignment: the encode kernel's interleaved-row write reads each
+    // lane's scratch as `*(uint32_t*)(my_scratch + w*4)`. `my_scratch`
+    // strides by `scratch_per_stream` per lane, so any non-multiple-of-4
+    // stride leaves odd lanes 2 bytes off from a 4-byte boundary — and
+    // PTX `ld.u32` on a runtime-derived misaligned pointer is undefined
+    // (compiler emits a single-instruction load assuming alignment).
+    // `(x + 64) * 2` is `2x + 128`, which is `2 mod 4` whenever x is odd.
+    // Round up to 16 for L2 sector alignment (free, and the kernel reads
+    // 128 bytes per row anyway).
+    const scratch_per_stream: usize = std.mem.alignForward(usize, (@as(usize, max_src) / NUM_STREAMS + 64) * 2, 16);
 
     const desc_bytes: usize = descs.len * @sizeOf(HuffEncDesc);
     const sizes_bytes: usize = descs.len * 4;
@@ -213,10 +250,10 @@ pub fn gpuEncodeOff16HuffImpl(
         if (off16_count < OFF16_HUFFMAN_MIN_COUNT) continue;
         const off16_data: u32 = off16_hdr + 2;
 
-        // Huffman body worst case ≈ HUFF_BODY_HEADER_BYTES (221) fixed
-        // + count×11/8; count*2 + 256 is a safe capacity bound (margin
-        // is 256 - 221 = 35 B after the 4→32 stream sub-header growth).
-        const hi_cap: u32 = off16_count * 2 + 256;
+        // Huffman BIL body worst case = HUFF_BODY_FIXED_BYTES (228 header
+        // + 96 rounding + 32 slack = 356) + count×11/8 per-stream bits.
+        // See the HUFF_BODY_FIXED_BYTES constant docstring above.
+        const hi_cap: u32 = bilDstCap(off16_count);
         descs[i] = .{
             .src_offset = off16_data + 1, // hi plane: odd bytes
             .src_size = off16_count,
@@ -227,7 +264,7 @@ pub fn gpuEncodeOff16HuffImpl(
         hi_offsets[i] = total;
         total += hi_cap;
 
-        const lo_cap: u32 = off16_count * 2 + 256;
+        const lo_cap: u32 = bilDstCap(off16_count);
         descs[n + i] = .{
             .src_offset = off16_data, // lo plane: even bytes
             .src_size = off16_count,
@@ -362,10 +399,10 @@ pub fn gpuEncodeLiteralsHuffImpl(
         const lit_src: u32 = lit_hdr + 3;
         if (lit_src + lit_count > base + cs) continue;
 
-        // Huffman body worst case ≈ HUFF_BODY_HEADER_BYTES (221) fixed
-        // + count×11/8; count*2 + 256 is a safe capacity bound (margin
-        // is 256 - 221 = 35 B after the 4→32 stream sub-header growth).
-        const dst_cap: u32 = lit_count * 2 + 256;
+        // Huffman BIL body worst case = HUFF_BODY_FIXED_BYTES (228 header
+        // + 96 rounding + 32 slack = 356) + count×11/8 per-stream bits.
+        // See the HUFF_BODY_FIXED_BYTES constant docstring above.
+        const dst_cap: u32 = bilDstCap(lit_count);
         descs[i] = .{
             .src_offset = lit_src,
             .src_size = lit_count,
@@ -465,7 +502,7 @@ pub fn gpuEncodeTokensHuffImpl(
         const tok_src: u32 = tok_hdr + 3;
         if (tok_src + tok_count > base + cs) continue;
 
-        const dst_cap: u32 = tok_count * 2 + 256;
+        const dst_cap: u32 = bilDstCap(tok_count);
         descs[i] = .{
             .src_offset = tok_src,
             .src_size = tok_count,

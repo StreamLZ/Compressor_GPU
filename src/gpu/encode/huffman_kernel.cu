@@ -228,17 +228,21 @@ extern "C" __global__ void slzHuffBuildTablesKernel(
 
 // ── HUFF_NUM_STREAMS-way parallel encoder - one block per sub-chunk ───
 //
-// Emits the chunk_type=4 body (the CPU encoder's encode-block output,
-// minus the 5-byte chunk header which the frame assembler prepends):
-//   [HUFF_WEIGHTS_BYTES weights - 4 bits/symbol, byte i = cl[2i] | cl[2i+1]<<4]
-//   [HUFF_SUBHEADER_BYTES sub-header - (N-1) × u24 LE stream sizes;
-//                                       stream (N-1) size derived from total]
-//   [stream 0 | stream 1 | ... | stream N-1]
+// Emits the chunk_type=4 body in the BIL (bounded-interleaved) layout
+// (the CPU encoder's encode-block output, minus the 5-byte chunk header
+// which the frame assembler prepends):
+//   [HUFF_WEIGHTS_BYTES weights — 4 bits/symbol, byte i = cl[2i] | cl[2i+1]<<4]
+//   [HUFF_SUBHEADER_BYTES sub-header — N × u24 LE per-stream byte sizes]
+//   [HUFF_BIL_K_BYTES — u32 LE interleaved word count K = min(words[s])]
+//   [interleaved area — K rows × N×4 bytes; lane s writes its own 4 bytes
+//                       at offset w·128 + s·4 each row (32-lane coalesced store)]
+//   [tail area — per-stream bytes from word K onward, at exclusive-
+//                prefix-sum-of-tail-sizes offsets]
 //
 // where N = HUFF_NUM_STREAMS = 32. Code tables come from
 // slzHuffBuildTablesKernel. Lanes 0..N-1 (= all 32 warp lanes) each
-// encode one input slice into per-stream scratch; lane 0 then assembles
-// the body at `output + descs[block_id].dst_offset`.
+// encode one input slice into per-stream scratch; the warp then
+// cooperatively writes the BIL body at `output + descs[block_id].dst_offset`.
 extern "C" __global__ void slzHuffEncode4StreamKernel(
     const uint8_t* __restrict__ input,
     const HuffEncDesc* __restrict__ descs_in,
@@ -289,14 +293,12 @@ extern "C" __global__ void slzHuffEncode4StreamKernel(
         bytes = encodeStreamOneLane(my_in, my_in_size, desc.src_stride,
                                     block_code_lengths, my_codes, my_scratch);
     }
-    // Publish per-lane byte counts into shared mem so every lane reads
-    // the same view. One write per lane, one sync - cheaper than 32
-    // inline __shfl_sync broadcasts, and (more importantly) avoids the
-    // per-lane `uint32_t stream_bytes[HUFF_NUM_STREAMS]` stack array
-    // that nvcc would otherwise allocate 128 B for on every lane.
-    __shared__ uint32_t stream_bytes[HUFF_NUM_STREAMS];
-    if (lane < HUFF_NUM_STREAMS) stream_bytes[lane] = bytes;
-    __syncwarp();
+    // BIL needs every lane to know just its OWN encoded byte count
+    // (`bytes` register, set above). The prior concat layout published
+    // all 32 counts to a __shared__ array so lane 0 could iterate them
+    // during serial concat; BIL writes the subheader / interleaved area
+    // entirely with per-lane operations using `bytes` directly, so no
+    // shared publication is needed and the array is removed.
 
     uint8_t* out = output + desc.dst_offset;
 
@@ -305,38 +307,89 @@ extern "C" __global__ void slzHuffEncode4StreamKernel(
     for (int i = lane; i < HUFF_WEIGHTS_BYTES; i += WARP_SIZE)
         out[i] = packWeightByte(block_code_lengths[2 * i], block_code_lengths[2 * i + 1]);
 
-    // HUFF_SUBHEADER_BYTES sub-header at offset HUFF_WEIGHTS_BYTES
-    // ((N-1) × u24 LE; stream (N-1) size derived from total payload).
-    // Lanes 0..N-2 each emit their own size in parallel; lane N-1's
-    // size is implicit (caller derives from in_size on decode).
-    if (lane < HUFF_NUM_STREAMS - 1) {
+    // ── BIL sub-header ──
+    // N × u24 LE — every lane writes its own size (vs the prior format
+    // that only wrote N-1 sizes and derived the last). BIL needs all N
+    // explicitly so each lane can compute words[s] = (sizes[s]+3)/4
+    // locally and the warp can find K = min(words[s]) without an extra
+    // payload-total reduction.
+    if (lane < HUFF_NUM_STREAMS) {
         writeLE24(out + HUFF_WEIGHTS_BYTES + lane * HUFF_STREAM_SIZE_BYTES, bytes);
     }
 
-    // Body concat: warp-cooperative. Iterate over streams sequentially
-    // but each stream is byte-cooperative across the warp via warpCopy.
-    // Each lane copies every WARP_SIZE-th byte of the current stream.
-    // For typical stream sizes (~src_size/32 = ~2 KB at 64KB sub-chunks
-    // and ratio ~0.5), this is a ~32x throughput improvement over the
-    // prior lane-0 serial copy.
-    //
-    // Layout invariant matches encode_huff.zig's
-    // `scratch_bytes = descs.len * NUM_STREAMS * scratch_per_stream`
-    // sizing - strides are (NUM_STREAMS × scratch_per_stream) between
-    // blocks and scratch_per_stream between streams within a block.
-    uint8_t* body = out + HUFF_BODY_HEADER_BYTES;
-    uint32_t total_body = 0;
-    #pragma unroll 1
-    for (int s = 0; s < HUFF_NUM_STREAMS; s++) {
-        const uint8_t* src = scratch
-            + ((uint64_t)block_id * HUFF_NUM_STREAMS + s) * scratch_per_stream;
-        const uint32_t sz = stream_bytes[s];
-        warpCopy(body, src, sz, lane);
-        body += sz;
-        total_body += sz;
+    // Per-lane scratch base + zero-pad the trailing partial word so the
+    // interleaved write can do an aligned 4-byte store from offset w*4
+    // without picking up uninitialized scratch bytes past `bytes`.
+    uint8_t* my_scratch = scratch
+        + ((uint64_t)block_id * HUFF_NUM_STREAMS + (uint32_t)lane) * scratch_per_stream;
+    const uint32_t my_words = (bytes + 3u) / 4u;
+    for (uint32_t p = bytes; p < my_words * 4u; p++) my_scratch[p] = 0;
+
+    // K = min(words[s]) across the warp — the largest prefix of words
+    // every stream has, i.e. how many rows go into the interleaved area.
+    uint32_t K = my_words;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        uint32_t v = __shfl_xor_sync(FULL_WARP_MASK, K, off);
+        K = (v < K) ? v : K;
+    }
+
+    // K (u32 LE) immediately after the sub-header. Lane 0 only.
+    if (lane == 0) {
+        uint8_t* k_dst = out + HUFF_WEIGHTS_BYTES + HUFF_SUBHEADER_BYTES;
+        k_dst[0] = (uint8_t)(K & 0xFFu);
+        k_dst[1] = (uint8_t)((K >> 8)  & 0xFFu);
+        k_dst[2] = (uint8_t)((K >> 16) & 0xFFu);
+        k_dst[3] = (uint8_t)((K >> 24) & 0xFFu);
+    }
+
+    // ── Interleaved area: K rows × HUFF_BIL_ROW_BYTES per row ──
+    // All 32 lanes write to adjacent 4-byte slots in the same row, so
+    // each row materializes as a single coalesced 128-byte sector store.
+    // K iterations of "one coalesced store" — much faster than the prior
+    // sequential warpCopy per stream.
+    uint8_t* il_base = out + HUFF_BODY_HEADER_BYTES;
+    for (uint32_t w = 0; w < K; w++) {
+        uint8_t* dst = il_base + w * (uint32_t)HUFF_BIL_ROW_BYTES + (uint32_t)lane * 4u;
+        // my_scratch is zero-padded above to >= my_words*4 bytes, and
+        // w < K <= my_words, so this 4-byte load is fully valid.
+        *reinterpret_cast<uint32_t*>(dst) =
+            *reinterpret_cast<const uint32_t*>(my_scratch + w * 4u);
+    }
+
+    // ── Tail area: per-stream bytes from word K onward ──
+    // Each lane has my_tail_bytes = (my_words - K) * 4 bytes to write
+    // (zero for the lane(s) whose words[s] == K). Per-lane tail offset
+    // within the tail area is the exclusive prefix sum of my_tail_bytes.
+    uint32_t my_tail_bytes = (my_words > K) ? (my_words - K) * 4u : 0u;
+    uint32_t tail_off = my_tail_bytes;
+    #pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        uint32_t v = __shfl_up_sync(FULL_WARP_MASK, tail_off, off);
+        if (lane >= off) tail_off += v;
+    }
+    tail_off -= my_tail_bytes;  // exclusive
+
+    uint8_t* tail_area = il_base + K * (uint32_t)HUFF_BIL_ROW_BYTES;
+    uint8_t* my_tail_dst = tail_area + tail_off;
+    const uint8_t* my_tail_src = my_scratch + K * 4u;
+    // Different lanes have different tail sizes (typically 0-40 bytes);
+    // serialize per-lane. The hottest streams' tails dominate the per-
+    // warp tail-write time, but tails are small (~10% of total bytes).
+    for (uint32_t i = 0; i < my_tail_bytes; i++) {
+        my_tail_dst[i] = my_tail_src[i];
+    }
+
+    // Total body size: K × row_bytes + sum-of-tail-bytes across warp.
+    uint32_t total_tail = my_tail_bytes;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        total_tail += __shfl_xor_sync(FULL_WARP_MASK, total_tail, off);
     }
 
     if (lane == 0) {
-        out_sizes[block_id] = HUFF_BODY_HEADER_BYTES + total_body;
+        out_sizes[block_id] = HUFF_BODY_HEADER_BYTES
+                            + K * (uint32_t)HUFF_BIL_ROW_BYTES
+                            + total_tail;
     }
 }
