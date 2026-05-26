@@ -13,8 +13,11 @@ Commits landed this arc: `712d593` (K1) → `651392a` (K2) → `01e9e38` (K3)
 → `1212a2e` (K6d Zig polish) → `239b9ed` (status update) →
 `a047ba0` (revert K1 C9 — measurable L3 kernel regression) →
 `3136a33` (record C9 revert) → `d886d31`/`655e56d` (perf-warning
-comments at the four C9 shfl sites) → `<HEAD>` (K6e — agent-fanned
-Zig polish batch, +29 items).
+comments at the four C9 shfl sites) → `3e6187b` (K6e — agent-fanned
+Zig polish batch, +29 items) → `747fbad` (K6f Round 1 — PTX-identical
+hot-path nits) → `f921acf` (K6f Round 2 — small codegen-affecting
+hot-path nits) → `27c9114` (K6f Round 3a — readability hot-path nits)
+→ `b081138` (K6f Round 3b — delta-literal helper extract).
 
 **Perf result vs morning baseline (apples-to-apples, same hardware,
 same .slz files, `-db -t 1 -r 30`):**
@@ -95,21 +98,26 @@ is essentially flat post-revert.
 | K6 | K6.30 static constexpr → inline constexpr | NOT DONE — single-TU project, no ODR risk today |  |
 | K6 | K6.31 Fibonacci naming symmetry | DONE (aliases) | `c025e21` |
 | K6 | K6.32 walk_max_chunks → WALK_MAX_CHUNKS | DONE (alias) | `c025e21` |
-| K6 | K6.33 MIN_PARALLEL_MATCH_LEN comparison polarity | NOT DONE — perf-neutral, defer |  |
-| K6 | K6.34 lz_decode_raw.cuh `if constexpr` | NOT DONE — touches hot decoder, defer |  |
-| K6 | K6.35 static_assert(WARP_SIZE == 32) | NOT DONE — defer |  |
-| K6 | K6.36 LAST_BIT_SET helper | NOT DONE — defer |  |
-| K6 | K6.37 lz_decode_general overflow check | NOT DONE — defer with K5.6 |  |
-| K6 | K6.38 prefetched_token decl placement | NOT DONE — defer |  |
+| K6 | K6.33 MIN_PARALLEL_MATCH_LEN comparison polarity | DONE | K6f-R2 `f921acf` |
+| K6 | K6.34 lz_decode_raw.cuh `if constexpr` | DONE | K6f-R3a `27c9114` |
+| K6 | K6.35 static_assert(WARP_SIZE == 32) | DONE | K6f-R1 `747fbad` |
+| K6 | K6.36 LAST_BIT_SET helper (`lastBitSet`) | DONE | K6f-R3a `27c9114` |
+| K6 | K6.37 lz_decode_general overflow check | NOT DONE — defer (adds hot-path work) |  |
+| K6 | K6.38 prefetched_token decl placement | DONE (documented hoist) | K6f-R3a `27c9114` |
 | K6 | K6.39 redundant break in per-block loop | DONE | `c025e21` |
-| K6 | K6.40 TokenType enum | NOT DONE — defer with K5.6 |  |
-| K6 | K6.41 delta-literal trailing helper extract | NOT DONE — defer |  |
-| K6 | K6.42-K6.44 __restrict__ + shfl comments | NOT DONE — defer (low-priority polish) |  |
+| K6 | K6.40 TokenType enum | DONE | K6f-R3a `27c9114` |
+| K6 | K6.41 delta-literal trailing helper extract | DONE | K6f-R3b `b081138` |
+| K6 | K6.42-K6.43 __restrict__ adds | DONE | K6f-R1 `747fbad` |
+| K6 | K6.44 shfl(block2_cmd_offset) comment | DONE | K6f-R1 `747fbad` |
 | K6 | K6.45 walkReadF32LE memcpy bit-cast | DONE | `c025e21` |
-| K6 | K6.46-K6.50 huffman_kernel.cu micro-polish | NOT DONE — defer (low-priority) |  |
+| K6 | K6.46 decode huffman int → uint32_t | DONE | K6f-R2 `f921acf` |
+| K6 | K6.47 encode huffman drop redundant mask | DONE | K6f-R2 `f921acf` |
+| K6 | K6.48 encode huffman assert(len > 0) | DONE | K6f-R2 `f921acf` |
+| K6 | K6.49 huffman alignment hoist | NOT DONE — defer (risky inner-loop rewrite) |  |
+| K6 | K6.50 huffman code_lengths UB | ALREADY-DONE (K1 C2) | `712d593` |
 | K6 | K6.51 SLZ_GUARD_SINGLE_THREAD macro | DONE | `c025e21` |
-| K6 | K6.52 (uint32_t)INITIAL_LITERAL_COPY_BYTES cast | NOT DONE — defer |  |
-| K6 | K6.53 chunk_type 1/6 naming | NOT DONE — defer |  |
+| K6 | K6.52 (uint32_t)INITIAL_LITERAL_COPY_BYTES cast | DONE | K6f-R1 `747fbad` |
+| K6 | K6.53 chunk_type 1/6 naming | ALREADY-DONE (no tANS naming remains) |  |
 | K6 | K6.54-K6.60 encode CUDA misc polish | NOT DONE — defer |  |
 | K6 | K6.61 __syncwarp() comment in assemble | DONE | `c025e21` |
 | K6 | K6.62 decode_dispatch `var dd = s;` shadow | DONE | `1212a2e` |
@@ -154,14 +162,18 @@ is essentially flat post-revert.
 | K6 | K6.103 update old CLEANUP_TODO.md DONE table | NOT DONE — see "Next steps" below |  |
 
 **Summary:** 6 of 6 K1 items (1 reverted), 7 of 7 K2 items, 18 of 18 K3
-items, 6 of 6 K4 items, 7 of 11 K5 items (4 deferred), and ~59 of 103
-K6 items — covers documentation, naming, small-radius polish, plus the
-K6e agent-fanned Zig batch (29 items in one round across 14 files).
-Remaining K6 items are the hot-path decoder polish (K6.33-K6.50 group,
-deferred because PTX-scheduling-sensitive — see the C9 lesson at the
-top), a couple of medium-radius refactors (K6.68, K6.83, K6.84), three
-explicit "won't do" with reasons (K6.23, K6.26, K6.30), and K6.103
-(old CLEANUP_TODO.md DONE-table update).
+items, 6 of 6 K4 items, 7 of 11 K5 items (4 deferred), and ~74 of 103
+K6 items — the K6e agent batch added 29 Zig-side items in one round;
+the K6f hot-path batch added 15 more (split across Round 1 PTX-identical,
+Round 2 small codegen, Round 3a readability, Round 3b helper extract,
+each with mandatory PTX diff + bench verify because of the C9 lesson).
+Remaining K6 items: K6.37 + K6.49 (hot-path additions still deferred —
+both add work to inner loops), K6.54-K6.60 + K6.64-K6.85 partial
+remnants, four "won't do" (K6.23, K6.26, K6.30, K6.86), three
+medium-radius refactors (K6.68, K6.83, K6.84), and K6.103 (old
+CLEANUP_TODO.md DONE-table update). Per the user, both TODO files
+will be deleted when the arc is fully done — no need for a transitional
+fold-back commit.
 
 ## Deferred items — next-session pickup
 
