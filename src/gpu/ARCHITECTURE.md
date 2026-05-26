@@ -267,12 +267,44 @@ them in parallel: lane k of the warp decodes sub-stream k for k in
 idle; widening to 32 is the single biggest source of the kernel's
 current throughput.
 
-Stream sizes are stored as 31 × u24 LE in the sub-header (lane 31's
-size is derived from `in_size - HUFF_BODY_HEADER_BYTES - sum`). Each
-lane computes its own input offset via an exclusive warp-shuffle
-prefix sum: 5 shuffles for 32-way fan-out. A 4-stream design could
-afford a linear scan on lane 0; at 32 streams the prefix-sum becomes
-the right primitive.
+### BIL: bounded-interleaved wire format
+
+The 32 streams are stored in a bounded-interleaved (BIL) layout
+rather than 32 concatenated tails. Each per-lane stream is logically
+sliced into 4-byte BIL words; let `K = min(words[s])` be the largest
+prefix every stream has. The body is:
+
+```
+  [128 B weights — 4 bits/symbol]
+  [96 B sub-header — 32 × u24 LE per-stream byte sizes]
+  [4 B K — u32 LE]
+  [K rows × 128 B interleaved area — row w holds lane k's word w at
+                                      offset (w · 128 + k · 4)]
+  [tail area — per-stream bytes from word K onward, at exclusive
+               prefix-sum-of-tail-sizes offsets]
+```
+
+The hot-loop refill is a single coalesced 128-byte sector load (one
+4-byte word per lane from the same row); the prior concat layout
+needed 32 scattered per-stream loads because each lane's read pointer
+lived in a different byte range. Only the trailing tail rows
+(typically <10% of refills on natural text) keep the old scatter
+pattern. The encoder zero-pads each stream's last word so refills
+never read partial bytes.
+
+Stream sizes are stored explicitly for all 32 streams (vs the prior
+"31 × u24 + derived" layout): every lane needs to know its own
+`words[s]` locally so the warp can min-reduce to K without an extra
+total-payload round-trip. Cost is +3 B sub-header + 4 B K per
+Huffman body; rounding-to-word costs ≤3 B per stream (≤96 B per
+body). On 64 KB sub-chunks this is ~0.3 pp ratio across enwik8 and
+silesia in exchange for the ~4–6% Huffman-kernel-time win at L3–L5.
+
+Body offsets in the file are `chunk_offset + 5` (after the 5-byte
+type-4 chunk header), so the refill pointer is 4-aligned only ~25%
+of the time. The decoder uses `memcpy(&word, w_ptr, 4)` rather than
+a u32 reinterpret_cast; nvcc lowers it to byte loads + shifts when
+alignment isn't provable and to a single `ld.u32` when it is.
 
 Each lane runs the same tight inner loop. It refills a 64-bit
 bit buffer from the compressed input whenever the buffer drops below
