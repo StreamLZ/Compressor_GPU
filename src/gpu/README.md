@@ -124,14 +124,17 @@ CUDA kernels compile to PTX/CUBIN out-of-band (they need `nvcc` + the MSVC
 toolchain, which `zig build` does not invoke):
 
 ```
-tools/build_gpu.bat       decode/lz_kernel.cu, decode/huffman_kernel.cu,
-                          encode/huffman_kernel.cu, plus the Vulkan SPIR-V
-tools/build_gpu_enc.bat   encode/lz_kernel.cu, encode/assemble_kernel.cu
+tools/build_gpu.bat       compiles all five .cu files under src/gpu/
+                          (decode/{lz,huffman}_kernel.cu and
+                          encode/{lz,huffman,assemble}_kernel.cu) to
+                          .ptx + .cubin via `nvcc -arch=sm_89 -O3`,
+                          then runs `zig build -Doptimize=ReleaseFast
+                          -Dgpu=true` so the freshly-built PTX is
+                          embedded into streamlz.exe / streamlz_gpu.dll.
 ```
 
-Both run `nvcc -arch=sm_89 -O3`. The generated `.ptx` is committed; the
-Zig drivers `@embedFile` it, so a plain `zig build` does not require CUDA
-to be installed.
+The generated `.ptx` is committed; the Zig drivers `@embedFile` it, so
+a plain `zig build` does not require CUDA to be installed.
 
 ```
 zig build -Doptimize=ReleaseFast -Dgpu=true   streamlz CLI with GPU paths

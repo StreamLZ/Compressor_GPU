@@ -46,11 +46,26 @@ pub fn build(b: *std.Build) void {
     bench_option.addOption(bool, "gpu", gpu);
     root_module.addOptions("build_options", bench_option);
 
+    // PTX-freshness gate. Walks src/gpu/ for .cu/.cuh and .ptx files and
+    // fails the build if any source mtime exceeds any PTX mtime. Catches
+    // the "I edited a .cu but forgot to run build_gpu.bat" mistake that
+    // otherwise silently embeds stale kernel code into any binary that
+    // @embedFile's the PTX. Shared by `exe` (when -Dgpu=true) and the
+    // always-GPU `gpulib` (defined below).
+    const ptx_freshness = b.allocator.create(std.Build.Step) catch @panic("oom");
+    ptx_freshness.* = std.Build.Step.init(.{
+        .id = .custom,
+        .name = "gpu-ptx-freshness",
+        .owner = b,
+        .makeFn = ptxFreshnessCheck,
+    });
+
     const exe = b.addExecutable(.{
         .name = "streamlz",
         .root_module = root_module,
     });
     if (bench) addVendorLibs(b, exe);
+    if (gpu) exe.step.dependOn(ptx_freshness);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -158,6 +173,7 @@ pub fn build(b: *std.Build) void {
         .name = "streamlz_gpu",
         .root_module = gpulib_module,
     });
+    gpulib.step.dependOn(ptx_freshness);
     const gpulib_install = b.addInstallArtifact(gpulib, .{});
     const gpu_hdr_install = b.addInstallHeaderFile(b.path("include/streamlz_gpu.h"), "streamlz_gpu.h");
     const gpulib_step = b.step("gpulib", "Build GPU C API shared library (streamlz_gpu.dll)");
@@ -228,4 +244,85 @@ fn addVendorLibs(b: *std.Build, exe: *std.Build.Step.Compile) void {
     exe.root_module.addIncludePath(b.path("vendor/lz4"));
     exe.root_module.linkLibrary(zstd_lib);
     exe.root_module.linkLibrary(lz4_lib);
+}
+
+/// Custom build step that walks `src/gpu/` and fails the build if any
+/// `.cu` or `.cuh` file has a newer mtime than any `.ptx` in the same
+/// tree. Wired up in `build()` so `exe` (when -Dgpu=true) and `gpulib`
+/// (always-GPU) depend on it. The check is cheap (~10s of file stats)
+/// and runs before any compilation, so a stale-PTX edit gets caught at
+/// `zig build` time with a clear message instead of silently embedding
+/// stale kernel code.
+///
+/// `vulkan_driver.zig` and `lz_kernel.comp`/`.spv` are excluded from
+/// the walk - Vulkan compile is a separate flow.
+fn ptxFreshnessCheck(step: *std.Build.Step, opts: std.Build.Step.MakeOptions) anyerror!void {
+    _ = opts;
+    const b = step.owner;
+    const alloc = b.allocator;
+    const io = b.graph.io;
+
+    var dir = b.build_root.handle.openDir(io, "src/gpu", .{ .iterate = true }) catch |err| {
+        return step.fail("cannot open src/gpu: {s}", .{@errorName(err)});
+    };
+    defer dir.close(io);
+
+    var newest_src_path: ?[]u8 = null;
+    var newest_src_mtime: i96 = std.math.minInt(i96);
+    var oldest_ptx_path: ?[]u8 = null;
+    var oldest_ptx_mtime: i96 = std.math.maxInt(i96);
+
+    var walker = dir.walk(alloc) catch |err| {
+        return step.fail("walk src/gpu failed: {s}", .{@errorName(err)});
+    };
+    defer walker.deinit();
+
+    while (walker.next(io) catch |err| {
+        return step.fail("walk src/gpu next failed: {s}", .{@errorName(err)});
+    }) |entry| {
+        if (entry.kind != .file) continue;
+        // Skip Vulkan: .comp source and .spv output are a separate flow.
+        if (std.mem.endsWith(u8, entry.basename, ".comp")) continue;
+        if (std.mem.endsWith(u8, entry.basename, ".spv")) continue;
+        // Skip vulkan_driver.zig too (Zig source, but matches the same
+        // "ignore vulkan" intent).
+        if (std.mem.eql(u8, entry.basename, "vulkan_driver.zig")) continue;
+
+        const is_src = std.mem.endsWith(u8, entry.basename, ".cu") or
+                       std.mem.endsWith(u8, entry.basename, ".cuh");
+        const is_ptx = std.mem.endsWith(u8, entry.basename, ".ptx");
+        if (!is_src and !is_ptx) continue;
+
+        const stat = entry.dir.statFile(io, entry.basename, .{}) catch continue;
+        const mtime_ns: i96 = stat.mtime.toNanoseconds();
+        if (is_src and mtime_ns > newest_src_mtime) {
+            if (newest_src_path) |p| alloc.free(p);
+            newest_src_path = alloc.dupe(u8, entry.path) catch unreachable;
+            newest_src_mtime = mtime_ns;
+        }
+        if (is_ptx and mtime_ns < oldest_ptx_mtime) {
+            if (oldest_ptx_path) |p| alloc.free(p);
+            oldest_ptx_path = alloc.dupe(u8, entry.path) catch unreachable;
+            oldest_ptx_mtime = mtime_ns;
+        }
+    }
+
+    if (newest_src_path == null) return; // No .cu/.cuh found - nothing to check.
+    if (oldest_ptx_path == null) {
+        return step.fail(
+            "no .ptx files found under src/gpu/.\n" ++
+            "Run tools\\build_gpu.bat to compile every kernel and rebuild the exe.",
+            .{},
+        );
+    }
+
+    if (newest_src_mtime > oldest_ptx_mtime) {
+        return step.fail(
+            "PTX is stale relative to .cu/.cuh sources.\n" ++
+            "  newest source: src/gpu/{s}\n" ++
+            "  oldest PTX:    src/gpu/{s}\n" ++
+            "Run tools\\build_gpu.bat to rebuild every kernel + the embedding exe.",
+            .{ newest_src_path.?, oldest_ptx_path.? },
+        );
+    }
 }
