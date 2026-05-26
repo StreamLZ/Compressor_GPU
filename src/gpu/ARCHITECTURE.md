@@ -350,6 +350,94 @@ at different times (stream sizes are not uniform), so a barrier
 inside the loop would stall fast lanes on slow ones for no
 correctness benefit.
 
+### Building the LUT
+
+The LUT-build kernel turns the 128-byte code-length section at the
+front of each Huffman body into a 1024-entry packed LUT. One warp
+per Huffman body, all thirty-two lanes active. Bit-identical to the
+reference encoder, verified across every sub-chunk of enwik8 and
+silesia in `tools/huff_test/huff_lut_build_experiments.cu` against a
+CPU oracle.
+
+The earlier build sat on lane zero for two long serial passes — a
+256-iter histogram + canonical-code assignment, then a 256-by-256
+nested loop filling dual-symbol LUT entries — while the other
+thirty-one lanes idled. NCU on that version showed it compute-bound
+at 53% SM busy with "Fixed Latency Dependency" the top stall: the
+signature of a long chain of dependent shared-memory writes on a
+single lane. The redesign attacks that pattern in three places.
+
+First, canonical-code assignment goes warp-parallel. The symbols are
+processed as eight batches of thirty-two. Within each batch every
+lane reads its symbol's code length, then `__match_any_sync` returns
+a bitmask of the lanes in the batch that share the same length.
+Popcount of that mask intersected with the lower-lane mask gives
+each lane's intra-batch offset within its length bucket. A
+shared-memory `per_L_base[L]` counter accumulates the per-batch
+contributions; the lowest-numbered lane in each same-length group
+(found via `__ffs(match_mask)`) atomic-adds the group size to that
+counter so the next batch sees the new base. After eight batches
+every lane in every batch has computed its symbol's canonical code
+without a single serial lane-0 iteration.
+
+Second, the inner loop of the dual-symbol pass iterates a
+length-sorted used-symbol list instead of scanning all 256 symbols.
+The histogram from the parallel canonical-code phase already
+classifies symbols by length, so the build phase emits a
+`used_pkd[]` array sorted by length ascending, each entry packing
+length, canonical code, and symbol into one u32. A `len_end[L]`
+array holds the bucket-end indices. The dual pass picks an outer s1
+from this list, computes the maximum allowed L2 from s1's length
+(`MAX_CODE_LEN − L1`), and runs the inner s2 loop bounded by
+`len_end[MAX_CODE_LEN − L1]`. No length check inside the inner
+loop, no skipped iterations on unused symbols, and the inner reads
+are batched four at a time as uint4 loads (LDS.128). The earlier
+nested-256 layout had every iteration paying a branch on `L2 == 0`
+and another on `L1 + L2 > MAX_CODE_LEN`; both vanish here.
+
+Third, the LUT is built in shared memory and bulk-dumped to global
+at the end. The earlier kernel wrote each LUT entry directly to
+global, which made the global-write pipeline the limiter (NCU
+showed Long Scoreboard 3.27 cyc/inst, LG Throttle 1.16 on the
+intermediate version that used wider shared-memory reads but still
+wrote to global). Moving the LUT into shared (`__shared__ uint32_t
+lut[1024]`, 4 KB) keeps Pass 1 and Pass 2's many small spans on the
+~10× faster shared-memory path. At the end of the kernel the warp
+copies the LUT to global with a coalesced uint4 loop using
+`__stcs` — the decoder kernel that consumes the LUT runs in a
+separate launch and may not be scheduled on this SM, so L1 caching
+the bytes here would only pollute the cache.
+
+Pass 1 (the single-symbol fan-out) is also folded into the
+canonical-code-assignment phase. The moment a lane knows its
+symbol's canonical code it writes both the `used_pkd[]` entry and
+the Pass 1 LUT span; a single warp-pass produces both data
+structures instead of two serial sweeps.
+
+Pass 3 (the escape entries for length-eleven codes) stays serial on
+lane zero. Length-eleven codes are typically zero to four per body
+on natural text, so a 256-iter scan with a branch-predicted
+`code_lengths[s] != MAX_CODE_LEN + 1` filter is cheap compared to
+the cost of going parallel and synchronizing.
+
+The kernel uses about 5.5 KB of static shared memory per block
+(256 B code lengths, 1 KB used-symbol list, 4 KB LUT, plus three
+small per-length arrays). At sm_89 that gives eighteen blocks per
+SM resident — below the twenty-four block-count cap that the prior
+build hit but, in practice, the workload-imbalance of canonical
+Huffman at this scale already caps achieved occupancy at around 30%
+either way. The win is in the dependent-instruction chains the new
+algorithm shortens, not in occupancy.
+
+End-to-end the new build kernel runs roughly four times faster than
+the prior dense-iteration version on the canonical enwik8 workload
+(measured per-kernel: 0.77 ms → 0.18 ms at L5; harness microbench
+shows the same ratio at higher block counts). MIO Throttle drops
+from 3.78 cyc/inst to 0.06; Long Scoreboard from 3.27 to 0.43. The
+build kernel is now far enough off the critical path that the LZ
+decode kernel is the next thing to shorten if that critical path
+matters.
+
 ## The encode pipeline
 
 ```
@@ -597,7 +685,7 @@ compiled with `nvcc -arch=sm_89 -O3`:
 | `slzCompactRawDescsKernel`     | 40 | 0 | 0 |
 | `slzCompactHuffDescsKernel`    | 40 | 0 | 0 |
 | `slzGatherRawOff16Kernel`      | 12 | 0 | 0 |
-| `slzHuffBuildLutKernel`        | 40 | 104 | 1280 |
+| `slzHuffBuildLutKernel`        | 40 | 0 | 5536 |
 | `slzHuffDecode4StreamKernel` †  | 40 | 0 | 0 (+4096 dyn) |
 | `slzHuffBuildTablesKernel`     | 50 | 0 | 9472 |
 | `slzHuffEncode4StreamKernel` †  | 56 | 128 | 0 |
@@ -605,14 +693,19 @@ compiled with `nvcc -arch=sm_89 -O3`:
 | `slzAssembleWriteKernel`       | 46 | 0 | 0 |
 | `slzFrameAssembleKernel`       | 26 | 0 | 0 |
 
-Two things stand out. Almost no kernel uses static shared memory.
-The Huffman LUT-build kernels stage their tables there because the
-LUT itself fits comfortably. The Huffman decode kernel takes 4 KB
-of dynamic shared per launch for the runtime LUT (allocated at
-kernel launch, not counted in the SHARED column above). The LZ
-decode kernel keeps its entire working set in registers; the
-entropy scratch lives in global memory and the hardware caches
-absorb the traffic.
+Two things stand out. Most kernels use little or no static shared
+memory. The two Huffman build kernels are the exceptions: the
+decode-side LUT-build holds a 4 KB working LUT plus a length-sorted
+used-symbol list and the per-length bucket arrays (5.5 KB total) so
+the bulk of its writes stay on the fast shared path before a final
+coalesced uint4 dump to global; the encode-side
+`slzHuffBuildTablesKernel` stages 9.5 KB for the histogram, tree
+nodes, and code tables. The Huffman decode kernel takes 4 KB of
+dynamic shared per launch for the runtime LUT (allocated at kernel
+launch, not counted in the SHARED column above). The LZ decode
+kernel keeps its entire working set in registers; the entropy
+scratch lives in global memory and the hardware caches absorb the
+traffic.
 
 † The `4Stream` suffix on the two Huffman kernel names is retained
 for the Zig dispatch ABI introduced by the prior 4-stream design.

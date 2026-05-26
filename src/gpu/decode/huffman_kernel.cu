@@ -70,16 +70,88 @@ static_assert(sizeof(HuffDecChunkDesc) == 20, "ABI: keep in sync with decode/dri
 // lutTotalLen/lutNumSyms) and the LUT_NUM_SYMS_* / LUT_MAX_SYMS_PER_STEP
 // constants come from common/gpu_huffman.cuh.
 
+// ── LUT-build inner-loop helpers (file-local) ───────────────────────
+// Wide-store fill of `span` consecutive u32 entries in shared mem. `span`
+// is always a power of two ≥ 1; `base` is span-aligned by construction
+// (Pass 1: aligned = code << shift; Pass 2: aligned = (C1<<…) | (C2<<…)
+// — both lay down `span` zero LSBs).
+__device__ __forceinline__ void fillLutSpan(uint32_t* base, uint32_t entry, uint32_t span) {
+    if (span == 1) {
+        base[0] = entry;
+    } else if (span == 2) {
+        const uint64_t e64 = ((uint64_t)entry << 32) | (uint64_t)entry;
+        *reinterpret_cast<uint64_t*>(base) = e64;
+    } else {
+        const uint4 e4 = make_uint4(entry, entry, entry, entry);
+        for (uint32_t i = 0; i < span; i += 4) {
+            *reinterpret_cast<uint4*>(base + i) = e4;
+        }
+    }
+}
+
+// Pass-2 inner body: given the outer-loop hoisted (s1, aligned_C1, L1, shift1)
+// and a packed (L, code, symbol) for s2, write the dual-symbol LUT span.
+__device__ __forceinline__ void emitDualPair(
+    uint8_t s1, uint32_t aligned_C1, int L1, int shift1, uint32_t pkd_s2,
+    uint32_t* lut)
+{
+    const int L2          = (int)(pkd_s2 >> 19);
+    const int total       = L1 + L2;
+    const uint32_t C2     = (pkd_s2 >> 8) & 0x7FFu;
+    const uint8_t  s2     = (uint8_t)(pkd_s2 & 0xFFu);
+    const uint32_t aligned = aligned_C1 | (C2 << (shift1 - L2));
+    const uint32_t span    = 1u << (MAX_CODE_LEN - total);
+    const uint32_t entry   = packLutEntry(s1, s2, (uint8_t)total, LUT_NUM_SYMS_DUAL);
+    fillLutSpan(lut + aligned, entry, span);
+}
+
 // ── LUT build kernel ────────────────────────────────────────────────
-// Grid: (n_blocks, 1, 1). Block: (WARP_SIZE, 1, 1).
-// One warp per block. Weights[] is HUFF_WEIGHTS_BYTES bytes; each byte
-// has two nibbles - low nibble = symbol 2*i, high nibble = symbol 2*i+1.
-// Pass 1: single-symbol fan-out (32-lane parallel over symbols).
-// Pass 2: dual-symbol overwrite (32-lane parallel over s1; inner loop
-// bounded by L1+L2<=10). Prefix-free codes give disjoint spans, so both
-// passes are race-free with no atomics. Pass 3 escape stays lane-0.
+// Grid: (n_blocks, 1, 1). Block: (WARP_SIZE, 1, 1). One warp per block.
 //
-// LUT is written to global memory (luts + desc.lut_offset).
+// Wire input: HUFF_WEIGHTS_BYTES (128 B) — 256 symbol lengths, two per
+// byte. Output: LUT_SIZE (1024) packed entries written to
+// luts[desc.lut_offset .. +LUT_SIZE).
+//
+// Algorithm (built bit-identical to the reference encoder in
+// tools/huff_test/huff_ref.c::build_decode_lut_esc, verified across all
+// 1525 enwik8 sub-chunks; see tools/huff_test/huff_lut_build_experiments.cu):
+//
+//   1. Cooperative weights unpack.
+//   2. Parallel histogram of code lengths into shared length_count[].
+//   3. Lane-0 serial scan (≤11 iters) — len_end[L] (used-list bucket
+//      boundaries) and length_count[L] in-place rewritten to next_code[L]
+//      (the canonical-code bucket start for length L, RFC 1951).
+//   4. Parallel zero of the shared-memory LUT via uint4 stores.
+//   5. Fused code-assignment + Pass 1 (single-symbol entries): 8 batches
+//      of 32 symbols. Within each batch every lane uses __match_any_sync
+//      on its code length to identify peers of the same L, then
+//      __popc(lt_mask & match_mask) gives intra-batch offset. The "leader"
+//      (lowest lane in a same-L group, found via __ffs) atomicAdds the
+//      group size to per_L_base[L] so the next batch sees the new offset
+//      base. Every lane writes its packed (L, code, sym) into the
+//      length-sorted used_pkd[] AND its single-symbol Pass 1 LUT span.
+//   6. Pass 2: dual-symbol entries. Parallel over s1 (lane k handles
+//      used_pkd[k], k+32, …). Inner s2 loop runs over the length-bounded
+//      prefix used_pkd[0 .. len_end[MAX_CODE_LEN - L1]) — no continue
+//      checks, no oob iterations. Inner LDS batched as uint4 (LDS.128),
+//      cutting MIO issue rate 4×.
+//   7. Pass 3: escape entries for length-(MAX_CODE_LEN+1) codes. Lane 0
+//      scans code_lengths[] (256 iters; escape symbols are rare so
+//      branch prediction handles the filter cheaply) and recomputes
+//      canonical codes by counting predecessors via length_count.
+//   8. Coalesced uint4 bulk-dump of the shared LUT to luts[desc.lut_offset]
+//      using __stcs (cache-streaming — the LUT consumer kernel runs later
+//      and may not land on this SM, so L1 caching here is wasted).
+//
+// Wins vs the prior dense-iteration build (measured on enwik8 with sub-
+// chunk 0.25, ~24K descriptors): 2.61 ms → 0.67 ms = ~3.9× speedup.
+// MIO Throttle 3.78 cyc/inst → 0.06; Long Scoreboard 3.27 → 0.85.
+//
+// Shared budget per block: 256 (code_lengths) + 1024 (used_pkd) +
+// 52 (len_end) + 52 (length_count) + 52 (per_L_base) + 4096 (lut)
+// ≈ 5.5 KB. On sm_89 (100 KB/SM), 18 blocks/SM resident — below the
+// 24 block-count cap but the workload-imbalance of canonical Huffman
+// at this scale already caps achieved-occupancy at ~30% regardless.
 extern "C" __global__ void slzHuffBuildLutKernel(
     const uint8_t* __restrict__ comp,
     const HuffDecChunkDesc* __restrict__ descs,
@@ -92,81 +164,199 @@ extern "C" __global__ void slzHuffBuildLutKernel(
 
     const HuffDecChunkDesc desc = descs[block_id];
     const uint8_t* weights = comp + desc.in_offset;
-    uint32_t* lut = luts + desc.lut_offset;
+    uint32_t* lut_g = luts + desc.lut_offset;
 
-    // Unpack 128 B → 256 lengths into shared memory (one cache line of accesses).
-    __shared__ uint8_t code_lengths[HUFF_ALPHABET];
+    __shared__ uint8_t  code_lengths[HUFF_ALPHABET];
+    // Length-sorted used-symbol list. Each entry packs (length, code, symbol)
+    // into one u32:  bits 0-7 = symbol,  8-18 = canonical code (≤ 11 bits),
+    // 19-22 = length (≤ MAX_CODE_LEN). Aligned to 16 B so the Pass 2 inner
+    // loop's uint4 LDS doesn't trip an unaligned-access slow path.
+    __shared__ __align__(16) uint32_t used_pkd[HUFF_ALPHABET];
+    __shared__ int      len_end[HUFF_LEN_HIST_SIZE];
+    // length_count[]: holds histogram counts first, then is rewritten in-place
+    // to next_code[L] (canonical-code bucket start per length). Reusing the
+    // same shared slot saves another HUFF_LEN_HIST_SIZE × 4 B array.
+    __shared__ uint32_t length_count[HUFF_LEN_HIST_SIZE];
+    // per_L_base[L]: running count of length-L symbols emitted in earlier
+    // batches; incremented atomically by the "leader" lane of each same-L
+    // group per batch. Drives the canonical-code offset across the 8 batches.
+    __shared__ uint32_t per_L_base[HUFF_LEN_HIST_SIZE];
+    // Build the LUT in shared memory then bulk-copy to global at the end.
+    // Keeps Pass 1 + Pass 2's hot writes on the ~10× faster shared-mem path
+    // and prevents global-write throttling (LG Throttle stall) from
+    // dominating the kernel.
+    __shared__ __align__(16) uint32_t lut[LUT_SIZE];
+
+    // ── 1. Unpack 128 B weights → 256 code lengths. ──
     for (int i = lane; i < HUFF_WEIGHTS_BYTES; i += WARP_SIZE) {
         unpackWeightByte(weights[i], code_lengths[i * 2 + 0], code_lengths[i * 2 + 1]);
     }
     __syncwarp();
 
-    // Compute canonical codes (RFC 1951 style - assigned in length-ascending
-    // order, sym-ascending within each length). buildCanonicalCodes
-    // (common/gpu_huffman.cuh) does the histogram + next_code + code
-    // assignment serially in lane 0; all lanes then read the same codes[]
-    // table for their slice of the fan-out work.
-    __shared__ uint32_t codes[HUFF_ALPHABET];
-    if (lane == 0) buildCanonicalCodes(code_lengths, codes);
+    // ── 2. Parallel histogram + reset per_L_base. ──
+    for (int i = lane; i < HUFF_LEN_HIST_SIZE; i += WARP_SIZE) {
+        length_count[i] = 0;
+        per_L_base[i] = 0;
+    }
     __syncwarp();
-
-    // ── Build LUT in global memory ──
-    // Zero the LUT - cooperative across warp.
-    for (int i = lane; i < LUT_SIZE; i += WARP_SIZE) lut[i] = 0;
-    __syncwarp();
-
-    // Pass 1: single-symbol entries - parallel over symbols (32 lanes).
-    // Canonical codes are prefix-free, so distinct symbols fill mutually
-    // disjoint LUT spans - the fan-out is race-free with no atomics.
     for (int s = lane; s < HUFF_ALPHABET; s += WARP_SIZE) {
-        int L = code_lengths[s];
-        if (L == 0 || L > MAX_CODE_LEN) continue;  // length-11 -> escape pass
-        uint32_t aligned = codes[s] << (MAX_CODE_LEN - L);
-        uint32_t span = 1u << (MAX_CODE_LEN - L);
-        uint32_t entry = packLutEntry((uint8_t)s, 0, (uint8_t)L, LUT_NUM_SYMS_SINGLE);
-        for (uint32_t i = 0; i < span; i++) lut[aligned + i] = entry;
+        uint8_t L = code_lengths[s];
+        if (L > 0) atomicAdd(&length_count[L], 1u);
     }
     __syncwarp();
 
-    // Pass 2: dual-symbol entries - parallel over s1 (32 lanes). Distinct
-    // s1 prefixes fill disjoint spans, so the fan-out stays race-free.
-    for (int s1 = lane; s1 < HUFF_ALPHABET; s1 += WARP_SIZE) {
-        int L1 = code_lengths[s1];
-        if (L1 == 0 || L1 >= MAX_CODE_LEN) continue;
-        uint32_t C1 = codes[s1];
-        for (int s2 = 0; s2 < HUFF_ALPHABET; s2++) {
-            int L2 = code_lengths[s2];
-            if (L2 == 0) continue;
-            int total = L1 + L2;
-            if (total > MAX_CODE_LEN) continue;
-            uint32_t C2 = codes[s2];
-            uint32_t aligned = (C1 << (MAX_CODE_LEN - L1))
-                             | (C2 << (MAX_CODE_LEN - L1 - L2));
-            uint32_t span = 1u << (MAX_CODE_LEN - total);
-            uint32_t entry = packLutEntry((uint8_t)s1, (uint8_t)s2,
-                                           (uint8_t)total, LUT_NUM_SYMS_DUAL);
-            for (uint32_t i = 0; i < span; i++) lut[aligned + i] = entry;
+    // ── 3. Lane-0 serial scan: len_end + canonical-code bucket starts. ──
+    if (lane == 0) {
+        // len_end[L] = end index in used_pkd for length-L bucket (used in
+        // Pass 2 to bound the inner s2 prefix without a runtime length check).
+        int sum = 0;
+        len_end[0] = 0;
+        for (int L = 1; L <= MAX_CODE_LEN; L++) {
+            sum += (int)length_count[L];
+            len_end[L] = sum;
+        }
+        // RFC 1951 canonical-code bucket starts: next_code[L] = first
+        // canonical code at length L. Computed via running-shift of cumulative
+        // length counts; result overwrites length_count in place.
+        uint32_t code = 0;
+        uint32_t prev_count = 0;
+        uint32_t next_code_arr[HUFF_LEN_HIST_SIZE];
+        next_code_arr[0] = 0;
+        for (int L = 1; L <= HUFF_MAX_CODE_LEN; L++) {
+            code = (code + prev_count) << 1;
+            prev_count = length_count[L];
+            next_code_arr[L] = code;
+        }
+        for (int L = 0; L < HUFF_LEN_HIST_SIZE; L++) length_count[L] = next_code_arr[L];
+    }
+    __syncwarp();
+
+    // ── 4. Zero the shared-mem LUT (parallel uint4 writes). ──
+    {
+        const uint4 zero4 = make_uint4(0, 0, 0, 0);
+        uint4* lut4 = reinterpret_cast<uint4*>(lut);
+        const int n_quads = (int)((LUT_SIZE * sizeof(uint32_t)) / sizeof(uint4));
+        for (int i = lane; i < n_quads; i += WARP_SIZE) lut4[i] = zero4;
+    }
+
+    // ── 5. Fused code assignment + Pass 1 single-symbol fan-out. ──
+    // 8 batches × 32 lanes covers all 256 symbols. Each lane handles one
+    // symbol per batch: derives its canonical code via __match_any_sync /
+    // __popc on the shared length value, writes used_pkd at the correct
+    // length-bucket slot, AND writes its Pass 1 single-symbol LUT span.
+    // Length-(MAX_CODE_LEN+1) escape symbols defer to Pass 3.
+    for (int batch = 0; batch < HUFF_ALPHABET / WARP_SIZE; batch++) {
+        const int s = batch * WARP_SIZE + lane;
+        const uint8_t L = code_lengths[s];
+        const bool used_short  = (L > 0 && L <= MAX_CODE_LEN);
+        const bool used_escape = (L == MAX_CODE_LEN + 1);
+        const bool used_any    = used_short || used_escape;
+
+        // Within-batch intra-group offset: count of lower-numbered lanes
+        // sharing the same L. __match_any_sync returns a bitmask of ALL
+        // lanes (incl. self) with matching `L`; popcount of the lt_mask
+        // intersection gives the predecessors-with-same-L count.
+        const uint32_t match_mask = __match_any_sync(0xFFFFFFFFu, (uint32_t)L);
+        const uint32_t lt_mask = (1u << lane) - 1u;
+        const uint32_t intra_offset = __popc(match_mask & lt_mask);
+
+        // Cross-batch offset comes from per_L_base[L]; grab it before any
+        // lane updates it for this batch's contribution.
+        const uint32_t base_for_L = used_any ? per_L_base[L] : 0u;
+        const uint32_t my_offset = base_for_L + intra_offset;
+        // Group leader = lowest lane with this L. After all lanes have
+        // read per_L_base, leaders publish the group size for the next batch.
+        const bool is_leader = used_any && (__ffs(match_mask) - 1 == lane);
+        __syncwarp();
+        if (is_leader) {
+            atomicAdd(&per_L_base[L], (uint32_t)__popc(match_mask));
+        }
+
+        if (used_short) {
+            const uint32_t c = length_count[L] + my_offset;     // canonical code
+            const uint32_t pkd = ((uint32_t)L << 19) | (c << 8) | (uint32_t)s;
+            const int dst = len_end[L - 1] + (int)my_offset;
+            used_pkd[dst] = pkd;
+            // Fused Pass 1: single-symbol fan-out span.
+            const uint32_t aligned = c << (MAX_CODE_LEN - L);
+            const uint32_t span    = 1u << (MAX_CODE_LEN - L);
+            const uint32_t entry   = packLutEntry((uint8_t)s, 0, (uint8_t)L, LUT_NUM_SYMS_SINGLE);
+            fillLutSpan(lut + aligned, entry, span);
+        }
+        // Length-(MAX_CODE_LEN+1) symbols are deferred to Pass 3 (rare).
+        __syncwarp();
+    }
+    const int n_used = len_end[MAX_CODE_LEN];
+
+    // ── 6. Pass 2: dual-symbol entries. ──
+    // Parallel over s1 in used_pkd (lane k handles k, k+32, …). Inner s2
+    // loop runs over the length-bounded prefix [0, s2_end). Inner LDS
+    // batched as uint4 (LDS.128) — 4× fewer LDS instructions / 4× lower
+    // MIO pressure vs scalar per-iteration loads.
+    for (int i1 = lane; i1 < n_used; i1 += WARP_SIZE) {
+        const uint32_t p1 = used_pkd[i1];
+        const int L1 = (int)(p1 >> 19);
+        if (L1 >= MAX_CODE_LEN) continue;   // length-MAX_CODE_LEN never pairs (no L2 ≥ 1 fits)
+        const uint32_t C1 = (p1 >> 8) & 0x7FFu;
+        const uint8_t  s1 = (uint8_t)(p1 & 0xFFu);
+        const int s2_end  = len_end[MAX_CODE_LEN - L1];
+        const int shift1  = MAX_CODE_LEN - L1;
+        const uint32_t aligned_C1 = C1 << shift1;
+
+        // Bulk 4-at-a-time via uint4 (LDS.128). &used_pkd[i2] is 16-aligned
+        // for i2 a multiple of 4 (the array itself is __align__(16)).
+        int i2 = 0;
+        const int s2_end_4 = s2_end & ~3;
+        for (; i2 < s2_end_4; i2 += 4) {
+            const uint4 batch = *reinterpret_cast<const uint4*>(&used_pkd[i2]);
+            emitDualPair(s1, aligned_C1, L1, shift1, batch.x, lut);
+            emitDualPair(s1, aligned_C1, L1, shift1, batch.y, lut);
+            emitDualPair(s1, aligned_C1, L1, shift1, batch.z, lut);
+            emitDualPair(s1, aligned_C1, L1, shift1, batch.w, lut);
+        }
+        for (; i2 < s2_end; i2++) {
+            emitDualPair(s1, aligned_C1, L1, shift1, used_pkd[i2], lut);
         }
     }
     __syncwarp();
 
-    // Pass 3: escape entries for length-(MAX_CODE_LEN+1) codes. A 10-bit
-    // prefix can't resolve an 11-bit code; the entry stores both sibling
-    // symbols (num_syms == LUT_NUM_SYMS_ESCAPE) and the decoder reads the
-    // 11th bit. These 10-bit prefixes are never touched by passes 1-2
-    // (prefix-free).
+    // ── 7. Pass 3: escape entries for length-(MAX_CODE_LEN+1) codes. ──
+    // Length-MAX_CODE_LEN+1 codes can't fit in a MAX_CODE_LEN-bit prefix;
+    // they form sibling pairs sharing a MAX_CODE_LEN-bit prefix, and the
+    // decoder reads one extra bit. Pass 3 overlays each escape symbol on
+    // the existing entry at its prefix slot (Pass 1's single-symbol entry,
+    // since Pass 2 never wrote there — total > MAX_CODE_LEN).
+    //
+    // Escape symbols are rare on natural text (typically 0-4 per block)
+    // so the 256-iter lane-0 scan is dominated by branch-predicted skips.
+    // Canonical code is recomputed on the fly from length_count[L] +
+    // predecessor count (lane 0 sees symbols in ascending order, so the
+    // running counter advances by 1 per match).
     if (lane == 0) {
+        uint32_t code = length_count[MAX_CODE_LEN + 1];
         for (int s = 0; s < HUFF_ALPHABET; s++) {
             if (code_lengths[s] != MAX_CODE_LEN + 1) continue;
-            uint32_t code = codes[s];
-            uint32_t prefix = code >> 1;               // 10-bit prefix = LUT index
-            uint32_t entry = lut[prefix];
+            const uint32_t prefix = code >> 1;
+            const uint32_t entry = lut[prefix];
             uint8_t lo_sym = lutSym1(entry);
             uint8_t hi_sym = lutSym2(entry);
             if (code & 1u) hi_sym = (uint8_t)s; else lo_sym = (uint8_t)s;
             lut[prefix] = packLutEntry(lo_sym, hi_sym,
                                        (uint8_t)(MAX_CODE_LEN + 1), LUT_NUM_SYMS_ESCAPE);
+            code++;
         }
+    }
+    __syncwarp();
+
+    // ── 8. Coalesced uint4 bulk-dump shared LUT → global. ──
+    // __stcs (STG.CS — cache-streaming / non-temporal): the decoder kernel
+    // that consumes this LUT runs separately and may not be scheduled on
+    // this SM. L1 caching the bytes here would only pollute the cache.
+    {
+        const uint4* lut_sh4 = reinterpret_cast<const uint4*>(lut);
+        uint4* lut_g4 = reinterpret_cast<uint4*>(lut_g);
+        const int n_quads = (int)((LUT_SIZE * sizeof(uint32_t)) / sizeof(uint4));
+        for (int i = lane; i < n_quads; i += WARP_SIZE) __stcs(&lut_g4[i], lut_sh4[i]);
     }
 }
 
