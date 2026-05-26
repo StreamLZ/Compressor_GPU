@@ -646,16 +646,29 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     try cudaCall(h2d_fn(self.d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes), .copy);
     // Ordering contract: ctx-wide sync. The descs and the prefix-sum
     // launch below run on stream 0; this also stalls any work the caller
-    // had on other streams. Acceptable here because this is the *front
-    // end* of the pipeline — work_stream-bound kernels haven't launched
-    // yet (the back half is the only async-callable region).
+    // had on OTHER streams (including a caller's `work_stream` queue if
+    // slzDecompressAsync is the entry point). Acceptable trade-off
+    // because:
+    //   1. This sync is on the *front end* of the pipeline — the
+    //      work_stream-bound LZ kernels haven't launched yet, so the
+    //      caller's async stream isn't yet "queued behind" anything.
+    //   2. Async callers pay this stall once per decompress and recoup
+    //      it across the LZ-launch back half (which DOES stay on
+    //      work_stream and overlaps with caller work).
+    // If a multi-stream pipeline is ever reintroduced (NUM_PIPELINE_STREAMS
+    // > 1), revisit: a stream-targeted `cuStreamSynchronize(0)` would
+    // preserve the descs ordering without stalling the caller's stream.
     try cudaCall(sync_fn(), .sync);
 
     // 4d Phase 3 step 6: prefix-sum runs on device. The 4-byte D2H of
     // total_subchunks below is launch-plumbing — needed to size the
     // entropy scratch + compute region offsets host-side; no per-chunk
     // CPU work remains.
-    _ = scan_gpu_mod.gpuPrefixSumChunksImpl(self, self.d_descs_persist, @intCast(chunk_descs.len), sub_chunk_cap) orelse return error.BadMode; // null = fallback signal; scan_gpu's `?T` convention preserved (see scan_gpu.zig docstring)
+    // gpuPrefixSumChunksImpl returns GpuError!T (not ?T) because there's
+    // no host fallback for the prefix sum — every GPU decode path needs
+    // it. Specific GpuError variants propagate (OutOfDeviceMemory /
+    // KernelLaunchFailed / SyncFailed / BackendNotAvailable / KernelMissing).
+    _ = try scan_gpu_mod.gpuPrefixSumChunksImpl(self, self.d_descs_persist, @intCast(chunk_descs.len), sub_chunk_cap);
     var total_subchunks: u32 = 0;
     try cudaCall(d2h_fn(@ptrCast(&total_subchunks), self.d_total_subchunks_buf, 4), .copy);
     // CPU mirror for the pipeline branch — NUM_PIPELINE_STREAMS==1

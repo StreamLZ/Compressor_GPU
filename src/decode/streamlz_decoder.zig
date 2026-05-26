@@ -108,11 +108,14 @@ pub fn decompressFramedFromDevice(
     dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!u32 {
     // Step 1: walk kernel — device-only result, no D2H inside the launch.
-    const dev = gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size) orelse return error.KernelLaunchFailed;
+    // GpuError variants from gpuWalkFrameImpl (OutOfDeviceMemory /
+    // KernelLaunchFailed / SyncFailed / BackendNotAvailable / KernelMissing /
+    // CopyFailed for the memset) propagate to the caller; no flattening.
+    const dev = try gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size);
     // Legacy bridge — until fullGpuLaunchImpl becomes a pure launcher
     // (steps 2-5) it still wants host values + a host chunk_descs slice.
     // Pull them explicitly here; subsequent steps eliminate each.
-    const meta = gpu_driver.walkMetaToHost(dev.d_meta) orelse return error.CopyFailed;
+    const meta = try gpu_driver.walkMetaToHost(dev.d_meta);
     // status != 0 = walk kernel detected unsupported frame shape (dict,
     // PDM, checksums, multi-block). meta.n_chunks bounds check = corrupt
     // frame. Both are "the GPU can't handle this; fall back to host" —

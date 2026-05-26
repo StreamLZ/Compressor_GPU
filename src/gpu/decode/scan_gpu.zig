@@ -7,16 +7,22 @@
 //! loaded so the host-scan fallback in `decode_dispatch.zig` can pick up
 //! without a rebuild.
 //!
-//! Convention note: this file uses the `?T` return + raw
-//! `if (rc != CUDA_SUCCESS) return null;` pattern intentionally, NOT
-//! `GpuError!T` + `try cudaCall(...)` like `decode_dispatch.zig`.
-//! Reason: scan_gpu functions are best-effort fast paths — null means
-//! "fall back to host scan" (or skip this optimization), not "the decode
-//! has failed". The caller in `fullGpuLaunchImpl` always has the
-//! `scan_host.zig` fallback available. Promoting CUDA failures to errors
-//! here would force the caller to either re-fallback in a catch (back to
-//! null-equivalent) or fail the whole decode on what is recoverable. The
-//! current convention preserves that recoverability.
+//! Convention note: most entry points in this file use the `?T` return
+//! + raw `if (rc != CUDA_SUCCESS) return null;` pattern intentionally,
+//! NOT `GpuError!T` + `try cudaCall(...)` like `decode_dispatch.zig`.
+//! Reason: those scan_gpu functions are best-effort fast paths — null
+//! means "fall back to host scan" (or skip this optimization), not
+//! "the decode has failed". The caller in `fullGpuLaunchImpl` always
+//! has the `scan_host.zig` fallback available. Promoting CUDA failures
+//! to errors there would force the caller to either re-fallback in a
+//! catch (back to null-equivalent) or fail the whole decode on what is
+//! recoverable.
+//!
+//! Exception: `gpuPrefixSumChunksImpl` returns `GpuError!T` because the
+//! prefix-sum has NO host fallback — every GPU decode path requires it.
+//! Null-on-failure would have silently masked alloc/launch/sync failures
+//! as the generic `error.BadMode` at the call site. K5.1's error fan-out
+//! should reach this function too.
 
 const std = @import("std");
 
@@ -24,31 +30,39 @@ const cuda = @import("cuda_api.zig");
 const ml = @import("module_loader.zig");
 const d = @import("descriptors.zig");
 const dec_ctx = @import("decode_context.zig");
+const desc_err = @import("descriptors.zig");
 
 const CUdeviceptr = cuda.CUdeviceptr;
 const CUDA_SUCCESS = cuda.CUDA_SUCCESS;
 const DecodeContext = dec_ctx.DecodeContext;
 const ensureDeviceBuf = dec_ctx.ensureDeviceBuf;
+const GpuError = desc_err.GpuError;
+const cudaCall = desc_err.cudaCall;
 
 /// 4d Phase 3 GPU frame walk — device-only output. Launches the walk
 /// kernel and returns the device pointers it wrote to. NO D2H. Caller
 /// either passes the device pointers to downstream kernels (true D2D
 /// path) or invokes `walkResultToHost` to copy what it needs out.
+///
+/// Returns specific GpuError variants like `gpuPrefixSumChunksImpl`:
+/// frame-walk is on the device-resident decode hot path with no host
+/// fallback, so distinguishing alloc / launch / sync failures from
+/// missing-symbol failures at the caller matters.
 pub fn gpuWalkFrameImpl(
     self: *DecodeContext,
     d_frame: u64,
     frame_size: u32,
-) ?d.WalkFrameResultDev {
-    if (!ml.init()) return null;
-    if (ml.walk_frame_fn == 0) return null;
-    const launch = cuda.cuLaunchKernel_fn orelse return null;
-    const sync = cuda.cuCtxSynchronize_fn orelse return null;
-    const memset = cuda.cuMemsetD8_fn orelse return null;
+) GpuError!d.WalkFrameResultDev {
+    if (!ml.init()) return error.BackendNotAvailable;
+    if (ml.walk_frame_fn == 0) return error.KernelMissing;
+    const launch = cuda.cuLaunchKernel_fn orelse return error.BackendNotAvailable;
+    const sync = cuda.cuCtxSynchronize_fn orelse return error.BackendNotAvailable;
+    const memset = cuda.cuMemsetD8_fn orelse return error.BackendNotAvailable;
 
     const chunks_bytes: usize = @as(usize, d.walk_max_chunks) * @sizeOf(d.ChunkDesc);
-    if (!ensureDeviceBuf(&self.d_walk_chunks, &self.d_walk_chunks_size, chunks_bytes)) return null;
-    if (!ensureDeviceBuf(&self.d_walk_meta, &self.d_walk_meta_size, d.walk_meta_offsets.bytes)) return null;
-    if (memset(self.d_walk_meta, 0, d.walk_meta_offsets.bytes) != CUDA_SUCCESS) return null;
+    if (!ensureDeviceBuf(&self.d_walk_chunks, &self.d_walk_chunks_size, chunks_bytes)) return error.OutOfDeviceMemory;
+    if (!ensureDeviceBuf(&self.d_walk_meta, &self.d_walk_meta_size, d.walk_meta_offsets.bytes)) return error.OutOfDeviceMemory;
+    try cudaCall(memset(self.d_walk_meta, 0, d.walk_meta_offsets.bytes), .copy);
 
     var k_frame = d_frame;
     var k_size = frame_size;
@@ -69,9 +83,9 @@ pub fn gpuWalkFrameImpl(
     };
     var extra = [_]?*anyopaque{null};
     const t_walk = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzWalkFrameKernel", 0);
-    if (launch(ml.walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return null;
+    try cudaCall(launch(ml.walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, 0, &params, &extra), .launch);
     dec_ctx.endKernelTiming(t_walk, 0);
-    if (sync() != CUDA_SUCCESS) return null;
+    try cudaCall(sync(), .sync);
 
     return .{
         .d_chunk_descs = self.d_walk_chunks,
@@ -79,20 +93,26 @@ pub fn gpuWalkFrameImpl(
     };
 }
 
+/// Per-chunk prefix sum of sub-chunk counts. Required by every GPU
+/// decode path — there is no host fallback (unlike the rest of this
+/// file's `?T`-returning functions, which DO have host fallbacks).
+/// Returns specific GpuError variants so the caller can surface
+/// out-of-memory / launch-failure / sync-failure distinctly instead
+/// of flattening them to error.BadMode.
 pub fn gpuPrefixSumChunksImpl(
     self: *DecodeContext,
     d_chunk_descs: u64,
     n_chunks: u32,
     sub_chunk_cap: u32,
-) ?d.PrefixSumResultDev {
-    if (!ml.init()) return null;
-    if (ml.prefix_sum_chunks_fn == 0) return null;
-    const launch = cuda.cuLaunchKernel_fn orelse return null;
-    const sync = cuda.cuCtxSynchronize_fn orelse return null;
+) GpuError!d.PrefixSumResultDev {
+    if (!ml.init()) return error.BackendNotAvailable;
+    if (ml.prefix_sum_chunks_fn == 0) return error.KernelMissing;
+    const launch = cuda.cuLaunchKernel_fn orelse return error.BackendNotAvailable;
+    const sync = cuda.cuCtxSynchronize_fn orelse return error.BackendNotAvailable;
 
     const first_bytes: usize = @as(usize, d.walk_max_chunks) * 4;
-    if (!ensureDeviceBuf(&self.d_first_sub_idx_persist, &self.d_first_sub_idx_persist_size, first_bytes)) return null;
-    if (!ensureDeviceBuf(&self.d_total_subchunks_buf, &self.d_total_subchunks_buf_size, 4)) return null;
+    if (!ensureDeviceBuf(&self.d_first_sub_idx_persist, &self.d_first_sub_idx_persist_size, first_bytes)) return error.OutOfDeviceMemory;
+    if (!ensureDeviceBuf(&self.d_total_subchunks_buf, &self.d_total_subchunks_buf_size, 4)) return error.OutOfDeviceMemory;
 
     var k_chunks = d_chunk_descs;
     var k_n = n_chunks;
@@ -105,9 +125,9 @@ pub fn gpuPrefixSumChunksImpl(
     };
     var extra = [_]?*anyopaque{null};
     const t_prefix = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzPrefixSumChunksKernel", 0);
-    if (launch(ml.prefix_sum_chunks_fn, 1, 1, 1, 1, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return null;
+    try cudaCall(launch(ml.prefix_sum_chunks_fn, 1, 1, 1, 1, 1, 1, 0, 0, &params, &extra), .launch);
     dec_ctx.endKernelTiming(t_prefix, 0);
-    if (sync() != CUDA_SUCCESS) return null;
+    try cudaCall(sync(), .sync);
 
     return .{
         .d_first_sub_idx = self.d_first_sub_idx_persist,
@@ -115,10 +135,13 @@ pub fn gpuPrefixSumChunksImpl(
     };
 }
 
-pub fn walkMetaToHost(d_meta: u64) ?d.WalkMeta {
-    const d2h = cuda.cuMemcpyDtoH_fn orelse return null;
+/// D2H the walk metadata struct from the device. Same rationale as
+/// `gpuWalkFrameImpl` for the GpuError!T return: pairs of (alloc / copy
+/// / missing-symbol) failures need to surface distinctly.
+pub fn walkMetaToHost(d_meta: u64) GpuError!d.WalkMeta {
+    const d2h = cuda.cuMemcpyDtoH_fn orelse return error.BackendNotAvailable;
     var m: [6]u32 = .{0} ** 6;
-    if (d2h(@ptrCast(&m), d_meta, d.walk_meta_offsets.bytes) != CUDA_SUCCESS) return null;
+    try cudaCall(d2h(@ptrCast(&m), d_meta, d.walk_meta_offsets.bytes), .copy);
     return .{
         .n_chunks = m[0], .decomp_size = m[1], .sub_chunk_cap = m[2],
         .block_start = m[3], .block_size = m[4], .status = m[5],

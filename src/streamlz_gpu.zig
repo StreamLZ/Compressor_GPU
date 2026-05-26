@@ -82,6 +82,42 @@ fn mapDecompressError(err: anyerror) c_int {
     };
 }
 
+/// Returns true iff `err` is one of `gpu_driver.GpuError`'s members.
+/// Used by both GPU C-ABI entry points to map any GpuError uniformly
+/// to "host fallback" (SLZ_ERROR_CUDA / -1) rather than misclassify a
+/// CUDA failure as a corrupt frame via `mapDecompressError`.
+///
+/// The comptime block locks the listed members against
+/// `descriptors.zig:GpuError`: adding a new member there without
+/// updating the switch below is a compile error, so silent drift is
+/// impossible.
+fn isGpuFallbackError(err: anyerror) bool {
+    comptime {
+        const expected_members: usize = @typeInfo(gpu_driver.GpuError).error_set.?.len;
+        if (expected_members != 7) @compileError(
+            "gpu_driver.GpuError member count changed; update the switch below " ++
+            "and the assertion to match the new count.",
+        );
+    }
+    return switch (err) {
+        error.BadMode,
+        error.BackendNotAvailable,
+        error.OutOfDeviceMemory,
+        error.KernelLaunchFailed,
+        error.SyncFailed,
+        error.CopyFailed,
+        error.KernelMissing,
+        => true,
+        else => false,
+    };
+}
+
+/// GPU C-ABI return mapping: GpuError → -1 (host fallback signal),
+/// any other error → mapDecompressError's standard mapping.
+fn mapGpuFallbackOrDecompress(err: anyerror) c_int {
+    return if (isGpuFallbackError(err)) -1 else mapDecompressError(err);
+}
+
 // ── Codec cores — run on the worker thread ────────────────────────────
 // Each returns the byte count (>= 0) or a negative SLZ_ERROR_* code.
 fn compressCore(h: *Context, input: []const u8, output: []u8, opts: CompressOpts) c_int {
@@ -129,22 +165,7 @@ fn decompressCoreD2D(h: *Context, frame_bytes: []const u8, d_output: u64, opts: 
         d_output,
         0,
         &h.dec,
-    ) catch |err| return switch (err) {
-        // Any GpuError → fall back to host-bounce. The fan-out into
-        // BackendNotAvailable / OutOfDeviceMemory / KernelLaunchFailed /
-        // SyncFailed / CopyFailed / KernelMissing is purely diagnostic:
-        // all of them mean the same thing here, that the GPU couldn't
-        // do it and the caller should retry on the host path.
-        error.BadMode,
-        error.BackendNotAvailable,
-        error.OutOfDeviceMemory,
-        error.KernelLaunchFailed,
-        error.SyncFailed,
-        error.CopyFailed,
-        error.KernelMissing,
-        => -1,
-        else => mapDecompressError(err),
-    };
+    ) catch |err| return mapGpuFallbackOrDecompress(err);
     // For a frame with a dictionary prefix, the decoded content sits at
     // d_output[r.offset..r.offset+r.written]. The library API contract
     // returns the *content* size, so callers expect the bytes at
@@ -291,23 +312,11 @@ const DecompressJobTrueD2D = struct {
             j.d_dst,
             &j.h.dec,
         ) catch |err| {
-            // Any GpuError → caller falls back. The fan-out (Backend-
-            // NotAvailable / OutOfDeviceMemory / KernelLaunchFailed /
-            // SyncFailed / CopyFailed / KernelMissing) is diagnostic only;
-            // all of them map to "GPU couldn't do it, retry on host".
-            switch (err) {
-                error.BadMode,
-                error.BackendNotAvailable,
-                error.OutOfDeviceMemory,
-                error.KernelLaunchFailed,
-                error.SyncFailed,
-                error.CopyFailed,
-                error.KernelMissing,
-                => {
-                    j.fall_back = true;
-                    j.result = SLZ_ERROR_CUDA;
-                },
-                else => j.result = mapDecompressError(err),
+            if (isGpuFallbackError(err)) {
+                j.fall_back = true;
+                j.result = SLZ_ERROR_CUDA;
+            } else {
+                j.result = mapDecompressError(err);
             }
             return;
         };
