@@ -57,6 +57,12 @@ __device__ void writeLengthValue(uint8_t* len_buf, uint32_t &len_count, uint32_t
     if (value <= LENGTH_INLINE_MAX) {
         len_buf[len_count++] = (uint8_t)value;
     } else {
+        // Extended-form tag byte: encodes the low 2 bits of `value` in
+        // the high 6 bits via a deliberate unsigned underflow. With
+        // LENGTH_EXT_TAG_BIAS = 4 and low2 ∈ [0, 3]:
+        //   low2 - 4 wraps to 0xFC..0xFF (as uint32_t), masked to 0xFC..0xFF
+        // The decoder reverses by reading the tag, subtracting 0xFC, and
+        // recovering low2 in [0, 3]. The remainder u16 LE follows.
         uint32_t low2 = value & 3;
         uint8_t tag = (uint8_t)((low2 - LENGTH_EXT_TAG_BIAS) & 0xFF);
         len_buf[len_count++] = tag;
@@ -179,6 +185,11 @@ __device__ void emitCmd(
 
     s.token_buf[s.token_count++] = offset_class_token;
     if (write_length) {
+        // length_value is int32_t; clamp to non-negative for writeLengthValue
+        // (uint32_t). The `> 0` (vs `>= 0`) is intentional: a zero length
+        // value means "no length-stream byte needed" and the writeLengthValue
+        // call should still produce the single-byte encoding for 0 — both
+        // branches collapse to the same uint32 0, so they're equivalent.
         uint32_t lv = (length_value > 0) ? (uint32_t)length_value : 0;
         writeLengthValue(s.len_buf, s.length_count, lv);
     }

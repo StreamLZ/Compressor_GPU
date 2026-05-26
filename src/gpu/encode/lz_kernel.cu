@@ -87,8 +87,18 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
     uint8_t* dst = output + desc.dst_offset;
     const uint32_t lit_data_start = (desc.is_first ? INITIAL_LITERAL_COPY_BYTES : 0) + STREAM_HEADER_BYTES;
 
-    // Sub-stream working buffers carved out of dst. The /4 and /2
-    // divisors size each region for its worst case relative to src_size.
+    // Sub-stream working buffers carved out of dst. Each region is sized
+    // for its worst case relative to src_size:
+    //   token_buf  : src_size / 4  — shortest token is 1 byte per 4-byte match,
+    //                                so token bytes ≤ src_size/4.
+    //   off16_buf  : src_size / 2  — each off16 entry is 2 bytes, and an
+    //                                off16 token covers ≥ 4 src bytes, so
+    //                                off16 bytes ≤ src_size/2.
+    //   len_buf    : src_size / 4  — extended-length bytes (1 or 3 each)
+    //                                only appear for long literals / matches,
+    //                                bounded similarly.
+    // Worst-case total: src_size + src_size/4 + src_size/2 + src_size/4
+    //                 = 2 * src_size, matched by the per-block dst capacity.
     OutputStreams streams;
     streams.lit_buf   = dst + lit_data_start;
     streams.token_buf = dst + src_size;

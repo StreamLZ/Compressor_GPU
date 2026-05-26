@@ -110,7 +110,11 @@ __device__ ChainMatch findMatchChain(
                 uint32_t max_ext = end_pos - pos;
                 while (ml < max_ext && src[pos + ml] == src[recent_ref + ml]) ml++;
 
-                // Insert current position into hash tables
+                // Insert current position into hash tables. The long_hash
+                // entry packs (hb_tag in low 6 bits) | (pos << 6) — the
+                // 26-bit pos truncation is safe because chunks are ≤ 256KB
+                // (= 2^18), so pos < 2^18 < 2^26 and the top 6 bits of
+                // (pos << LONG_HASH_TAG_BITS) are guaranteed zero.
                 uint32_t prev_head = first_hash[ha];
                 next_hash[pos & NEXT_HASH_INDEX_MASK] = (uint16_t)(prev_head & NEXT_HASH_INDEX_MASK);
                 first_hash[ha] = pos;
@@ -118,12 +122,18 @@ __device__ ChainMatch findMatchChain(
 
                 return {(int32_t)ml, 0};
             }
-            // Partial recent match: count leading matching bytes (0-3)
+            // Partial recent match: count leading matching bytes (0-3).
+            // xor_val has its lowest set bit at the first mismatched bit;
+            // __ffs returns a 1-based bit index, so __ffs(x)-1 is the
+            // 0-based trailing-zero count. Divided by BITS_PER_BYTE (=8)
+            // it counts full matching low bytes — the partial-match length.
+            // (Mirrors CPU runChainParser recent-match path.)
             recent_match_length = (int32_t)(__ffs(xor_val) - 1) / (int32_t)BITS_PER_BYTE;
         }
     }
 
-    // Min match length bump for long literal runs (matches CPU)
+    // Min match length bump for long literal runs (matches CPU
+    // runChainParser, src/encode/fast/fast_lz_parser.zig).
     int32_t minimum_match_length = (int32_t)MIN_MATCH;
     if (lit_run_length >= LONG_LIT_RUN_THRESHOLD) {
         if (recent_match_length < 3) recent_match_length = 0;
@@ -378,7 +388,9 @@ __device__ void scanBlockChain(
             continue;
         }
 
-        // Backward extension: extend match backward into literal run
+        // Backward extension: extend match backward into literal run.
+        // Mirrors CPU runChainParser's backward-extension loop
+        // (src/encode/fast/fast_lz_parser.zig).
         while (pos > anchor && pos > actual_offset) {
             uint32_t prev = pos - 1;
             uint32_t back = prev - actual_offset;
