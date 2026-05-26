@@ -71,7 +71,7 @@ is essentially flat post-revert.
 | K4 | K4.5 huff_off16 no-clobber assert | DONE | `7dfe3e6` |
 | K4 | K4.6 beginKernelTiming leak on launch failure | DONE | `7dfe3e6` |
 | K5 | K5.1 GpuError subtyping (backend-neutral names) | DONE | `8609057` |
-| K5 | K5.2 fullGpuLaunchImpl extraction | DEFER — 423 LOC, hot path |  |
+| K5 | K5.2 fullGpuLaunchImpl extraction (DecodeRequest + 3 helpers) | DONE | `8f61edf` + `9cd641b` |
 | K5 | K5.3 Move stack buffers to DecodeContext | DONE | `b552f02` |
 | K5 | K5.4 ctx-wide sync_fn document/migrate | DONE (option B — document) | `b2641d1` |
 | K5 | K5.5 Template decodeSubChunkGeneral on OFF16_SPLIT | DEFER — needs perf evaluation |  |
@@ -876,19 +876,27 @@ change.
 
 ### K5.2. `fullGpuLaunchImpl` extraction
 
-[risk: med — touches the hottest decode dispatch] [effort: l]
+[risk: med — touches the hottest decode dispatch] [effort: l] — DONE
 
-`decode_dispatch.zig:308-734` — 423 LOC, 11 params. Extract:
-- `runHuffPredecode(self, ml, ...)` — the huff_build + huff_decode block
-  (lines ~508-560)
-- `runLzPipeline(self, ml, ...)` — the for-loop over pipeline groups
-  (lines ~584-668)
-- `finalizeOutput(self, ...)` — the d_output_target D2D-copy logic at
-  the tail
+Shipped in two steps for independent perf verification:
+- Step 1 (`8f61edf`): `DecodeRequest` struct bundles all 10 per-call
+  inputs; signature drops from 11 params to `(self, req)`. Inner body
+  shadows the fields as locals so no inner-loop code moved. Three
+  call sites updated (`fullGpuLaunch` wrapper plus two paths in
+  `streamlz_decoder.zig`).
+- Step 2 (`9cd641b`): extracted three helpers:
+  - `runHuffPredecode` — LUT-build + 4-stream decode kernel launches
+    plus internal SLZ_SPLIT_TIMER fence; returns build-only ns count.
+  - `runLzPipeline` — per-pipeline-stream LZ kernel launches with
+    raw/general variant selection; returns summed split_lz_ns.
+  - `finalizeOutput` — D2D (4d Phase 3) or D2H output copy with the
+    sync-mode ctx-wide sync.
+  Orchestrator went from 442 to 302 lines and reads top-to-bottom
+  as setup → scan → prep → runHuffPredecode → runLzPipeline →
+  finalizeOutput.
 
-Add `DecodeRequest` struct for the 6 invariant params (chunk_descs,
-compressed_block, dst_full, dst_start_off, decompressed_size,
-sub_chunk_cap).
+Each step bench-verified perf-flat on enwik8 L1/L3/L5 (-db -r 30,
+all kernel-time deltas within run-to-run noise; wall-clocks flat).
 
 ### K5.3. Move stack buffers to `DecodeContext`
 
