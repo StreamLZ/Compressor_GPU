@@ -168,12 +168,12 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
     uint8_t* __restrict__ out, uint32_t out_size)
 {
     uint64_t bit_buf = 0;
-    int bit_count = 0;
+    uint32_t bit_count = 0;
     uint32_t in_pos = 0;
     uint32_t out_pos = 0;     // total bytes decoded
     uint32_t written = 0;     // bytes flushed to global
     uint64_t acc = 0;         // pending decoded bytes (byte 0 = oldest)
-    int pending = 0;
+    uint32_t pending = 0;
 
     // Hot loop: 1 decode/iter, refill keeps >= 11 bits. Decoded bytes are
     // accumulated and flushed as 32-bit stores — the first <=3 flushes
@@ -207,12 +207,12 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
         }
         bit_buf <<= total_len;
         bit_count -= total_len;
-        while (pending >= (int)sizeof(uint32_t)) {
+        while (pending >= sizeof(uint32_t)) {
             if (((uintptr_t)(out + written) & (alignof(uint32_t) - 1)) == 0u) {
                 *reinterpret_cast<uint32_t*>(out + written) = (uint32_t)acc;
                 acc >>= 32;
                 written  += (uint32_t)sizeof(uint32_t);
-                pending  -= (int)sizeof(uint32_t);
+                pending  -= (uint32_t)sizeof(uint32_t);
             } else {
                 out[written++] = (uint8_t)(acc & 0xFF);
                 acc >>= 8;

@@ -46,7 +46,7 @@ __device__ __forceinline__ void warpMatchCopy(
     uint8_t* __restrict__ dst, uint32_t dst_pos,
     uint32_t match_src, uint32_t match_len, int32_t match_dist, int lane
 ) {
-    if (match_dist >= (int32_t)match_len && match_len > MIN_PARALLEL_MATCH_LEN - 1) {
+    if (match_dist >= (int32_t)match_len && match_len >= MIN_PARALLEL_MATCH_LEN) {
         for (uint32_t i = lane; i < match_len; i += WARP_SIZE)
             dst[dst_pos + i] = dst[match_src + i];
     } else if (lane == 0) {
@@ -77,7 +77,7 @@ __device__ __forceinline__ void warpMatchCopyBounded(
     uint32_t match_src, uint32_t match_len, int32_t match_dist,
     uint32_t dst_end_abs, int lane
 ) {
-    if (match_dist >= (int32_t)match_len && match_len > MIN_PARALLEL_MATCH_LEN - 1) {
+    if (match_dist >= (int32_t)match_len && match_len >= MIN_PARALLEL_MATCH_LEN) {
         for (uint32_t i = lane; i < match_len; i += WARP_SIZE)
             if (dst_pos + i < dst_end_abs)
                 dst[dst_pos + i] = dst[match_src + i];

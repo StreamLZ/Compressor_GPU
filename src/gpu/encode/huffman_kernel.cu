@@ -11,6 +11,7 @@
 // harness tools/huff_test/ before being backported here.
 
 #include <cstdint>
+#include <cassert>
 #include "../common/gpu_warp.cuh"     // WARP_SIZE, FULL_WARP_MASK, BITS_PER_BYTE
 #include "../common/gpu_byteio.cuh"   // writeLE24
 #include "../common/gpu_huffman.cuh"  // HUFF_* constants, weights pack, buildCanonicalCodes
@@ -65,7 +66,15 @@ __device__ __forceinline__ uint32_t encodeStreamOneLane(
         uint8_t  sym = in[(uint64_t)i * stride];
         uint32_t code = codes[sym];
         int      len  = code_lengths[sym];
-        bit_buf = (bit_buf << len) | (uint64_t)(code & ((1u << len) - 1u));
+        // Contract: every used symbol has a non-zero canonical code length
+        // (buildCanonicalCodes preserves this). A zero-length code would
+        // make the `bit_buf << len` produce no bits and the mask compute
+        // `(1u << 0) - 1u == 0`, silently dropping the symbol.
+        assert(len > 0);
+        // No mask needed: canonical codes for a symbol of length `len`
+        // already fit in `len` bits (high bits zero by construction in
+        // buildCanonicalCodes). Drop the redundant `& ((1u << len) - 1u)`.
+        bit_buf = (bit_buf << len) | (uint64_t)code;
         bit_count += len;
         while (bit_count >= BITS_PER_BYTE) {
             bit_count -= BITS_PER_BYTE;
