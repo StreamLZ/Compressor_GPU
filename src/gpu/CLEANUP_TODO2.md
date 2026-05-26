@@ -70,7 +70,7 @@ is essentially flat post-revert.
 | K4 | K4.4 gpuFrameAssembleImpl 16-arg → struct | DONE | `7dfe3e6` |
 | K4 | K4.5 huff_off16 no-clobber assert | DONE | `7dfe3e6` |
 | K4 | K4.6 beginKernelTiming leak on launch failure | DONE | `7dfe3e6` |
-| K5 | K5.1 GpuError subtyping | DEFER — heavy refactor, separate session |  |
+| K5 | K5.1 GpuError subtyping (backend-neutral names) | DONE | `8609057` |
 | K5 | K5.2 fullGpuLaunchImpl extraction | DEFER — 423 LOC, hot path |  |
 | K5 | K5.3 Move stack buffers to DecodeContext | DONE | `b552f02` |
 | K5 | K5.4 ctx-wide sync_fn document/migrate | DONE (option B — document) | `b2641d1` |
