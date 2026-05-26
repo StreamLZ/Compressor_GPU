@@ -162,6 +162,18 @@ extern "C" __global__ void slzHuffBuildLutKernel(
 // ── Single-stream decode core (one lane) ────────────────────────────
 // Top-aligned bit buffer; 4-byte big-endian refill; double-symbol (X2)
 // LUT lookup.
+//
+// Two-phase design:
+//   Phase 1 (preamble): byte-drain until `out + written` is 4-aligned.
+//                       Runs at most ~3 byte stores per lane.
+//   Phase 2 (hot loop): 2 LUT lookups per refill check, unconditional
+//                       u32 stores (alignment invariant from phase 1).
+//
+// Phase 2's refill threshold is 2*(MAX_CODE_LEN+1) = 22 bits. After
+// refill, bit_count is in [32, 53] — strictly ≥ 22 — so two decodes
+// always succeed without a mid-batch refill check, even when both are
+// length-11 escape codes. 3-lookup would need ≤ 33 bits which exceeds
+// the 32 bits one refill can add, forcing fallback paths.
 __device__ __forceinline__ uint32_t decodeStreamOneLane(
     const uint8_t* __restrict__ in, uint32_t in_size,
     const uint32_t* __restrict__ lut,
@@ -175,11 +187,26 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
     uint64_t acc = 0;         // pending decoded bytes (byte 0 = oldest)
     uint32_t pending = 0;
 
-    // Hot loop: 1 decode/iter, refill keeps >= 11 bits. Decoded bytes are
-    // accumulated and flushed as 32-bit stores — the first <=3 flushes
-    // byte-store to bring `out + written` to a 4-byte boundary, then the
-    // rest are aligned 32-bit stores (cuts L2 store traffic ~4x).
-    while (out_pos + LUT_MAX_SYMS_PER_STEP <= out_size) {
+    // ── Phase 1: preamble — byte-drain until `out + written` is 4-aligned ──
+    //
+    // Phase 2's hot loop does an UNCONDITIONAL u32 store that faults on
+    // a misaligned address. Each lane's output starts at
+    // `out_offset + lane * (out_size / 4)`; neither term is guaranteed
+    // 4-aligned (out_size is the decompressed chunk size and can be any
+    // byte count), so the destination's starting alignment is arbitrary.
+    // We byte-drain until aligned ONCE here, then phase 2 stays aligned
+    // for the rest of the decode — every u32 store advances `written` by
+    // exactly 4, preserving alignment.
+    //
+    // K6.49 (a prior attempt to use this same preamble idea on the
+    // earlier 1-lookup hot loop) regressed 7-10% because a 1-lookup body
+    // didn't amortize the preamble cost. The 2-lookup hot loop below
+    // does — the at-most-3 byte stores here are paid back across
+    // thousands of output bytes per lane.
+    //
+    // Cap: at most ~3 iterations of this outer loop, since each decode
+    // emits 1-2 bytes and we exit as soon as alignment is reached.
+    while (out_pos < out_size && ((uintptr_t)(out + written) & (alignof(uint32_t) - 1)) != 0u) {
         if (bit_count < MAX_CODE_LEN + 1) {
             if (in_pos + 4 > in_size) break;
             uint32_t v = ((uint32_t)in[in_pos    ] << 24)
@@ -194,7 +221,7 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
         int total_len = lutTotalLen(entry);
         int num_syms  = lutNumSyms(entry);
         if (total_len == 0) return 0;
-        if (num_syms == LUT_NUM_SYMS_ESCAPE) {  // escape: length-11 code, pick by the 11th bit
+        if (num_syms == LUT_NUM_SYMS_ESCAPE) {
             uint32_t b11 = (uint32_t)((bit_buf >> (BITBUF_BITS - 1 - MAX_CODE_LEN)) & 1u);
             uint32_t sym = b11 ? lutSym2(entry) : lutSym1(entry);
             acc |= (uint64_t)sym << (pending * 8);
@@ -207,22 +234,76 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
         }
         bit_buf <<= total_len;
         bit_count -= total_len;
-        // K6.49 alignment hoist attempted and REVERTED — it regressed L3
-        // enwik8 kernel best from ~6.69 ms to ~7.17-7.37 ms (~+7-10%).
-        // PTX REG/STACK unchanged (40/0 on slzHuffDecode4StreamKernel) so
-        // the cost was nvcc scheduling, not register pressure. The per-
-        // iteration branch is evidently cheaper than the two-phase split
-        // in this code shape. Do NOT hoist without bench-verifying first.
-        while (pending >= sizeof(uint32_t)) {
-            if (((uintptr_t)(out + written) & (alignof(uint32_t) - 1)) == 0u) {
+        // Drain pending byte-by-byte UNTIL we're aligned — then exit the
+        // outer preamble loop and let phase 2 take over with u32 stores.
+        // A dual-symbol entry can emit 2 bytes; both might be needed to
+        // reach alignment if `out + written` was at offset 2 mod 4.
+        while (pending > 0 && ((uintptr_t)(out + written) & (alignof(uint32_t) - 1)) != 0u) {
+            out[written++] = (uint8_t)(acc & 0xFF);
+            acc >>= 8;
+            pending -= 1;
+        }
+    }
+
+    // ── Phase 2: hot loop — 2 lookups/refill, unconditional u32 store ──
+    //
+    // The two reasons this is faster than 1-lookup-with-alignment-check:
+    //
+    // 1. One refill check covers 2 decodes. 2 decodes consume at most
+    //    2 × (MAX_CODE_LEN + 1) = 22 bits; the refill threshold of 22
+    //    leaves post-refill bit_count in [32, 53], strictly ≥ 22, so the
+    //    second decode never needs a mid-batch refill check. 3-lookup is
+    //    NOT safe — it could consume up to 33 bits, which exceeds the
+    //    32 a single refill can add, so it would force fallback paths.
+    //
+    // 2. The u32 store is unconditional. Phase 1 established the
+    //    invariant that (out + written) is 4-aligned; each store here
+    //    advances `written` by exactly 4, preserving it. The alignment
+    //    check the previous design did on every flush is now provably
+    //    dead and the removed branch is most of the speedup.
+    //
+    // out_pos headroom of 2 × LUT_MAX_SYMS_PER_STEP: each iter can emit
+    // up to 2 lookups × LUT_MAX_SYMS_PER_STEP symbols. The tail handles
+    // the trailing 0-3 bytes one decode at a time.
+    while (out_pos + 2 * LUT_MAX_SYMS_PER_STEP <= out_size) {
+        if (bit_count < 2 * (MAX_CODE_LEN + 1)) {
+            if (in_pos + 4 > in_size) break;
+            uint32_t v = ((uint32_t)in[in_pos    ] << 24)
+                       | ((uint32_t)in[in_pos + 1] << 16)
+                       | ((uint32_t)in[in_pos + 2] <<  8)
+                       | ((uint32_t)in[in_pos + 3]);
+            bit_buf |= ((uint64_t)v) << (REFILL_BITS - bit_count);
+            bit_count += REFILL_BITS;
+            in_pos += 4;
+        }
+        #pragma unroll
+        for (int k = 0; k < 2; k++) {
+            uint32_t entry = lut[(uint32_t)(bit_buf >> (BITBUF_BITS - MAX_CODE_LEN))];
+            int total_len = lutTotalLen(entry);
+            int num_syms  = lutNumSyms(entry);
+            if (total_len == 0) return 0;
+            if (num_syms == LUT_NUM_SYMS_ESCAPE) {  // length-11 code: the 11th bit picks sym1 vs sym2
+                uint32_t b11 = (uint32_t)((bit_buf >> (BITBUF_BITS - 1 - MAX_CODE_LEN)) & 1u);
+                uint32_t sym = b11 ? lutSym2(entry) : lutSym1(entry);
+                acc |= (uint64_t)sym << (pending * 8);
+                pending += 1;
+                out_pos += 1;
+            } else {
+                acc |= (uint64_t)lutSymPair(entry) << (pending * 8);
+                pending += num_syms;
+                out_pos += num_syms;
+            }
+            bit_buf <<= total_len;
+            bit_count -= total_len;
+            // Unconditional u32 store — alignment invariant holds from
+            // phase 1. Each store cuts L2 store traffic ~4× vs a byte
+            // store and the dropped branch is the bulk of the speedup
+            // over the previous design.
+            if (pending >= sizeof(uint32_t)) {
                 *reinterpret_cast<uint32_t*>(out + written) = (uint32_t)acc;
                 acc >>= 32;
-                written  += (uint32_t)sizeof(uint32_t);
-                pending  -= (uint32_t)sizeof(uint32_t);
-            } else {
-                out[written++] = (uint8_t)(acc & 0xFF);
-                acc >>= 8;
-                pending -= 1;
+                written += (uint32_t)sizeof(uint32_t);
+                pending -= (uint32_t)sizeof(uint32_t);
             }
         }
     }

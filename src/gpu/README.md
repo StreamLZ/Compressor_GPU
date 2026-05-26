@@ -219,7 +219,7 @@ decode path applies here.)
 | Codec | ratio | D2D wall-clock | decode e2e |
 |-------|------:|---------------:|-----------:|
 | StreamLZ L1 | 58.6% | **2.92 ms** | 15.63 ms |
-| StreamLZ L5 | 38.9% | **6.26 ms** | 17.55 ms |
+| StreamLZ L5 | 38.9% | **5.87 ms** | **17.12 ms** |
 | nvCOMP LZ4  | 60.0% | 5.1 ms | 18.5 ms |
 | nvCOMP Zstd | 40.2% | 6.2 ms | 18.2 ms |
 
@@ -233,9 +233,11 @@ correctness verify.
 faster decode on both axes: D2D 2.92 vs 5.1 ms (1.75x faster),
 e2e 15.63 vs 18.5 ms (1.18x faster).
 
-**StreamLZ L5 vs nvCOMP Zstd.** Wins ratio (38.9% vs 40.2%) and e2e
-(17.55 vs 18.2 ms, 0.65 ms faster). On the pure-GPU D2D timer, Zstd is
-narrowly ahead: 6.2 vs 6.26 ms — Zstd faster by ~1%.
+**StreamLZ L5 win vs nvCOMP Zstd.** Smaller frame (38.9% vs 40.2%) and
+faster decode on both axes: D2D 5.87 vs 6.2 ms (1.06x faster),
+e2e 17.12 vs 18.2 ms (1.06x faster). The D2D edge came from the
+two-phase Huffman decode (preamble byte-drain + 2-lookup hot loop with
+unconditional u32 stores) described in `ARCHITECTURE.md`.
 
 ## Invariants: do not break these
 

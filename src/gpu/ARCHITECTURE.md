@@ -281,6 +281,26 @@ can decode both at once. On text-like inputs where most codes are
 short, this roughly doubles throughput compared to the one-symbol-
 per-lookup variant.
 
+The decoder runs in two phases to amortize a per-store alignment
+check out of the hot loop. Each lane's output starts at an arbitrary
+byte offset, so the first phase byte-drains the decoded stream until
+the destination pointer is four-byte aligned. The cost is at most
+three byte stores per lane. From there the second phase takes over
+and writes four bytes per store unconditionally; alignment is
+preserved because every store advances the write cursor by exactly
+four.
+
+The second phase also batches two LUT lookups per refill check. A
+single decoded code is at most eleven bits, so two decodes consume
+at most twenty-two bits. The refill loads four bytes (thirty-two
+bits) into the buffer whenever the bit count drops below twenty-two,
+which leaves the post-refill bit count at thirty-two or more, always
+enough for both lookups. Three lookups would need up to thirty-three
+bits, which a single thirty-two-bit refill cannot guarantee, so the
+batch size is fixed at two. The combination of the dropped alignment
+branch in the inner store and the halved refill check is the bulk of
+the kernel's throughput on text-like inputs.
+
 There is no warp synchronization inside the Huffman inner loop. The
 four active lanes work entirely independently; the decoder
 explicitly forbids adding a `__syncwarp` below the early-return,
