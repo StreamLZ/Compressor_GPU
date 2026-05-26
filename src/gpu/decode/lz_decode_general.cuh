@@ -29,6 +29,24 @@ enum TokenType : uint32_t {
     TOKEN_TYPE_LONG_FAR     = 4, // 1-byte token + extended match length, off32
 };
 
+// Delta-literal mode (sub-chunk mode == 0): each output byte is the
+// sum of a literal byte and the byte at `dst[i + recent_offset]`.
+// Used in the inner token loop AND the per-block / final trailing-
+// literal flushes — same pattern at three sites. `__forceinline__` so
+// nvcc inlines it identically to the open-coded version it replaces.
+__device__ __forceinline__ void deltaLiteralCopyBounded(
+    uint8_t* __restrict__ dst, uint32_t dst_pos,
+    const uint8_t* __restrict__ lit, uint32_t lit_pos,
+    uint32_t count, uint32_t dst_end_abs, uint32_t lit_size,
+    int32_t recent_offset, int lane
+) {
+    for (uint32_t i = lane; i < count; i += WARP_SIZE)
+        if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size) {
+            uint32_t match_src = (uint32_t)((int32_t)(dst_pos + i) + recent_offset);
+            dst[dst_pos + i] = lit[lit_pos + i] + dst[match_src];
+        }
+}
+
 // Intentionally NOT __noinline__: an experiment in this session
 // confirmed the attribute is a net negative here. With it,
 // slzLzDecodeKernel STACK grew 192 -> 208 and slzLzDecodeRawKernel
@@ -169,14 +187,9 @@ __device__ void decodeSubChunkGeneral(
             // ── Warp-cooperative literal copy ──
             if (lit_len > 0) {
                 if (mode == 0) {
-                    // Delta-literal mode: dst[i] = lit[i] + dst[i + recent_offset].
-                    // Not extractable into a generic helper because of the
-                    // additive recent-offset back-reference.
-                    for (uint32_t i = lane; i < lit_len; i += WARP_SIZE)
-                        if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size) {
-                            uint32_t match_src = (uint32_t)((int32_t)(dst_pos + i) + recent_offset);
-                            dst[dst_pos + i] = lit[lit_pos + i] + dst[match_src];
-                        }
+                    deltaLiteralCopyBounded(dst, dst_pos, lit, lit_pos,
+                                            lit_len, dst_end_abs, lit_size,
+                                            recent_offset, lane);
                 } else {
                     warpLiteralCopyBounded(dst, dst_pos, lit, lit_pos,
                                            lit_len, dst_end_abs, lit_size, lane);
@@ -216,11 +229,9 @@ __device__ void decodeSubChunkGeneral(
             if (block_end > dst_end_abs) block_end = dst_end_abs;
             uint32_t block_trailing = (block_end > dst_pos) ? (block_end - dst_pos) : 0;
             if (mode == 0) {
-                for (uint32_t i = lane; i < block_trailing; i += WARP_SIZE)
-                    if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size) {
-                        uint32_t match_src = (uint32_t)((int32_t)(dst_pos + i) + recent_offset);
-                        dst[dst_pos + i] = lit[lit_pos + i] + dst[match_src];
-                    }
+                deltaLiteralCopyBounded(dst, dst_pos, lit, lit_pos,
+                                        block_trailing, dst_end_abs, lit_size,
+                                        recent_offset, lane);
             } else {
                 warpLiteralCopyBounded(dst, dst_pos, lit, lit_pos,
                                        block_trailing, dst_end_abs, lit_size, lane);
@@ -251,11 +262,9 @@ __device__ void decodeSubChunkGeneral(
     lit_pos = __shfl_sync(FULL_WARP_MASK, lit_pos, 0);
     uint32_t trailing = (lit_size > lit_pos) ? (lit_size - lit_pos) : 0;
     if (mode == 0) {
-        for (uint32_t i = lane; i < trailing; i += WARP_SIZE)
-            if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size) {
-                uint32_t match_src = (uint32_t)((int32_t)(dst_pos + i) + recent_offset);
-                dst[dst_pos + i] = lit[lit_pos + i] + dst[match_src];
-            }
+        deltaLiteralCopyBounded(dst, dst_pos, lit, lit_pos,
+                                trailing, dst_end_abs, lit_size,
+                                recent_offset, lane);
     } else {
         // The final trailing literal copy lacks the lit_pos bound check
         // (the trailing count itself derives from lit_size), so the
