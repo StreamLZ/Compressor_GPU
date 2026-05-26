@@ -192,6 +192,10 @@ __device__ void decodeSubChunkGeneral(
 
         // ── Per-block trailing literals (at 64KB boundary) ──
         __syncwarp();
+        // Lane-broadcast dst_pos / lit_pos required for perf — formally
+        // coherent but the shfls act as nvcc reorder barriers. Do NOT
+        // remove without re-running `-db -t 1 -r 30` on L3 (this was the
+        // exact regression in K1's C9; see file docstring).
         dst_pos = __shfl_sync(FULL_WARP_MASK, dst_pos, 0);
         lit_pos = __shfl_sync(FULL_WARP_MASK, lit_pos, 0);
         {
@@ -228,6 +232,8 @@ __device__ void decodeSubChunkGeneral(
 
     // ── Final trailing literals ──
     __syncwarp();
+    // Same perf-required shfls as the per-block trailing block above —
+    // see file docstring (C9 revert) before considering removal.
     dst_pos = __shfl_sync(FULL_WARP_MASK, dst_pos, 0);
     lit_pos = __shfl_sync(FULL_WARP_MASK, lit_pos, 0);
     uint32_t trailing = (lit_size > lit_pos) ? (lit_size - lit_pos) : 0;
