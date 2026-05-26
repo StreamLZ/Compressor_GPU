@@ -142,6 +142,7 @@ fn decompressCore(h: *Context, frame_bytes: []const u8, output: []u8, opts: Deco
         output,
         0,
         &h.dec,
+        true, // C ABI slzDecompress: always allow GPU when compiled in
     ) catch |err| return mapDecompressError(err);
     if (r.offset > 0 and r.written > 0) {
         std.mem.copyForwards(u8, output[0..r.written], output[r.offset..][0..r.written]);

@@ -759,7 +759,7 @@ fn runDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, ar
     const dst = out_map.slice();
     const t_alloc = gpu_driver.qpcNow();
 
-    const dec_result = decoder.decompressFramedParallelThreaded(allocator, io, src, dst, args.threads, &gpu_driver.g_default) catch |err| {
+    const dec_result = decoder.decompressFramedParallelThreaded(allocator, io, src, dst, args.threads, &gpu_driver.g_default, args.gpu) catch |err| {
         out_map.unmap();
         try w.print("error: decompression failed: {s}\n", .{@errorName(err)});
         try w.flush();
@@ -819,12 +819,15 @@ fn runBenchCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer,
     const mb: f64 = @as(f64, @floatFromInt(src.len)) / (1024.0 * 1024.0);
     try w.print("Input: {s} ({d} bytes, {d:.2} MB)\n", .{ in_path, src.len, mb });
 
-    // Dictionary resolution (same logic as runCompress).
+    // Dictionary resolution (same logic as runCompress, including the
+    // `and !args.gpu` guard on auto-detection: the GPU encode path
+    // doesn't apply dicts, so auto-attaching one here would produce a
+    // file the GPU decoder can't roundtrip).
     var dict_data_b: ?[]const u8 = null;
     var dict_id_b: ?u32 = null;
     if (args.dict_name) |name| {
         if (dict_mod.findByName(name)) |d| { dict_data_b = d.data; dict_id_b = d.id; }
-    } else if (!args.no_dict) {
+    } else if (!args.no_dict and !args.gpu) {
         if (dict_mod.findByExtension(in_path)) |d| { dict_data_b = d.data; dict_id_b = d.id; }
     }
 
@@ -833,7 +836,7 @@ fn runBenchCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer,
     defer allocator.free(decompressed);
 
     // Warm-up compress.
-    const comp_opts: encoder.Options = .{ .level = level, .dictionary = dict_data_b, .dictionary_id = dict_id_b, .num_threads = args.threads };
+    const comp_opts: encoder.Options = .{ .level = level, .dictionary = dict_data_b, .dictionary_id = dict_id_b, .num_threads = args.threads, .gpu_mode = args.gpu };
     var comp_size: usize = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_encoder.g_default);
 
     // Compress (single timed run — -r only affects decompress).
@@ -852,8 +855,11 @@ fn runBenchCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer,
         @as(f64, @floatFromInt(comp_size)) / @as(f64, @floatFromInt(src.len)) * 100.0,
     });
 
-    // Persistent decompress context.
+    // Persistent decompress context. `-gpu` gates the runtime GPU
+    // dispatch so `-b` (without `-gpu`) measures the pure-CPU decode
+    // path even on a GPU build, and `-b -gpu` exercises the GPU one.
     var dec_ctx = decoder.DecompressContext.initThreadedWithIo(allocator, io, args.threads);
+    dec_ctx.use_gpu = args.gpu;
     defer dec_ctx.deinit();
 
     // Warm-up decompress.
@@ -863,22 +869,63 @@ fn runBenchCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer,
         dec_off = wr.offset;
     }
 
-    // Decompress benchmark.
+    // Decompress benchmark. When `-gpu` is passed, also capture the
+    // pure-GPU-kernel time (D2D wall-clock) so users can see both the
+    // end-to-end host wall-clock and the kernel-only time the
+    // device-resident D2D entry points would see.
     const dec_times = try allocator.alloc(u64, runs);
     defer allocator.free(dec_times);
+    const kern_times = try allocator.alloc(i64, runs);
+    defer allocator.free(kern_times);
+    @memset(kern_times, 0);
+    const gpu_drv = @import("gpu/decode/driver.zig");
     var r: u32 = 0;
     while (r < runs) : (r += 1) {
         const timer_start = std.Io.Clock.awake.now(io);
         _ = try dec_ctx.decompress(compressed[0..comp_size], decompressed);
         dec_times[r] = @as(u64, @intCast(timer_start.untilNow(io, .awake).toNanoseconds()));
+        if (args.gpu) kern_times[r] = gpu_drv.last_kernel_ns;
         const run_ms = @as(f64, @floatFromInt(dec_times[r])) / 1_000_000.0;
         const run_mbps = mb * 1000.0 / run_ms;
-        try w.print("  Decompress run {d}: {d:.0}ms ({d:.1} MB/s)\n", .{ r + 1, run_ms, run_mbps });
+        if (args.gpu and kern_times[r] > 0) {
+            const kern_ms = @as(f64, @floatFromInt(kern_times[r])) / 1_000_000.0;
+            const kern_mbps = mb * 1000.0 / kern_ms;
+            try w.print("  Decompress run {d}: e2e {d:.0}ms ({d:.1} MB/s)  d2d {d:.2}ms ({d:.1} MB/s)\n", .{
+                r + 1, run_ms, run_mbps, kern_ms, kern_mbps,
+            });
+        } else {
+            try w.print("  Decompress run {d}: {d:.0}ms ({d:.1} MB/s)\n", .{ r + 1, run_ms, run_mbps });
+        }
     }
     const dec_median_ns = medianOrMean(dec_times);
     const dec_median_ms = @as(f64, @floatFromInt(dec_median_ns)) / 1_000_000.0;
     const dec_median_mbps = mb * 1000.0 / dec_median_ms;
-    try w.print("  Decompress median: {d:.0}ms ({d:.1} MB/s)\n\n", .{ dec_median_ms, dec_median_mbps });
+    if (args.gpu) {
+        // Median of the d2d kernel times across the timed runs. Zero
+        // kern_times slots are skipped (the GPU path may have fallen
+        // back to host for a given run, which leaves last_kernel_ns at 0).
+        var nonzero_kerns: [256]i64 = undefined;
+        var nz_count: usize = 0;
+        for (kern_times) |k| {
+            if (k > 0 and nz_count < nonzero_kerns.len) {
+                nonzero_kerns[nz_count] = k;
+                nz_count += 1;
+            }
+        }
+        if (nz_count > 0) {
+            std.mem.sort(i64, nonzero_kerns[0..nz_count], {}, std.sort.asc(i64));
+            const kern_median_ns: i64 = nonzero_kerns[nz_count / 2];
+            const kern_median_ms = @as(f64, @floatFromInt(kern_median_ns)) / 1_000_000.0;
+            const kern_median_mbps = mb * 1000.0 / kern_median_ms;
+            try w.print("  Decompress median: e2e {d:.0}ms ({d:.1} MB/s)  d2d {d:.2}ms ({d:.1} MB/s)\n\n", .{
+                dec_median_ms, dec_median_mbps, kern_median_ms, kern_median_mbps,
+            });
+        } else {
+            try w.print("  Decompress median: {d:.0}ms ({d:.1} MB/s)\n\n", .{ dec_median_ms, dec_median_mbps });
+        }
+    } else {
+        try w.print("  Decompress median: {d:.0}ms ({d:.1} MB/s)\n\n", .{ dec_median_ms, dec_median_mbps });
+    }
 
     // Round-trip check.
     if (std.mem.eql(u8, src, decompressed[dec_off..][0..src.len])) {
@@ -1003,6 +1050,7 @@ fn runBenchDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Write
     }
 
     var dec_ctx = decoder.DecompressContext.initThreadedWithIo(allocator, io, args.threads);
+    dec_ctx.use_gpu = args.gpu;
     defer dec_ctx.deinit();
 
     // Warm-up.
@@ -1150,7 +1198,7 @@ fn runBenchAll(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
         const idx = level - 1;
 
         // Compress once, timed.
-        const comp_opts: encoder.Options = .{ .level = level, .num_threads = @intCast(num_threads) };
+        const comp_opts: encoder.Options = .{ .level = level, .num_threads = @intCast(num_threads), .gpu_mode = args.gpu };
         const comp_start = std.Io.Clock.awake.now(io);
         const comp_size = encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_encoder.g_default) catch |err| {
             try w.print("  L{d}: compress failed: {s}\n", .{ level, @errorName(err) });
@@ -1159,8 +1207,9 @@ fn runBenchAll(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
         };
         const best_comp_ns = @as(u64, @intCast(comp_start.untilNow(io, .awake).toNanoseconds()));
 
-        // Decompress context.
+        // Decompress context. -gpu flag gates the runtime GPU path.
         var dec_ctx = decoder.DecompressContext.initThreadedWithIo(allocator, io, num_threads);
+        dec_ctx.use_gpu = args.gpu;
         defer dec_ctx.deinit();
 
         // Warm-up decompress.
@@ -1534,7 +1583,11 @@ fn runBenchCompare(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, 
         const comp_size = encoder.compressFramedWithIo(allocator, io, src, compressed, opts, &gpu_encoder.g_default) catch 0;
         const comp_ns = @as(u64, @intCast(comp_timer.untilNow(io, .awake).toNanoseconds()));
         if (comp_size > 0) {
+            // -bc compares CPU codecs (zstd, lz4) against SLZ. The
+            // encode side above doesn't set gpu_mode (CPU encode); the
+            // decode side stays CPU too for a fair head-to-head.
             var dec_ctx = decoder.DecompressContext.initThreadedWithIo(allocator, io, @intCast(threads));
+            dec_ctx.use_gpu = false;
             defer dec_ctx.deinit();
             _ = dec_ctx.decompress(compressed[0..comp_size], decompressed) catch {
                 try w.writeAll(" decompress FAILED\n");

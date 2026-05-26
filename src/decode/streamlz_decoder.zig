@@ -11,7 +11,12 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const use_gpu = if (@hasDecl(build_options, "gpu")) build_options.gpu else false;
+/// Compile-time: was the GPU backend linked in? False for CPU-only
+/// builds. The GPU dispatch sites below gate on (gpu_compiled_in AND
+/// the runtime per-call `use_gpu` flag), so a CPU-only build skips
+/// the GPU code entirely while a GPU build still respects the
+/// caller's `-gpu` CLI flag.
+const gpu_compiled_in = if (@hasDecl(build_options, "gpu")) build_options.gpu else false;
 const frame = @import("../format/frame_format.zig");
 const block_header = @import("../format/block_header.zig");
 const constants = @import("../format/streamlz_constants.zig");
@@ -57,7 +62,7 @@ pub fn decompressFramed(
     dst: []u8,
     dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!usize {
-    const r = try decompressFramedInner(null, null, src, dst, 0, dec_ctx);
+    const r = try decompressFramedInner(null, null, src, dst, 0, dec_ctx, null, true);
     if (r.offset > 0 and r.written > 0) {
         std.mem.copyForwards(u8, dst[0..r.written], dst[r.offset..][0..r.written]);
     }
@@ -66,14 +71,18 @@ pub fn decompressFramed(
 
 /// Parallel variant of `decompressFramed`. Uses `allocator` to spawn
 /// worker threads + allocate per-thread scratch for SC (L6-L8) blocks.
-/// Non-SC blocks fall through to the serial path.
+/// Non-SC blocks fall through to the serial path. `use_gpu` is the
+/// per-call runtime gate on the GPU dispatch path (see DecompressContext
+/// docs); pass `false` to measure the pure-CPU decode path even on a
+/// GPU build.
 pub fn decompressFramedParallel(
     allocator: std.mem.Allocator,
     src: []const u8,
     dst: []u8,
     dec_ctx: *gpu_driver.DecodeContext,
+    use_gpu: bool,
 ) DecompressError!usize {
-    const r = try decompressFramedInner(allocator, null, src, dst, 0, dec_ctx, null);
+    const r = try decompressFramedInner(allocator, null, src, dst, 0, dec_ctx, null, use_gpu);
     if (r.offset > 0 and r.written > 0) {
         std.mem.copyForwards(u8, dst[0..r.written], dst[r.offset..][0..r.written]);
     }
@@ -87,8 +96,9 @@ pub fn decompressFramedParallelThreaded(
     dst: []u8,
     max_threads: usize,
     dec_ctx: *gpu_driver.DecodeContext,
+    use_gpu: bool,
 ) DecompressError!DecompressResult {
-    return decompressFramedInner(allocator, io, src, dst, max_threads, dec_ctx, null);
+    return decompressFramedInner(allocator, io, src, dst, max_threads, dec_ctx, null, use_gpu);
 }
 
 /// 4d Phase 3 TRUE D2D decompress. The compressed frame is already at
@@ -171,7 +181,9 @@ pub fn decompressFramedParallelToDevice(
     max_threads: usize,
     dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!DecompressResult {
-    const r = try decompressFramedInner(allocator, io, src, &[_]u8{}, max_threads, dec_ctx, d_output);
+    // D2D path is GPU-only by definition (every block must be
+    // GPU-decodable); pass use_gpu=true unconditionally.
+    const r = try decompressFramedInner(allocator, io, src, &[_]u8{}, max_threads, dec_ctx, d_output, true);
     if (std.c.getenv("SLZ_E2E_TIMER") != null)
         std.debug.print("[d2d] decompressFramedParallelToDevice wrote {d} bytes to device\n", .{r.written});
     return r;
@@ -189,6 +201,13 @@ pub const DecompressContext = struct {
     /// the module-global default so existing behavior is unchanged; a
     /// future library API will hand each handle its own DecodeContext.
     dec_ctx: *gpu_driver.DecodeContext = &gpu_driver.g_default,
+    /// Per-handle runtime gate on the GPU dispatch path. Defaults to
+    /// `true` so existing callers keep current behavior; the CLI sets
+    /// it from the `-gpu` flag so `-b` (without `-gpu`) measures the
+    /// pure-CPU decode path even on a GPU build. The dispatch sites
+    /// gate on `(gpu_compiled_in and ctx.use_gpu)`, so a CPU-only build
+    /// short-circuits to host regardless of this field.
+    use_gpu: bool = true,
 
     pub fn init(allocator: std.mem.Allocator) DecompressContext {
         return .{
@@ -222,7 +241,7 @@ pub const DecompressContext = struct {
         while (src_pos < src.len) {
             const piece_src = src[src_pos..];
             const piece_dst = dst[dst_off..];
-            const pair = try decompressOneFrame(self.allocator, self.io, piece_src, piece_dst, self.max_threads, self.dec_ctx, null);
+            const pair = try decompressOneFrame(self.allocator, self.io, piece_src, piece_dst, self.max_threads, self.dec_ctx, null, self.use_gpu);
             src_pos += pair.src_consumed;
             if (dict_off == 0 and pair.dst_offset > 0) dict_off = pair.dst_offset;
             dst_off += pair.dst_offset + pair.dst_written;
@@ -249,6 +268,9 @@ fn decompressFramedInner(
     /// Vulkan) cannot satisfy this contract; the inner loop returns
     /// error.BadMode if it has to fall back to a non-GPU branch.
     d_output_target: ?u64,
+    /// Per-call runtime gate on the GPU dispatch path. See
+    /// decompressOneFrame's same-named param for the full rationale.
+    use_gpu: bool,
 ) DecompressError!DecompressResult {
     if (src.len == 0) return .{ .written = 0, .offset = 0 };
 
@@ -267,7 +289,7 @@ fn decompressFramedInner(
         // can keep its dst_off relative to the piece (matches the host
         // `dst` slicing one line above).
         const piece_dev_target = if (d_output_target) |t| t + dst_off else null;
-        const pair = try decompressOneFrame(allocator_opt, io_opt, piece_src, piece_dst, max_threads, dec_ctx, piece_dev_target);
+        const pair = try decompressOneFrame(allocator_opt, io_opt, piece_src, piece_dst, max_threads, dec_ctx, piece_dev_target, use_gpu);
         src_pos += pair.src_consumed;
         if (dict_off == 0 and pair.dst_offset > 0) dict_off = pair.dst_offset;
         dst_off += pair.dst_offset + pair.dst_written;
@@ -292,6 +314,12 @@ fn decompressOneFrame(
     /// 4d Phase 3: see decompressFramedInner. Forwarded as-is to the
     /// per-block dispatch — null = legacy host-output path.
     d_output_target: ?u64,
+    /// Per-call gate on the GPU dispatch path. Combined with the
+    /// comptime `gpu_compiled_in` to produce the final decision: GPU
+    /// is taken only when both are true. CLI sets this from `-gpu`;
+    /// CPU-only tests/callers pass `false`; GPU-required paths (D2D,
+    /// C ABI's slzDecompress) pass `true`.
+    use_gpu: bool,
 ) DecompressError!FrameResult {
     if (src.len == 0) return .{ .src_consumed = 0, .dst_written = 0 };
 
@@ -428,7 +456,7 @@ fn decompressOneFrame(
         // GPU batch path: GPU LZ kernel iterates sub-chunks within each chunk,
         // so it handles any sc_group_size. At sc>0.5 the encoder gates off tANS
         // (raw streams only) so the per-chunk tANS scratch isn't needed there.
-        if (use_gpu) gpu_frame: {
+        if (gpu_compiled_in and use_gpu) gpu_frame: {
             const gpu = @import("../gpu/decode/driver.zig");
             if (!gpu.isAvailable()) break :gpu_frame;
             if (block_src.len < 2) break :gpu_frame;
@@ -469,7 +497,7 @@ fn decompressOneFrame(
         }
 
         // Vulkan fallback: try Vulkan compute when CUDA is unavailable
-        if (!dispatched_parallel and use_gpu and hdr.sc_group_size <= 1.0) vk_frame: {
+        if (gpu_compiled_in and !dispatched_parallel and use_gpu and hdr.sc_group_size <= 1.0) vk_frame: {
             const vk = @import("../gpu/decode/vulkan_driver.zig");
             if (!vk.isAvailable()) break :vk_frame;
             if (block_src.len < 2) break :vk_frame;
@@ -570,6 +598,7 @@ fn decompressOneFrame(
                 hdr.sc_group_size,
                 hdr.level,
                 dec_ctx,
+                use_gpu,
             );
         }
         pos += block_hdr.compressed_size;
@@ -796,7 +825,9 @@ pub fn decompressBlockWithDict(
     // v2 default sc_group_size. Streaming / framed callers should
     // instead use `decompressFramed` / `decompressStream` so the
     // header-declared sc_group_size flows through.
-    try decompressCompressedBlock(src, dst, &dst_off, decompressed_size, &scratch, @as(f32, @floatFromInt(constants.default_sc_group_size)), 0, dec_ctx);
+    // Block-level API has no CLI -gpu plumbing; default to GPU when
+    // the binary supports it (mirrors pre-flag behavior).
+    try decompressCompressedBlock(src, dst, &dst_off, decompressed_size, &scratch, @as(f32, @floatFromInt(constants.default_sc_group_size)), 0, dec_ctx, true);
     return dst_off - dst_offset;
 }
 
@@ -822,6 +853,9 @@ fn decompressCompressedBlock(
     sc_group_size: f32,
     frame_level: u8,
     dec_ctx: *gpu_driver.DecodeContext,
+    /// Per-call runtime gate on the GPU dispatch path. See
+    /// decompressOneFrame's same-named param for the full rationale.
+    use_gpu: bool,
 ) DecompressError!void {
     _ = frame_level;
     // Peek the first 2-byte internal block header to detect SC mode up-front.
@@ -848,7 +882,7 @@ fn decompressCompressedBlock(
     // Cross-chunk off32 references can't be resolved in parallel GPU decode.
     // tANS literal/token streams are pre-decoded by the tANS kernel (Pass 1).
     // Entropy-coded off16 streams are decoded on the CPU and uploaded.
-    if (use_gpu and sc_group_size <= 1.0) gpu_batch: {
+    if (gpu_compiled_in and use_gpu and sc_group_size <= 1.0) gpu_batch: {
         const gpu = @import("../gpu/decode/driver.zig");
         if (!gpu.isAvailable()) break :gpu_batch;
         gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, sc_group_size, scratch, null, dec_ctx, null) catch {

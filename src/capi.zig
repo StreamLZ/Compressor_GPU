@@ -70,6 +70,7 @@ export fn slz_decompress(
         dst[0..dst_len],
         0,
         &gpu_driver.g_default,
+        true, // C ABI slzDecompress: always allow GPU when compiled in
     ) catch |err| return mapDecompressError(err);
     if (result.offset > 0) {
         std.mem.copyForwards(u8, dst[0..result.written], dst[result.offset..][0..result.written]);

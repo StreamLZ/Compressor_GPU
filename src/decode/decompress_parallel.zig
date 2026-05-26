@@ -1314,6 +1314,7 @@ fn parallelRoundtrip(source: []const u8, level: u8) !void {
         compressed[0..n],
         decoded_par,
         &gpu_driver.g_default,
+        true, // test: allow GPU when compiled in (default historic behavior)
     );
     try testing.expectEqual(source.len, written_par);
     try testing.expectEqualSlices(u8, source, decoded_par[0..written_par]);
