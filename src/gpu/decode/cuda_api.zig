@@ -28,14 +28,16 @@ pub fn qpcNow() i64 {
     return c;
 }
 // QueryPerformanceFrequency is fixed for the process lifetime — cache
-// the first read so qpcMs avoids the syscall on every call.
-var cached_qpc_freq: i64 = 0;
+// the first read so qpcMs avoids the syscall on every call. Atomic
+// because qpcMs can be called from any thread; the value is idempotent
+// so a benign race that re-queries is harmless.
+var cached_qpc_freq: std.atomic.Value(i64) = .init(0);
 pub fn qpcMs(from: i64, to: i64) f64 {
-    var freq = cached_qpc_freq;
+    var freq = cached_qpc_freq.load(.monotonic);
     if (freq == 0) {
         _ = win32.QueryPerformanceFrequency(&freq);
         if (freq == 0) freq = 1;
-        cached_qpc_freq = freq;
+        cached_qpc_freq.store(freq, .monotonic);
     }
     return @as(f64, @floatFromInt(to - from)) * 1000.0 / @as(f64, @floatFromInt(freq));
 }
@@ -48,7 +50,13 @@ pub const CUDA_SUCCESS: CUresult = 0;
 // ── Module state (dlopen handle + current context) ─────────────
 pub var lib: ?*anyopaque = null;
 pub var ctx: usize = 0;
-pub var initialized: bool = false;
+
+/// Module-loader bring-up state. `uninit` is the initial value;
+/// `init` advances through `in_progress` while it runs (lets a re-entry
+/// detect a loop) and finishes at `ready` on success or `failed` if any
+/// step bailed. `init` returns true iff `init_state == .ready` afterwards.
+pub const InitState = enum { uninit, in_progress, ready, failed };
+pub var init_state: InitState = .uninit;
 
 // ── Driver API function signatures ──────────────────────────────
 pub const FnInit = *const fn (c_uint) callconv(.c) CUresult;

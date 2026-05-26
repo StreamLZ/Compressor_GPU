@@ -271,6 +271,17 @@ pub const DecodeContext = struct {
     pipeline_streams: [cuda.NUM_PIPELINE_STREAMS]usize = .{0} ** cuda.NUM_PIPELINE_STREAMS,
     pipeline_streams_created: bool = false,
 
+    // Per-call scratch buffers — pulled off the dispatch-loop stack
+    // because the combined ~384 KiB is uncomfortably large in a recursive
+    // call frame. Reused across calls; capacity is sized for the largest
+    // frame the GPU codec can produce (walk_max_chunks chunks × per-stream-cap).
+    //   merged_huff_buf       — CPU merge fallback, four streams' worth of
+    //                           HuffDecChunkDesc entries (~320 KiB).
+    //   first_subchunk_idx_buf — CPU mirror of the per-chunk first-sub-chunk
+    //                           prefix sum used by the non-pure-D2D path (~64 KiB).
+    merged_huff_buf: [d.MAX_HUFF_DESCS_PER_STREAM * 4]d.HuffDecChunkDesc = undefined,
+    first_subchunk_idx_buf: [d.walk_max_chunks]u32 = .{0} ** d.walk_max_chunks,
+
     // Per-kernel timing (slzDecompressOpts_t.enable_profiling). When true,
     // every kernel launch in fullGpuLaunchImpl records a cuEvent pair and
     // appends to `pending_timings`. `finalizeProfiling` (called after the

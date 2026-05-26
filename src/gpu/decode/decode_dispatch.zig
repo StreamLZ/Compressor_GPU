@@ -87,8 +87,9 @@ fn mergeHuffDescs(
         return;
     }
     // CPU merge fallback: used by the non-pure-D2D / CPU-scan paths.
-    // Capacity = 4 buffers × d.MAX_HUFF_DESCS_PER_STREAM.
-    var merged_huff: [d.MAX_HUFF_DESCS_PER_STREAM * 4]HuffDecChunkDesc = undefined;
+    // Storage lives on the DecodeContext (see merged_huff_buf there) so
+    // the dispatch frame stays small.
+    const merged_huff: []HuffDecChunkDesc = self.merged_huff_buf[0..];
     var m: u32 = 0;
     var lut_slot: u32 = 0;
     const append = struct {
@@ -105,12 +106,12 @@ fn mergeHuffDescs(
             }
         }
     }.run;
-    append(&merged_huff, &m, &lut_slot, self.huff_lit_host_buf[0..scan.num_huff_lit], 0);
-    append(&merged_huff, &m, &lut_slot, self.huff_tok_host_buf[0..scan.num_huff_tok], @intCast(tok_offset));
-    append(&merged_huff, &m, &lut_slot, self.huff_off16hi_host_buf[0..scan.num_huff_off16hi], @intCast(off16_offset));
-    append(&merged_huff, &m, &lut_slot, self.huff_off16lo_host_buf[0..scan.num_huff_off16lo], @intCast(off16_offset));
+    append(merged_huff, &m, &lut_slot, self.huff_lit_host_buf[0..scan.num_huff_lit], 0);
+    append(merged_huff, &m, &lut_slot, self.huff_tok_host_buf[0..scan.num_huff_tok], @intCast(tok_offset));
+    append(merged_huff, &m, &lut_slot, self.huff_off16hi_host_buf[0..scan.num_huff_off16hi], @intCast(off16_offset));
+    append(merged_huff, &m, &lut_slot, self.huff_off16lo_host_buf[0..scan.num_huff_off16lo], @intCast(off16_offset));
 
-    try cudaCall(h2d_fn(self.d_huff_descs, @ptrCast(&merged_huff), @as(usize, m) * @sizeOf(HuffDecChunkDesc)));
+    try cudaCall(h2d_fn(self.d_huff_descs, @ptrCast(merged_huff.ptr), @as(usize, m) * @sizeOf(HuffDecChunkDesc)));
     try cudaCall(sync_fn());
 }
 
@@ -166,11 +167,19 @@ fn gatherRawOff16(
             var extra = [_]?*anyopaque{null};
             // ndesc is exact (host already knows the count); no over-launch.
             // The self-gate inside the kernel makes over-launch safe regardless.
-            // We do NOT propagate a launch failure here — the D2D/H2D
-            // fallback below is byte-equivalent and always available, so
-            // treating the launch as a best-effort fast path is correct
-            // and the failure mode is "slower, not wrong". If you change
-            // that contract, replace the if-success-return below with
+            //
+            // K5.9 decision: KEEP the D2D/H2D fallback below and treat the
+            // launch as a best-effort fast path. Justification: the two
+            // failure modes are disjoint — the kernel-launch path needs
+            // `cuLaunchKernel + scratch_base + descs`; the fallback path
+            // needs only `cuMemcpyDtoDAsync` (or `cuMemcpyHtoD`) + the
+            // same buffers. A driver glitch that breaks launch (e.g. the
+            // optional kernel slot got loaded but the launch fails due
+            // to grid limits) does not break a plain memcpy. So a launch
+            // failure is "slower, not wrong"; the fallback recovers
+            // byte-equivalent output. If you ever change that contract
+            // (i.e. fold the fallback into a single trusted path),
+            // replace the if-success-return below with
             // `try cudaCall(launch_fn(...))`.
             const grid_x: u32 = ndesc;
             const t_gather = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzGatherRawOff16Kernel", 0);
@@ -327,7 +336,7 @@ pub fn fullGpuLaunchImpl(
     d_compressed_src: ?u64,
 ) GpuError!void {
     if (!ml.init() or ml.kernel_fn == 0) return error.BadMode;
-    ml.ensurePipelineStreams(self);
+    try ml.ensurePipelineStreams(self);
 
     const facade = @import("driver.zig");
 
@@ -372,10 +381,11 @@ pub fn fullGpuLaunchImpl(
     try cudaCall(d2h_fn(@ptrCast(&total_subchunks), self.d_total_subchunks_buf, 4));
     self.d_first_subchunk_idx = self.d_first_sub_idx_persist;
     // CPU mirror for the pipeline branch — NUM_PIPELINE_STREAMS==1
-    // reads only index 0 (= 0). Zero-init suffices; bumping the stream
-    // count would need a selective D2H of group boundaries from
-    // d_first_sub_idx_persist.
-    var first_subchunk_idx_buf: [d.walk_max_chunks]u32 = .{0} ** d.walk_max_chunks;
+    // reads only index 0 (= 0). Storage lives on the DecodeContext;
+    // zero-init at first use is enough (subsequent calls overwrite as
+    // needed). Bumping the stream count would need a selective D2H of
+    // group boundaries from d_first_sub_idx_persist.
+    const first_subchunk_idx_buf: []u32 = &self.first_subchunk_idx_buf;
     // d.ENTROPY_SCRATCH_SLOT_BYTES holds the largest sub-chunk's lit/tok
     // streams; off16-hi at +0, off16-lo at +d.OFF16_HILO_SPLIT_OFFSET
     // within each slot. Layout: [lit: total*slot] [tok: total*slot] [off16: total*slot].
@@ -389,7 +399,7 @@ pub fn fullGpuLaunchImpl(
     const need_first_sub_idx = total_subchunks != @as(u32, @intCast(chunk_descs.len));
     if (need_first_sub_idx) {
         const fs_bytes: usize = chunk_descs.len * @sizeOf(u32);
-        try cudaCall(d2h_fn(@ptrCast(&first_subchunk_idx_buf), self.d_first_sub_idx_persist, fs_bytes));
+        try cudaCall(d2h_fn(@ptrCast(first_subchunk_idx_buf.ptr), self.d_first_sub_idx_persist, fs_bytes));
     } else {
         self.d_first_subchunk_idx = 0;
     }

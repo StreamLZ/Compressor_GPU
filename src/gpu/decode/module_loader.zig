@@ -11,6 +11,7 @@ const std = @import("std");
 
 const cuda = @import("cuda_api.zig");
 const dec_ctx = @import("decode_context.zig");
+const d = @import("descriptors.zig");
 
 const CUresult = cuda.CUresult;
 const CUdevice = cuda.CUdevice;
@@ -32,8 +33,17 @@ pub var huff_build_fn: usize = 0;
 pub var huff_decode_fn: usize = 0;
 
 pub fn init() bool {
-    if (cuda.initialized) return kernel_fn != 0;
-    cuda.initialized = true;
+    switch (cuda.init_state) {
+        .ready => return true,
+        .failed, .in_progress => return false, // .in_progress catches re-entry
+        .uninit => {},
+    }
+    cuda.init_state = .in_progress;
+    // Common bail-out: any path that exits this function while still
+    // `.in_progress` transitions to `.failed` so the next init() call
+    // doesn't re-try the bring-up. The success path sets `.ready`
+    // explicitly at the bottom; defer then sees `.ready` and is a no-op.
+    defer if (cuda.init_state == .in_progress) { cuda.init_state = .failed; };
 
     if (std.c.getenv("SLZ_NO_CUDA") != null) return false;
 
@@ -134,9 +144,15 @@ pub fn init() bool {
 
     // Create persistent pipeline streams (CU_STREAM_NON_BLOCKING = 1)
     // on the module-default context. Per-handle DecodeContexts get the
-    // same treatment lazily in `ensurePipelineStreams` below.
-    ensurePipelineStreams(&@import("driver.zig").g_default);
+    // same treatment lazily in `ensurePipelineStreams` below. Failure
+    // here transitions the loader to `.failed` (the errdefer above doesn't
+    // fire because the call returns void — propagate manually).
+    ensurePipelineStreams(&@import("driver.zig").g_default) catch {
+        cuda.init_state = .failed;
+        return false;
+    };
 
+    cuda.init_state = .ready;
     return true;
 }
 
@@ -145,11 +161,22 @@ pub fn init() bool {
 /// context that hasn't created them yet. Without this, h.dec contexts
 /// fall through to the non-pipelined branch of fullGpuLaunchImpl, which
 /// never launches the Huffman kernels and silently produces zero literals.
-pub fn ensurePipelineStreams(d_ctx: *dec_ctx.DecodeContext) void {
+///
+/// On partial failure (some streams created, then a later one fails) we
+/// destroy the partials before returning the error, so the context never
+/// observes `pipeline_streams_created = true` with a half-populated array.
+pub fn ensurePipelineStreams(d_ctx: *dec_ctx.DecodeContext) d.GpuError!void {
     if (d_ctx.pipeline_streams_created) return;
-    const create_fn = cuda.cuStreamCreate_fn orelse return;
-    for (0..cuda.NUM_PIPELINE_STREAMS) |i| {
-        if (create_fn(&d_ctx.pipeline_streams[i], 1) != CUDA_SUCCESS) return;
+    const create_fn = cuda.cuStreamCreate_fn orelse return error.BadMode;
+    var created: usize = 0;
+    errdefer if (cuda.cuStreamDestroy_fn) |destroy_fn| {
+        for (d_ctx.pipeline_streams[0..created]) |s| {
+            if (s != 0) _ = destroy_fn(s);
+        }
+        d_ctx.pipeline_streams = .{0} ** cuda.NUM_PIPELINE_STREAMS;
+    };
+    while (created < cuda.NUM_PIPELINE_STREAMS) : (created += 1) {
+        if (create_fn(&d_ctx.pipeline_streams[created], 1) != CUDA_SUCCESS) return error.BadMode;
     }
     d_ctx.pipeline_streams_created = true;
 }
