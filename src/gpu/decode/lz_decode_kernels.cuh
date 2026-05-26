@@ -102,7 +102,7 @@ slzLzDecodeKernel(
             sub_chunk_header = __shfl_sync(FULL_WARP_MASK, sub_chunk_header, 0);
 
             if (!subchunkIsLz(sub_chunk_header)) {
-                // Non-LZ sub-chunk (entropy-only) — skip for now
+                // Non-LZ sub-chunk (entropy-only) - skip for now
                 break;
             }
 
@@ -153,7 +153,7 @@ slzLzDecodeKernel(
 //
 // Parameters: compressed input blob, per-chunk descriptors, output
 // blob, chunks-per-warp count, valid descriptor count, and the max
-// decompressed sub-chunk size — see slzLzDecodeKernel for the
+// decompressed sub-chunk size - see slzLzDecodeKernel for the
 // shared parameter semantics.
 extern "C" __global__ void
 __launch_bounds__(LZ_KERNEL_BLOCK_THREADS, LZ_KERNEL_MIN_BLOCKS_PER_SM)

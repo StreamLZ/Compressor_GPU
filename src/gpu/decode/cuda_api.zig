@@ -1,7 +1,7 @@
 //! CUDA Driver API + Win32 surface used by the GPU-decode pipeline.
 //!
 //! Why this file exists: every sub-module needs the CUresult/CUdeviceptr
-//! aliases and one or more of the `cuXxx_fn` slots — bundling the
+//! aliases and one or more of the `cuXxx_fn` slots - bundling the
 //! typedefs, function-pointer slots, dlopen state, and the QPC clock
 //! here keeps `module_loader.zig`/`decode_context.zig`/etc. free of
 //! duplicate FFI boilerplate.
@@ -21,13 +21,13 @@ pub const win32 = struct {
 
 /// Monotonic high-resolution timestamp (QueryPerformanceCounter). Pair
 /// with qpcMs() for elapsed-millisecond timing without an std.Io handle
-/// — used by the SLZ_E2E_TIMER instrumentation in init() and the CLI.
+/// - used by the SLZ_E2E_TIMER instrumentation in init() and the CLI.
 pub fn qpcNow() i64 {
     var c: i64 = 0;
     _ = win32.QueryPerformanceCounter(&c);
     return c;
 }
-// QueryPerformanceFrequency is fixed for the process lifetime — cache
+// QueryPerformanceFrequency is fixed for the process lifetime - cache
 // the first read so qpcMs avoids the syscall on every call. Atomic
 // because qpcMs can be called from any thread; the value is idempotent
 // so a benign race that re-queries is harmless.

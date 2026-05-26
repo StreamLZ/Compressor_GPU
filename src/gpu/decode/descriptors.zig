@@ -1,6 +1,6 @@
 //! Plain-old-data descriptor types shared by the GPU decode pipeline.
 //!
-//! Kept free of CUDA bindings on purpose — sub-modules import this for the
+//! Kept free of CUDA bindings on purpose - sub-modules import this for the
 //! struct shapes and the few constants without dragging in `cuda_api.zig`.
 //! `extern struct` layouts here MUST stay in sync with the C/CUDA mirrors
 //! in `src/gpu/decode/slz_wire_format.cuh` and the `*_kernel.cuh` headers
@@ -19,7 +19,7 @@ pub const ChunkDesc = extern struct {
     _pad: [3]u8 = .{ 0, 0, 0 },
 };
 
-// ── Huffman literal descriptors — matches decode/huffman_kernel.cu HuffDecChunkDesc.
+// ── Huffman literal descriptors - matches decode/huffman_kernel.cu HuffDecChunkDesc.
 // in_offset/in_size cover the FULL payload (128 B weights + 93 B sub-header +
 // 32 stream payloads, per HUFF_NUM_STREAMS / HUFF_SUBHEADER_BYTES /
 // HUFF_BODY_HEADER_BYTES in src/gpu/common/gpu_huffman.cuh). Build kernel
@@ -36,22 +36,22 @@ pub const HUFF_LUT_ENTRIES: usize = 1024; // matches MAX_CODE_LEN=10 (10-bit esc
 
 // ── Per-context buffer caps ─────────────────────────────────────
 // Host-side max counts; sized for the largest frame the GPU codec
-// can produce (walk_max_chunks chunks * sub-chunks-per-chunk).
+// can produce (WALK_MAX_CHUNKS chunks * sub-chunks-per-chunk).
 //
 // MAX_SUB_CHUNKS_PER_CHUNK names the host-scan path's worst-case
 // fan-out (each chunk produces at most this many entropy descs per
 // stream). Expressing the cap as WALK_MAX_CHUNKS / MAX_SUB_CHUNKS_PER_CHUNK
 // makes the relationship visible; the scan_gpu.zig D2D path uses a
 // different bound (WALK_MAX_CHUNKS * MAX_SUB_CHUNKS_PER_CHUNK) for the
-// device-side compact buffers — see the comment there.
+// device-side compact buffers - see the comment there.
 pub const MAX_SUB_CHUNKS_PER_CHUNK: u32 = 4;
 pub const MAX_HUFF_DESCS_PER_STREAM: u32 = WALK_MAX_CHUNKS / MAX_SUB_CHUNKS_PER_CHUNK;
 pub const MAX_RAW_OFF16_DESCS: u32 = 8192;
 
 // ── Per-sub-chunk entropy scratch geometry ──────────────────────
 // Mirror the C-side constants in decode/slz_wire_format.cuh:
-//   ENTROPY_SCRATCH_SLOT_BYTES = 131072 — one per global sub-chunk
-//   OFF16_HILO_SPLIT_OFFSET    = 65536  — hi bytes start, lo bytes at +offset
+//   ENTROPY_SCRATCH_SLOT_BYTES = 131072 - one per global sub-chunk
+//   OFF16_HILO_SPLIT_OFFSET    = 65536  - hi bytes start, lo bytes at +offset
 // (Sub-chunks decompress up to 128KB; the slot is sized for that.)
 pub const ENTROPY_SCRATCH_SLOT_BYTES: u64 = 131072;
 pub const OFF16_HILO_SPLIT_OFFSET: u32 = 65536;
@@ -78,7 +78,7 @@ pub const PendingTiming = struct {
     end_event: usize,
 };
 
-// Staged decode-scan output — mirror SlzScanHuffDesc / SlzScanRawDesc in
+// Staged decode-scan output - mirror SlzScanHuffDesc / SlzScanRawDesc in
 // scan_parse_kernel.cuh (filled) and compact_descs_kernels.cuh (compacted).
 // slzScanParseKernel fills one entry per stream type per global sub-chunk
 // index; `valid` marks an entropy-coded / raw stream present. gpuScanChunks
@@ -119,17 +119,15 @@ pub const ScanResult = struct {
 };
 
 /// 4d Phase 3 step 1: GPU walk-kernel result, device-only. d_chunk_descs
-/// holds up to `walk_max_chunks` SlzChunkDesc entries; d_meta is six
+/// holds up to `WALK_MAX_CHUNKS` SlzChunkDesc entries; d_meta is six
 /// u32s: (n_chunks, decomp_size, sub_chunk_cap, block_start, block_size,
-/// status). Nothing is D2H'd by the walk — downstream kernels read the
+/// status). Nothing is D2H'd by the walk - downstream kernels read the
 /// device pointers directly.
 pub const WalkFrameResultDev = struct {
     d_chunk_descs: u64,
     d_meta: u64,
 };
 pub const WALK_MAX_CHUNKS: u32 = 16384;
-/// Back-compat alias for the prior name; remove after call sites migrate.
-pub const walk_max_chunks: u32 = WALK_MAX_CHUNKS;
 pub const walk_meta_offsets = struct {
     pub const n_chunks: u32 = 0;
     pub const decomp_size: u32 = 4;
@@ -153,8 +151,8 @@ pub const WalkMeta = struct {
 };
 
 /// 4d Phase 3 step 2: device-side prefix sum of per-chunk sub-chunk
-/// counts. Reads (d_chunk_descs, d_n_chunks, d_sub_chunk_cap) — all
-/// device-resident — and writes (d_first_sub_idx, d_total_subchunks).
+/// counts. Reads (d_chunk_descs, d_n_chunks, d_sub_chunk_cap) - all
+/// device-resident - and writes (d_first_sub_idx, d_total_subchunks).
 /// No D2H, no CPU work.
 pub const PrefixSumResultDev = struct {
     d_first_sub_idx: u64,
@@ -169,7 +167,7 @@ pub const PrefixSumResultDev = struct {
 /// `DecompressError` already unify, and (b) the C ABI in
 /// `src/streamlz_gpu.zig` switches on `error.BadMode` as the
 /// "fall back to CPU" signal. Treat the new members as more-informative
-/// variants that ALSO trigger fallback — the higher-level catch sites
+/// variants that ALSO trigger fallback - the higher-level catch sites
 /// catch the full `GpuError` set, not just `BadMode`.
 pub const GpuError = error{
     BackendNotAvailable, // dlopen/getProc, cuInit, vkCreateInstance failed
@@ -195,7 +193,7 @@ pub const ErrorKind = enum {
 /// Funnel any CUDA Driver API return code into the GpuError surface so
 /// callers can `try cudaCall(cuMemcpyHtoD_fn(...), .copy)` instead of
 /// dropping the result with `_ = ...`. The `kind` tag selects which
-/// `GpuError` member to return — see ErrorKind above for the mapping.
+/// `GpuError` member to return - see ErrorKind above for the mapping.
 pub fn cudaCall(rc: c_int, comptime kind: ErrorKind) GpuError!void {
     if (rc == 0) return; // CUDA_SUCCESS == 0
     return switch (kind) {

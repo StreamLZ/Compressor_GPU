@@ -1,11 +1,11 @@
 //! Device-resident frame assembly (roadmap 4d).
 //!
 //! Two entrypoints:
-//!   * `gpuAssembleFrameImpl` — runs after LZ + the three Huffman passes
+//!   * `gpuAssembleFrameImpl` - runs after LZ + the three Huffman passes
 //!     left their bodies device-resident in d_asm_huff_{lit,tok,off16};
 //!     measures, prefix-sums, then writes [3-byte hdr][payload] for every
 //!     sub-chunk and publishes the host-side packed result.
-//!   * `gpuFrameAssembleImpl` — 4d step 8 pure-D2D writer that splices
+//!   * `gpuFrameAssembleImpl` - 4d step 8 pure-D2D writer that splices
 //!     the assembled sub-chunk blocks plus host-precomputed layout into
 //!     a complete StreamLZ frame straight into the caller's device buffer.
 
@@ -22,10 +22,10 @@ const AssembleDesc = ec.AssembleDesc;
 
 /// Device-resident frame assembly (roadmap 4d). Runs after gpuCompressImpl
 /// (raw streams resident in d_output) and the three GPU Huffman passes
-/// (run with huff_keep_device — bodies resident in d_asm_huff_*, no host
+/// (run with huff_keep_device - bodies resident in d_asm_huff_*, no host
 /// bounce). Assembles every sub-chunk's [3-byte header][payload] on the
 /// GPU and publishes the packed host-side result in `assembled_*` for the
-/// frame assembler to splice. Returns false — caller keeps the CPU path —
+/// frame assembler to splice. Returns false - caller keeps the CPU path -
 /// if any prerequisite is absent.
 pub fn gpuAssembleFrameImpl(
     self: *EncodeContext,
@@ -38,7 +38,7 @@ pub fn gpuAssembleFrameImpl(
     const n: u32 = @intCast(chunk_descs.len);
     if (n == 0) return false;
 
-    // Per-stream metadata (offsets + sizes) — always host-side, small;
+    // Per-stream metadata (offsets + sizes) - always host-side, small;
     // present iff the matching Huffman pass succeeded.
     const hl_off = self.huff_lit_offsets orelse return false;
     const hl_sz = self.huff_lit_sizes orelse return false;
@@ -57,7 +57,7 @@ pub fn gpuAssembleFrameImpl(
 
     // The three GPU Huffman passes already left their bodies device-
     // resident in d_asm_huff_{lit,tok,off16} (huff_keep_device set by the
-    // encoder before they ran) — no host bounce.
+    // encoder before they ran) - no host bounce.
 
     // Build per-sub-chunk descriptors (out_offset filled after pass 1).
     var descs = allocator.alloc(AssembleDesc, n) catch return false;
@@ -96,7 +96,7 @@ pub fn gpuAssembleFrameImpl(
     var p_n = n;
     var extra = [_]?*anyopaque{null};
 
-    // Pass 1 — measure each sub-chunk's assembled payload size.
+    // Pass 1 - measure each sub-chunk's assembled payload size.
     var m_params = [_]?*anyopaque{
         @ptrCast(&p_raw),   @ptrCast(&p_hl),    @ptrCast(&p_ht),
         @ptrCast(&p_ho),    @ptrCast(&p_descs), @ptrCast(&p_sizes),
@@ -116,7 +116,7 @@ pub fn gpuAssembleFrameImpl(
     for (0..n) |i| {
         // `enc_sizes[i] == 0` is unambiguously a measure-kernel parse
         // failure: the measure pass writes at least the framing bytes
-        // for any valid sub-chunk descriptor (raw_size > 0 here — we
+        // for any valid sub-chunk descriptor (raw_size > 0 here - we
         // only reach this path with non-empty chunks fed from
         // gpuCompressImpl). A zero size means the kernel couldn't parse
         // the raw stream layout (corrupted header bytes), so bail out
@@ -127,7 +127,7 @@ pub fn gpuAssembleFrameImpl(
         total += 3 + enc_sizes[i];
     }
 
-    // Pass 2 — write [3-byte header][payload] for every sub-chunk.
+    // Pass 2 - write [3-byte header][payload] for every sub-chunk.
     if (h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes) != ffi.CUDA_SUCCESS) return false;
     if (!ec.ensureBuf(&self.d_asm_out, &self.d_asm_out_size, @max(total, 1))) return false;
     var p_out = self.d_asm_out;
@@ -168,7 +168,7 @@ pub fn gpuAssembleFrameImpl(
     return true;
 }
 
-/// 4d step 8 — Pure-D2D frame writer. Takes the device-resident assembled
+/// 4d step 8 - Pure-D2D frame writer. Takes the device-resident assembled
 /// sub-chunk blocks (already in `self.d_asm_out` from gpuAssembleFrameImpl)
 /// plus host-precomputed per-chunk layout info, launches
 /// slzFrameAssembleKernel, and writes the complete StreamLZ frame to
@@ -176,17 +176,17 @@ pub fn gpuAssembleFrameImpl(
 /// failure.
 ///
 /// Caller must supply:
-///   `prefix_bytes` — pre-formed frame_hdr + block_hdr (~30-40 B).
-///   `per_chunk_asm_off`  — start of each chunk's sub-chunk(s) in d_asm_out.
-///   `per_chunk_asm_size` — total asm bytes for each chunk (sum across its sub-chunks).
-///   `internal_hdr0/1`    — the 2-byte internal block header (same for every chunk).
-///   `eff_chunk_size`     — source chunk stride in bytes (for SC tail src offsets).
-///   `d_input_dev`        — device source (for SC tail prefix bytes).
+///   `prefix_bytes` - pre-formed frame_hdr + block_hdr (~30-40 B).
+///   `per_chunk_asm_off`  - start of each chunk's sub-chunk(s) in d_asm_out.
+///   `per_chunk_asm_size` - total asm bytes for each chunk (sum across its sub-chunks).
+///   `internal_hdr0/1`    - the 2-byte internal block header (same for every chunk).
+///   `eff_chunk_size`     - source chunk stride in bytes (for SC tail src offsets).
+///   `d_input_dev`        - device source (for SC tail prefix bytes).
 ///
 /// Self-contained (`sc_tail_count = n_chunks - 1` when n_chunks > 1, else 0)
 /// is inferred from the chunk count; SC mode is the only one slzCompress
 /// produces.
-/// Bytes the frame assembler prepends before the per-chunk payloads —
+/// Bytes the frame assembler prepends before the per-chunk payloads -
 /// pre-formed by the caller (frame header + block header) plus the
 /// 2-byte internal block header that gets repeated at each chunk boundary.
 pub const FramePreamble = struct {
@@ -285,7 +285,10 @@ pub fn gpuFrameAssembleImpl(
     var extra = [_]?*anyopaque{null};
 
     // Grid: n_chunks blocks for per-chunk writes + 1 block for prefix/tail/end mark.
-    // 128 threads per block — enough for cooperative copies up to ~few KB/iter.
+    // 128 threads per block - enough for cooperative copies up to ~few KB/iter.
+    // Defensive u32-overflow guard: WALK_MAX_CHUNKS caps n_chunks lower
+    // (16384), but a future bump could theoretically reach u32 max here.
+    if (n_chunks == std.math.maxInt(u32)) return null;
     const grid_x: u32 = n_chunks + 1;
     // Heavy phase: ride the caller's stream when slzCompressAsync set
     // work_stream so cudaStreamSynchronize on it waits for the frame

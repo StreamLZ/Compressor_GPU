@@ -56,7 +56,7 @@ const LzCommonParams = struct {
 /// the per-stream-type region offset and lut_offsets assigned sequentially.
 /// Two paths:
 ///   GPU merge (pure-D2D, when the device compact populated the d_compact_*
-///   buffers): launches slzMergeHuffDescsKernel — no host arrays touched.
+///   buffers): launches slzMergeHuffDescsKernel - no host arrays touched.
 ///   CPU merge (CPU-scan fallback): walks the host-side huff_*_host_buf
 ///   arrays and uploads the merged result via one H2D.
 fn mergeHuffDescs(
@@ -70,7 +70,7 @@ fn mergeHuffDescs(
 ) GpuError!void {
     if (scan.device_compact_populated and ml.merge_huff_descs_fn != 0) {
         // Step 6c: the compact kernels already populated the four per-stream
-        // device buffers in step 6b. Launch the merge kernel — it writes
+        // device buffers in step 6b. Launch the merge kernel - it writes
         // straight to self.d_huff_descs and updates the n_merged slot in
         // d_compact_counts. No host arrays, no H2D.
         var k_lit: u64 = self.d_compact_lit;
@@ -130,7 +130,7 @@ fn mergeHuffDescs(
 /// Place raw (type 0) off16 sub-streams into the off16 scratch. The bytes
 /// are already on the GPU (d_comp_persist holds the whole compressed blob).
 /// Preferred: upload the descriptor list in one H2D and run
-/// slzGatherRawOff16Kernel — one launch copies every stream in parallel.
+/// slzGatherRawOff16Kernel - one launch copies every stream in parallel.
 /// Fallbacks: async device-to-device loop, then a plain host-upload loop.
 fn gatherRawOff16(
     self: *DecodeContext,
@@ -182,7 +182,7 @@ fn gatherRawOff16(
             //
             // The D2D/H2D fallback below is KEPT and the launch treated
             // as a best-effort fast path. Justification: the two failure
-            // modes are disjoint — the kernel-launch path needs
+            // modes are disjoint - the kernel-launch path needs
             // `cuLaunchKernel + scratch_base + descs`; the fallback path
             // needs only `cuMemcpyDtoDAsync` (or `cuMemcpyHtoD`) + the
             // same buffers. A driver glitch that breaks launch (e.g. the
@@ -235,8 +235,15 @@ const E2eCumulative = struct {
     predh: i64 = 0,
 };
 
+/// Nanoseconds elapsed between `t0` (a `std.Io.Clock.awake.now(...)`
+/// reading) and now, as i64. `anytype` because the Clock reading type
+/// isn't directly nameable at the call site.
+inline fn nsSince(t0: anytype, iv: std.Io) i64 {
+    return @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+}
+
 /// SLZ_E2E_TIMER: phase breakdown print at the end of the decode call.
-/// `t0` is the start clock reading captured at function entry — `anytype`
+/// `t0` is the start clock reading captured at function entry - `anytype`
 /// because the std.Io.Clock reading type is not directly nameable here.
 fn emitE2eTrace(
     t0: anytype,
@@ -244,7 +251,7 @@ fn emitE2eTrace(
     cum: E2eCumulative,
     last_kernel: i64,
 ) void {
-    const cum_end_ns: i64 = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+    const cum_end_ns: i64 = nsSince(t0, iv);
     const ms = struct {
         fn f(ns: i64) f64 {
             return @as(f64, @floatFromInt(ns)) / 1e6;
@@ -430,7 +437,7 @@ fn runHuffPredecode(
         if (cuda.cuStreamSync_fn) |sf| try cudaCall(sf(huff_stream), .sync);
         if (t_huff_start) |hs| {
             if (io) |io_val|
-                split_huff_build_ns = @intCast(hs.untilNow(io_val, .awake).toNanoseconds());
+                split_huff_build_ns = nsSince(hs, io_val);
         }
     }
     {
@@ -479,7 +486,7 @@ fn runLzPipeline(
     var split_lz_ns: i64 = 0;
 
     for (0..NUM_PIPELINE_STREAMS) |g| {
-        const stream: usize = if (NUM_PIPELINE_STREAMS == 1) heavy_stream else self.pipeline_streams[g];
+        const stream: usize = if (comptime NUM_PIPELINE_STREAMS == 1) heavy_stream else self.pipeline_streams[g];
         const chunk_start = @as(u32, @intCast(g)) * pipe_chunk_count;
         const chunk_end = @min(chunk_start + pipe_chunk_count, total_chunks);
         const group_chunks = chunk_end - chunk_start;
@@ -560,7 +567,7 @@ fn runLzPipeline(
             try cudaCall(stream_sync_fn(stream), .sync);
             if (t_lz_start) |ts_start| {
                 if (io) |io_val| {
-                    split_lz_ns += @intCast(ts_start.untilNow(io_val, .awake).toNanoseconds());
+                    split_lz_ns += nsSince(ts_start, io_val);
                 }
             }
         }
@@ -596,8 +603,8 @@ fn finalizeOutput(self: *DecodeContext, req: DecodeRequest, heavy_stream: usize)
 }
 
 pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void {
-    // Shadow request fields as locals so the function body below — which
-    // predates the struct-arg refactor and references the bare names —
+    // Shadow request fields as locals so the function body below - which
+    // predates the struct-arg refactor and references the bare names -
     // doesn't need a full rename. Zig folds these into the same registers
     // it would have used for the old direct params.
     const chunk_descs = req.chunk_descs;
@@ -616,12 +623,12 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
 
     const facade = @import("driver.zig");
 
-    // SLZ_E2E_TIMER: end-to-end decode phase breakdown — setup+H2D /
+    // SLZ_E2E_TIMER: end-to-end decode phase breakdown - setup+H2D /
     // host scan+prep / kernels / D2H. Off by default.
     const e2e_timer = std.c.getenv("SLZ_E2E_TIMER") != null;
     // SLZ_HUFF_DBG: cache once per call (otherwise getenv would run on
     // every decode in this loop's caller). NOTE: scope is per-CALL, not
-    // per-process — the env var is still re-read on every fullGpuLaunchImpl
+    // per-process - the env var is still re-read on every fullGpuLaunchImpl
     // invocation. For a true once-per-process cache, lift to a module-
     // level std.once.Once. The per-call cache is enough for the dev-only
     // SLZ_HUFF_DBG path; flipping it across calls in one process is rare.
@@ -658,7 +665,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // had on OTHER streams (including a caller's `work_stream` queue if
     // slzDecompressAsync is the entry point). Acceptable trade-off
     // because:
-    //   1. This sync is on the *front end* of the pipeline — the
+    //   1. This sync is on the *front end* of the pipeline - the
     //      work_stream-bound LZ kernels haven't launched yet, so the
     //      caller's async stream isn't yet "queued behind" anything.
     //   2. Async callers pay this stall once per decompress and recoup
@@ -670,17 +677,17 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     try cudaCall(sync_fn(), .sync);
 
     // 4d Phase 3 step 6: prefix-sum runs on device. The 4-byte D2H of
-    // total_subchunks below is launch-plumbing — needed to size the
+    // total_subchunks below is launch-plumbing - needed to size the
     // entropy scratch + compute region offsets host-side; no per-chunk
     // CPU work remains.
     // gpuPrefixSumChunksImpl returns GpuError!T (not ?T) because there's
-    // no host fallback for the prefix sum — every GPU decode path needs
+    // no host fallback for the prefix sum - every GPU decode path needs
     // it. Specific GpuError variants propagate (OutOfDeviceMemory /
     // KernelLaunchFailed / SyncFailed / BackendNotAvailable / KernelMissing).
     _ = try scan_gpu_mod.gpuPrefixSumChunksImpl(self, self.d_descs_persist, @intCast(chunk_descs.len), sub_chunk_cap);
     var total_subchunks: u32 = 0;
     try cudaCall(d2h_fn(@ptrCast(&total_subchunks), self.d_total_subchunks_buf, 4), .copy);
-    // CPU mirror for the pipeline branch — NUM_PIPELINE_STREAMS==1
+    // CPU mirror for the pipeline branch - NUM_PIPELINE_STREAMS==1
     // reads only index 0 (= 0). Storage lives on the DecodeContext;
     // zero-init at first use is enough (subsequent calls overwrite as
     // needed). Bumping the stream count would need a selective D2H of
@@ -721,8 +728,8 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // end H2D phase; caller's async work hasn't been scheduled yet.
     try cudaCall(sync_fn(), .sync);
     if (t_e2e0) |t0| if (io) |iv| {
-        e2e_cum.h2d = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
-        e2e_cum.prescan = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+        e2e_cum.h2d = nsSince(t0, iv);
+        e2e_cum.prescan = nsSince(t0, iv);
     };
 
     // ── Scan for entropy chunks (Huffman + raw off16) ─────────
@@ -770,14 +777,14 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         dumpScanIfRequested(self, chunk_descs, compressed_block, sub_chunk_cap, scan);
 
         if (t_e2e0) |t0| if (io) |iv| {
-            e2e_cum.postscan = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+            e2e_cum.postscan = nsSince(t0, iv);
         };
 
         try gatherRawOff16(self, scan, compressed_block, h2d_fn, sync_fn, launch_fn);
     }
 
     if (t_e2e0) |t0| if (io) |iv| {
-        e2e_cum.scan = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+        e2e_cum.scan = nsSince(t0, iv);
     };
 
     // ── Huffman pre-decode (Pass 1.5): merge per-stream-type descriptors
@@ -816,7 +823,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         const pipe_chunk_count = (total_chunks + NUM_PIPELINE_STREAMS - 1) / NUM_PIPELINE_STREAMS;
         // Ctx-wide sync: drain the H2D + scan + compact + merge work on
         // stream 0 before the LZ kernels launch on heavy_stream. Caller's
-        // work_stream may have other pending work — we accept stalling it
+        // work_stream may have other pending work - we accept stalling it
         // here because the pipeline transition needs everything settled
         // (chunk descs, huff scratch, pipeline_streams readiness).
         try cudaCall(sync_fn(), .sync);
@@ -850,7 +857,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             try cudaCall(stream_sync_fn(self.pipeline_streams[0]), .sync);
             if (t_huff_start) |hs| {
                 if (io) |io_val| {
-                    split_huff_ns = @intCast(hs.untilNow(io_val, .awake).toNanoseconds());
+                    split_huff_ns = nsSince(hs, io_val);
                 }
             }
             std.debug.print("  [huff split] build {d:.3} ms  decode {d:.3} ms\n", .{
@@ -872,7 +879,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             io,
         );
 
-        // Sync all pipeline streams — UNLESS the caller is async
+        // Sync all pipeline streams - UNLESS the caller is async
         // (work_stream set). In async mode we leave the queued work on
         // the user's stream and let them sync; blocking here would
         // defeat the purpose.
@@ -896,7 +903,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
 
         if (t_before_kern) |t_start| {
             if (io) |io_val| {
-                facade.last_kernel_ns = @intCast(t_start.untilNow(io_val, .awake).toNanoseconds());
+                facade.last_kernel_ns = nsSince(t_start, io_val);
                 if (split_timer) {
                     facade.last_lz_kernel_ns = split_lz_ns;
                     facade.last_huff_kernel_ns = split_huff_ns;
@@ -909,7 +916,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     }
 
     if (t_e2e0) |t0| if (io) |iv| {
-        e2e_cum.predh = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+        e2e_cum.predh = nsSince(t0, iv);
     };
     try finalizeOutput(self, req, heavy_stream);
 

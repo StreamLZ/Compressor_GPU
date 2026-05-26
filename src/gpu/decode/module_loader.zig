@@ -18,6 +18,12 @@ const CUdevice = cuda.CUdevice;
 const CUDA_SUCCESS = cuda.CUDA_SUCCESS;
 
 // ── Kernel module + function handles ─────────────────────────────
+/// PTX filenames embedded by `nullTerminatedPtx` below. Named here so
+/// a future versioned-PTX scheme (e.g. `lz_kernel.sm89.ptx`) only has
+/// to update these two strings, not the two call sites.
+const LZ_PTX_NAME: []const u8 = "lz_kernel.ptx";
+const HUFF_PTX_NAME: []const u8 = "huffman_kernel.ptx";
+
 /// Embed a `.ptx` file as a null-terminated byte slice. The CUDA Driver
 /// API's `cuModuleLoadData` takes a C-string pointer; embedding the file
 /// raw gives a sized byte array that is NOT null-terminated, hence the
@@ -56,7 +62,7 @@ pub fn init() bool {
     if (std.c.getenv("SLZ_NO_CUDA") != null) return false;
 
     // SLZ_E2E_TIMER: break down cold CUDA bring-up (the dominant fixed
-    // cost of a one-shot decode — context creation + PTX JIT).
+    // cost of a one-shot decode - context creation + PTX JIT).
     const init_dbg = std.c.getenv("SLZ_E2E_TIMER") != null;
     const t_init0 = cuda.qpcNow();
 
@@ -96,7 +102,7 @@ pub fn init() bool {
     var dev: CUdevice = 0;
     if ((cuda.cuDeviceGet_fn orelse return false)(&dev, 0) != CUDA_SUCCESS) return false;
 
-    // Prefer the caller's already-current CUDA context — a library should
+    // Prefer the caller's already-current CUDA context - a library should
     // interoperate with the caller's CUDA / nvCOMP work rather than create
     // a rival context. Only create our own when no context is current
     // (CLI / standalone use).
@@ -117,13 +123,13 @@ pub fn init() bool {
     const get_fn = cuda.cuModuleGetFunction_fn orelse return false;
 
     // Load LZ decode kernel (Pass 2)
-    const ptx = nullTerminatedPtx("lz_kernel.ptx");
+    const ptx = nullTerminatedPtx(LZ_PTX_NAME);
     if (load_fn(&module, ptx.ptr) != CUDA_SUCCESS) return false;
     if (get_fn(&kernel_fn, module, "slzLzDecodeKernel") != CUDA_SUCCESS) return false;
-    // Optional raw-off16 gather kernel — driver falls back to D2D copies
+    // Optional raw-off16 gather kernel - driver falls back to D2D copies
     // if absent.
     _ = get_fn(&gather_off16_fn, module, "slzGatherRawOff16Kernel");
-    // Optional lean L1/L2-raw kernel — driver routes to it when no entropy
+    // Optional lean L1/L2-raw kernel - driver routes to it when no entropy
     // is present. Failing to load is fine; falls back to general kernel.
     _ = get_fn(&kernel_raw_fn, module, "slzLzDecodeRawKernel");
     // Optional GPU decode-scan kernel (roadmap 4d Phase 2). Absent → the
@@ -146,7 +152,7 @@ pub fn init() bool {
     // (Zig dispatch ABI introduced by the prior 4-stream design); the
     // kernel now decodes HUFF_NUM_STREAMS = 32 streams in parallel
     // (one per warp lane). See src/gpu/common/gpu_huffman.cuh.
-    const huff_ptx = nullTerminatedPtx("huffman_kernel.ptx");
+    const huff_ptx = nullTerminatedPtx(HUFF_PTX_NAME);
     if (load_fn(&huff_module, huff_ptx.ptr) == CUDA_SUCCESS) {
         _ = get_fn(&huff_build_fn, huff_module, "slzHuffBuildLutKernel");
         _ = get_fn(&huff_decode_fn, huff_module, "slzHuffDecode4StreamKernel");
@@ -163,7 +169,7 @@ pub fn init() bool {
     // on the module-default context. Per-handle DecodeContexts get the
     // same treatment lazily in `ensurePipelineStreams` below. Failure
     // here transitions the loader to `.failed` (the errdefer above doesn't
-    // fire because the call returns void — propagate manually).
+    // fire because the call returns void - propagate manually).
     ensurePipelineStreams(&@import("driver.zig").g_default) catch {
         cuda.init_state = .failed;
         return false;

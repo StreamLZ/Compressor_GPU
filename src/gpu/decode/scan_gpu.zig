@@ -10,7 +10,7 @@
 //! Convention note: most entry points in this file use the `?T` return
 //! + raw `if (rc != CUDA_SUCCESS) return null;` pattern intentionally,
 //! NOT `GpuError!T` + `try cudaCall(...)` like `decode_dispatch.zig`.
-//! Reason: those scan_gpu functions are best-effort fast paths — null
+//! Reason: those scan_gpu functions are best-effort fast paths - null
 //! means "fall back to host scan" (or skip this optimization), not
 //! "the decode has failed". The caller in `fullGpuLaunchImpl` always
 //! has the `scan_host.zig` fallback available. Promoting CUDA failures
@@ -19,7 +19,7 @@
 //! recoverable.
 //!
 //! Exception: `gpuPrefixSumChunksImpl` returns `GpuError!T` because the
-//! prefix-sum has NO host fallback — every GPU decode path requires it.
+//! prefix-sum has NO host fallback - every GPU decode path requires it.
 //! Null-on-failure would have silently masked alloc/launch/sync failures
 //! as the generic `error.BadMode` at the call site. K5.1's error fan-out
 //! should reach this function too.
@@ -39,7 +39,7 @@ const ensureDeviceBuf = dec_ctx.ensureDeviceBuf;
 const GpuError = desc_err.GpuError;
 const cudaCall = desc_err.cudaCall;
 
-/// 4d Phase 3 GPU frame walk — device-only output. Launches the walk
+/// 4d Phase 3 GPU frame walk - device-only output. Launches the walk
 /// kernel and returns the device pointers it wrote to. NO D2H. Caller
 /// either passes the device pointers to downstream kernels (true D2D
 /// path) or invokes `walkResultToHost` to copy what it needs out.
@@ -59,7 +59,7 @@ pub fn gpuWalkFrameImpl(
     const sync = cuda.cuCtxSynchronize_fn orelse return error.BackendNotAvailable;
     const memset = cuda.cuMemsetD8_fn orelse return error.BackendNotAvailable;
 
-    const chunks_bytes: usize = @as(usize, d.walk_max_chunks) * @sizeOf(d.ChunkDesc);
+    const chunks_bytes: usize = @as(usize, d.WALK_MAX_CHUNKS) * @sizeOf(d.ChunkDesc);
     if (!ensureDeviceBuf(&self.d_walk_chunks, &self.d_walk_chunks_size, chunks_bytes)) return error.OutOfDeviceMemory;
     if (!ensureDeviceBuf(&self.d_walk_meta, &self.d_walk_meta_size, d.walk_meta_offsets.bytes)) return error.OutOfDeviceMemory;
     try cudaCall(memset(self.d_walk_meta, 0, d.walk_meta_offsets.bytes), .copy);
@@ -67,7 +67,7 @@ pub fn gpuWalkFrameImpl(
     var k_frame = d_frame;
     var k_size = frame_size;
     var k_chunks = self.d_walk_chunks;
-    var k_max = d.walk_max_chunks;
+    var k_max = d.WALK_MAX_CHUNKS;
     var k_meta_n: u64 = self.d_walk_meta + d.walk_meta_offsets.n_chunks;
     var k_meta_decomp: u64 = self.d_walk_meta + d.walk_meta_offsets.decomp_size;
     var k_meta_sccap: u64 = self.d_walk_meta + d.walk_meta_offsets.sub_chunk_cap;
@@ -94,7 +94,7 @@ pub fn gpuWalkFrameImpl(
 }
 
 /// Per-chunk prefix sum of sub-chunk counts. Required by every GPU
-/// decode path — there is no host fallback (unlike the rest of this
+/// decode path - there is no host fallback (unlike the rest of this
 /// file's `?T`-returning functions, which DO have host fallbacks).
 /// Returns specific GpuError variants so the caller can surface
 /// out-of-memory / launch-failure / sync-failure distinctly instead
@@ -110,7 +110,7 @@ pub fn gpuPrefixSumChunksImpl(
     const launch = cuda.cuLaunchKernel_fn orelse return error.BackendNotAvailable;
     const sync = cuda.cuCtxSynchronize_fn orelse return error.BackendNotAvailable;
 
-    const first_bytes: usize = @as(usize, d.walk_max_chunks) * 4;
+    const first_bytes: usize = @as(usize, d.WALK_MAX_CHUNKS) * 4;
     if (!ensureDeviceBuf(&self.d_first_sub_idx_persist, &self.d_first_sub_idx_persist_size, first_bytes)) return error.OutOfDeviceMemory;
     if (!ensureDeviceBuf(&self.d_total_subchunks_buf, &self.d_total_subchunks_buf_size, 4)) return error.OutOfDeviceMemory;
 
@@ -174,7 +174,7 @@ pub fn gpuScanChunks(
     // mirror is needed here.
 
     // Staged buffer: [lit][tok][hi][lo] ScanHuffDesc, then [raw_hi][raw_lo]
-    // ScanRawDesc — one entry per global sub-chunk index per stream type.
+    // ScanRawDesc - one entry per global sub-chunk index per stream type.
     const huff_arr_bytes: usize = @as(usize, total_subchunks) * @sizeOf(d.ScanHuffDesc);
     const raw_arr_bytes: usize = @as(usize, total_subchunks) * @sizeOf(d.ScanRawDesc);
     const staged_bytes: usize = huff_arr_bytes * 4 + raw_arr_bytes * 2;
@@ -233,9 +233,9 @@ pub fn gpuScanChunks(
     var num_raw: u32 = 0;
 
     if (gpu_compact_ok) {
-        // Size compact buffers. n_huff bound: walk_max_chunks * 4
+        // Size compact buffers. n_huff bound: WALK_MAX_CHUNKS * 4
         // (sub-chunks per chunk at sc>=1). n_raw bound: 2 × that.
-        const huff_compact_max = @as(usize, d.walk_max_chunks) * 4;
+        const huff_compact_max = @as(usize, d.WALK_MAX_CHUNKS) * 4;
         const huff_compact_bytes = huff_compact_max * @sizeOf(d.HuffDecChunkDesc);
         const raw_compact_max = huff_compact_max * 2;
         const raw_compact_bytes = raw_compact_max * @sizeOf(d.RawOff16Desc);

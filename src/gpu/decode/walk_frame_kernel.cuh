@@ -1,7 +1,7 @@
 // ── StreamLZ frame-walk kernel ─────────────────────────────────
 // Single-threaded GPU port of decompressOneFrame + gpuBatchDecode's
 // per-chunk walk: reads the entire compressed frame from device memory
-// and produces a device-resident SlzChunkDesc[] array — the CPU never
+// and produces a device-resident SlzChunkDesc[] array - the CPU never
 // touches the compressed bytes. Included into the single lz_kernel.cu
 // translation unit.
 #pragma once
@@ -11,11 +11,11 @@
 // ── Frame-walk kernel (roadmap 4d Phase 3) ──────────────────────────
 // Single-threaded GPU port of decompressOneFrame + gpuBatchDecode's
 // per-chunk walk. Reads the entire compressed frame from device memory
-// (d_frame) and produces a device-resident SlzChunkDesc[] array — the
+// (d_frame) and produces a device-resident SlzChunkDesc[] array - the
 // CPU never touches the compressed bytes. Used by the D2D slzDecompress
 // entry; legacy host-bounce paths keep their CPU walk.
 //
-// Scope: handles the slzCompress output shape — Fast codec, no
+// Scope: handles the slzCompress output shape - Fast codec, no
 // dictionary, no parallel-decode-metadata, no checksums. Sets d_status
 // non-zero on any unsupported feature so the wrapper can fall back.
 //
@@ -45,7 +45,7 @@ __device__ __forceinline__ float walkReadF32LE(const uint8_t* p) {
 // d_block_start / d_block_size: byte range of the block payload within
 // d_frame. Wrapper D2D-copies this range into d_comp_persist; chunk_descs
 // src_offset is block-payload-relative (matches the CPU walk in
-// gpuBatchDecode). Single-block frames only (status 13 otherwise) —
+// gpuBatchDecode). Single-block frames only (status 13 otherwise) -
 // slzCompress output.
 extern "C" __global__ void slzWalkFrameKernel(
     const uint8_t* __restrict__ d_frame,
@@ -75,8 +75,8 @@ extern "C" __global__ void slzWalkFrameKernel(
     const uint8_t flags = d_frame[5];
     const uint8_t codec = d_frame[6];
     if (codec != SLZ_CODEC_FAST_LZ) { *d_status = 3; return; }
-    // d_frame[7] = level — unused here.
-    // d_frame[8] = block_size_log2 (encoded) — unused (we walk by block hdr).
+    // d_frame[7] = level - unused here.
+    // d_frame[8] = block_size_log2 (encoded) - unused (we walk by block hdr).
     const float sc_group_size = walkReadF32LE(d_frame + 9);
 
     uint32_t pos = SLZ_FRAME_MIN_HDR_SIZE;

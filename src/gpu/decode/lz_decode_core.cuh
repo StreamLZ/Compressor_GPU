@@ -1,4 +1,4 @@
-// ── StreamLZ LZ decode — shared warp primitives ────────────────
+// ── StreamLZ LZ decode - shared warp primitives ────────────────
 // Hillis-Steele warp prefix scan + warp-cooperative copy helpers used
 // by both LZ decoders (lz_decode_raw.cuh + lz_decode_general.cuh).
 // Each decoder #includes this header for the helpers it needs.
@@ -31,7 +31,7 @@ __device__ __forceinline__ void warpScanU32(uint32_t v, uint32_t& exclusive, uin
 // sequentially on lane 0 because lane k would read dst[match_src+k]
 // before lane k-1 wrote it.
 //
-// Both are __forceinline__ — the prior inline bodies they replace were
+// Both are __forceinline__ - the prior inline bodies they replace were
 // in the decode hot loop, and nvcc lays them out identically.
 __device__ __forceinline__ void warpLiteralCopy(
     uint8_t* __restrict__ dst, uint32_t dst_pos,

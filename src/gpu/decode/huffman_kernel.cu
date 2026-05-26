@@ -1,12 +1,12 @@
 // ── StreamLZ GPU Huffman Decode Kernel ──────────────────────────
 // Canonical Huffman, code height limited to 11 (`MAX_CODE_LEN + 1`);
 // fast-LUT index width `MAX_CODE_LEN = 10`. Double-symbol (X2) LUT
-// (4 KB shared), 32-stream parallel decode (all warp lanes active —
+// (4 KB shared), 32-stream parallel decode (all warp lanes active -
 // 8× the throughput of a 4-stream design at ~0.1pp ratio cost on
 // realistic sub-chunk sizes).
 //
 // Wire layout for a chunk_type=4 literal stream:
-//   [preceding chunk header, consumed by the frame decoder — 3 or 5 bytes]
+//   [preceding chunk header, consumed by the frame decoder - 3 or 5 bytes]
 //   [128 B weights, 4 bits per symbol, packed low-nibble-first]
 //   [sub-header: (HUFF_NUM_STREAMS - 1) × u24 LE stream sizes;
 //                last stream's size = total payload - sum of stored sizes]
@@ -14,10 +14,10 @@
 // Bits within each byte are MSB-first.
 //
 // Two kernels:
-//   slzHuffBuildLutKernel  — 1 warp per block, builds a 1024-entry
+//   slzHuffBuildLutKernel  - 1 warp per block, builds a 1024-entry
 //                            (`LUT_SIZE`) X2 LUT in global luts[] from
 //                            128 B weights.
-//   slzHuffDecode4StreamKernel — 1 warp per block, all 32 lanes decode
+//   slzHuffDecode4StreamKernel - 1 warp per block, all 32 lanes decode
 //                                in parallel (the legacy "4Stream" name
 //                                is retained for Zig dispatch ABI).
 //
@@ -29,14 +29,14 @@
 #include "../common/gpu_byteio.cuh"   // readLE24
 #include "../common/gpu_huffman.cuh"  // HUFF_* constants, LUT pack/unpack, buildCanonicalCodes
 
-// MAX_CODE_LEN is the fast-LUT *index width* (10) — an alias of the
+// MAX_CODE_LEN is the fast-LUT *index width* (10) - an alias of the
 // shared HUFF_LUT_INDEX_BITS. Codes are height-limited to
 // MAX_CODE_LEN+1 = HUFF_MAX_CODE_LEN = 11; length-11 codes resolve via
-// escape LUT entries (num_syms == LUT_NUM_SYMS_ESCAPE) — a 1024-entry
+// escape LUT entries (num_syms == LUT_NUM_SYMS_ESCAPE) - a 1024-entry
 // LUT (4 KB shared) instead of 2048 (8 KB), roughly doubling
 // decode-kernel occupancy.
 //
-// `LUT_SIZE` is `(int)HUFF_LUT_ENTRIES` — the shared header defines the
+// `LUT_SIZE` is `(int)HUFF_LUT_ENTRIES` - the shared header defines the
 // value, this file just narrows the type for the local int contexts
 // (loop bounds, shared-memory size constants).
 static constexpr int MAX_CODE_LEN = HUFF_LUT_INDEX_BITS;     // 10
@@ -50,7 +50,7 @@ static constexpr int LUT_SIZE     = (int)HUFF_LUT_ENTRIES;   // 1024
 static constexpr int      BITBUF_BITS  = 64;                   // bit_buf width in bits
 static constexpr int      REFILL_BITS  = 32;                   // bits per 4-byte refill chunk
 
-// ── Descriptor — matches Zig HuffDecChunkDesc in decode/driver.zig ──
+// ── Descriptor - matches Zig HuffDecChunkDesc in decode/driver.zig ──
 // Unified: in_offset/in_size cover the FULL payload (HUFF_WEIGHTS_BYTES
 // weights + HUFF_SUBHEADER_BYTES sub-header + HUFF_NUM_STREAMS stream
 // payloads, i.e. HUFF_BODY_HEADER_BYTES fixed + sum(stream_sizes)).
@@ -72,7 +72,7 @@ static_assert(sizeof(HuffDecChunkDesc) == 20, "ABI: keep in sync with decode/dri
 // ── LUT build kernel ────────────────────────────────────────────────
 // Grid: (n_blocks, 1, 1). Block: (WARP_SIZE, 1, 1).
 // One warp per block. Weights[] is HUFF_WEIGHTS_BYTES bytes; each byte
-// has two nibbles — low nibble = symbol 2*i, high nibble = symbol 2*i+1.
+// has two nibbles - low nibble = symbol 2*i, high nibble = symbol 2*i+1.
 // Pass 1: single-symbol fan-out (32-lane parallel over symbols).
 // Pass 2: dual-symbol overwrite (32-lane parallel over s1; inner loop
 // bounded by L1+L2<=10). Prefix-free codes give disjoint spans, so both
@@ -100,7 +100,7 @@ extern "C" __global__ void slzHuffBuildLutKernel(
     }
     __syncwarp();
 
-    // Compute canonical codes (RFC 1951 style — assigned in length-ascending
+    // Compute canonical codes (RFC 1951 style - assigned in length-ascending
     // order, sym-ascending within each length). buildCanonicalCodes
     // (common/gpu_huffman.cuh) does the histogram + next_code + code
     // assignment serially in lane 0; all lanes then read the same codes[]
@@ -110,13 +110,13 @@ extern "C" __global__ void slzHuffBuildLutKernel(
     __syncwarp();
 
     // ── Build LUT in global memory ──
-    // Zero the LUT — cooperative across warp.
+    // Zero the LUT - cooperative across warp.
     for (int i = lane; i < LUT_SIZE; i += WARP_SIZE) lut[i] = 0;
     __syncwarp();
 
-    // Pass 1: single-symbol entries — parallel over symbols (32 lanes).
+    // Pass 1: single-symbol entries - parallel over symbols (32 lanes).
     // Canonical codes are prefix-free, so distinct symbols fill mutually
-    // disjoint LUT spans — the fan-out is race-free with no atomics.
+    // disjoint LUT spans - the fan-out is race-free with no atomics.
     for (int s = lane; s < HUFF_ALPHABET; s += WARP_SIZE) {
         int L = code_lengths[s];
         if (L == 0 || L > MAX_CODE_LEN) continue;  // length-11 -> escape pass
@@ -127,7 +127,7 @@ extern "C" __global__ void slzHuffBuildLutKernel(
     }
     __syncwarp();
 
-    // Pass 2: dual-symbol entries — parallel over s1 (32 lanes). Distinct
+    // Pass 2: dual-symbol entries - parallel over s1 (32 lanes). Distinct
     // s1 prefixes fill disjoint spans, so the fan-out stays race-free.
     for (int s1 = lane; s1 < HUFF_ALPHABET; s1 += WARP_SIZE) {
         int L1 = code_lengths[s1];
@@ -180,7 +180,7 @@ extern "C" __global__ void slzHuffBuildLutKernel(
 //                       u32 stores (alignment invariant from phase 1).
 //
 // Phase 2's refill threshold is 2*(MAX_CODE_LEN+1) = 22 bits. After
-// refill, bit_count is in [32, 53] — strictly ≥ 22 — so two decodes
+// refill, bit_count is in [32, 53] - strictly ≥ 22 - so two decodes
 // always succeed without a mid-batch refill check, even when both are
 // length-11 escape codes. 3-lookup would need ≤ 33 bits which exceeds
 // the 32 bits one refill can add, forcing fallback paths.
@@ -197,7 +197,7 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
     uint64_t acc = 0;         // pending decoded bytes (byte 0 = oldest)
     uint32_t pending = 0;
 
-    // ── Phase 1: preamble — byte-drain until `out + written` is 4-aligned ──
+    // ── Phase 1: preamble - byte-drain until `out + written` is 4-aligned ──
     //
     // Phase 2's hot loop does an UNCONDITIONAL u32 store that faults on
     // a misaligned address. Each lane's output starts at
@@ -205,12 +205,12 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
     // 4-aligned (out_size is the decompressed chunk size and can be any
     // byte count), so the destination's starting alignment is arbitrary.
     // We byte-drain until aligned ONCE here, then phase 2 stays aligned
-    // for the rest of the decode — every u32 store advances `written` by
+    // for the rest of the decode - every u32 store advances `written` by
     // exactly 4, preserving alignment.
     //
     // A prior attempt to use this same preamble idea on the earlier
     // 1-lookup hot loop regressed 7-10% because a 1-lookup body didn't
-    // amortize the preamble cost. The 2-lookup hot loop below does —
+    // amortize the preamble cost. The 2-lookup hot loop below does -
     // the at-most-3 byte stores here are paid back across thousands of
     // output bytes per lane.
     //
@@ -244,7 +244,7 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
         }
         bit_buf <<= total_len;
         bit_count -= total_len;
-        // Drain pending byte-by-byte UNTIL we're aligned — then exit the
+        // Drain pending byte-by-byte UNTIL we're aligned - then exit the
         // outer preamble loop and let phase 2 take over with u32 stores.
         // A dual-symbol entry can emit 2 bytes; both might be needed to
         // reach alignment if `out + written` was at offset 2 mod 4.
@@ -255,7 +255,7 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
         }
     }
 
-    // ── Phase 2: hot loop — 2 lookups/refill, unconditional u32 store ──
+    // ── Phase 2: hot loop - 2 lookups/refill, unconditional u32 store ──
     //
     // Naming note: `MAX_CODE_LEN` in this file is the *LUT index width*
     // (10), an alias of `HUFF_LUT_INDEX_BITS`. The actual max code length
@@ -268,7 +268,7 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
     //    2 × (MAX_CODE_LEN + 1) = 2 × HUFF_MAX_CODE_LEN = 22 bits; the
     //    refill threshold of 22 leaves post-refill bit_count in [32, 53],
     //    strictly ≥ 22, so the second decode never needs a mid-batch
-    //    refill check. 3-lookup is NOT safe — it could consume up to
+    //    refill check. 3-lookup is NOT safe - it could consume up to
     //    3 × HUFF_MAX_CODE_LEN = 33 bits, which exceeds the 32 a single
     //    refill can add, so it would force fallback paths.
     //
@@ -286,7 +286,7 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
     // the inner-loop bound `k < 2`, and the refill threshold
     // `2 × (MAX_CODE_LEN + 1)`. If LUT_MAX_SYMS_PER_STEP is ever bumped,
     // all three need re-derivation, and the refill-threshold bound itself
-    // would have to fit within `REFILL_BITS = 32` — a 3-lookup batch
+    // would have to fit within `REFILL_BITS = 32` - a 3-lookup batch
     // would need ≤ 32 bits of refill but can consume up to 33, so it
     // isn't safe. The static_assert locks the assumption.
     static_assert(LUT_MAX_SYMS_PER_STEP == 2,
@@ -322,7 +322,7 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
             }
             bit_buf <<= total_len;
             bit_count -= total_len;
-            // Unconditional u32 store — alignment invariant holds from
+            // Unconditional u32 store - alignment invariant holds from
             // phase 1. Each store cuts L2 store traffic ~4× vs a byte
             // store and the dropped branch is the bulk of the speedup
             // over the previous design.
@@ -362,7 +362,7 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
         // bit_count up so the LUT read below doesn't shift past the end.
         // SAFETY: the lookup may resolve a "fictitious" symbol from the
         // zero-padded low bits, but the surrounding `out_pos < out_size`
-        // gate clips writes to valid output slots — any spurious decode
+        // gate clips writes to valid output slots - any spurious decode
         // either lands within the legitimate output region (where it
         // overwrites a byte that would have been written by a properly-
         // terminated stream) or never fires. Decoder still returns 0
@@ -390,8 +390,8 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
 }
 
 // ── 32-stream decode kernel ─────────────────────────────────────────
-// Grid: (n_blocks, 1, 1). Block: (WARP_SIZE, 1, 1) — one warp per block.
-// All 32 lanes decode in parallel (one stream each) — 8× the active-lane
+// Grid: (n_blocks, 1, 1). Block: (WARP_SIZE, 1, 1) - one warp per block.
+// All 32 lanes decode in parallel (one stream each) - 8× the active-lane
 // throughput vs the prior 4-stream design.
 // Layout (after the 128 B weights, which this kernel skips via in_offset+128):
 //   [HUFF_SUBHEADER_BYTES sub-header: (N-1) × u24 LE stream sizes;
@@ -402,7 +402,7 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
 // decode kernel skips them internally to reach the sub-header.
 //
 // Name retained (slzHuffDecode4StreamKernel) for ABI compatibility with
-// the existing Zig dispatch — it now decodes HUFF_NUM_STREAMS streams,
+// the existing Zig dispatch - it now decodes HUFF_NUM_STREAMS streams,
 // not literally 4.
 extern "C" __global__ void slzHuffDecode4StreamKernel(
     const uint8_t* __restrict__ comp,
@@ -426,7 +426,7 @@ extern "C" __global__ void slzHuffDecode4StreamKernel(
     // 32-stream dispatch: every lane decodes one stream. The sub-header
     // carries 31 × u24 LE sizes; lane k reads its own size (or derives
     // size[31] from the payload remainder via a warp reduce). Per-lane
-    // input offset is an exclusive prefix sum via warp shuffles — O(log N)
+    // input offset is an exclusive prefix sum via warp shuffles - O(log N)
     // instead of the O(N) linear scan a 4-stream design could afford.
 
     const uint8_t* hdr = comp + desc.in_offset + HUFF_WEIGHTS_BYTES;

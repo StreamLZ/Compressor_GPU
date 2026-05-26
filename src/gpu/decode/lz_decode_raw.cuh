@@ -1,4 +1,4 @@
-// ── StreamLZ LZ decode — raw-mode sub-chunk decoder ────────────
+// ── StreamLZ LZ decode - raw-mode sub-chunk decoder ────────────
 // One of two warp-cooperative LZ decoders (the other lives in
 // lz_decode_general.cuh). Streamlined single-LZ-block path: no off32,
 // no delta literals, no block split. Selected for any sub-chunk with
@@ -81,7 +81,7 @@ __device__ __noinline__ void decodeSubChunkRawMode(
                 // `(1u << (lane + 1)) - 1u` would be undefined when lane == 31
                 // (shift count >= u32 width); `(2u << lane) - 1u` produces the
                 // same inclusive-prefix mask without UB. The idiom only works
-                // because `lane` is in [0, 31] — assert that explicitly.
+                // because `lane` is in [0, 31] - assert that explicitly.
                 static_assert(WARP_SIZE == 32,
                               "(2u << lane) - 1u inclusive-prefix idiom assumes WARP_SIZE == 32");
                 uint32_t my_prefix = fresh_mask & ((2u << lane) - 1u);

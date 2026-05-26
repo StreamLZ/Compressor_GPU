@@ -19,7 +19,7 @@ const CompressChunkDesc = ec.CompressChunkDesc;
 
 /// `out_dev`: when non-zero, the encoder writes Huffman bodies straight
 /// into that caller-owned device buffer (which must hold ≥
-/// `total_dst_bytes`) and skips the host download — `out_bytes` is then
+/// `total_dst_bytes`) and skips the host download - `out_bytes` is then
 /// unused. This is the 4d device-resident path: the bodies stay on the
 /// GPU for the frame-assembly kernels. When zero, bodies land in the
 /// shared persist buffer and are downloaded into `out_bytes` as before.
@@ -32,7 +32,7 @@ pub fn gpuEncodeHuffImpl(
     out_dev: CUdeviceptr,
     /// Two static, null-terminated kernel-name strings the profiler will
     /// store in last_timings. Index 0 is the build kernel, 1 is the encode
-    /// kernel. Pointers must live for the library's lifetime — use
+    /// kernel. Pointers must live for the library's lifetime - use
     /// string literals (see gpuEncodeLiteralsHuffImpl etc).
     profile_names: [2][*:0]const u8,
 ) bool {
@@ -43,7 +43,6 @@ pub fn gpuEncodeHuffImpl(
     const d2h_fn = ffi.cuMemcpyDtoH_fn orelse return false;
     const launch_fn = ffi.cuLaunchKernel_fn orelse return false;
     const sync_fn = ffi.cuCtxSynchronize_fn orelse return false;
-    const memset_fn = ffi.cuMemsetD8_fn orelse return false;
 
     const n: u32 = @intCast(descs.len);
     // Convention across all four entrypoints: empty input → false (no
@@ -53,7 +52,7 @@ pub fn gpuEncodeHuffImpl(
 
     // Per-stream scratch sized from the largest descriptor (one slab fits
     // every block). NUM_STREAMS mirrors HUFF_NUM_STREAMS in
-    // src/gpu/common/gpu_huffman.cuh — the encoder kernel uses that
+    // src/gpu/common/gpu_huffman.cuh - the encoder kernel uses that
     // constant directly; this Zig side has to match so the scratch slab
     // has the right per-stream stride. Each stream gets src_size/N
     // symbols of ≤ 11 bits; 2 bytes/symbol is a safe bound.
@@ -91,7 +90,11 @@ pub fn gpuEncodeHuffImpl(
     if (!ec.ensureBuf(&self.d_huff_sizes_persist, &self.d_huff_sizes_size, sizes_bytes)) return false;
 
     if (h2d_fn(self.d_huff_descs_persist, @ptrCast(descs.ptr), desc_bytes) != ffi.CUDA_SUCCESS) return false;
-    if (memset_fn(self.d_huff_sizes_persist, 0, sizes_bytes) != ffi.CUDA_SUCCESS) return false;
+    // (No memset of d_huff_sizes_persist needed: slzHuffEncode4StreamKernel
+    // writes out_sizes[block_id] for every block_id < n_blocks, including
+    // empty descs (which write 0). The downstream d2h reads exactly
+    // sizes_bytes for this call's descs.len, so stale tail bytes can't
+    // leak in.)
     if (sync_fn() != ffi.CUDA_SUCCESS) return false;
 
     // Kernel 1: build per-block Huffman tables from the source streams.
@@ -111,7 +114,7 @@ pub fn gpuEncodeHuffImpl(
     var extra = [_]?*anyopaque{null};
     const t_htbl = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, profile_names[0], 0);
     // Defer so the begin event always pairs with an end record, even on
-    // launch failure — finalizeProfiling otherwise blocks on the unrecorded
+    // launch failure - finalizeProfiling otherwise blocks on the unrecorded
     // end event.
     defer gpu_decode.endKernelTiming(t_htbl, 0);
     if (launch_fn(module_loader.huff_tables_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &tbl_params, &extra) != ffi.CUDA_SUCCESS)
@@ -136,7 +139,7 @@ pub fn gpuEncodeHuffImpl(
     if (sync_fn() != ffi.CUDA_SUCCESS) return false;
 
     if (d2h_fn(@ptrCast(out_sizes.ptr), self.d_huff_sizes_persist, sizes_bytes) != ffi.CUDA_SUCCESS) return false;
-    // Device-resident mode leaves the bodies on the GPU — only the small
+    // Device-resident mode leaves the bodies on the GPU - only the small
     // sizes array comes back. Else download the full body buffer.
     if (out_dev == 0)
         if (d2h_fn(@ptrCast(out_bytes.ptr), self.d_huff_out_persist, total_dst_bytes) != ffi.CUDA_SUCCESS) return false;
@@ -337,7 +340,7 @@ pub fn gpuEncodeLiteralsHuffImpl(
 
     var descs = allocator.alloc(HuffEncDesc, n) catch return false;
     defer allocator.free(descs);
-    // bool-return function — errdefer would never fire; cleanup lives
+    // bool-return function - errdefer would never fire; cleanup lives
     // in the explicit catch blocks below.
     var offsets = allocator.alloc(u32, n) catch return false;
 
@@ -434,7 +437,7 @@ pub fn gpuEncodeTokensHuffImpl(
 
     var descs = allocator.alloc(HuffEncDesc, n) catch return false;
     defer allocator.free(descs);
-    // bool-return function — errdefer would never fire; cleanup lives
+    // bool-return function - errdefer would never fire; cleanup lives
     // in the explicit catch blocks below.
     var offsets = allocator.alloc(u32, n) catch return false;
 

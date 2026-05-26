@@ -1,9 +1,9 @@
-// ── StreamLZ GPU LZ encode — warp-parallel greedy parser ────────
+// ── StreamLZ GPU LZ encode - warp-parallel greedy parser ────────
 // The use_chain=0 parser: a warp-parallel greedy match scan. All 32
 // lanes probe the hash table in lockstep and simulate the CPU's
 // serial hash-write order. Port of the CPU runGreedyParser.
 //
-// Included by lz_kernel.cu — see that file for the build line.
+// Included by lz_kernel.cu - see that file for the build line.
 #pragma once
 
 #include "lz_format.cuh"
@@ -99,9 +99,9 @@ __device__ void scanBlock(
                     hash_ref = their_pos;
                 }
                 // else: CPU's content check fails (different key OR
-                // offset < 8) — no match.
+                // offset < 8) - no match.
             } else {
-                // No intra-warp overwrite — pre-warp ht[h] is what CPU sees.
+                // No intra-warp overwrite - pre-warp ht[h] is what CPU sees.
                 uint32_t ref_val = ht[h];
                 if (ref_val != HASH_EMPTY && ref_val + 8 <= my_pos) {
                     uint32_t rk = readU32LE(src + ref_val);
@@ -200,7 +200,7 @@ __device__ void scanBlock(
         uint32_t min_match_len;
 
         if (winning_type == 0) {
-            // Hash match (includes intra-warp same-key — unified above).
+            // Hash match (includes intra-warp same-key - unified above).
             match_pos = pos + first_lane;
             match_ref = __shfl_sync(FULL_WARP_MASK, my_ref, first_lane);
             min_match_len = MIN_MATCH;

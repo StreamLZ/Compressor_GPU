@@ -1,4 +1,4 @@
-// ── StreamLZ GPU — shared LZ wire-format constants ──────────────────
+// ── StreamLZ GPU - shared LZ wire-format constants ──────────────────
 // The contract between encode-side (lz_kernel.cu, assemble_kernel.cu)
 // and decode-side (lz_kernel.cu, huffman_kernel.cu) kernels. Anything
 // that the encoder writes and the decoder reads (or vice versa) lives
@@ -49,12 +49,12 @@ __device__ __forceinline__ bool     subchunkIsLz      (uint32_t hdr) { return (h
 __device__ __forceinline__ uint32_t subchunkMode      (uint32_t hdr) { return (hdr >> SUBCHUNK_MODE_SHIFT) & SUBCHUNK_MODE_MASK; }
 __device__ __forceinline__ uint32_t subchunkCompSize  (uint32_t hdr) { return hdr & SUBCHUNK_COMP_SIZE_MASK; }
 
-// ── Off16 stream — entropy-coded marker ─────────────────────────────
+// ── Off16 stream - entropy-coded marker ─────────────────────────────
 // A leading count of OFF16_ENTROPY_MARKER tells the parser the off16
 // stream is split into hi/lo halves (each its own entropy chunk).
 static constexpr uint32_t OFF16_ENTROPY_MARKER      = 0xFFFFu;
 
-// ── Off32 stream — packed count header ──────────────────────────────
+// ── Off32 stream - packed count header ──────────────────────────────
 // The 3-byte off32 header packs two 12-bit counts (block-0 in the high
 // 12 bits, block-1 in the low 12 bits). A count field of
 // OFF32_COUNT_PACK_MAX (= 4095) escapes to a following u16 carrying the
@@ -111,7 +111,7 @@ static constexpr uint32_t CHUNK_FLAG_MEMSET         = 0x2u;
 // scratch-slot stride for the scan kernel", not "block size".
 static constexpr uint32_t DEFAULT_SUB_CHUNK_CAP     = 0x10000u; // 64KB
 static_assert(DEFAULT_SUB_CHUNK_CAP == LZ_BLOCK_SIZE,
-              "naming coincidence — both are 64KB; see comment above");
+              "naming coincidence - both are 64KB; see comment above");
 
 // LZ length-stream extended marker: bytes whose raw value exceeds
 // EXT_LENGTH_THRESHOLD trigger a 2-byte extended-length read. Encoder
@@ -123,13 +123,13 @@ static constexpr uint32_t EXT_LENGTH_THRESHOLD       = 251;
 // (BE u24). STREAM_HEADER_BYTES is the old name retained for back-compat
 // with the existing encode references; prefer the new name in new code.
 static constexpr uint32_t LZ_SUBSTREAM_COUNT_HDR_BYTES = 3;
-// DEPRECATED — use LZ_SUBSTREAM_COUNT_HDR_BYTES in new code.
+// DEPRECATED - use LZ_SUBSTREAM_COUNT_HDR_BYTES in new code.
 static constexpr uint32_t STREAM_HEADER_BYTES       = LZ_SUBSTREAM_COUNT_HDR_BYTES;
 static constexpr uint32_t OFF16_HEADER_BYTES        = 2; // little-endian u16
 
 // ── 5-byte non-compact entropy chunk header (assemble_kernel.cu) ────
 // Layout (encoder writes, decoder reads):
-//   byte 0:           [type:4 | dm1_hi4:4]   — type in high nibble,
+//   byte 0:           [type:4 | dm1_hi4:4]   - type in high nibble,
 //                     top 4 bits of dst_size_minus_1 in low nibble
 //   bytes 1..4 (BE):  [dm1_low14:14 | comp_size:18]
 // where dst_size_minus_1 reconstructs as (dm1_hi4 << 14) | dm1_low14.

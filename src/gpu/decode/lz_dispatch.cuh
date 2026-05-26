@@ -34,7 +34,7 @@ __device__ void parseAndDecodeSubChunkRaw(
 
     uint32_t initial_copy = 0;
     if (base_offset == 0) {
-        // First 8 bytes are raw literals — copy directly to output.
+        // First 8 bytes are raw literals - copy directly to output.
         if ((uint32_t)lane < INITIAL_LITERAL_COPY_BYTES) dst[dst_offset + lane] = src[lane];
         __syncwarp();
         src += INITIAL_LITERAL_COPY_BYTES;
@@ -80,7 +80,7 @@ __device__ void parseAndDecodeSubChunkRaw(
     block2_cmd_offset = __shfl_sync(FULL_WARP_MASK, block2_cmd_offset, 0);
     src = broadcastSrc(sc_src, src);
 
-    // Off16 stream (raw — no entropy 0xFFFF marker handling on this path).
+    // Off16 stream (raw - no entropy 0xFFFF marker handling on this path).
     const uint8_t* off16_raw;
     uint32_t off16_count = 0;
     if (lane == 0) {

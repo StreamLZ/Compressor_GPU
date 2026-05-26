@@ -1,10 +1,10 @@
-// ── StreamLZ GPU LZ encode — token / offset / length serializer ──
+// ── StreamLZ GPU LZ encode - token / offset / length serializer ──
 // The output-stream serializer shared by both parsers. Turns
 // (literal-run, match) pairs into the codec's lit / token / off16 /
 // off32 / len sub-streams. 1:1 port of the CPU writeComplexOffset
 // family.
 //
-// Included by lz_kernel.cu — see that file for the build line.
+// Included by lz_kernel.cu - see that file for the build line.
 #pragma once
 
 #include "lz_format.cuh"
@@ -36,7 +36,7 @@ static constexpr uint32_t LIT1_MAX_MATCHES = 32;  // max recorded recent-offset 
 // off32, lengths) plus their write cursors into one value, so the
 // serializer / parser signatures do not have to thread 12 separate
 // arguments. Passed by reference; cursors mutate in place. Bundling
-// is purely structural — semantics are identical to the previous
+// is purely structural - semantics are identical to the previous
 // flat-argument form.
 struct OutputStreams {
     uint8_t* lit_buf;   uint32_t lit_count;
@@ -188,7 +188,7 @@ __device__ void emitCmd(
         // length_value is int32_t; clamp to non-negative for writeLengthValue
         // (uint32_t). The `> 0` (vs `>= 0`) is intentional: a zero length
         // value means "no length-stream byte needed" and the writeLengthValue
-        // call should still produce the single-byte encoding for 0 — both
+        // call should still produce the single-byte encoding for 0 - both
         // branches collapse to the same uint32 0, so they're equivalent.
         uint32_t lv = (length_value > 0) ? (uint32_t)length_value : 0;
         writeLengthValue(s.len_buf, s.length_count, lv);
@@ -249,7 +249,7 @@ __device__ void emitWithLiteral1(
             if (i != last) {
                 // New recorded match: register the gap and advance last
                 // past the matched byte. Subsequent consecutive matches
-                // (i == last on next iter) are FOLDED into this entry —
+                // (i == last on next iter) are FOLDED into this entry -
                 // they must NOT update `last`, otherwise the fold loop
                 // below emits a recent-offset match at a non-matching
                 // position. (CPU equivalent: only updates last when
@@ -291,7 +291,7 @@ __device__ void emitWithLiteral1(
         emitCmd(s, cur_lit, match_len, offset,
                 cur_anchor, block2_start, recent_offset);
     } else {
-        // No recent-offset bytes found — emit normally
+        // No recent-offset bytes found - emit normally
         for (uint32_t i = 0; i < lit_len; i++)
             s.lit_buf[s.lit_count + i] = src[anchor + i];
         s.lit_count += lit_len;

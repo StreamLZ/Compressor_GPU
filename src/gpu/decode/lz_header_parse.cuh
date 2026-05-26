@@ -22,7 +22,7 @@ __device__ inline const uint8_t* broadcastSrc(const uint8_t* sc_src,
 // Each parser runs the lane-0 wire-format walk for one stream, then
 // broadcasts size/flag scalars and rebuilds `src` on every lane via
 // broadcastSrc. Split out of parseSubChunkHeaders so the outer fn stays
-// readable; each is left without an inline hint so nvcc decides — the
+// readable; each is left without an inline hint so nvcc decides - the
 // outer __noinline__ qualifier is what protects the decode hot loop
 // from header-parse register pressure.
 
@@ -131,7 +131,7 @@ static __device__ void parseCommandStreamHeader(
             cmd_size = count_b;
             cmd_pre_decoded = 1;
         } else if (ct == 4 && entropy_tok_scratch != nullptr) {
-            // Huffman token stream (GPU-emitted) — pre-decoded by
+            // Huffman token stream (GPU-emitted) - pre-decoded by
             // slzHuffDecode4StreamKernel into entropy_tok_scratch. Same
             // 3/5-byte wire format as the legacy entropy types.
             uint32_t comp_size;
@@ -141,7 +141,7 @@ static __device__ void parseCommandStreamHeader(
         } else {
             // Unsupported entropy type (chunk_type ∉ {0, 4} on GPU). Advance
             // src past the stream so subsequent parsers see correct offsets,
-            // but signal an empty cmd to the caller — the decoder cannot
+            // but signal an empty cmd to the caller - the decoder cannot
             // consume this payload.
             (void)skipEntropyStream(src);
             cmd_size = 0;
@@ -222,7 +222,7 @@ static __device__ void parseOff16StreamHeader(
 
 // Off32 (raw) and length-tail are parsed together because they share
 // the same lane-0 cursor walk: off32 counts/pointers are computed, then
-// the remaining bytes form the length stream — splitting would force a
+// the remaining bytes form the length stream - splitting would force a
 // second broadcast that the original code intentionally avoids.
 static __device__ void parseOff32StreamHeaders(
     const uint8_t* sc_src,
@@ -268,9 +268,9 @@ static __device__ void parseOff32StreamHeaders(
     ps.len_avail = len_avail;
 }
 
-// ── Sub-chunk header parser — __noinline__ to free registers ────
+// ── Sub-chunk header parser - __noinline__ to free registers ────
 // Parses all stream headers, returns pointers/sizes in ParsedStreams.
-// Registers used here are freed before the decode hot loop runs — the
+// Registers used here are freed before the decode hot loop runs - the
 // __noinline__ qualifier is load-bearing for occupancy; do not remove.
 //
 // Lane contract: warp-cooperative. Each header is parsed on lane 0,

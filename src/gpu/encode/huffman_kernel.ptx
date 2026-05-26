@@ -4815,7 +4815,7 @@ $L__BB1_4:
 	.param .b64 param1;
 	st.param.b64 	[param1+0], %rd61;
 	.param .b32 param2;
-	st.param.b32 	[param2+0], 80;
+	st.param.b32 	[param2+0], 85;
 	.param .b64 param3;
 	st.param.b64 	[param3+0], 0;
 	.param .b64 param4;

@@ -16,7 +16,7 @@ const CUDA_SUCCESS = cuda.CUDA_SUCCESS;
 
 // The four `last_*_ns` telemetry vars and `g_default` live in driver.zig
 // (the facade) because Zig cannot expose a `pub var` from another module
-// through a `pub const` alias — external callers reading
+// through a `pub const` alias - external callers reading
 // `gpu_decode.last_kernel_ns` must reach actual storage in the facade.
 // Sub-modules write back via `@import("driver.zig").last_kernel_ns = ...`.
 
@@ -42,7 +42,7 @@ pub fn ensureDeviceOutput(self: *DecodeContext, size: usize) bool {
 /// Page-locked (pinned) host allocation. D2H/H2D against pinned memory runs
 /// at full PCIe bandwidth (~2x pageable, which the driver stages chunk-wise
 /// through an internal pinned buffer) and is genuinely async-capable.
-/// Returns null when CUDA is unavailable — caller falls back to a normal
+/// Returns null when CUDA is unavailable - caller falls back to a normal
 /// allocation, so this is always safe to attempt.
 pub fn allocHost(size: usize) ?[]u8 {
     if (!@import("module_loader.zig").init()) return null;
@@ -86,7 +86,7 @@ pub fn bindContextToCallingThread() bool {
 
 /// Allocate + record a start event for a kernel about to launch on `stream`.
 /// Returns the end-event handle to pass to `endKernelTiming`, or null when
-/// profiling is disabled or any CUDA call failed (timing is best-effort —
+/// profiling is disabled or any CUDA call failed (timing is best-effort -
 /// never blocks the encode/decode path).
 pub fn beginKernelTiming(
     ctx_enabled: bool,
@@ -127,7 +127,7 @@ pub fn beginKernelTiming(
 /// for an event that the driver will never complete. We accept this risk
 /// because profiling is opt-in (only enabled when the caller sets
 /// `enable_profiling`) and any CUDA failure at this point already implies
-/// the surrounding decode launch is in a non-recoverable state — the next
+/// the surrounding decode launch is in a non-recoverable state - the next
 /// `cuCtxSynchronize` in the dispatch path will surface the real error
 /// before `finalizeProfiling` is reached.
 pub fn endKernelTiming(end_event: ?usize, stream: usize) void {
@@ -146,7 +146,7 @@ pub fn finalizeProfiling(
     // Idempotent when pending is empty: leave last_timings untouched so the
     // values populated by the prior call survive. slzGetLastTimings calls
     // this from the main thread after the worker's fullGpuLaunchImpl has
-    // already drained pending into last_timings — wiping here would zero
+    // already drained pending into last_timings - wiping here would zero
     // those timings out.
     if (pending.items.len == 0) return;
     last_timings.clearRetainingCapacity();
@@ -163,7 +163,7 @@ pub fn finalizeProfiling(
         return;
     };
     // The four CUDA-result drops below (sync / elapsed / destroy ×2)
-    // are swallowed by design — profiling is opt-in and a transient driver
+    // are swallowed by design - profiling is opt-in and a transient driver
     // hiccup here only loses a single ms reading, never decode correctness.
     for (pending.items) |p| {
         _ = sync_fn(p.end_event);
@@ -284,7 +284,7 @@ pub const DecodeContext = struct {
     d_huff_descs_size: usize = 0,
     d_huff_lut: CUdeviceptr = 0,
     d_huff_lut_size: usize = 0,
-    // One host buffer per stream type — scanner appends to each; fullGpuLaunch
+    // One host buffer per stream type - scanner appends to each; fullGpuLaunch
     // merges them into one device array with per-type out_offset added.
     huff_lit_host_buf: [d.MAX_HUFF_DESCS_PER_STREAM]d.HuffDecChunkDesc = undefined,
     huff_tok_host_buf: [d.MAX_HUFF_DESCS_PER_STREAM]d.HuffDecChunkDesc = undefined,
@@ -297,16 +297,16 @@ pub const DecodeContext = struct {
     pipeline_streams: [cuda.NUM_PIPELINE_STREAMS]usize = @splat(0),
     pipeline_streams_created: bool = false,
 
-    // Per-call scratch buffers — pulled off the dispatch-loop stack
+    // Per-call scratch buffers - pulled off the dispatch-loop stack
     // because the combined ~384 KiB is uncomfortably large in a recursive
     // call frame. Reused across calls; capacity is sized for the largest
-    // frame the GPU codec can produce (walk_max_chunks chunks × per-stream-cap).
-    //   merged_huff_buf       — CPU merge fallback, four streams' worth of
+    // frame the GPU codec can produce (WALK_MAX_CHUNKS chunks × per-stream-cap).
+    //   merged_huff_buf       - CPU merge fallback, four streams' worth of
     //                           HuffDecChunkDesc entries (~320 KiB).
-    //   first_subchunk_idx_buf — CPU mirror of the per-chunk first-sub-chunk
+    //   first_subchunk_idx_buf - CPU mirror of the per-chunk first-sub-chunk
     //                           prefix sum used by the non-pure-D2D path (~64 KiB).
     merged_huff_buf: [d.MAX_HUFF_DESCS_PER_STREAM * 4]d.HuffDecChunkDesc = undefined,
-    first_subchunk_idx_buf: [d.walk_max_chunks]u32 = .{0} ** d.walk_max_chunks,
+    first_subchunk_idx_buf: [d.WALK_MAX_CHUNKS]u32 = .{0} ** d.WALK_MAX_CHUNKS,
 
     // Per-kernel timing (slzDecompressOpts_t.enable_profiling). When true,
     // every kernel launch in fullGpuLaunchImpl records a cuEvent pair and
@@ -390,5 +390,5 @@ pub const DecodeContext = struct {
     }
 };
 
-// `g_default` lives in driver.zig (the facade) — see the telemetry comment
+// `g_default` lives in driver.zig (the facade) - see the telemetry comment
 // at the top of this file for why storage of `pub var`s must be there.

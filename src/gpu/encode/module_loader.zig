@@ -31,7 +31,7 @@ fn nullTerminatedPtx(comptime name: []const u8) [:0]const u8 {
     return @embedFile(name) ++ "\x00";
 }
 
-// Per-module handles. CUDA context comes from the decode driver — see
+// Per-module handles. CUDA context comes from the decode driver - see
 // the file-level doc above.
 pub var module: ffi.CUmodule = 0;
 pub var kernel_fn: ffi.CUfunction = 0;
@@ -48,7 +48,7 @@ pub fn init() bool {
     if (initialized) return kernel_fn != 0;
     initialized = true;
 
-    // Reuse the CUDA context the decode driver creates — see the
+    // Reuse the CUDA context the decode driver creates - see the
     // file-level doc on why encode does not own context creation.
     const dec_gpu = @import("../decode/driver.zig");
     if (!dec_gpu.init()) return false;
@@ -73,7 +73,7 @@ pub fn init() bool {
     const get_fn = ffi.cuModuleGetFunction_fn orelse return false;
     if (get_fn(&kernel_fn, module, "slzLzEncodeKernel") != ffi.CUDA_SUCCESS) return false;
 
-    // GPU Huffman encoder (chunk_type=4). Optional — if the module or
+    // GPU Huffman encoder (chunk_type=4). Optional - if the module or
     // either kernel is missing, gpuEncode*Huff returns false and the
     // caller falls back to the CPU Huffman encoder.
     const huff_ptx = nullTerminatedPtx("huffman_kernel.ptx");
@@ -83,7 +83,7 @@ pub fn init() bool {
     }
 
     // GPU frame-assembly kernels (chunk_type=4 device-resident compress
-    // tail). Optional — gpuAssembleFrameImpl returns false if absent.
+    // tail). Optional - gpuAssembleFrameImpl returns false if absent.
     const asm_ptx = nullTerminatedPtx("assemble_kernel.ptx");
     if ((ffi.cuModuleLoadData_fn orelse return false)(&assemble_module, asm_ptx.ptr) == ffi.CUDA_SUCCESS) {
         _ = get_fn(&assemble_measure_fn, assemble_module, "slzAssembleMeasureKernel");

@@ -1,7 +1,7 @@
 // ── StreamLZ prefix-sum-chunks kernel ──────────────────────────
 // Computes the per-chunk first-sub-chunk index plus the total
-// sub-chunk count on device. Single-threaded sequential sum — n is
-// bounded by walk_max_chunks (16384), so trivial wall-time and not
+// sub-chunk count on device. Single-threaded sequential sum - n is
+// bounded by WALK_MAX_CHUNKS (16384), so trivial wall-time and not
 // worth a parallel scan. Included into the single lz_kernel.cu
 // translation unit.
 #pragma once
@@ -10,8 +10,8 @@
 
 // ── Prefix-sum-chunks kernel (roadmap 4d Phase 3 step 2) ───────────
 // Computes the per-chunk first-sub-chunk index plus the total
-// sub-chunk count, on device. Single-threaded sequential sum — n is
-// bounded by walk_max_chunks (16384), so trivial wall-time and not
+// sub-chunk count, on device. Single-threaded sequential sum - n is
+// bounded by WALK_MAX_CHUNKS (16384), so trivial wall-time and not
 // worth a parallel scan. Replaces the CPU first_subchunk_idx loop in
 // fullGpuLaunchImpl on the pure-D2D path.
 extern "C" __global__ void slzPrefixSumChunksKernel(

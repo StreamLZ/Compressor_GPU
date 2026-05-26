@@ -32,7 +32,7 @@ pub fn gpuCompressImpl(
     // FFI fn resolution convention: entrypoints that this path REQUIRES
     // (no fallback) are resolved upfront so the whole launch bails out
     // cleanly if any one is missing. Optional fns (used only on a
-    // conditional branch) are resolved inline at the use site — see
+    // conditional branch) are resolved inline at the use site - see
     // `cuMemsetD8_fn` below, which is wrapped in an `if (...) |fn|` so
     // its absence doesn't kill the encode (zeroing isn't strictly
     // required when the kernel writes every output byte).
@@ -54,7 +54,7 @@ pub fn gpuCompressImpl(
     if (!ec.ensureBuf(&self.d_descs_persist, &self.d_descs_size, desc_bytes)) return false;
     if (!ec.ensureBuf(&self.d_sizes_persist, &self.d_sizes_size, sizes_bytes)) return false;
 
-    // Global hash tables — chain mode uses 3 tables per block:
+    // Global hash tables - chain mode uses 3 tables per block:
     //   first_hash (hash_size u32) + long_hash (hash_size u32) + next_hash (32768 u16 = 16384 u32)
     if (chain) {
         const next_hash_words: usize = ec.NEXT_HASH_ENTRIES / 2; // u16 entries packed into u32 words
@@ -100,7 +100,7 @@ pub fn gpuCompressImpl(
     var p_hash_bits = hash_bits;
     var p_use_chain: u32 = if (chain) 1 else 0;
     // L4+ enables the greedy parser's match-range rehash (CPU engine_level>=2).
-    // L3 stays without it — that is the L3/L4 distinction. L5 uses the chain
+    // L3 stays without it - that is the L3/L4 distinction. L5 uses the chain
     // parser so the flag is inert there.
     var p_l4: u32 = if (level >= 4) 1 else 0;
 
@@ -120,7 +120,7 @@ pub fn gpuCompressImpl(
     const shared_bytes: u32 = if (global or chain) 0 else @intCast(hash_size * 4);
     const t_lz = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzEncodeKernel", 0);
     // Defer endKernelTiming so the pending begin event always gets a
-    // matching end record — even on launch failure. Otherwise
+    // matching end record - even on launch failure. Otherwise
     // finalizeProfiling would block on an unrecorded end event.
     defer gpu_decode.endKernelTiming(t_lz, 0);
     if (launch_fn(module_loader.kernel_fn, num_chunks, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra) != ffi.CUDA_SUCCESS)

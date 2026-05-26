@@ -1,12 +1,12 @@
 // ── StreamLZ GPU frame-assembly kernel ──────────────────────────────
 // Device-resident compress tail (roadmap 4d). Replaces the CPU
 // `reencodeGpuWithEntropy` per-sub-chunk loop in fast_framed.zig: given
-// the LZ kernel's raw sub-chunk streams and the GPU-Huffman bodies — all
-// already device-resident — assemble each sub-chunk's payload on the GPU.
+// the LZ kernel's raw sub-chunk streams and the GPU-Huffman bodies - all
+// already device-resident - assemble each sub-chunk's payload on the GPU.
 //
 // Two passes, one warp per sub-chunk:
-//   slzAssembleMeasureKernel — compute each sub-chunk's assembled size.
-//   slzAssembleWriteKernel   — write [3-byte sub-chunk header][payload].
+//   slzAssembleMeasureKernel - compute each sub-chunk's assembled size.
+//   slzAssembleWriteKernel   - write [3-byte sub-chunk header][payload].
 // Between them the driver prefix-sums the sizes (→ desc.out_offset) and
 // writes the chunk / block / frame scaffolding.
 //
@@ -28,18 +28,18 @@
 // ── Wire-format constants (assembler-private) ───────────────────────
 // LZ_BLOCK_SIZE, HUFF_CHUNK_TYPE, OFF16_ENTROPY_MARKER, OFF32_COUNT_PACK_MAX,
 // OFF32_LONG_ENTRY_TAG, SUBCHUNK_HDR_BYTES, and the SUBCHUNK_* family
-// come from ../common/gpu_wire_format.cuh — the encode/decode-shared
+// come from ../common/gpu_wire_format.cuh - the encode/decode-shared
 // contract.
 //
 // RAW_CHUNK_HDR_BYTES is the 3-byte type-0 entropy chunk header
 // `[u24 BE size]` (NOT the SUBCHUNK_HDR_BYTES sub-chunk header above,
-// which happens to also be 3 bytes — both are 3 by coincidence).
+// which happens to also be 3 bytes - both are 3 by coincidence).
 // HUFF_CHUNK_HDR_BYTES is the non-compact type-4 (Huffman) header.
 static constexpr int      RAW_CHUNK_HDR_BYTES   = 3;   // type-0 [u24 BE size]
 static constexpr int      HUFF_CHUNK_HDR_BYTES  = 5;   // type-4 non-compact header
 static constexpr int      OFF16_ENTROPY_MIN     = 32;  // entropy-code off16 at/above this count
 
-// ── Per-sub-chunk descriptor — mirrors Zig AssembleDesc in driver.zig ─
+// ── Per-sub-chunk descriptor - mirrors Zig AssembleDesc in driver.zig ─
 // Offsets are byte offsets into the corresponding device base buffer.
 // A Huffman body with size 0 means "no body" → that stream is raw.
 struct AssembleDesc {
@@ -214,21 +214,21 @@ __device__ static uint32_t assembleSubChunk(
     if (!s.ok) return 0;
     uint32_t wp = 0;
 
-    // 0. initial raw bytes (frame's first sub-chunk only) — verbatim.
+    // 0. initial raw bytes (frame's first sub-chunk only) - verbatim.
     if (init_n > 0) {
         if (out) { warpCopy(out, raw_base, init_n, lane); __syncwarp(); }
         wp += init_n;
     }
 
-    // 1. literals — huff vs raw.
+    // 1. literals - huff vs raw.
     wp += emitEntropyStream(out ? out + wp : nullptr, s.lit, s.lit_count,
                             d_huff_lit + desc.huff_lit_offset, desc.huff_lit_size, lane);
 
-    // 2. tokens — huff vs raw.
+    // 2. tokens - huff vs raw.
     wp += emitEntropyStream(out ? out + wp : nullptr, s.tok, s.tok_count,
                             d_huff_tok + desc.huff_tok_offset, desc.huff_tok_size, lane);
 
-    // 3. cmd2 — 2 bytes verbatim, when present.
+    // 3. cmd2 - 2 bytes verbatim, when present.
     if (s.cmd2_present) {
         if (out && lane == 0) { out[wp] = s.cmd2[0]; out[wp + 1] = s.cmd2[1]; }
         wp += 2;
@@ -299,11 +299,11 @@ __device__ static uint32_t assembleSubChunk(
         wp += off16_bytes;
     }
 
-    // 5. off32 — verbatim copy (header + extra + data).
+    // 5. off32 - verbatim copy (header + extra + data).
     if (out) { __syncwarp(); warpCopy(out + wp, s.off32, s.off32_bytes, lane); }
     wp += s.off32_bytes;
 
-    // 6. length stream — verbatim copy.
+    // 6. length stream - verbatim copy.
     if (out) { __syncwarp(); warpCopy(out + wp, s.length, s.length_size, lane); }
     wp += s.length_size;
 
@@ -426,7 +426,7 @@ extern "C" __global__ void slzFrameAssembleKernel(
 
         // SC tail prefix: (n_chunks - 1) entries of 8 bytes each. Each entry
         // copies the first 8 bytes of chunk (entry_idx+1) from d_input.
-        // The last entry may have fewer than 8 source bytes — pad with zeros.
+        // The last entry may have fewer than 8 source bytes - pad with zeros.
         if (n_chunks > 1) {
             const uint32_t total_tail_bytes = (n_chunks - 1) * 8u;
             for (uint32_t i = lane; i < total_tail_bytes; i += bdim) {

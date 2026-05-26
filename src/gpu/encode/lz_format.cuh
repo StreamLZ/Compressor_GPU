@@ -1,9 +1,9 @@
-// ── StreamLZ GPU LZ encode — format constants & hash primitives ──
+// ── StreamLZ GPU LZ encode - format constants & hash primitives ──
 // Pure format/hash primitives for the LZ encode kernel: stream-format
 // constants, the per-chunk descriptor, hash-key helpers and the
 // zero-padded tail read. No parser logic lives here.
 //
-// Included by lz_kernel.cu — see that file for the build line.
+// Included by lz_kernel.cu - see that file for the build line.
 #pragma once
 
 #include <cstdint>
@@ -14,7 +14,7 @@
 // ── Match / format constants ────────────────────────────────────
 // LZ_BLOCK_SIZE (the 64KB block boundary) and INITIAL_LITERAL_COPY_BYTES
 // (the 8-byte verbatim prefix on the first chunk) come from
-// ../common/gpu_wire_format.cuh — the encode/decode-shared contract.
+// ../common/gpu_wire_format.cuh - the encode/decode-shared contract.
 static constexpr uint32_t MIN_MATCH        = 4;            // shortest LZ match
 static constexpr uint32_t HASH_EMPTY       = 0xFFFFFFFFu;  // empty greedy hash-table slot
 static constexpr uint32_t CHAIN_MAX_STEPS  = 8;            // chain-parser walk depth
@@ -28,7 +28,7 @@ static constexpr uint32_t NEXT_HASH_SIZE   = 65536;        // 2^16 entries of ui
 static constexpr uint32_t NEAR_OFFSET_MAX = 0xFFFFu;        // off16 vs off32 split
 // The "large offset" threshold above which the encoder switches to the
 // 4-byte extended off32 form is, by construction, the same value as the
-// tag bits OR'd into the truncated offset — the encoder uses the tag
+// tag bits OR'd into the truncated offset - the encoder uses the tag
 // pattern itself to mean "extended form follows". Define the threshold
 // in terms of the tag so the relationship is visible (and invariant).
 static constexpr uint32_t OFF32_LARGE_TAG        = 0xC00000u;
@@ -61,7 +61,7 @@ static constexpr uint32_t FAR_OFFSET_MIN_MATCH  = 14;  // CPU mmlt: minimum matc
 // by the greedy-parser short hash (k=6 → 6-byte key, top 16 bits zero)
 // and the chain-parser long hash (k=8 → full 8-byte key). HASH_MUL_A is
 // the table-A 64-bit multiplier (independent constant, not Fibonacci-
-// derived — matches CPU MatchHasher2).
+// derived - matches CPU MatchHasher2).
 static constexpr uint64_t HASH_MUL_FIB_K6 = 0x79B97F4A7C150000ULL;
 static constexpr uint64_t HASH_MUL_FIB_64 = 0x9E3779B97F4A7C15ULL;
 static constexpr uint64_t HASH_MUL_A      = 0xB7A5646300000000ULL;
@@ -73,7 +73,7 @@ static constexpr uint64_t HASH_A_MUL      = HASH_MUL_A;
 static constexpr uint64_t FIB_HASH_MUL_64 = HASH_MUL_FIB_64;
 
 // ── Per-chunk LZ-pass descriptor ────────────────────────────────
-// ABI-mirrored by CompressChunkDesc in src/gpu/encode/driver.zig — do
+// ABI-mirrored by CompressChunkDesc in src/gpu/encode/driver.zig - do
 // not reorder fields or change types. is_first triggers the 8-byte
 // INITIAL_COPY verbatim prefix at the start of the output.
 struct CompressChunkDesc {

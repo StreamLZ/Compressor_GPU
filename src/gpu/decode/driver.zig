@@ -1,27 +1,27 @@
-//! GPU decode driver — thin facade.
+//! GPU decode driver - thin facade.
 //!
 //! The decode driver was split into focused sub-modules during the GPU
 //! cleanup pass (roadmap item 5). External callers continue to import
 //! `gpu/decode/driver.zig` and reach every public symbol unchanged; this
 //! file owns the singleton `g_default` and the three `last_*_kernel_ns`
-//! telemetry `pub var`s (storage must live in the facade — Zig cannot
+//! telemetry `pub var`s (storage must live in the facade - Zig cannot
 //! re-export a `pub var` from another module through `pub const`).
 //!
 //! Sub-module layout:
-//!   cuda_api.zig         — nvcuda.dll handle, CU* typedefs, cu*_fn slots,
+//!   cuda_api.zig         - nvcuda.dll handle, CU* typedefs, cu*_fn slots,
 //!                          getProc, qpcNow / qpcMs, NUM_PIPELINE_STREAMS
-//!   module_loader.zig    — PTX load, kernel-handle pub vars, init(),
+//!   module_loader.zig    - PTX load, kernel-handle pub vars, init(),
 //!                          isAvailable(), ensurePipelineStreams
-//!   descriptors.zig      — ChunkDesc / HuffDecChunkDesc / RawOff16Desc /
+//!   descriptors.zig      - ChunkDesc / HuffDecChunkDesc / RawOff16Desc /
 //!                          ScanResult / WalkFrameResultDev / WalkMeta /
 //!                          KernelTiming / PendingTiming, HUFF_LUT_ENTRIES,
-//!                          walk_max_chunks, GpuError
-//!   decode_context.zig   — DecodeContext, ensureDeviceBuf / Output,
+//!                          WALK_MAX_CHUNKS, GpuError
+//!   decode_context.zig   - DecodeContext, ensureDeviceBuf / Output,
 //!                          alloc/free/copy helpers, profiling fns
-//!   scan_host.zig        — scanForEntropyChunks + local header parsers
-//!   scan_gpu.zig         — gpuWalkFrameImpl, gpuPrefixSumChunksImpl,
+//!   scan_host.zig        - scanForEntropyChunks + local header parsers
+//!   scan_gpu.zig         - gpuWalkFrameImpl, gpuPrefixSumChunksImpl,
 //!                          walkMetaToHost, gpuScanChunks
-//!   decode_dispatch.zig  — fullGpuLaunch / fullGpuLaunchImpl + the
+//!   decode_dispatch.zig  - fullGpuLaunch / fullGpuLaunchImpl + the
 //!                          per-decode helpers (dumpScanIfRequested,
 //!                          emitE2eTrace, gatherRawOff16, mergeHuffDescs)
 
@@ -53,7 +53,7 @@ pub const KernelTiming = d.KernelTiming;
 pub const PendingTiming = d.PendingTiming;
 pub const GpuError = d.GpuError;
 pub const HUFF_LUT_ENTRIES = d.HUFF_LUT_ENTRIES;
-pub const walk_max_chunks = d.walk_max_chunks;
+pub const WALK_MAX_CHUNKS = d.WALK_MAX_CHUNKS;
 
 // ── Per-decode context + host I/O helpers ─────────────────────
 pub const DecodeContext = dc.DecodeContext;

@@ -4,7 +4,7 @@
 // the device-side header parsers used by every decode path.
 //
 // Included into the single lz_kernel.cu translation unit (see that
-// file's banner). Pure header — no kernels.
+// file's banner). Pure header - no kernels.
 #pragma once
 
 #include <cstdint>
@@ -14,11 +14,11 @@
 
 // ── StreamLZ token format constants ────────────────────────────
 // Tokens encode literal-length + match-length + offset type in one byte.
-//   token >= 24:  standard — lit[2:0], match[6:3], use_recent[7], off16
-//   token == 0:   long literal — length from length stream + 64
-//   token == 1:   long near match — length from length stream + 91, off16
-//   token == 2:   long far match — length from length stream + 29, off32
-//   token 3-23:   short far match — match = token + 5, off32
+//   token >= 24:  standard - lit[2:0], match[6:3], use_recent[7], off16
+//   token == 0:   long literal - length from length stream + 64
+//   token == 1:   long near match - length from length stream + 91, off16
+//   token == 2:   long far match - length from length stream + 29, off32
+//   token 3-23:   short far match - match = token + 5, off32
 static constexpr uint32_t TOKEN_SHORT_MIN      = 24;
 static constexpr uint32_t TOKEN_LONG_LITERAL   = 0;
 static constexpr uint32_t TOKEN_LONG_NEAR      = 1;
@@ -36,7 +36,7 @@ static constexpr uint32_t TOKEN_USE_RECENT_SHIFT = 7;   // bit 7 = use recent of
 static constexpr uint32_t TOKEN_USE_RECENT_MASK  = 1;
 
 // LZ_BLOCK_SIZE, MAX_BLOCKS_PER_SUBCHUNK, INITIAL_LITERAL_COPY_BYTES,
-// INITIAL_RECENT_OFFSET come from ../common/gpu_wire_format.cuh — the
+// INITIAL_RECENT_OFFSET come from ../common/gpu_wire_format.cuh - the
 // encode/decode-shared format contract. Warp / lane constants
 // (WARP_SIZE, LANE_MASK, FULL_WARP_MASK) come from ../common/gpu_warp.cuh.
 //
@@ -46,7 +46,7 @@ static constexpr uint32_t TOKEN_USE_RECENT_MASK  = 1;
 static constexpr uint32_t MIN_PARALLEL_MATCH_LEN = 2;
 
 // Extended length-stream encoding: a byte value > EXT_LENGTH_THRESHOLD
-// (defined in ../common/gpu_wire_format.cuh — same constant the encoder
+// (defined in ../common/gpu_wire_format.cuh - same constant the encoder
 // emits against) carries a 2-byte uint16_t extension scaled by 4.
 static constexpr uint32_t EXT_LENGTH_EXTRA_BYTES = 2;
 static constexpr uint32_t EXT_LENGTH_SCALE       = 4;
@@ -109,7 +109,7 @@ static constexpr int      LZ_KERNEL_BLOCK_THREADS    = 64;
 static constexpr int      LZ_KERNEL_MIN_BLOCKS_PER_SM = 24;
 
 // ── Chunk descriptor ───────────────────────────────────────────
-// ABI struct — must stay byte-identical to `pub const ChunkDesc` in
+// ABI struct - must stay byte-identical to `pub const ChunkDesc` in
 // src/gpu/decode/driver.zig (which uses an explicit `_pad: [3]u8`).
 struct SlzChunkDesc {
     uint32_t src_offset;    // byte offset into compressed block
@@ -123,7 +123,7 @@ struct SlzChunkDesc {
 static_assert(sizeof(SlzChunkDesc) == 24, "ABI: keep in sync with decode/driver.zig");
 
 // ── Raw off16 gather descriptor ────────────────────────────────
-// ABI struct — must stay byte-identical to `RawOff16Desc` in
+// ABI struct - must stay byte-identical to `RawOff16Desc` in
 // src/gpu/decode/driver.zig.
 struct SlzRawOff16Desc {
     uint32_t src_offset;   // byte offset into comp_base
@@ -190,8 +190,8 @@ __device__ inline uint32_t readLength(const uint8_t* length_stream,
 // inner LZ-decode loop) and the scan kernel (which keeps an explicit
 // `pos` offset so it can bounds-check each step against `chunk_len`).
 // The caller is responsible for having verified that the right number
-// of bytes are readable at the address — `Type0` needs >= 3 bytes,
-// `EntropyHdr` needs >= 5 bytes — before invoking.
+// of bytes are readable at the address - `Type0` needs >= 3 bytes,
+// `EntropyHdr` needs >= 5 bytes - before invoking.
 
 struct Type0HdrFields {
     uint32_t size;         // raw byte count
@@ -263,7 +263,7 @@ __device__ inline uint32_t parseRawStreamSize(const uint8_t*& src) {
 // header_bytes is 5, returned by parseEntropyHdrFields for the long-form).
 // The per-warp decoder paths in `lz_dispatch.cuh::parseAndDecodeSubChunk[Raw]`
 // satisfy this because the encoder cannot emit a sub-chunk smaller than
-// its own header + payload — the sub-chunk header in `cmd[0..3]`
+// its own header + payload - the sub-chunk header in `cmd[0..3]`
 // constrains the byte range. The scan kernel uses the cursor-free
 // scanSkipStreamHeader variant in scan_parse_kernel.cuh which checks
 // `pos + need <= chunk_len` explicitly.
@@ -290,11 +290,11 @@ __device__ inline uint32_t skipPairedPrimary(const uint8_t*& src) {
 // ── Helper: skip an entropy-coded stream header + payload ──────
 // Reads the header at *src, advances src past the header + payload, and
 // returns the decompressed (or count) size for the stream's chunk type:
-//   type 0    raw                          — returns raw size
-//   type 4    Huffman                      — returns dst size (GPU encoder emits)
-//   type 1, 2, 6  legacy entropy (decoder-skip-only) — returns dst size
-//   type 7    paired-primary               — returns countA
-//   type 5    paired-secondary             — returns countB
+//   type 0    raw                          - returns raw size
+//   type 4    Huffman                      - returns dst size (GPU encoder emits)
+//   type 1, 2, 6  legacy entropy (decoder-skip-only) - returns dst size
+//   type 7    paired-primary               - returns countA
+//   type 5    paired-secondary             - returns countB
 __device__ inline uint32_t skipEntropyStream(const uint8_t*& src) {
     uint32_t ct = (src[0] >> CHUNK_TYPE_SHIFT) & CHUNK_TYPE_MASK;
     if (ct == 0) {
@@ -312,7 +312,7 @@ __device__ inline uint32_t skipEntropyStream(const uint8_t*& src) {
         src += PAIRED_SECONDARY_HEADER_BYTES;
         return count_b;
     } else {
-        // Huffman type 4 (GPU emits) or legacy entropy types 2/6 — parse header to skip.
+        // Huffman type 4 (GPU emits) or legacy entropy types 2/6 - parse header to skip.
         uint32_t comp_size;
         return parseEntropyHeader(src, comp_size);
     }

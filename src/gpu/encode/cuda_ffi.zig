@@ -1,4 +1,4 @@
-//! CUDA Driver API FFI shim — shared by every src/gpu/encode/*.zig module.
+//! CUDA Driver API FFI shim - shared by every src/gpu/encode/*.zig module.
 //!
 //! Holds the Win32 LoadLibrary handles, the CUresult/CUdevice typedefs,
 //! the function-pointer typedefs (`FnXxx`), and the `pub var` slots the
@@ -12,7 +12,7 @@
 //! allocations). Encode loads its own `nvcuda.dll` handle + function
 //! pointers because it needs encode-specific entries that decode does not
 //! (e.g. memset, async D2D). There are no `cuInit_fn`, `cuDeviceGet_fn`,
-//! or `cuCtxCreate_fn` slots here on purpose — encode never resolves them.
+//! or `cuCtxCreate_fn` slots here on purpose - encode never resolves them.
 
 const std = @import("std");
 
@@ -32,7 +32,7 @@ pub const CUDA_SUCCESS: CUresult = 0;
 pub const CUmodule = usize;
 pub const CUfunction = usize;
 
-// nvcuda.dll handle — populated by module_loader.init(). Underscore-
+// nvcuda.dll handle - populated by module_loader.init(). Underscore-
 // prefixed because it's an implementation detail; only this file and
 // the encode module_loader touch it.
 pub var _lib: ?*anyopaque = null;
@@ -60,7 +60,7 @@ pub var cuCtxSynchronize_fn: ?FnCtxSync = null;
 pub var cuMemsetD8_fn: ?FnMemsetD8 = null;
 
 /// Resolve a single exported function from the already-loaded nvcuda
-/// handle. Returns null if either the handle or the symbol is missing —
+/// handle. Returns null if either the handle or the symbol is missing -
 /// the caller decides whether that's fatal (cuModuleLoadData etc.) or
 /// merely disables an optional kernel path (huffman, assemble).
 pub fn getProc(comptime T: type, name: [*:0]const u8) ?T {

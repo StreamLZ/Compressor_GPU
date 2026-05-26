@@ -1,4 +1,4 @@
-// ── StreamLZ LZ decode — general sub-chunk decoder ─────────────
+// ── StreamLZ LZ decode - general sub-chunk decoder ─────────────
 // One of two warp-cooperative LZ decoders (the other lives in
 // lz_decode_raw.cuh). Full-featured path: handles off32, delta
 // literals, and multi-block sub-chunks (up to MAX_BLOCKS_PER_SUBCHUNK
@@ -26,7 +26,7 @@ struct DecodeOutput {
 
 // Token-type tag values assigned by the lane-0 parser and consumed
 // after the broadcast. Only LONG_LITERAL is tested by name (it
-// suppresses the recent_offset update — long-literal tokens don't
+// suppresses the recent_offset update - long-literal tokens don't
 // carry a new offset, so recent_offset must be preserved). The others
 // differ only in which offset stream they pull from (off16 vs off32);
 // kept named for debuggability.
@@ -41,7 +41,7 @@ enum TokenType : uint32_t {
 // Delta-literal mode (sub-chunk mode == 0): each output byte is the
 // sum of a literal byte and the byte at `dst[i + recent_offset]`.
 // Used in the inner token loop AND the per-block / final trailing-
-// literal flushes — same pattern at three sites. `__forceinline__` so
+// literal flushes - same pattern at three sites. `__forceinline__` so
 // nvcc inlines it identically to the open-coded version it replaces.
 __device__ __forceinline__ void deltaLiteralCopyBounded(
     uint8_t* __restrict__ dst, uint32_t dst_pos,
@@ -89,7 +89,7 @@ __device__ void decodeSubChunkGeneral(
     const uint32_t lit_size = ps.lit_size;
     // off16_raw is unused when OFF16_SPLIT=true; off16_hi/lo are unused
     // when OFF16_SPLIT=false. [[maybe_unused]] silences nvcc's #177-D
-    // "declared but never referenced" warning in each specialization —
+    // "declared but never referenced" warning in each specialization -
     // the warning is in fact evidence the if-constexpr DCE is working.
     [[maybe_unused]] const uint8_t* __restrict__ off16_raw = ps.off16_raw;
     const uint32_t off16_count = ps.off16_count;
@@ -114,7 +114,7 @@ __device__ void decodeSubChunkGeneral(
     // dst_end_abs is the upper bound on every `dst[i]` store below. If a
     // corrupt descriptor presents `dst_offset + dst_size` that overflows
     // uint32, the sum would wrap small and let writes scribble far past
-    // the legal output region. One-time clamp at function entry — costs
+    // the legal output region. One-time clamp at function entry - costs
     // ~2 instructions per sub-chunk decode, not in any hot loop.
     uint32_t dst_end_abs = (dst_size > 0xFFFFFFFFu - dst_offset)
         ? 0xFFFFFFFFu
@@ -204,7 +204,7 @@ __device__ void decodeSubChunkGeneral(
             }
 
             // ── Broadcast parsed values from lane 0 to all lanes ──
-            // PERF: lit_pos looks redundant (lane-coherent — every lane
+            // PERF: lit_pos looks redundant (lane-coherent - every lane
             // does lit_pos += lit_len below). It isn't. Removing this
             // + the dst_pos/lit_pos shfls in the 3 sites below costs
             // ~130 µs (+2%) on L3 enwik8 `-db -t 1 -r 30`. PTX REG=40
@@ -245,7 +245,7 @@ __device__ void decodeSubChunkGeneral(
             }
 
             // PERF: dst_pos/lit_pos look redundant (lane-coherent after
-            // the cooperative copies). They aren't — see top-of-loop note.
+            // the cooperative copies). They aren't - see top-of-loop note.
             dst_pos   = __shfl_sync(FULL_WARP_MASK, dst_pos, 0);
             lit_pos   = __shfl_sync(FULL_WARP_MASK, lit_pos, 0);
             if (!use_recent && (token_type != TOKEN_TYPE_LONG_LITERAL)) recent_offset = match_offset;
@@ -255,8 +255,7 @@ __device__ void decodeSubChunkGeneral(
 
         // ── Per-block trailing literals (at 64KB boundary) ──
         __syncwarp();
-        // PERF: same as inner-loop shfls — looks lane-coherent, isn't.
-        // Removing the four sites costs ~130 µs (+2%) on L3 enwik8.
+        // PERF: see top-of-function "five __shfl_sync broadcasts" note.
         dst_pos = __shfl_sync(FULL_WARP_MASK, dst_pos, 0);
         lit_pos = __shfl_sync(FULL_WARP_MASK, lit_pos, 0);
         {
@@ -277,7 +276,7 @@ __device__ void decodeSubChunkGeneral(
         }
 
         // ── Advance to block 2 ──
-        // On the last iter (block_iter == MAX-1) these writes are dead —
+        // On the last iter (block_iter == MAX-1) these writes are dead -
         // the for-loop bound will exit before any are read. Letting the
         // setup run on the dead iteration trades a never-taken `break`
         // for a few unconditional writes that nvcc dead-code-eliminates.
@@ -291,8 +290,7 @@ __device__ void decodeSubChunkGeneral(
 
     // ── Final trailing literals ──
     __syncwarp();
-    // PERF: same as inner-loop shfls — looks lane-coherent, isn't.
-    // Removing the four sites costs ~130 µs (+2%) on L3 enwik8.
+    // PERF: see top-of-function "five __shfl_sync broadcasts" note.
     dst_pos = __shfl_sync(FULL_WARP_MASK, dst_pos, 0);
     lit_pos = __shfl_sync(FULL_WARP_MASK, lit_pos, 0);
     uint32_t trailing = (lit_size > lit_pos) ? (lit_size - lit_pos) : 0;

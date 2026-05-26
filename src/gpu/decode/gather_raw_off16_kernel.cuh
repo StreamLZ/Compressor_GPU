@@ -9,7 +9,7 @@
 
 // ── Raw off16 gather ────────────────────────────────────────────────
 // Scatters the raw (type-0) off16 sub-streams from the compressed blob
-// into the off16 scratch in a single launch — replacing ~1500
+// into the off16 scratch in a single launch - replacing ~1500
 // host-issued device-to-device copies (the per-call driver overhead was
 // ~8 ms). Descriptor layout matches the Zig RawOff16Desc
 // {src_offset, size, gpu_offset}.

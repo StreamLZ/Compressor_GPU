@@ -1,13 +1,13 @@
-// ── StreamLZ GPU — little/big-endian byte-IO primitives ─────────
+// ── StreamLZ GPU - little/big-endian byte-IO primitives ─────────
 // Shared by every CUDA kernel in src/gpu/. Pure header: #pragma once,
 // inline device helpers only, no kernels and no translation-unit
 // state. #include'd via "../common/gpu_byteio.cuh" into the existing
 // single .cu translation units.
 //
 // The wire format mixes big-endian and little-endian fields. Each call
-// site picks a named helper from this header — readBE24 / readU32BE for
+// site picks a named helper from this header - readBE24 / readU32BE for
 // big-endian fields, readU16LE / readU32LE / readU64LE / readLE24 for
-// little-endian fields — so the convention is self-documenting at the
+// little-endian fields - so the convention is self-documenting at the
 // read/write site rather than buried in an open-coded byte shift.
 #pragma once
 
@@ -55,9 +55,9 @@ __device__ __forceinline__ void storeU16LE(uint8_t* dst, uint16_t value) {
 }
 
 // ── 32-bit little-endian load / store (unaligned-safe) ──────────
-// readU32LE — 4-byte LE load. Used pervasively: LZ match-finder hot loop,
+// readU32LE - 4-byte LE load. Used pervasively: LZ match-finder hot loop,
 // frame-walk kernel (block / chunk header fields), assemble kernel
-// (chunk-internal header). writeU32LE — 4-byte LE store, used by the
+// (chunk-internal header). writeU32LE - 4-byte LE store, used by the
 // assemble kernel (chunk-internal header + end mark).
 __device__ __forceinline__ uint32_t readU32LE(const uint8_t* p) {
     uint32_t v; memcpy(&v, p, 4); return v;

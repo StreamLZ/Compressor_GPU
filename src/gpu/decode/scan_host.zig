@@ -40,11 +40,11 @@ pub fn scanForEntropyChunks(
     var num_huff_tok: u32 = 0;
     var num_huff_hi: u32 = 0;
     var num_huff_lo: u32 = 0;
-    var cur_sub_idx: u32 = 0; // global sub-chunk index — mirrors driver prefix sum
+    var cur_sub_idx: u32 = 0; // global sub-chunk index - mirrors driver prefix sum
     const cap_safe: u32 = if (sub_chunk_cap == 0) 65536 else sub_chunk_cap;
 
     // SLZ_E2E_TIMER: per-sub-chunk walk timing. Measured ~0.5-0.9 ms on
-    // the dev desktop — the scan is not a decode bottleneck (decode is
+    // the dev desktop - the scan is not a decode bottleneck (decode is
     // PCIe-bound); SLZ_GPU_SCAN moves it to the GPU mainly for the
     // device-resident D2D path, not for speed.
     const scan_dbg = std.c.getenv("SLZ_E2E_TIMER") != null;
@@ -122,7 +122,7 @@ pub fn scanForEntropyChunks(
                 const tok_first = chunk_src[pos];
                 const tok_type = (tok_first >> d.CHUNK_TYPE_SHIFT) & d.CHUNK_TYPE_MASK;
                 if (tok_type == 4) {
-                    // Huffman token stream — record sub_dst_off; driver adds
+                    // Huffman token stream - record sub_dst_off; driver adds
                     // tok_offset later when merging into the unified descriptor array.
                     parseHuffHeader(chunk_src, pos, ch.src_offset, sub_dst_off,
                                     huff_tok_descs, &num_huff_tok);
@@ -222,7 +222,7 @@ pub fn scanForEntropyChunks(
 /// Writes a HuffDecChunkDesc whose in_offset points at the FULL payload
 /// (128 B weights + 93 B sub-header + 32 streams; see HUFF_NUM_STREAMS /
 /// HUFF_BODY_HEADER_BYTES in src/gpu/common/gpu_huffman.cuh). lut_offset
-/// is assigned by index — each descriptor owns HUFF_LUT_ENTRIES contiguous
+/// is assigned by index - each descriptor owns HUFF_LUT_ENTRIES contiguous
 /// LUT entries.
 fn parseHuffHeader(
     chunk_src: []const u8,
@@ -303,7 +303,7 @@ fn skipStreamHeader(chunk_src: []const u8, pos: u32) ?u32 {
             return pos + 3 + sz;
         }
     } else if (ct == 1 or ct == 2 or ct == 4 or ct == 6) {
-        // Entropy chunk types — Huffman (4) is GPU-emitted; types 1, 2, 6
+        // Entropy chunk types - Huffman (4) is GPU-emitted; types 1, 2, 6
         // are legacy and parsed for forward compat. 3 or 5 byte header +
         // compressed payload.
         if (first_byte >= 0x80) {

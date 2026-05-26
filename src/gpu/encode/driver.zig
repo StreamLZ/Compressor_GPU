@@ -1,4 +1,4 @@
-//! GPU encode driver — thin facade.
+//! GPU encode driver - thin facade.
 //!
 //! The encode driver was split into focused sub-modules during the GPU
 //! cleanup pass (roadmap item 5). External callers continue to import
@@ -7,14 +7,14 @@
 //! plus re-exports the per-handle `*Impl` functions from the sub-modules.
 //!
 //! Sub-module layout:
-//!   cuda_ffi.zig         — nvcuda.dll handle, CU* typedefs, FnXxx + cu*_fn slots, getProc
-//!   module_loader.zig    — PTX load, kernel-handle pub vars, init(), isAvailable()
-//!   encode_context.zig   — EncodeContext, CompressChunkDesc / AssembleDesc /
+//!   cuda_ffi.zig         - nvcuda.dll handle, CU* typedefs, FnXxx + cu*_fn slots, getProc
+//!   module_loader.zig    - PTX load, kernel-handle pub vars, init(), isAvailable()
+//!   encode_context.zig   - EncodeContext, CompressChunkDesc / AssembleDesc /
 //!                          HuffEncDesc, ensureBuf, copyDeviceToHost
-//!   levels.zig           — hashBitsForLevel / useGlobalHash / useChainParser
-//!   encode_lz.zig        — gpuCompressImpl (LZ launcher)
-//!   encode_huff.zig      — gpuEncodeHuffImpl + per-stream {Literals,Tokens,Off16} Impls
-//!   encode_assemble.zig  — gpuAssembleFrameImpl, gpuFrameAssembleImpl (4d device-resident)
+//!   levels.zig           - hashBitsForLevel / useGlobalHash / useChainParser
+//!   encode_lz.zig        - gpuCompressImpl (LZ launcher)
+//!   encode_huff.zig      - gpuEncodeHuffImpl + per-stream {Literals,Tokens,Off16} Impls
+//!   encode_assemble.zig  - gpuAssembleFrameImpl, gpuFrameAssembleImpl (4d device-resident)
 
 const std = @import("std");
 const module_loader = @import("module_loader.zig");
@@ -55,7 +55,7 @@ pub var g_default: EncodeContext = .{};
 /// Last LZ-encode kernel duration in nanoseconds (set when caller passes
 /// an `io` clock to `gpuCompressImpl`). Written by `encode_lz.gpuCompressImpl`
 /// via `@import("driver.zig").last_kernel_ns`. Separate from the decode
-/// driver's `last_kernel_ns` — the two are not interchangeable; reading
+/// driver's `last_kernel_ns` - the two are not interchangeable; reading
 /// this after a decode (or vice versa) returns a stale value.
 pub var last_kernel_ns: i64 = 0;
 

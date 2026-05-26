@@ -1,9 +1,9 @@
-// ── StreamLZ GPU LZ encode — serial chain-hash lazy parser ──────
+// ── StreamLZ GPU LZ encode - serial chain-hash lazy parser ──────
 // The use_chain=1 parser: a serial chain-hash lazy matcher run
 // entirely on lane 0. Port of the CPU runLazyParserChain. Used at
 // the higher levels where the driver enables chain mode.
 //
-// Included by lz_kernel.cu — see that file for the build line.
+// Included by lz_kernel.cu - see that file for the build line.
 #pragma once
 
 #include "lz_format.cuh"
@@ -111,7 +111,7 @@ __device__ ChainMatch findMatchChain(
                 while (ml < max_ext && src[pos + ml] == src[recent_ref + ml]) ml++;
 
                 // Insert current position into hash tables. The long_hash
-                // entry packs (hb_tag in low 6 bits) | (pos << 6) — the
+                // entry packs (hb_tag in low 6 bits) | (pos << 6) - the
                 // 26-bit pos truncation is safe because chunks are ≤ 256KB
                 // (= 2^18), so pos < 2^18 < 2^26 and the top 6 bits of
                 // (pos << LONG_HASH_TAG_BITS) are guaranteed zero.
@@ -126,7 +126,7 @@ __device__ ChainMatch findMatchChain(
             // xor_val has its lowest set bit at the first mismatched bit;
             // __ffs returns a 1-based bit index, so __ffs(x)-1 is the
             // 0-based trailing-zero count. Divided by BITS_PER_BYTE (=8)
-            // it counts full matching low bytes — the partial-match length.
+            // it counts full matching low bytes - the partial-match length.
             // (Mirrors CPU runChainParser recent-match path.)
             recent_match_length = (int32_t)(__ffs(xor_val) - 1) / (int32_t)BITS_PER_BYTE;
         }
@@ -192,7 +192,7 @@ __device__ ChainMatch findMatchChain(
                 }
             }
         }
-        // Note: there is no reachable "far first-hash" branch here —
+        // Note: there is no reachable "far first-hash" branch here -
         // NEAR_OFFSET_MAX == LZ_BLOCK_SIZE - 1, so any candidate_offset
         // > NEAR_OFFSET_MAX is also >= LZ_BLOCK_SIZE. Far matches are
         // discovered via the long_hash secondary table below.
@@ -303,7 +303,7 @@ __device__ void insertChainRange(
 
 // ── scanBlockChain: serial chain-hash lazy parser for one block ──
 // Port of CPU runLazyParserChain. Lane 0 does all work; the other
-// lanes do nothing here — the warp re-converges at the __syncwarp()
+// lanes do nothing here - the warp re-converges at the __syncwarp()
 // in the kernel after this function returns.
 //
 // Scans positions [start_pos .. end_pos), using the chain hasher to

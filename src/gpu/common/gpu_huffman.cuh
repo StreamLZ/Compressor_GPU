@@ -1,4 +1,4 @@
-// ── StreamLZ GPU — shared Huffman wire format & primitives ──────
+// ── StreamLZ GPU - shared Huffman wire format & primitives ──────
 // Shared by the two Huffman kernels (decode/huffman_kernel.cu and
 // encode/huffman_kernel.cu). Pure header: #pragma once, constants +
 // inline device helpers, no kernels and no translation-unit state.
@@ -28,8 +28,8 @@ static constexpr int HUFF_LEN_HIST_SIZE = HUFF_MAX_CODE_LEN + 2;    // 13
 
 // ── 32-stream wire-format constants ─────────────────────────────
 // chunk_type=4 body layout, where N = HUFF_NUM_STREAMS = 32:
-//   [HUFF_WEIGHTS_BYTES weights — 4 bits/symbol, packed low-nibble-first]
-//   [HUFF_SUBHEADER_BYTES sub-header — (N-1) × u24 LE stream sizes;
+//   [HUFF_WEIGHTS_BYTES weights - 4 bits/symbol, packed low-nibble-first]
+//   [HUFF_SUBHEADER_BYTES sub-header - (N-1) × u24 LE stream sizes;
 //                                       stream (N-1) size derived from total]
 //   [stream 0 | stream 1 | ... | stream N-1]
 //
@@ -63,7 +63,7 @@ static_assert(HUFF_NUM_STREAMS == 32,
 // 256 4-bit code lengths are stored in HUFF_WEIGHTS_BYTES bytes: byte i
 // holds symbol 2*i in the low nibble and symbol 2*i+1 in the high
 // nibble. packWeightByte / unpackWeightByte are exact inverses of one
-// nibble layout — the encoder packs, the decoder unpacks.
+// nibble layout - the encoder packs, the decoder unpacks.
 __device__ __forceinline__ uint8_t packWeightByte(uint8_t len_even, uint8_t len_odd) {
     return (uint8_t)((len_even & HUFF_NIBBLE_MASK)
                    | ((len_odd & HUFF_NIBBLE_MASK) << 4));
@@ -78,7 +78,7 @@ __device__ __forceinline__ void unpackWeightByte(uint8_t b, uint8_t& len_even,
 // ── Canonical-Huffman code construction ─────────────────────────
 // RFC-1951-style canonical code assignment: codes are assigned in
 // (length, symbol) ascending order. One helper shared by the decoder's
-// LUT builder and the encoder's table builder — both previously open-
+// LUT builder and the encoder's table builder - both previously open-
 // coded the identical algorithm. Called serially by one lane.
 //
 //   code_lengths : HUFF_ALPHABET entries; 0 = unused symbol.
@@ -111,16 +111,16 @@ __device__ __forceinline__ void buildCanonicalCodes(const uint8_t* code_lengths,
 
 // ── LUT entry packing / unpacking ───────────────────────────────
 // Same layout as tools/huff_test/huff_ref.c pack_lut_entry():
-//   bits  7:0  — sym1
-//   bits 15:8  — sym2
-//   bits 23:16 — total_len (bits consumed)
-//   bits 31:24 — num_syms (1, 2, or LUT_NUM_SYMS_ESCAPE)
+//   bits  7:0  - sym1
+//   bits 15:8  - sym2
+//   bits 23:16 - total_len (bits consumed)
+//   bits 31:24 - num_syms (1, 2, or LUT_NUM_SYMS_ESCAPE)
 static constexpr int LUT_SYM1_SHIFT = 0;
 static constexpr int LUT_SYM2_SHIFT = 8;
 static constexpr int LUT_LEN_SHIFT  = 16;
 static constexpr int LUT_NSYM_SHIFT = 24;
 
-// num_syms field values in a packed LUT entry — these are wire-format
+// num_syms field values in a packed LUT entry - these are wire-format
 // tag values stored in the LUT's high byte, not symbol counts (though
 // SINGLE=1 and DUAL=2 happen to match the count of symbols they emit).
 // ESCAPE=3 is chosen so any non-{1,2} value triggers the escape branch;
@@ -142,7 +142,7 @@ __device__ __forceinline__ uint32_t packLutEntry(uint8_t sym1, uint8_t sym2,
          | ((uint32_t)sym1      << LUT_SYM1_SHIFT);
 }
 
-// Field accessors mirroring packLutEntry — keep unpack centralized.
+// Field accessors mirroring packLutEntry - keep unpack centralized.
 // The four single-field accessors (lutSym1/lutSym2/lutTotalLen/lutNumSyms)
 // return uint8_t for type-consistency with packLutEntry's inputs;
 // lutSymPair returns uint16_t because callers consume it as a packed

@@ -9,7 +9,7 @@
 #pragma once
 
 #include "slz_wire_format.cuh"
-// Pulled in for HUFF_LUT_ENTRIES — the shared 4-stream Huffman wire format.
+// Pulled in for HUFF_LUT_ENTRIES - the shared 4-stream Huffman wire format.
 #include "../common/gpu_huffman.cuh"
 
 // ── Compact-huff-descs / Compact-raw-descs (4d Phase 3 step 4) ─────
@@ -21,7 +21,7 @@
 // Used by the pure-D2D pipeline to eliminate the CPU compaction loop
 // that gpuScanChunks used to do after a D2H of the staged data.
 
-// HuffDecChunkDesc output struct — must match the Zig HuffDecChunkDesc
+// HuffDecChunkDesc output struct - must match the Zig HuffDecChunkDesc
 // (and huffman_kernel.cu's local definition). 5 u32 = 20 bytes.
 struct SlzHuffDecChunkDesc {
     uint32_t in_offset, in_size, out_offset, out_size, lut_offset;
@@ -29,7 +29,7 @@ struct SlzHuffDecChunkDesc {
 static_assert(sizeof(SlzHuffDecChunkDesc) == 20, "ABI: keep in sync with decode/driver.zig");
 
 // Staged scan output (used by the compact kernels and slzScanParseKernel
-// below). chunk_type=4 Huffman stream descriptor — staged form:
+// below). chunk_type=4 Huffman stream descriptor - staged form:
 // lut_offset is assigned by the compact step, not the scan kernel.
 struct SlzScanHuffDesc { uint32_t in_offset, in_size, out_offset, out_size, valid; };
 struct SlzScanRawDesc  { uint32_t src_offset, size, gpu_offset, valid; };

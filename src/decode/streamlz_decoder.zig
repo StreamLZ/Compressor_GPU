@@ -121,7 +121,7 @@ pub fn decompressFramedFromDevice(
     // frame. Both are "the GPU can't handle this; fall back to host" —
     // semantic BadMode, not a CUDA-level failure.
     if (meta.status != 0) return error.BadMode;
-    if (meta.n_chunks == 0 or meta.n_chunks > gpu_driver.walk_max_chunks) return error.BadMode;
+    if (meta.n_chunks == 0 or meta.n_chunks > gpu_driver.WALK_MAX_CHUNKS) return error.BadMode;
     const chunks = allocator.alloc(gpu_driver.ChunkDesc, meta.n_chunks) catch return error.OutOfMemory;
     defer allocator.free(chunks);
     {

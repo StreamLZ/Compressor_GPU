@@ -52,7 +52,7 @@
 //   l4_features  -- non-zero enables match-range rehash in the greedy parser
 //
 // Output layout written by lane 0 (consumed by driver.zig and the
-// decode kernels — this is a format contract):
+// decode kernels - this is a format contract):
 //   [INITIAL_LITERAL_COPY_BYTES verbatim bytes]   (only if desc.is_first)
 //   [3-byte BE lit_count][literals]
 //   [3-byte BE token_count][tokens]
@@ -89,12 +89,12 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
 
     // Sub-stream working buffers carved out of dst. Each region is sized
     // for its worst case relative to src_size:
-    //   token_buf  : src_size / 4  — shortest token is 1 byte per 4-byte match,
+    //   token_buf  : src_size / 4  - shortest token is 1 byte per 4-byte match,
     //                                so token bytes ≤ src_size/4.
-    //   off16_buf  : src_size / 2  — each off16 entry is 2 bytes, and an
+    //   off16_buf  : src_size / 2  - each off16 entry is 2 bytes, and an
     //                                off16 token covers ≥ 4 src bytes, so
     //                                off16 bytes ≤ src_size/2.
-    //   len_buf    : src_size / 4  — extended-length bytes (1 or 3 each)
+    //   len_buf    : src_size / 4  - extended-length bytes (1 or 3 each)
     //                                only appear for long literals / matches,
     //                                bounded similarly.
     // Worst-case total: src_size + src_size/4 + src_size/2 + src_size/4

@@ -16,17 +16,17 @@ const CUdeviceptr = ffi.CUdeviceptr;
 
 // ── Wire-format byte sizes (Zig mirrors of common/gpu_wire_format.cuh) ──
 //
-//   INITIAL_LITERAL_COPY_BYTES — 8 verbatim literal bytes the very first
+//   INITIAL_LITERAL_COPY_BYTES - 8 verbatim literal bytes the very first
 //     sub-chunk emits as a raw prefix; per-sub-chunk init copies are
 //     restored from the SC-tail prefix table post-decode.
-//   SC_TAIL_PER_CHUNK_BYTES    — bytes-per-entry in the SC-tail prefix
+//   SC_TAIL_PER_CHUNK_BYTES    - bytes-per-entry in the SC-tail prefix
 //     table that follows the assembled blocks (entry i holds the first 8
 //     bytes of source chunk i+1, so the decoder can restore the init copy
 //     without re-encoding it inside each chunk).
-//   CHUNK_INTERNAL_HDR_BYTES   — per-chunk internal block header on disk:
+//   CHUNK_INTERNAL_HDR_BYTES   - per-chunk internal block header on disk:
 //     2-byte SLZ internal block header + 4-byte chunk-size word = 6 bytes
 //     prefixing each chunk's assembled payload.
-//   NEXT_HASH_ENTRIES          — chain-parser next-hash modular index size
+//   NEXT_HASH_ENTRIES          - chain-parser next-hash modular index size
 //     (2^16). Matches NEXT_HASH_SIZE in encode/lz_format.cuh.
 pub const INITIAL_LITERAL_COPY_BYTES: u32 = 8;
 pub const SC_TAIL_PER_CHUNK_BYTES: u32 = 8;
@@ -43,7 +43,7 @@ pub const CompressChunkDesc = extern struct {
 };
 
 // Per-sub-chunk descriptor for the frame-assembly kernels. Mirrors
-// `AssembleDesc` in assemble_kernel.cu — keep field order/types in sync.
+// `AssembleDesc` in assemble_kernel.cu - keep field order/types in sync.
 pub const AssembleDesc = extern struct {
     raw_offset: u32, // sub-chunk raw payload offset in d_output
     raw_size: u32, // raw payload byte count (comp_sizes[i])
@@ -60,7 +60,7 @@ pub const AssembleDesc = extern struct {
     out_offset: u32, // assembled [hdr+payload] destination (filled pass 2)
 };
 
-/// GPU Huffman encode descriptor — matches `HuffEncDesc` in
+/// GPU Huffman encode descriptor - matches `HuffEncDesc` in
 /// gpu_huff_kernel.cu. `src_stride` is 1 for a contiguous stream or 2
 /// to encode one off16 byte plane.
 pub const HuffEncDesc = extern struct {
@@ -94,7 +94,7 @@ pub const EncodeContext = struct {
 
     // 4d Phase 3: when set to a non-zero device address, gpuCompressImpl
     // populates d_input_persist via a D2D copy from this pointer instead
-    // of the H2D from the host `input` slice — the caller's data is
+    // of the H2D from the host `input` slice - the caller's data is
     // already GPU-resident (slzCompress D2D path). The caller resets it
     // to 0 after the compress call.
     d_input_override: u64 = 0,
@@ -108,11 +108,11 @@ pub const EncodeContext = struct {
     d_output_override: u64 = 0,
     output_written_to_device: bool = false,
 
-    // 4d step 8 scratch — small device buffers populated host-side per call:
-    //   d_frame_chunk_dst    — per-chunk dst offsets (n_chunks × u32)
-    //   d_frame_asm_offsets  — per-chunk asm-out start offsets (n_chunks × u32)
-    //   d_frame_asm_chunk_sz — per-chunk total asm size (n_chunks × u32)
-    //   d_frame_prefix_bytes — pre-formed frame_hdr + block_hdr (~40 B)
+    // 4d step 8 scratch - small device buffers populated host-side per call:
+    //   d_frame_chunk_dst    - per-chunk dst offsets (n_chunks × u32)
+    //   d_frame_asm_offsets  - per-chunk asm-out start offsets (n_chunks × u32)
+    //   d_frame_asm_chunk_sz - per-chunk total asm size (n_chunks × u32)
+    //   d_frame_prefix_bytes - pre-formed frame_hdr + block_hdr (~40 B)
     d_frame_chunk_dst: CUdeviceptr = 0,
     d_frame_chunk_dst_size: usize = 0,
     d_frame_asm_offsets: CUdeviceptr = 0,
@@ -161,7 +161,7 @@ pub const EncodeContext = struct {
     d_asm_out_size: usize = 0,
     d_asm_sizes: CUdeviceptr = 0,
     d_asm_sizes_size: usize = 0,
-    // Host-side assembled result — packed [3-byte sub-chunk hdr][payload]
+    // Host-side assembled result - packed [3-byte sub-chunk hdr][payload]
     // blocks; the frame assembler splices block i from
     // assembled_data[assembled_offsets[i]..][0..assembled_sizes[i]].
     assembled_data: ?[]u8 = null,
@@ -173,7 +173,7 @@ pub const EncodeContext = struct {
     // before the Huffman passes when SLZ_GPU_ASSEMBLE is active.
     huff_keep_device: bool = false,
 
-    // ── Result slices — formerly module-global `pub var`. Each encode
+    // ── Result slices - formerly module-global `pub var`. Each encode
     // operation writes its downloaded host-side payloads here; the frame
     // assembler reads them back. Moved into the context so the compress
     // path is reentrant per handle.
@@ -184,7 +184,7 @@ pub const EncodeContext = struct {
     // only legal teardown is:
     //   1. `allocator.free(huff_off16hi_data)` (the single real free), then
     //   2. null out ALL SIX off16 slots so a follow-up encode lands on a
-    //      clean context — sizes/data/offsets for hi AND lo:
+    //      clean context - sizes/data/offsets for hi AND lo:
     //        huff_off16hi_sizes, huff_off16hi_data, huff_off16hi_offsets,
     //        huff_off16lo_sizes, huff_off16lo_data, huff_off16lo_offsets.
     // See `deinit` below and `fast_framed.zig` for the canonical pattern.
@@ -217,7 +217,7 @@ pub const EncodeContext = struct {
                 if (ptr.* != 0) {
                     // Free failure on a pointer we know is valid (we
                     // allocated it via cuMemAlloc and never freed it)
-                    // means the driver/context is dying — there's
+                    // means the driver/context is dying - there's
                     // nothing useful we can do in a deinit path, so
                     // ignore the CUresult.
                     if (ffi.cuMemFree_fn) |free_fn| _ = free_fn(ptr.*);
