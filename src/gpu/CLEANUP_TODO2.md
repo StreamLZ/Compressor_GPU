@@ -102,7 +102,7 @@ is essentially flat post-revert.
 | K6 | K6.34 lz_decode_raw.cuh `if constexpr` | DONE | K6f-R3a `27c9114` |
 | K6 | K6.35 static_assert(WARP_SIZE == 32) | DONE | K6f-R1 `747fbad` |
 | K6 | K6.36 LAST_BIT_SET helper (`lastBitSet`) | DONE | K6f-R3a `27c9114` |
-| K6 | K6.37 lz_decode_general overflow check | NOT DONE — defer (adds hot-path work) |  |
+| K6 | K6.37 lz_decode_general overflow check on dst_end_abs | DONE (one-time clamp at fn entry, not in hot loop) | K6i `9aedcd9` |
 | K6 | K6.38 prefetched_token decl placement | DONE (documented hoist) | K6f-R3a `27c9114` |
 | K6 | K6.39 redundant break in per-block loop | DONE | `c025e21` |
 | K6 | K6.40 TokenType enum | DONE | K6f-R3a `27c9114` |
@@ -113,7 +113,7 @@ is essentially flat post-revert.
 | K6 | K6.46 decode huffman int → uint32_t | DONE | K6f-R2 `f921acf` |
 | K6 | K6.47 encode huffman drop redundant mask | DONE | K6f-R2 `f921acf` |
 | K6 | K6.48 encode huffman assert(len > 0) | DONE | K6f-R2 `f921acf` |
-| K6 | K6.49 huffman alignment hoist | NOT DONE — defer (risky inner-loop rewrite) |  |
+| K6 | K6.49 huffman alignment hoist | ATTEMPTED + REVERTED (L3 kernel +7-10%, PTX REG unchanged; C9-like scheduling regression) | K6i attempt `9aedcd9` |
 | K6 | K6.50 huffman code_lengths UB | ALREADY-DONE (K1 C2) | `712d593` |
 | K6 | K6.51 SLZ_GUARD_SINGLE_THREAD macro | DONE | `c025e21` |
 | K6 | K6.52 (uint32_t)INITIAL_LITERAL_COPY_BYTES cast | DONE | K6f-R1 `747fbad` |
