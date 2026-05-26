@@ -36,7 +36,7 @@ pub const HUFF_LUT_ENTRIES: usize = 1024; // matches MAX_CODE_LEN=10 (10-bit esc
 // Host-side max counts; sized for the largest frame the GPU codec
 // can produce (walk_max_chunks chunks * sub-chunks-per-chunk).
 //
-// K6.82: MAX_SUB_CHUNKS_PER_CHUNK names the host-scan path's worst-case
+// MAX_SUB_CHUNKS_PER_CHUNK names the host-scan path's worst-case
 // fan-out (each chunk produces at most this many entropy descs per
 // stream). Expressing the cap as WALK_MAX_CHUNKS / MAX_SUB_CHUNKS_PER_CHUNK
 // makes the relationship visible; the scan_gpu.zig D2D path uses a

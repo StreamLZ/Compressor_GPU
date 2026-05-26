@@ -104,7 +104,7 @@ pub fn init() bool {
         var existing: usize = 0;
         if (get_current(&existing) == CUDA_SUCCESS and existing != 0) cuda.ctx = existing;
     }
-    // K6.85: surface which branch the e2e timer measured so the "ctx" cost
+    // Surface which branch the e2e timer measured so the "ctx" cost
     // in the print below is interpretable (piggyback skips cuCtxCreate
     // entirely; standalone pays the full ~40 ms context cost).
     const piggyback_ctx = cuda.ctx != 0;

@@ -261,8 +261,8 @@ fn parseHuffHeader(
     num_huff.* += 1;
 }
 
-/// Parse-helper return type for type 0 (memcpy) stream headers. Local to
-/// scan_host (the only consumer; K6.74 moved it out of descriptors.zig).
+/// Parse-helper return type for type 0 (memcpy) stream headers. Local
+/// to scan_host (the only consumer; previously lived in descriptors.zig).
 const Type0Info = struct { data_offset: u32, size: u32 };
 
 /// Parse a type 0 (memcpy) stream header, returning the data offset

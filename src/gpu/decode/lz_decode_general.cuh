@@ -69,7 +69,7 @@ __device__ __forceinline__ void deltaLiteralCopyBounded(
 // The five __shfl_sync broadcasts of dst_pos / lit_pos in the token
 // loop and per-block / final trailing-literal sections look formally
 // redundant (every lane updates both by the broadcast lit_len /
-// match_len count). The K1 cleanup removed them on that argument and
+// match_len count). A prior cleanup removed them on that argument and
 // L3 enwik8 kernel time regressed ~130 µs (+2%) measurably. The PTX
 // REG count stays at 40 either way, so the cost is scheduling /
 // memory-ordering, not register pressure. Keep the shfls.
@@ -80,7 +80,8 @@ __device__ void decodeSubChunkGeneral(
 ) {
     // Hoist field reads into locals so the hot loop addresses registers
     // rather than restating `ps.x` everywhere. nvcc would do this anyway
-    // but the explicit form preserves the pre-K5.6 codegen shape.
+    // but the explicit form preserves the codegen shape from before the
+    // struct-arg refactor.
     const uint8_t* __restrict__ cmd = ps.cmd_ptr;
     const uint32_t cmd_size = ps.cmd_size;
     const uint8_t* __restrict__ lit = ps.lit_ptr;

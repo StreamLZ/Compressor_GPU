@@ -198,11 +198,11 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
     // for the rest of the decode — every u32 store advances `written` by
     // exactly 4, preserving alignment.
     //
-    // K6.49 (a prior attempt to use this same preamble idea on the
-    // earlier 1-lookup hot loop) regressed 7-10% because a 1-lookup body
-    // didn't amortize the preamble cost. The 2-lookup hot loop below
-    // does — the at-most-3 byte stores here are paid back across
-    // thousands of output bytes per lane.
+    // A prior attempt to use this same preamble idea on the earlier
+    // 1-lookup hot loop regressed 7-10% because a 1-lookup body didn't
+    // amortize the preamble cost. The 2-lookup hot loop below does —
+    // the at-most-3 byte stores here are paid back across thousands of
+    // output bytes per lane.
     //
     // Cap: at most ~3 iterations of this outer loop, since each decode
     // emits 1-2 bytes and we exit as soon as alignment is reached.

@@ -132,9 +132,9 @@ fn decompressCoreD2D(h: *Context, frame_bytes: []const u8, d_output: u64, opts: 
     ) catch |err| return switch (err) {
         // Any GpuError → fall back to host-bounce. The fan-out into
         // BackendNotAvailable / OutOfDeviceMemory / KernelLaunchFailed /
-        // SyncFailed / CopyFailed / KernelMissing (K5.1) is purely
-        // diagnostic — all of them mean the same thing here: the GPU
-        // couldn't do it, the caller should retry on the host path.
+        // SyncFailed / CopyFailed / KernelMissing is purely diagnostic:
+        // all of them mean the same thing here, that the GPU couldn't
+        // do it and the caller should retry on the host path.
         error.BadMode,
         error.BackendNotAvailable,
         error.OutOfDeviceMemory,
@@ -291,7 +291,7 @@ const DecompressJobTrueD2D = struct {
             j.d_dst,
             &j.h.dec,
         ) catch |err| {
-            // Any GpuError → caller falls back. K5.1 fan-out (Backend-
+            // Any GpuError → caller falls back. The fan-out (Backend-
             // NotAvailable / OutOfDeviceMemory / KernelLaunchFailed /
             // SyncFailed / CopyFailed / KernelMissing) is diagnostic only;
             // all of them map to "GPU couldn't do it, retry on host".

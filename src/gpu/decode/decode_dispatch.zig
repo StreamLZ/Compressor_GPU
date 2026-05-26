@@ -180,9 +180,9 @@ fn gatherRawOff16(
             // ndesc is exact (host already knows the count); no over-launch.
             // The self-gate inside the kernel makes over-launch safe regardless.
             //
-            // K5.9 decision: KEEP the D2D/H2D fallback below and treat the
-            // launch as a best-effort fast path. Justification: the two
-            // failure modes are disjoint — the kernel-launch path needs
+            // The D2D/H2D fallback below is KEPT and the launch treated
+            // as a best-effort fast path. Justification: the two failure
+            // modes are disjoint — the kernel-launch path needs
             // `cuLaunchKernel + scratch_base + descs`; the fallback path
             // needs only `cuMemcpyDtoDAsync` (or `cuMemcpyHtoD`) + the
             // same buffers. A driver glitch that breaks launch (e.g. the
@@ -407,7 +407,7 @@ pub fn fullGpuLaunchImpl(
     // launch below run on stream 0; this also stalls any work the caller
     // had on other streams. Acceptable here because this is the *front
     // end* of the pipeline — work_stream-bound kernels haven't launched
-    // yet (the back half is the only async-callable region). See K5.4.
+    // yet (the back half is the only async-callable region).
     try cudaCall(sync_fn(), .sync);
 
     // 4d Phase 3 step 6: prefix-sum runs on device. The 4-byte D2H of
@@ -554,7 +554,7 @@ pub fn fullGpuLaunchImpl(
         // stream 0 before the LZ kernels launch on heavy_stream. Caller's
         // work_stream may have other pending work — we accept stalling it
         // here because the pipeline transition needs everything settled
-        // (chunk descs, huff scratch, pipeline_streams readiness). See K5.4.
+        // (chunk descs, huff scratch, pipeline_streams readiness).
         try cudaCall(sync_fn(), .sync);
 
         // ── KERNEL TIMER: only pure GPU kernel time from here ──
