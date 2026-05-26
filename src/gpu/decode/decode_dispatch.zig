@@ -370,6 +370,11 @@ pub fn fullGpuLaunchImpl(
     // them. The lower H2D path is still present and unconditionally
     // re-uploads; this hoist is what feeds the prefix-sum kernel.
     try cudaCall(h2d_fn(self.d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes));
+    // Ordering contract: ctx-wide sync. The descs and the prefix-sum
+    // launch below run on stream 0; this also stalls any work the caller
+    // had on other streams. Acceptable here because this is the *front
+    // end* of the pipeline — work_stream-bound kernels haven't launched
+    // yet (the back half is the only async-callable region). See K5.4.
     try cudaCall(sync_fn());
 
     // 4d Phase 3 step 6: prefix-sum runs on device. The 4-byte D2H of
@@ -414,6 +419,8 @@ pub fn fullGpuLaunchImpl(
             try cudaCall(h2d_fn(self.d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len));
         }
     }
+    // Ctx-wide sync: same rationale as above. We're still in the front-
+    // end H2D phase; caller's async work hasn't been scheduled yet.
     try cudaCall(sync_fn());
     if (t_e2e0) |t0| if (io) |iv| {
         e2e_cum.h2d = @intCast(t0.untilNow(iv, .awake).toNanoseconds());
@@ -509,6 +516,11 @@ pub fn fullGpuLaunchImpl(
     const heavy_stream: usize = if (self.work_stream != 0) self.work_stream else self.pipeline_streams[0];
     {
         const pipe_chunk_count = (total_chunks + NUM_PIPELINE_STREAMS - 1) / NUM_PIPELINE_STREAMS;
+        // Ctx-wide sync: drain the H2D + scan + compact + merge work on
+        // stream 0 before the LZ kernels launch on heavy_stream. Caller's
+        // work_stream may have other pending work — we accept stalling it
+        // here because the pipeline transition needs everything settled
+        // (chunk descs, huff scratch, pipeline_streams readiness). See K5.4.
         try cudaCall(sync_fn());
 
         // ── KERNEL TIMER: only pure GPU kernel time from here ──

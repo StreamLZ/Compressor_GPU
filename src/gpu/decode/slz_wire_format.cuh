@@ -238,6 +238,14 @@ __device__ __forceinline__ EntropyHdrFields parseEntropyHdrFields(const uint8_t*
 // Cursor-advancing wrapper used by the per-warp decoder. Reads a 2- or
 // 3-byte big-endian size prefix, advances src past the prefix, and
 // returns the raw size.
+//
+// SAFETY: this helper does NOT bounds-check `src`. Caller must guarantee
+// `src + 3` is in-bounds (the maximum header_bytes is 3, returned by
+// parseType0HdrFields for the long-form). The two call sites that pass
+// short-form headers (header_bytes = 2) still tolerate the extra byte:
+// per-warp decoders always reserve a full 3-byte read window. The scan
+// kernel uses the explicit (pos, chunk_len) parser variants in
+// scan_parse_kernel.cuh which do bounds-check.
 __device__ inline uint32_t parseRawStreamSize(const uint8_t*& src) {
     Type0HdrFields h = parseType0HdrFields(src);
     src += h.header_bytes;
@@ -250,6 +258,15 @@ __device__ inline uint32_t parseRawStreamSize(const uint8_t*& src) {
 // Huffman; decoder also accepts legacy types 1 and 6 in older frames),
 // advances src past the header + payload, and returns the decompressed
 // size; the compressed size is written to out_comp_size.
+//
+// SAFETY: caller must guarantee `src + 5 <= sub_chunk_end` (the maximum
+// header_bytes is 5, returned by parseEntropyHdrFields for the long-form).
+// The per-warp decoder paths in `lz_dispatch.cuh::parseAndDecodeSubChunk[Raw]`
+// satisfy this because the encoder cannot emit a sub-chunk smaller than
+// its own header + payload — the sub-chunk header in `cmd[0..3]`
+// constrains the byte range. The scan kernel uses the cursor-free
+// scanSkipStreamHeader variant in scan_parse_kernel.cuh which checks
+// `pos + need <= chunk_len` explicitly.
 __device__ inline uint32_t parseEntropyHeader(const uint8_t*& src,
                                               uint32_t& out_comp_size) {
     EntropyHdrFields h = parseEntropyHdrFields(src);
