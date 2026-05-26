@@ -23,6 +23,14 @@
 const std = @import("std");
 const ffi = @import("cuda_ffi.zig");
 
+/// Embed a `.ptx` file as a null-terminated byte slice. The CUDA Driver
+/// API's `cuModuleLoadData` takes a C-string pointer; embedding the file
+/// raw gives a sized byte array that is NOT null-terminated, hence the
+/// `++ "\x00"`. The .ptr field of the returned slice is `[*:0]const u8`.
+fn nullTerminatedPtx(comptime name: []const u8) [:0]const u8 {
+    return @embedFile(name) ++ "\x00";
+}
+
 // Per-module handles. CUDA context comes from the decode driver — see
 // the file-level doc above.
 pub var module: ffi.CUmodule = 0;
@@ -59,7 +67,7 @@ pub fn init() bool {
     ffi.cuCtxSynchronize_fn = ffi.getProc(ffi.FnCtxSync, "cuCtxSynchronize");
     ffi.cuMemsetD8_fn = ffi.getProc(ffi.FnMemsetD8, "cuMemsetD8_v2");
 
-    const ptx = @embedFile("lz_kernel.ptx") ++ "\x00";
+    const ptx = nullTerminatedPtx("lz_kernel.ptx");
     if ((ffi.cuModuleLoadData_fn orelse return false)(&module, ptx.ptr) != ffi.CUDA_SUCCESS) return false;
 
     const get_fn = ffi.cuModuleGetFunction_fn orelse return false;
@@ -68,7 +76,7 @@ pub fn init() bool {
     // GPU Huffman encoder (chunk_type=4). Optional — if the module or
     // either kernel is missing, gpuEncode*Huff returns false and the
     // caller falls back to the CPU Huffman encoder.
-    const huff_ptx = @embedFile("huffman_kernel.ptx") ++ "\x00";
+    const huff_ptx = nullTerminatedPtx("huffman_kernel.ptx");
     if ((ffi.cuModuleLoadData_fn orelse return false)(&huff_module, huff_ptx.ptr) == ffi.CUDA_SUCCESS) {
         _ = get_fn(&huff_tables_kernel_fn, huff_module, "slzHuffBuildTablesKernel");
         _ = get_fn(&huff_encode_kernel_fn, huff_module, "slzHuffEncode4StreamKernel");
@@ -76,7 +84,7 @@ pub fn init() bool {
 
     // GPU frame-assembly kernels (chunk_type=4 device-resident compress
     // tail). Optional — gpuAssembleFrameImpl returns false if absent.
-    const asm_ptx = @embedFile("assemble_kernel.ptx") ++ "\x00";
+    const asm_ptx = nullTerminatedPtx("assemble_kernel.ptx");
     if ((ffi.cuModuleLoadData_fn orelse return false)(&assemble_module, asm_ptx.ptr) == ffi.CUDA_SUCCESS) {
         _ = get_fn(&assemble_measure_fn, assemble_module, "slzAssembleMeasureKernel");
         _ = get_fn(&assemble_write_fn, assemble_module, "slzAssembleWriteKernel");

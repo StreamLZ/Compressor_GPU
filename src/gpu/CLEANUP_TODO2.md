@@ -118,17 +118,23 @@ is essentially flat post-revert.
 | K6 | K6.51 SLZ_GUARD_SINGLE_THREAD macro | DONE | `c025e21` |
 | K6 | K6.52 (uint32_t)INITIAL_LITERAL_COPY_BYTES cast | DONE | K6f-R1 `747fbad` |
 | K6 | K6.53 chunk_type 1/6 naming | ALREADY-DONE (no tANS naming remains) |  |
-| K6 | K6.54-K6.60 encode CUDA misc polish | NOT DONE — defer |  |
+| K6 | K6.54 INITIAL_RECENT_OFFSET (encode) | ALREADY-DONE (K3.18) | `01e9e38` |
+| K6 | K6.55 negative-tag underflow idiom comment | DONE | K6g `daf4711` |
+| K6 | K6.56 length_value > 0 vs >= 0 documented | DONE | K6g `daf4711` |
+| K6 | K6.57 sub-stream sizing divisors documented | DONE | K6g `daf4711` |
+| K6 | K6.58 26-bit pos truncation comment | DONE | K6g `daf4711` |
+| K6 | K6.59 CPU oracle citations | DONE | K6g `daf4711` |
+| K6 | K6.60 __ffs trailing-zero comment | DONE | K6g `daf4711` |
 | K6 | K6.61 __syncwarp() comment in assemble | DONE | `c025e21` |
 | K6 | K6.62 decode_dispatch `var dd = s;` shadow | DONE | `1212a2e` |
 | K6 | K6.63 cache SLZ_HUFF_DBG getenv | DONE | `1212a2e` |
 | K6 | K6.66 .{0} ** 1 → @splat(0) for pipeline_streams | DONE | K6e |
 | K6 | K6.67 decode_dispatch two-step assignment collapse | DONE | K6e |
-| K6 | K6.68 setupLzCommonParams helper extract | NOT DONE — defer, warmer dispatch code |  |
+| K6 | K6.68 LzCommonParams struct extract | DONE | K6h `<HEAD>` |
 | K6 | K6.69 scan_gpu _t → t_walk / t_prefix rename | DONE | K6e |
 | K6 | K6.70 scan_gpu drop vestigial first_subchunk_idx param | DONE | K6e |
 | K6 | K6.71 scan_gpu comment grammar fix | DONE | K6e |
-| K6 | K6.72 scan_gpu cudaCall convention | SKIPPED — needs return-type change rippling to callers |  |
+| K6 | K6.72 scan_gpu cudaCall convention | DONE (documented intent — `?T` is fallback-to-host semantics, by design) | K6h |
 | K6 | K6.73 descriptors.zig ScanResult num_raw_off16 default | DONE | K6e |
 | K6 | K6.74 descriptors.zig Type0Info → scan_host.zig | DONE | K6e |
 | K6 | K6.75 GpuError doc path pointer | DONE | K6e |
@@ -137,10 +143,10 @@ is essentially flat post-revert.
 | K6 | K6.78 decode_context finalizeProfiling swallow comment | DONE | K6e |
 | K6 | K6.79 decode_context dd → destroy_fn rename | DONE | K6e |
 | K6 | K6.80 decode_context move h_pinned_output next to d_output | DONE | K6e |
-| K6 | K6.81 decode_context promote // group comments to /// | SKIPPED — group comments span many fields, real refactor needed |  |
+| K6 | K6.81 decode_context promote // group comments to /// | NOT DONE — confirmed: group comments span many fields, needs real refactor (split each block into per-field comments). Defer. |  |
 | K6 | K6.82 descriptors MAX_HUFF_DESCS_PER_STREAM relationship | DONE | K6e |
-| K6 | K6.83 dumpScanIfRequested portability | NOT DONE — over-refactor risk |  |
-| K6 | K6.84 nullTerminatedPtx helper extract | NOT DONE — defer (module loader path) |  |
+| K6 | K6.83 dumpScanIfRequested portability | DONE (env-var-driven path; libc fopen kept since dev-only) | K6h |
+| K6 | K6.84 nullTerminatedPtx helper extract | DONE (both decode + encode module_loaders) | K6h |
 | K6 | K6.85 SLZ_E2E_TIMER print piggyback vs create | DONE | K6e |
 | K6 | K6.86 cuda_api.zig ctx → ?usize | NOT DONE — too invasive (used pervasively as usize) |  |
 | K6 | K6.87 NUM_PIPELINE_STREAMS = 1 history comment | DONE | K6e |

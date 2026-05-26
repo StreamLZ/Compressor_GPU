@@ -38,6 +38,18 @@ const beginKernelTiming = dec_ctx.beginKernelTiming;
 const endKernelTiming = dec_ctx.endKernelTiming;
 const finalizeProfiling = dec_ctx.finalizeProfiling;
 
+/// The six params shared by both LZ-decode kernel variants (raw and
+/// general). Kept as a struct so each field has a stable address for the
+/// CUDA kernel-params array (which takes `&field` pointers).
+const LzCommonParams = struct {
+    comp: CUdeviceptr,
+    descs_dev: CUdeviceptr,
+    dst: CUdeviceptr,
+    cpg: u32, // chunks_per_group
+    total: CUdeviceptr, // d_n_groups_scratch pointer
+    sc_cap: u32, // sub_chunk_cap
+};
+
 /// Pre-decode preparation: combine the four per-stream-type Huffman
 /// descriptor arrays (lit / tok / off16-hi / off16-lo) into one merged
 /// device array in `self.d_huff_descs`, with out_offsets adjusted by
@@ -258,10 +270,27 @@ fn dumpScanIfRequested(
     scan: ScanResult,
 ) void {
     if (std.c.getenv("SLZ_DUMP_SCAN") == null) return;
+    // Dev-debug-only path gated on SLZ_DUMP_SCAN. Uses libc fopen so
+    // no `std.Io` plumbing is needed (the rest of this fn signature has
+    // no io param). The Zig 0.16 `std.Io.Dir.cwd().createFile` API does
+    // require an io param; threading one through is a bigger refactor
+    // than this debug helper warrants. Path is the value of SLZ_DUMP_SCAN
+    // if it looks like a path, else "scan_dump.bin" in cwd (was
+    // hard-coded "c:/tmp/scan_dump.bin", Windows-only).
     const cio = @cImport({
         @cInclude("stdio.h");
     });
-    const fp = cio.fopen("c:/tmp/scan_dump.bin", "wb") orelse return;
+    const env = std.c.getenv("SLZ_DUMP_SCAN").?;
+    // Treat a value of "1" / "true" / "yes" as the default path; anything
+    // else is the literal path the user wants.
+    const env_slice = std.mem.sliceTo(env, 0);
+    const path: [*:0]const u8 = if (env_slice.len <= 1 or
+        std.mem.eql(u8, env_slice, "true") or
+        std.mem.eql(u8, env_slice, "yes"))
+        "scan_dump.bin"
+    else
+        env;
+    const fp = cio.fopen(path, "wb") orelse return;
     defer _ = cio.fclose(fp);
     var hdr = [_]u32{
         0x53434E31, // 'SCN1'
@@ -642,44 +671,46 @@ pub fn fullGpuLaunchImpl(
             // Huffman literals require the general kernel (it reads entropy_scratch).
             const use_raw_kernel = n_huff == 0 and ml.kernel_raw_fn != 0;
 
+            // The six common params shared by both LZ-decode kernel
+            // variants. Storage is a struct so each field has a stable
+            // address for the kernel-params array.
+            var common = LzCommonParams{
+                .comp = self.d_comp_persist,
+                .descs_dev = self.d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc),
+                .dst = self.d_output,
+                .cpg = chunks_per_group,
+                .total = self.d_n_groups_scratch,
+                .sc_cap = sub_chunk_cap,
+            };
+
             if (use_raw_kernel) {
-                var p_comp = self.d_comp_persist;
-                var p_descs_dev = self.d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc);
-                var p_dst = self.d_output;
-                var p_cpg = chunks_per_group;
-                var p_total = self.d_n_groups_scratch;
-                var p_sc_cap = sub_chunk_cap;
                 var raw_params = [_]?*anyopaque{
-                    @ptrCast(&p_comp),
-                    @ptrCast(&p_descs_dev),
-                    @ptrCast(&p_dst),
-                    @ptrCast(&p_cpg),
-                    @ptrCast(&p_total),
-                    @ptrCast(&p_sc_cap),
+                    @ptrCast(&common.comp),
+                    @ptrCast(&common.descs_dev),
+                    @ptrCast(&common.dst),
+                    @ptrCast(&common.cpg),
+                    @ptrCast(&common.total),
+                    @ptrCast(&common.sc_cap),
                 };
                 var raw_extra = [_]?*anyopaque{null};
                 const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", stream);
                 try cudaCall(launch_fn(ml.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra));
                 endKernelTiming(t_lzr, stream);
             } else {
-                var p_comp = self.d_comp_persist;
-                var p_descs_dev = self.d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc);
-                var p_dst = self.d_output;
-                var p_cpg = chunks_per_group;
-                var p_total = self.d_n_groups_scratch;
-                var p_sc_cap = sub_chunk_cap;
+                // General kernel additionally takes entropy_scratch +
+                // slot_stride + first_sub_idx (variable per launch).
                 var p_entropy_scratch = self.d_entropy_scratch;
                 var p_entropy_slot_stride: u64 = @as(u64, total_subchunks) * d.ENTROPY_SCRATCH_SLOT_BYTES;
                 var p_first_sub_idx: CUdeviceptr = self.d_first_subchunk_idx +
                     if (self.d_first_subchunk_idx != 0) @as(u64, chunk_start) * @sizeOf(u32) else 0;
 
                 var lz_params = [_]?*anyopaque{
-                    @ptrCast(&p_comp),
-                    @ptrCast(&p_descs_dev),
-                    @ptrCast(&p_dst),
-                    @ptrCast(&p_cpg),
-                    @ptrCast(&p_total),
-                    @ptrCast(&p_sc_cap),
+                    @ptrCast(&common.comp),
+                    @ptrCast(&common.descs_dev),
+                    @ptrCast(&common.dst),
+                    @ptrCast(&common.cpg),
+                    @ptrCast(&common.total),
+                    @ptrCast(&common.sc_cap),
                     @ptrCast(&p_entropy_scratch),
                     @ptrCast(&p_entropy_slot_stride),
                     @ptrCast(&p_first_sub_idx),

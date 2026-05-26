@@ -18,6 +18,14 @@ const CUdevice = cuda.CUdevice;
 const CUDA_SUCCESS = cuda.CUDA_SUCCESS;
 
 // ── Kernel module + function handles ─────────────────────────────
+/// Embed a `.ptx` file as a null-terminated byte slice. The CUDA Driver
+/// API's `cuModuleLoadData` takes a C-string pointer; embedding the file
+/// raw gives a sized byte array that is NOT null-terminated, hence the
+/// `++ "\x00"`. The .ptr field of the returned slice is `[*:0]const u8`.
+fn nullTerminatedPtx(comptime name: []const u8) [:0]const u8 {
+    return @embedFile(name) ++ "\x00";
+}
+
 pub var module: usize = 0;
 pub var kernel_fn: usize = 0;
 pub var kernel_raw_fn: usize = 0;
@@ -109,7 +117,7 @@ pub fn init() bool {
     const get_fn = cuda.cuModuleGetFunction_fn orelse return false;
 
     // Load LZ decode kernel (Pass 2)
-    const ptx = @embedFile("lz_kernel.ptx") ++ "\x00";
+    const ptx = nullTerminatedPtx("lz_kernel.ptx");
     if (load_fn(&module, ptx.ptr) != CUDA_SUCCESS) return false;
     if (get_fn(&kernel_fn, module, "slzLzDecodeKernel") != CUDA_SUCCESS) return false;
     // Optional raw-off16 gather kernel — driver falls back to D2D copies
@@ -134,7 +142,7 @@ pub fn init() bool {
     const t_lz = cuda.qpcNow();
 
     // Load Huffman decode kernels (Pass 1.5, for chunk_type=4 literals)
-    const huff_ptx = @embedFile("huffman_kernel.ptx") ++ "\x00";
+    const huff_ptx = nullTerminatedPtx("huffman_kernel.ptx");
     if (load_fn(&huff_module, huff_ptx.ptr) == CUDA_SUCCESS) {
         _ = get_fn(&huff_build_fn, huff_module, "slzHuffBuildLutKernel");
         _ = get_fn(&huff_decode_fn, huff_module, "slzHuffDecode4StreamKernel");

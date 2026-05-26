@@ -6,6 +6,17 @@
 //! Each entry point gracefully returns null when its kernel symbol isn't
 //! loaded so the host-scan fallback in `decode_dispatch.zig` can pick up
 //! without a rebuild.
+//!
+//! Convention note (K6.72): this file uses the `?T` return + raw
+//! `if (rc != CUDA_SUCCESS) return null;` pattern intentionally, NOT
+//! `GpuError!T` + `try cudaCall(...)` like `decode_dispatch.zig`.
+//! Reason: scan_gpu functions are best-effort fast paths — null means
+//! "fall back to host scan" (or skip this optimization), not "the decode
+//! has failed". The caller in `fullGpuLaunchImpl` always has the
+//! `scan_host.zig` fallback available. Promoting CUDA failures to errors
+//! here would force the caller to either re-fallback in a catch (back to
+//! null-equivalent) or fail the whole decode on what is recoverable. The
+//! current convention preserves that recoverability.
 
 const std = @import("std");
 
