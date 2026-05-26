@@ -159,22 +159,48 @@ pub const PrefixSumResultDev = struct {
     d_total_subchunks: u64,
 };
 
-/// Error set returned by `fullGpuLaunch` / `fullGpuLaunchImpl`. The GPU
-/// decode path only ever fails with `BadMode` (driver/kernel unavailable,
-/// device allocation failure, or a CUDA call returning non-success). Kept
-/// local so this file imports nothing outside `src/gpu/`. `BadMode` is a
-/// member of the decoder's `DecodeError` (see
-/// `src/decode/fast/fast_lz_decoder.zig` — the `fast.DecodeError` set),
-/// so callers that return `DecompressError` (which includes
-/// `fast.DecodeError`) still unify.
+/// Error set returned by the GPU decode path. Names are intentionally
+/// backend-neutral so the same set works for the CUDA driver and the
+/// Vulkan compute backend (`vulkan_driver.zig`). `BadMode` stays as a
+/// member because (a) it's part of `fast.DecodeError` (see
+/// `src/decode/fast/fast_lz_decoder.zig`) so callers that return
+/// `DecompressError` already unify, and (b) the C ABI in
+/// `src/streamlz_gpu.zig` switches on `error.BadMode` as the
+/// "fall back to CPU" signal. Treat the new members as more-informative
+/// variants that ALSO trigger fallback — the higher-level catch sites
+/// catch the full `GpuError` set, not just `BadMode`.
 pub const GpuError = error{
-    BadMode,
+    BackendNotAvailable, // dlopen/getProc, cuInit, vkCreateInstance failed
+    OutOfDeviceMemory, // cuMemAlloc / vkAllocateMemory failed
+    KernelLaunchFailed, // cuLaunchKernel / vkCmdDispatch+QueueSubmit failed
+    SyncFailed, // cuCtxSync / cuStreamSync / vkWaitForFences failed
+    CopyFailed, // cuMemcpy[HtoD|DtoH|DtoDAsync] / vkCmdCopyBuffer failed
+    KernelMissing, // a required kernel handle is 0 (PTX loaded but symbol absent)
+    BadMode, // ABI-compat + catch-all fallback signal
+};
+
+/// Tag categorizing what the wrapped CUDA call was doing, so `cudaCall`
+/// can return the right `GpuError` member on failure. Threaded as a
+/// `comptime` parameter so the switch is constant-folded.
+pub const ErrorKind = enum {
+    launch, // cuLaunchKernel
+    sync, // cuCtxSynchronize / cuStreamSynchronize
+    copy, // cuMemcpy* (any direction, sync or async) + cuMemsetD8*
+    alloc, // cuMemAlloc (and the bool-returning ensureDeviceBuf wrappers)
+    init, // cuInit / cuDeviceGet / cuCtxCreate / cuModuleLoadData
 };
 
 /// Funnel any CUDA Driver API return code into the GpuError surface so
-/// callers can `try cudaCall(cuMemcpyHtoD_fn(...))` instead of dropping
-/// the result with `_ = ...`. The decode path's only failure mode is
-/// `BadMode`; this keeps every silent-corruption surface one `try` away.
-pub fn cudaCall(rc: c_int) GpuError!void {
-    if (rc != 0) return error.BadMode; // CUDA_SUCCESS == 0
+/// callers can `try cudaCall(cuMemcpyHtoD_fn(...), .copy)` instead of
+/// dropping the result with `_ = ...`. The `kind` tag selects which
+/// `GpuError` member to return — see ErrorKind above for the mapping.
+pub fn cudaCall(rc: c_int, comptime kind: ErrorKind) GpuError!void {
+    if (rc == 0) return; // CUDA_SUCCESS == 0
+    return switch (kind) {
+        .launch => error.KernelLaunchFailed,
+        .sync => error.SyncFailed,
+        .copy => error.CopyFailed,
+        .alloc => error.OutOfDeviceMemory,
+        .init => error.BackendNotAvailable,
+    };
 }

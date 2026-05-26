@@ -130,7 +130,19 @@ fn decompressCoreD2D(h: *Context, frame_bytes: []const u8, d_output: u64, opts: 
         0,
         &h.dec,
     ) catch |err| return switch (err) {
-        error.BadMode => -1, // signal "fall back"
+        // Any GpuError → fall back to host-bounce. The fan-out into
+        // BackendNotAvailable / OutOfDeviceMemory / KernelLaunchFailed /
+        // SyncFailed / CopyFailed / KernelMissing (K5.1) is purely
+        // diagnostic — all of them mean the same thing here: the GPU
+        // couldn't do it, the caller should retry on the host path.
+        error.BadMode,
+        error.BackendNotAvailable,
+        error.OutOfDeviceMemory,
+        error.KernelLaunchFailed,
+        error.SyncFailed,
+        error.CopyFailed,
+        error.KernelMissing,
+        => -1,
         else => mapDecompressError(err),
     };
     // For a frame with a dictionary prefix, the decoded content sits at
@@ -279,12 +291,23 @@ const DecompressJobTrueD2D = struct {
             j.d_dst,
             &j.h.dec,
         ) catch |err| {
-            // BadMode → unsupported frame shape; caller falls back.
-            if (err == error.BadMode) {
-                j.fall_back = true;
-                j.result = SLZ_ERROR_CUDA;
-            } else {
-                j.result = mapDecompressError(err);
+            // Any GpuError → caller falls back. K5.1 fan-out (Backend-
+            // NotAvailable / OutOfDeviceMemory / KernelLaunchFailed /
+            // SyncFailed / CopyFailed / KernelMissing) is diagnostic only;
+            // all of them map to "GPU couldn't do it, retry on host".
+            switch (err) {
+                error.BadMode,
+                error.BackendNotAvailable,
+                error.OutOfDeviceMemory,
+                error.KernelLaunchFailed,
+                error.SyncFailed,
+                error.CopyFailed,
+                error.KernelMissing,
+                => {
+                    j.fall_back = true;
+                    j.result = SLZ_ERROR_CUDA;
+                },
+                else => j.result = mapDecompressError(err),
             }
             return;
         };

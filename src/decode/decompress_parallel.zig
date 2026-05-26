@@ -53,6 +53,7 @@ const pdm = @import("../format/parallel_decode_metadata.zig");
 const fast = @import("fast/fast_lz_decoder.zig");
 const high = @import("high/high_lz_decoder.zig");
 const high_runs = @import("high/high_lz_token_executor.zig");
+const gpu_err = @import("../gpu/decode/descriptors.zig");
 
 pub const DecodeError = error{
     Truncated,
@@ -62,7 +63,7 @@ pub const DecodeError = error{
     BlockDataTruncated,
     OutputTooSmall,
     ChunkSizeMismatch,
-} || fast.DecodeError || high.DecodeError || std.mem.Allocator.Error || std.Thread.CpuCountError;
+} || gpu_err.GpuError || fast.DecodeError || high.DecodeError || std.mem.Allocator.Error || std.Thread.CpuCountError;
 
 /// Describes a single 256 KB-output-sized chunk within a compressed
 /// block, annotated with its byte ranges in both input and output.

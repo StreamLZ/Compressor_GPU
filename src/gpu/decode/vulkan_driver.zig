@@ -702,32 +702,32 @@ pub fn fullVkLaunch(
     sub_chunk_cap: u32,
     io: ?std.Io,
 ) GpuError!void {
-    if (!init()) return error.BadMode;
+    if (!init()) return error.BackendNotAvailable;
     _ = io;
 
-    const updateDS = vkProc(*const fn (Handle, u32, [*]const VkWriteDescriptorSet, u32, ?*anyopaque) callconv(.c) void, "vkUpdateDescriptorSets") orelse return error.BadMode;
-    const beginCB = vkProc(*const fn (Handle, *const VkCommandBufferBeginInfo) callconv(.c) VkResult, "vkBeginCommandBuffer") orelse return error.BadMode;
-    const endCB = vkProc(*const fn (Handle) callconv(.c) VkResult, "vkEndCommandBuffer") orelse return error.BadMode;
-    const resetCB = vkProc(*const fn (Handle, u32) callconv(.c) VkResult, "vkResetCommandBuffer") orelse return error.BadMode;
-    const bindPipe = vkProc(*const fn (Handle, u32, Handle) callconv(.c) void, "vkCmdBindPipeline") orelse return error.BadMode;
-    const bindDS_fn = vkProc(*const fn (Handle, u32, Handle, u32, u32, [*]const Handle, u32, ?*const u32) callconv(.c) void, "vkCmdBindDescriptorSets") orelse return error.BadMode;
-    const pushConst = vkProc(*const fn (Handle, Handle, u32, u32, u32, *const anyopaque) callconv(.c) void, "vkCmdPushConstants") orelse return error.BadMode;
-    const dispatchFn = vkProc(*const fn (Handle, u32, u32, u32) callconv(.c) void, "vkCmdDispatch") orelse return error.BadMode;
-    const queueSubmit = vkProc(*const fn (Handle, u32, [*]const VkSubmitInfo, Handle) callconv(.c) VkResult, "vkQueueSubmit") orelse return error.BadMode;
-    const waitFence = vkProc(*const fn (Handle, u32, [*]const Handle, u32, u64) callconv(.c) VkResult, "vkWaitForFences") orelse return error.BadMode;
-    const resetFence = vkProc(*const fn (Handle, u32, [*]const Handle) callconv(.c) VkResult, "vkResetFences") orelse return error.BadMode;
-    const cmdCopy = vkProc(*const fn (Handle, Handle, Handle, u32, [*]const VkBufferCopy) callconv(.c) void, "vkCmdCopyBuffer") orelse return error.BadMode;
-    const resetQP = vkProc(*const fn (Handle, Handle, u32, u32) callconv(.c) void, "vkCmdResetQueryPool") orelse return error.BadMode;
-    const writeTS = vkProc(*const fn (Handle, u32, Handle, u32) callconv(.c) void, "vkCmdWriteTimestamp") orelse return error.BadMode;
-    const pipeBarrier = vkProc(*const fn (Handle, u32, u32, u32, ?*const anyopaque, u32, ?*const anyopaque, u32, ?*const anyopaque) callconv(.c) void, "vkCmdPipelineBarrier") orelse return error.BadMode;
+    const updateDS = vkProc(*const fn (Handle, u32, [*]const VkWriteDescriptorSet, u32, ?*anyopaque) callconv(.c) void, "vkUpdateDescriptorSets") orelse return error.BackendNotAvailable;
+    const beginCB = vkProc(*const fn (Handle, *const VkCommandBufferBeginInfo) callconv(.c) VkResult, "vkBeginCommandBuffer") orelse return error.BackendNotAvailable;
+    const endCB = vkProc(*const fn (Handle) callconv(.c) VkResult, "vkEndCommandBuffer") orelse return error.BackendNotAvailable;
+    const resetCB = vkProc(*const fn (Handle, u32) callconv(.c) VkResult, "vkResetCommandBuffer") orelse return error.BackendNotAvailable;
+    const bindPipe = vkProc(*const fn (Handle, u32, Handle) callconv(.c) void, "vkCmdBindPipeline") orelse return error.BackendNotAvailable;
+    const bindDS_fn = vkProc(*const fn (Handle, u32, Handle, u32, u32, [*]const Handle, u32, ?*const u32) callconv(.c) void, "vkCmdBindDescriptorSets") orelse return error.BackendNotAvailable;
+    const pushConst = vkProc(*const fn (Handle, Handle, u32, u32, u32, *const anyopaque) callconv(.c) void, "vkCmdPushConstants") orelse return error.BackendNotAvailable;
+    const dispatchFn = vkProc(*const fn (Handle, u32, u32, u32) callconv(.c) void, "vkCmdDispatch") orelse return error.BackendNotAvailable;
+    const queueSubmit = vkProc(*const fn (Handle, u32, [*]const VkSubmitInfo, Handle) callconv(.c) VkResult, "vkQueueSubmit") orelse return error.BackendNotAvailable;
+    const waitFence = vkProc(*const fn (Handle, u32, [*]const Handle, u32, u64) callconv(.c) VkResult, "vkWaitForFences") orelse return error.BackendNotAvailable;
+    const resetFence = vkProc(*const fn (Handle, u32, [*]const Handle) callconv(.c) VkResult, "vkResetFences") orelse return error.BackendNotAvailable;
+    const cmdCopy = vkProc(*const fn (Handle, Handle, Handle, u32, [*]const VkBufferCopy) callconv(.c) void, "vkCmdCopyBuffer") orelse return error.BackendNotAvailable;
+    const resetQP = vkProc(*const fn (Handle, Handle, u32, u32) callconv(.c) void, "vkCmdResetQueryPool") orelse return error.BackendNotAvailable;
+    const writeTS = vkProc(*const fn (Handle, u32, Handle, u32) callconv(.c) void, "vkCmdWriteTimestamp") orelse return error.BackendNotAvailable;
+    const pipeBarrier = vkProc(*const fn (Handle, u32, u32, u32, ?*const anyopaque, u32, ?*const anyopaque, u32, ?*const anyopaque) callconv(.c) void, "vkCmdPipelineBarrier") orelse return error.BackendNotAvailable;
 
     const total_output = dst_start_off + decompressed_size;
     const comp_bytes = if (compressed_block.len > 0) compressed_block.len else 4;
     const desc_bytes = chunk_descs.len * @sizeOf(ChunkDesc);
 
-    if (!ensureBuf(&b_comp, &m_comp, &b_comp_sz, comp_bytes)) return error.BadMode;
-    if (!ensureBuf(&b_out, &m_out, &b_out_sz, total_output + 64)) return error.BadMode;
-    if (!ensureBuf(&b_desc, &m_desc, &b_desc_sz, desc_bytes)) return error.BadMode;
+    if (!ensureBuf(&b_comp, &m_comp, &b_comp_sz, comp_bytes)) return error.OutOfDeviceMemory;
+    if (!ensureBuf(&b_out, &m_out, &b_out_sz, total_output + 64)) return error.OutOfDeviceMemory;
+    if (!ensureBuf(&b_desc, &m_desc, &b_desc_sz, desc_bytes)) return error.OutOfDeviceMemory;
 
     // ── Write upload data to host memory ──
     // Staging layout for device-local path: [compressed | descriptors | dict_prefix]
@@ -737,11 +737,11 @@ pub fn fullVkLaunch(
     const staging_upload_size = comp_bytes + desc_bytes + dst_start_off;
 
     if (has_device_local) {
-        if (!ensureStaging(staging_upload_size)) return error.BadMode;
-        if (!ensureDownloadBuf(total_output + 64)) return error.BadMode;
+        if (!ensureStaging(staging_upload_size)) return error.OutOfDeviceMemory;
+        if (!ensureDownloadBuf(total_output + 64)) return error.OutOfDeviceMemory;
 
         // Single map, write all upload data at sequential offsets
-        const p = mapMem(m_staging, 0, staging_upload_size) orelse return error.BadMode;
+        const p = mapMem(m_staging, 0, staging_upload_size) orelse return error.CopyFailed;
         if (compressed_block.len > 0)
             @memcpy(p[stage_off_comp..][0..compressed_block.len], compressed_block);
         @memcpy(p[stage_off_desc..][0..desc_bytes], @as([*]const u8, @ptrCast(chunk_descs.ptr))[0..desc_bytes]);
@@ -751,17 +751,17 @@ pub fn fullVkLaunch(
     } else {
         // Host-visible (iGPU): write directly to device buffers
         if (compressed_block.len > 0) {
-            const p = mapMem(m_comp, 0, compressed_block.len) orelse return error.BadMode;
+            const p = mapMem(m_comp, 0, compressed_block.len) orelse return error.CopyFailed;
             @memcpy(p[0..compressed_block.len], compressed_block);
             unmapMem(m_comp);
         }
         {
-            const p = mapMem(m_desc, 0, desc_bytes) orelse return error.BadMode;
+            const p = mapMem(m_desc, 0, desc_bytes) orelse return error.CopyFailed;
             @memcpy(p[0..desc_bytes], @as([*]const u8, @ptrCast(chunk_descs.ptr))[0..desc_bytes]);
             unmapMem(m_desc);
         }
         if (dst_start_off > 0) {
-            const p = mapMem(m_out, 0, dst_start_off) orelse return error.BadMode;
+            const p = mapMem(m_out, 0, dst_start_off) orelse return error.CopyFailed;
             @memcpy(p[0..dst_start_off], dst_full[0..dst_start_off]);
             unmapMem(m_out);
         }
@@ -783,7 +783,7 @@ pub fn fullVkLaunch(
     // ── Record single command buffer: [copies] → barrier → dispatch → barrier → [copy back] ──
     _ = resetCB(vk_cmd_buf, 0);
     var begin_info = VkCommandBufferBeginInfo{};
-    if (beginCB(vk_cmd_buf, &begin_info) != VK_SUCCESS) return error.BadMode;
+    if (beginCB(vk_cmd_buf, &begin_info) != VK_SUCCESS) return error.KernelLaunchFailed;
 
     if (has_device_local) {
         // Staging → device copies (offsets match staging layout)
@@ -815,19 +815,19 @@ pub fn fullVkLaunch(
         cmdCopy(vk_cmd_buf, b_out, b_download, 1, &[1]VkBufferCopy{.{ .srcOffset = dst_start_off, .size = decompressed_size }});
     }
 
-    if (endCB(vk_cmd_buf) != VK_SUCCESS) return error.BadMode;
+    if (endCB(vk_cmd_buf) != VK_SUCCESS) return error.KernelLaunchFailed;
 
     // ── Single submit, single fence ──
     const t_submit = qpcNow();
     const submit = VkSubmitInfo{ .commandBufferCount = 1, .pCommandBuffers = &vk_cmd_buf };
-    if (queueSubmit(vk_queue, 1, &[1]VkSubmitInfo{submit}, vk_fence) != VK_SUCCESS) return error.BadMode;
+    if (queueSubmit(vk_queue, 1, &[1]VkSubmitInfo{submit}, vk_fence) != VK_SUCCESS) return error.KernelLaunchFailed;
     _ = waitFence(vk_dev, 1, &[1]Handle{vk_fence}, 1, ~@as(u64, 0));
     _ = resetFence(vk_dev, 1, &[1]Handle{vk_fence});
     const t_after_fence = qpcNow();
 
     // ── Read GPU timestamps (kernel-only, excludes transfers) ──
     if (vk_query_pool != null) {
-        const getResults = vkProc(*const fn (Handle, Handle, u32, u32, usize, *anyopaque, VkDeviceSize, u32) callconv(.c) VkResult, "vkGetQueryPoolResults") orelse return error.BadMode;
+        const getResults = vkProc(*const fn (Handle, Handle, u32, u32, usize, *anyopaque, VkDeviceSize, u32) callconv(.c) VkResult, "vkGetQueryPoolResults") orelse return error.BackendNotAvailable;
         var timestamps: [2]u64 = .{ 0, 0 };
         if (getResults(vk_dev, vk_query_pool, 0, 2, @sizeOf([2]u64), @ptrCast(&timestamps), 8, 3) == VK_SUCCESS and timestamps[1] > timestamps[0]) {
             const ticks = timestamps[1] -% timestamps[0];
@@ -842,11 +842,11 @@ pub fn fullVkLaunch(
 
     // ── Read back output (from cached download buffer — fast CPU reads) ──
     if (has_device_local) {
-        const p = mapMem(m_download, 0, decompressed_size) orelse return error.BadMode;
+        const p = mapMem(m_download, 0, decompressed_size) orelse return error.CopyFailed;
         @memcpy((dst_full + dst_start_off)[0..decompressed_size], p[0..decompressed_size]);
         unmapMem(m_staging);
     } else {
-        const p = mapMem(m_out, dst_start_off, decompressed_size) orelse return error.BadMode;
+        const p = mapMem(m_out, dst_start_off, decompressed_size) orelse return error.CopyFailed;
         @memcpy((dst_full + dst_start_off)[0..decompressed_size], p[0..decompressed_size]);
         unmapMem(m_out);
     }

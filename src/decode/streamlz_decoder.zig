@@ -42,7 +42,7 @@ pub const DecompressError = error{
     ChunkSizeMismatch,
     UnknownDictionary,
     ContentSizeTooLarge,
-} || fast.DecodeError || high.DecodeError || std.mem.Allocator.Error || std.Thread.CpuCountError;
+} || gpu_driver.GpuError || fast.DecodeError || high.DecodeError || std.mem.Allocator.Error || std.Thread.CpuCountError;
 
 /// Streams `src` (an SLZ1-framed buffer) into `dst`, returning the number
 /// of bytes written to `dst`. `dst.len` must be at least `content_size + safe_space`
@@ -108,18 +108,22 @@ pub fn decompressFramedFromDevice(
     dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!u32 {
     // Step 1: walk kernel — device-only result, no D2H inside the launch.
-    const dev = gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size) orelse return error.BadMode;
+    const dev = gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size) orelse return error.KernelLaunchFailed;
     // Legacy bridge — until fullGpuLaunchImpl becomes a pure launcher
     // (steps 2-5) it still wants host values + a host chunk_descs slice.
     // Pull them explicitly here; subsequent steps eliminate each.
-    const meta = gpu_driver.walkMetaToHost(dev.d_meta) orelse return error.BadMode;
+    const meta = gpu_driver.walkMetaToHost(dev.d_meta) orelse return error.CopyFailed;
+    // status != 0 = walk kernel detected unsupported frame shape (dict,
+    // PDM, checksums, multi-block). meta.n_chunks bounds check = corrupt
+    // frame. Both are "the GPU can't handle this; fall back to host" —
+    // semantic BadMode, not a CUDA-level failure.
     if (meta.status != 0) return error.BadMode;
     if (meta.n_chunks == 0 or meta.n_chunks > gpu_driver.walk_max_chunks) return error.BadMode;
     const chunks = allocator.alloc(gpu_driver.ChunkDesc, meta.n_chunks) catch return error.OutOfMemory;
     defer allocator.free(chunks);
     {
         const d2h = @import("../gpu/decode/driver.zig");
-        if (!d2h.copyDeviceToHost(std.mem.sliceAsBytes(chunks), dev.d_chunk_descs)) return error.BadMode;
+        if (!d2h.copyDeviceToHost(std.mem.sliceAsBytes(chunks), dev.d_chunk_descs)) return error.CopyFailed;
     }
     if (std.c.getenv("SLZ_E2E_TIMER") != null)
         std.debug.print("[walk] n_chunks={d} decomp={d} block_start={d} block_size={d} status={d}\n", .{ meta.n_chunks, meta.decomp_size, meta.block_start, meta.block_size, meta.status });
