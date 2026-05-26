@@ -51,20 +51,24 @@ pub fn gpuEncodeHuffImpl(
     // `n == 0 → return false` early-outs in the wrappers below.
     if (n == 0) return false;
 
-    // Per-stream scratch: each 4-way split quarter holds src_size/4 symbols
-    // of ≤ 11 bits; 2 bytes/symbol is a safe bound. Size from the largest
-    // descriptor so one slab fits every block.
+    // Per-stream scratch sized from the largest descriptor (one slab fits
+    // every block). NUM_STREAMS mirrors HUFF_NUM_STREAMS in
+    // src/gpu/common/gpu_huffman.cuh — the encoder kernel uses that
+    // constant directly; this Zig side has to match so the scratch slab
+    // has the right per-stream stride. Each stream gets src_size/N
+    // symbols of ≤ 11 bits; 2 bytes/symbol is a safe bound.
+    const NUM_STREAMS: usize = 32;  // KEEP IN SYNC with HUFF_NUM_STREAMS
     var max_src: u32 = 0;
     for (descs) |d| {
         if (d.src_size > max_src) max_src = d.src_size;
     }
-    const scratch_per_stream: usize = (@as(usize, max_src) / 4 + 64) * 2;
+    const scratch_per_stream: usize = (@as(usize, max_src) / NUM_STREAMS + 64) * 2;
 
     const desc_bytes: usize = descs.len * @sizeOf(HuffEncDesc);
     const sizes_bytes: usize = descs.len * 4;
     const cl_bytes: usize = descs.len * 256;
     const codes_bytes: usize = descs.len * 256 * 4;
-    const scratch_bytes: usize = descs.len * 4 * scratch_per_stream;
+    const scratch_bytes: usize = descs.len * NUM_STREAMS * scratch_per_stream;
 
     if (!ec.ensureBuf(&self.d_huff_descs_persist, &self.d_huff_descs_size, desc_bytes)) return false;
     if (!ec.ensureBuf(&self.d_huff_cl_persist, &self.d_huff_cl_size, cl_bytes)) return false;

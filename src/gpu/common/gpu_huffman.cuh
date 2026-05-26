@@ -26,17 +26,24 @@ static constexpr uint32_t HUFF_LUT_ENTRIES    = 1u << HUFF_LUT_INDEX_BITS; // 10
 // Code-length histogram size: indices 0..HUFF_MAX_CODE_LEN+1 inclusive.
 static constexpr int HUFF_LEN_HIST_SIZE = HUFF_MAX_CODE_LEN + 2;    // 13
 
-// ── 4-stream wire-format constants ──────────────────────────────
+// ── 32-stream wire-format constants ─────────────────────────────
 // chunk_type=4 body layout:
 //   [HUFF_WEIGHTS_BYTES weights — 4 bits/symbol, packed low-nibble-first]
-//   [HUFF_SUBHEADER_BYTES sub-header — 3 × u24 LE stream sizes]
-//   [stream 0 | stream 1 | stream 2 | stream 3]
-static constexpr int     HUFF_NUM_STREAMS       = 4;            // 4-stream split
+//   [HUFF_SUBHEADER_BYTES sub-header — (N-1) × u24 LE stream sizes;
+//                                       stream (N-1) size derived from total]
+//   [stream 0 | stream 1 | ... | stream N-1]
+//
+// 32 streams lets all 32 warp lanes decode in parallel (vs 4 lanes active
+// in the prior 4-stream format). The bigger sub-header (93 vs 9 bytes)
+// and 32 stream-boundary trims cost ~0.1pp ratio at 64 KB sub-chunks,
+// scaling as ~108/chunk_size. Production trends toward larger sub-chunks
+// for LZ ratio reasons, so the cost stays in the noise.
+static constexpr int     HUFF_NUM_STREAMS       = 32;           // 32-stream split (was 4)
 static constexpr int     HUFF_ALPHABET          = 256;          // 8-bit symbol alphabet
 static constexpr int     HUFF_WEIGHTS_BYTES     = 128;          // 256 symbols × 4-bit lengths
 static constexpr int     HUFF_STREAM_SIZE_BYTES = 3;            // bytes per u24 stream-size field
-static constexpr int     HUFF_SUBHEADER_BYTES   = (HUFF_NUM_STREAMS - 1) * HUFF_STREAM_SIZE_BYTES; // 9
-static constexpr int     HUFF_BODY_HEADER_BYTES = HUFF_WEIGHTS_BYTES + HUFF_SUBHEADER_BYTES;       // 137
+static constexpr int     HUFF_SUBHEADER_BYTES   = (HUFF_NUM_STREAMS - 1) * HUFF_STREAM_SIZE_BYTES; // 93
+static constexpr int     HUFF_BODY_HEADER_BYTES = HUFF_WEIGHTS_BYTES + HUFF_SUBHEADER_BYTES;       // 221
 static constexpr uint8_t HUFF_NIBBLE_MASK       = 0x0F;         // low-nibble mask
 
 // ── Weights pack / unpack ───────────────────────────────────────

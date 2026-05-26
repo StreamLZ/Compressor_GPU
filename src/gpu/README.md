@@ -137,8 +137,8 @@ back to the CPU path.
 
 ## Performance
 
-Measured 2026-05-25 on an RTX 4060 Ti (`sm_89`), HEAD `893e043`, `-gpu`
-mode (64 KB sub-chunks). Corpora: enwik8 (100 MB text), silesia
+Measured 2026-05-26 on an RTX 4060 Ti (`sm_89`), 32-stream Huffman,
+`-gpu` mode (64 KB sub-chunks). Corpora: enwik8 (100 MB text), silesia
 (212.8 MB mixed). Decode figures are best-of-30 (`streamlz -db -r 30`,
 sequential per the no-parallel-benchmarks rule); all times in milliseconds.
 
@@ -148,11 +148,14 @@ sequential per the no-parallel-benchmarks rule); all times in milliseconds.
 |-------|-------:|--------:|
 | L1 | 58.6% | 47.8% |
 | L2 | 58.6% | 47.8% |
-| L3 | 43.0% | 37.3% |
-| L4 | 41.9% | 36.7% |
-| L5 | 38.9% | 33.1% |
+| L3 | 43.4% | 37.8% |
+| L4 | 42.4% | 37.2% |
+| L5 | 39.3% | 33.6% |
 
-L1–L2 are LZ-only (no entropy stage); L3–L5 add GPU Huffman.
+L1–L2 are LZ-only (no entropy stage); L3–L5 add GPU Huffman. The 32-stream
+Huffman wire format costs ~0.4–0.5 pp ratio at 64 KB sub-chunks (sub-header
+grew from 9 to 93 bytes per chunk) in exchange for a ~17% kernel-time win
+from running 32 active warp lanes vs the prior 4-stream / 4-lane design.
 
 ### Decode (ms): D2D wall-clock and end-to-end
 
@@ -160,9 +163,9 @@ L1–L2 are LZ-only (no entropy stage); L3–L5 add GPU Huffman.
 |-------|------------------|-------------------|
 | L1 | **2.92** / 15.63 | **5.07** / 30.20 |
 | L2 | **2.94** / 15.66 | **5.09** / 30.30 |
-| L3 | **6.57** / 18.11 | **12.27** / 36.25 |
-| L4 | **6.38** / 17.84 | **12.08** / 35.91 |
-| L5 | **6.26** / 17.55 | **12.41** / 35.45 |
+| L3 | **4.87** / 16.43 | **8.68** / 32.75 |
+| L4 | **4.76** / 16.31 | **8.74** / 32.72 |
+| L5 | **4.89** / 16.18 | **9.35** / 32.60 |
 
 **D2D wall-clock** = the time a caller of `slzDecompress` with device-
 resident input and output sees on the wire. Measured via `cudaEventRecord`
@@ -177,15 +180,16 @@ LZ-only sub-D2D times (L3+ pipelined together with Huffman pre-decode):
 
 | Level | enwik8 LZ / Huff | silesia LZ / Huff |
 |-------|------------------|-------------------|
-| L3 | 2.99 / 3.58 | 5.17 / 7.08 |
-| L4 | 2.89 / 3.48 | 5.04 / 7.00 |
-| L5 | 3.28 / 3.03 | 6.09 / 6.29 |
+| L3 | 3.12 / 1.93 | 5.37 / 3.52 |
+| L4 | 2.93 / 1.81 | 5.22 / 3.50 |
+| L5 | 3.41 / 1.58 | 6.20 / 3.01 |
 
-The Huffman pre-decode (L3+) is roughly equal to the LZ kernel. Both
-contribute about half the GPU work for entropy-coded levels. The D2H
-copy of the decompressed output remains the largest e2e cost; for D2D
-callers, it drops to zero (the L1 D2D wall-clock of 2.92 ms is the
-entire decompress time).
+The 32-stream Huffman pre-decode (L3+) now lands at roughly one-third of
+the LZ kernel time (down from roughly equal under the 4-stream design):
+all 32 warp lanes decode in parallel where only 4 used to. LZ kernel
+time is unchanged. The D2H copy of the decompressed output remains the
+largest e2e cost; for D2D callers, it drops to zero (the L1 D2D
+wall-clock of 2.92 ms is the entire decompress time).
 
 ### Encode (ms): GPU LZ-encode kernel
 
@@ -206,7 +210,7 @@ the binary heterogeneity of silesia_all.tar (mostly text + xml + dna
 with short chain depth + a few large binaries with extremely deep chains)
 defeats the chain parser's CHAIN_MAX_STEPS guard. The encode-time number
 is dominated by a few outlier sub-chunks and not representative of the
-codec on uniform inputs (enwik8 L5 ratio 38.9% in 296 ms remains a fair
+codec on uniform inputs (enwik8 L5 ratio 39.3% in 296 ms remains a fair
 data point). The compression *ratio* on silesia L5 is real and
 representative; only the encode-time number is misleading.
 
@@ -219,7 +223,7 @@ decode path applies here.)
 | Codec | ratio | D2D wall-clock | decode e2e |
 |-------|------:|---------------:|-----------:|
 | StreamLZ L1 | 58.6% | **2.92 ms** | 15.63 ms |
-| StreamLZ L5 | 38.9% | **5.87 ms** | **17.12 ms** |
+| StreamLZ L5 | 39.3% | **4.89 ms** | **16.18 ms** |
 | nvCOMP LZ4  | 60.0% | 5.1 ms | 18.5 ms |
 | nvCOMP Zstd | 40.2% | 6.2 ms | 18.2 ms |
 
@@ -233,11 +237,12 @@ correctness verify.
 faster decode on both axes: D2D 2.92 vs 5.1 ms (1.75x faster),
 e2e 15.63 vs 18.5 ms (1.18x faster).
 
-**StreamLZ L5 win vs nvCOMP Zstd.** Smaller frame (38.9% vs 40.2%) and
-faster decode on both axes: D2D 5.87 vs 6.2 ms (1.06x faster),
-e2e 17.12 vs 18.2 ms (1.06x faster). The D2D edge came from the
-two-phase Huffman decode (preamble byte-drain + 2-lookup hot loop with
-unconditional u32 stores) described in `ARCHITECTURE.md`.
+**StreamLZ L5 win vs nvCOMP Zstd.** Smaller frame (39.3% vs 40.2%) and
+faster decode on both axes: D2D 4.89 vs 6.2 ms (1.27x faster),
+e2e 16.18 vs 18.2 ms (1.12x faster). The D2D edge comes from the
+32-stream Huffman decode (all 32 warp lanes active, vs 4 in the prior
+design) combined with the two-phase preamble + 2-lookup hot loop
+described in `ARCHITECTURE.md`.
 
 ## Invariants: do not break these
 

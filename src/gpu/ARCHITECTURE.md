@@ -61,12 +61,13 @@ chunks. Packing two of them together amortizes the per-block launch
 and scheduling overhead, but each is doing its own thing.
 
 For Huffman decoding, the encoder has already split the input into
-four sub-streams so the decoder can run four lanes in parallel.
-`slzHuffDecode4StreamKernel` uses one warp per Huffman block, but
-only lanes 0 through 3 are active during the inner decode loop. The
-remaining 28 lanes return immediately and consume zero register
-state. This trades total occupancy for clean register usage; the
-active lanes get a larger register budget for their hot loop.
+32 sub-streams so the decoder can run all 32 lanes in parallel.
+`slzHuffDecode4StreamKernel` (name retained for ABI compatibility —
+it decodes 32 streams, not 4) uses one warp per Huffman block with
+every lane active. Each lane runs its own bit-buffer plus LUT loop
+on its own input slice; there is no cross-lane traffic in the hot
+loop. See the 32-stream Huffman decoder section below for the
+input-offset prefix-sum + per-lane decode-loop details.
 
 The orchestration kernels that manage the per-frame bookkeeping
 (walk the frame, prefix-sum the chunk counts, scan the sub-chunk
@@ -255,17 +256,25 @@ out-of-line implicitly. Forcing the attribute on the general decoder
 only adds the spill slots. The lz_decode_general.cuh top-of-file
 comment captures this conclusion.
 
-## The four-stream Huffman decoder
+## The 32-stream Huffman decoder
 
 A canonical-Huffman block in this codec consists of code-length
-information, followed by four independent compressed sub-streams.
-The four streams are interleaved at encode time so the decoder can
-process them in parallel: lane 0 of the warp decodes sub-stream 0,
-lane 1 decodes sub-stream 1, lane 2 decodes sub-stream 2, lane 3
-decodes sub-stream 3. Lanes 4 through 31 return immediately at the
-start of the kernel and consume no further resources.
+information, followed by 32 independent compressed sub-streams. The
+32 streams are interleaved at encode time so the decoder can process
+them in parallel: lane k of the warp decodes sub-stream k for k in
+0..31. All 32 lanes are active. The earlier design used 4 streams
+(modeled on zstd's 4-way interleave), which left 28 of 32 lanes
+idle; widening to 32 is the single biggest source of the kernel's
+current throughput.
 
-Each active lane runs the same tight inner loop. It refills a 64-bit
+Stream sizes are stored as 31 × u24 LE in the sub-header (lane 31's
+size is derived from `in_size - HUFF_BODY_HEADER_BYTES - sum`). Each
+lane computes its own input offset via an exclusive warp-shuffle
+prefix sum — 5 shuffles for 32-way fan-out. A 4-stream design could
+afford a linear scan on lane 0; at 32 streams the prefix-sum becomes
+the right primitive.
+
+Each lane runs the same tight inner loop. It refills a 64-bit
 bit buffer from the compressed input whenever the buffer drops below
 the maximum code length, indexes a 1024-entry shared LUT with the
 top ten bits of the buffer, and consumes the symbols encoded in the
@@ -302,10 +311,12 @@ branch in the inner store and the halved refill check is the bulk of
 the kernel's throughput on text-like inputs.
 
 There is no warp synchronization inside the Huffman inner loop. The
-four active lanes work entirely independently; the decoder
-explicitly forbids adding a `__syncwarp` below the early-return,
-because lanes 4 through 31 are no longer alive to participate in a
-warp barrier and the barrier would hang.
+prefix-sum that distributes per-lane input offsets is the last
+cooperative step; after that each lane runs its own bit-buffer +
+LUT loop with no cross-lane interaction. Lanes finish their streams
+at different times (stream sizes are not uniform), so a barrier
+inside the loop would stall fast lanes on slow ones for no
+correctness benefit.
 
 ## The encode pipeline
 
@@ -456,12 +467,13 @@ bytes with predictable strides instead of parsing variable-length
 entries inline with tokens.
 
 The Huffman wire format puts code lengths up front, followed by
-three sub-stream-size headers and four sub-streams. The code-length
+31 sub-stream-size headers and 32 sub-streams. The code-length
 section is exactly 128 bytes of packed nibbles. The sub-stream-size
-section is exactly nine bytes (three 24-bit little-endian integers,
-since the fourth size is derived from the total). Both are loadable
-in one coalesced 32-byte load, and the LUT-build kernel reads them
-directly from the compressed buffer without an intermediate copy.
+section is 31 × 3 = 93 bytes of 24-bit little-endian integers
+(the 32nd size is derived from `in_size - 128 - 93 - sum`). The
+LUT-build kernel reads the code lengths directly from the
+compressed buffer; the decode kernel reads the sub-stream sizes
+into a warp-shuffle prefix sum to compute each lane's input offset.
 
 The off16 stream uses a sentinel value to disambiguate raw from
 entropy-coded form. A leading count field of 0xFFFF means the
