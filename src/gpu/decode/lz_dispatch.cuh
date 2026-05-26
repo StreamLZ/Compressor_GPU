@@ -21,10 +21,10 @@
 // Lane contract: warp-cooperative; each header is parsed on lane 0 and
 // `src` is rebuilt on every lane via broadcastSrc.
 __device__ void parseAndDecodeSubChunkRaw(
-    const uint8_t* sc_src,
+    const uint8_t* __restrict__ sc_src,
     uint32_t sc_comp_size,
     uint32_t sc_decomp_size,
-    uint8_t* dst,
+    uint8_t* __restrict__ dst,
     uint32_t dst_offset,
     uint32_t base_offset
 ) {
@@ -35,7 +35,7 @@ __device__ void parseAndDecodeSubChunkRaw(
     uint32_t initial_copy = 0;
     if (base_offset == 0) {
         // First 8 bytes are raw literals — copy directly to output.
-        if (lane < (int)INITIAL_LITERAL_COPY_BYTES) dst[dst_offset + lane] = src[lane];
+        if ((uint32_t)lane < INITIAL_LITERAL_COPY_BYTES) dst[dst_offset + lane] = src[lane];
         __syncwarp();
         src += INITIAL_LITERAL_COPY_BYTES;
         initial_copy = INITIAL_LITERAL_COPY_BYTES;
@@ -75,6 +75,8 @@ __device__ void parseAndDecodeSubChunkRaw(
         block2_cmd_offset = readU16LE(src);
         src += 2;
     }
+    // Lane 0 may have updated block2_cmd_offset above (conditional on
+    // sc_decomp_size > 64KB); broadcast so every lane sees the same value.
     block2_cmd_offset = __shfl_sync(FULL_WARP_MASK, block2_cmd_offset, 0);
     src = broadcastSrc(sc_src, src);
 
@@ -161,16 +163,16 @@ __device__ void parseAndDecodeSubChunkRaw(
 // decodeSubChunkRawMode or decodeSubChunkGeneral. The header parser's
 // registers are freed before the decode hot loop runs.
 __device__ void parseAndDecodeSubChunk(
-    const uint8_t* sc_src,
+    const uint8_t* __restrict__ sc_src,
     uint32_t sc_comp_size,
     uint32_t sc_decomp_size,
-    uint8_t* dst,
+    uint8_t* __restrict__ dst,
     uint32_t dst_offset,
     uint32_t base_offset,
     uint32_t mode,
-    uint8_t* entropy_lit_scratch,
-    uint8_t* entropy_tok_scratch,
-    uint8_t* entropy_off16_scratch
+    uint8_t* __restrict__ entropy_lit_scratch,
+    uint8_t* __restrict__ entropy_tok_scratch,
+    uint8_t* __restrict__ entropy_off16_scratch
 ) {
     ParsedStreams ps;
     parseSubChunkHeaders(sc_src, sc_comp_size, sc_decomp_size, dst,

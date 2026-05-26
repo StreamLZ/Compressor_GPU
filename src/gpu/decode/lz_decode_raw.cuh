@@ -80,7 +80,10 @@ __device__ __noinline__ void decodeSubChunkRawMode(
                 // Compute src_lane on every lane (must call __shfl_sync uniformly).
                 // `(1u << (lane + 1)) - 1u` would be undefined when lane == 31
                 // (shift count >= u32 width); `(2u << lane) - 1u` produces the
-                // same inclusive-prefix mask without UB.
+                // same inclusive-prefix mask without UB. The idiom only works
+                // because `lane` is in [0, 31] — assert that explicitly.
+                static_assert(WARP_SIZE == 32,
+                              "(2u << lane) - 1u inclusive-prefix idiom assumes WARP_SIZE == 32");
                 uint32_t my_prefix = fresh_mask & ((2u << lane) - 1u);
                 int src_lane = (my_prefix != 0) ? (31 - __clz(my_prefix)) : 0;
                 int32_t shuffled_off = __shfl_sync(FULL_WARP_MASK, my_match_offset, src_lane);

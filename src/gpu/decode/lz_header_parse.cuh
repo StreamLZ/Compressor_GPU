@@ -297,7 +297,7 @@ __device__ __noinline__ void parseSubChunkHeaders(
 
     ps.initial_copy = 0;
     if (base_offset == 0) {
-        if (lane < (int)INITIAL_LITERAL_COPY_BYTES) dst[dst_offset + lane] = src[lane];
+        if ((uint32_t)lane < INITIAL_LITERAL_COPY_BYTES) dst[dst_offset + lane] = src[lane];
         __syncwarp();
         src += INITIAL_LITERAL_COPY_BYTES;
         ps.initial_copy = INITIAL_LITERAL_COPY_BYTES;
