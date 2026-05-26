@@ -135,10 +135,11 @@ __device__ void decodeSubChunkGeneral(
             }
 
             // ── Broadcast parsed values from lane 0 to all lanes ──
-            // The full broadcast set (including lit_pos / dst_pos shfls
-            // below) is required for perf even though some values are
-            // already coherent across lanes — see the C9 revert note in
-            // the file docstring.
+            // PERF: lit_pos looks redundant (lane-coherent — every lane
+            // does lit_pos += lit_len below). It isn't. Removing this
+            // + the dst_pos/lit_pos shfls in the 3 sites below costs
+            // ~130 µs (+2%) on L3 enwik8 `-db -t 1 -r 30`. PTX REG=40
+            // either way; nvcc uses them as reorder barriers.
             token_type   = __shfl_sync(FULL_WARP_MASK, token_type, 0);
             lit_len      = __shfl_sync(FULL_WARP_MASK, lit_len, 0);
             match_len    = __shfl_sync(FULL_WARP_MASK, match_len, 0);
@@ -179,10 +180,8 @@ __device__ void decodeSubChunkGeneral(
                 dst_pos += match_len;
             }
 
-            // dst_pos / lit_pos are formally coherent here (every lane
-            // added the broadcast lit_len / match_len above), but the
-            // shfls below are still required for measured perf — see C9
-            // revert note in the file docstring.
+            // PERF: dst_pos/lit_pos look redundant (lane-coherent after
+            // the cooperative copies). They aren't — see top-of-loop note.
             dst_pos   = __shfl_sync(FULL_WARP_MASK, dst_pos, 0);
             lit_pos   = __shfl_sync(FULL_WARP_MASK, lit_pos, 0);
             if (!use_recent && (token_type != 1)) recent_offset = match_offset;
@@ -192,10 +191,8 @@ __device__ void decodeSubChunkGeneral(
 
         // ── Per-block trailing literals (at 64KB boundary) ──
         __syncwarp();
-        // Lane-broadcast dst_pos / lit_pos required for perf — formally
-        // coherent but the shfls act as nvcc reorder barriers. Do NOT
-        // remove without re-running `-db -t 1 -r 30` on L3 (this was the
-        // exact regression in K1's C9; see file docstring).
+        // PERF: same as inner-loop shfls — looks lane-coherent, isn't.
+        // Removing the four sites costs ~130 µs (+2%) on L3 enwik8.
         dst_pos = __shfl_sync(FULL_WARP_MASK, dst_pos, 0);
         lit_pos = __shfl_sync(FULL_WARP_MASK, lit_pos, 0);
         {
@@ -232,8 +229,8 @@ __device__ void decodeSubChunkGeneral(
 
     // ── Final trailing literals ──
     __syncwarp();
-    // Same perf-required shfls as the per-block trailing block above —
-    // see file docstring (C9 revert) before considering removal.
+    // PERF: same as inner-loop shfls — looks lane-coherent, isn't.
+    // Removing the four sites costs ~130 µs (+2%) on L3 enwik8.
     dst_pos = __shfl_sync(FULL_WARP_MASK, dst_pos, 0);
     lit_pos = __shfl_sync(FULL_WARP_MASK, lit_pos, 0);
     uint32_t trailing = (lit_size > lit_pos) ? (lit_size - lit_pos) : 0;
