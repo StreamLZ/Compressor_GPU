@@ -14,6 +14,25 @@ const gpu_decode = @import("../decode/driver.zig");
 
 const CUdeviceptr = ffi.CUdeviceptr;
 
+// ── Wire-format byte sizes (Zig mirrors of common/gpu_wire_format.cuh) ──
+//
+//   INITIAL_LITERAL_COPY_BYTES — 8 verbatim literal bytes the very first
+//     sub-chunk emits as a raw prefix; per-sub-chunk init copies are
+//     restored from the SC-tail prefix table post-decode.
+//   SC_TAIL_PER_CHUNK_BYTES    — bytes-per-entry in the SC-tail prefix
+//     table that follows the assembled blocks (entry i holds the first 8
+//     bytes of source chunk i+1, so the decoder can restore the init copy
+//     without re-encoding it inside each chunk).
+//   CHUNK_INTERNAL_HDR_BYTES   — per-chunk internal block header on disk:
+//     2-byte SLZ internal block header + 4-byte chunk-size word = 6 bytes
+//     prefixing each chunk's assembled payload.
+//   NEXT_HASH_ENTRIES          — chain-parser next-hash modular index size
+//     (2^16). Matches NEXT_HASH_SIZE in encode/lz_format.cuh.
+pub const INITIAL_LITERAL_COPY_BYTES: u32 = 8;
+pub const SC_TAIL_PER_CHUNK_BYTES: u32 = 8;
+pub const CHUNK_INTERNAL_HDR_BYTES: u32 = 6;
+pub const NEXT_HASH_ENTRIES: usize = 65536;
+
 // ── Chunk descriptor (matches CUDA struct) ──────────────────────
 pub const CompressChunkDesc = extern struct {
     src_offset: u32,

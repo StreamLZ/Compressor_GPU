@@ -201,16 +201,17 @@ pub fn gpuFrameAssembleImpl(
     const launch = ffi.cuLaunchKernel_fn orelse return null;
     const sync = ffi.cuCtxSynchronize_fn orelse return null;
 
-    // Build per-chunk dst offset table on host (prefix sum of 6 + asm_size).
+    // Build per-chunk dst offset table on host (prefix sum of
+    // CHUNK_INTERNAL_HDR_BYTES + asm_size).
     const per_chunk_dst_buf = allocator.alloc(u32, n_chunks) catch return null;
     defer allocator.free(per_chunk_dst_buf);
     var pos: u32 = @intCast(prefix_bytes.len);
     for (0..n_chunks) |i| {
         per_chunk_dst_buf[i] = pos;
-        pos += 6 + per_chunk_asm_size[i];
+        pos += ec.CHUNK_INTERNAL_HDR_BYTES + per_chunk_asm_size[i];
     }
     const sc_tail_off: u32 = pos;
-    const sc_tail_bytes: u32 = if (n_chunks > 1) (n_chunks - 1) * 8 else 0;
+    const sc_tail_bytes: u32 = if (n_chunks > 1) (n_chunks - 1) * ec.SC_TAIL_PER_CHUNK_BYTES else 0;
     pos += sc_tail_bytes;
     const end_mark_off: u32 = pos;
     pos += 4;

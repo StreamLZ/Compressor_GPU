@@ -45,9 +45,9 @@ static constexpr uint32_t TOKEN_USE_RECENT_MASK  = 1;
 // to be worth splitting across lanes.
 static constexpr uint32_t MIN_PARALLEL_MATCH_LEN = 2;
 
-// Extended length-stream encoding: a byte value > 251 carries a 2-byte
-// uint16_t extension that is scaled by 4.
-static constexpr uint32_t EXT_LENGTH_THRESHOLD   = 251;
+// Extended length-stream encoding: a byte value > EXT_LENGTH_THRESHOLD
+// (defined in ../common/gpu_wire_format.cuh — same constant the encoder
+// emits against) carries a 2-byte uint16_t extension scaled by 4.
 static constexpr uint32_t EXT_LENGTH_EXTRA_BYTES = 2;
 static constexpr uint32_t EXT_LENGTH_SCALE       = 4;
 
@@ -83,8 +83,12 @@ static constexpr uint32_t PAIRED_SECONDARY_HEADER_BYTES = 7;
 
 // Off16 stream: OFF16_ENTROPY_MARKER (0xFFFF in ../common/gpu_wire_format.cuh)
 // signals an entropy-coded off16 pair (hi/lo split). The hi/lo halves
-// live at these offsets in the per-sub-chunk off16 scratch slot.
+// live at these offsets in the per-sub-chunk off16 scratch slot. The
+// split offset is one block's worth of hi bytes followed by lo bytes;
+// the static_assert below makes that relationship compile-time enforced.
 static constexpr uint32_t OFF16_HILO_SPLIT_OFFSET = 65536;
+static_assert(OFF16_HILO_SPLIT_OFFSET == LZ_BLOCK_SIZE,
+              "off16 hi/lo split must equal one LZ block (one block of hi bytes, then lo bytes)");
 
 // Off32 stream sizes header (3-byte LE field): count1 in the high 12
 // bits, count2 in the low 12 bits. A 12-bit count of OFF32_COUNT_PACK_MAX

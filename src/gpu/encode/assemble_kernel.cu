@@ -27,8 +27,14 @@
 
 // ── Wire-format constants (assembler-private) ───────────────────────
 // LZ_BLOCK_SIZE, HUFF_CHUNK_TYPE, OFF16_ENTROPY_MARKER, OFF32_COUNT_PACK_MAX,
-// OFF32_LONG_ENTRY_TAG, and the SUBCHUNK_* family come from
-// ../common/gpu_wire_format.cuh — the encode/decode-shared contract.
+// OFF32_LONG_ENTRY_TAG, SUBCHUNK_HDR_BYTES, and the SUBCHUNK_* family
+// come from ../common/gpu_wire_format.cuh — the encode/decode-shared
+// contract.
+//
+// RAW_CHUNK_HDR_BYTES is the 3-byte type-0 entropy chunk header
+// `[u24 BE size]` (NOT the SUBCHUNK_HDR_BYTES sub-chunk header above,
+// which happens to also be 3 bytes — both are 3 by coincidence).
+// HUFF_CHUNK_HDR_BYTES is the non-compact type-4 (Huffman) header.
 static constexpr int      RAW_CHUNK_HDR_BYTES   = 3;   // type-0 [u24 BE size]
 static constexpr int      HUFF_CHUNK_HDR_BYTES  = 5;   // type-4 non-compact header
 static constexpr int      OFF16_ENTROPY_MIN     = 32;  // entropy-code off16 at/above this count
@@ -231,8 +237,12 @@ __device__ static uint32_t assembleSubChunk(
         const uint8_t* lo = d_huff_off16 + desc.huff_off16lo_offset;
         const uint32_t hi_sz = desc.huff_off16hi_size;
         const uint32_t lo_sz = desc.huff_off16lo_size;
-        const bool hi_huff = (hi_sz + 2 < s.off16_count);
-        const bool lo_huff = (lo_sz + 2 < s.off16_count);
+        // Huffman wins when (compressed_size + header_overhead_delta)
+        // < raw_count. The delta is the extra bytes a Huffman header
+        // costs versus a raw header: HUFF_CHUNK_HDR_BYTES - RAW_CHUNK_HDR_BYTES.
+        constexpr int HUFF_VS_RAW_HDR_OVERHEAD = HUFF_CHUNK_HDR_BYTES - RAW_CHUNK_HDR_BYTES;
+        const bool hi_huff = (hi_sz + HUFF_VS_RAW_HDR_OVERHEAD < s.off16_count);
+        const bool lo_huff = (lo_sz + HUFF_VS_RAW_HDR_OVERHEAD < s.off16_count);
         const uint32_t hi_chunk = hi_huff ? (HUFF_CHUNK_HDR_BYTES + hi_sz)
                                           : (s.off16_count + RAW_CHUNK_HDR_BYTES);
         const uint32_t lo_chunk = lo_huff ? (HUFF_CHUNK_HDR_BYTES + lo_sz)

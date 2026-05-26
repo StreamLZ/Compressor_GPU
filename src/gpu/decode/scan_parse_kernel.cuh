@@ -95,11 +95,11 @@ __device__ static uint32_t scanSkipStreamHeader(
         const EntropyHdrFields h = parseEntropyHdrFields(chunk_src + pos);
         return pos + h.header_bytes + h.comp_size;
     } else if (ct == 5) {
-        if (pos + 7 > chunk_len) return 0xFFFFFFFFu;
-        return pos + 7;
+        if (pos + PAIRED_SECONDARY_HEADER_BYTES > chunk_len) return 0xFFFFFFFFu;
+        return pos + PAIRED_SECONDARY_HEADER_BYTES;
     } else if (ct == 7) {
-        if (pos + 4 > chunk_len) return 0xFFFFFFFFu;
-        return scanSkipStreamHeader(chunk_src, chunk_len, pos + 4);
+        if (pos + PAIRED_PRIMARY_HEADER_BYTES > chunk_len) return 0xFFFFFFFFu;
+        return scanSkipStreamHeader(chunk_src, chunk_len, pos + PAIRED_PRIMARY_HEADER_BYTES);
     }
     return 0xFFFFFFFFu;
 }
@@ -126,7 +126,7 @@ extern "C" __global__ void slzScanParseKernel(
     if (i >= n_chunks) return;
 
     const SlzChunkDesc ch = chunks[i];
-    const uint32_t cap_safe = sub_chunk_cap ? sub_chunk_cap : 65536u;
+    const uint32_t cap_safe = sub_chunk_cap ? sub_chunk_cap : DEFAULT_SUB_CHUNK_CAP;
     const uint32_t chunk_first_sub = first_sub_idx[i];
 
     if (ch.flags != 0 || ch.decomp_size == 0) {
@@ -150,7 +150,7 @@ extern "C" __global__ void slzScanParseKernel(
     uint32_t sub_local = 0;
     const uint32_t n_subs_expected = (ch.decomp_size + cap_safe - 1) / cap_safe;
 
-    while (remaining > 0 && sub_pos + 3 <= chunk_len) {
+    while (remaining > 0 && sub_pos + SUBCHUNK_HDR_BYTES <= chunk_len) {
         const uint32_t sub_idx = chunk_first_sub + sub_local;
         st_lit[sub_idx].valid = 0;
         st_tok[sub_idx].valid = 0;
@@ -162,25 +162,25 @@ extern "C" __global__ void slzScanParseKernel(
         const uint32_t sub_hdr = readBE24(chunk_src + sub_pos);
         if (!subchunkIsLz(sub_hdr)) break;
         const uint32_t sc_comp = subchunkCompSize(sub_hdr);
-        const uint32_t sub_end = sub_pos + 3 + sc_comp;
+        const uint32_t sub_end = sub_pos + SUBCHUNK_HDR_BYTES + sc_comp;
         if (sub_end > chunk_len) break;
         const uint32_t sub_decomp = remaining < cap_safe ? remaining : cap_safe;
 
         const uint32_t sub_dst_off = sub_idx * SCAN_SUBCHUNK_SLOT;
-        const uint32_t init_b = (sub_idx == 0) ? 8u : 0u;
-        uint32_t pos = sub_pos + 3 + init_b;
+        const uint32_t init_b = (sub_idx == 0) ? INITIAL_LITERAL_COPY_BYTES : 0u;
+        uint32_t pos = sub_pos + SUBCHUNK_HDR_BYTES + init_b;
         const uint32_t end = sub_end;
 
         do {
             if (pos >= end) break;
-            if (((chunk_src[pos] >> 4) & 0x7) == 4)
+            if (((chunk_src[pos] >> CHUNK_TYPE_SHIFT) & CHUNK_TYPE_MASK) == HUFF_CHUNK_TYPE)
                 scanParseHuffHeader(chunk_src, chunk_len, pos, ch.src_offset, sub_dst_off, st_lit[sub_idx]);
             uint32_t nxt = scanSkipStreamHeader(chunk_src, chunk_len, pos);
             if (nxt == 0xFFFFFFFFu) break;
             pos = nxt;
             if (pos >= end) break;
 
-            if (((chunk_src[pos] >> 4) & 0x7) == 4)
+            if (((chunk_src[pos] >> CHUNK_TYPE_SHIFT) & CHUNK_TYPE_MASK) == HUFF_CHUNK_TYPE)
                 scanParseHuffHeader(chunk_src, chunk_len, pos, ch.src_offset, sub_dst_off, st_tok[sub_idx]);
             nxt = scanSkipStreamHeader(chunk_src, chunk_len, pos);
             if (nxt == 0xFFFFFFFFu) break;
@@ -192,12 +192,12 @@ extern "C" __global__ void slzScanParseKernel(
                 pos += 2;
             }
             if (pos + 2 > end) break;
-            const uint32_t marker = (uint32_t)chunk_src[pos] | ((uint32_t)chunk_src[pos + 1] << 8);
+            const uint32_t marker = readU16LE(chunk_src + pos);
             if (marker != OFF16_ENTROPY_MARKER) break;
             pos += 2;
             if (pos >= end) break;
 
-            const uint32_t hi_type = (chunk_src[pos] >> 4) & 0x7;
+            const uint32_t hi_type = (chunk_src[pos] >> CHUNK_TYPE_SHIFT) & CHUNK_TYPE_MASK;
             if (hi_type == 0) {
                 uint32_t doff, sz;
                 if (scanParseType0(chunk_src, chunk_len, pos, doff, sz)) {
@@ -206,7 +206,7 @@ extern "C" __global__ void slzScanParseKernel(
                     st_raw_hi[sub_idx].gpu_offset = sub_dst_off;
                     st_raw_hi[sub_idx].valid      = 1;
                 }
-            } else if (hi_type == 4) {
+            } else if (hi_type == HUFF_CHUNK_TYPE) {
                 scanParseHuffHeader(chunk_src, chunk_len, pos, ch.src_offset, sub_dst_off, st_hi[sub_idx]);
             }
             nxt = scanSkipStreamHeader(chunk_src, chunk_len, pos);
@@ -214,7 +214,7 @@ extern "C" __global__ void slzScanParseKernel(
             pos = nxt;
             if (pos >= end) break;
 
-            const uint32_t lo_type = (chunk_src[pos] >> 4) & 0x7;
+            const uint32_t lo_type = (chunk_src[pos] >> CHUNK_TYPE_SHIFT) & CHUNK_TYPE_MASK;
             if (lo_type == 0) {
                 uint32_t doff, sz;
                 if (scanParseType0(chunk_src, chunk_len, pos, doff, sz)) {
@@ -223,7 +223,7 @@ extern "C" __global__ void slzScanParseKernel(
                     st_raw_lo[sub_idx].gpu_offset = sub_dst_off + SCAN_OFF16_LO_SLOT;
                     st_raw_lo[sub_idx].valid      = 1;
                 }
-            } else if (lo_type == 4) {
+            } else if (lo_type == HUFF_CHUNK_TYPE) {
                 scanParseHuffHeader(chunk_src, chunk_len, pos, ch.src_offset, sub_dst_off + SCAN_OFF16_LO_SLOT, st_lo[sub_idx]);
             }
         } while (0);

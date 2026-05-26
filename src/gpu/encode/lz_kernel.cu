@@ -105,7 +105,7 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
     uint32_t off32_count_block1 = 0, off32_count_block2 = 0;
     uint32_t cmd_stream2_offset = 0;
     uint32_t anchor = desc.is_first ? INITIAL_LITERAL_COPY_BYTES : 0;
-    int32_t recent_offset = -8;
+    int32_t recent_offset = INITIAL_RECENT_OFFSET;
 
     if (use_chain) {
         // ── Chain parser mode ────────────────────────────────────

@@ -36,6 +36,13 @@ pub const EncodeContext = ec.EncodeContext;
 
 pub const copyDeviceToHost = ec.copyDeviceToHost;
 
+// Wire-format byte sizes re-exported for the CPU-side framer in
+// src/encode/fast_framed.zig (which orchestrates GPU encode + frame
+// assembly). See encode_context.zig for the underlying definitions.
+pub const INITIAL_LITERAL_COPY_BYTES = ec.INITIAL_LITERAL_COPY_BYTES;
+pub const SC_TAIL_PER_CHUNK_BYTES = ec.SC_TAIL_PER_CHUNK_BYTES;
+pub const CHUNK_INTERNAL_HDR_BYTES = ec.CHUNK_INTERNAL_HDR_BYTES;
+
 // ── Singletons ────────────────────────────────────────────────
 // `g_default` and `last_kernel_ns` live on the facade so external callers
 // reading `gpu_enc.g_default` / `gpu_enc.last_kernel_ns` keep working

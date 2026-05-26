@@ -1366,9 +1366,9 @@ pub fn compressFramedOne(
             for (0..n_chunks) |ci| {
                 per_chunk_asm_off_buf[ci] = offsets[ci];
                 per_chunk_asm_size_buf[ci] = sizes[ci];
-                total_chunk_bytes += 6 + sizes[ci];
+                total_chunk_bytes += gpu_enc.CHUNK_INTERNAL_HDR_BYTES + sizes[ci];
             }
-            const sc_tail_bytes: usize = if (n_chunks > 1) (n_chunks - 1) * 8 else 0;
+            const sc_tail_bytes: usize = if (n_chunks > 1) (n_chunks - 1) * gpu_enc.SC_TAIL_PER_CHUNK_BYTES else 0;
             const block_payload_size: usize = total_chunk_bytes + sc_tail_bytes;
 
             const frame_hdr_len: usize = frame_block_hdr_pos; // pos right after writeHeader

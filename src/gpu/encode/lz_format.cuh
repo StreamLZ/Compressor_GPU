@@ -26,8 +26,13 @@ static constexpr uint32_t NEXT_HASH_SIZE   = 65536;        // 2^16 entries of ui
 
 // Offset / length stream encoding (see lz_token_emit.cuh).
 static constexpr uint32_t NEAR_OFFSET_MAX = 0xFFFFu;        // off16 vs off32 split
-static constexpr uint32_t LARGE_OFFSET_THRESHOLD = 0xC00000u;  // 4-byte extended off32 form
-static constexpr uint32_t OFF32_LARGE_TAG  = 0xC00000u;     // tag bits OR'd into the truncated offset
+// The "large offset" threshold above which the encoder switches to the
+// 4-byte extended off32 form is, by construction, the same value as the
+// tag bits OR'd into the truncated offset — the encoder uses the tag
+// pattern itself to mean "extended form follows". Define the threshold
+// in terms of the tag so the relationship is visible (and invariant).
+static constexpr uint32_t OFF32_LARGE_TAG        = 0xC00000u;
+static constexpr uint32_t LARGE_OFFSET_THRESHOLD = OFF32_LARGE_TAG;
 static constexpr uint32_t OFF32_LOW22_MASK = 0x3FFFFFu;     // 22-bit low offset mask
 // The decoder's OFF32_LONG_ENTRY_TAG (common/gpu_wire_format.cuh) is the
 // high byte of OFF32_LARGE_TAG; the tag must occupy the bits the low22

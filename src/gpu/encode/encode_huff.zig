@@ -146,7 +146,7 @@ pub fn gpuEncodeOff16HuffImpl(
     for (0..n) |i| {
         const cs = comp_sizes[i];
         const base: u32 = chunk_descs[i].dst_offset;
-        const init_b: u32 = if (chunk_descs[i].is_first != 0) 8 else 0;
+        const init_b: u32 = if (chunk_descs[i].is_first != 0) ec.INITIAL_LITERAL_COPY_BYTES else 0;
 
         // Default to empty (no entropy coding for this sub-chunk).
         hi_offsets[i] = total;
@@ -296,7 +296,7 @@ pub fn gpuEncodeLiteralsHuffImpl(
     for (0..n) |i| {
         const cs = comp_sizes[i];
         const base: u32 = chunk_descs[i].dst_offset;
-        const init_b: u32 = if (chunk_descs[i].is_first != 0) 8 else 0;
+        const init_b: u32 = if (chunk_descs[i].is_first != 0) ec.INITIAL_LITERAL_COPY_BYTES else 0;
         offsets[i] = total;
         descs[i] = .{ .src_offset = 0, .src_size = 0, .src_stride = 1, .dst_offset = total, .dst_capacity = 0 };
 
@@ -389,7 +389,7 @@ pub fn gpuEncodeTokensHuffImpl(
     for (0..n) |i| {
         const cs = comp_sizes[i];
         const base: u32 = chunk_descs[i].dst_offset;
-        const init_b: u32 = if (chunk_descs[i].is_first != 0) 8 else 0;
+        const init_b: u32 = if (chunk_descs[i].is_first != 0) ec.INITIAL_LITERAL_COPY_BYTES else 0;
         offsets[i] = total;
         descs[i] = .{ .src_offset = 0, .src_size = 0, .src_stride = 1, .dst_offset = total, .dst_capacity = 0 };
 

@@ -79,14 +79,41 @@ static constexpr uint8_t  SLZ_FRAME_VERSION         = 2;
 static constexpr uint8_t  SLZ_CODEC_FAST_LZ         = 1; // Codec.fast_lz
 static constexpr uint32_t SLZ_FRAME_MIN_HDR_SIZE    = 14;
 static constexpr uint32_t SLZ_FRAME_END_MARK        = 0;
+
+// Frame-header flag bits (byte 5 of the frame header).
+static constexpr uint8_t  SLZ_FRAME_FLAG_CONTENT_SIZE_PRESENT = 0x01;
+static constexpr uint8_t  SLZ_FRAME_FLAG_DICT_ID_PRESENT      = 0x02;
+
+// Block-header bits (4-byte LE word at block start).
 static constexpr uint32_t SLZ_BLOCK_UNCOMP_FLAG     = 0x80000000u;
 static constexpr uint32_t SLZ_BLOCK_PDM_FLAG        = 0x40000000u;
 static constexpr uint32_t SLZ_CHUNK_SIZE_MASK       = 0x3FFFFu;   // 256KB - 1
 static constexpr uint32_t SLZ_CHUNK_TYPE_SHIFT      = 18;
 static constexpr uint32_t SLZ_CHUNK_TYPE_MASK       = 3u << SLZ_CHUNK_TYPE_SHIFT;
 static constexpr uint8_t  SLZ_INT_BLOCK_MAGIC       = 0x05;
+static constexpr uint8_t  SLZ_BLOCK_HDR_MAGIC_MASK   = 0x0F; // low nibble of internal-header byte 0
+static constexpr uint8_t  SLZ_BLOCK_HDR_DECODER_MASK = 0x7F; // low 7 bits of internal-header byte 1
+static constexpr uint8_t  SLZ_BLOCK_HDR_CHECKSUM_FLAG = 0x80; // top bit of internal-header byte 1
 static constexpr uint8_t  SLZ_DECODER_FAST          = 1;
 static constexpr uint8_t  SLZ_DECODER_TURBO         = 2;
+
+// Total source-chunk size in bytes (sc_group_size=1.0). Matches the CPU
+// encoder's `constants.chunk_size`.
+static constexpr uint32_t SLZ_CHUNK_SIZE_BYTES      = 262144u; // 256KB
+
+// Chunk descriptor flag bits (SlzChunkDesc::flags).
+static constexpr uint32_t CHUNK_FLAG_UNCOMPRESSED   = 0x1u;
+static constexpr uint32_t CHUNK_FLAG_MEMSET         = 0x2u;
+
+// Default sub-chunk slot size when caller passes 0. Equal to LZ_BLOCK_SIZE
+// by coincidence; named separately because the semantic is "fallback
+// scratch-slot stride for the scan kernel", not "block size".
+static constexpr uint32_t DEFAULT_SUB_CHUNK_CAP     = 0x10000u; // 64KB
+
+// LZ length-stream extended marker: bytes whose raw value exceeds
+// EXT_LENGTH_THRESHOLD trigger a 2-byte extended-length read. Encoder
+// emits against this; decoder reads it.
+static constexpr uint32_t EXT_LENGTH_THRESHOLD       = 251;
 
 // ── LZ-substream header sizes (encode side writes, decode side reads) ──
 static constexpr uint32_t STREAM_HEADER_BYTES       = 3; // big-endian count

@@ -57,7 +57,7 @@ slzLzDecodeKernel(
         if (ch.decomp_size == 0) continue;
 
         // Uncompressed chunk: warp-cooperative copy
-        if (ch.flags & 1) {
+        if (ch.flags & CHUNK_FLAG_UNCOMPRESSED) {
             const uint8_t* src = compressed + ch.src_offset;
             for (uint32_t i = lane; i < ch.decomp_size; i += WARP_SIZE)
                 dst[ch.dst_offset + i] = src[i];
@@ -66,7 +66,7 @@ slzLzDecodeKernel(
         }
 
         // Memset chunk
-        if (ch.flags & 2) {
+        if (ch.flags & CHUNK_FLAG_MEMSET) {
             for (uint32_t i = lane; i < ch.decomp_size; i += WARP_SIZE)
                 dst[ch.dst_offset + i] = ch.memset_fill;
             __syncwarp();
@@ -179,7 +179,7 @@ slzLzDecodeRawKernel(
         const SlzChunkDesc& ch = chunks[chunk_idx];
         if (ch.decomp_size == 0) continue;
 
-        if (ch.flags & 1) {
+        if (ch.flags & CHUNK_FLAG_UNCOMPRESSED) {
             const uint8_t* src = compressed + ch.src_offset;
             for (uint32_t i = lane; i < ch.decomp_size; i += WARP_SIZE)
                 dst[ch.dst_offset + i] = src[i];
@@ -187,7 +187,7 @@ slzLzDecodeRawKernel(
             continue;
         }
 
-        if (ch.flags & 2) {
+        if (ch.flags & CHUNK_FLAG_MEMSET) {
             for (uint32_t i = lane; i < ch.decomp_size; i += WARP_SIZE)
                 dst[ch.dst_offset + i] = ch.memset_fill;
             __syncwarp();

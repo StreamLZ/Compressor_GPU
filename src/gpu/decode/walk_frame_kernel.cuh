@@ -76,8 +76,8 @@ extern "C" __global__ void slzWalkFrameKernel(
     const float sc_group_size = walkReadF32LE(d_frame + 9);
 
     uint32_t pos = SLZ_FRAME_MIN_HDR_SIZE;
-    const bool content_size_present = (flags & 0x01) != 0;
-    const bool dict_id_present      = (flags & 0x02) != 0;
+    const bool content_size_present = (flags & SLZ_FRAME_FLAG_CONTENT_SIZE_PRESENT) != 0;
+    const bool dict_id_present      = (flags & SLZ_FRAME_FLAG_DICT_ID_PRESENT) != 0;
     if (dict_id_present) { *d_status = 4; return; }
     if (content_size_present) pos += 8;
     // No PDM / checksums on the slzCompress path; the loop below
@@ -85,12 +85,12 @@ extern "C" __global__ void slzWalkFrameKernel(
 
     // eff_chunk_size mirrors decompressOneFrame/gpuBatchDecode: it's the
     // CHUNK boundary at which the 2-byte internal block header repeats.
-    uint32_t eff_chunk_size = (uint32_t)(sc_group_size * 262144.0f);
-    if (eff_chunk_size > 262144u) eff_chunk_size = 262144u;
-    if (eff_chunk_size == 0) eff_chunk_size = 65536u;
+    uint32_t eff_chunk_size = (uint32_t)(sc_group_size * (float)SLZ_CHUNK_SIZE_BYTES);
+    if (eff_chunk_size > SLZ_CHUNK_SIZE_BYTES) eff_chunk_size = SLZ_CHUNK_SIZE_BYTES;
+    if (eff_chunk_size == 0) eff_chunk_size = DEFAULT_SUB_CHUNK_CAP;
     // sub_chunk_cap is the slot stride used by the scan kernel; mirrors
-    // the CPU's `eff_sc_cap = constants.sub_chunk_size` (= 131072).
-    const uint32_t sub_chunk_cap = 131072u;
+    // the CPU's `eff_sc_cap = constants.sub_chunk_size` (= 128KB).
+    const uint32_t sub_chunk_cap = (uint32_t)ENTROPY_SCRATCH_SLOT_BYTES;
 
     uint32_t dst_off = 0;
     uint32_t n_chunks = 0;
@@ -121,7 +121,7 @@ extern "C" __global__ void slzWalkFrameKernel(
             // `d_compressed_src = d_frame + block_start` so the decode
             // kernels' `compressed + src_offset` reads land on the right
             // bytes.
-            d_chunks[n_chunks] = { 0u, decomp_size, decomp_size, dst_off, 1u, 0, {0, 0, 0} };
+            d_chunks[n_chunks] = { 0u, decomp_size, decomp_size, dst_off, CHUNK_FLAG_UNCOMPRESSED, 0, {0, 0, 0} };
             n_chunks++;
             dst_off += decomp_size;
             pos += comp_size;
@@ -131,10 +131,10 @@ extern "C" __global__ void slzWalkFrameKernel(
         if (pos + 2 > frame_size) { *d_status = 12; return; }
         const uint8_t bh0 = d_frame[pos];
         const uint8_t bh1 = d_frame[pos + 1];
-        if ((bh0 & 0x0F) != SLZ_INT_BLOCK_MAGIC) { *d_status = 7; return; }
-        const uint8_t decoder = bh1 & 0x7F;
+        if ((bh0 & SLZ_BLOCK_HDR_MAGIC_MASK) != SLZ_INT_BLOCK_MAGIC) { *d_status = 7; return; }
+        const uint8_t decoder = bh1 & SLZ_BLOCK_HDR_DECODER_MASK;
         if (decoder != SLZ_DECODER_FAST && decoder != SLZ_DECODER_TURBO) { *d_status = 8; return; }
-        const bool use_checksums = (bh1 >> 7) != 0;
+        const bool use_checksums = (bh1 & SLZ_BLOCK_HDR_CHECKSUM_FLAG) != 0;
         if (use_checksums) { *d_status = 5; return; }
         const uint32_t block_end = pos + comp_size;
 
@@ -147,10 +147,10 @@ extern "C" __global__ void slzWalkFrameKernel(
                 if (pos + 2 > block_end) { *d_status = 7; return; }
                 const uint8_t b0 = d_frame[pos];
                 const uint8_t b1 = d_frame[pos + 1];
-                if ((b0 & 0x0F) != SLZ_INT_BLOCK_MAGIC) { *d_status = 7; return; }
-                const uint8_t dec2 = b1 & 0x7F;
+                if ((b0 & SLZ_BLOCK_HDR_MAGIC_MASK) != SLZ_INT_BLOCK_MAGIC) { *d_status = 7; return; }
+                const uint8_t dec2 = b1 & SLZ_BLOCK_HDR_DECODER_MASK;
                 if (dec2 != SLZ_DECODER_FAST && dec2 != SLZ_DECODER_TURBO) { *d_status = 8; return; }
-                if ((b1 >> 7) != 0) { *d_status = 5; return; }
+                if ((b1 & SLZ_BLOCK_HDR_CHECKSUM_FLAG) != 0) { *d_status = 5; return; }
                 pos += 2;
             }
 
@@ -166,7 +166,7 @@ extern "C" __global__ void slzWalkFrameKernel(
                 pos += 4;
                 if (pos + comp > block_end) { *d_status = 12; return; }
                 if (n_chunks >= max_chunks) { *d_status = 11; return; }
-                const uint32_t flg = (comp == dst_this) ? 1u : 0u;
+                const uint32_t flg = (comp == dst_this) ? CHUNK_FLAG_UNCOMPRESSED : 0u;
                 // src_offset is BLOCK-PAYLOAD-RELATIVE (matches CPU walk).
                 d_chunks[n_chunks] = { pos - block_payload_start, comp, dst_this, dst_off, flg, 0, {0, 0, 0} };
                 n_chunks++;
@@ -176,7 +176,7 @@ extern "C" __global__ void slzWalkFrameKernel(
                 const uint8_t fill = d_frame[pos + 4];
                 pos += 5;
                 if (n_chunks >= max_chunks) { *d_status = 11; return; }
-                d_chunks[n_chunks] = { 0, 0, dst_this, dst_off, 2u, fill, {0, 0, 0} };
+                d_chunks[n_chunks] = { 0, 0, dst_this, dst_off, CHUNK_FLAG_MEMSET, fill, {0, 0, 0} };
                 n_chunks++;
             } else {
                 *d_status = 10; return;

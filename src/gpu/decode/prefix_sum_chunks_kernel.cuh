@@ -24,7 +24,7 @@ extern "C" __global__ void slzPrefixSumChunksKernel(
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     const uint32_t n = n_chunks;
     uint32_t cap = sub_chunk_cap;
-    if (cap == 0) cap = 65536u;
+    if (cap == 0) cap = DEFAULT_SUB_CHUNK_CAP;
     uint32_t total = 0;
     for (uint32_t i = 0; i < n; i++) {
         d_first_sub_idx[i] = total;

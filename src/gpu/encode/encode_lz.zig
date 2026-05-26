@@ -50,7 +50,7 @@ pub fn gpuCompressImpl(
     // Global hash tables — chain mode uses 3 tables per block:
     //   first_hash (hash_size u32) + long_hash (hash_size u32) + next_hash (32768 u16 = 16384 u32)
     if (chain) {
-        const next_hash_words: usize = 65536 / 2; // 65536 u16 entries = 32768 u32 words
+        const next_hash_words: usize = ec.NEXT_HASH_ENTRIES / 2; // u16 entries packed into u32 words
         const table_stride = hash_size + hash_size + next_hash_words;
         const hash_bytes = @as(usize, num_chunks) * table_stride * 4;
         if (!ec.ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) return false;
