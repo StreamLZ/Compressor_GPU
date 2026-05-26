@@ -322,6 +322,30 @@ fn dumpScanIfRequested(
     }
 }
 
+/// Bundle of the per-call inputs to `fullGpuLaunchImpl`. Replaces an
+/// 11-parameter signature with `(self, req)`. Passed by value; the
+/// struct's slice / pointer fields make it ~100 bytes, but it's
+/// constructed once per decompress call so the copy cost is invisible
+/// next to the kernel work.
+///
+/// `d_compressed_src` (4d Phase 3 D2D): when non-null the compressed
+/// block is already device-resident at this address; the source is
+/// D2D-copied into `d_comp_persist` (no PCIe). `compressed_block.ptr`
+/// is then unused (caller may pass an undefined slice with the
+/// correct `.len`).
+pub const DecodeRequest = struct {
+    chunk_descs: []const ChunkDesc,
+    compressed_block: []const u8,
+    dst_full: [*]u8,
+    dst_start_off: usize,
+    decompressed_size: usize,
+    chunks_per_group: u32,
+    sub_chunk_cap: u32,
+    io: ?std.Io,
+    d_output_target: ?u64,
+    d_compressed_src: ?u64,
+};
+
 pub fn fullGpuLaunch(
     chunk_descs: []const ChunkDesc,
     compressed_block: []const u8,
@@ -332,38 +356,36 @@ pub fn fullGpuLaunch(
     sub_chunk_cap: u32,
     io: ?std.Io,
 ) GpuError!void {
-    return fullGpuLaunchImpl(
-        &@import("driver.zig").g_default,
-        chunk_descs,
-        compressed_block,
-        dst_full,
-        dst_start_off,
-        decompressed_size,
-        chunks_per_group,
-        sub_chunk_cap,
-        io,
-        null,
-        null,
-    );
+    return fullGpuLaunchImpl(&@import("driver.zig").g_default, .{
+        .chunk_descs = chunk_descs,
+        .compressed_block = compressed_block,
+        .dst_full = dst_full,
+        .dst_start_off = dst_start_off,
+        .decompressed_size = decompressed_size,
+        .chunks_per_group = chunks_per_group,
+        .sub_chunk_cap = sub_chunk_cap,
+        .io = io,
+        .d_output_target = null,
+        .d_compressed_src = null,
+    });
 }
 
-pub fn fullGpuLaunchImpl(
-    self: *DecodeContext,
-    chunk_descs: []const ChunkDesc,
-    compressed_block: []const u8,
-    dst_full: [*]u8,
-    dst_start_off: usize,
-    decompressed_size: usize,
-    chunks_per_group: u32,
-    sub_chunk_cap: u32,
-    io: ?std.Io,
-    d_output_target: ?u64,
-    /// 4d Phase 3 D2D: when non-null the compressed block is already
-    /// device-resident at this address; the source is D2D-copied into
-    /// d_comp_persist (no PCIe). `compressed_block.ptr` is then unused
-    /// (caller may pass an undefined slice with the correct `.len`).
-    d_compressed_src: ?u64,
-) GpuError!void {
+pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void {
+    // Shadow request fields as locals so the function body below — which
+    // predates the struct-arg refactor and references the bare names —
+    // doesn't need a full rename. Zig folds these into the same registers
+    // it would have used for the old direct params.
+    const chunk_descs = req.chunk_descs;
+    const compressed_block = req.compressed_block;
+    const dst_full = req.dst_full;
+    const dst_start_off = req.dst_start_off;
+    const decompressed_size = req.decompressed_size;
+    const chunks_per_group = req.chunks_per_group;
+    const sub_chunk_cap = req.sub_chunk_cap;
+    const io = req.io;
+    const d_output_target = req.d_output_target;
+    const d_compressed_src = req.d_compressed_src;
+
     if (!ml.init()) return error.BackendNotAvailable;
     if (ml.kernel_fn == 0) return error.KernelMissing;
     try ml.ensurePipelineStreams(self);

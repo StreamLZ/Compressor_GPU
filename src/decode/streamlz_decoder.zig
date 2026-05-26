@@ -138,19 +138,18 @@ pub fn decompressFramedFromDevice(
     const compressed_block: []const u8 = stub_ptr[0..meta.block_size];
 
     var dst_dummy: u8 = 0;
-    gpu_driver.fullGpuLaunchImpl(
-        dec_ctx,
-        chunks,
-        compressed_block,
-        @ptrCast(&dst_dummy),
-        0,
-        meta.decomp_size,
-        chunks_per_group,
-        meta.sub_chunk_cap,
-        io,
-        d_output,
-        d_frame + meta.block_start,
-    ) catch |err| return err;
+    gpu_driver.fullGpuLaunchImpl(dec_ctx, .{
+        .chunk_descs = chunks,
+        .compressed_block = compressed_block,
+        .dst_full = @ptrCast(&dst_dummy),
+        .dst_start_off = 0,
+        .decompressed_size = meta.decomp_size,
+        .chunks_per_group = chunks_per_group,
+        .sub_chunk_cap = meta.sub_chunk_cap,
+        .io = io,
+        .d_output_target = d_output,
+        .d_compressed_src = d_frame + meta.block_start,
+    }) catch |err| return err;
     return meta.decomp_size;
 }
 
@@ -1173,19 +1172,18 @@ fn gpuBatchDecode(
     }
 
     const eff_sc_cap: u32 = @intCast(constants.sub_chunk_size);
-    try gpu.fullGpuLaunchImpl(
-        dec_ctx,
-        chunk_descs[0..chunk_idx],
-        block_src,
-        dst.ptr,
-        dst_start_off,
-        decompressed_size,
-        chunks_per_group,
-        eff_sc_cap,
-        io_opt,
-        d_output_target,
-        null, // d_compressed_src — legacy path, source is host
-    );
+    try gpu.fullGpuLaunchImpl(dec_ctx, .{
+        .chunk_descs = chunk_descs[0..chunk_idx],
+        .compressed_block = block_src,
+        .dst_full = dst.ptr,
+        .dst_start_off = dst_start_off,
+        .decompressed_size = decompressed_size,
+        .chunks_per_group = chunks_per_group,
+        .sub_chunk_cap = eff_sc_cap,
+        .io = io_opt,
+        .d_output_target = d_output_target,
+        .d_compressed_src = null, // legacy path: source is host
+    });
 }
 
 // ────────────────────────────────────────────────────────────
