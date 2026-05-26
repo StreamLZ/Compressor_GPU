@@ -102,12 +102,29 @@ fn mergeHuffDescs(
     // Storage lives on the DecodeContext (see merged_huff_buf there) so
     // the dispatch frame stays small.
     const merged_huff: []HuffDecChunkDesc = self.merged_huff_buf[0..];
+
+    // Upfront capacity check: the sum of per-stream counts must fit in
+    // `merged_huff` (sized MAX_HUFF_DESCS_PER_STREAM × 4). Each per-
+    // stream-type input buffer is sized MAX_HUFF_DESCS_PER_STREAM, so
+    // the only way to exceed the merged buffer is if scan_host is ever
+    // changed to relax its per-stream bounds. Reject loudly rather than
+    // silently truncating (the old append loop's `if (m_ptr.* >= dst.len)
+    // return;` would have dropped any overflow without surfacing the
+    // count mismatch, and the downstream kernel-launch grid still used
+    // n_huff = sum-of-scan-counts).
+    const total_huff: usize = @as(usize, scan.num_huff_lit) + scan.num_huff_tok +
+        scan.num_huff_off16hi + scan.num_huff_off16lo;
+    if (total_huff > merged_huff.len) return error.BadMode;
+
     var m: u32 = 0;
     var lut_slot: u32 = 0;
     const append = struct {
         fn run(dst: []HuffDecChunkDesc, m_ptr: *u32, lut_ptr: *u32,
                src: []const HuffDecChunkDesc, region_off: u32) void {
             for (src) |s| {
+                // Guard is now redundant (total_huff bound above), but
+                // kept as a defense-in-depth assert against a future
+                // refactor that bypasses the upfront check.
                 if (m_ptr.* >= dst.len) return;
                 var entry = s;
                 entry.out_offset += region_off;
