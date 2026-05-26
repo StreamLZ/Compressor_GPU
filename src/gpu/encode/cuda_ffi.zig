@@ -26,17 +26,25 @@ pub const CUdevice = c_int;
 pub const CUdeviceptr = u64;
 pub const CUDA_SUCCESS: CUresult = 0;
 
-// nvcuda.dll handle — populated by module_loader.init().
-pub var lib: ?*anyopaque = null;
+// Opaque CUDA handles. The driver API treats `CUmodule` and `CUfunction`
+// as opaque pointers; we model them as `usize` so module_loader can use
+// the typed names instead of bare `usize` slots.
+pub const CUmodule = usize;
+pub const CUfunction = usize;
 
-pub const FnModuleLoadData = *const fn (*usize, [*]const u8) callconv(.c) CUresult;
-pub const FnModuleGetFunction = *const fn (*usize, usize, [*:0]const u8) callconv(.c) CUresult;
+// nvcuda.dll handle — populated by module_loader.init(). Underscore-
+// prefixed because it's an implementation detail; only this file and
+// the encode module_loader touch it.
+pub var _lib: ?*anyopaque = null;
+
+pub const FnModuleLoadData = *const fn (*CUmodule, [*]const u8) callconv(.c) CUresult;
+pub const FnModuleGetFunction = *const fn (*CUfunction, CUmodule, [*:0]const u8) callconv(.c) CUresult;
 pub const FnMemAlloc = *const fn (*CUdeviceptr, usize) callconv(.c) CUresult;
 pub const FnMemFree = *const fn (CUdeviceptr) callconv(.c) CUresult;
 pub const FnMemcpyHtoD = *const fn (CUdeviceptr, *const anyopaque, usize) callconv(.c) CUresult;
 pub const FnMemcpyDtoH = *const fn (*anyopaque, CUdeviceptr, usize) callconv(.c) CUresult;
 pub const FnMemcpyDtoDAsync = *const fn (CUdeviceptr, CUdeviceptr, usize, usize) callconv(.c) CUresult;
-pub const FnLaunchKernel = *const fn (usize, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, usize, [*]?*anyopaque, [*]?*anyopaque) callconv(.c) CUresult;
+pub const FnLaunchKernel = *const fn (CUfunction, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, usize, [*]?*anyopaque, [*]?*anyopaque) callconv(.c) CUresult;
 pub const FnCtxSync = *const fn () callconv(.c) CUresult;
 pub const FnMemsetD8 = *const fn (CUdeviceptr, u8, usize) callconv(.c) CUresult;
 
@@ -56,7 +64,7 @@ pub var cuMemsetD8_fn: ?FnMemsetD8 = null;
 /// the caller decides whether that's fatal (cuModuleLoadData etc.) or
 /// merely disables an optional kernel path (huffman, assemble).
 pub fn getProc(comptime T: type, name: [*:0]const u8) ?T {
-    const h = lib orelse return null;
+    const h = _lib orelse return null;
     const raw = win32.GetProcAddress(h, name) orelse return null;
     return @ptrCast(raw);
 }

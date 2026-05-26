@@ -22,6 +22,12 @@ const CUDA_SUCCESS = cuda.CUDA_SUCCESS;
 
 pub fn ensureDeviceBuf(ptr: *CUdeviceptr, current_size: *usize, needed: usize) bool {
     if (current_size.* >= needed) return true;
+    // K6.76: the free's result is intentionally dropped — at this point we
+    // are about to grow the buffer regardless, and a failed free leaks at
+    // worst a single allocation (cleaned up at process exit / context
+    // destroy). Surfacing the failure here would force every caller to
+    // distinguish "alloc failed" from "free failed before alloc", which
+    // adds no actionable signal.
     if (ptr.* != 0) _ = (cuda.cuMemFree_fn orelse return false)(ptr.*);
     current_size.* = 0;
     if ((cuda.cuMemAlloc_fn orelse return false)(ptr, needed) != CUDA_SUCCESS) return false;
@@ -95,22 +101,35 @@ pub fn beginKernelTiming(
     var end: usize = 0;
     if (create_fn(&start, 0) != CUDA_SUCCESS) return null;
     if (create_fn(&end, 0) != CUDA_SUCCESS) {
-        if (cuda.cuEventDestroy_fn) |dd| _ = dd(start);
+        if (cuda.cuEventDestroy_fn) |destroy_fn| _ = destroy_fn(start);
         return null;
     }
     if (record_fn(start, stream) != CUDA_SUCCESS) {
-        if (cuda.cuEventDestroy_fn) |dd| { _ = dd(start); _ = dd(end); }
+        if (cuda.cuEventDestroy_fn) |destroy_fn| { _ = destroy_fn(start); _ = destroy_fn(end); }
         return null;
     }
     pending.append(std.heap.page_allocator, .{
         .name = name, .start_event = start, .end_event = end,
     }) catch {
-        if (cuda.cuEventDestroy_fn) |dd| { _ = dd(start); _ = dd(end); }
+        if (cuda.cuEventDestroy_fn) |destroy_fn| { _ = destroy_fn(start); _ = destroy_fn(end); }
         return null;
     };
     return end;
 }
 
+/// Record the end event of a kernel-timing pair. The pair was appended to
+/// `pending_timings` by `beginKernelTiming`; this is the matching second
+/// half.
+///
+/// K6.77 contract: if `cuEventRecord` fails here (e.g. invalid stream,
+/// context lost), the end-event is never armed, so the matching
+/// `cuEventSynchronize` in `finalizeProfiling` will block forever waiting
+/// for an event that the driver will never complete. We accept this risk
+/// because profiling is opt-in (only enabled when the caller sets
+/// `enable_profiling`) and any CUDA failure at this point already implies
+/// the surrounding decode launch is in a non-recoverable state — the next
+/// `cuCtxSynchronize` in the dispatch path will surface the real error
+/// before `finalizeProfiling` is reached.
 pub fn endKernelTiming(end_event: ?usize, stream: usize) void {
     const e = end_event orelse return;
     const record_fn = cuda.cuEventRecord_fn orelse return;
@@ -143,6 +162,9 @@ pub fn finalizeProfiling(
         pending.clearRetainingCapacity();
         return;
     };
+    // K6.78: the four CUDA-result drops below (sync / elapsed / destroy ×2)
+    // are swallowed by design — profiling is opt-in and a transient driver
+    // hiccup here only loses a single ms reading, never decode correctness.
     for (pending.items) |p| {
         _ = sync_fn(p.end_event);
         var ms: f32 = 0.0;
@@ -163,6 +185,11 @@ pub const DecodeContext = struct {
     // ── Output buffer ──────────────────────────────────────────
     d_output: CUdeviceptr = 0,
     d_output_size: usize = 0,
+    // Pinned host mirror of d_output for the D2H copy on the synchronous
+    // decompress path. Grouped here (K6.80) so output-related state lives
+    // together.
+    h_pinned_output: ?[*]u8 = null,
+    h_pinned_output_size: usize = 0,
 
     // ── Persistent compressed-input + descriptor buffers ───────
     d_comp_persist: CUdeviceptr = 0,
@@ -177,9 +204,6 @@ pub const DecodeContext = struct {
     // lo bytes at +d.OFF16_HILO_SPLIT_OFFSET.
     d_entropy_scratch: CUdeviceptr = 0,
     d_entropy_scratch_size: usize = 0,
-
-    h_pinned_output: ?[*]u8 = null,
-    h_pinned_output_size: usize = 0,
 
     // Off16 scratch view = d_entropy_scratch + off16_offset (set in fullGpuLaunchImpl).
     // Used by the raw-off16 gather kernel and the D2D/H2D fallback loops.
@@ -267,8 +291,10 @@ pub const DecodeContext = struct {
     huff_off16hi_host_buf: [d.MAX_HUFF_DESCS_PER_STREAM]d.HuffDecChunkDesc = undefined,
     huff_off16lo_host_buf: [d.MAX_HUFF_DESCS_PER_STREAM]d.HuffDecChunkDesc = undefined,
 
-    // Pipeline streams (persistent, created once in init)
-    pipeline_streams: [cuda.NUM_PIPELINE_STREAMS]usize = .{0} ** cuda.NUM_PIPELINE_STREAMS,
+    // Pipeline streams (persistent, created once in init). Stays sized by
+    // cuda.NUM_PIPELINE_STREAMS even though it currently equals 1 (K6.66 /
+    // K6.87) so a future bump just re-evaluates the comptime length.
+    pipeline_streams: [cuda.NUM_PIPELINE_STREAMS]usize = @splat(0),
     pipeline_streams_created: bool = false,
 
     // Per-call scratch buffers — pulled off the dispatch-loop stack
@@ -355,7 +381,7 @@ pub const DecodeContext = struct {
                     if (s != 0) _ = destroy_fn(s);
                 }
             }
-            self.pipeline_streams = .{0} ** cuda.NUM_PIPELINE_STREAMS;
+            self.pipeline_streams = @splat(0);
             self.pipeline_streams_created = false;
         }
 

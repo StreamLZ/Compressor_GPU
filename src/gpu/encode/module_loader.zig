@@ -25,15 +25,15 @@ const ffi = @import("cuda_ffi.zig");
 
 // Per-module handles. CUDA context comes from the decode driver — see
 // the file-level doc above.
-pub var module: usize = 0;
-pub var kernel_fn: usize = 0;
-pub var huff_module: usize = 0;
-pub var huff_tables_kernel_fn: usize = 0;
-pub var huff_encode_kernel_fn: usize = 0;
-pub var assemble_module: usize = 0;
-pub var assemble_measure_fn: usize = 0;
-pub var assemble_write_fn: usize = 0;
-pub var frame_assemble_fn: usize = 0;
+pub var module: ffi.CUmodule = 0;
+pub var kernel_fn: ffi.CUfunction = 0;
+pub var huff_module: ffi.CUmodule = 0;
+pub var huff_tables_kernel_fn: ffi.CUfunction = 0;
+pub var huff_encode_kernel_fn: ffi.CUfunction = 0;
+pub var assemble_module: ffi.CUmodule = 0;
+pub var assemble_measure_fn: ffi.CUfunction = 0;
+pub var assemble_write_fn: ffi.CUfunction = 0;
+pub var frame_assemble_fn: ffi.CUfunction = 0;
 pub var initialized: bool = false;
 
 pub fn init() bool {
@@ -45,8 +45,8 @@ pub fn init() bool {
     const dec_gpu = @import("../decode/driver.zig");
     if (!dec_gpu.init()) return false;
 
-    ffi.lib = ffi.win32.LoadLibraryA("nvcuda.dll");
-    if (ffi.lib == null) return false;
+    ffi._lib = ffi.win32.LoadLibraryA("nvcuda.dll");
+    if (ffi._lib == null) return false;
 
     ffi.cuModuleLoadData_fn = ffi.getProc(ffi.FnModuleLoadData, "cuModuleLoadData");
     ffi.cuModuleGetFunction_fn = ffi.getProc(ffi.FnModuleGetFunction, "cuModuleGetFunction");

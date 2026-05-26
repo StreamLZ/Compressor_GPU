@@ -46,7 +46,10 @@ pub fn gpuEncodeHuffImpl(
     const memset_fn = ffi.cuMemsetD8_fn orelse return false;
 
     const n: u32 = @intCast(descs.len);
-    if (n == 0) return true;
+    // Convention across all four entrypoints: empty input → false (no
+    // bodies produced; caller falls back to the raw stream). Matches the
+    // `n == 0 → return false` early-outs in the wrappers below.
+    if (n == 0) return false;
 
     // Per-stream scratch: each 4-way split quarter holds src_size/4 symbols
     // of ≤ 11 bits; 2 bytes/symbol is a safe bound. Size from the largest
@@ -75,6 +78,9 @@ pub fn gpuEncodeHuffImpl(
     if (sync_fn() != ffi.CUDA_SUCCESS) return false;
 
     // Kernel 1: build per-block Huffman tables from the source streams.
+    // Huffman source = LZ output (raw streams written by gpuCompressImpl
+    // into d_output_persist; descriptor src_offsets point into the same
+    // buffer at the lit/tok/off16 sub-stream offsets).
     var p_src = self.d_output_persist;
     var p_descs = self.d_huff_descs_persist;
     var p_cl = self.d_huff_cl_persist;
@@ -82,7 +88,7 @@ pub fn gpuEncodeHuffImpl(
     var p_stride: u32 = 256;
     var p_n: u32 = n;
     var tbl_params = [_]?*anyopaque{
-        @ptrCast(&p_src),   @ptrCast(&p_descs), @ptrCast(&p_cl),
+        @ptrCast(&p_src),   @ptrCast(&p_descs),  @ptrCast(&p_cl),
         @ptrCast(&p_codes), @ptrCast(&p_stride), @ptrCast(&p_n),
     };
     var extra = [_]?*anyopaque{null};
@@ -101,9 +107,9 @@ pub fn gpuEncodeHuffImpl(
     var p_sizes = self.d_huff_sizes_persist;
     var p_sps: u32 = @intCast(scratch_per_stream);
     var enc_params = [_]?*anyopaque{
-        @ptrCast(&p_src),     @ptrCast(&p_descs), @ptrCast(&p_cl),
-        @ptrCast(&p_codes),   @ptrCast(&p_scratch), @ptrCast(&p_out),
-        @ptrCast(&p_sizes),   @ptrCast(&p_sps), @ptrCast(&p_stride),
+        @ptrCast(&p_src),   @ptrCast(&p_descs),   @ptrCast(&p_cl),
+        @ptrCast(&p_codes), @ptrCast(&p_scratch), @ptrCast(&p_out),
+        @ptrCast(&p_sizes), @ptrCast(&p_sps),     @ptrCast(&p_stride),
         @ptrCast(&p_n),
     };
     const t_henc = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, profile_names[1], 0);
@@ -232,15 +238,18 @@ pub fn gpuEncodeOff16HuffImpl(
         }
         out_dev = self.d_asm_huff_off16;
     }
-    const bytes: []u8 = if (resident) &[_]u8{} else (allocator.alloc(u8, total) catch {
+    // Device-resident mode skips the host bounce buffer entirely; pass
+    // an empty slice so `gpuEncodeHuffImpl`'s `out_bytes` parameter still
+    // has a valid (but unused) backing pointer.
+    const empty_bytes = &[_]u8{};
+    const bytes: []u8 = if (resident) empty_bytes else (allocator.alloc(u8, total) catch {
         allocator.free(hi_offsets);
         allocator.free(lo_offsets);
         allocator.free(all_sizes);
         return false;
     });
 
-    if (!gpuEncodeHuffImpl(self, descs, total, all_sizes, bytes, out_dev,
-        .{ "huff-off16/build", "huff-off16/encode" })) {
+    if (!gpuEncodeHuffImpl(self, descs, total, all_sizes, bytes, out_dev, .{ "huff-off16/build", "huff-off16/encode" })) {
         allocator.free(hi_offsets);
         allocator.free(lo_offsets);
         allocator.free(all_sizes);
@@ -250,13 +259,15 @@ pub fn gpuEncodeOff16HuffImpl(
 
     // Split sizes into hi (first n) and lo (next n).
     const hi_sizes = allocator.alloc(u32, n) catch {
-        allocator.free(hi_offsets); allocator.free(lo_offsets);
+        allocator.free(hi_offsets);
+        allocator.free(lo_offsets);
         allocator.free(all_sizes);
         if (!resident) allocator.free(bytes);
         return false;
     };
     const lo_sizes = allocator.alloc(u32, n) catch {
-        allocator.free(hi_offsets); allocator.free(lo_offsets);
+        allocator.free(hi_offsets);
+        allocator.free(lo_offsets);
         allocator.free(hi_sizes);
         allocator.free(all_sizes);
         if (!resident) allocator.free(bytes);
@@ -275,11 +286,14 @@ pub fn gpuEncodeOff16HuffImpl(
     std.debug.assert(self.huff_off16lo_sizes == null);
     std.debug.assert(self.huff_off16lo_data == null);
     std.debug.assert(self.huff_off16lo_offsets == null);
+    // hi owns `bytes`; lo is a non-owning alias of the same slice.
+    // See the OWNERSHIP RULE on the huff_off16{hi,lo}_data fields in
+    // encode_context.zig for the teardown contract.
     self.huff_off16hi_sizes = hi_sizes;
-    self.huff_off16hi_data = if (resident) null else bytes; // shared buffer; both hi and lo offsets index into it
+    self.huff_off16hi_data = if (resident) null else bytes;
     self.huff_off16hi_offsets = hi_offsets;
     self.huff_off16lo_sizes = lo_sizes;
-    self.huff_off16lo_data = if (resident) null else bytes; // SAME pointer — only one of {hi,lo} should free it
+    self.huff_off16lo_data = if (resident) null else bytes;
     self.huff_off16lo_offsets = lo_offsets;
     return true;
 }
@@ -357,14 +371,17 @@ pub fn gpuEncodeLiteralsHuffImpl(
         }
         out_dev = self.d_asm_huff_lit;
     }
-    const bytes: []u8 = if (resident) &[_]u8{} else (allocator.alloc(u8, total) catch {
+    // Device-resident mode skips the host bounce buffer entirely; pass
+    // an empty slice so `gpuEncodeHuffImpl`'s `out_bytes` parameter still
+    // has a valid (but unused) backing pointer.
+    const empty_bytes = &[_]u8{};
+    const bytes: []u8 = if (resident) empty_bytes else (allocator.alloc(u8, total) catch {
         allocator.free(offsets);
         allocator.free(sizes);
         return false;
     });
 
-    if (!gpuEncodeHuffImpl(self, descs, total, sizes, bytes, out_dev,
-        .{ "huff-lit/build", "huff-lit/encode" })) {
+    if (!gpuEncodeHuffImpl(self, descs, total, sizes, bytes, out_dev, .{ "huff-lit/build", "huff-lit/encode" })) {
         allocator.free(offsets);
         allocator.free(sizes);
         if (!resident) allocator.free(bytes);
@@ -454,14 +471,17 @@ pub fn gpuEncodeTokensHuffImpl(
         }
         out_dev = self.d_asm_huff_tok;
     }
-    const bytes: []u8 = if (resident) &[_]u8{} else (allocator.alloc(u8, total) catch {
+    // Device-resident mode skips the host bounce buffer entirely; pass
+    // an empty slice so `gpuEncodeHuffImpl`'s `out_bytes` parameter still
+    // has a valid (but unused) backing pointer.
+    const empty_bytes = &[_]u8{};
+    const bytes: []u8 = if (resident) empty_bytes else (allocator.alloc(u8, total) catch {
         allocator.free(offsets);
         allocator.free(sizes);
         return false;
     });
 
-    if (!gpuEncodeHuffImpl(self, descs, total, sizes, bytes, out_dev,
-        .{ "huff-tok/build", "huff-tok/encode" })) {
+    if (!gpuEncodeHuffImpl(self, descs, total, sizes, bytes, out_dev, .{ "huff-tok/build", "huff-tok/encode" })) {
         allocator.free(offsets);
         allocator.free(sizes);
         if (!resident) allocator.free(bytes);

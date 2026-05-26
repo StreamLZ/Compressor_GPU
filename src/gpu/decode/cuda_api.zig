@@ -117,6 +117,14 @@ pub var cuEventDestroy_fn: ?FnEventDestroy = null;
 
 /// Pipeline streams (persistent, created once in init). Owned by each
 /// DecodeContext; the numeric width drives `DecodeContext.pipeline_streams`.
+///
+/// K6.87: was historically higher (2-4) when the entropy pre-decode and the
+/// LZ kernel ran on separate streams to overlap. The unified Huffman+LZ
+/// schedule now keeps everything on the heavy stream, so a single non-
+/// blocking stream is enough. The for-loops in `ensurePipelineStreams` /
+/// `deinit` stay parameterized on this constant so a future bump (e.g.
+/// re-introducing multi-stream entropy overlap) only needs the literal
+/// changed.
 pub const NUM_PIPELINE_STREAMS = 1;
 
 pub fn getProc(comptime T: type, name: [*:0]const u8) ?T {

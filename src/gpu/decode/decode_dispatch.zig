@@ -387,7 +387,6 @@ pub fn fullGpuLaunchImpl(
     _ = scan_gpu_mod.gpuPrefixSumChunksImpl(self, self.d_descs_persist, @intCast(chunk_descs.len), sub_chunk_cap) orelse return error.BadMode;
     var total_subchunks: u32 = 0;
     try cudaCall(d2h_fn(@ptrCast(&total_subchunks), self.d_total_subchunks_buf, 4));
-    self.d_first_subchunk_idx = self.d_first_sub_idx_persist;
     // CPU mirror for the pipeline branch — NUM_PIPELINE_STREAMS==1
     // reads only index 0 (= 0). Storage lives on the DecodeContext;
     // zero-init at first use is enough (subsequent calls overwrite as
@@ -404,12 +403,15 @@ pub fn fullGpuLaunchImpl(
     const off16_offset = @as(usize, total_subchunks) * per_subchunk_scratch * 2;
     self.d_entropy_off16_scratch = self.d_entropy_scratch + off16_offset;
 
+    // Sub-chunks per chunk > 1 (sc<1 cases) want the per-chunk first-sub-chunk
+    // table on host for the pipeline split; the 1-sub-chunk-per-chunk case
+    // doesn't need it (chunk_idx is the global sub-chunk idx). Pass either
+    // the device-resident prefix sum or 0 (nullptr → kernel uses identity).
     const need_first_sub_idx = total_subchunks != @as(u32, @intCast(chunk_descs.len));
+    self.d_first_subchunk_idx = if (need_first_sub_idx) self.d_first_sub_idx_persist else 0;
     if (need_first_sub_idx) {
         const fs_bytes: usize = chunk_descs.len * @sizeOf(u32);
         try cudaCall(d2h_fn(@ptrCast(first_subchunk_idx_buf.ptr), self.d_first_sub_idx_persist, fs_bytes));
-    } else {
-        self.d_first_subchunk_idx = 0;
     }
 
     // 4d Phase 3 D2D: source bytes already device-resident → D2D-copy
@@ -450,7 +452,6 @@ pub fn fullGpuLaunchImpl(
                 chunk_descs,
                 compressed_block,
                 sub_chunk_cap,
-                first_subchunk_idx_buf[0..chunk_descs.len],
                 total_subchunks,
                 &self.huff_lit_host_buf,
                 &self.huff_tok_host_buf,

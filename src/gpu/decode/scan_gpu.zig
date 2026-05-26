@@ -57,9 +57,9 @@ pub fn gpuWalkFrameImpl(
         @ptrCast(&k_meta_bsize),  @ptrCast(&k_meta_status),
     };
     var extra = [_]?*anyopaque{null};
-    const _t = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzWalkFrameKernel", 0);
+    const t_walk = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzWalkFrameKernel", 0);
     if (launch(ml.walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return null;
-    dec_ctx.endKernelTiming(_t, 0);
+    dec_ctx.endKernelTiming(t_walk, 0);
     if (sync() != CUDA_SUCCESS) return null;
 
     return .{
@@ -93,9 +93,9 @@ pub fn gpuPrefixSumChunksImpl(
         @ptrCast(&k_first), @ptrCast(&k_total),
     };
     var extra = [_]?*anyopaque{null};
-    const _t = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzPrefixSumChunksKernel", 0);
+    const t_prefix = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzPrefixSumChunksKernel", 0);
     if (launch(ml.prefix_sum_chunks_fn, 1, 1, 1, 1, 1, 1, 0, 0, &params, &extra) != CUDA_SUCCESS) return null;
-    dec_ctx.endKernelTiming(_t, 0);
+    dec_ctx.endKernelTiming(t_prefix, 0);
     if (sync() != CUDA_SUCCESS) return null;
 
     return .{
@@ -119,10 +119,6 @@ pub fn gpuScanChunks(
     chunk_descs: []const d.ChunkDesc,
     compressed_block: []const u8,
     sub_chunk_cap: u32,
-    /// Vestigial — gpuScanChunks now reads the device-resident prefix
-    /// sum directly. Kept in the signature to limit churn at the call
-    /// site; only the `.len` is consulted (must equal chunk_descs.len).
-    first_subchunk_idx: []const u32,
     total_subchunks: u32,
     huff_lit_descs: []d.HuffDecChunkDesc,
     huff_tok_descs: []d.HuffDecChunkDesc,
@@ -132,16 +128,16 @@ pub fn gpuScanChunks(
 ) ?d.ScanResult {
     if (ml.scan_parse_fn == 0) return null;
     const n: u32 = @intCast(chunk_descs.len);
-    if (n == 0 or total_subchunks == 0 or first_subchunk_idx.len < n) return null;
+    if (n == 0 or total_subchunks == 0) return null;
 
     const d2h = cuda.cuMemcpyDtoH_fn orelse return null;
     const h2d = cuda.cuMemcpyHtoD_fn orelse return null;
     const launch = cuda.cuLaunchKernel_fn orelse return null;
     const sync = cuda.cuCtxSynchronize_fn orelse return null;
     const memset = cuda.cuMemsetD8_fn orelse return null;
-    // The legacy `first_subchunk_idx` host array is unused — the scan
-    // kernel reads the device-resident prefix sum (d_first_sub_idx_persist)
-    // directly. We only kept the len-check above.
+    // The scan kernel reads the device-resident prefix sum
+    // (d_first_sub_idx_persist) directly; no host first_subchunk_idx
+    // mirror is needed here.
 
     // Staged buffer: [lit][tok][hi][lo] ScanHuffDesc, then [raw_hi][raw_lo]
     // ScanRawDesc — one entry per global sub-chunk index per stream type.
@@ -149,7 +145,7 @@ pub fn gpuScanChunks(
     const raw_arr_bytes: usize = @as(usize, total_subchunks) * @sizeOf(d.ScanRawDesc);
     const staged_bytes: usize = huff_arr_bytes * 4 + raw_arr_bytes * 2;
     if (!ensureDeviceBuf(&self.d_scan_staged, &self.d_scan_staged_size, staged_bytes)) return null;
-    // Zero so sub-chunk slots no thread reaches keep valid=0.
+    // Zero so sub-chunk slots that no thread reaches keep valid=0.
     if (memset(self.d_scan_staged, 0, staged_bytes) != CUDA_SUCCESS) return null;
 
     const base = self.d_scan_staged;

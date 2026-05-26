@@ -11,7 +11,10 @@ Commits landed this arc: `712d593` (K1) → `651392a` (K2) → `01e9e38` (K3)
 → `7dfe3e6` (K4) → `b552f02` (K5 easy) → `b2641d1` (K5b docs)
 → `9e30a6d` (K6a docs) → `c025e21` (K6bc naming + CUDA polish)
 → `1212a2e` (K6d Zig polish) → `239b9ed` (status update) →
-`a047ba0` (revert K1 C9 — measurable L3 kernel regression).
+`a047ba0` (revert K1 C9 — measurable L3 kernel regression) →
+`3136a33` (record C9 revert) → `d886d31`/`655e56d` (perf-warning
+comments at the four C9 shfl sites) → `<HEAD>` (K6e — agent-fanned
+Zig polish batch, +29 items).
 
 **Perf result vs morning baseline (apples-to-apples, same hardware,
 same .slz files, `-db -t 1 -r 30`):**
@@ -111,18 +114,54 @@ is essentially flat post-revert.
 | K6 | K6.61 __syncwarp() comment in assemble | DONE | `c025e21` |
 | K6 | K6.62 decode_dispatch `var dd = s;` shadow | DONE | `1212a2e` |
 | K6 | K6.63 cache SLZ_HUFF_DBG getenv | DONE | `1212a2e` |
-| K6 | K6.64-K6.85 decode Zig misc polish | NOT DONE — defer |  |
+| K6 | K6.66 .{0} ** 1 → @splat(0) for pipeline_streams | DONE | K6e |
+| K6 | K6.67 decode_dispatch two-step assignment collapse | DONE | K6e |
+| K6 | K6.68 setupLzCommonParams helper extract | NOT DONE — defer, warmer dispatch code |  |
+| K6 | K6.69 scan_gpu _t → t_walk / t_prefix rename | DONE | K6e |
+| K6 | K6.70 scan_gpu drop vestigial first_subchunk_idx param | DONE | K6e |
+| K6 | K6.71 scan_gpu comment grammar fix | DONE | K6e |
+| K6 | K6.72 scan_gpu cudaCall convention | SKIPPED — needs return-type change rippling to callers |  |
+| K6 | K6.73 descriptors.zig ScanResult num_raw_off16 default | DONE | K6e |
+| K6 | K6.74 descriptors.zig Type0Info → scan_host.zig | DONE | K6e |
+| K6 | K6.75 GpuError doc path pointer | DONE | K6e |
+| K6 | K6.76 decode_context cuMemFree-on-grow doc | DONE | K6e |
+| K6 | K6.77 decode_context endKernelTiming silent-failure doc | DONE | K6e |
+| K6 | K6.78 decode_context finalizeProfiling swallow comment | DONE | K6e |
+| K6 | K6.79 decode_context dd → destroy_fn rename | DONE | K6e |
+| K6 | K6.80 decode_context move h_pinned_output next to d_output | DONE | K6e |
+| K6 | K6.81 decode_context promote // group comments to /// | SKIPPED — group comments span many fields, real refactor needed |  |
+| K6 | K6.82 descriptors MAX_HUFF_DESCS_PER_STREAM relationship | DONE | K6e |
+| K6 | K6.83 dumpScanIfRequested portability | NOT DONE — over-refactor risk |  |
+| K6 | K6.84 nullTerminatedPtx helper extract | NOT DONE — defer (module loader path) |  |
+| K6 | K6.85 SLZ_E2E_TIMER print piggyback vs create | DONE | K6e |
 | K6 | K6.86 cuda_api.zig ctx → ?usize | NOT DONE — too invasive (used pervasively as usize) |  |
-| K6 | K6.87 NUM_PIPELINE_STREAMS = 1 history comment | NOT DONE — defer |  |
+| K6 | K6.87 NUM_PIPELINE_STREAMS = 1 history comment | DONE | K6e |
 | K6 | K6.88 levels.zig drop unused level param | DONE | `1212a2e` |
-| K6 | K6.89-K6.102 encode Zig misc polish | NOT DONE — defer |  |
+| K6 | K6.89 encode/cuda_ffi.zig lib → _lib rename | DONE | K6e |
+| K6 | K6.90 encode/cuda_ffi.zig CUmodule/CUfunction typed aliases | DONE | K6e |
+| K6 | K6.91 encode_context.zig huff_off16 OWNERSHIP wording | DONE | K6e |
+| K6 | K6.92 encode_huff.zig Huffman-source-is-LZ-output comment | DONE | K6e |
+| K6 | K6.93 encode_huff.zig drop "SAME pointer" inline comment | DONE | K6e |
+| K6 | K6.94 encode_huff.zig consistent empty-input return | DONE (`false` everywhere) | K6e |
+| K6 | K6.95 encode_assemble.zig enc_sizes[i]==0 docs | DONE | K6e |
+| K6 | K6.96 encode_lz.zig FFI fn resolution convention doc | DONE | K6e |
+| K6 | K6.97 encode_context.zig ignored free_fn CUresult comment | DONE | K6e |
+| K6 | K6.98 encode_huff.zig run zig fmt on params arrays | DONE | K6e |
+| K6 | K6.99 encode/driver.zig trim cycle comment | DONE | K6e |
+| K6 | K6.100 encode/driver.zig last_kernel_ns "decode has own" | DONE | K6e |
+| K6 | K6.101 encode_huff.zig extract bytes alloc-or-fallback local | DONE | K6e |
+| K6 | K6.102 encode_assemble.zig name the `6` (CHUNK_INTERNAL_HDR_BYTES) | ALREADY-DONE (K3.12) | `01e9e38` |
 | K6 | K6.103 update old CLEANUP_TODO.md DONE table | NOT DONE — see "Next steps" below |  |
 
-**Summary:** 6 of 6 K1 items, 7 of 7 K2 items, 18 of 18 K3 items, 6 of 6
-K4 items, 7 of 11 K5 items (4 deferred), and ~30 of 103 K6 items —
-focused on the highest-value documentation, naming, and small-radius
-polish work. The remaining K6 items are all low-priority follow-up
-polish; future passes can chip away at them in batches similar to K6a-d.
+**Summary:** 6 of 6 K1 items (1 reverted), 7 of 7 K2 items, 18 of 18 K3
+items, 6 of 6 K4 items, 7 of 11 K5 items (4 deferred), and ~59 of 103
+K6 items — covers documentation, naming, small-radius polish, plus the
+K6e agent-fanned Zig batch (29 items in one round across 14 files).
+Remaining K6 items are the hot-path decoder polish (K6.33-K6.50 group,
+deferred because PTX-scheduling-sensitive — see the C9 lesson at the
+top), a couple of medium-radius refactors (K6.68, K6.83, K6.84), three
+explicit "won't do" with reasons (K6.23, K6.26, K6.30), and K6.103
+(old CLEANUP_TODO.md DONE-table update).
 
 ## Deferred items — next-session pickup
 

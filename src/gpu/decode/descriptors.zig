@@ -35,7 +35,15 @@ pub const HUFF_LUT_ENTRIES: usize = 1024; // matches MAX_CODE_LEN=10 (10-bit esc
 // ── Per-context buffer caps ─────────────────────────────────────
 // Host-side max counts; sized for the largest frame the GPU codec
 // can produce (walk_max_chunks chunks * sub-chunks-per-chunk).
-pub const MAX_HUFF_DESCS_PER_STREAM: u32 = 4096;
+//
+// K6.82: MAX_SUB_CHUNKS_PER_CHUNK names the host-scan path's worst-case
+// fan-out (each chunk produces at most this many entropy descs per
+// stream). Expressing the cap as WALK_MAX_CHUNKS / MAX_SUB_CHUNKS_PER_CHUNK
+// makes the relationship visible; the scan_gpu.zig D2D path uses a
+// different bound (WALK_MAX_CHUNKS * MAX_SUB_CHUNKS_PER_CHUNK) for the
+// device-side compact buffers — see the comment there.
+pub const MAX_SUB_CHUNKS_PER_CHUNK: u32 = 4;
+pub const MAX_HUFF_DESCS_PER_STREAM: u32 = WALK_MAX_CHUNKS / MAX_SUB_CHUNKS_PER_CHUNK;
 pub const MAX_RAW_OFF16_DESCS: u32 = 8192;
 
 // ── Per-sub-chunk entropy scratch geometry ──────────────────────
@@ -96,7 +104,7 @@ pub const RawOff16Desc = struct {
 };
 
 pub const ScanResult = struct {
-    num_raw_off16: u32,
+    num_raw_off16: u32 = 0,
     num_huff_lit: u32 = 0,
     num_huff_tok: u32 = 0,
     num_huff_off16hi: u32 = 0,
@@ -107,9 +115,6 @@ pub const ScanResult = struct {
     /// GPU merge kernel (step 6c) instead of the CPU append loop.
     device_compact_populated: bool = false,
 };
-
-/// Parse-helper return type for type 0 (memcpy) stream headers.
-pub const Type0Info = struct { data_offset: u32, size: u32 };
 
 /// 4d Phase 3 step 1: GPU walk-kernel result, device-only. d_chunk_descs
 /// holds up to `walk_max_chunks` SlzChunkDesc entries; d_meta is six
@@ -158,8 +163,10 @@ pub const PrefixSumResultDev = struct {
 /// decode path only ever fails with `BadMode` (driver/kernel unavailable,
 /// device allocation failure, or a CUDA call returning non-success). Kept
 /// local so this file imports nothing outside `src/gpu/`. `BadMode` is a
-/// member of the decoder's `DecodeError`, so callers that return
-/// `DecompressError` (which includes `fast.DecodeError`) still unify.
+/// member of the decoder's `DecodeError` (see
+/// `src/decode/fast/fast_lz_decoder.zig` — the `fast.DecodeError` set),
+/// so callers that return `DecompressError` (which includes
+/// `fast.DecodeError`) still unify.
 pub const GpuError = error{
     BadMode,
 };

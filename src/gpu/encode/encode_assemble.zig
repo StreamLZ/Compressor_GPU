@@ -114,7 +114,15 @@ pub fn gpuAssembleFrameImpl(
     // Prefix-sum: each sub-chunk block is 3 (header) + enc_n bytes.
     var total: u32 = 0;
     for (0..n) |i| {
-        if (enc_sizes[i] == 0) return false; // kernel parse error
+        // `enc_sizes[i] == 0` is unambiguously a measure-kernel parse
+        // failure: the measure pass writes at least the framing bytes
+        // for any valid sub-chunk descriptor (raw_size > 0 here — we
+        // only reach this path with non-empty chunks fed from
+        // gpuCompressImpl). A zero size means the kernel couldn't parse
+        // the raw stream layout (corrupted header bytes), so bail out
+        // rather than write a malformed block. No "empty sub-chunk"
+        // interpretation: zero-length sub-chunks never get encoded.
+        if (enc_sizes[i] == 0) return false;
         descs[i].out_offset = total;
         total += 3 + enc_sizes[i];
     }

@@ -181,9 +181,15 @@ pub const EncodeContext = struct {
     // one allocation (a flat byte buffer indexed by hi_offsets and
     // lo_offsets respectively). `huff_off16hi_data` is the owner;
     // `huff_off16lo_data` is a non-owning alias of the SAME slice. The
-    // only legal free is `allocator.free(huff_off16hi_data); set both
-    // to null` (see fast_framed.zig). Anyone introducing a new free
-    // site must honor that rule or the alias double-frees.
+    // only legal teardown is:
+    //   1. `allocator.free(huff_off16hi_data)` (the single real free), then
+    //   2. null out ALL SIX off16 slots so a follow-up encode lands on a
+    //      clean context — sizes/data/offsets for hi AND lo:
+    //        huff_off16hi_sizes, huff_off16hi_data, huff_off16hi_offsets,
+    //        huff_off16lo_sizes, huff_off16lo_data, huff_off16lo_offsets.
+    // See `deinit` below and `fast_framed.zig` for the canonical pattern.
+    // Anyone introducing a new free site must honor that rule or the alias
+    // double-frees.
     huff_off16hi_sizes: ?[]u32 = null,
     huff_off16hi_data: ?[]u8 = null, // OWNS the shared buffer
     huff_off16hi_offsets: ?[]u32 = null,
@@ -209,6 +215,11 @@ pub const EncodeContext = struct {
         const free_dev = struct {
             fn f(ptr: *CUdeviceptr, sz: *usize) void {
                 if (ptr.* != 0) {
+                    // Free failure on a pointer we know is valid (we
+                    // allocated it via cuMemAlloc and never freed it)
+                    // means the driver/context is dying — there's
+                    // nothing useful we can do in a deinit path, so
+                    // ignore the CUresult.
                     if (ffi.cuMemFree_fn) |free_fn| _ = free_fn(ptr.*);
                     ptr.* = 0;
                 }

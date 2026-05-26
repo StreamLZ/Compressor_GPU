@@ -45,8 +45,8 @@ pub const CHUNK_INTERNAL_HDR_BYTES = ec.CHUNK_INTERNAL_HDR_BYTES;
 // ── Singletons ────────────────────────────────────────────────
 // `g_default` and `last_kernel_ns` live on the facade so external callers
 // reading `gpu_enc.g_default` / `gpu_enc.last_kernel_ns` keep working
-// unchanged. Sub-modules that need to write `last_kernel_ns` import this
-// facade back (the @import cycle is fine for `pub var` access).
+// unchanged. Sub-modules can `@import("driver.zig")` to read the
+// singletons; not a cycle.
 
 /// Default context used by the thin public wrappers. A future library
 /// API will hand each handle its own `EncodeContext`.
@@ -54,7 +54,9 @@ pub var g_default: EncodeContext = .{};
 
 /// Last LZ-encode kernel duration in nanoseconds (set when caller passes
 /// an `io` clock to `gpuCompressImpl`). Written by `encode_lz.gpuCompressImpl`
-/// via `@import("driver.zig").last_kernel_ns`.
+/// via `@import("driver.zig").last_kernel_ns`. Separate from the decode
+/// driver's `last_kernel_ns` — the two are not interchangeable; reading
+/// this after a decode (or vice versa) returns a stale value.
 pub var last_kernel_ns: i64 = 0;
 
 // ── Per-handle entrypoints (re-exported from sub-modules) ─────

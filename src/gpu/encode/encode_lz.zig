@@ -29,6 +29,13 @@ pub fn gpuCompressImpl(
 ) bool {
     if (!module_loader.init()) return false;
 
+    // FFI fn resolution convention: entrypoints that this path REQUIRES
+    // (no fallback) are resolved upfront so the whole launch bails out
+    // cleanly if any one is missing. Optional fns (used only on a
+    // conditional branch) are resolved inline at the use site — see
+    // `cuMemsetD8_fn` below, which is wrapped in an `if (...) |fn|` so
+    // its absence doesn't kill the encode (zeroing isn't strictly
+    // required when the kernel writes every output byte).
     const h2d_fn = ffi.cuMemcpyHtoD_fn orelse return false;
     const d2h_fn = ffi.cuMemcpyDtoH_fn orelse return false;
     const launch_fn = ffi.cuLaunchKernel_fn orelse return false;

@@ -96,6 +96,10 @@ pub fn init() bool {
         var existing: usize = 0;
         if (get_current(&existing) == CUDA_SUCCESS and existing != 0) cuda.ctx = existing;
     }
+    // K6.85: surface which branch the e2e timer measured so the "ctx" cost
+    // in the print below is interpretable (piggyback skips cuCtxCreate
+    // entirely; standalone pays the full ~40 ms context cost).
+    const piggyback_ctx = cuda.ctx != 0;
     if (cuda.ctx == 0) {
         if ((cuda.cuCtxCreate_fn orelse return false)(&cuda.ctx, 0, dev) != CUDA_SUCCESS) return false;
     }
@@ -137,8 +141,9 @@ pub fn init() bool {
     }
     const t_huff = cuda.qpcNow();
     if (init_dbg) {
-        std.debug.print("[gpu-init] dll+cuInit+ctx {d:.2}  lz-module(PTX JIT) {d:.2}  huff-module(PTX JIT) {d:.2}  total {d:.2} ms\n", .{
-            cuda.qpcMs(t_init0, t_ctx), cuda.qpcMs(t_ctx, t_lz), cuda.qpcMs(t_lz, t_huff), cuda.qpcMs(t_init0, t_huff),
+        const ctx_kind: [*:0]const u8 = if (piggyback_ctx) "ctx=piggyback" else "ctx=create";
+        std.debug.print("[gpu-init] dll+cuInit+{s} {d:.2}  lz-module(PTX JIT) {d:.2}  huff-module(PTX JIT) {d:.2}  total {d:.2} ms\n", .{
+            ctx_kind, cuda.qpcMs(t_init0, t_ctx), cuda.qpcMs(t_ctx, t_lz), cuda.qpcMs(t_lz, t_huff), cuda.qpcMs(t_init0, t_huff),
         });
     }
 
