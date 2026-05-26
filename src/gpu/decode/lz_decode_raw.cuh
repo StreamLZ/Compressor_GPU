@@ -85,7 +85,7 @@ __device__ __noinline__ void decodeSubChunkRawMode(
                 static_assert(WARP_SIZE == 32,
                               "(2u << lane) - 1u inclusive-prefix idiom assumes WARP_SIZE == 32");
                 uint32_t my_prefix = fresh_mask & ((2u << lane) - 1u);
-                int src_lane = (my_prefix != 0) ? (31 - __clz(my_prefix)) : 0;
+                int src_lane = (my_prefix != 0) ? lastBitSet(my_prefix) : 0;
                 int32_t shuffled_off = __shfl_sync(FULL_WARP_MASK, my_match_offset, src_lane);
                 if (my_use_recent && my_prefix != 0) {
                     my_match_offset = shuffled_off;
@@ -127,7 +127,7 @@ __device__ __noinline__ void decodeSubChunkRawMode(
                 lit_pos   += total_lit;
 
                 if (fresh_mask != 0) {
-                    int last_fresh = 31 - __clz(fresh_mask);
+                    int last_fresh = lastBitSet(fresh_mask);
                     recent_offset = __shfl_sync(FULL_WARP_MASK, my_match_offset, last_fresh);
                 }
                 continue;
@@ -147,7 +147,7 @@ __device__ __noinline__ void decodeSubChunkRawMode(
                 use_recent = (token >> TOKEN_USE_RECENT_SHIFT) & TOKEN_USE_RECENT_MASK;
                 if (!use_recent && off16_pos < off16_count) {
                     uint16_t v;
-                    if (OFF16_SPLIT) {
+                    if constexpr (OFF16_SPLIT) {
                         v = (uint16_t)off16_lo[off16_pos] | ((uint16_t)off16_hi[off16_pos] << 8);
                     } else {
                         v = readU16LE(off16_raw + off16_pos * OFF16_ENTRY_BYTES);
@@ -164,7 +164,7 @@ __device__ __noinline__ void decodeSubChunkRawMode(
                           + LONG_NEAR_BASE;
                 if (off16_pos < off16_count) {
                     uint16_t v;
-                    if (OFF16_SPLIT) {
+                    if constexpr (OFF16_SPLIT) {
                         v = (uint16_t)off16_lo[off16_pos] | ((uint16_t)off16_hi[off16_pos] << 8);
                     } else {
                         v = readU16LE(off16_raw + off16_pos * OFF16_ENTRY_BYTES);

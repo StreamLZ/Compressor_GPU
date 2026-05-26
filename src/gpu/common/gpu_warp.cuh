@@ -35,3 +35,12 @@ static constexpr uint32_t U64_BITS      = 64;
 // short-circuit any spuriously-launched threads at the top. The macro
 // makes the intent self-documenting at the call site.
 #define SLZ_GUARD_SINGLE_THREAD() do { if (blockIdx.x != 0 || threadIdx.x != 0) return; } while (0)
+
+// ── Last-bit-set index ──────────────────────────────────────────
+// Returns the 0-based position of the highest set bit in `x`. Undefined
+// for x == 0 (CUDA's __clz returns 32 → result is -1; callers that
+// allow zero must guard externally). Wraps the `(U32_BITS - 1) - __clz(x)`
+// idiom used in several warp-reduction sites.
+__device__ __forceinline__ int lastBitSet(uint32_t x) {
+    return (int)(U32_BITS - 1) - __clz(x);
+}

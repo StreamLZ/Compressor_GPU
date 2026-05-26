@@ -15,6 +15,20 @@
 
 #include "lz_decode_core.cuh"
 
+// Token-type tag values assigned by the lane-0 parser and consumed
+// after the broadcast. Only LONG_LITERAL is tested by name (it
+// suppresses the recent_offset update — long-literal tokens don't
+// carry a new offset, so recent_offset must be preserved). The others
+// differ only in which offset stream they pull from (off16 vs off32);
+// kept named for debuggability.
+enum TokenType : uint32_t {
+    TOKEN_TYPE_SHORT        = 0, // 1-byte token, inline off16 (or use_recent)
+    TOKEN_TYPE_LONG_LITERAL = 1, // 1-byte token + extended literal length
+    TOKEN_TYPE_LONG_NEAR    = 2, // 1-byte token + extended match length, off16
+    TOKEN_TYPE_SHORT_FAR    = 3, // 1-byte token (match length inline), off32
+    TOKEN_TYPE_LONG_FAR     = 4, // 1-byte token + extended match length, off32
+};
+
 // Intentionally NOT __noinline__: an experiment in this session
 // confirmed the attribute is a net negative here. With it,
 // slzLzDecodeKernel STACK grew 192 -> 208 and slzLzDecodeRawKernel
@@ -60,7 +74,9 @@ __device__ void decodeSubChunkGeneral(
     uint32_t block_cmd_end = (block2_cmd_offset > 0 && block2_cmd_offset < cmd_size)
         ? block2_cmd_offset : cmd_size;
 
-    // Prefetch first token
+    // Prefetch first token. Hoisted outside the for-loop (both
+    // block_iter iterations need the carried value across the boundary;
+    // the advance-to-block-2 site at the bottom re-prefetches lane 0).
     uint32_t prefetched_token = 0;
     if (lane == 0 && cmd_pos < block_cmd_end) prefetched_token = cmd[cmd_pos];
 
@@ -68,7 +84,7 @@ __device__ void decodeSubChunkGeneral(
         while (cmd_pos < block_cmd_end) {
             uint32_t token = 0, lit_len = 0, match_len = 0;
             int32_t match_offset = recent_offset;
-            uint32_t use_recent = 0, token_type = 0;
+            uint32_t use_recent = 0, token_type = TOKEN_TYPE_SHORT;
 
             // ── Token parse (lane 0 only) ──
             if (lane == 0) {
@@ -76,7 +92,7 @@ __device__ void decodeSubChunkGeneral(
                 cmd_pos++;
                 if (cmd_pos < block_cmd_end) prefetched_token = cmd[cmd_pos];
                 if (token >= TOKEN_SHORT_MIN) {
-                    token_type = 0;
+                    token_type = TOKEN_TYPE_SHORT;
                     lit_len = token & TOKEN_LIT_MASK;
                     match_len = (token >> TOKEN_MATCH_SHIFT) & TOKEN_MATCH_MASK;
                     use_recent = (token >> TOKEN_USE_RECENT_SHIFT) & TOKEN_USE_RECENT_MASK;
@@ -91,11 +107,11 @@ __device__ void decodeSubChunkGeneral(
                         off16_pos++;
                     }
                 } else if (token == TOKEN_LONG_LITERAL) {
-                    token_type = 1;
+                    token_type = TOKEN_TYPE_LONG_LITERAL;
                     lit_len = readLength(length_stream, length_offset, length_remaining)
                             + LONG_LITERAL_BASE;
                 } else if (token == TOKEN_LONG_NEAR) {
-                    token_type = 2;
+                    token_type = TOKEN_TYPE_LONG_NEAR;
                     match_len = readLength(length_stream, length_offset, length_remaining)
                               + LONG_NEAR_BASE;
                     if (off16_pos < off16_count) {
@@ -109,7 +125,7 @@ __device__ void decodeSubChunkGeneral(
                     }
                     use_recent = 0;
                 } else if (token == TOKEN_LONG_FAR) {
-                    token_type = 4;
+                    token_type = TOKEN_TYPE_LONG_FAR;
                     match_len = readLength(length_stream, length_offset, length_remaining)
                               + LONG_FAR_BASE;
                     if (off32_pos < off32_block_count) {
@@ -121,7 +137,7 @@ __device__ void decodeSubChunkGeneral(
                     }
                     use_recent = 0;
                 } else {
-                    token_type = 3;
+                    token_type = TOKEN_TYPE_SHORT_FAR;
                     match_len = token + SHORT_FAR_BASE;
                     if (off32_pos < off32_block_count) {
                         // off32 entries are 3 bytes each (encoder writes byte triples).
@@ -184,7 +200,7 @@ __device__ void decodeSubChunkGeneral(
             // the cooperative copies). They aren't — see top-of-loop note.
             dst_pos   = __shfl_sync(FULL_WARP_MASK, dst_pos, 0);
             lit_pos   = __shfl_sync(FULL_WARP_MASK, lit_pos, 0);
-            if (!use_recent && (token_type != 1)) recent_offset = match_offset;
+            if (!use_recent && (token_type != TOKEN_TYPE_LONG_LITERAL)) recent_offset = match_offset;
             recent_offset = __shfl_sync(FULL_WARP_MASK, recent_offset, 0);
             length_offset = __shfl_sync(FULL_WARP_MASK, length_offset, 0);
         }
