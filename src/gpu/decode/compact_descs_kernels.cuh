@@ -42,7 +42,7 @@ extern "C" __global__ void slzCompactHuffDescsKernel(
     SlzHuffDecChunkDesc* __restrict__    d_out,
     uint32_t* __restrict__               d_n_out)
 {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    SLZ_GUARD_SINGLE_THREAD();
     const uint32_t tot = *d_total_subs;
     uint32_t k = 0;
     for (uint32_t i = 0; i < tot; i++) {
@@ -66,7 +66,7 @@ extern "C" __global__ void slzCompactRawDescsKernel(
     SlzRawOff16Desc* __restrict__      d_out,
     uint32_t* __restrict__             d_n_out)
 {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    SLZ_GUARD_SINGLE_THREAD();
     const uint32_t tot = *d_total_subs;
     uint32_t k = 0;
     for (uint32_t i = 0; i < tot; i++) {

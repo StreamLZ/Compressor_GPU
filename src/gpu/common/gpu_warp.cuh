@@ -28,3 +28,10 @@ static constexpr uint32_t FULL_WARP_MASK = 0xFFFFFFFFu;     // all 32 lanes acti
 static constexpr uint32_t BITS_PER_BYTE = 8;
 static constexpr uint32_t U32_BITS      = 32;
 static constexpr uint32_t U64_BITS      = 64;
+
+// ── Single-thread launch guard ──────────────────────────────────
+// Several driver-orchestration kernels (walk_frame, prefix_sum_chunks,
+// merge_huff_descs, compact_descs) launch one block of one thread and
+// short-circuit any spuriously-launched threads at the top. The macro
+// makes the intent self-documenting at the call site.
+#define SLZ_GUARD_SINGLE_THREAD() do { if (blockIdx.x != 0 || threadIdx.x != 0) return; } while (0)

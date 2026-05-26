@@ -56,10 +56,21 @@ static constexpr uint32_t NEXT_HASH_INDEX_MASK = 0xFFFFu;    // next_hash modula
 static constexpr uint32_t MIN_HASH_MATCH_OFFSET = 8;   // smallest reusable hash offset (offset-8 is the fallback)
 static constexpr uint32_t FAR_OFFSET_MIN_MATCH  = 14;  // CPU mmlt: minimum match length threshold for far offsets
 
-// ── Fibonacci hash multipliers ──────────────────────────────────
-static constexpr uint64_t FIB_HASH_MUL_K6 = 0x79B97F4A7C150000ULL;  // k=6 shifted Fibonacci multiplier
-static constexpr uint64_t HASH_A_MUL       = 0xB7A5646300000000ULL;  // Hash-A 64-bit multiplier
-static constexpr uint64_t FIB_HASH_MUL_64  = 0x9E3779B97F4A7C15ULL;  // 64-bit Fibonacci multiplier
+// ── Hash multipliers (Fibonacci + table-A) ──────────────────────
+// HASH_MUL_FIB_K6 / HASH_MUL_FIB_64 are Fibonacci-hash multipliers used
+// by the greedy-parser short hash (k=6 → 6-byte key, top 16 bits zero)
+// and the chain-parser long hash (k=8 → full 8-byte key). HASH_MUL_A is
+// the table-A 64-bit multiplier (independent constant, not Fibonacci-
+// derived — matches CPU MatchHasher2).
+static constexpr uint64_t HASH_MUL_FIB_K6 = 0x79B97F4A7C150000ULL;
+static constexpr uint64_t HASH_MUL_FIB_64 = 0x9E3779B97F4A7C15ULL;
+static constexpr uint64_t HASH_MUL_A      = 0xB7A5646300000000ULL;
+// Back-compat aliases for the prior names (delete after one more cleanup
+// pass once all call sites migrate). The hash kernels still reference
+// the old names below.
+static constexpr uint64_t FIB_HASH_MUL_K6 = HASH_MUL_FIB_K6;
+static constexpr uint64_t HASH_A_MUL      = HASH_MUL_A;
+static constexpr uint64_t FIB_HASH_MUL_64 = HASH_MUL_FIB_64;
 
 // ── Per-chunk LZ-pass descriptor ────────────────────────────────
 // ABI-mirrored by CompressChunkDesc in src/gpu/encode/driver.zig — do

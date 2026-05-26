@@ -200,7 +200,10 @@ __device__ void decodeSubChunkGeneral(
         }
 
         // ── Advance to block 2 ──
-        if (block_iter + 1 >= MAX_BLOCKS_PER_SUBCHUNK) break;
+        // On the last iter (block_iter == MAX-1) these writes are dead —
+        // the for-loop bound will exit before any are read. Letting the
+        // setup run on the dead iteration trades a never-taken `break`
+        // for a few unconditional writes that nvcc dead-code-eliminates.
         block_cmd_end = cmd_size;
         off32_block = off32_raw2;
         off32_block_count = off32_count2;

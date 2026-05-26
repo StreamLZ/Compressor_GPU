@@ -100,11 +100,17 @@ static constexpr int LUT_SYM2_SHIFT = 8;
 static constexpr int LUT_LEN_SHIFT  = 16;
 static constexpr int LUT_NSYM_SHIFT = 24;
 
-// num_syms field values in a packed LUT entry.
+// num_syms field values in a packed LUT entry — these are wire-format
+// tag values stored in the LUT's high byte, not symbol counts (though
+// SINGLE=1 and DUAL=2 happen to match the count of symbols they emit).
 static constexpr uint8_t LUT_NUM_SYMS_SINGLE   = 1;   // single-symbol entry
 static constexpr uint8_t LUT_NUM_SYMS_DUAL     = 2;   // double-symbol entry
 static constexpr uint8_t LUT_NUM_SYMS_ESCAPE   = 3;   // height-limit escape entry
-static constexpr int     LUT_MAX_SYMS_PER_STEP = 2;   // max symbols an X2 entry emits
+
+// Distinct from the tag values above: this is the maximum number of
+// symbols any LUT entry can emit per decode step (an X2 entry emits 2).
+// Used to size per-thread output buffers in the decode loop.
+static constexpr int     LUT_MAX_SYMS_PER_STEP = 2;
 
 __device__ __forceinline__ uint32_t packLutEntry(uint8_t sym1, uint8_t sym2,
                                                   uint8_t total_len, uint8_t num_syms) {
@@ -115,8 +121,11 @@ __device__ __forceinline__ uint32_t packLutEntry(uint8_t sym1, uint8_t sym2,
 }
 
 // Field accessors mirroring packLutEntry — keep unpack centralized.
+// All four return uint8_t for type-consistency with packLutEntry's inputs;
+// lutSymPair returns uint16_t because callers consume it as a packed
+// (sym1 in low byte, sym2 in high byte) value, e.g. for `*(uint16_t*)dst = lutSymPair(e)`.
 __device__ __forceinline__ uint8_t  lutSym1(uint32_t entry)     { return (uint8_t)(entry >> LUT_SYM1_SHIFT); }
 __device__ __forceinline__ uint8_t  lutSym2(uint32_t entry)     { return (uint8_t)(entry >> LUT_SYM2_SHIFT); }
 __device__ __forceinline__ uint16_t lutSymPair(uint32_t entry)  { return (uint16_t)(entry & 0xFFFFu); }
-__device__ __forceinline__ int      lutTotalLen(uint32_t entry) { return (entry >> LUT_LEN_SHIFT)  & 0xFF; }
-__device__ __forceinline__ int      lutNumSyms(uint32_t entry)  { return (entry >> LUT_NSYM_SHIFT) & 0xFF; }
+__device__ __forceinline__ uint8_t  lutTotalLen(uint32_t entry) { return (uint8_t)((entry >> LUT_LEN_SHIFT)  & 0xFF); }
+__device__ __forceinline__ uint8_t  lutNumSyms(uint32_t entry)  { return (uint8_t)((entry >> LUT_NSYM_SHIFT) & 0xFF); }

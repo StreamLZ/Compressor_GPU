@@ -52,7 +52,7 @@ extern "C" __global__ void slzMergeHuffDescsKernel(
     SlzHuffDecChunkDesc* __restrict__       d_merged,
     uint32_t* __restrict__                  d_n_merged)
 {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    SLZ_GUARD_SINGLE_THREAD();
     uint32_t lut_slot = 0;
     appendRegion(d_merged, lut_slot, d_lit, *d_n_lit, 0);
     appendRegion(d_merged, lut_slot, d_tok, *d_n_tok, tok_region_off);

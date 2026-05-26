@@ -33,9 +33,13 @@
 // SLZ_FRAME_* constants live in common/gpu_wire_format.cuh (frame ABI).
 
 __device__ __forceinline__ float walkReadF32LE(const uint8_t* p) {
-    union { uint32_t u; float f; } u;
-    u.u = readU32LE(p);
-    return u.f;
+    // memcpy (rather than a union type-pun) is the defined-behavior
+    // bit-cast pattern in C++17+; nvcc compiles it to the same single
+    // ld.global as the union form.
+    float v;
+    uint32_t raw = readU32LE(p);
+    memcpy(&v, &raw, sizeof(v));
+    return v;
 }
 
 // d_block_start / d_block_size: byte range of the block payload within
@@ -55,7 +59,7 @@ extern "C" __global__ void slzWalkFrameKernel(
     uint32_t* __restrict__      d_block_size,
     uint32_t* __restrict__      d_status)
 {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    SLZ_GUARD_SINGLE_THREAD();
     *d_n_chunks = 0;
     *d_decompressed_size = 0;
     *d_sub_chunk_cap = 0;

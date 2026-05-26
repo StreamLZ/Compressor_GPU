@@ -180,6 +180,9 @@ __device__ static uint32_t emitEntropyStream(
     if (use_huff) {
         if (out) {
             if (lane == 0) writeHuffChunkHdr(out, huff_size, raw_count);
+            // Publish the lane-0 header write before the cooperative body
+            // copy reads `out + HUFF_CHUNK_HDR_BYTES` (other lanes have
+            // not yet observed lane 0's stores without this barrier).
             __syncwarp();
             warpCopy(out + HUFF_CHUNK_HDR_BYTES, huff_body, huff_size, lane);
         }
@@ -187,6 +190,8 @@ __device__ static uint32_t emitEntropyStream(
     }
     if (out) {
         if (lane == 0) writeBE24(out, raw_count);
+        // Same barrier rationale as above: cooperative copy must not
+        // observe a half-written header.
         __syncwarp();
         warpCopy(out + RAW_CHUNK_HDR_BYTES, raw_bytes, raw_count, lane);
     }

@@ -21,7 +21,7 @@ extern "C" __global__ void slzPrefixSumChunksKernel(
     uint32_t* __restrict__            d_first_sub_idx,
     uint32_t* __restrict__            d_total_subchunks)
 {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    SLZ_GUARD_SINGLE_THREAD();
     const uint32_t n = n_chunks;
     uint32_t cap = sub_chunk_cap;
     if (cap == 0) cap = DEFAULT_SUB_CHUNK_CAP;

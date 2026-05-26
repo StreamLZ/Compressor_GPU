@@ -120,7 +120,9 @@ pub const WalkFrameResultDev = struct {
     d_chunk_descs: u64,
     d_meta: u64,
 };
-pub const walk_max_chunks: u32 = 16384;
+pub const WALK_MAX_CHUNKS: u32 = 16384;
+/// Back-compat alias for the prior name; remove after call sites migrate.
+pub const walk_max_chunks: u32 = WALK_MAX_CHUNKS;
 pub const walk_meta_offsets = struct {
     pub const n_chunks: u32 = 0;
     pub const decomp_size: u32 = 4;

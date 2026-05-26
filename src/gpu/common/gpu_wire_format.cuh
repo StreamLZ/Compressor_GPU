@@ -27,8 +27,10 @@ static constexpr uint32_t INITIAL_LITERAL_COPY_BYTES = 8;
 static constexpr int32_t  INITIAL_RECENT_OFFSET      = -8;
 
 // ── Chunk types (chunk_header byte high nibble >> CHUNK_TYPE_SHIFT) ──
-// On GPU we only emit raw (0) and Huffman (4); tANS (1, 6) and paired
-// (5, 7) types were retired with the GPU tANS encoder.
+// On GPU we only emit raw (implicitly type 0, no named constant) and
+// Huffman (type 4); tANS (1, 6) and paired (5, 7) types were retired
+// with the GPU tANS encoder. The raw type is the default-zero value so
+// no RAW_CHUNK_TYPE constant exists; code reads "ct == 0" inline.
 static constexpr uint32_t CHUNK_TYPE_SHIFT      = 4;
 static constexpr uint32_t CHUNK_TYPE_MASK       = 7;
 static constexpr uint8_t  HUFF_CHUNK_TYPE       = 4;
@@ -116,13 +118,21 @@ static constexpr uint32_t DEFAULT_SUB_CHUNK_CAP     = 0x10000u; // 64KB
 static constexpr uint32_t EXT_LENGTH_THRESHOLD       = 251;
 
 // ── LZ-substream header sizes (encode side writes, decode side reads) ──
-static constexpr uint32_t STREAM_HEADER_BYTES       = 3; // big-endian count
+// LZ_SUBSTREAM_COUNT_HDR_BYTES = bytes for the per-substream count prefix
+// (BE u24). STREAM_HEADER_BYTES is the old name retained for back-compat
+// with the existing encode references; prefer the new name in new code.
+static constexpr uint32_t LZ_SUBSTREAM_COUNT_HDR_BYTES = 3;
+static constexpr uint32_t STREAM_HEADER_BYTES       = LZ_SUBSTREAM_COUNT_HDR_BYTES;
 static constexpr uint32_t OFF16_HEADER_BYTES        = 2; // little-endian u16
 
 // ── 5-byte non-compact entropy chunk header (assemble_kernel.cu) ────
-// d[0] = [type << 4 | (dm1 >> 14) & 0xF]
-// d[1..5] = readU32BE-ordered (comp_size in low 18 bits, low 14 bits of
-//           dm1 packed above, see writeHuffChunkHdr).
+// Layout (encoder writes, decoder reads):
+//   byte 0:           [type:4 | dm1_hi4:4]   — type in high nibble,
+//                     top 4 bits of dst_size_minus_1 in low nibble
+//   bytes 1..4 (BE):  [dm1_low14:14 | comp_size:18]
+// where dst_size_minus_1 reconstructs as (dm1_hi4 << 14) | dm1_low14.
+// The 32-bit BE word at bytes 1..4 (readU32BE) yields comp_size in the
+// low 18 bits and dm1_low14 in bits 18..31.
 static constexpr uint32_t ENTROPY_HDR_DM1_HIGH4_SHIFT = 14;
 static constexpr uint32_t ENTROPY_HDR_DM1_HIGH_MASK   = 0xF;
 static constexpr uint32_t ENTROPY_HDR_DM1_LOW_MASK    = 0x3FFF;
