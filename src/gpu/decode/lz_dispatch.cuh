@@ -157,7 +157,10 @@ __device__ void parseAndDecodeSubChunkRaw(
             block2_cmd_offset, initial_copy,
         };
         const DecodeOutput out_raw = { dst, sc_decomp_size, dst_offset };
-        decodeSubChunkGeneral(ps_raw, out_raw, /*mode=*/1);
+        // ps_raw.off16_split is always 0 on this path (raw L1/L2 has no
+        // entropy-coded off16), so the false specialization is the only
+        // one ever reached.
+        decodeSubChunkGeneral<false>(ps_raw, out_raw, /*mode=*/1);
     }
 }
 
@@ -211,6 +214,13 @@ __device__ void parseAndDecodeSubChunk(
         }
     } else {
         const DecodeOutput out_general = { dst, sc_decomp_size, dst_offset };
-        decodeSubChunkGeneral(ps, out_general, mode);
+        // Compile-time dispatch on off16_split mirrors the raw-mode block
+        // above: nvcc dead-code-eliminates the unused off16 branch + drops
+        // the unused pointer params in each specialization.
+        if (ps.off16_split) {
+            decodeSubChunkGeneral<true>(ps, out_general, mode);
+        } else {
+            decodeSubChunkGeneral<false>(ps, out_general, mode);
+        }
     }
 }

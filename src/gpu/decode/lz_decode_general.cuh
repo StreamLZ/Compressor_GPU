@@ -73,6 +73,7 @@ __device__ __forceinline__ void deltaLiteralCopyBounded(
 // L3 enwik8 kernel time regressed ~130 µs (+2%) measurably. The PTX
 // REG count stays at 40 either way, so the cost is scheduling /
 // memory-ordering, not register pressure. Keep the shfls.
+template <bool OFF16_SPLIT>
 __device__ void decodeSubChunkGeneral(
     const ParsedStreams& ps,
     const DecodeOutput& out,
@@ -86,11 +87,14 @@ __device__ void decodeSubChunkGeneral(
     const uint32_t cmd_size = ps.cmd_size;
     const uint8_t* __restrict__ lit = ps.lit_ptr;
     const uint32_t lit_size = ps.lit_size;
-    const uint8_t* __restrict__ off16_raw = ps.off16_raw;
+    // off16_raw is unused when OFF16_SPLIT=true; off16_hi/lo are unused
+    // when OFF16_SPLIT=false. [[maybe_unused]] silences nvcc's #177-D
+    // "declared but never referenced" warning in each specialization —
+    // the warning is in fact evidence the if-constexpr DCE is working.
+    [[maybe_unused]] const uint8_t* __restrict__ off16_raw = ps.off16_raw;
     const uint32_t off16_count = ps.off16_count;
-    const uint8_t* __restrict__ off16_hi = ps.off16_hi;
-    const uint8_t* __restrict__ off16_lo = ps.off16_lo;
-    const uint32_t off16_split = ps.off16_split;
+    [[maybe_unused]] const uint8_t* __restrict__ off16_hi = ps.off16_hi;
+    [[maybe_unused]] const uint8_t* __restrict__ off16_lo = ps.off16_lo;
     const uint8_t* __restrict__ off32_raw1 = ps.off32_raw1;
     const uint32_t off32_count1 = ps.off32_count1;
     const uint8_t* __restrict__ off32_raw2 = ps.off32_raw2;
@@ -147,7 +151,7 @@ __device__ void decodeSubChunkGeneral(
                     use_recent = (token >> TOKEN_USE_RECENT_SHIFT) & TOKEN_USE_RECENT_MASK;
                     if (!use_recent && off16_pos < off16_count) {
                         uint16_t v;
-                        if (off16_split) {
+                        if constexpr (OFF16_SPLIT) {
                             v = (uint16_t)off16_lo[off16_pos] | ((uint16_t)off16_hi[off16_pos] << 8);
                         } else {
                             v = readU16LE(off16_raw + off16_pos * OFF16_ENTRY_BYTES);
@@ -165,7 +169,7 @@ __device__ void decodeSubChunkGeneral(
                               + LONG_NEAR_BASE;
                     if (off16_pos < off16_count) {
                         uint16_t v;
-                        if (off16_split) {
+                        if constexpr (OFF16_SPLIT) {
                             v = (uint16_t)off16_lo[off16_pos] | ((uint16_t)off16_hi[off16_pos] << 8);
                         } else {
                             v = readU16LE(off16_raw + off16_pos * OFF16_ENTRY_BYTES);
