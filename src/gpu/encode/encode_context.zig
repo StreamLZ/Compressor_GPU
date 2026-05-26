@@ -197,6 +197,69 @@ pub const EncodeContext = struct {
     huff_tok_sizes: ?[]u32 = null,
     huff_tok_data: ?[]u8 = null,
     huff_tok_offsets: ?[]u32 = null,
+
+    /// Free every owned device + host buffer and reset every field to
+    /// its default. Intended for a per-handle library API teardown; the
+    /// long-lived `driver.g_default` singleton in the current CLI / C ABI
+    /// never calls this (its lifetime is the process).
+    ///
+    /// Honors the huff_off16 OWNERSHIP RULE above: hi owns the shared
+    /// allocation, lo is a non-owning alias.
+    pub fn deinit(self: *EncodeContext, allocator: std.mem.Allocator) void {
+        const free_dev = struct {
+            fn f(ptr: *CUdeviceptr, sz: *usize) void {
+                if (ptr.* != 0) {
+                    if (ffi.cuMemFree_fn) |free_fn| _ = free_fn(ptr.*);
+                    ptr.* = 0;
+                }
+                sz.* = 0;
+            }
+        }.f;
+        free_dev(&self.d_frame_chunk_dst, &self.d_frame_chunk_dst_size);
+        free_dev(&self.d_frame_asm_offsets, &self.d_frame_asm_offsets_size);
+        free_dev(&self.d_frame_asm_chunk_sz, &self.d_frame_asm_chunk_sz_size);
+        free_dev(&self.d_frame_prefix_bytes, &self.d_frame_prefix_bytes_size);
+        free_dev(&self.d_input_persist, &self.d_input_size);
+        free_dev(&self.d_output_persist, &self.d_output_size);
+        free_dev(&self.d_descs_persist, &self.d_descs_size);
+        free_dev(&self.d_hash_persist, &self.d_hash_size);
+        free_dev(&self.d_sizes_persist, &self.d_sizes_size);
+        free_dev(&self.d_huff_descs_persist, &self.d_huff_descs_size);
+        free_dev(&self.d_huff_cl_persist, &self.d_huff_cl_size);
+        free_dev(&self.d_huff_codes_persist, &self.d_huff_codes_size);
+        free_dev(&self.d_huff_scratch_persist, &self.d_huff_scratch_size);
+        free_dev(&self.d_huff_out_persist, &self.d_huff_out_size);
+        free_dev(&self.d_huff_sizes_persist, &self.d_huff_sizes_size);
+        free_dev(&self.d_asm_huff_lit, &self.d_asm_huff_lit_size);
+        free_dev(&self.d_asm_huff_tok, &self.d_asm_huff_tok_size);
+        free_dev(&self.d_asm_huff_off16, &self.d_asm_huff_off16_size);
+        free_dev(&self.d_asm_descs, &self.d_asm_descs_size);
+        free_dev(&self.d_asm_out, &self.d_asm_out_size);
+        free_dev(&self.d_asm_sizes, &self.d_asm_sizes_size);
+
+        if (self.assembled_data) |s| { allocator.free(s); self.assembled_data = null; }
+        if (self.assembled_offsets) |s| { allocator.free(s); self.assembled_offsets = null; }
+        if (self.assembled_sizes) |s| { allocator.free(s); self.assembled_sizes = null; }
+
+        // huff_off16: hi OWNS the shared byte buffer; lo is a non-owning
+        // alias. Drop the alias FIRST, then free the owner.
+        self.huff_off16lo_data = null;
+        if (self.huff_off16hi_data) |s| { allocator.free(s); self.huff_off16hi_data = null; }
+        if (self.huff_off16hi_sizes) |s| { allocator.free(s); self.huff_off16hi_sizes = null; }
+        if (self.huff_off16hi_offsets) |s| { allocator.free(s); self.huff_off16hi_offsets = null; }
+        if (self.huff_off16lo_sizes) |s| { allocator.free(s); self.huff_off16lo_sizes = null; }
+        if (self.huff_off16lo_offsets) |s| { allocator.free(s); self.huff_off16lo_offsets = null; }
+
+        if (self.huff_lit_sizes) |s| { allocator.free(s); self.huff_lit_sizes = null; }
+        if (self.huff_lit_data) |s| { allocator.free(s); self.huff_lit_data = null; }
+        if (self.huff_lit_offsets) |s| { allocator.free(s); self.huff_lit_offsets = null; }
+        if (self.huff_tok_sizes) |s| { allocator.free(s); self.huff_tok_sizes = null; }
+        if (self.huff_tok_data) |s| { allocator.free(s); self.huff_tok_data = null; }
+        if (self.huff_tok_offsets) |s| { allocator.free(s); self.huff_tok_offsets = null; }
+
+        self.pending_timings.deinit(std.heap.page_allocator);
+        self.last_timings.deinit(std.heap.page_allocator);
+    }
 };
 
 /// Reallocate the device buffer at `ptr` if its current size is below

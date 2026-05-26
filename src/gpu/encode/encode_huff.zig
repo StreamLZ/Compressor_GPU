@@ -87,9 +87,12 @@ pub fn gpuEncodeHuffImpl(
     };
     var extra = [_]?*anyopaque{null};
     const t_htbl = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, profile_names[0], 0);
+    // Defer so the begin event always pairs with an end record, even on
+    // launch failure — finalizeProfiling otherwise blocks on the unrecorded
+    // end event.
+    defer gpu_decode.endKernelTiming(t_htbl, 0);
     if (launch_fn(module_loader.huff_tables_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &tbl_params, &extra) != ffi.CUDA_SUCCESS)
         return false;
-    gpu_decode.endKernelTiming(t_htbl, 0);
 
     // Kernel 2: pack each sub-chunk into a chunk_type=4 body. Device-
     // resident mode writes straight into the caller's buffer.
@@ -104,9 +107,9 @@ pub fn gpuEncodeHuffImpl(
         @ptrCast(&p_n),
     };
     const t_henc = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, profile_names[1], 0);
+    defer gpu_decode.endKernelTiming(t_henc, 0);
     if (launch_fn(module_loader.huff_encode_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &enc_params, &extra) != ffi.CUDA_SUCCESS)
         return false;
-    gpu_decode.endKernelTiming(t_henc, 0);
     if (sync_fn() != ffi.CUDA_SUCCESS) return false;
 
     if (d2h_fn(@ptrCast(out_sizes.ptr), self.d_huff_sizes_persist, sizes_bytes) != ffi.CUDA_SUCCESS) return false;
@@ -263,6 +266,15 @@ pub fn gpuEncodeOff16HuffImpl(
     @memcpy(lo_sizes, all_sizes[n..]);
     allocator.free(all_sizes);
 
+    // No-clobber assert: catch the double-encode-without-free bug at the
+    // write site (where we still know whose buffer would leak) instead of
+    // at the free site (where the double-free is harder to trace).
+    std.debug.assert(self.huff_off16hi_sizes == null);
+    std.debug.assert(self.huff_off16hi_data == null);
+    std.debug.assert(self.huff_off16hi_offsets == null);
+    std.debug.assert(self.huff_off16lo_sizes == null);
+    std.debug.assert(self.huff_off16lo_data == null);
+    std.debug.assert(self.huff_off16lo_offsets == null);
     self.huff_off16hi_sizes = hi_sizes;
     self.huff_off16hi_data = if (resident) null else bytes; // shared buffer; both hi and lo offsets index into it
     self.huff_off16hi_offsets = hi_offsets;

@@ -103,8 +103,8 @@ pub fn gpuAssembleFrameImpl(
         @ptrCast(&p_n),
     };
     const t_am = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleMeasureKernel", 0);
+    defer gpu_decode.endKernelTiming(t_am, 0);
     if (launch(module_loader.assemble_measure_fn, n, 1, 1, 32, 1, 1, 0, 0, &m_params, &extra) != ffi.CUDA_SUCCESS) return false;
-    gpu_decode.endKernelTiming(t_am, 0);
     if (sync() != ffi.CUDA_SUCCESS) return false;
 
     const enc_sizes = allocator.alloc(u32, n) catch return false;
@@ -129,8 +129,8 @@ pub fn gpuAssembleFrameImpl(
         @ptrCast(&p_n),
     };
     const t_aw = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleWriteKernel", 0);
+    defer gpu_decode.endKernelTiming(t_aw, 0);
     if (launch(module_loader.assemble_write_fn, n, 1, 1, 32, 1, 1, 0, 0, &w_params, &extra) != ffi.CUDA_SUCCESS) return false;
-    gpu_decode.endKernelTiming(t_aw, 0);
     if (sync() != ffi.CUDA_SUCCESS) return false;
 
     // Download the assembled blocks; publish the host-side result.
@@ -178,23 +178,46 @@ pub fn gpuAssembleFrameImpl(
 /// Self-contained (`sc_tail_count = n_chunks - 1` when n_chunks > 1, else 0)
 /// is inferred from the chunk count; SC mode is the only one slzCompress
 /// produces.
-pub fn gpuFrameAssembleImpl(
-    self: *EncodeContext,
-    allocator: std.mem.Allocator,
-    n_chunks: u32,
-    eff_chunk_size: u32,
-    src_len: u32,
+/// Bytes the frame assembler prepends before the per-chunk payloads —
+/// pre-formed by the caller (frame header + block header) plus the
+/// 2-byte internal block header that gets repeated at each chunk boundary.
+pub const FramePreamble = struct {
     prefix_bytes: []const u8,
     internal_hdr0: u8,
     internal_hdr1: u8,
+};
+
+/// Layout description of the per-chunk asm payloads the kernel will splice.
+/// `per_chunk_asm_off` and `per_chunk_asm_size` are parallel arrays of
+/// length `n_chunks`. `eff_chunk_size` and `src_len` describe the source
+/// chunking so the kernel can rebuild the SC tail prefix table.
+pub const ChunkLayout = struct {
+    n_chunks: u32,
+    eff_chunk_size: u32,
+    src_len: u32,
     per_chunk_asm_off: []const u32,
     per_chunk_asm_size: []const u32,
+};
+
+pub fn gpuFrameAssembleImpl(
+    self: *EncodeContext,
+    allocator: std.mem.Allocator,
+    layout: ChunkLayout,
+    preamble: FramePreamble,
     d_input_dev: u64,
     d_output: u64,
 ) ?u32 {
     if (!module_loader.init()) return null;
     if (module_loader.frame_assemble_fn == 0) return null;
     if (self.d_asm_out == 0) return null;
+    const n_chunks = layout.n_chunks;
+    const eff_chunk_size = layout.eff_chunk_size;
+    const src_len = layout.src_len;
+    const per_chunk_asm_off = layout.per_chunk_asm_off;
+    const per_chunk_asm_size = layout.per_chunk_asm_size;
+    const prefix_bytes = preamble.prefix_bytes;
+    const internal_hdr0 = preamble.internal_hdr0;
+    const internal_hdr1 = preamble.internal_hdr1;
     if (n_chunks == 0 or per_chunk_asm_off.len < n_chunks or per_chunk_asm_size.len < n_chunks) return null;
 
     const h2d = ffi.cuMemcpyHtoD_fn orelse return null;
@@ -261,8 +284,8 @@ pub fn gpuFrameAssembleImpl(
     // bytes to be in d_output.
     const heavy_stream: usize = self.work_stream;
     const t_fa = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzFrameAssembleKernel", heavy_stream);
+    defer gpu_decode.endKernelTiming(t_fa, heavy_stream);
     if (launch(module_loader.frame_assemble_fn, grid_x, 1, 1, 128, 1, 1, 0, heavy_stream, &params, &extra) != ffi.CUDA_SUCCESS) return null;
-    gpu_decode.endKernelTiming(t_fa, heavy_stream);
     // In async mode we leave the kernel in flight on the caller's stream
     // (their cudaStreamSynchronize is the sync point); else block here.
     if (heavy_stream == 0) {

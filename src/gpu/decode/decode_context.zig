@@ -289,6 +289,68 @@ pub const DecodeContext = struct {
     // (they share host-dependent values like total_subchunks); only the
     // back half rides the caller's stream.
     work_stream: usize = 0,
+
+    /// Free every owned device + host buffer and reset every field to its
+    /// default. Intended for a per-handle library API teardown; the
+    /// long-lived `driver.g_default` singleton in the current CLI / C ABI
+    /// never calls this (its lifetime is the process).
+    pub fn deinit(self: *DecodeContext) void {
+        const free_dev = struct {
+            fn f(ptr: *CUdeviceptr, sz: *usize) void {
+                if (ptr.* != 0) {
+                    if (cuda.cuMemFree_fn) |free_fn| _ = free_fn(ptr.*);
+                    ptr.* = 0;
+                }
+                sz.* = 0;
+            }
+        }.f;
+        free_dev(&self.d_output, &self.d_output_size);
+        free_dev(&self.d_comp_persist, &self.d_comp_persist_size);
+        free_dev(&self.d_descs_persist, &self.d_descs_persist_size);
+        free_dev(&self.d_entropy_scratch, &self.d_entropy_scratch_size);
+        free_dev(&self.d_entropy_off16_scratch, &self.d_entropy_off16_scratch_size);
+        free_dev(&self.d_raw_off16_descs, &self.d_raw_off16_descs_size);
+        free_dev(&self.d_first_subchunk_idx, &self.d_first_subchunk_idx_size);
+        free_dev(&self.d_scan_staged, &self.d_scan_staged_size);
+        free_dev(&self.d_scan_first_sub, &self.d_scan_first_sub_size);
+        free_dev(&self.d_walk_chunks, &self.d_walk_chunks_size);
+        free_dev(&self.d_walk_meta, &self.d_walk_meta_size);
+        free_dev(&self.d_first_sub_idx_persist, &self.d_first_sub_idx_persist_size);
+        free_dev(&self.d_total_subchunks_buf, &self.d_total_subchunks_buf_size);
+        free_dev(&self.d_compact_lit, &self.d_compact_lit_size);
+        free_dev(&self.d_compact_tok, &self.d_compact_tok_size);
+        free_dev(&self.d_compact_hi, &self.d_compact_hi_size);
+        free_dev(&self.d_compact_lo, &self.d_compact_lo_size);
+        free_dev(&self.d_compact_raw, &self.d_compact_raw_size);
+        free_dev(&self.d_compact_counts, &self.d_compact_counts_size);
+        free_dev(&self.d_n_raw_scratch, &self.d_n_raw_scratch_size);
+        free_dev(&self.d_n_huff_scratch, &self.d_n_huff_scratch_size);
+        free_dev(&self.d_n_chunks_scratch, &self.d_n_chunks_scratch_size);
+        free_dev(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size);
+        free_dev(&self.d_huff_descs, &self.d_huff_descs_size);
+        free_dev(&self.d_huff_lut, &self.d_huff_lut_size);
+
+        // Pinned host output (cuMemAllocHost / cuMemFreeHost).
+        if (self.h_pinned_output) |p| {
+            if (cuda.cuMemFreeHost_fn) |free_fn| _ = free_fn(@ptrCast(p));
+            self.h_pinned_output = null;
+        }
+        self.h_pinned_output_size = 0;
+
+        // Persistent pipeline streams created in ensurePipelineStreams.
+        if (self.pipeline_streams_created) {
+            if (cuda.cuStreamDestroy_fn) |destroy_fn| {
+                for (self.pipeline_streams) |s| {
+                    if (s != 0) _ = destroy_fn(s);
+                }
+            }
+            self.pipeline_streams = .{0} ** cuda.NUM_PIPELINE_STREAMS;
+            self.pipeline_streams_created = false;
+        }
+
+        self.pending_timings.deinit(std.heap.page_allocator);
+        self.last_timings.deinit(std.heap.page_allocator);
+    }
 };
 
 // `g_default` lives in driver.zig (the facade) — see the telemetry comment

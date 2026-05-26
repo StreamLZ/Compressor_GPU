@@ -1391,14 +1391,18 @@ pub fn compressFramedOne(
             const total_frame_size = gpu_enc.gpuFrameAssembleImpl(
                 enc_ctx,
                 allocator,
-                @intCast(n_chunks),
-                @intCast(eff_chunk),
-                @intCast(src.len),
-                prefix_buf[0..prefix_size],
-                flags0_d2d,
-                codec_byte,
-                per_chunk_asm_off_buf[0..n_chunks],
-                per_chunk_asm_size_buf[0..n_chunks],
+                .{
+                    .n_chunks = @intCast(n_chunks),
+                    .eff_chunk_size = @intCast(eff_chunk),
+                    .src_len = @intCast(src.len),
+                    .per_chunk_asm_off = per_chunk_asm_off_buf[0..n_chunks],
+                    .per_chunk_asm_size = per_chunk_asm_size_buf[0..n_chunks],
+                },
+                .{
+                    .prefix_bytes = prefix_buf[0..prefix_size],
+                    .internal_hdr0 = flags0_d2d,
+                    .internal_hdr1 = codec_byte,
+                },
                 enc_ctx.d_input_override,
                 enc_ctx.d_output_override,
             ) orelse break :pure_d2d;
