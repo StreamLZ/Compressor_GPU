@@ -75,7 +75,7 @@ is essentially flat post-revert.
 | K5 | K5.3 Move stack buffers to DecodeContext | DONE | `b552f02` |
 | K5 | K5.4 ctx-wide sync_fn document/migrate | DONE (option B — document) | `b2641d1` |
 | K5 | K5.5 Template decodeSubChunkGeneral on OFF16_SPLIT | DEFER — needs perf evaluation |  |
-| K5 | K5.6 decodeSubChunkGeneral 18-arg → struct (ParsedStreams + DecodeOutput) | DONE | pending |
+| K5 | K5.6 decodeSubChunkGeneral 18-arg → struct (ParsedStreams + DecodeOutput) | DONE | `9632a1f` |
 | K5 | K5.7 parseRawStreamSize / parseEntropyHeader SAFETY | DONE (option 2 — comments) | `b2641d1` |
 | K5 | K5.8 cached_qpc_freq → std.atomic.Value | DONE | `b552f02` |
 | K5 | K5.9 gatherRawOff16 fallback contract | DONE (option 2 — keep fallback) | `b552f02` |
