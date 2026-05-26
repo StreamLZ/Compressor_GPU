@@ -10,7 +10,21 @@ landed. See the **Status table** immediately below for per-item disposition.
 Commits landed this arc: `712d593` (K1) → `651392a` (K2) → `01e9e38` (K3)
 → `7dfe3e6` (K4) → `b552f02` (K5 easy) → `b2641d1` (K5b docs)
 → `9e30a6d` (K6a docs) → `c025e21` (K6bc naming + CUDA polish)
-→ `1212a2e` (K6d Zig polish).
+→ `1212a2e` (K6d Zig polish) → `239b9ed` (status update) →
+`a047ba0` (revert K1 C9 — measurable L3 kernel regression).
+
+**Perf result vs morning baseline (apples-to-apples, same hardware,
+same .slz files, `-db -t 1 -r 30`):**
+
+| Level | Morning (`04a783b`) | HEAD (`a047ba0`) | Net |
+|---|---:|---:|---:|
+| L1 kernel best | 2.981–3.012 ms | 2.987 ms | noise |
+| L3 kernel best | 6.649–6.685 ms | 6.687–6.694 ms | +23 µs (~0.3% — back near baseline) |
+| L5 kernel best | 6.491 ms | 6.382 ms | **−109 µs (1.7% faster)** |
+
+L5's improvement is the K3 REG drop on slzScanParseKernel (40→39) and
+the K6.39 dead-break removal in lz_decode_general.cuh paying off; L3
+is essentially flat post-revert.
 
 | Section | Item | Status | Commit |
 |---|---|---|---|
@@ -22,7 +36,7 @@ Commits landed this arc: `712d593` (K1) → `651392a` (K2) → `01e9e38` (K3)
 | K1 | C6 dead `if (chunk_len < 3) break;` | DONE | `712d593` |
 | K1 | C7 d_input_override silent fallback | DONE | `712d593` |
 | K1 | C8 dead errdefer × 3 | DONE | `712d593` |
-| K1 | C9 redundant __shfl_sync in lz_decode_general | DONE | `712d593` |
+| K1 | C9 redundant __shfl_sync in lz_decode_general | DONE then REVERTED (perf regression) | `712d593` → `a047ba0` |
 | K1 | C10 overflow-safe gather bounds check | DONE | `712d593` |
 | K2 | K2.1 writeU32LE | DONE | `651392a` |
 | K2 | K2.2 readU64LE | DONE | `651392a` |
