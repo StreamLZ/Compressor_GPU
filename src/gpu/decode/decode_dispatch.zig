@@ -97,10 +97,10 @@ fn mergeHuffDescs(
                src: []const HuffDecChunkDesc, region_off: u32) void {
             for (src) |s| {
                 if (m_ptr.* >= dst.len) return;
-                var dd = s;
-                dd.out_offset += region_off;
-                dd.lut_offset = lut_ptr.* * @as(u32, @intCast(HUFF_LUT_ENTRIES));
-                dst[m_ptr.*] = dd;
+                var entry = s;
+                entry.out_offset += region_off;
+                entry.lut_offset = lut_ptr.* * @as(u32, @intCast(HUFF_LUT_ENTRIES));
+                dst[m_ptr.*] = entry;
                 m_ptr.* += 1;
                 lut_ptr.* += 1;
             }
@@ -343,6 +343,9 @@ pub fn fullGpuLaunchImpl(
     // SLZ_E2E_TIMER: end-to-end decode phase breakdown — setup+H2D /
     // host scan+prep / kernels / D2H. Off by default.
     const e2e_timer = std.c.getenv("SLZ_E2E_TIMER") != null;
+    // SLZ_HUFF_DBG: cache once per call (otherwise getenv would run on
+    // every decode in this loop's caller).
+    const huff_dbg = std.c.getenv("SLZ_HUFF_DBG") != null;
     const t_e2e0 = if (e2e_timer)
         (if (io) |iv| std.Io.Clock.awake.now(iv) else null)
     else
@@ -487,7 +490,7 @@ pub fn fullGpuLaunchImpl(
     // into a single device array with correct out_offsets, then upload.
     const n_huff: u32 = scan.num_huff_lit + scan.num_huff_tok +
         scan.num_huff_off16hi + scan.num_huff_off16lo;
-    if (std.c.getenv("SLZ_HUFF_DBG") != null) {
+    if (huff_dbg) {
         std.debug.print("huff scan: lit={d} tok={d} hi={d} lo={d} total={d}\n", .{ scan.num_huff_lit, scan.num_huff_tok, scan.num_huff_off16hi, scan.num_huff_off16lo, n_huff });
     }
     const have_huff = n_huff > 0 and ml.huff_build_fn != 0 and ml.huff_decode_fn != 0;

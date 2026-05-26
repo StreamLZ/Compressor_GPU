@@ -26,11 +26,12 @@ pub fn hashBitsForLevel(level: u8) u32 {
     };
 }
 
-pub fn useGlobalHash(level: u8) bool {
+pub fn useGlobalHash(_: u8) bool {
     // All levels use global hash. L1's larger hash table (16-bit) needs
     // more than CUDA shared-mem allows; using global also dodges the
-    // shared-mem-hash corruption bug seen at L2 sc>=0.5.
-    _ = level;
+    // shared-mem-hash corruption bug seen at L2 sc>=0.5. The `level`
+    // parameter is preserved (as `_`) for future per-level differentiation
+    // and so call sites don't churn if the policy ever splits by level.
     return true;
 }
 
