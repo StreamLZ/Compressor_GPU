@@ -710,6 +710,12 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     const need_first_sub_idx = total_subchunks != @as(u32, @intCast(chunk_descs.len));
     self.d_first_subchunk_idx = if (need_first_sub_idx) self.d_first_sub_idx_persist else 0;
     if (need_first_sub_idx) {
+        // Host buffer is sized WALK_MAX_CHUNKS × u32; reject frames with
+        // more chunks than that to prevent the D2H below from overrunning
+        // it. The gpu_scan path has its own equivalent check (search
+        // `first_subchunk_idx_buf.len` below); add the same guard here so
+        // the host-scan / no-gpu-scan path is also safe.
+        if (chunk_descs.len > first_subchunk_idx_buf.len) return error.BadMode;
         const fs_bytes: usize = chunk_descs.len * @sizeOf(u32);
         try cudaCall(d2h_fn(@ptrCast(first_subchunk_idx_buf.ptr), self.d_first_sub_idx_persist, fs_bytes), .copy);
     }
