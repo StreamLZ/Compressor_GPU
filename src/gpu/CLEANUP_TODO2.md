@@ -1,6 +1,153 @@
 # GPU cleanup follow-up #2 — post-compact handoff
 
-**Read this whole top section before starting any work.**
+**Status as of commit `1212a2e` (K6d):** the bulk of the punch list is
+landed. See the **Status table** immediately below for per-item disposition.
+
+---
+
+## Status table
+
+Commits landed this arc: `712d593` (K1) → `651392a` (K2) → `01e9e38` (K3)
+→ `7dfe3e6` (K4) → `b552f02` (K5 easy) → `b2641d1` (K5b docs)
+→ `9e30a6d` (K6a docs) → `c025e21` (K6bc naming + CUDA polish)
+→ `1212a2e` (K6d Zig polish).
+
+| Section | Item | Status | Commit |
+|---|---|---|---|
+| K1 | C1 off32 packed header | DONE | `712d593` |
+| K1 | C2 Kraft sum UB shift | DONE | `712d593` |
+| K1 | C3 buildCanonicalCodes guard + loop bound | DONE | `712d593` |
+| K1 | C4 dead else-if (chain parser) | DONE | `712d593` |
+| K1 | C5 dead ternary | DONE | `712d593` |
+| K1 | C6 dead `if (chunk_len < 3) break;` | DONE | `712d593` |
+| K1 | C7 d_input_override silent fallback | DONE | `712d593` |
+| K1 | C8 dead errdefer × 3 | DONE | `712d593` |
+| K1 | C9 redundant __shfl_sync in lz_decode_general | DONE | `712d593` |
+| K1 | C10 overflow-safe gather bounds check | DONE | `712d593` |
+| K2 | K2.1 writeU32LE | DONE | `651392a` |
+| K2 | K2.2 readU64LE | DONE | `651392a` |
+| K2 | K2.3 writeLE24 in lz_token_emit | DONE | `651392a` |
+| K2 | K2.4 writeBE24 / writeU32LE in assemble | DONE | `651392a` |
+| K2 | K2.5 scan_host magic 131072 / 65536 | DONE | `651392a` |
+| K2 | K2.6 scan_host readBE24 helper × 5 | DONE | `651392a` |
+| K2 | K2.7 scan_host CHUNK_TYPE_SHIFT/MASK × 4 | DONE | `651392a` |
+| K3 | K3.1-K3.6 scan_parse_kernel magic numbers | DONE | `01e9e38` |
+| K3 | K3.7 SLZ_FRAME_FLAG_* constants | DONE | `01e9e38` |
+| K3 | K3.8 SLZ_BLOCK_HDR_* constants | DONE | `01e9e38` |
+| K3 | K3.9 SLZ_CHUNK_SIZE_BYTES + sub_chunk_cap | DONE | `01e9e38` |
+| K3 | K3.10 CHUNK_FLAG_UNCOMPRESSED / MEMSET | DONE | `01e9e38` |
+| K3 | K3.11 NEXT_HASH_ENTRIES | DONE | `01e9e38` |
+| K3 | K3.12 SC_TAIL_PER_CHUNK_BYTES / CHUNK_INTERNAL_HDR_BYTES | DONE | `01e9e38` |
+| K3 | K3.13 RAW_CHUNK_HDR_BYTES clarifying comment | DONE | `01e9e38` |
+| K3 | K3.14 HUFF_VS_RAW_HDR_OVERHEAD | DONE | `01e9e38` |
+| K3 | K3.15 LARGE_OFFSET_THRESHOLD = OFF32_LARGE_TAG | DONE | `01e9e38` |
+| K3 | K3.16 EXT_LENGTH_THRESHOLD moved to common | DONE | `01e9e38` |
+| K3 | K3.17 static_assert(OFF16_HILO_SPLIT_OFFSET == LZ_BLOCK_SIZE) | DONE | `01e9e38` |
+| K3 | K3.18 INITIAL_RECENT_OFFSET in encode/lz_kernel | DONE | `01e9e38` |
+| K4 | K4.1 delete 5 dead encode facade wrappers | DONE (kept `g_default`) | `7dfe3e6` |
+| K4 | K4.2 EncodeContext.deinit | DONE | `7dfe3e6` |
+| K4 | K4.3 DecodeContext.deinit + cuStreamDestroy FFI | DONE | `7dfe3e6` |
+| K4 | K4.4 gpuFrameAssembleImpl 16-arg → struct | DONE | `7dfe3e6` |
+| K4 | K4.5 huff_off16 no-clobber assert | DONE | `7dfe3e6` |
+| K4 | K4.6 beginKernelTiming leak on launch failure | DONE | `7dfe3e6` |
+| K5 | K5.1 GpuError subtyping | DEFER — heavy refactor, separate session |  |
+| K5 | K5.2 fullGpuLaunchImpl extraction | DEFER — 423 LOC, hot path |  |
+| K5 | K5.3 Move stack buffers to DecodeContext | DONE | `b552f02` |
+| K5 | K5.4 ctx-wide sync_fn document/migrate | DONE (option B — document) | `b2641d1` |
+| K5 | K5.5 Template decodeSubChunkGeneral on OFF16_SPLIT | DEFER — needs perf evaluation |  |
+| K5 | K5.6 decodeSubChunkGeneral 17-arg → struct | DEFER — hot path, medium risk |  |
+| K5 | K5.7 parseRawStreamSize / parseEntropyHeader SAFETY | DONE (option 2 — comments) | `b2641d1` |
+| K5 | K5.8 cached_qpc_freq → std.atomic.Value | DONE | `b552f02` |
+| K5 | K5.9 gatherRawOff16 fallback contract | DONE (option 2 — keep fallback) | `b552f02` |
+| K5 | K5.10 module_loader.init tri-state enum | DONE | `b552f02` |
+| K5 | K5.11 ensurePipelineStreams GpuError!void | DONE | `b552f02` |
+| K6 | K6.2-K6.4 byteio docs | DONE | `9e30a6d` |
+| K6 | K6.5 gpu_warp.cuh layout heading split | DONE | `9e30a6d` |
+| K6 | K6.6 encode/lz_kernel.cu "below"→"above" | DONE | `9e30a6d` |
+| K6 | K6.7 lz_format.cuh include list | DONE | `9e30a6d` |
+| K6 | K6.8-K6.14 README polish | DONE | `9e30a6d` |
+| K6 | K6.15-K6.21 ARCHITECTURE polish | DONE | `9e30a6d` |
+| K6 | K6.22 RAW_CHUNK_TYPE comment | DONE | `c025e21` |
+| K6 | K6.23 SLZ_CHUNK_TYPE_MASK rename | NOT DONE — would break encode/decode ABI |  |
+| K6 | K6.24 STREAM_HEADER_BYTES → LZ_SUBSTREAM_COUNT_HDR_BYTES | DONE (alias) | `c025e21` |
+| K6 | K6.25 ENTROPY_HDR_* layout comment | DONE | `c025e21` |
+| K6 | K6.26 SLZ_FRAME_MIN_HDR_SIZE width | NOT DONE — type-churn for cosmetic gain |  |
+| K6 | K6.27 lutTotalLen / lutNumSyms return uint8_t | DONE | `c025e21` |
+| K6 | K6.28 LUT_NUM_SYMS_TAG_* vs MAX_SYMS_PER_STEP | DONE | `c025e21` |
+| K6 | K6.29 lutSymPair endianness comment | DONE | `c025e21` |
+| K6 | K6.30 static constexpr → inline constexpr | NOT DONE — single-TU project, no ODR risk today |  |
+| K6 | K6.31 Fibonacci naming symmetry | DONE (aliases) | `c025e21` |
+| K6 | K6.32 walk_max_chunks → WALK_MAX_CHUNKS | DONE (alias) | `c025e21` |
+| K6 | K6.33 MIN_PARALLEL_MATCH_LEN comparison polarity | NOT DONE — perf-neutral, defer |  |
+| K6 | K6.34 lz_decode_raw.cuh `if constexpr` | NOT DONE — touches hot decoder, defer |  |
+| K6 | K6.35 static_assert(WARP_SIZE == 32) | NOT DONE — defer |  |
+| K6 | K6.36 LAST_BIT_SET helper | NOT DONE — defer |  |
+| K6 | K6.37 lz_decode_general overflow check | NOT DONE — defer with K5.6 |  |
+| K6 | K6.38 prefetched_token decl placement | NOT DONE — defer |  |
+| K6 | K6.39 redundant break in per-block loop | DONE | `c025e21` |
+| K6 | K6.40 TokenType enum | NOT DONE — defer with K5.6 |  |
+| K6 | K6.41 delta-literal trailing helper extract | NOT DONE — defer |  |
+| K6 | K6.42-K6.44 __restrict__ + shfl comments | NOT DONE — defer (low-priority polish) |  |
+| K6 | K6.45 walkReadF32LE memcpy bit-cast | DONE | `c025e21` |
+| K6 | K6.46-K6.50 huffman_kernel.cu micro-polish | NOT DONE — defer (low-priority) |  |
+| K6 | K6.51 SLZ_GUARD_SINGLE_THREAD macro | DONE | `c025e21` |
+| K6 | K6.52 (uint32_t)INITIAL_LITERAL_COPY_BYTES cast | NOT DONE — defer |  |
+| K6 | K6.53 chunk_type 1/6 naming | NOT DONE — defer |  |
+| K6 | K6.54-K6.60 encode CUDA misc polish | NOT DONE — defer |  |
+| K6 | K6.61 __syncwarp() comment in assemble | DONE | `c025e21` |
+| K6 | K6.62 decode_dispatch `var dd = s;` shadow | DONE | `1212a2e` |
+| K6 | K6.63 cache SLZ_HUFF_DBG getenv | DONE | `1212a2e` |
+| K6 | K6.64-K6.85 decode Zig misc polish | NOT DONE — defer |  |
+| K6 | K6.86 cuda_api.zig ctx → ?usize | NOT DONE — too invasive (used pervasively as usize) |  |
+| K6 | K6.87 NUM_PIPELINE_STREAMS = 1 history comment | NOT DONE — defer |  |
+| K6 | K6.88 levels.zig drop unused level param | DONE | `1212a2e` |
+| K6 | K6.89-K6.102 encode Zig misc polish | NOT DONE — defer |  |
+| K6 | K6.103 update old CLEANUP_TODO.md DONE table | NOT DONE — see "Next steps" below |  |
+
+**Summary:** 6 of 6 K1 items, 7 of 7 K2 items, 18 of 18 K3 items, 6 of 6
+K4 items, 7 of 11 K5 items (4 deferred), and ~30 of 103 K6 items —
+focused on the highest-value documentation, naming, and small-radius
+polish work. The remaining K6 items are all low-priority follow-up
+polish; future passes can chip away at them in batches similar to K6a-d.
+
+## Deferred items — next-session pickup
+
+The four K5 architectural items are real refactors that need their own
+session each:
+
+- **K5.1 GpuError subtyping** — fan out `error{BadMode}` into a richer
+  error set (CudaNotAvailable / OutOfDeviceMemory / CudaLaunchFailed /
+  CudaSyncFailed / CudaCopyFailed / KernelMissing / BadMode). Thread the
+  comptime kind tag through `cudaCall` and every call site. Heavy
+  mechanical change.
+- **K5.2 fullGpuLaunchImpl extraction** — split the 423-LOC, 11-param
+  function into `runHuffPredecode` / `runLzPipeline` / `finalizeOutput`
+  plus a `DecodeRequest` struct for the 6 invariant params.
+- **K5.5 template decodeSubChunkGeneral on OFF16_SPLIT** — specialize
+  the general decoder identically to the raw-mode decoder. Needs careful
+  REG/STACK + decode-bench evaluation; J4's experiment with __noinline__
+  on the same function showed PTX numbers can move adversely.
+- **K5.6 decodeSubChunkGeneral 17-arg → struct** — group into
+  `DecodeStreams` / `DecodeOutput` + 2 scalars. Touches the hottest
+  decode path so any REG/STACK regression must be measured.
+
+The ~70 deferred K6 nits are all small-radius polish (mostly
+`__restrict__` adds, helper extractions, comment additions, naming
+consistency). They can be batched by file in future sessions; nothing
+blocks progress on K5.
+
+## Verification baselines retained
+
+- enwik8 (100 MB) SHA: `2B49720EC4D78C3C9FABAEE6E4179A5E997302B3A70029F30F2D582218C024A8`
+- silesia_all.tar (212 MB) SHA: `86817A72FC4F404A0330247F69C1278DE8AD058AC1401A9CB1AE174FF5356C74`
+- `-gpu` enwik8 L1 compressed size: 58,637,026 bytes (matches `cfca2aa` baseline).
+- Every batch above re-verified both SHAs across `-gpu` L1/L3/L5 enwik8
+  + L3/L5 silesia, plus CPU-encode + CPU-decode L1 via the CPU-only
+  binary. REG/STACK cited in each commit message.
+
+---
+
+## Original handoff (preserved below for reference)
 
 This is the SECOND-pass punch list, gathered from a 5-agent textbook-grade
 re-review run against HEAD `a7a9f5f`. Treat this file as the source of
