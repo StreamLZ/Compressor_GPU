@@ -83,7 +83,14 @@ __device__ void decodeSubChunkGeneral(
     uint32_t cmd_pos = 0, lit_pos = 0, off16_pos = 0, off32_pos = 0;
     uint32_t dst_pos = dst_offset + initial_copy;
     int32_t recent_offset = INITIAL_RECENT_OFFSET;
-    uint32_t dst_end_abs = dst_offset + dst_size;
+    // dst_end_abs is the upper bound on every `dst[i]` store below. If a
+    // corrupt descriptor presents `dst_offset + dst_size` that overflows
+    // uint32, the sum would wrap small and let writes scribble far past
+    // the legal output region. One-time clamp at function entry — costs
+    // ~2 instructions per sub-chunk decode, not in any hot loop.
+    uint32_t dst_end_abs = (dst_size > 0xFFFFFFFFu - dst_offset)
+        ? 0xFFFFFFFFu
+        : (dst_offset + dst_size);
     uint32_t length_offset = 0;
     const uint8_t* off32_block = off32_raw1;
     uint32_t off32_block_count = off32_count1;

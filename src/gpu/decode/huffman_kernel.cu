@@ -207,6 +207,12 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
         }
         bit_buf <<= total_len;
         bit_count -= total_len;
+        // K6.49 alignment hoist attempted and REVERTED — it regressed L3
+        // enwik8 kernel best from ~6.69 ms to ~7.17-7.37 ms (~+7-10%).
+        // PTX REG/STACK unchanged (40/0 on slzHuffDecode4StreamKernel) so
+        // the cost was nvcc scheduling, not register pressure. The per-
+        // iteration branch is evidently cheaper than the two-phase split
+        // in this code shape. Do NOT hoist without bench-verifying first.
         while (pending >= sizeof(uint32_t)) {
             if (((uintptr_t)(out + written) & (alignof(uint32_t) - 1)) == 0u) {
                 *reinterpret_cast<uint32_t*>(out + written) = (uint32_t)acc;
