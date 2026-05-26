@@ -20,8 +20,10 @@ pub const ChunkDesc = extern struct {
 };
 
 // ── Huffman literal descriptors — matches decode/huffman_kernel.cu HuffDecChunkDesc.
-// in_offset/in_size cover the FULL payload (128 B weights + 9 B sub-header +
-// 4 stream payloads). Build kernel reads first 128 B; decode kernel skips 128.
+// in_offset/in_size cover the FULL payload (128 B weights + 93 B sub-header +
+// 32 stream payloads, per HUFF_NUM_STREAMS / HUFF_SUBHEADER_BYTES /
+// HUFF_BODY_HEADER_BYTES in src/gpu/common/gpu_huffman.cuh). Build kernel
+// reads first 128 B; decode kernel skips 128.
 pub const HuffDecChunkDesc = extern struct {
     in_offset: u32,
     in_size: u32,

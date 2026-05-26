@@ -47,12 +47,14 @@ static constexpr int      BITBUF_BITS  = 64;                   // bit_buf width 
 static constexpr int      REFILL_BITS  = 32;                   // bits per 4-byte refill chunk
 
 // ── Descriptor — matches Zig HuffDecChunkDesc in decode/driver.zig ──
-// Unified: in_offset/in_size cover the FULL payload (128 B weights +
-// 9 B sub-header + 4 stream payloads). Build kernel reads the leading
-// 128 B; decode kernel skips them and works on the remainder.
+// Unified: in_offset/in_size cover the FULL payload (HUFF_WEIGHTS_BYTES
+// weights + HUFF_SUBHEADER_BYTES sub-header + HUFF_NUM_STREAMS stream
+// payloads, i.e. HUFF_BODY_HEADER_BYTES fixed + sum(stream_sizes)).
+// Build kernel reads the leading HUFF_WEIGHTS_BYTES; decode kernel skips
+// them and works on the remainder.
 struct HuffDecChunkDesc {
-    uint32_t in_offset;     // byte offset in compressed buffer (points at 128 B weights)
-    uint32_t in_size;       // FULL payload bytes (128 + 9 + sum(streams))
+    uint32_t in_offset;     // byte offset in compressed buffer (points at weights)
+    uint32_t in_size;       // FULL payload bytes (HUFF_BODY_HEADER_BYTES + sum(streams))
     uint32_t out_offset;    // byte offset in literal scratch
     uint32_t out_size;      // expected decompressed bytes
     uint32_t lut_offset;    // entry index into luts[] (LUT_SIZE entries per block)
@@ -269,6 +271,17 @@ __device__ __forceinline__ uint32_t decodeStreamOneLane(
     // out_pos headroom of 2 × LUT_MAX_SYMS_PER_STEP: each iter can emit
     // up to 2 lookups × LUT_MAX_SYMS_PER_STEP symbols. The tail handles
     // the trailing 0-3 bytes one decode at a time.
+    //
+    // Three linked constants in this block: the gate (2 × LUT_MAX_SYMS),
+    // the inner-loop bound `k < 2`, and the refill threshold
+    // `2 × (MAX_CODE_LEN + 1)`. If LUT_MAX_SYMS_PER_STEP is ever bumped,
+    // all three need re-derivation, and the refill-threshold bound itself
+    // would have to fit within `REFILL_BITS = 32` — a 3-lookup batch
+    // would need ≤ 32 bits of refill but can consume up to 33, so it
+    // isn't safe. The static_assert locks the assumption.
+    static_assert(LUT_MAX_SYMS_PER_STEP == 2,
+                  "phase-2 hot loop is hard-wired to a 2-lookup batch; "
+                  "see refill-threshold analysis above");
     while (out_pos + 2 * LUT_MAX_SYMS_PER_STEP <= out_size) {
         if (bit_count < 2 * (MAX_CODE_LEN + 1)) {
             if (in_pos + 4 > in_size) break;
@@ -402,8 +415,9 @@ extern "C" __global__ void slzHuffDecode4StreamKernel(
     } else {
         my_size = 0;  // filled in below from total - sum
     }
-    // Warp reduce: sum of stream sizes 0..30. Lane 31 (whose `my_size` is
-    // still 0) gets the total, then derives its real size from in_size.
+    // Warp reduce: sum of stream sizes 0..HUFF_NUM_STREAMS-2. Lane
+    // HUFF_NUM_STREAMS-1 (whose `my_size` is still 0) gets the total,
+    // then derives its real size from in_size.
     uint32_t sum = my_size;
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {

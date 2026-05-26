@@ -107,7 +107,8 @@ pub fn scanForEntropyChunks(
                 const lit_type = (lit_first >> d.CHUNK_TYPE_SHIFT) & d.CHUNK_TYPE_MASK;
                 if (lit_type == 4) {
                     // Huffman literal stream. Payload after the header is
-                    // [128 B weights][9 B sub-header][4 streams].
+                    // [128 B weights][93 B sub-header][32 streams] (see
+                    // HUFF_NUM_STREAMS in src/gpu/common/gpu_huffman.cuh).
                     parseHuffHeader(chunk_src, pos, ch.src_offset, sub_dst_off,
                                     huff_lit_descs, &num_huff_lit);
                 }
@@ -219,8 +220,10 @@ pub fn scanForEntropyChunks(
 
 /// Parse a chunk_type=4 Huffman literal header at `lit_off` within chunk_src.
 /// Writes a HuffDecChunkDesc whose in_offset points at the FULL payload
-/// (128 B weights + 9 B sub-header + 4 streams). lut_offset is assigned by
-/// index — each descriptor owns HUFF_LUT_ENTRIES contiguous LUT entries.
+/// (128 B weights + 93 B sub-header + 32 streams; see HUFF_NUM_STREAMS /
+/// HUFF_BODY_HEADER_BYTES in src/gpu/common/gpu_huffman.cuh). lut_offset
+/// is assigned by index — each descriptor owns HUFF_LUT_ENTRIES contiguous
+/// LUT entries.
 fn parseHuffHeader(
     chunk_src: []const u8,
     lit_off: u32,

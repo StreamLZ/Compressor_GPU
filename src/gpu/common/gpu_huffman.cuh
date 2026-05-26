@@ -34,10 +34,15 @@ static constexpr int HUFF_LEN_HIST_SIZE = HUFF_MAX_CODE_LEN + 2;    // 13
 //   [stream 0 | stream 1 | ... | stream N-1]
 //
 // 32 streams lets all 32 warp lanes decode in parallel (vs 4 lanes active
-// in the prior 4-stream format). The bigger sub-header (93 vs 9 bytes)
-// and 32 stream-boundary trims cost ~0.1pp ratio at 64 KB sub-chunks,
-// scaling as ~108/chunk_size. Production trends toward larger sub-chunks
-// for LZ ratio reasons, so the cost stays in the noise.
+// in the prior 4-stream format). The cost has two parts:
+//   - Sub-header byte overhead: (93-9) / chunk_size = 84 / 65536 ≈ 0.13%
+//     at 64 KB sub-chunks.
+//   - Stream-boundary entropy loss: 32 boundaries vs 4 means more
+//     trailing-byte rounding + more partial-byte flushes. Empirically
+//     this dominates the byte overhead.
+// Total measured ratio cost ≈ 0.4-0.5 pp at 64 KB sub-chunks on
+// enwik8 / silesia L3-L5 (see ratio table in src/gpu/README.md).
+// At larger sub-chunks both components shrink linearly with chunk size.
 static constexpr int     HUFF_NUM_STREAMS       = 32;           // 32-stream split (was 4)
 static constexpr int     HUFF_ALPHABET          = 256;          // 8-bit symbol alphabet
 static constexpr int     HUFF_WEIGHTS_BYTES     = 128;          // 256 symbols × 4-bit lengths
@@ -45,6 +50,14 @@ static constexpr int     HUFF_STREAM_SIZE_BYTES = 3;            // bytes per u24
 static constexpr int     HUFF_SUBHEADER_BYTES   = (HUFF_NUM_STREAMS - 1) * HUFF_STREAM_SIZE_BYTES; // 93
 static constexpr int     HUFF_BODY_HEADER_BYTES = HUFF_WEIGHTS_BYTES + HUFF_SUBHEADER_BYTES;       // 221
 static constexpr uint8_t HUFF_NIBBLE_MASK       = 0x0F;         // low-nibble mask
+
+// Both Huffman kernels assign one warp lane per stream (encoder lane k
+// encodes stream k, decoder lane k decodes stream k). Bumping
+// HUFF_NUM_STREAMS to anything other than the NVIDIA warp size (32)
+// would require both kernels to be re-architected. Lock the invariant.
+static_assert(HUFF_NUM_STREAMS == 32,
+              "HUFF_NUM_STREAMS is hard-wired to one lane per warp; "
+              "see slzHuffEncode4StreamKernel / slzHuffDecode4StreamKernel");
 
 // ── Weights pack / unpack ───────────────────────────────────────
 // 256 4-bit code lengths are stored in HUFF_WEIGHTS_BYTES bytes: byte i

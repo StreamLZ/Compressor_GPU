@@ -72,9 +72,11 @@ static __device__ void parseLiteralStreamHeader(
             lit_pre_decoded = 1;
         } else if (chunk_type == 4 && entropy_lit_scratch != nullptr) {
             // Huffman (GPU-emitted): same 3/5-byte header convention as the
-            // legacy entropy types; payload is [128 B weights][9 B sub-header]
-            // [4 streams]. Pre-decoded into entropy_lit_scratch by
-            // slzHuffDecode4StreamKernel.
+            // legacy entropy types; payload is [128 B weights][93 B sub-header]
+            // [32 streams] (see HUFF_NUM_STREAMS / HUFF_BODY_HEADER_BYTES in
+            // src/gpu/common/gpu_huffman.cuh). Pre-decoded into
+            // entropy_lit_scratch by slzHuffDecode4StreamKernel (name retained
+            // for ABI; decodes 32 streams now, not 4).
             uint32_t comp_size;
             lit_size = parseEntropyHeader(src, comp_size);
             lit_ptr = entropy_lit_scratch;

@@ -107,6 +107,12 @@ Every CUDA kernel is resolved by the Zig drivers via `cuModuleGetFunction`.
 | decode | `slzHuffBuildLutKernel` | `decode/huffman_kernel.cu` |
 | decode | `slzHuffDecode4StreamKernel` | `decode/huffman_kernel.cu` |
 
+The `4Stream` suffix on the two Huffman kernels is retained for the Zig
+dispatch ABI; both encode and decode now operate on `HUFF_NUM_STREAMS = 32`
+streams (one per warp lane), not 4. See `ARCHITECTURE.md` and the kernel
+banners in the corresponding `.cu` files for the wire-format details.
+
+
 Decode LZ-aggregator kernels live in their per-kernel `.cuh` headers
 (see the layout block above) which the single `decode/lz_kernel.cu`
 aggregator includes; only the `.cu` emits a `.ptx`, hence the source

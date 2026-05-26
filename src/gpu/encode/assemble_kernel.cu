@@ -57,6 +57,7 @@ struct AssembleDesc {
     uint32_t init_bytes;          // 8 for the frame's first sub-chunk (verbatim prefix), else 0
     uint32_t out_offset;          // assembled payload destination in d_frame (pass 2)
 };
+static_assert(sizeof(AssembleDesc) == 52, "ABI: keep in sync with encode_context.zig AssembleDesc");
 
 // ── Raw sub-chunk payload, parsed ───────────────────────────────────
 struct RawStreams {

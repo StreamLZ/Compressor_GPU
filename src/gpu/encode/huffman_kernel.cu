@@ -1,7 +1,14 @@
 // GPU Huffman entropy encoder — two kernels.
 //
-//   slzHuffBuildTablesKernel  — histogram + canonical code-length build.
-//   slzHuffEncode4StreamKernel — pack a sub-chunk into a chunk_type=4 body.
+//   slzHuffBuildTablesKernel    — histogram + canonical code-length build.
+//   slzHuffEncode4StreamKernel  — pack a sub-chunk into a chunk_type=4
+//                                 body (the "4Stream" name is retained for
+//                                 the Zig dispatch ABI introduced by the
+//                                 prior 4-stream design; this kernel now
+//                                 encodes HUFF_NUM_STREAMS streams in
+//                                 parallel — one per warp lane, currently
+//                                 32). Mirrors the decoder name pattern
+//                                 in src/gpu/decode/huffman_kernel.cu.
 //
 // Both mirror the production CPU Huffman encoder exactly, so the output
 // pairs bit-for-bit with the production Huffman decoder. Codes are
@@ -214,17 +221,19 @@ extern "C" __global__ void slzHuffBuildTablesKernel(
     }
 }
 
-// ── 4-stream encoder — one block per sub-chunk, lanes 0..3 active ────
+// ── HUFF_NUM_STREAMS-way parallel encoder — one block per sub-chunk ───
 //
 // Emits the chunk_type=4 body (the CPU encoder's encode-block output,
 // minus the 5-byte chunk header which the frame assembler prepends):
-//   [128 B weights — 4 bits/symbol, byte i = cl[2i] | cl[2i+1]<<4]
-//   [9 B sub-header — 3 × u24 LE stream sizes; stream 3 derived]
-//   [stream 0 | stream 1 | stream 2 | stream 3]
+//   [HUFF_WEIGHTS_BYTES weights — 4 bits/symbol, byte i = cl[2i] | cl[2i+1]<<4]
+//   [HUFF_SUBHEADER_BYTES sub-header — (N-1) × u24 LE stream sizes;
+//                                       stream (N-1) size derived from total]
+//   [stream 0 | stream 1 | ... | stream N-1]
 //
-// Code tables come from slzHuffBuildTablesKernel. Lanes 0..3 each encode
-// one input quarter into per-stream scratch; lane 0 then assembles the
-// body at `output + descs[block_id].dst_offset`.
+// where N = HUFF_NUM_STREAMS = 32. Code tables come from
+// slzHuffBuildTablesKernel. Lanes 0..N-1 (= all 32 warp lanes) each
+// encode one input slice into per-stream scratch; lane 0 then assembles
+// the body at `output + descs[block_id].dst_offset`.
 extern "C" __global__ void slzHuffEncode4StreamKernel(
     const uint8_t* __restrict__ input,
     const HuffEncDesc* __restrict__ descs_in,
@@ -255,7 +264,10 @@ extern "C" __global__ void slzHuffEncode4StreamKernel(
     // for the weights pack below).
     const uint8_t* block_code_lengths = code_lengths + (uint64_t)block_id * tables_stride;
 
-    // Lanes 0..3 each encode one of the 4 quarters into scratch.
+    // All HUFF_NUM_STREAMS lanes each encode one input slice into scratch.
+    // (HUFF_NUM_STREAMS == WARP_SIZE, so every lane is active — the
+    // `if (lane < HUFF_NUM_STREAMS)` guard is structurally redundant but
+    // is left in place as a documentation of the contract.)
     uint32_t bytes = 0;
     if (lane < HUFF_NUM_STREAMS) {
         uint32_t q = desc.src_size / HUFF_NUM_STREAMS;
@@ -272,7 +284,7 @@ extern "C" __global__ void slzHuffEncode4StreamKernel(
         bytes = encodeStreamOneLane(my_in, my_in_size, desc.src_stride,
                                     block_code_lengths, my_codes, my_scratch);
     }
-    // Barrier covers the lane-0..3 scratch writes before the cross-lane
+    // Barrier covers the per-lane scratch writes before the cross-lane
     // shuffles below; all 32 lanes reach here (the if-block has no return).
     __syncwarp();
 
@@ -285,18 +297,24 @@ extern "C" __global__ void slzHuffEncode4StreamKernel(
 
     uint8_t* out = output + desc.dst_offset;
 
-    // 128-byte weights — 32 lanes pack 4 entries each.
+    // HUFF_WEIGHTS_BYTES weights — WARP_SIZE lanes cooperative pack
+    // (HUFF_WEIGHTS_BYTES / WARP_SIZE = 4 entries per lane).
     for (int i = lane; i < HUFF_WEIGHTS_BYTES; i += WARP_SIZE)
         out[i] = packWeightByte(block_code_lengths[2 * i], block_code_lengths[2 * i + 1]);
 
     if (lane == 0) {
-        // 9-byte sub-header at offset 128 (3 × u24 LE; stream 3 derived).
+        // HUFF_SUBHEADER_BYTES sub-header at offset HUFF_WEIGHTS_BYTES
+        // ((N-1) × u24 LE; stream (N-1) size derived from total payload).
         uint8_t* subheader = out + HUFF_WEIGHTS_BYTES;
         for (int s = 0; s < HUFF_NUM_STREAMS - 1; s++) {
             writeLE24(subheader + s * HUFF_STREAM_SIZE_BYTES, stream_bytes[s]);
         }
 
-        // Concatenate the 4 per-stream scratch buffers into the body.
+        // Concatenate the HUFF_NUM_STREAMS per-stream scratch buffers into
+        // the body. Layout invariant matches encode_huff.zig's
+        // `scratch_bytes = descs.len * NUM_STREAMS * scratch_per_stream`
+        // sizing — strides are (NUM_STREAMS × scratch_per_stream) between
+        // blocks and scratch_per_stream between streams within a block.
         uint8_t* dst = out + HUFF_BODY_HEADER_BYTES;
         uint32_t total_body = 0;
         for (int s = 0; s < HUFF_NUM_STREAMS; s++) {
@@ -307,6 +325,6 @@ extern "C" __global__ void slzHuffEncode4StreamKernel(
             total_body += stream_bytes[s];
         }
 
-        out_sizes[block_id] = HUFF_WEIGHTS_BYTES + HUFF_SUBHEADER_BYTES + total_body;
+        out_sizes[block_id] = HUFF_BODY_HEADER_BYTES + total_body;
     }
 }

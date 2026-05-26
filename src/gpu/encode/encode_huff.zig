@@ -192,8 +192,9 @@ pub fn gpuEncodeOff16HuffImpl(
         if (off16_count < 32) continue; // matches CPU `>= 32` gate
         const off16_data: u32 = off16_hdr + 2;
 
-        // Huffman body worst case ≈ 137 fixed + count×11/8; count*2 + 256
-        // is a safe capacity bound.
+        // Huffman body worst case ≈ HUFF_BODY_HEADER_BYTES (221) fixed
+        // + count×11/8; count*2 + 256 is a safe capacity bound (margin
+        // is 256 - 221 = 35 B after the 4→32 stream sub-header growth).
         const hi_cap: u32 = off16_count * 2 + 256;
         descs[i] = .{
             .src_offset = off16_data + 1, // hi plane: odd bytes
@@ -340,8 +341,9 @@ pub fn gpuEncodeLiteralsHuffImpl(
         const lit_src: u32 = lit_hdr + 3;
         if (lit_src + lit_count > base + cs) continue;
 
-        // Huffman body worst case ≈ 137 fixed + count×11/8; count*2 + 256
-        // is a safe capacity bound.
+        // Huffman body worst case ≈ HUFF_BODY_HEADER_BYTES (221) fixed
+        // + count×11/8; count*2 + 256 is a safe capacity bound (margin
+        // is 256 - 221 = 35 B after the 4→32 stream sub-header growth).
         const dst_cap: u32 = lit_count * 2 + 256;
         descs[i] = .{
             .src_offset = lit_src,

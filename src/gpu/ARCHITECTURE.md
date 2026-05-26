@@ -62,7 +62,7 @@ and scheduling overhead, but each is doing its own thing.
 
 For Huffman decoding, the encoder has already split the input into
 32 sub-streams so the decoder can run all 32 lanes in parallel.
-`slzHuffDecode4StreamKernel` (name retained for ABI compatibility —
+`slzHuffDecode4StreamKernel` (name retained for ABI compatibility:
 it decodes 32 streams, not 4) uses one warp per Huffman block with
 every lane active. Each lane runs its own bit-buffer plus LUT loop
 on its own input slice; there is no cross-lane traffic in the hot
@@ -247,7 +247,7 @@ The attribute stays.
 
 The opposite experiment also failed. The J4 cleanup tried adding
 `__noinline__` to `decodeSubChunkGeneral` (the entropy-mode decoder's
-hot loop body — much larger than the header parser). PTX STACK grew on
+hot loop body, much larger than the header parser). PTX STACK grew on
 both `slzLzDecodeKernel` (192 → 208) and `slzLzDecodeRawKernel` (72 →
 80) with REG unchanged, indicating the attribute forced extra spill
 slots. The header parser is small enough that out-of-lining it is a
@@ -270,7 +270,7 @@ current throughput.
 Stream sizes are stored as 31 × u24 LE in the sub-header (lane 31's
 size is derived from `in_size - HUFF_BODY_HEADER_BYTES - sum`). Each
 lane computes its own input offset via an exclusive warp-shuffle
-prefix sum — 5 shuffles for 32-way fan-out. A 4-stream design could
+prefix sum: 5 shuffles for 32-way fan-out. A 4-stream design could
 afford a linear scan on lane 0; at 32 streams the prefix-sum becomes
 the right primitive.
 
@@ -566,18 +566,28 @@ compiled with `nvcc -arch=sm_89 -O3`:
 | `slzCompactHuffDescsKernel`    | 40 | 0 | 0 |
 | `slzGatherRawOff16Kernel`      | 12 | 0 | 0 |
 | `slzHuffBuildLutKernel`        | 40 | 104 | 1280 |
-| `slzHuffDecode4StreamKernel`   | 40 | 0 | 0 |
+| `slzHuffDecode4StreamKernel` †  | 40 | 0 | 0 (+4096 dyn) |
 | `slzHuffBuildTablesKernel`     | 50 | 0 | 9472 |
-| `slzHuffEncode4StreamKernel`   | 38 | 0 | 0 |
+| `slzHuffEncode4StreamKernel` †  | 56 | 128 | 0 |
 | `slzAssembleMeasureKernel`     | 26 | 0 | 0 |
 | `slzAssembleWriteKernel`       | 46 | 0 | 0 |
 | `slzFrameAssembleKernel`       | 26 | 0 | 0 |
 
-Two things stand out. Almost no kernel uses shared memory. Only the
-Huffman LUT-build kernels use it, and only because the LUT itself
-fits there comfortably. The LZ decode kernel keeps its entire
-working set in registers; the entropy scratch lives in global memory
-and the hardware caches absorb the traffic.
+Two things stand out. Almost no kernel uses static shared memory.
+The Huffman LUT-build kernels stage their tables there because the
+LUT itself fits comfortably. The Huffman decode kernel takes 4 KB
+of dynamic shared per launch for the runtime LUT (allocated at
+kernel launch, not counted in the SHARED column above). The LZ
+decode kernel keeps its entire working set in registers; the
+entropy scratch lives in global memory and the hardware caches
+absorb the traffic.
+
+† The `4Stream` suffix on the two Huffman kernel names is retained
+for the Zig dispatch ABI introduced by the prior 4-stream design.
+Both kernels now operate on `HUFF_NUM_STREAMS = 32` streams (one
+per warp lane), not 4. See `common/gpu_huffman.cuh` for the
+constants and the kernel banners in the corresponding `.cu` files
+for the wire-format details.
 
 The orchestration kernels are tiny. Walk, scan, compact, merge,
 prefix-sum, and gather each use between 12 and 40 registers and no

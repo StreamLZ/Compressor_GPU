@@ -33,7 +33,8 @@ __device__ __forceinline__ uint32_t readU32BE(const uint8_t* p) {
 }
 
 // ── 24-bit little-endian codec ──────────────────────────────────
-// The Huffman 4-stream sub-header stores per-stream sizes little-endian.
+// The Huffman sub-header stores per-stream sizes little-endian
+// (HUFF_NUM_STREAMS-1 sizes, each a u24 LE).
 __device__ __forceinline__ uint32_t readLE24(const uint8_t* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
 }
