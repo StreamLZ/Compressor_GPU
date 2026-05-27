@@ -111,6 +111,83 @@ the share, the bigger the win from removing that stall reason.
 | drain | 0.47 | 0.7% | |
 | _other_ | 4.32 | 6.0% | |
 
+## What specifically is spilling — ptxas + PTX inspection
+
+`nvcc -O3 -arch=sm_89 -Xptxas -v` per-function spill report:
+
+| Function | Stack frame | Spill stores | Spill loads | Regs |
+|---|---:|---:|---:|---:|
+| **slzLzDecodeKernel** (entry) | **192 B** | **148 B** | **228 B** | 40 |
+| └─ `decodeSubChunkRawMode<true>` (called from above) | — | 20 B | 52 B | — |
+| └─ `decodeSubChunkRawMode<false>` | — | 12 B | 32 B | — |
+| └─ `parseSubChunkHeaders` (__noinline__) | — | 0 B | 4 B | — |
+| slzLzDecodeRawKernel | 72 B | 108 B | 184 B | 40 |
+| slzHuffDecode4StreamKernel | 0 | **0** | **0** | 40 |
+| slzHuffBuildLutKernel | 0 | **0** | **0** | 40 |
+| slzGatherRawOff16Kernel | 0 | **0** | **0** | 11 |
+
+**The spilled state is the `ParsedStreams` struct.** PTX-level inspection of
+slzLzDecodeKernel shows `__local_depot3[104]` — exactly the size of
+[`ParsedStreams`](include/slz_wire_format.cuh) (8 pointers × 8 bytes + 9 ×
+u32 = 100 bytes, +4 alignment padding = 104). Every `ld.local` / `st.local`
+in the kernel targets this depot, with offsets that map 1:1 to struct
+fields:
+
+| Depot offset | Field | Bytes |
+|---:|---|---:|
+| 0  | `lit_ptr`           | 8 |
+| 8  | `cmd_ptr`           | 8 |
+| 16 | `off16_raw`         | 8 |
+| 24 | `off16_hi`          | 8 |
+| 32 | `off16_lo`          | 8 |
+| 40 | `off32_raw1`        | 8 |
+| 48 | `off32_raw2`        | 8 |
+| 56 | `len_stream`        | 8 |
+| 64 | `lit_size` + `cmd_size` (v2.u32) | 8 |
+| 72 | `off16_count` + `off16_split` | 8 |
+| 80 | `off32_count1` + `off32_count2` | 8 |
+| 88 | `len_avail` + `cmd_stream2_offset` | 8 |
+| 96 | `initial_copy`      | 4 |
+
+The hoisting block at [`lz_decode_general.cuh:86-105`](include/lz_decode_general.cuh#L86-L105)
+that copies `ps.field` into locals is exactly where the spills get materialized
+— ptxas can't fit all 17 ParsedStreams values + the inner-loop state in 40
+registers, so it puts the struct on the stack and reloads fields on demand
+inside the hot token loop.
+
+### Why 40 registers? The launch_bounds budget.
+
+`__launch_bounds__(LZ_KERNEL_BLOCK_THREADS=64, LZ_KERNEL_MIN_BLOCKS_PER_SM=24)`
+in [slz_wire_format.cuh:107-109](include/slz_wire_format.cuh#L107-L109) is the
+constraint that forces 40 regs/thread:
+
+```
+Register budget = 65,536 (sm_89 file) / (64 threads × 24 blocks) ≈ 42.6 regs/thread.
+```
+
+ptxas rounds down to 40 and spills the rest. Without that bound, the kernel
+would naturally want ~55-60 registers to fit the hoisted state — but that
+would limit occupancy to 16-18 blocks/SM.
+
+### The actionable experiment
+
+Try `__launch_bounds__(64, 16)` (raise register cap to 64). Expected:
+- Spill stores/loads → near-zero
+- `long_scoreboard` stall drops materially (the spill-related portion ~30-40%)
+- Theoretical occupancy 66% (was 100%); achieved might land at ~55%
+- **Net**: probably a win, but worth measuring. If the occupancy drop hurts
+  latency hiding more than the spill removal helps, partial-spill at (64, 20)
+  is a middle-ground compromise.
+
+Other paths:
+1. Pass `ParsedStreams` fields as separate function arguments instead of via
+   a struct — gives ptxas finer control over which to keep in registers.
+2. Shrink `ParsedStreams` — `off16_raw` and `off16_split` are redundant when
+   the OFF16_SPLIT template is fixed; `initial_copy` is 0 or 8 (1 bit).
+   Could save 16 bytes from the spill set with conditional compilation.
+3. Split `decodeSubChunkGeneral` into two phases (parse-only and decode-only),
+   each with a smaller live-state footprint at any moment.
+
 ## Source-level signals from NCU rules
 
 Beyond the stall breakdown, NCU's static analysis surfaced these specific
