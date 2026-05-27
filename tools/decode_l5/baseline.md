@@ -58,6 +58,83 @@ $ tools/decode_l5/profile_decode_l5.bat c:/tmp/ew8_l5_scan.bin assets/enwik8.txt
 | `slzLzDecodeKernel`          | (763, 1, 1) × (32, 2)   |   3.70 ms |     73.7%  |     73.7%   | 23.6%  | 58.1%  | 88.8%  |   84.0%   |          22.62 / 32     |              15.49 |       2.60 |
 | **Pipeline (sum)**           |                         | **~4.71 ms** | — | — | — | — | — | — | — | — | — |
 
+## Stall-reason breakdown (silesia L5, from NCU `--set full` PC sampling)
+
+Per-issued-instruction warp cycle accounting. The "% of cycles" column is each
+stall reason's share of total warp cycles per issued instruction; the bigger
+the share, the bigger the win from removing that stall reason.
+
+### slzLzDecodeKernel — total 14.5 warp cycles / issued inst
+
+| Stall reason | Cycles | % of cycles | What it means |
+|---|---:|---:|---|
+| **long_scoreboard** | **5.76** | **39.7%** | Waiting on L1TEX (global/local/surface/texture) data dependency. The NCU rule pegs this exactly: 5.8 cycles waiting for L1TEX scoreboard. Mostly the dst[match_src] reads in warpMatchCopy. |
+| **wait** | 3.36 | 23.2% | Fixed-latency dependency (e.g. `__syncwarp`, FP/INT pipe latency). Hard to attack directly. |
+| **not_selected** | 1.35 | 9.3% | Warp was ready but the scheduler picked another (warps competing for the same issue slot — symptom of healthy occupancy, not a problem). |
+| **branch_resolving** | 1.02 | 7.0% | Waiting for branch target to resolve. With 25.4% of instructions being branches (349M / 1373M) and 9.2% of those divergent (32M), this is structural. |
+| **short_scoreboard** | 0.65 | 4.5% | Waiting on MIO (shared mem, constant, special) data dep. |
+| **mio_throttle** | 0.52 | 3.6% | MIO pipe at throughput cap. |
+| **no_instruction** | 0.47 | 3.2% | I-cache miss — the kernel is large enough that I-cache pressure shows. |
+| **math_pipe_throttle** | 0.29 | 2.0% | FP/INT pipe at cap. |
+| _other_ | 1.08 | 7.5% | dispatch_stall, drain, lg_throttle, imc_miss, etc. |
+
+### slzHuffDecode4StreamKernel — total 21.7 warp cycles / issued inst
+
+| Stall reason | Cycles | % of cycles | Note |
+|---|---:|---:|---|
+| **long_scoreboard** | **16.09** | **74.2%** | Memory-latency-bound. Kernel already at 96% memory SoL — this is the BIL refill pattern paying off (one stall, big refill), not a sign of a fixable problem. |
+| wait | 1.71 | 7.9% | |
+| short_scoreboard | 1.59 | 7.3% | Shared-mem LUT dependencies. |
+| not_selected | 0.38 | 1.7% | |
+| math_pipe_throttle | 0.35 | 1.6% | |
+| mio_throttle | 0.36 | 1.7% | |
+| imc_miss | 0.21 | 1.0% | |
+| _other_ | 1.00 | 4.6% | |
+
+### slzHuffBuildLutKernel — total 8.4 warp cycles / issued inst
+
+| Stall reason | Cycles | % of cycles | Note |
+|---|---:|---:|---|
+| **wait** | **2.55** | **30.3%** | Fixed-latency / `__syncwarp`. |
+| **short_scoreboard** | **2.04** | **24.3%** | Shared-mem dependencies (the LUT-build pattern reads/writes the shared LUT extensively). |
+| barrier | 1.32 | 15.6% | `__syncwarp` between passes. |
+| no_instruction | 0.67 | 8.0% | |
+| long_scoreboard | 0.33 | 3.9% | Very little — kernel is mostly compute + shared mem. |
+| not_selected | 0.32 | 3.8% | |
+
+### slzGatherRawOff16Kernel — total 72.1 warp cycles / issued inst
+
+| Stall reason | Cycles | % of cycles | Note |
+|---|---:|---:|---|
+| **long_scoreboard** | **64.26** | **89.2%** | Pure DRAM-latency wait. The kernel is a sparse byte-gather (256 lanes × 256-byte stride writes) — bound by DRAM latency, not bandwidth. Expected for a gather pattern; not worth attacking. |
+| wait | 3.03 | 4.2% | |
+| drain | 0.47 | 0.7% | |
+| _other_ | 4.32 | 6.0% | |
+
+## Source-level signals from NCU rules
+
+Beyond the stall breakdown, NCU's static analysis surfaced these specific
+problems in `slzLzDecodeKernel`:
+
+1. **Register spill to local memory: 8,367,316 requests** — the kernel is using 40
+   registers/thread but has live-state pressure that spills to L1/L2/DRAM.
+2. **Local stores: 1.0 of 32 bytes per sector actually used** (NCU est. speedup 70%).
+   The spill writes are scattered (one byte per lane per sector). Every spill
+   store wastes ~31/32 of L1 bandwidth.
+3. **Local loads: 6.9 of 32 bytes per sector used** (NCU est. speedup 57%).
+   Spill reads are slightly better-aligned but still ~22% efficient.
+4. **Global stores: 5.4 of 32 bytes per sector used** (NCU est. speedup 60%).
+   Output-write coalescing is poor — short literal/match copies have small tails
+   that fragment the stores.
+5. **Uncoalesced global accesses: 12.6 MB excessive sectors** (15% of total 86 MB,
+   NCU est. speedup 14%). Probably the `dst[pos - off]` match-source reads at
+   non-warp-aligned positions.
+6. **Achieved occupancy 79% vs theoretical 100%** (NCU est. speedup 21%). One
+   full wave + a partial wave of 808 blocks; the partial wave costs ~50% of the
+   theoretical kernel runtime that a no-tail launch would have.
+7. **Avg active threads/warp 21.8, predicated-on 20.6** (NCU est. speedup 26%).
+   Divergent literal/match-copy short tails leave ~1/3 of the warp idle.
+
 ## Bottleneck reading — what matters for future experiments
 
 **1. `slzLzDecodeKernel` is the dominant cost** — 7.14 / 8.94 ≈ **80% of silesia
@@ -94,17 +171,37 @@ Bandwidth-bound (50-62% of SoL on the gather). Not worth pursuing.
 
 ### Optimization targets, ordered by ROI
 
-1. **LZ decode kernel lane utilization** — push avg active threads/warp
-   from ~22 toward 32. The literal-copy and match-copy phases are the
-   obvious targets (short tails leave many lanes idle).
-2. **LZ decode L1-pipe pressure** — see if `__ldg` / `__ldcs` cache hints
-   on the match-source reads change anything. NCU says L1 hit 71%,
-   so most reads are cache-resident, but the pipe is busy at 71%.
-3. **Reduce HuffDecode bandwidth pressure** — already at SoL ceiling; a
-   smaller LUT or in-shared-mem reuse pattern might help, but the
-   kernel is already in a warp-cooperative state.
-4. **Fuse Gather + HuffBuild** — gather is 1% of pipeline, fusing saves a
-   tiny launch overhead but is risky. Probably not worth it.
+Concrete from the stall + source-counter analysis above:
+
+1. **Eliminate register spill in LzDecode** (NCU est. speedup ~30-50%).
+   8.37M local-memory spill requests with 1.0/32 byte sector utilization
+   means every spilled register write wastes 31/32 of L1 bandwidth and
+   probably explains a large fraction of the 39.7% `long_scoreboard`
+   stall and the 4.5% `short_scoreboard` stall. Approach: trim live
+   register state in the inner parse loop (`ParsedStreams` struct fields,
+   loop-carried cursors) or split the kernel so spilled state isn't live
+   across the heavy memory phases.
+2. **LzDecode lane utilization** (NCU est. speedup 26%). Push active
+   threads/warp from 21.8 → 32. The literal-copy and match-copy short
+   tails are the target — when `lit_len < 32` or `match_len < 32`, some
+   lanes idle. A predicated-write approach or per-lane work redistribution
+   would help.
+3. **LzDecode tail-wave occupancy** (NCU est. speedup 21%). 1624 blocks
+   on 34 SMs × ~12 blocks/SM ≈ 1 full wave + a 808-block partial wave.
+   Larger-per-warp work (fewer blocks, more chunks per warp) would
+   eliminate the tail. Current `chunks_per_group=1` is the lever.
+4. **LzDecode uncoalesced output stores** (NCU est. speedup 60%). The
+   global-store sector utilization is 5.4/32. Writing literals/matches
+   one byte at a time per lane is the cause. A 4-byte vectorized store
+   path (alignment-permitting) would dramatically improve this.
+5. **HuffDecode** — already at 96% mem SoL with 74% of stalls being
+   long_scoreboard. Bandwidth-bound. No easy wins; would need a smaller
+   working set (smaller LUT, different code length distribution).
+6. **HuffBuild** — 30% wait + 24% short_scoreboard + 16% barrier. Already
+   warp-cooperative; further wins require either fewer barrier rounds or
+   a fundamentally different LUT-build algorithm.
+7. **Gather** — 89% long_scoreboard. Inherent for sparse byte-gather.
+   Not worth pursuing.
 
 ## Reproducing this baseline
 
