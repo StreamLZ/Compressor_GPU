@@ -61,6 +61,7 @@ pub var init_state: InitState = .uninit;
 // ── Driver API function signatures ──────────────────────────────
 pub const FnInit = *const fn (c_uint) callconv(.c) CUresult;
 pub const FnDeviceGet = *const fn (*CUdevice, c_int) callconv(.c) CUresult;
+pub const FnDeviceGetAttribute = *const fn (*c_int, c_int, CUdevice) callconv(.c) CUresult;
 pub const FnCtxCreate = *const fn (*usize, c_uint, CUdevice) callconv(.c) CUresult;
 pub const FnModuleLoadData = *const fn (*usize, [*]const u8) callconv(.c) CUresult;
 pub const FnModuleGetFunction = *const fn (*usize, usize, [*:0]const u8) callconv(.c) CUresult;
@@ -89,7 +90,17 @@ pub const FnEventDestroy = *const fn (usize) callconv(.c) CUresult;
 
 pub var cuInit_fn: ?FnInit = null;
 pub var cuDeviceGet_fn: ?FnDeviceGet = null;
+pub var cuDeviceGetAttribute_fn: ?FnDeviceGetAttribute = null;
 pub var cuCtxCreate_fn: ?FnCtxCreate = null;
+
+/// SM count of the active CUDA device, populated by module_loader.init.
+/// Read by callers that need to size launch geometry to the GPU
+/// (e.g. fast_framed.zig's adaptive sc_group_size threshold).
+/// 0 until init has run successfully.
+pub var sm_count: u32 = 0;
+
+/// CUDA driver API constant: CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT.
+pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
 pub var cuModuleLoadData_fn: ?FnModuleLoadData = null;
 pub var cuModuleGetFunction_fn: ?FnModuleGetFunction = null;
 pub var cuMemAlloc_fn: ?FnMemAlloc = null;

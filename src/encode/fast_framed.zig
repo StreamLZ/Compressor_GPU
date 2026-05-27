@@ -920,7 +920,27 @@ pub fn compressFramedOne(
         else => unreachable,
     };
     var pos: usize = 0;
-    const sc_grp: f32 = if (opts.sc_group_size_override) |ov| ov else if (opts.gpu_mode) 0.25 else switch (opts.level) {
+    const sc_grp: f32 = if (opts.sc_group_size_override) |ov| ov else if (opts.gpu_mode) blk: {
+        // Adaptive GPU sc_group_size. Below the GPU's saturation threshold
+        // for sc=0.5, use sc=0.25 so the decoder has enough sub-chunks to
+        // saturate (each sub-chunk = 1 decoder warp; saturation needs
+        // sm_count × 48 warps). At or above the threshold, switch to sc=0.5:
+        // chain parser sees 128 KB groups instead of 64 KB → +1.5 pp ratio
+        // gain on silesia AND ~9× encode speedup (per-chunk hash halves,
+        // fits in VRAM without paging). Above sc=0.5 the wire format's
+        // sub_chunk_cap=128KB blocks further ratio gains while linearly
+        // hurting decode (within-group serial dependency). Validated
+        // 2026-05-27 in tools/encode_l5_silesia/.
+        const cuda_api = @import("../gpu/decode/cuda_api.zig");
+        // Per-warp decode work at sc=0.5 = 128 KB. Saturation = sm_count ×
+        // 48 warps/SM (architectural max on sm_8x/9x).
+        const sat_warps: usize = if (cuda_api.sm_count > 0)
+            @as(usize, @intCast(cuda_api.sm_count)) * 48
+        else
+            34 * 48; // fallback: assume ~RTX 4060 Ti class GPU
+        const sc05_threshold = sat_warps * (128 * 1024);
+        break :blk if (src.len >= sc05_threshold) @as(f32, 0.5) else @as(f32, 0.25);
+    } else switch (opts.level) {
         1 => @as(f32, @floatFromInt(lz_constants.default_sc_group_size)),
         2, 3, 4 => @floatFromInt(@min(high_framed.computeAdaptiveGroupSize(src.len), 16)),
         5 => @floatFromInt(high_framed.computeAdaptiveGroupSize(src.len)),

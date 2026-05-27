@@ -71,6 +71,7 @@ pub fn init() bool {
 
     cuda.cuInit_fn = cuda.getProc(cuda.FnInit, "cuInit");
     cuda.cuDeviceGet_fn = cuda.getProc(cuda.FnDeviceGet, "cuDeviceGet");
+    cuda.cuDeviceGetAttribute_fn = cuda.getProc(cuda.FnDeviceGetAttribute, "cuDeviceGetAttribute");
     cuda.cuCtxCreate_fn = cuda.getProc(cuda.FnCtxCreate, "cuCtxCreate_v2") orelse cuda.getProc(cuda.FnCtxCreate, "cuCtxCreate");
     cuda.cuModuleLoadData_fn = cuda.getProc(cuda.FnModuleLoadData, "cuModuleLoadData");
     cuda.cuModuleGetFunction_fn = cuda.getProc(cuda.FnModuleGetFunction, "cuModuleGetFunction");
@@ -101,6 +102,17 @@ pub fn init() bool {
 
     var dev: CUdevice = 0;
     if ((cuda.cuDeviceGet_fn orelse return false)(&dev, 0) != CUDA_SUCCESS) return false;
+
+    // Cache SM count so callers (fast_framed.zig adaptive sc threshold)
+    // can size launch geometry to the actual GPU. Optional: cuDeviceGetAttribute
+    // may not resolve on very old driver builds; fall back to 0 (callers
+    // treat 0 as "unknown" and use a conservative default).
+    if (cuda.cuDeviceGetAttribute_fn) |get_attr| {
+        var sm: c_int = 0;
+        if (get_attr(&sm, cuda.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev) == CUDA_SUCCESS and sm > 0) {
+            cuda.sm_count = @intCast(sm);
+        }
+    }
 
     // Prefer the caller's already-current CUDA context - a library should
     // interoperate with the caller's CUDA / nvCOMP work rather than create

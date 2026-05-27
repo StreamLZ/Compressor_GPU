@@ -24,17 +24,32 @@ on RTX 4060 Ti sm_89.
 
 | Level | enwik8 | silesia | Notes |
 |------:|-------:|--------:|-------|
-| L1 | 73 | 138 | greedy parser |
-| L3 | 84 | 158 | greedy parser |
-| L5 | 283 | **20,811** | **silesia L5 PATHOLOGICAL — serial chain parser walks deep chains on binary data** |
+| L1 |  70 | 132 | greedy parser |
+| L3 |  84 | 155 | greedy parser |
+| L4 |  84 | 151 | greedy parser (was 108 / 203 pre hash_bits=17 fix) |
+| L5 | 236 | 412 | serial chain parser (was 283 / 20,811 pre hash_bits=17 fix) |
 
-The silesia L5 figure is the single worst kernel time anywhere in the
-codec (>200× the next-worst). Documented in
-`project_l5_silesia_pathology`.
+The "silesia L5 PATHOLOGICAL" 20,811 ms figure was diagnosed in
+2026-05-27 to be **PCIe spill of the chain hash table** (at hash_bits=20
+the chain parser's per-chunk hash is ~8 MB; silesia at sc=0.25 has 3,248
+chunks → 26 GB hash allocation that overflows 16 GB VRAM and pages
+through PCIe at ~30 GB/s vs VRAM's ~360 GB/s). Fixed by lowering
+hash_bits to 17 for L4/L5 in `levels.zig` — per-chunk hash drops to
+~1 MB which fits in VRAM for any reasonable input size. Cost: +0.07 %
+raw bytes at L5, +0.1 pp at L4 (rounding), no decode-side impact.
 
 ---
 
-## Idea 1 — MATCH.ANY warp match-finder for LZ encode (HIGHEST IMPACT)
+## Idea 1 — MATCH.ANY warp match-finder for LZ encode
+
+**Status note (2026-05-27):** the original "HIGHEST IMPACT" framing of
+this idea was driven by the 20.8 s silesia-L5 figure. That figure was
+PCIe-spill, now fixed (see baseline table above — silesia L5 went
+20,811 → 412 ms with a one-line hash_bits change). The chain parser is
+still serial on lane 0 (NCU shows ~1.1 active threads/warp), so a
+warp-cooperative redesign would still help — but the practical upside
+is now closer to 2-3× on the remaining 412 ms, not the 50× that the
+hash-bits fix already delivered.
 
 **Where to apply:** `src/gpu/encode/lz_kernel.cu` — both the warp-parallel
 greedy parser (L1-L4, in `lz_greedy_parser.cuh`) and the serial chain
@@ -453,7 +468,10 @@ attempting.
 2. **Idea 2 + Idea 4 together** (1-2 days). Best ROI; harness-first in
    `tools/huff_test/`. ~8% off L5 decode aggregate if both land.
 3. **Idea 6** (30 min). Free polish on encoder side.
-4. **Idea 1** (1-2 weeks). Highest absolute win, biggest effort. Tackle
-   silesia L5 pathology directly. Build new `tools/lz_test/` harness.
+4. **Idea 1** (1-2 weeks). Was the silesia L5 50× win — already landed
+   via the hash_bits=17 patch (see baseline table). Remaining upside on
+   the chain parser is 2-3× from warp-cooperative redesign. Build new
+   `tools/lz_test/` harness if pursuing. The standalone encode-L5
+   harness from 2026-05-27 lives at `tools/encode_l5_silesia/`.
 5. **Idea 3** (1-2 weeks). Only if encoder work is done and decode is
    still the bottleneck. Most speculative; could be 0% or 20%.

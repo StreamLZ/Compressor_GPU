@@ -146,11 +146,14 @@ back to the CPU path.
 
 ## Performance
 
-Measured 2026-05-26 on an RTX 4060 Ti (`sm_89`), 32-stream Huffman in
+Measured 2026-05-27 on an RTX 4060 Ti (`sm_89`), 32-stream Huffman in
 the BIL (bounded-interleaved) wire format with the warp-cooperative
-LUT-build kernel (commit `ba46e9a`), `-gpu` mode (64 KB sub-chunks).
-Corpora: enwik8 (100 MB text), silesia (212.8 MB mixed). Decode figures
-are best-of-30 (`streamlz -db -r 30`, sequential per the
+LUT-build kernel (commit `ba46e9a`) and the L4/L5 hash-bits=17 fix
+that keeps the chain hash table resident in VRAM (commit pending).
+`-gpu` mode (64 KB sub-chunks default; sc=0.5 above the
+`sm_count × 48 × 128 KB` GPU-saturation threshold). Corpora:
+enwik8 (100 MB text), silesia (212.8 MB mixed). Decode figures are
+best-of-30 (`streamlz -db -r 30`, sequential per the
 no-parallel-benchmarks rule); all times in milliseconds.
 
 ### Compression ratio
@@ -160,8 +163,12 @@ no-parallel-benchmarks rule); all times in milliseconds.
 | L1 | 58.6% | 47.8% |
 | L2 | 58.6% | 47.8% |
 | L3 | 43.7% | 38.0% |
-| L4 | 42.6% | 37.4% |
+| L4 | 42.7% | 37.5% |
 | L5 | 39.6% | 33.9% |
+
+L4 ratio rounds up by 0.1 pp on both files after the hash_bits=17 change
+(L4 enwik8 42.66% → rounds to 42.7%; L4 silesia 37.47% → rounds to 37.5%);
+L5 raw bytes shift by < 0.1 % which is invisible at this rounding.
 
 L1–L2 are LZ-only (no entropy stage); L3–L5 add GPU Huffman. The BIL
 Huffman wire format costs ~0.3 pp ratio over the prior concat layout
@@ -174,11 +181,14 @@ Huffman decode memory-bandwidth-bound rather than scatter-latency-bound.
 
 | Level | enwik8 D2D / e2e | silesia D2D / e2e |
 |-------|------------------|-------------------|
-| L1 | **2.91** / 15.65 | **5.08** / 30.31 |
-| L2 | **2.93** / 15.71 | **5.09** / 30.31 |
-| L3 | **4.09** / 15.68 | **7.12** / 30.75 |
-| L4 | **3.95** / 15.48 | **6.98** / 30.85 |
-| L5 | **4.13** / 16.11 | **7.70** / 30.60 |
+| L1 | **2.91** / 15.57 | **5.07** / 30.07 |
+| L2 | **2.93** / 15.59 | **5.09** / 30.11 |
+| L3 | **4.09** / 15.66 | **7.15** / 30.84 |
+| L4 | **3.93** / 15.42 | **6.94** / 30.65 |
+| L5 | **4.12** / 15.39 | **7.72** / 30.76 |
+
+(Decode unchanged within noise vs the pre-hash_bits=17 baseline — the
+encode-side hash-table size change has no effect on decode kernels.)
 
 **D2D wall-clock** = the time a caller of `slzDecompress` with device-
 resident input and output sees on the wire. Measured via `cudaEventRecord`
@@ -213,21 +223,21 @@ kernels run as a separate pass and are not included).
 
 | Level | enwik8 | silesia |
 |-------|-------:|--------:|
-| L1 | 71 | 132 |
-| L2 | 79 | 143 |
-| L3 | 84 | 154 |
-| L4 | 108 | 203 |
-| L5 | 283 | 20811 † |
+| L1 |  70 |  132 |
+| L2 |  77 |  151 |
+| L3 |  84 |  155 |
+| L4 |  84 |  151 |
+| L5 | 236 |  412 |
 
-† silesia L5 in the serial chain parser is the known pathological slow
-path documented in [`project_l5_silesia_pathology`](project_l5_silesia_pathology.md):
-the binary heterogeneity of silesia_all.tar (mostly text + xml + dna
-with short chain depth + a few large binaries with extremely deep chains)
-defeats the chain parser's CHAIN_MAX_STEPS guard. The encode-time number
-is dominated by a few outlier sub-chunks and not representative of the
-codec on uniform inputs (enwik8 L5 ratio 39.6% in 283 ms remains a fair
-data point). The compression *ratio* on silesia L5 is real and
-representative; only the encode-time number is misleading.
+L4 and L5 now use `hash_bits=17` (was 20). At hb=20 the chain parser's
+per-chunk hash was ~8 MB; for silesia at sc=0.25 (3248 chunks) this
+allocated ~26 GB and spilled to system RAM via PCIe on consumer GPUs
+(16 GB VRAM), producing the prior 20.8 s L5 silesia outlier. hb=17
+keeps per-chunk hash at ~1 MB which fits in VRAM for any reasonable
+input size. **silesia L5 encode: 20811 → 412 ms (~50× faster);
+enwik8 L5: 283 → 236 ms (-17%); L4 silesia 203 → 151 ms (-26%);
+L4 enwik8 108 → 84 ms (-22%).** Ratio cost is +0.1 pp at L4 (rounding)
+and < 0.07 % raw at L5 (essentially invisible after Huffman).
 
 ### vs nvCOMP (enwik8, 100 MB)
 
