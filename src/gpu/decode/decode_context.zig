@@ -10,6 +10,7 @@ const std = @import("std");
 
 const cuda = @import("cuda_api.zig");
 const d = @import("descriptors.zig");
+const graph_params_mod = @import("graph_params.zig");
 
 const CUdeviceptr = cuda.CUdeviceptr;
 const CUDA_SUCCESS = cuda.CUDA_SUCCESS;
@@ -306,6 +307,16 @@ pub const DecodeContext = struct {
     // stream_sync at the front of the back-half satisfies this).
     graph_exec: usize = 0,
     graph_captured: usize = 0,
+
+    // Phase 4 Step 1: persistent kernel-param storage for every launch
+    // inside the captured region. Stack-local `var p_*: u64 = ...; var
+    // params = [...]&p_*...;` patterns invalidate the moment the launching
+    // function returns - the graph captured *addresses*, not values - so
+    // every captured launch must read/write its params out of stable
+    // memory. `bindAll` wires up each nested `params[i]` array to point
+    // at the matching value fields; called once per process from
+    // `fullGpuLaunchImpl` (idempotent).
+    graph_params: graph_params_mod.BackHalfGraphParams = .{},
 
     // Per-call scratch buffers - pulled off the dispatch-loop stack
     // because the combined ~384 KiB is uncomfortably large in a recursive
