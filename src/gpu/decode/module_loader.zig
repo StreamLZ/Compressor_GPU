@@ -99,6 +99,19 @@ pub fn init() bool {
     cuda.cuEventElapsedTime_fn = cuda.getProc(cuda.FnEventElapsedTime, "cuEventElapsedTime");
     cuda.cuEventDestroy_fn = cuda.getProc(cuda.FnEventDestroy, "cuEventDestroy_v2");
 
+    // CUDA Graph API — used by Phase 4 capture/replay. These may be
+    // absent on very old driver builds; the graph code paths check
+    // each pointer at call sites and fall back to non-graph execution
+    // when the symbols are missing.
+    cuda.cuStreamBeginCapture_fn = cuda.getProc(cuda.FnStreamBeginCapture, "cuStreamBeginCapture_v2");
+    cuda.cuStreamEndCapture_fn = cuda.getProc(cuda.FnStreamEndCapture, "cuStreamEndCapture");
+    cuda.cuGraphInstantiate_fn = cuda.getProc(cuda.FnGraphInstantiate, "cuGraphInstantiate_v2");
+    cuda.cuGraphLaunch_fn = cuda.getProc(cuda.FnGraphLaunch, "cuGraphLaunch");
+    cuda.cuGraphDestroy_fn = cuda.getProc(cuda.FnGraphDestroy, "cuGraphDestroy");
+    cuda.cuGraphExecDestroy_fn = cuda.getProc(cuda.FnGraphExecDestroy, "cuGraphExecDestroy");
+    cuda.cuGraphGetNodes_fn = cuda.getProc(cuda.FnGraphGetNodes, "cuGraphGetNodes");
+    cuda.cuGraphExecKernelNodeSetParams_fn = cuda.getProc(cuda.FnGraphExecKernelNodeSetParams, "cuGraphExecKernelNodeSetParams");
+
     if ((cuda.cuInit_fn orelse return false)(0) != CUDA_SUCCESS) return false;
 
     var dev: CUdevice = 0;
