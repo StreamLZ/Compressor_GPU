@@ -551,6 +551,14 @@ fn runLzPipeline(
     /// (no H2D round-trip); otherwise `self.d_n_groups_scratch` after
     /// the host-staging H2D in `fullGpuLaunchImpl`.
     total_dev: CUdeviceptr,
+    /// Base device address the LZ kernel writes decompressed bytes
+    /// into. Normally `self.d_output` (library scratch). On the D2D
+    /// fast path the caller routes the caller-supplied
+    /// `req.d_output_target` here so the kernel writes straight to
+    /// the caller's buffer — skips the ~1.1 ms / 100 MB finalize D2D
+    /// copy that otherwise stages through d_output. Requires
+    /// `req.dst_start_off == 0` (no host-side prefix to splice in).
+    dst_base: CUdeviceptr,
 ) GpuError!i64 {
     const launch_fn = fns.launch;
     const stream_sync_fn = fns.stream_sync;
@@ -595,7 +603,7 @@ fn runLzPipeline(
         // problem this whole step exists to avoid.
         const comp_addr: CUdeviceptr = self.d_comp_persist;
         const descs_addr: CUdeviceptr = self.d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc);
-        const dst_addr: CUdeviceptr = self.d_output;
+        const dst_addr: CUdeviceptr = dst_base;
         const total_addr: CUdeviceptr = total_dev;
 
         if (use_raw_kernel) {
@@ -942,6 +950,22 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             break :blk self.d_n_groups_scratch;
         };
 
+        // ── Direct-write-to-output fast path ───────────────────────────
+        // When the caller supplied a device output buffer AND there's no
+        // host-side prefix to splice in (dst_start_off == 0), point the
+        // LZ kernel directly at that buffer. The finalize-D2D copy
+        // (~1.1 ms on a 100 MB output measured by nsys) is then skipped
+        // — the LZ kernel was already going to write `decompressed_size`
+        // bytes; writing them to the caller's address instead of our
+        // scratch saves that whole copy.
+        //
+        // The legacy path (dst_start_off > 0, or host D2H output) still
+        // stages through self.d_output: the host needs to H2D the prefix
+        // bytes into our buffer first, and the D2H output path needs a
+        // device source to D2H from anyway.
+        const write_direct: bool = req.d_output_target != null and req.dst_start_off == 0;
+        const lz_dst_base: CUdeviceptr = if (write_direct) req.d_output_target.? else self.d_output;
+
         // ── Phase 4: opt-in CUDA Graph capture of the back-half ────────
         // Conditions for enabling graph mode this call. Any "no" falls
         // through to the existing direct-launch path.
@@ -1030,6 +1054,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             io,
             cache_hit,
             lz_total_dev,
+            lz_dst_base,
         );
 
         // End capture (cache_miss only) and submit the graph (any
@@ -1100,7 +1125,15 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     if (t_e2e0) |t0| if (io) |iv| {
         e2e_cum.predh = nsSince(t0, iv);
     };
-    try finalizeOutput(self, &fns, req, heavy_stream);
+    // Skip finalizeOutput when the LZ kernel wrote straight to the
+    // caller's device buffer (req.d_output_target with dst_start_off
+    // == 0). Same condition as `write_direct` inside the back-half
+    // block; inlined here because `write_direct` was scoped to that
+    // block. Saves the ~1.1 ms / 100 MB D2D copy the legacy path did.
+    const skip_finalize = req.d_output_target != null and req.dst_start_off == 0;
+    if (!skip_finalize) {
+        try finalizeOutput(self, &fns, req, heavy_stream);
+    }
 
     // Profiling: drain pending cuEvent pairs into last_timings. Skip in
     // async mode (caller hasn't synced yet; the events may still be
