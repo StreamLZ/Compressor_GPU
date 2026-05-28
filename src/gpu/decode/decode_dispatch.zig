@@ -122,10 +122,12 @@ fn mergeHuffDescs(
             @ptrCast(&k_merged),      @ptrCast(&k_n_merged),
         };
         var m_extra = [_]?*anyopaque{null};
-        const t_merge = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzMergeHuffDescsKernel", 0);
-        try cudaCall(launch_fn(ml.merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, 0, &m_params, &m_extra), .launch);
-        endKernelTiming(t_merge, 0);
-        try cudaCall(sync_fn(), .sync);
+        // Phase 2: stream-targeted launch + sync on caller's work_stream.
+        const stream = self.work_stream;
+        const t_merge = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzMergeHuffDescsKernel", stream);
+        try cudaCall(launch_fn(ml.merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &m_params, &m_extra), .launch);
+        endKernelTiming(t_merge, stream);
+        try cudaCall(sync_fn(stream), .sync);
         return;
     }
     // CPU merge fallback: used by the non-pure-D2D / CPU-scan paths.
@@ -171,7 +173,7 @@ fn mergeHuffDescs(
     append(merged_huff, &m, &lut_slot, self.huff_off16lo_host_buf[0..scan.num_huff_off16lo], @intCast(off16_offset));
 
     try cudaCall(h2d_fn(self.d_huff_descs, @ptrCast(merged_huff.ptr), @as(usize, m) * @sizeOf(HuffDecChunkDesc)), .copy);
-    try cudaCall(sync_fn(), .sync);
+    // h2d_fn is sync-on-host (cuMemcpyHtoD); no further sync needed.
 }
 
 /// Place raw (type 0) off16 sub-streams into the off16 scratch. The bytes
@@ -241,11 +243,12 @@ fn gatherRawOff16(
             // replace the if-success-return below with
             // `try cudaCall(launch_fn(...))`.
             const grid_x: u32 = ndesc;
-            const t_gather = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzGatherRawOff16Kernel", 0);
-            const launch_rc = launch_fn(ml.gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, 0, &params, &extra);
+            const stream = self.work_stream;
+            const t_gather = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzGatherRawOff16Kernel", stream);
+            const launch_rc = launch_fn(ml.gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, stream, &params, &extra);
             if (launch_rc == CUDA_SUCCESS) {
-                endKernelTiming(t_gather, 0);
-                try cudaCall(sync_fn(), .sync);
+                endKernelTiming(t_gather, stream);
+                try cudaCall(sync_fn(stream), .sync);
                 return;
             }
             // Best-effort path failed; log so a genuine misconfiguration
@@ -253,17 +256,18 @@ fn gatherRawOff16(
             // fallback below still completes correctness; the print just
             // makes the slow-path diagnosable.
             std.debug.print("GPU gatherRawOff16: launch failed rc={d}; falling back to D2D/H2D\n", .{launch_rc});
-            endKernelTiming(t_gather, 0);
+            endKernelTiming(t_gather, stream);
         }
     }
     // Fallback: async device-to-device, else host upload.
     if (cuda.cuMemcpyDtoDAsync_fn) |d2d| {
+        const stream = self.work_stream;
         for (0..scan.num_raw_off16) |ri| {
             const rd = self.raw_off16_buf[ri];
             if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len)
-                try cudaCall(d2d(self.d_entropy_off16_scratch + rd.gpu_offset, self.d_comp_persist + rd.src_offset, rd.size, 0), .copy);
+                try cudaCall(d2d(self.d_entropy_off16_scratch + rd.gpu_offset, self.d_comp_persist + rd.src_offset, rd.size, stream), .copy);
         }
-        try cudaCall(sync_fn(), .sync);
+        try cudaCall(sync_fn(stream), .sync);
     } else {
         for (0..scan.num_raw_off16) |ri| {
             const rd = self.raw_off16_buf[ri];
@@ -688,7 +692,6 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     const h2d_fn = fns.h2d;
     const d2h_fn = fns.d2h;
     const launch_fn = fns.launch;
-    const sync_fn = fns.sync;
 
     const total_output = dst_start_off + decompressed_size;
     if (!ensureDeviceOutput(self, total_output + 64)) return error.OutOfDeviceMemory;
@@ -703,24 +706,11 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     if (!ensureDeviceBuf(&self.d_descs_persist, &self.d_descs_persist_size, desc_bytes)) return error.OutOfDeviceMemory;
 
     // Chunk descs must be on device before the prefix-sum kernel reads
-    // them. The lower H2D path is still present and unconditionally
-    // re-uploads; this hoist is what feeds the prefix-sum kernel.
+    // them. h2d_fn is sync-on-host (cuMemcpyHtoD) so by the time it
+    // returns the data is already device-resident — no explicit sync
+    // needed before the launch below. Phase 2 removed the prior
+    // cuCtxSynchronize that was stalling caller streams.
     try cudaCall(h2d_fn(self.d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes), .copy);
-    // Ordering contract: ctx-wide sync. The descs and the prefix-sum
-    // launch below run on stream 0; this also stalls any work the caller
-    // had on OTHER streams (including a caller's `work_stream` queue if
-    // slzDecompressAsync is the entry point). Acceptable trade-off
-    // because:
-    //   1. This sync is on the *front end* of the pipeline - the
-    //      work_stream-bound LZ kernels haven't launched yet, so the
-    //      caller's async stream isn't yet "queued behind" anything.
-    //   2. Async callers pay this stall once per decompress and recoup
-    //      it across the LZ-launch back half (which DOES stay on
-    //      work_stream and overlaps with caller work).
-    // If a multi-stream pipeline is ever reintroduced (NUM_PIPELINE_STREAMS
-    // > 1), revisit: a stream-targeted `cuStreamSynchronize(0)` would
-    // preserve the descs ordering without stalling the caller's stream.
-    try cudaCall(sync_fn(), .sync);
 
     // 4d Phase 3 step 6: prefix-sum runs on device. The 4-byte D2H of
     // total_subchunks below is launch-plumbing - needed to size the
@@ -768,17 +758,19 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
 
     // 4d Phase 3 D2D: source bytes already device-resident → D2D-copy
     // them into d_comp_persist (no PCIe). Else H2D from host.
+    // Phase 2: D2D issues on self.work_stream so the post-copy stream-
+    // sync below only waits on the caller's stream (not ctx-wide); H2D
+    // path is sync-on-host, so the only async hand-off to wait on is the
+    // D2D branch.
     if (compressed_block.len > 0) {
         if (d_compressed_src) |dev_src| {
             const d2d = fns.d2d orelse return error.BackendNotAvailable;
-            try cudaCall(d2d(self.d_comp_persist, dev_src, compressed_block.len, 0), .copy);
+            try cudaCall(d2d(self.d_comp_persist, dev_src, compressed_block.len, self.work_stream), .copy);
+            try cudaCall(fns.stream_sync(self.work_stream), .sync);
         } else {
             try cudaCall(h2d_fn(self.d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len), .copy);
         }
     }
-    // Ctx-wide sync: same rationale as above. We're still in the front-
-    // end H2D phase; caller's async work hasn't been scheduled yet.
-    try cudaCall(sync_fn(), .sync);
     if (t_e2e0) |t0| if (io) |iv| {
         e2e_cum.h2d = nsSince(t0, iv);
         e2e_cum.prescan = nsSince(t0, iv);
@@ -832,7 +824,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             e2e_cum.postscan = nsSince(t0, iv);
         };
 
-        try gatherRawOff16(self, scan, compressed_block, h2d_fn, sync_fn, launch_fn);
+        try gatherRawOff16(self, scan, compressed_block, h2d_fn, fns.stream_sync, launch_fn);
     }
 
     if (t_e2e0) |t0| if (io) |iv| {
@@ -853,7 +845,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         if (!ensureDeviceBuf(&self.d_huff_descs, &self.d_huff_descs_size, huff_desc_bytes)) return error.OutOfDeviceMemory;
         if (!ensureDeviceBuf(&self.d_huff_lut, &self.d_huff_lut_size, huff_lut_bytes)) return error.OutOfDeviceMemory;
 
-        try mergeHuffDescs(self, scan, tok_offset, off16_offset, h2d_fn, sync_fn, launch_fn);
+        try mergeHuffDescs(self, scan, tok_offset, off16_offset, h2d_fn, fns.stream_sync, launch_fn);
     }
 
     // ── Pipeline: split into N groups, overlap entropy with LZ ───
@@ -873,12 +865,12 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     const heavy_stream: usize = if (self.work_stream != 0) self.work_stream else self.pipeline_streams[0];
     {
         const pipe_chunk_count = (total_chunks + NUM_PIPELINE_STREAMS - 1) / NUM_PIPELINE_STREAMS;
-        // Ctx-wide sync: drain the H2D + scan + compact + merge work on
-        // stream 0 before the LZ kernels launch on heavy_stream. Caller's
-        // work_stream may have other pending work - we accept stalling it
-        // here because the pipeline transition needs everything settled
-        // (chunk descs, huff scratch, pipeline_streams readiness).
-        try cudaCall(sync_fn(), .sync);
+        // Phase 2: front-half work (walk + prefix-sum + scan + compact +
+        // merge + gather + descs H2D) is queued on work_stream. Sync just
+        // that stream so the back-half LZ + Huff kernels on heavy_stream
+        // see all front-half results, without stalling caller's other
+        // streams (which is what the prior cuCtxSynchronize did).
+        try cudaCall(fns.stream_sync(self.work_stream), .sync);
 
         // ── KERNEL TIMER: only pure GPU kernel time from here ──
         const t_before_kern = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
