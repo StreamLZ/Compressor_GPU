@@ -131,8 +131,9 @@ int main(int argc, char** argv) {
     double best_wall = 1e30, sum_wall = 0.0;
     float best_d2d = 1e30f, sum_d2d = 0.0f;
     double best_kern = 1e30, sum_kern = 0.0;
-    /* Captured from the first measured run so we can print a per-kernel
-     * breakdown alongside the aggregate numbers. */
+    /* Per-kernel breakdown captured from the run that produced
+     * `best_kern` so the displayed breakdown's sum ties out exactly
+     * to the reported `kernel active best`. */
     slzKernelTiming_t breakdown_timings[64];
     size_t breakdown_cnt = 0;
 
@@ -159,16 +160,18 @@ int main(int argc, char** argv) {
         slzGetLastTimings(h, timings, 64, &kcnt);
         double kern_ms = 0.0;
         for (size_t i = 0; i < kcnt; i++) kern_ms += (double)timings[i].ms;
-        if (r == 0) {
-            const size_t to_copy = kcnt < 64 ? kcnt : 64;
-            for (size_t i = 0; i < to_copy; i++) breakdown_timings[i] = timings[i];
-            breakdown_cnt = to_copy;
-        }
 
         const double wall_ms = t1 - t0;
         if (wall_ms < best_wall) best_wall = wall_ms;
         if (d2d_ms < best_d2d) best_d2d = d2d_ms;
-        if (kern_ms < best_kern) best_kern = kern_ms;
+        if (kern_ms < best_kern) {
+            best_kern = kern_ms;
+            /* Snapshot this run's per-kernel breakdown — the displayed
+             * sum will tie out to `kernel active best`. */
+            const size_t to_copy = kcnt < 64 ? kcnt : 64;
+            for (size_t i = 0; i < to_copy; i++) breakdown_timings[i] = timings[i];
+            breakdown_cnt = to_copy;
+        }
         sum_wall += wall_ms;
         sum_d2d += d2d_ms;
         sum_kern += kern_ms;
@@ -208,13 +211,16 @@ int main(int argc, char** argv) {
     printf("  kernel active mean: %.3f ms  (%.0f MB/s)\n", kern_mean_ms, kern_mean_mb_s);
     printf("  stream-idle gap (D2D - kernel-active) best/mean: %.3f / %.3f ms\n", gap_best, gap_mean);
     printf("  verify:          %s\n", verify_ok ? "OK" : "FAIL");
-    /* Per-kernel breakdown from the first measured run — shows where
-     * the kernel-active time is spent. */
+    /* Per-kernel breakdown from the run that produced `kernel active
+     * best` above — its sum equals that value. */
     if (breakdown_cnt > 0) {
-        printf("  per-kernel breakdown (run 1):\n");
+        printf("  per-kernel breakdown (best-kern run):\n");
+        double sum_check = 0.0;
         for (size_t i = 0; i < breakdown_cnt; i++) {
             printf("    %-40s %8.4f ms\n", breakdown_timings[i].name, breakdown_timings[i].ms);
+            sum_check += (double)breakdown_timings[i].ms;
         }
+        printf("    %-40s %8.4f ms\n", "(sum)", sum_check);
     }
 
     cudaEventDestroy(e_start);
