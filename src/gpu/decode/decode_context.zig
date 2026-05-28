@@ -318,6 +318,14 @@ pub const DecodeContext = struct {
     // `fullGpuLaunchImpl` (idempotent).
     graph_params: graph_params_mod.BackHalfGraphParams = .{},
 
+    // Phase 4 Step 4: identifies the shape of the call that produced
+    // `graph_exec`. A subsequent call whose `GraphShapeKey.matches()` the
+    // cached one can replay via cuGraphLaunch without paying the
+    // cuGraphInstantiate cost (~hundreds of µs). `valid = false` means
+    // the cache is empty (first call, or a prior mismatch tore it down).
+    graph_shape_key: graph_params_mod.GraphShapeKey = .{},
+    graph_shape_valid: bool = false,
+
     // Per-call scratch buffers - pulled off the dispatch-loop stack
     // because the combined ~384 KiB is uncomfortably large in a recursive
     // call frame. Reused across calls; capacity is sized for the largest

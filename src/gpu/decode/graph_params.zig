@@ -171,6 +171,28 @@ pub const OutputCopyParams = struct {
     p_size: usize = 0,
 };
 
+/// Phase 4 Step 4: shape-cache key. Two decode calls with the same
+/// `GraphShapeKey` can share a single `cuGraphExec` — the captured
+/// kernel-grid sizes (`gridDimX = n_chunks` for huff kernels, derived
+/// from `n_chunks / chunks_per_group` for LZ) are baked into the graph,
+/// so changing them requires a fresh `cuGraphInstantiate`. Other
+/// per-call inputs (device pointers, sub_chunk_cap, total_subchunks,
+/// d_output_target) are read by the kernels via the persistent
+/// `params[i] -> p_*` indirection — they're updated by the per-call
+/// param-write in `runHuffPredecode` / `runLzPipeline` and consumed
+/// directly by `cuGraphLaunch`, so they don't appear in the key.
+pub const GraphShapeKey = struct {
+    n_chunks: u32 = 0,
+    n_huff: u32 = 0,
+    chunks_per_group: u32 = 0,
+
+    pub fn matches(self: GraphShapeKey, other: GraphShapeKey) bool {
+        return self.n_chunks == other.n_chunks
+            and self.n_huff == other.n_huff
+            and self.chunks_per_group == other.chunks_per_group;
+    }
+};
+
 /// Aggregates one param struct per captured kernel + a `bound` flag so we
 /// can lazily call each `bind()` once when the owning `DecodeContext`
 /// reaches its final memory location. Hung off `DecodeContext` (see
