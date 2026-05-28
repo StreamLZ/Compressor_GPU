@@ -775,8 +775,14 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     if (compressed_block.len > 0) {
         if (d_compressed_src) |dev_src| {
             const d2d = fns.d2d orelse return error.BackendNotAvailable;
+            // No post-D2D sync: every downstream consumer of d_comp_persist
+            // (gpuPrefixSumChunksImpl, gpuScanChunks, runHuffPredecode,
+            // runLzPipeline) runs on the same work_stream and sees the copy
+            // via stream ordering. The explicit sync added in commit ebce084
+            // was a stream-0-era leftover; removing it lets the front-half
+            // kernels queue while the D2D is still in flight on the same
+            // stream's command buffer.
             try cudaCall(d2d(self.d_comp_persist, dev_src, compressed_block.len, self.work_stream), .copy);
-            try cudaCall(fns.stream_sync(self.work_stream), .sync);
         } else {
             try cudaCall(h2d_fn(self.d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len), .copy);
         }
