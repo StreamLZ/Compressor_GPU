@@ -71,7 +71,7 @@ for %%L in (1 2 3 4 5) do (
     if errorlevel 1 (echo encode enwik8 L%%L FAILED & exit /b 1)
 )
 for %%L in (1 2 3 4 5) do (
-    echo --- silesia(128MB) L%%L ---
+    echo --- silesia 128MB L%%L ---
     "%SLZ%" -l %%L -gpu "%SILESIA_128%" -o "%TMP%\bench_d2d_s_L%%L.slz"
     if errorlevel 1 (echo encode silesia L%%L FAILED & exit /b 1)
 )
@@ -89,7 +89,7 @@ for %%L in (1 2 3 4 5) do (
 )
 for %%L in (1 2 3 4 5) do (
     echo.
-    echo --- silesia(128MB) L%%L D2D bench ---
+    echo --- silesia 128MB L%%L D2D bench ---
     "%BENCH%" "%TMP%\bench_d2d_s_L%%L.slz" "%SILESIA_128%" --runs 30 > "%TMP%\bench_d2d_out_s_L%%L.txt"
     if errorlevel 1 (echo bench silesia L%%L FAILED & type "%TMP%\bench_d2d_out_s_L%%L.txt" & exit /b 1)
     type "%TMP%\bench_d2d_out_s_L%%L.txt"
