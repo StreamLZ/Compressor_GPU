@@ -164,7 +164,12 @@ pub fn decompressFramedFromDevice(
         .dst_start_off = 0,
         .decompressed_size = meta.decomp_size,
         .chunks_per_group = chunks_per_group,
-        .sub_chunk_cap = meta.sub_chunk_cap,
+        // sub_chunk_cap is unconditionally the entropy-scratch slot
+        // stride — the walk kernel writes this exact constant to
+        // d_meta (walk_frame_kernel.cuh:97), we used to D2H it back
+        // and pass it through. Use the constant directly; meta.sub_chunk_cap
+        // now goes unread by the host.
+        .sub_chunk_cap = @intCast(gpu_driver.ENTROPY_SCRATCH_SLOT_BYTES),
         .io = io,
         .d_output_target = d_output,
         .d_compressed_src = d_frame + meta.block_start,
