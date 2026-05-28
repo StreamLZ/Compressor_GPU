@@ -517,7 +517,6 @@ fn runLzPipeline(
     split_timer: bool,
     io: ?std.Io,
 ) GpuError!i64 {
-    const h2d_fn = fns.h2d;
     const launch_fn = fns.launch;
     const stream_sync_fn = fns.stream_sync;
 
@@ -540,11 +539,13 @@ fn runLzPipeline(
         const lz_groups_in_pipe = (group_chunks + chunks_per_group - 1) / chunks_per_group;
         const lz_grid_x = (lz_groups_in_pipe + 1) / 2;
 
-        // Step 7: LZ kernels self-gate on `*d_total_chunks`. Stage the
-        // per-pipeline-group count into d_n_groups_scratch (4 B H2D).
-        if (!ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4)) return error.OutOfDeviceMemory;
-        var host_per_group_total: u32 = chunk_end - chunk_start;
-        try cudaCall(h2d_fn(self.d_n_groups_scratch, @ptrCast(&host_per_group_total), 4), .copy);
+        // d_n_groups_scratch is staged by the caller (fullGpuLaunchImpl)
+        // before this function runs. Phase 4 (graph capture) needs the H2D
+        // outside the captured stream region; hoisting it once at NUM_PIPELINE_
+        // STREAMS == 1 is correct because chunk_end - chunk_start == total_chunks
+        // when the loop runs once. If NUM_PIPELINE_STREAMS ever > 1, this hoist
+        // needs to either move back inline (re-introducing graph-mode H2D
+        // problems) or be re-thought as N device counters.
 
         // Fast path: no entropy in this scan → use lean L1/L2 raw kernel.
         // Huffman literals require the general kernel (it reads entropy_scratch).
@@ -852,6 +853,11 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // land in d_output. The sync wrapper leaves work_stream at 0 and
     // falls back to the library's own pipeline_streams[0].
     const heavy_stream: usize = if (self.work_stream != 0) self.work_stream else self.pipeline_streams[0];
+
+    // Phase 4 Step 3: set true inside the back-half block when graph
+    // capture rolled finalizeOutput into the captured region. The late
+    // unconditional finalizeOutput call below the block is then skipped.
+    var graph_finalize_done: bool = false;
     {
         const pipe_chunk_count = (total_chunks + NUM_PIPELINE_STREAMS - 1) / NUM_PIPELINE_STREAMS;
         // Phase 2: front-half work (walk + prefix-sum + scan + compact +
@@ -868,23 +874,44 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         // around them too. Without split, Huff time gets pipelined into LZ.
         const split_timer = std.c.getenv("SLZ_SPLIT_TIMER") != null;
 
-        // Phase 4 placeholder: a naive stream-capture attempt here doesn't
-        // work because cuLaunchKernel captures the ADDRESSES of the kernel
-        // param array (which are stack-local in runHuffPredecode /
-        // runLzPipeline / mergeHuffDescs), not the values. By the time the
-        // captured graph replays, those addresses are invalidated stack
-        // memory and the kernel reads garbage → segfault. A real Phase 4
-        // implementation needs:
-        //   1. Persistent per-kernel param structs hung off DecodeContext
-        //      (so the captured pointers point at memory that outlives the
-        //      capture).
-        //   2. Per-call update via cuGraphExecKernelNodeSetParams when
-        //      caller-supplied pointers (d_frame, d_output_target) or
-        //      counts (n_chunks, n_huff) change.
-        //   3. Shape-keyed cache so the instantiate (~hundreds of µs)
-        //      amortizes across runs of the same shape.
-        // Tracked as Phase 4 in the todo list; the graph_exec + graph_captured
-        // fields on DecodeContext are already present for a future pass.
+        // Stage the LZ kernel's self-gate count (d_n_groups_scratch <-
+        // total_chunks). Hoisted out of runLzPipeline so a graph-mode
+        // capture of the back half doesn't see a synchronous H2D inside
+        // the captured stream region. See runLzPipeline comment for the
+        // NUM_PIPELINE_STREAMS == 1 caveat.
+        if (!ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4)) return error.OutOfDeviceMemory;
+        var host_total_chunks: u32 = total_chunks;
+        try cudaCall(h2d_fn(self.d_n_groups_scratch, @ptrCast(&host_total_chunks), 4), .copy);
+
+        // ── Phase 4 Step 3: opt-in CUDA Graph capture of the back-half ──
+        // Conditions for enabling capture this call. Any "no" means we
+        // fall through to the direct-launch path below (today's behavior).
+        const want_graph = std.c.getenv("SLZ_GPU_GRAPHS") != null;
+        const huff_safe = !have_huff or (scan.device_compact_populated and ml.merge_huff_descs_fn != 0);
+        const use_graph = want_graph
+            and !split_timer
+            and self.work_stream != 0           // async path only
+            and req.d_output_target != null     // D2D output (captured memcpy)
+            and huff_safe                       // pure-D2D huff path, no sync H2D
+            and cuda.cuStreamBeginCapture_fn != null
+            and cuda.cuStreamEndCapture_fn != null
+            and cuda.cuGraphInstantiate_fn != null
+            and cuda.cuGraphLaunch_fn != null;
+
+        if (use_graph) {
+            // Step 3 is "always re-capture" — no shape cache yet. Step 4
+            // adds shape-key + per-call updates so subsequent same-shape
+            // calls skip the instantiate.
+            if (self.graph_exec != 0) {
+                if (cuda.cuGraphExecDestroy_fn) |fge| _ = fge(self.graph_exec);
+                self.graph_exec = 0;
+            }
+            if (self.graph_captured != 0) {
+                if (cuda.cuGraphDestroy_fn) |fgd| _ = fgd(self.graph_captured);
+                self.graph_captured = 0;
+            }
+            try cudaCall(cuda.cuStreamBeginCapture_fn.?(heavy_stream, cuda.CU_STREAM_CAPTURE_MODE_GLOBAL), .launch);
+        }
 
         const t_huff_start = if (split_timer and have_huff)
             if (io) |io_val| std.Io.Clock.awake.now(io_val) else null
@@ -903,7 +930,8 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         var split_huff_ns: i64 = 0;
 
         // Close Huff time slice: sync the pipeline stream so the LZ
-        // measurement excludes Huff time.
+        // measurement excludes Huff time. (split_timer rules out graph
+        // mode above; the inner sync is safe.)
         if (split_timer and have_huff) {
             try cudaCall(stream_sync_fn(self.pipeline_streams[0]), .sync);
             if (t_huff_start) |hs| {
@@ -931,7 +959,26 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             io,
         );
 
-        // Phase 4 end-cap goes here once the real implementation lands.
+        // Phase 4 Step 3: end capture + instantiate + launch. The final
+        // D2D memcpy in finalizeOutput is rolled into the captured region
+        // so a single cuGraphLaunch covers Huff predecode → LZ decode →
+        // output copy. The late finalizeOutput call below the closing
+        // brace is then skipped via `graph_finalize_done`.
+        if (use_graph) {
+            try finalizeOutput(self, &fns, req, heavy_stream);
+            var graph_handle: usize = 0;
+            try cudaCall(cuda.cuStreamEndCapture_fn.?(heavy_stream, &graph_handle), .launch);
+            self.graph_captured = graph_handle;
+            var error_node: usize = 0;
+            var log_buf: [256]u8 = .{0} ** 256;
+            const inst_rc = cuda.cuGraphInstantiate_fn.?(&self.graph_exec, graph_handle, &error_node, @ptrCast(&log_buf), log_buf.len);
+            if (inst_rc != CUDA_SUCCESS) {
+                std.debug.print("GPU graph instantiate FAILED rc={d}\n", .{inst_rc});
+                return error.KernelLaunchFailed;
+            }
+            try cudaCall(cuda.cuGraphLaunch_fn.?(self.graph_exec, heavy_stream), .launch);
+            graph_finalize_done = true;
+        }
 
         // Sync all pipeline streams - UNLESS the caller is async
         // (work_stream set). In async mode we leave the queued work on
@@ -972,7 +1019,9 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     if (t_e2e0) |t0| if (io) |iv| {
         e2e_cum.predh = nsSince(t0, iv);
     };
-    try finalizeOutput(self, &fns, req, heavy_stream);
+    if (!graph_finalize_done) {
+        try finalizeOutput(self, &fns, req, heavy_stream);
+    }
 
     // Profiling: drain pending cuEvent pairs into last_timings. Skip in
     // async mode (caller hasn't synced yet; the events may still be
