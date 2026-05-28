@@ -894,6 +894,24 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         // around them too. Without split, Huff time gets pipelined into LZ.
         const split_timer = std.c.getenv("SLZ_SPLIT_TIMER") != null;
 
+        // Phase 4 placeholder: a naive stream-capture attempt here doesn't
+        // work because cuLaunchKernel captures the ADDRESSES of the kernel
+        // param array (which are stack-local in runHuffPredecode /
+        // runLzPipeline / mergeHuffDescs), not the values. By the time the
+        // captured graph replays, those addresses are invalidated stack
+        // memory and the kernel reads garbage → segfault. A real Phase 4
+        // implementation needs:
+        //   1. Persistent per-kernel param structs hung off DecodeContext
+        //      (so the captured pointers point at memory that outlives the
+        //      capture).
+        //   2. Per-call update via cuGraphExecKernelNodeSetParams when
+        //      caller-supplied pointers (d_frame, d_output_target) or
+        //      counts (n_chunks, n_huff) change.
+        //   3. Shape-keyed cache so the instantiate (~hundreds of µs)
+        //      amortizes across runs of the same shape.
+        // Tracked as Phase 4 in the todo list; the graph_exec + graph_captured
+        // fields on DecodeContext are already present for a future pass.
+
         const t_huff_start = if (split_timer and have_huff)
             if (io) |io_val| std.Io.Clock.awake.now(io_val) else null
         else
@@ -938,6 +956,8 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             split_timer,
             io,
         );
+
+        // Phase 4 end-cap goes here once the real implementation lands.
 
         // Sync all pipeline streams - UNLESS the caller is async
         // (work_stream set). In async mode we leave the queued work on
