@@ -84,7 +84,6 @@ fn mergeHuffDescs(
     tok_offset: usize,
     off16_offset: usize,
     h2d_fn: anytype,
-    sync_fn: anytype,
     launch_fn: anytype,
 ) GpuError!void {
     if (scan.device_compact_populated and ml.merge_huff_descs_fn != 0) {
@@ -113,7 +112,12 @@ fn mergeHuffDescs(
         const t_merge = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzMergeHuffDescsKernel", stream);
         try cudaCall(launch_fn(ml.merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &mp.params, &mp.extra), .launch);
         endKernelTiming(t_merge, stream);
-        try cudaCall(sync_fn(stream), .sync);
+        // No post-launch sync: downstream kernels (huff_build, huff_decode)
+        // are queued on the same stream and see merge's output via stream
+        // ordering. In sync mode (work_stream == 0, heavy_stream !=
+        // work_stream) the pre-back-half cross-stream sync in
+        // fullGpuLaunchImpl covers it. Saves one ~50-300 µs host wait
+        // per call.
         return;
     }
     // CPU merge fallback: used by the non-pure-D2D / CPU-scan paths.
@@ -172,7 +176,6 @@ fn gatherRawOff16(
     scan: ScanResult,
     compressed_block: []const u8,
     h2d_fn: anytype,
-    sync_fn: anytype,
     launch_fn: anytype,
 ) GpuError!void {
     if (scan.num_raw_off16 == 0) return;
@@ -232,7 +235,8 @@ fn gatherRawOff16(
             const launch_rc = launch_fn(ml.gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, stream, &gp.params, &gp.extra);
             if (launch_rc == CUDA_SUCCESS) {
                 endKernelTiming(t_gather, stream);
-                try cudaCall(sync_fn(stream), .sync);
+                // No post-launch sync: downstream LZ kernel reads
+                // d_entropy_off16_scratch from the same stream.
                 return;
             }
             // Best-effort path failed; log so a genuine misconfiguration
@@ -251,7 +255,7 @@ fn gatherRawOff16(
             if (rd.size > 0 and rd.src_offset + rd.size <= compressed_block.len)
                 try cudaCall(d2d(self.d_entropy_off16_scratch + rd.gpu_offset, self.d_comp_persist + rd.src_offset, rd.size, stream), .copy);
         }
-        try cudaCall(sync_fn(stream), .sync);
+        // No post-D2D sync: same stream as downstream LZ kernel.
     } else {
         for (0..scan.num_raw_off16) |ri| {
             const rd = self.raw_off16_buf[ri];
@@ -855,7 +859,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             e2e_cum.postscan = nsSince(t0, iv);
         };
 
-        try gatherRawOff16(self, scan, compressed_block, h2d_fn, fns.stream_sync, launch_fn);
+        try gatherRawOff16(self, scan, compressed_block, h2d_fn, launch_fn);
     }
 
     if (t_e2e0) |t0| if (io) |iv| {
@@ -876,7 +880,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         if (!ensureDeviceBuf(&self.d_huff_descs, &self.d_huff_descs_size, huff_desc_bytes)) return error.OutOfDeviceMemory;
         if (!ensureDeviceBuf(&self.d_huff_lut, &self.d_huff_lut_size, huff_lut_bytes)) return error.OutOfDeviceMemory;
 
-        try mergeHuffDescs(self, scan, tok_offset, off16_offset, h2d_fn, fns.stream_sync, launch_fn);
+        try mergeHuffDescs(self, scan, tok_offset, off16_offset, h2d_fn, launch_fn);
     }
 
     // ── Pipeline: split into N groups, overlap entropy with LZ ───
@@ -896,12 +900,22 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     const heavy_stream: usize = if (self.work_stream != 0) self.work_stream else self.pipeline_streams[0];
     {
         const pipe_chunk_count = (total_chunks + NUM_PIPELINE_STREAMS - 1) / NUM_PIPELINE_STREAMS;
-        // Phase 2: front-half work (walk + prefix-sum + scan + compact +
-        // merge + gather + descs H2D) is queued on work_stream. Sync just
-        // that stream so the back-half LZ + Huff kernels on heavy_stream
-        // see all front-half results, without stalling caller's other
-        // streams (which is what the prior cuCtxSynchronize did).
-        try cudaCall(fns.stream_sync(self.work_stream), .sync);
+        // Front-half work (walk + prefix-sum + scan + compact + merge +
+        // gather + descs D2D) is queued on self.work_stream. Back-half
+        // (huff + LZ + finalize) is queued on heavy_stream.
+        //
+        // In async mode (self.work_stream != 0) the caller's stream is
+        // both work_stream and heavy_stream — same stream, so stream
+        // ordering alone gives the back-half its view of front-half
+        // results. The sync is pure host-wait overhead. nsys measured
+        // 12 µs median, 1.6 ms worst case on the bench.
+        //
+        // In sync mode (work_stream == 0) heavy_stream is
+        // pipeline_streams[0], a different stream — the back-half won't
+        // see the front-half's writes without an explicit barrier.
+        if (heavy_stream != self.work_stream) {
+            try cudaCall(fns.stream_sync(self.work_stream), .sync);
+        }
 
         // ── KERNEL TIMER: only pure GPU kernel time from here ──
         const t_before_kern = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;

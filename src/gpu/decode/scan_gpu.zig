@@ -233,7 +233,10 @@ pub fn gpuScanChunks(
     const t_scan = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzScanParseKernel", stream);
     if (launch(ml.scan_parse_fn, blocks, 1, 1, tpb, 1, 1, 0, stream, &params, &extra) != CUDA_SUCCESS) return null;
     dec_ctx.endKernelTiming(t_scan, stream);
-    if (stream_sync(stream) != CUDA_SUCCESS) return null;
+    // No post-scan sync: the compact kernels below queue on the same
+    // stream and see scan_parse's writes to d_scan_staged via stream
+    // ordering. The CPU-merge fallback at the bottom still syncs before
+    // its D2H of compact counts — that one IS load-bearing.
 
     // ── Step 6b: device-side compaction ─────────────────────────────
     // 4 × slzCompactHuffDescsKernel + 1 × slzCompactRawDescsKernel
