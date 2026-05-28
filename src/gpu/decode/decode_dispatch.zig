@@ -399,6 +399,15 @@ pub const DecodeRequest = struct {
     /// `d_walk_chunks` directly instead of D2H'ing + re-H2D'ing the
     /// same bytes.
     d_chunk_descs_override: ?u64 = null,
+    /// Phase 3-final: when non-null, the LZ kernel reads its self-gate
+    /// count (`*p_total`) from this device address instead of from
+    /// `self.d_n_groups_scratch`. Used by `decompressFramedFromDevice` to
+    /// point at `d_walk_meta + walk_meta_offsets.n_chunks` so the walk
+    /// kernel's output is consumed directly by the LZ kernel via stream
+    /// ordering — no host D2H, no host H2D restage. Null preserves the
+    /// CLI / host-bounce behavior (stage `total_chunks` into
+    /// `d_n_groups_scratch` host-side).
+    d_n_chunks_dev: ?u64 = null,
 };
 
 pub fn fullGpuLaunch(
@@ -532,6 +541,12 @@ fn runLzPipeline(
     /// self.graph_params.lz_* but skip cuLaunchKernel — the captured
     /// graph already holds the LZ launches.
     skip_launch: bool,
+    /// Phase 3-final: device address holding the self-gate count
+    /// (`*p_total` for the LZ kernel). When the D2D path supplies
+    /// `req.d_n_chunks_dev`, this is `d_walk_meta + offset(n_chunks)`
+    /// (no H2D round-trip); otherwise `self.d_n_groups_scratch` after
+    /// the host-staging H2D in `fullGpuLaunchImpl`.
+    total_dev: CUdeviceptr,
 ) GpuError!i64 {
     const launch_fn = fns.launch;
     const stream_sync_fn = fns.stream_sync;
@@ -577,7 +592,7 @@ fn runLzPipeline(
         const comp_addr: CUdeviceptr = self.d_comp_persist;
         const descs_addr: CUdeviceptr = self.d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc);
         const dst_addr: CUdeviceptr = self.d_output;
-        const total_addr: CUdeviceptr = self.d_n_groups_scratch;
+        const total_addr: CUdeviceptr = total_dev;
 
         if (use_raw_kernel) {
             const lr = &self.graph_params.lz_raw;
@@ -895,14 +910,23 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         // around them too. Without split, Huff time gets pipelined into LZ.
         const split_timer = std.c.getenv("SLZ_SPLIT_TIMER") != null;
 
-        // Stage the LZ kernel's self-gate count (d_n_groups_scratch <-
-        // total_chunks). Hoisted out of runLzPipeline so a graph-mode
-        // capture of the back half doesn't see a synchronous H2D inside
-        // the captured stream region. See runLzPipeline comment for the
-        // NUM_PIPELINE_STREAMS == 1 caveat.
-        if (!ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4)) return error.OutOfDeviceMemory;
-        var host_total_chunks: u32 = total_chunks;
-        try cudaCall(h2d_fn(self.d_n_groups_scratch, @ptrCast(&host_total_chunks), 4), .copy);
+        // Stage the LZ kernel's self-gate count. Three modes:
+        //   1. req.d_n_chunks_dev non-null (Phase 3-final D2D path): point
+        //      the LZ kernel directly at the caller-supplied device counter
+        //      (typically `d_walk_meta + walk_meta_offsets.n_chunks`, which
+        //      the walk kernel populated on this stream). No H2D, no D2H.
+        //   2. Otherwise (CLI / host-bounce): allocate / restage
+        //      d_n_groups_scratch with `total_chunks`. Hoisted out of
+        //      runLzPipeline so a graph-mode capture of the back half
+        //      doesn't see a sync H2D inside the captured region.
+        // See runLzPipeline comment for the NUM_PIPELINE_STREAMS == 1
+        // caveat.
+        const lz_total_dev: u64 = if (req.d_n_chunks_dev) |dev| dev else blk: {
+            if (!ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4)) return error.OutOfDeviceMemory;
+            var host_total_chunks: u32 = total_chunks;
+            try cudaCall(h2d_fn(self.d_n_groups_scratch, @ptrCast(&host_total_chunks), 4), .copy);
+            break :blk self.d_n_groups_scratch;
+        };
 
         // ── Phase 4: opt-in CUDA Graph capture of the back-half ────────
         // Conditions for enabling graph mode this call. Any "no" falls
@@ -991,6 +1015,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             split_timer,
             io,
             cache_hit,
+            lz_total_dev,
         );
 
         // End capture (cache_miss only) and submit the graph (any
