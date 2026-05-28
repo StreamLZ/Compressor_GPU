@@ -11,9 +11,12 @@ REM
 REM Sequential by design (per the no-parallel-benchmarks rule).
 REM Shows all output (no grep filtering); summary at the end.
 REM
-REM Baseline source: src/gpu/README.md "Decode (ms): D2D wall-
-REM clock and end-to-end" table + the "Compression ratio" table.
-REM Measured on an RTX 4060 Ti (sm_89), May 2026.
+REM Baselines are the current-best post-Phase-3c state (commit 2cb5c37,
+REM May 2026, RTX 4060 Ti sm_89). They differ slightly from the
+REM src/gpu/README.md table because Phase 3b/3c eliminated one D2H+H2D
+REM round trip and moved walk-meta sync to work_stream — net ~0.07-0.37
+REM ms e2e improvement vs the README values. Update both this table and
+REM the README when shipping changes that move the bar.
 REM ============================================================
 setlocal
 pushd "%~dp0\.."
@@ -91,16 +94,16 @@ powershell -NoProfile -Command ^
     "$shaE = (Get-FileHash 'assets/enwik8.txt').Hash;" ^
     "$shaS = (Get-FileHash 'assets/silesia_all.tar').Hash;" ^
     "$base = @{" ^
-        "'e_1' = @{D2D=2.91; E2E=15.57; Ratio=58.6};" ^
-        "'e_2' = @{D2D=2.93; E2E=15.59; Ratio=58.6};" ^
-        "'e_3' = @{D2D=4.09; E2E=15.66; Ratio=43.7};" ^
-        "'e_4' = @{D2D=3.93; E2E=15.42; Ratio=42.7};" ^
-        "'e_5' = @{D2D=4.12; E2E=15.39; Ratio=39.6};" ^
-        "'s_1' = @{D2D=5.07; E2E=30.07; Ratio=47.8};" ^
-        "'s_2' = @{D2D=5.09; E2E=30.11; Ratio=47.8};" ^
-        "'s_3' = @{D2D=7.15; E2E=30.84; Ratio=38.0};" ^
-        "'s_4' = @{D2D=6.94; E2E=30.65; Ratio=37.5};" ^
-        "'s_5' = @{D2D=7.72; E2E=30.76; Ratio=33.9} };" ^
+        "'e_1' = @{D2D=2.92; E2E=15.50; Ratio=58.6};" ^
+        "'e_2' = @{D2D=2.93; E2E=15.50; Ratio=58.6};" ^
+        "'e_3' = @{D2D=4.08; E2E=15.54; Ratio=43.7};" ^
+        "'e_4' = @{D2D=3.92; E2E=15.30; Ratio=42.7};" ^
+        "'e_5' = @{D2D=4.10; E2E=15.26; Ratio=39.6};" ^
+        "'s_1' = @{D2D=5.06; E2E=29.97; Ratio=47.8};" ^
+        "'s_2' = @{D2D=5.08; E2E=29.93; Ratio=47.8};" ^
+        "'s_3' = @{D2D=7.13; E2E=30.59; Ratio=38.0};" ^
+        "'s_4' = @{D2D=6.95; E2E=30.31; Ratio=37.5};" ^
+        "'s_5' = @{D2D=7.70; E2E=30.49; Ratio=33.9} };" ^
     "function ParseBench($p) {" ^
         "$t = Get-Content $p;" ^
         "$e2e = ($t | Where-Object { $_ -match '^\s+best:\s+([\d.]+) ms' } | ForEach-Object { [double]$matches[1] });" ^
@@ -127,7 +130,7 @@ powershell -NoProfile -Command ^
     "1..5 | ForEach-Object { Row 's' $_ \"%TMP%/bench_s_L${_}.slz\" \"%TMP%/bench_s_L${_}.bin\" $srcSiles $shaS };" ^
     "Write-Host '';" ^
     "Write-Host 'Times in ms (best of 30). d-* columns are now minus baseline; negative = improvement.';" ^
-    "Write-Host 'Baseline source: src/gpu/README.md (RTX 4060 Ti, May 2026).'"
+    "Write-Host 'Baseline: current-best post-Phase-3c (commit 2cb5c37, RTX 4060 Ti). Refresh after any perf-relevant change.'"
 
 echo.
 echo bench_all done.
