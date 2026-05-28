@@ -55,6 +55,7 @@ pub const GpuError = d.GpuError;
 pub const HUFF_LUT_ENTRIES = d.HUFF_LUT_ENTRIES;
 pub const WALK_MAX_CHUNKS = d.WALK_MAX_CHUNKS;
 pub const ENTROPY_SCRATCH_SLOT_BYTES = d.ENTROPY_SCRATCH_SLOT_BYTES;
+pub const walk_meta_offsets = d.walk_meta_offsets;
 
 // ── Per-decode context + host I/O helpers ─────────────────────
 pub const DecodeContext = dc.DecodeContext;

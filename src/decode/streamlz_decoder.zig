@@ -174,6 +174,11 @@ pub fn decompressFramedFromDevice(
         .d_output_target = d_output,
         .d_compressed_src = d_frame + meta.block_start,
         .d_chunk_descs_override = dev.d_chunk_descs,
+        // Phase 3-final B: point the LZ kernel at the walk kernel's
+        // n_chunks slot in d_walk_meta (offset 0). The walk runs first
+        // on work_stream and writes the real count; the LZ kernel runs
+        // after and reads it via stream ordering. No H2D round trip.
+        .d_n_chunks_dev = dev.d_meta + gpu_driver.walk_meta_offsets.n_chunks,
     }) catch |err| return err;
     return meta.decomp_size;
 }
