@@ -36,14 +36,25 @@ static int roundtrip(slzHandle_t h, const unsigned char* input, size_t n, int le
     cudaStreamCreate(&stream);
 
     size_t frame_len = 0;
-    slzStatus_t s = slzCompressAsync(h, d_in, n, NULL, 0, d_frame, bound, &frame_len, copts, stream);
+    slzStatus_t s = slzCompressAsync(h, d_in, n, d_frame, bound, &frame_len, copts, stream);
     if (s != SLZ_SUCCESS) { printf("L%d compressAsync failed: %s\n", level, slzStatusString(s)); return 1; }
     cudaStreamSynchronize(stream);
+    /* frame_len is now valid after the stream sync. */
 
+    /* For decompress, learn the expected size from the frame's host bytes:
+     * download the frame to host (small) so we can call slzGetDecompressedSize,
+     * then proceed with the device-resident decompress. (In a real workflow
+     * the caller usually already knows decomp_size from their outer metadata
+     * and skips this call.) */
+    unsigned char host_header[64];
+    cudaMemcpy(host_header, d_frame, (frame_len < 64 ? frame_len : 64), cudaMemcpyDeviceToHost);
     size_t out_len = 0;
+    s = slzGetDecompressedSize(h, host_header, &out_len);
+    if (s != SLZ_SUCCESS) { printf("L%d getDecompressedSize failed: %s\n", level, slzStatusString(s)); return 1; }
+
     slzDecompressOpts_t dopts = slzDecompressDefaultOpts();
     dopts.enable_profiling = profile;
-    s = slzDecompressAsync(h, d_frame, frame_len, NULL, 0, d_out, n + 64, &out_len, dopts, stream);
+    s = slzDecompressAsync(h, d_frame, frame_len, d_out, out_len, dopts, stream);
     if (s != SLZ_SUCCESS) { printf("L%d decompressAsync failed: %s\n", level, slzStatusString(s)); return 1; }
 
     /* Probe: is the kernel still in flight when we get here? */

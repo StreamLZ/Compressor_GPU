@@ -2,38 +2,69 @@
  *
  * StreamLZ is an LZ + entropy-coding compressor whose compress and
  * decompress paths run on the GPU. This header exposes it as a callable
- * library, in the style of nvCOMP's GPU codecs.
+ * library in the same shape as nvCOMP's batched APIs:
  *
- * --- Model -----------------------------------------------------------
- * Single buffer in, single self-describing frame out: the frame's
- * internal chunking is handled by the library, so the caller passes one
- * contiguous input and receives one contiguous frame (unlike nvCOMP's
- * batched arrays of independent chunks).
+ *   - The library does the compress/decompress work; the caller does the
+ *     CUDA memory and transfer plumbing (cudaMallocAsync /
+ *     cudaMemcpyAsync / cudaFreeAsync), so caller code composes cleanly
+ *     with the rest of their CUDA pipeline (own streams, own memory
+ *     pools, own error handling).
+ *   - All work is queued on the caller's CUstream / cudaStream_t. The
+ *     caller's cudaStreamSynchronize is the only sync point.
+ *   - For decompress, the caller learns the output size synchronously
+ *     before kicking off the GPU work, via a host-side parse of the
+ *     frame header (slzGetDecompressedSize).
+ *   - For compress, the caller learns a worst-case bound up front
+ *     (slzCompressBound); the actual compressed size is written by the
+ *     library to a caller-supplied host pointer after the stream
+ *     completes.
  *
- * Two buffer models, both supported:
- *   - Device->device (slzCompress / slzDecompress): the `d_`-prefixed
- *     pointers are device memory. The caller's data is already
- *     GPU-resident and the caller owns the scratch buffer — best for
- *     interop with the caller's other CUDA / nvCOMP work, no host
- *     round-trip.
- *   - Host->host (slzCompressHost / slzDecompressHost): plain host
- *     pointers. The library does the H2D/D2H copies and owns all
- *     device-side memory itself — simplest to call.
+ * --- Typical caller patterns ----------------------------------------
  *
- * Calls are SYNCHRONOUS: each compress/decompress runs the GPU work and
- * blocks until the result is ready. (A future opt-in stream-async
- * variant may be added; it would not change these entry points.)
+ * DECOMPRESS:
+ *   size_t output_size;
+ *   slzGetDecompressedSize(h, host_compressed_bytes, &output_size);
+ *
+ *   void *d_frame, *d_output;
+ *   cudaMallocAsync(&d_frame,  frame_size,  stream);
+ *   cudaMallocAsync(&d_output, output_size, stream);
+ *   cudaMemcpyAsync(d_frame, host_compressed_bytes, frame_size,
+ *                   cudaMemcpyHostToDevice, stream);
+ *   slzDecompressAsync(h, d_frame, frame_size, d_output, output_size,
+ *                      dec_opts, stream);
+ *   cudaMemcpyAsync(host_output, d_output, output_size,
+ *                   cudaMemcpyDeviceToHost, stream);
+ *   cudaStreamSynchronize(stream);
+ *   cudaFreeAsync(d_output, stream);
+ *   cudaFreeAsync(d_frame,  stream);
+ *
+ * COMPRESS:
+ *   size_t max_compressed_size;
+ *   slzCompressBound(h, input_size, comp_opts, &max_compressed_size);
+ *
+ *   void *d_input, *d_output;
+ *   cudaMallocAsync(&d_input,  input_size,          stream);
+ *   cudaMallocAsync(&d_output, max_compressed_size, stream);
+ *   cudaMemcpyAsync(d_input, host_input, input_size,
+ *                   cudaMemcpyHostToDevice, stream);
+ *
+ *   size_t actual_compressed_size;
+ *   slzCompressAsync(h, d_input, input_size,
+ *                    d_output, max_compressed_size,
+ *                    &actual_compressed_size,
+ *                    comp_opts, stream);
+ *   cudaMemcpyAsync(host_output, d_output, max_compressed_size,
+ *                   cudaMemcpyDeviceToHost, stream);
+ *   cudaStreamSynchronize(stream);
+ *   // host_output's first actual_compressed_size bytes are valid
+ *   cudaFreeAsync(d_output, stream);
+ *   cudaFreeAsync(d_input,  stream);
  *
  * --- CUDA context / threading ----------------------------------------
  * The library runs in the CALLER's CUDA context. slzCreate() must be
  * called with a CUDA context already current; it does not create one. A
  * single handle is not safe for concurrent calls on itself — give each
  * thread its own handle. Distinct handles are fully independent.
- *
- * --- Buffer ownership ------------------------------------------------
- * The caller owns every buffer. Scratch ("temp") sizing is queried up
- * front via slz*GetTempSize and the caller allocates and passes it in, so
- * the library holds no hidden per-operation device memory.
  */
 
 #ifndef STREAMLZ_GPU_H
@@ -61,7 +92,7 @@ typedef enum slzStatus_t {
  * is valid for the lifetime of the process. */
 const char* slzStatusString(slzStatus_t status);
 
-/* Null-terminated library version string, e.g. "2.0.0". */
+/* Null-terminated library version string, e.g. "3.0.0". */
 const char* slzVersionString(void);
 
 /* ---- Library handle ------------------------------------------------- */
@@ -114,10 +145,10 @@ typedef struct slzKernelTiming_t {
  * actually has; only min(capacity, *count) entries are written into
  * `timings`. Returns SLZ_SUCCESS even when capacity < *count.
  *
- * For ASYNC callers: you must cudaStreamSynchronize the stream you
- * passed to slz*Async BEFORE calling this — otherwise the cuEvent pairs
- * have not completed and their timings will be reported as 0. Use
- * slzWaitAndGetLastTimings to do the sync + drain in one call. */
+ * You must cudaStreamSynchronize the stream you passed to slz*Async
+ * BEFORE calling this — otherwise the cuEvent pairs have not completed
+ * and their timings will be reported as 0. Use slzWaitAndGetLastTimings
+ * to do the sync + drain in one call. */
 slzStatus_t slzGetLastTimings(slzHandle_t handle,
                               slzKernelTiming_t* timings, size_t capacity,
                               size_t* count);
@@ -126,124 +157,97 @@ slzStatus_t slzGetLastTimings(slzHandle_t handle,
  * in one call. Pass `stream` = NULL to skip the sync (equivalent to
  * slzGetLastTimings directly; use when you've already synchronized).
  * Otherwise `stream` is a CUstream / cudaStream_t cast to void*, the
- * same stream you passed to slzCompressAsync / slzDecompressAsync. */
+ * same stream you passed to slz*Async. */
 slzStatus_t slzWaitAndGetLastTimings(slzHandle_t handle, void* stream,
                                      slzKernelTiming_t* timings,
                                      size_t capacity, size_t* count);
 
-/* ---- Size queries --------------------------------------------------- */
-/* Worst-case compressed-frame size for `input_size` input bytes. Use it
- * to size the output buffer for slzCompress / slzCompressHost. */
+/* ---- Decompress-size discovery -------------------------------------- */
+/* Synchronous, pure-host call: parses the frame header at `host_bytes`
+ * and writes the decompressed byte count to *output_size. No GPU
+ * involvement; ~1 us.
+ *
+ * Contract: `host_bytes` must point to at least 64 bytes of valid
+ * StreamLZ frame data (or the entire frame if it is shorter). The
+ * library only reads what it needs from the leading header — up to
+ * ~26 bytes for any frame we produce — but a frame shorter than the
+ * required header field is rejected with SLZ_ERROR_CORRUPT_FRAME.
+ * In practice every caller has the whole compressed frame in host RAM
+ * by this point, so the 64-byte minimum is trivially satisfied.
+ *
+ * Use this when the caller doesn't know the decompressed size from
+ * their own outer metadata. Skip it (and use your own size) when you
+ * do. */
+slzStatus_t slzGetDecompressedSize(slzHandle_t handle,
+                                   const void* host_bytes,
+                                   size_t* output_size);
+
+/* Worst-case compressed-frame size for `input_size` input bytes at the
+ * level/opts specified. Sync, pure-host call. Use it to size d_output
+ * for slzCompressAsync. */
 slzStatus_t slzCompressBound(slzHandle_t handle, size_t input_size,
                              slzCompressOpts_t opts, size_t* max_output_size);
 
-/* Device-scratch size the device->device slzCompress needs for
- * `input_size` bytes. (slzCompressHost manages its own scratch.) */
-slzStatus_t slzCompressGetTempSize(slzHandle_t handle, size_t input_size,
-                                   slzCompressOpts_t opts, size_t* temp_size);
-
-/* Device-scratch size the device->device slzDecompress needs for a
- * `frame_size`-byte frame — a conservative bound. (slzDecompressHost
- * manages its own scratch.) */
-slzStatus_t slzDecompressGetTempSize(slzHandle_t handle, size_t frame_size,
-                                     size_t* temp_size);
-
-/* Decompressed byte count recorded in a frame header. `frame_header` is a
- * HOST pointer to at least the first 16 bytes of the frame; the size is
- * returned in *decompressed_size. (A device->device caller copies the
- * leading frame bytes to host first — the header is tiny.) */
-slzStatus_t slzGetDecompressedSize(slzHandle_t handle,
-                                   const void* frame_header, size_t header_len,
-                                   size_t* decompressed_size);
-
-/* ---- Compress / decompress: device -> device ------------------------ */
-/* Compress d_input (input_size device bytes) into a StreamLZ frame at
- * d_output. Blocks until the frame is ready; the frame's byte length is
- * written to the host-side *output_size.
- *
- *   d_temp        device scratch, >= slzCompressGetTempSize bytes
- *   d_output      device buffer, capacity >= slzCompressBound bytes
- *   output_size   host size_t; receives the frame length
- */
-slzStatus_t slzCompress(slzHandle_t handle,
-                        const void* d_input, size_t input_size,
-                        void* d_temp, size_t temp_size,
-                        void* d_output, size_t output_capacity,
-                        size_t* output_size,
-                        slzCompressOpts_t opts);
-
-/* Decompress a StreamLZ frame at d_frame into d_output. Blocks until the
- * output is ready; the decompressed byte count is written to the
- * host-side *output_size.
- *
- *   d_temp        device scratch, >= slzDecompressGetTempSize bytes
- *   d_output      device buffer, capacity >= slzGetDecompressedSize bytes
- *   output_size   host size_t; receives the decompressed length
- */
-slzStatus_t slzDecompress(slzHandle_t handle,
-                          const void* d_frame, size_t frame_size,
-                          void* d_temp, size_t temp_size,
-                          void* d_output, size_t output_capacity,
-                          size_t* output_size,
-                          slzDecompressOpts_t opts);
-
 /* ---- Async (stream-taking) entry points ----------------------------- */
-/* slzCompressAsync / slzDecompressAsync mirror nvCOMP's
- * nvcompBatchedXxxAsync pattern: submit GPU work on the caller's stream
- * and return — the caller's cudaStreamSynchronize is the sync point.
+/* slzCompressAsync and slzDecompressAsync queue all GPU work on the
+ * caller's `stream` and return — the caller's cudaStreamSynchronize is
+ * the only sync point. `stream` is a CUDA driver-API CUstream
+ * (== cudaStream_t) cast to void*; NULL is the default stream (stream 0).
  *
- * The call runs on the CALLER's thread (no internal worker / no per-call
- * thread spawn). Host-side setup work blocks the caller; only the heavy
- * back-half kernels and final D2D copy ride `stream` asynchronously.
- *
- * `stream` is a CUDA driver-API CUstream (== cudaStream_t) cast to
- * void*. NULL is interpreted as the default stream (stream 0), which
- * makes the call behave like the synchronous variant.
- *
- * `output_size` is a HOST pointer; the library writes the byte count
- * before returning (it knows the size from the frame header / the
- * compressed-frame layout — no cuMemcpy is required after sync).
- *
- * Decompress: the walk + scan + compact + merge phases still block the
- * CALLER's thread (host-dependent values + stream-0 implicit sync).
- * The heavy Huffman-decode + LZ-decode kernels and the final D2D output
- * copy ride the caller's stream and are NOT waited on; user must
- * cudaStreamSynchronize the stream to consume `d_output`.
- *
- * Compress: the LZ-encode + Huff-encode + assemble passes still block
- * the CALLER's thread (data dependencies on per-chunk sizes). Only the
- * final frame-assembly kernel is queued on the caller's stream; for the
- * pure-D2D path that is where the frame bytes land in d_output.
- *
- * Errors from the synchronous prefix surface as a negative status code
- * the same way as the sync entry points; errors from the queued kernels
- * surface via cudaGetLastError after the user's synchronize.
- *
- * Stack: these functions are stack-cheap (no deep encode/decode
- * orchestration on the call frame); safe to invoke from any thread with
- * a normal stack (>= 1 MB). */
-slzStatus_t slzCompressAsync(slzHandle_t handle,
-                             const void* d_input, size_t input_size,
-                             void* d_temp, size_t temp_size,
-                             void* d_output, size_t output_capacity,
-                             size_t* output_size,
-                             slzCompressOpts_t opts,
-                             void* stream);
+ * The library does NOT do any cudaMalloc / cudaMemcpy / cudaFree of the
+ * caller-facing buffers (d_input, d_output, d_frame). Caller is
+ * responsible for all of those, using their own stream and memory
+ * management. The library only does the work between H2D-of-input and
+ * the moment results are device-resident in d_output. */
 
+/* Decompress a StreamLZ frame whose bytes are device-resident at
+ * d_frame into d_output. `output_size` MUST equal the value returned
+ * by slzGetDecompressedSize for this frame (or be the caller's own
+ * accurate size from their outer metadata). The library will write
+ * exactly `output_size` bytes into d_output.
+ *
+ *   d_frame       device pointer to the compressed frame
+ *   frame_size    bytes at d_frame
+ *   d_output      device output buffer, must be >= output_size bytes
+ *   output_size   exact decompressed byte count (caller-supplied)
+ *   stream        caller's CUstream (void*); NULL = default stream
+ *
+ * Queue all decompress work on `stream`, then return. */
 slzStatus_t slzDecompressAsync(slzHandle_t handle,
                                const void* d_frame, size_t frame_size,
-                               void* d_temp, size_t temp_size,
-                               void* d_output, size_t output_capacity,
-                               size_t* output_size,
+                               void* d_output, size_t output_size,
                                slzDecompressOpts_t opts,
                                void* stream);
 
-/* ---- Compress / decompress: host -> host ---------------------------- */
-/* Same as slzCompress / slzDecompress but with plain host buffers: the
- * library performs the H2D/D2H copies and owns every device-side buffer
- * (input copy, output, and scratch) for the duration of the call. No
- * d_temp is required. One extra host<->device round-trip vs the
- * device->device entry points. */
+/* Compress `input_size` device bytes at d_input into a StreamLZ frame at
+ * d_output.
+ *
+ *   d_input         device pointer to raw input
+ *   input_size      bytes at d_input
+ *   d_output        device output buffer, must be >= max_compressed_size
+ *                   (use slzCompressBound to size this)
+ *   max_compressed  capacity of d_output
+ *   compressed_size HOST pointer; the library writes the actual
+ *                   compressed frame length here. Valid AFTER the
+ *                   caller's cudaStreamSynchronize(stream) — the
+ *                   library queues an internal D2H on `stream` after
+ *                   the compress kernels finish.
+ *   stream          caller's CUstream (void*); NULL = default stream
+ *
+ * Queue all compress work on `stream`, then return. */
+slzStatus_t slzCompressAsync(slzHandle_t handle,
+                             const void* d_input, size_t input_size,
+                             void* d_output, size_t max_compressed_size,
+                             size_t* compressed_size,
+                             slzCompressOpts_t opts,
+                             void* stream);
+
+/* ---- Compress / decompress: host -> host convenience ---------------- */
+/* Synchronous, all-CUDA-internal wrappers. Caller hands the library
+ * host buffers; the library does the H2D, the GPU work, the D2H, and
+ * the cleanup. One extra host<->device round-trip vs the async D2D
+ * entry points above; useful for CLI tools, ad-hoc decompression, and
+ * code that doesn't need overlap. */
 slzStatus_t slzCompressHost(slzHandle_t handle,
                             const void* input, size_t input_size,
                             void* output, size_t output_capacity,

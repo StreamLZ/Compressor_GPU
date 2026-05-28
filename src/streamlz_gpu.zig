@@ -383,7 +383,7 @@ export fn slzStatusString(status: c_int) [*:0]const u8 {
 }
 
 export fn slzVersionString() [*:0]const u8 {
-    return "2.0.0";
+    return "3.0.0";
 }
 
 // ── Handle lifecycle ──────────────────────────────────────────────────
@@ -425,45 +425,24 @@ export fn slzCompressBound(
     return SLZ_SUCCESS;
 }
 
-// v1 manages all device scratch internally, so callers need no temp
-// buffer for either path. Both queries report zero.
-export fn slzCompressGetTempSize(
-    handle: ?*Context,
-    input_size: usize,
-    opts: CompressOpts,
-    temp_size: ?*usize,
-) c_int {
-    _ = input_size;
-    _ = opts;
-    if (handle == null) return SLZ_ERROR_INVALID_HANDLE;
-    const out = temp_size orelse return SLZ_ERROR_INVALID_ARG;
-    out.* = 0;
-    return SLZ_SUCCESS;
-}
-
-export fn slzDecompressGetTempSize(
-    handle: ?*Context,
-    frame_size: usize,
-    temp_size: ?*usize,
-) c_int {
-    _ = frame_size;
-    if (handle == null) return SLZ_ERROR_INVALID_HANDLE;
-    const out = temp_size orelse return SLZ_ERROR_INVALID_ARG;
-    out.* = 0;
-    return SLZ_SUCCESS;
-}
-
+/// v3 contract: host_bytes points to >= 64 bytes of valid StreamLZ frame
+/// (or the whole frame if shorter — every header we produce is well
+/// under 64 bytes, and every realistic caller has the whole frame in
+/// host RAM). The library reads only what its parser needs; if the
+/// frame is shorter than the header field at hand, parseHeader returns
+/// Truncated and we map to SLZ_ERROR_CORRUPT_FRAME.
 export fn slzGetDecompressedSize(
     handle: ?*Context,
-    frame_header: ?*const anyopaque,
-    header_len: usize,
+    host_bytes: ?*const anyopaque,
     decompressed_size: ?*usize,
 ) c_int {
     if (handle == null) return SLZ_ERROR_INVALID_HANDLE;
-    const hdr_ptr = frame_header orelse return SLZ_ERROR_INVALID_ARG;
+    const hdr_ptr = host_bytes orelse return SLZ_ERROR_INVALID_ARG;
     const out = decompressed_size orelse return SLZ_ERROR_INVALID_ARG;
     const bytes: [*]const u8 = @ptrCast(hdr_ptr);
-    const parsed = frame.parseHeader(bytes[0..header_len]) catch return SLZ_ERROR_CORRUPT_FRAME;
+    // 64-byte slice is safely longer than any header we produce (max ~26 B)
+    // and the caller contract requires that many bytes be readable.
+    const parsed = frame.parseHeader(bytes[0..64]) catch return SLZ_ERROR_CORRUPT_FRAME;
     out.* = parsed.content_size orelse return SLZ_ERROR_CORRUPT_FRAME;
     return SLZ_SUCCESS;
 }
@@ -525,125 +504,7 @@ export fn slzDecompressHost(
     return SLZ_SUCCESS;
 }
 
-// ── Compress / decompress: device -> device ───────────────────────────
-// True D2D: no host bounce of the input bytes. The encoder reads the
-// data from d_input via d_input_override (D2D copy on the GPU); the
-// host `src` slice we hand the job carries `input_size` for sizing but
-// a deliberately unmapped pointer so any accidental host-side read
-// segfaults loud instead of returning garbage.
-export fn slzCompress(
-    handle: ?*Context,
-    d_input: ?*const anyopaque,
-    input_size: usize,
-    d_temp: ?*anyopaque,
-    temp_size: usize,
-    d_output: ?*anyopaque,
-    output_capacity: usize,
-    output_size: ?*usize,
-    opts: CompressOpts,
-) c_int {
-    _ = d_temp;
-    _ = temp_size;
-    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
-    const in_dev = d_input orelse return SLZ_ERROR_INVALID_ARG;
-    const out_dev = d_output orelse return SLZ_ERROR_INVALID_ARG;
-    const out_size = output_size orelse return SLZ_ERROR_INVALID_ARG;
-
-    const host_out = allocator.alloc(u8, output_capacity) catch return SLZ_ERROR_OUT_OF_MEMORY;
-    defer allocator.free(host_out);
-
-    // Sentinel `src` slice — correct length, unmapped pointer. Any
-    // dereference is an immediate segfault (intentional; that's how we
-    // catch CPU paths that still try to read host input).
-    const sentinel_ptr: [*]const u8 = @ptrFromInt(0x10);
-    const src_stub: []const u8 = sentinel_ptr[0..input_size];
-
-    var job = CompressJob{
-        .h = h,
-        .src = src_stub,
-        .dst = host_out,
-        .opts = opts,
-        .d_src = @intFromPtr(in_dev),
-        .d_dst = @intFromPtr(out_dev),
-    };
-    const rc = runOnWorker(CompressJob, &job);
-    if (rc < 0) return rc;
-    out_size.* = @intCast(rc);
-    return SLZ_SUCCESS;
-}
-
-export fn slzDecompress(
-    handle: ?*Context,
-    d_frame: ?*const anyopaque,
-    frame_size: usize,
-    d_temp: ?*anyopaque,
-    temp_size: usize,
-    d_output: ?*anyopaque,
-    output_capacity: usize,
-    output_size: ?*usize,
-    opts: DecompressOpts,
-) c_int {
-    _ = d_temp;
-    _ = temp_size;
-    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
-    const frame_dev = d_frame orelse return SLZ_ERROR_INVALID_ARG;
-    const out_dev = d_output orelse return SLZ_ERROR_INVALID_ARG;
-    const out_size = output_size orelse return SLZ_ERROR_INVALID_ARG;
-
-    // 4d Phase 3 TRUE D2D path: frame stays on device, walk runs on
-    // GPU, output stays on device — zero host bounce of payload bytes.
-    var true_job = DecompressJobTrueD2D{
-        .h = h,
-        .d_src = @intFromPtr(frame_dev),
-        .src_size = @intCast(frame_size),
-        .d_dst = @intFromPtr(out_dev),
-        .opts = opts,
-    };
-    const rc_true = runOnWorker(DecompressJobTrueD2D, &true_job);
-    if (rc_true >= 0) {
-        out_size.* = @intCast(rc_true);
-        return SLZ_SUCCESS;
-    }
-    if (!true_job.fall_back) return rc_true;
-
-    // Fallback A: D2H the frame to host, GPU decode with D2D output
-    // (legacy 4d Phase 3 decode path — half-D2D).
-    const host_frame = allocator.alloc(u8, frame_size) catch return SLZ_ERROR_OUT_OF_MEMORY;
-    defer allocator.free(host_frame);
-
-    var d2d_job = DecompressJobD2D{
-        .h = h,
-        .host_frame = host_frame,
-        .d_src = @intFromPtr(frame_dev),
-        .d_dst = @intFromPtr(out_dev),
-        .opts = opts,
-    };
-    const rc_d2d = runOnWorker(DecompressJobD2D, &d2d_job);
-    if (rc_d2d >= 0) {
-        out_size.* = @intCast(rc_d2d);
-        return SLZ_SUCCESS;
-    }
-    if (!d2d_job.fall_back) return rc_d2d;
-
-    // Fallback B: full host-bounce path. Reuses the already-D2H'd host_frame.
-    const host_out = allocator.alloc(u8, output_capacity) catch return SLZ_ERROR_OUT_OF_MEMORY;
-    defer allocator.free(host_out);
-
-    var job = DecompressJob{
-        .h = h,
-        .src = host_frame,
-        .dst = host_out,
-        .opts = opts,
-        .d_src = 0, // host_frame already populated by the D2D try
-        .d_dst = @intFromPtr(out_dev),
-    };
-    const rc = runOnWorker(DecompressJob, &job);
-    if (rc < 0) return rc;
-    out_size.* = @intCast(rc);
-    return SLZ_SUCCESS;
-}
-
-// ── Async (stream-taking) device-to-device variants ──────────────────
+// ── Async (stream-taking) device-to-device entry points ─────────────
 // Mirror nvCOMP's pattern: submit on `stream`, return; caller is the
 // sync. NULL stream is the default stream and makes these behave like
 // the sync entry points.
@@ -651,22 +512,18 @@ export fn slzCompressAsync(
     handle: ?*Context,
     d_input: ?*const anyopaque,
     input_size: usize,
-    d_temp: ?*anyopaque,
-    temp_size: usize,
     d_output: ?*anyopaque,
-    output_capacity: usize,
-    output_size: ?*usize,
+    max_compressed_size: usize,
+    compressed_size: ?*usize,
     opts: CompressOpts,
     stream: ?*anyopaque,
 ) c_int {
-    _ = d_temp;
-    _ = temp_size;
     const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
     const in_dev = d_input orelse return SLZ_ERROR_INVALID_ARG;
     const out_dev = d_output orelse return SLZ_ERROR_INVALID_ARG;
-    const out_size = output_size orelse return SLZ_ERROR_INVALID_ARG;
+    const out_size = compressed_size orelse return SLZ_ERROR_INVALID_ARG;
 
-    const host_out = allocator.alloc(u8, output_capacity) catch return SLZ_ERROR_OUT_OF_MEMORY;
+    const host_out = allocator.alloc(u8, max_compressed_size) catch return SLZ_ERROR_OUT_OF_MEMORY;
     defer allocator.free(host_out);
 
     const sentinel_ptr: [*]const u8 = @ptrFromInt(0x10);
@@ -697,21 +554,15 @@ export fn slzDecompressAsync(
     handle: ?*Context,
     d_frame: ?*const anyopaque,
     frame_size: usize,
-    d_temp: ?*anyopaque,
-    temp_size: usize,
     d_output: ?*anyopaque,
-    output_capacity: usize,
-    output_size: ?*usize,
+    output_size: usize,
     opts: DecompressOpts,
     stream: ?*anyopaque,
 ) c_int {
-    _ = d_temp;
-    _ = temp_size;
-    _ = output_capacity;
+    _ = output_size;
     const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
     const frame_dev = d_frame orelse return SLZ_ERROR_INVALID_ARG;
     const out_dev = d_output orelse return SLZ_ERROR_INVALID_ARG;
-    const out_size = output_size orelse return SLZ_ERROR_INVALID_ARG;
 
     var true_job = DecompressJobTrueD2D{
         .h = h,
@@ -726,12 +577,14 @@ export fn slzDecompressAsync(
     // compact + merge) blocks the caller; the heavy back-half Huff +
     // LZ kernels and the final D2D output copy ride `stream` and
     // complete after the caller's cudaStreamSynchronize.
+    //
+    // v3: caller already knows output_size (from slzGetDecompressedSize
+    // or their own metadata) so we don't need to report it back. The
+    // size param is used to validate d_output capacity inside the
+    // pipeline; passing wrong value is undefined behaviour.
     DecompressJobTrueD2D.run(&true_job);
     const rc = true_job.result;
-    if (rc >= 0) {
-        out_size.* = @intCast(rc);
-        return SLZ_SUCCESS;
-    }
+    if (rc >= 0) return SLZ_SUCCESS;
     // Async path doesn't fall back. If the TrueD2D shape isn't satisfied
     // (dict frame / PDM / multi-block), the caller should use the sync
     // slzDecompress entry point which handles fallback through the

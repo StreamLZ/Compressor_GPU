@@ -22,19 +22,23 @@ static int roundtrip(slzHandle_t h, const unsigned char* input, size_t n, int le
     }
     cudaMemcpy(d_in, input, n, cudaMemcpyHostToDevice);
 
+    /* Use a single stream and sync after each async call — gives the same
+     * observable behavior as the old sync slzCompress/slzDecompress. */
     size_t frame_len = 0;
-    slzStatus_t s = slzCompress(h, d_in, n, NULL, 0, d_frame, bound, &frame_len, opts);
-    if (s != SLZ_SUCCESS) { printf("L%d compress failed: %s\n", level, slzStatusString(s)); return 1; }
+    slzStatus_t s = slzCompressAsync(h, d_in, n, d_frame, bound, &frame_len, opts, NULL);
+    if (s != SLZ_SUCCESS) { printf("L%d compressAsync failed: %s\n", level, slzStatusString(s)); return 1; }
+    cudaDeviceSynchronize();
 
-    size_t out_len = 0;
     slzDecompressOpts_t dopts = slzDecompressDefaultOpts();
     dopts.enable_profiling = profile;
-    s = slzDecompress(h, d_frame, frame_len, NULL, 0, d_out, n + 64, &out_len, dopts);
-    if (s != SLZ_SUCCESS) { printf("L%d decompress failed: %s\n", level, slzStatusString(s)); return 1; }
+    s = slzDecompressAsync(h, d_frame, frame_len, d_out, n, dopts, NULL);
+    if (s != SLZ_SUCCESS) { printf("L%d decompressAsync failed: %s\n", level, slzStatusString(s)); return 1; }
+    cudaDeviceSynchronize();
 
+    size_t out_len = n;
     unsigned char* result = (unsigned char*)malloc(out_len);
     cudaMemcpy(result, d_out, out_len, cudaMemcpyDeviceToHost);
-    int ok = (out_len == n) && memcmp(input, result, n) == 0;
+    int ok = memcmp(input, result, n) == 0;
     printf("L%d in=%zu frame=%zu out=%zu %s\n", level, n, frame_len, out_len, ok ? "OK" : "FAIL");
     if (profile) {
         slzKernelTiming_t timings[64];

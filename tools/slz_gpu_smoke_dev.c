@@ -1,7 +1,7 @@
 /* Device->device smoke test for the StreamLZ GPU C ABI.
- * Allocates CUDA device buffers, uploads input, exercises slzCompress /
- * slzDecompress (the device->device entry points), downloads the result,
- * and checks a byte-exact roundtrip. Exits 0 on success. */
+ * Allocates CUDA device buffers, uploads input, exercises slzCompressAsync /
+ * slzDecompressAsync on the default stream, downloads the result, and
+ * checks a byte-exact roundtrip. Exits 0 on success. */
 #include "streamlz_gpu.h"
 #include <cuda_runtime.h>
 #include <stdio.h>
@@ -28,19 +28,20 @@ int main(void) {
     cudaMemcpy(d_in, input, n, cudaMemcpyHostToDevice);
 
     size_t frame_len = 0;
-    s = slzCompress(h, d_in, n, NULL, 0, d_frame, bound, &frame_len, opts);
-    if (s != SLZ_SUCCESS) { printf("slzCompress (d2d) failed: %s\n", slzStatusString(s)); return 1; }
+    s = slzCompressAsync(h, d_in, n, d_frame, bound, &frame_len, opts, NULL);
+    if (s != SLZ_SUCCESS) { printf("slzCompressAsync (d2d) failed: %s\n", slzStatusString(s)); return 1; }
+    cudaDeviceSynchronize();
     printf("d2d compressed %zu -> %zu bytes\n", n, frame_len);
 
-    size_t out_len = 0;
     slzDecompressOpts_t dopts = slzDecompressDefaultOpts();
-    s = slzDecompress(h, d_frame, frame_len, NULL, 0, d_out, n + 64, &out_len, dopts);
-    if (s != SLZ_SUCCESS) { printf("slzDecompress (d2d) failed: %s\n", slzStatusString(s)); return 1; }
+    s = slzDecompressAsync(h, d_frame, frame_len, d_out, n, dopts, NULL);
+    if (s != SLZ_SUCCESS) { printf("slzDecompressAsync (d2d) failed: %s\n", slzStatusString(s)); return 1; }
+    cudaDeviceSynchronize();
 
-    unsigned char *result = (unsigned char *)malloc(n + 64);
-    cudaMemcpy(result, d_out, out_len, cudaMemcpyDeviceToHost);
-    int ok = (out_len == n) && (memcmp(input, result, n) == 0);
-    printf("d2d decompressed %zu bytes, roundtrip %s\n", out_len, ok ? "OK" : "FAIL");
+    unsigned char *result = (unsigned char *)malloc(n);
+    cudaMemcpy(result, d_out, n, cudaMemcpyDeviceToHost);
+    int ok = memcmp(input, result, n) == 0;
+    printf("d2d decompressed %zu bytes, roundtrip %s\n", n, ok ? "OK" : "FAIL");
 
     slzDestroy(h);
     cudaFree(d_in); cudaFree(d_frame); cudaFree(d_out);

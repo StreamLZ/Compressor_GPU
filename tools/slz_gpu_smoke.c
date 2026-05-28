@@ -34,7 +34,7 @@ int main(void) {
     printf("compressed %zu -> %zu bytes\n", n, frame_len);
 
     size_t dsize = 0;
-    s = slzGetDecompressedSize(h, frame, frame_len, &dsize);
+    s = slzGetDecompressedSize(h, frame, &dsize);
     if (s != SLZ_SUCCESS) { printf("get-size failed: %s\n", slzStatusString(s)); return 1; }
     printf("decompressed size from header: %zu\n", dsize);
 

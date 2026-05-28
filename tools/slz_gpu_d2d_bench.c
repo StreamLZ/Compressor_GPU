@@ -84,18 +84,18 @@ int main(int argc, char** argv) {
     unsigned char* host_src = read_file(src_path, &src_size);
     if (!host_src) { printf("open %s failed\n", src_path); free(host_frame); return 1; }
 
-    /* The decompressed size is the source size; the frame header carries
-     * it too, but we already have the truth on the host. Use it for
-     * device-output sizing. */
+    /* The decompressed size is the source size; we know this from the
+     * host buffer, so we don't need slzGetDecompressedSize here. (A real
+     * caller would either know it from outer metadata like this, or call
+     * slzGetDecompressedSize once to discover it.) */
     const size_t decomp_size = src_size;
-    const size_t out_cap = decomp_size + 64;
 
     slzHandle_t h = NULL;
     if (slzCreate(&h) != SLZ_SUCCESS) { printf("slzCreate failed\n"); free(host_frame); free(host_src); return 1; }
 
     void *d_frame = NULL, *d_out = NULL;
     if (cudaMalloc(&d_frame, frame_size) != cudaSuccess ||
-        cudaMalloc(&d_out, out_cap) != cudaSuccess) {
+        cudaMalloc(&d_out, decomp_size) != cudaSuccess) {
         printf("cudaMalloc failed\n"); slzDestroy(h); free(host_frame); free(host_src); return 1;
     }
     cudaMemcpy(d_frame, host_frame, frame_size, cudaMemcpyHostToDevice);
@@ -113,8 +113,7 @@ int main(int argc, char** argv) {
     dopts.enable_profiling = 1;
 
     /* Warm-up run (mirrors -db which does +1 untimed iteration). */
-    size_t out_len = 0;
-    slzStatus_t s = slzDecompressAsync(h, d_frame, frame_size, NULL, 0, d_out, out_cap, &out_len, dopts, stream);
+    slzStatus_t s = slzDecompressAsync(h, d_frame, frame_size, d_out, decomp_size, dopts, stream);
     if (s != SLZ_SUCCESS) {
         printf("warm-up slzDecompressAsync failed: %s\n", slzStatusString(s));
         return 1;
@@ -140,7 +139,7 @@ int main(int argc, char** argv) {
     for (int r = 0; r < runs; r++) {
         const double t0 = host_now_ms();
         cudaEventRecord(e_start, stream);
-        s = slzDecompressAsync(h, d_frame, frame_size, NULL, 0, d_out, out_cap, &out_len, dopts, stream);
+        s = slzDecompressAsync(h, d_frame, frame_size, d_out, decomp_size, dopts, stream);
         if (s != SLZ_SUCCESS) {
             printf("slzDecompressAsync run %d failed: %s\n", r, slzStatusString(s));
             return 1;
@@ -178,10 +177,10 @@ int main(int argc, char** argv) {
     }
 
     /* SHA-style byte compare against the host source. */
-    unsigned char* host_out = (unsigned char*)malloc(out_len);
+    unsigned char* host_out = (unsigned char*)malloc(decomp_size);
     if (!host_out) { printf("host_out alloc failed\n"); return 1; }
-    cudaMemcpy(host_out, d_out, out_len, cudaMemcpyDeviceToHost);
-    const int verify_ok = (out_len == src_size) && (memcmp(host_out, host_src, src_size) == 0);
+    cudaMemcpy(host_out, d_out, decomp_size, cudaMemcpyDeviceToHost);
+    const int verify_ok = memcmp(host_out, host_src, src_size) == 0;
 
     const double decomp_mb = (double)decomp_size / (1024.0 * 1024.0);
     const double wall_best_mb_s = decomp_mb / (best_wall / 1000.0);
