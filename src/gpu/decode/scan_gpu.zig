@@ -308,23 +308,44 @@ pub fn gpuScanChunks(
             if (launch(ml.compact_raw_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &cr_params, &cr_extra) != CUDA_SUCCESS) return null;
             dec_ctx.endKernelTiming(t_cr, stream);
         }
-        if (stream_sync(stream) != CUDA_SUCCESS) return null;
+        if (ml.merge_huff_descs_fn != 0) {
+            // Phase 3d (pure-D2D merge path, the common case): skip the
+            // compact-counts D2H + the cuStreamSynchronize that gated
+            // it. The merge kernel + huff_build + huff_decode + the
+            // raw-gather kernel all read their counts from
+            // d_compact_counts as device pointers (already wired up
+            // below) and self-gate. Downstream allocations use
+            // worst-case bounds (= total_subchunks per Huff stream type
+            // + 2× total_subchunks for the two raw streams).
+            //
+            // Cost: on L1/L2 frames (no entropy → actual counts 0) the
+            // merge / huff_build / huff_decode kernels still launch
+            // with worst-case grids and early-exit on
+            // *d_n_merged == 0. Estimated ~15 μs additional GPU time
+            // on the L1/L2 D2D path. Phase 4 (CUDA Graphs) recovers
+            // this and more by eliminating per-call launch latency on
+            // the captured pipeline.
+            num_lit = total_subchunks;
+            num_tok = total_subchunks;
+            num_hi = total_subchunks;
+            num_lo = total_subchunks;
+            num_raw = total_subchunks * 2;
+        } else {
+            // Legacy host-merge fallback (merge_huff_descs_fn unloaded):
+            // need actual counts host-side to size the host-buf appends
+            // + D2H the compacted descriptors into the host buffers.
+            // Hot path doesn't take this branch on any in-tree build —
+            // it's defensive against a future driver build dropping the
+            // merge kernel.
+            if (stream_sync(stream) != CUDA_SUCCESS) return null;
+            var counts: [5]u32 = .{ 0, 0, 0, 0, 0 };
+            if (d2h(@ptrCast(&counts), self.d_compact_counts, 5 * 4) != CUDA_SUCCESS) return null;
+            num_lit = counts[0];
+            num_tok = counts[1];
+            num_hi = counts[2];
+            num_lo = counts[3];
+            num_raw = counts[4];
 
-        // The 5 counts come back as a single 20 B D2H.
-        var counts: [5]u32 = .{ 0, 0, 0, 0, 0 };
-        if (d2h(@ptrCast(&counts), self.d_compact_counts, 5 * 4) != CUDA_SUCCESS) return null;
-        num_lit = counts[0];
-        num_tok = counts[1];
-        num_hi = counts[2];
-        num_lo = counts[3];
-        num_raw = counts[4];
-
-        // The legacy CPU-merge fallback consumes huff_*_host_buf /
-        // raw_off16_descs. The pure-D2D merge kernel reads d_compact_*
-        // directly, so the host arrays are only needed when the merge
-        // kernel itself is missing. Skip the ~120 KB D2H in the common
-        // case; populate host arrays only as a true fallback path.
-        if (ml.merge_huff_descs_fn == 0) {
             if (num_lit > 0 and num_lit <= huff_lit_descs.len)
                 if (d2h(@ptrCast(huff_lit_descs.ptr), self.d_compact_lit, @as(usize, num_lit) * @sizeOf(d.HuffDecChunkDesc)) != CUDA_SUCCESS) return null;
             if (num_tok > 0 and num_tok <= huff_tok_descs.len)
