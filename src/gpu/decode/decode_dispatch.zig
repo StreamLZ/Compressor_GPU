@@ -407,6 +407,14 @@ pub const DecodeRequest = struct {
     io: ?std.Io,
     d_output_target: ?u64,
     d_compressed_src: ?u64,
+    /// Phase 3: when non-null, the chunk descs already live on the
+    /// device at this address (size: chunk_descs.len * sizeof(ChunkDesc))
+    /// and the H2D from the host slice is skipped. `chunk_descs.len`
+    /// is still authoritative for the count. Used by the D2D path
+    /// (decompressFramedFromDevice) to reuse the walk-kernel's
+    /// `d_walk_chunks` directly instead of D2H'ing + re-H2D'ing the
+    /// same bytes.
+    d_chunk_descs_override: ?u64 = null,
 };
 
 pub fn fullGpuLaunch(
@@ -704,12 +712,20 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     if (!ensureDeviceBuf(&self.d_comp_persist, &self.d_comp_persist_size, comp_bytes + 16)) return error.OutOfDeviceMemory;
     if (!ensureDeviceBuf(&self.d_descs_persist, &self.d_descs_persist_size, desc_bytes)) return error.OutOfDeviceMemory;
 
-    // Chunk descs must be on device before the prefix-sum kernel reads
-    // them. h2d_fn is sync-on-host (cuMemcpyHtoD) so by the time it
-    // returns the data is already device-resident — no explicit sync
-    // needed before the launch below. Phase 2 removed the prior
-    // cuCtxSynchronize that was stalling caller streams.
-    try cudaCall(h2d_fn(self.d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes), .copy);
+    // Chunk descs land in d_descs_persist either by D2D-copy from a
+    // caller-supplied device buffer (Phase 3 — saves a D2H+H2D round
+    // trip on the pure-D2D path where the walk-frame kernel already
+    // wrote them to d_walk_chunks) or by H2D from the host slice
+    // (host-bounce path, no device chunks available). h2d_fn is
+    // sync-on-host (cuMemcpyHtoD), and cuMemcpyDtoDAsync on the
+    // caller's work_stream serializes with the prefix-sum kernel below
+    // via stream ordering.
+    if (req.d_chunk_descs_override) |dev_ptr| {
+        const d2d = fns.d2d orelse return error.BackendNotAvailable;
+        try cudaCall(d2d(self.d_descs_persist, dev_ptr, desc_bytes, self.work_stream), .copy);
+    } else {
+        try cudaCall(h2d_fn(self.d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes), .copy);
+    }
 
     // 4d Phase 3 step 6: prefix-sum runs on device. The 4-byte D2H of
     // total_subchunks below is launch-plumbing - needed to size the

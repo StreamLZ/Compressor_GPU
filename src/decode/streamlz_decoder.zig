@@ -117,14 +117,17 @@ pub fn decompressFramedFromDevice(
     d_output: u64,
     dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!u32 {
+    _ = allocator; // Phase 3: chunks no longer allocated host-side.
     // Step 1: walk kernel — device-only result, no D2H inside the launch.
     // GpuError variants from gpuWalkFrameImpl (OutOfDeviceMemory /
     // KernelLaunchFailed / SyncFailed / BackendNotAvailable / KernelMissing /
     // CopyFailed for the memset) propagate to the caller; no flattening.
     const dev = try gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size);
-    // Legacy bridge — until fullGpuLaunchImpl becomes a pure launcher
-    // (steps 2-5) it still wants host values + a host chunk_descs slice.
-    // Pull them explicitly here; subsequent steps eliminate each.
+    // walkMetaToHost is 24 B but still blocks the CPU — Phase 3 work
+    // here ends with the chunks D2H elimination below. Eliminating
+    // walkMetaToHost itself requires plumbing n_chunks / decomp_size /
+    // block_start as device pointers all the way to fullGpuLaunchImpl,
+    // which is a larger refactor (separate commit).
     const meta = try gpu_driver.walkMetaToHost(dev.d_meta);
     // status != 0 = walk kernel detected unsupported frame shape (dict,
     // PDM, checksums, multi-block). meta.n_chunks bounds check = corrupt
@@ -132,12 +135,6 @@ pub fn decompressFramedFromDevice(
     // semantic BadMode, not a CUDA-level failure.
     if (meta.status != 0) return error.BadMode;
     if (meta.n_chunks == 0 or meta.n_chunks > gpu_driver.WALK_MAX_CHUNKS) return error.BadMode;
-    const chunks = allocator.alloc(gpu_driver.ChunkDesc, meta.n_chunks) catch return error.OutOfMemory;
-    defer allocator.free(chunks);
-    {
-        const d2h = @import("../gpu/decode/driver.zig");
-        if (!d2h.copyDeviceToHost(std.mem.sliceAsBytes(chunks), dev.d_chunk_descs)) return error.CopyFailed;
-    }
     if (std.c.getenv("SLZ_E2E_TIMER") != null)
         std.debug.print("[walk] n_chunks={d} decomp={d} block_start={d} block_size={d} status={d}\n", .{ meta.n_chunks, meta.decomp_size, meta.block_start, meta.block_size, meta.status });
 
@@ -150,9 +147,16 @@ pub fn decompressFramedFromDevice(
     const stub_ptr: [*]const u8 = @ptrFromInt(0x10);
     const compressed_block: []const u8 = stub_ptr[0..meta.block_size];
 
+    // Phase 3: chunks slice is now a length-only stub (.len = meta.n_chunks);
+    // fullGpuLaunchImpl reads d_chunk_descs_override (a D2D copy from
+    // d_walk_chunks) instead of H2D'ing the host slice. Saves a D2H+H2D
+    // round trip of n_chunks × sizeof(ChunkDesc).
+    const chunk_stub_ptr: [*]const gpu_driver.ChunkDesc = @ptrFromInt(0x10);
+    const chunks_stub: []const gpu_driver.ChunkDesc = chunk_stub_ptr[0..meta.n_chunks];
+
     var dst_dummy: u8 = 0;
     gpu_driver.fullGpuLaunchImpl(dec_ctx, .{
-        .chunk_descs = chunks,
+        .chunk_descs = chunks_stub,
         .compressed_block = compressed_block,
         .dst_full = @ptrCast(&dst_dummy),
         .dst_start_off = 0,
@@ -162,6 +166,7 @@ pub fn decompressFramedFromDevice(
         .io = io,
         .d_output_target = d_output,
         .d_compressed_src = d_frame + meta.block_start,
+        .d_chunk_descs_override = dev.d_chunk_descs,
     }) catch |err| return err;
     return meta.decomp_size;
 }
