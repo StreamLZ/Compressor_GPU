@@ -690,7 +690,6 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
 
     const fns = try Fns.resolve();
     const h2d_fn = fns.h2d;
-    const d2h_fn = fns.d2h;
     const launch_fn = fns.launch;
 
     const total_output = dst_start_off + decompressed_size;
@@ -721,14 +720,21 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // it. Specific GpuError variants propagate (OutOfDeviceMemory /
     // KernelLaunchFailed / SyncFailed / BackendNotAvailable / KernelMissing).
     _ = try scan_gpu_mod.gpuPrefixSumChunksImpl(self, self.d_descs_persist, @intCast(chunk_descs.len), sub_chunk_cap);
-    var total_subchunks: u32 = 0;
-    try cudaCall(d2h_fn(@ptrCast(&total_subchunks), self.d_total_subchunks_buf, 4), .copy);
-    // CPU mirror for the pipeline branch - NUM_PIPELINE_STREAMS==1
-    // reads only index 0 (= 0). Storage lives on the DecodeContext;
-    // zero-init at first use is enough (subsequent calls overwrite as
-    // needed). Bumping the stream count would need a selective D2H of
-    // group boundaries from d_first_sub_idx_persist.
-    const first_subchunk_idx_buf: []u32 = &self.first_subchunk_idx_buf;
+    // Phase 3: skip the D2H of total_subchunks — use a worst-case bound
+    // computed host-side. Max sub-chunks per chunk = ceil(chunk_size /
+    // sub_chunk_cap), clamped to MAX_BLOCKS_PER_SUBCHUNK*2 = 4 in the
+    // tightest 64KB sub-chunk case. Over-allocating entropy_scratch is
+    // safe (kernels self-gate on actual count via d_total_subchunks_buf
+    // / d_compact_counts). Saves a 4-byte D2H + the implicit kernel
+    // sync it forced.
+    // Wire format: SLZ_CHUNK_SIZE_BYTES = 256 KB (matches src/gpu/common/gpu_wire_format.cuh)
+    const CHUNK_SIZE_BYTES: u32 = 0x40000;
+    const max_sub_per_chunk: u32 = if (sub_chunk_cap == 0) 4 else @max(1, (CHUNK_SIZE_BYTES + sub_chunk_cap - 1) / sub_chunk_cap);
+    // Worst-case upper bound on total sub-chunks across the frame; used
+    // for entropy_scratch sizing + region offsets that must match between
+    // the merge-kernel writer and the LZ-kernel reader. Naming kept as
+    // `total_subchunks` so downstream call sites are unchanged.
+    const total_subchunks: u32 = @as(u32, @intCast(chunk_descs.len)) * max_sub_per_chunk;
     // d.ENTROPY_SCRATCH_SLOT_BYTES holds the largest sub-chunk's lit/tok
     // streams; off16-hi at +0, off16-lo at +d.OFF16_HILO_SPLIT_OFFSET
     // within each slot. Layout: [lit: total*slot] [tok: total*slot] [off16: total*slot].
@@ -739,22 +745,15 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     const off16_offset = @as(usize, total_subchunks) * per_subchunk_scratch * 2;
     self.d_entropy_off16_scratch = self.d_entropy_scratch + off16_offset;
 
-    // Sub-chunks per chunk > 1 (sc<1 cases) want the per-chunk first-sub-chunk
-    // table on host for the pipeline split; the 1-sub-chunk-per-chunk case
-    // doesn't need it (chunk_idx is the global sub-chunk idx). Pass either
-    // the device-resident prefix sum or 0 (nullptr → kernel uses identity).
-    const need_first_sub_idx = total_subchunks != @as(u32, @intCast(chunk_descs.len));
-    self.d_first_subchunk_idx = if (need_first_sub_idx) self.d_first_sub_idx_persist else 0;
-    if (need_first_sub_idx) {
-        // Host buffer is sized WALK_MAX_CHUNKS × u32; reject frames with
-        // more chunks than that to prevent the D2H below from overrunning
-        // it. The gpu_scan path has its own equivalent check (search
-        // `first_subchunk_idx_buf.len` below); add the same guard here so
-        // the host-scan / no-gpu-scan path is also safe.
-        if (chunk_descs.len > first_subchunk_idx_buf.len) return error.BadMode;
-        const fs_bytes: usize = chunk_descs.len * @sizeOf(u32);
-        try cudaCall(d2h_fn(@ptrCast(first_subchunk_idx_buf.ptr), self.d_first_sub_idx_persist, fs_bytes), .copy);
-    }
+    // Phase 3: always pass the device prefix-sum to the LZ kernel.
+    // When sub_chunk_cap >= chunk_size the prefix sum is [0, 1, 2, ...]
+    // and the kernel reads identity values — same effective behavior as
+    // the prior null-pointer / kernel-side identity branch. The 4 B
+    // saving on the dead D2H of first_subchunk_idx_buf (which no host
+    // code ever read) was a pure removal; nothing downstream depended
+    // on it.
+    self.d_first_subchunk_idx = self.d_first_sub_idx_persist;
+    if (chunk_descs.len > self.first_subchunk_idx_buf.len) return error.BadMode;
 
     // 4d Phase 3 D2D: source bytes already device-resident → D2D-copy
     // them into d_comp_persist (no PCIe). Else H2D from host.
@@ -788,7 +787,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         // segfault. The GPU scan reads from d_comp_persist (the D2D-
         // copied data), which is what we want.
         const want_gpu_scan = ml.scan_parse_fn != 0 and
-            chunk_descs.len <= first_subchunk_idx_buf.len and
+            chunk_descs.len <= self.first_subchunk_idx_buf.len and
             (d_compressed_src != null or std.c.getenv("SLZ_GPU_SCAN") != null);
         const gpu_scan: ?ScanResult = if (want_gpu_scan)
             scan_gpu_mod.gpuScanChunks(

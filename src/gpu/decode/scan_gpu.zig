@@ -111,13 +111,16 @@ pub fn gpuPrefixSumChunksImpl(
     if (!ml.init()) return error.BackendNotAvailable;
     if (ml.prefix_sum_chunks_fn == 0) return error.KernelMissing;
     const launch = cuda.cuLaunchKernel_fn orelse return error.BackendNotAvailable;
-    const stream_sync = cuda.cuStreamSync_fn orelse return error.BackendNotAvailable;
 
     const first_bytes: usize = @as(usize, d.WALK_MAX_CHUNKS) * 4;
     if (!ensureDeviceBuf(&self.d_first_sub_idx_persist, &self.d_first_sub_idx_persist_size, first_bytes)) return error.OutOfDeviceMemory;
     if (!ensureDeviceBuf(&self.d_total_subchunks_buf, &self.d_total_subchunks_buf_size, 4)) return error.OutOfDeviceMemory;
 
-    // Phase 2: launch on caller's stream when async; sync only that stream.
+    // Phase 2: launch on caller's stream when async (0 otherwise).
+    // Phase 3: no internal sync — downstream consumers are kernels on
+    // the same stream and serialize naturally. Result device pointers
+    // (d_first_sub_idx, d_total_subchunks_buf) are read by kernels, not
+    // by host.
     const stream = self.work_stream;
     var k_chunks = d_chunk_descs;
     var k_n = n_chunks;
@@ -132,7 +135,6 @@ pub fn gpuPrefixSumChunksImpl(
     const t_prefix = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzPrefixSumChunksKernel", stream);
     try cudaCall(launch(ml.prefix_sum_chunks_fn, 1, 1, 1, 1, 1, 1, 0, stream, &params, &extra), .launch);
     dec_ctx.endKernelTiming(t_prefix, stream);
-    try cudaCall(stream_sync(stream), .sync);
 
     return .{
         .d_first_sub_idx = self.d_first_sub_idx_persist,
