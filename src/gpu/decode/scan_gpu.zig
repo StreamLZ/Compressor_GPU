@@ -56,7 +56,6 @@ pub fn gpuWalkFrameImpl(
     if (!ml.init()) return error.BackendNotAvailable;
     if (ml.walk_frame_fn == 0) return error.KernelMissing;
     const launch = cuda.cuLaunchKernel_fn orelse return error.BackendNotAvailable;
-    const stream_sync = cuda.cuStreamSync_fn orelse return error.BackendNotAvailable;
     const memset = cuda.cuMemsetD8_fn orelse return error.BackendNotAvailable;
 
     const chunks_bytes: usize = @as(usize, d.WALK_MAX_CHUNKS) * @sizeOf(d.ChunkDesc);
@@ -64,8 +63,9 @@ pub fn gpuWalkFrameImpl(
     if (!ensureDeviceBuf(&self.d_walk_meta, &self.d_walk_meta_size, d.walk_meta_offsets.bytes)) return error.OutOfDeviceMemory;
     try cudaCall(memset(self.d_walk_meta, 0, d.walk_meta_offsets.bytes), .copy);
 
-    // Phase 2: launch on caller's work_stream (async) or stream 0 (sync).
-    // Stream-targeted sync below won't stall the caller's OTHER streams.
+    // Phase 3c: launch on work_stream (sync=0, async=caller's stream).
+    // No post-kernel sync here — the caller's walkMetaToHostAsync (or
+    // any subsequent kernel on the same stream) serializes naturally.
     const stream = self.work_stream;
     var k_frame = d_frame;
     var k_size = frame_size;
@@ -88,7 +88,6 @@ pub fn gpuWalkFrameImpl(
     const t_walk = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzWalkFrameKernel", stream);
     try cudaCall(launch(ml.walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, stream, &params, &extra), .launch);
     dec_ctx.endKernelTiming(t_walk, stream);
-    try cudaCall(stream_sync(stream), .sync);
 
     return .{
         .d_chunk_descs = self.d_walk_chunks,
@@ -142,13 +141,20 @@ pub fn gpuPrefixSumChunksImpl(
     };
 }
 
-/// D2H the walk metadata struct from the device. Same rationale as
-/// `gpuWalkFrameImpl` for the GpuError!T return: pairs of (alloc / copy
-/// / missing-symbol) failures need to surface distinctly.
-pub fn walkMetaToHost(d_meta: u64) GpuError!d.WalkMeta {
-    const d2h = cuda.cuMemcpyDtoH_fn orelse return error.BackendNotAvailable;
+/// D2H the walk metadata struct from the device.
+/// Phase 3c: now async on `stream` + stream-targeted sync — preserves
+/// caller's other-stream parallelism (the prior synchronous cuMemcpyDtoH
+/// implicitly stalled stream 0 against every other stream in the context).
+/// Status check is the caller's responsibility — the GPU decode contract
+/// is that the input frame came from the GPU encode path; CPU-produced
+/// frames (dict / multi-block / PDM / checksumed) are out of scope and
+/// allowed to fail loudly (see feedback_cpu_gpu_separate_formats).
+pub fn walkMetaToHost(d_meta: u64, stream: usize) GpuError!d.WalkMeta {
+    const d2h_async = cuda.cuMemcpyDtoHAsync_fn orelse return error.BackendNotAvailable;
+    const stream_sync = cuda.cuStreamSync_fn orelse return error.BackendNotAvailable;
     var m: [6]u32 = .{0} ** 6;
-    try cudaCall(d2h(@ptrCast(&m), d_meta, d.walk_meta_offsets.bytes), .copy);
+    try cudaCall(d2h_async(@ptrCast(&m), d_meta, d.walk_meta_offsets.bytes, stream), .copy);
+    try cudaCall(stream_sync(stream), .sync);
     return .{
         .n_chunks = m[0], .decomp_size = m[1], .sub_chunk_cap = m[2],
         .block_start = m[3], .block_size = m[4], .status = m[5],

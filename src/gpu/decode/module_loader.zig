@@ -86,6 +86,7 @@ pub fn init() bool {
     cuda.cuStreamDestroy_fn = cuda.getProc(cuda.FnStreamDestroy, "cuStreamDestroy_v2") orelse cuda.getProc(cuda.FnStreamDestroy, "cuStreamDestroy");
     cuda.cuStreamSync_fn = cuda.getProc(cuda.FnStreamSync, "cuStreamSynchronize_v2") orelse cuda.getProc(cuda.FnStreamSync, "cuStreamSynchronize");
     cuda.cuMemcpyHtoDAsync_fn = cuda.getProc(cuda.FnMemcpyHtoDAsync, "cuMemcpyHtoDAsync_v2");
+    cuda.cuMemcpyDtoHAsync_fn = cuda.getProc(cuda.FnMemcpyDtoHAsync, "cuMemcpyDtoHAsync_v2");
     cuda.cuMemcpyDtoDAsync_fn = cuda.getProc(cuda.FnMemcpyDtoDAsync, "cuMemcpyDtoDAsync_v2");
     cuda.cuMemsetD8Async_fn = cuda.getProc(cuda.FnMemsetD8Async, "cuMemsetD8Async");
     cuda.cuMemAllocHost_fn = cuda.getProc(cuda.FnMemAllocHost, "cuMemAllocHost_v2");

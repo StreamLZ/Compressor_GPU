@@ -123,17 +123,19 @@ pub fn decompressFramedFromDevice(
     // KernelLaunchFailed / SyncFailed / BackendNotAvailable / KernelMissing /
     // CopyFailed for the memset) propagate to the caller; no flattening.
     const dev = try gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size);
-    // walkMetaToHost is 24 B but still blocks the CPU — Phase 3 work
-    // here ends with the chunks D2H elimination below. Eliminating
-    // walkMetaToHost itself requires plumbing n_chunks / decomp_size /
-    // block_start as device pointers all the way to fullGpuLaunchImpl,
-    // which is a larger refactor (separate commit).
-    const meta = try gpu_driver.walkMetaToHost(dev.d_meta);
-    // status != 0 = walk kernel detected unsupported frame shape (dict,
-    // PDM, checksums, multi-block). meta.n_chunks bounds check = corrupt
-    // frame. Both are "the GPU can't handle this; fall back to host" —
-    // semantic BadMode, not a CUDA-level failure.
-    if (meta.status != 0) return error.BadMode;
+    // Phase 3c: walk-kernel finished launch (no internal sync). The
+    // meta D2H below rides the same work_stream so it serializes after
+    // the kernel; stream-targeted sync (instead of the prior ctx-wide
+    // implicit sync from a plain cuMemcpyDtoH) preserves caller's other
+    // streams.
+    const meta = try gpu_driver.walkMetaToHost(dev.d_meta, dec_ctx.work_stream);
+    // No status check: the GPU decode contract is GPU-produced frames
+    // only. CPU-produced frames (dict / multi-block / PDM / checksums)
+    // are out of scope per feedback_cpu_gpu_separate_formats — feeding
+    // one in is allowed to fail loudly with garbage output or AV.
+    // The n_chunks bound below still catches genuine frame corruption
+    // and pure-garbage memory (the cheap defensive check is host-only,
+    // not on the GPU hot path).
     if (meta.n_chunks == 0 or meta.n_chunks > gpu_driver.WALK_MAX_CHUNKS) return error.BadMode;
     if (std.c.getenv("SLZ_E2E_TIMER") != null)
         std.debug.print("[walk] n_chunks={d} decomp={d} block_start={d} block_size={d} status={d}\n", .{ meta.n_chunks, meta.decomp_size, meta.block_start, meta.block_size, meta.status });
