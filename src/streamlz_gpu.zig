@@ -681,7 +681,13 @@ export fn slzCompressAsync(
         .d_dst = @intFromPtr(out_dev),
         .work_stream = @intFromPtr(stream),
     };
-    const rc = runOnWorker(CompressJob, &job);
+    // Run inline on the caller's thread (nvCOMP-style — no per-call
+    // thread spawn). The host front half (setup + measure-pass D2H +
+    // headers) blocks the caller; the heavy back-half kernels +
+    // final D2D copy ride `stream` and complete after the caller's
+    // cudaStreamSynchronize.
+    CompressJob.run(&job);
+    const rc = job.result;
     if (rc < 0) return rc;
     out_size.* = @intCast(rc);
     return SLZ_SUCCESS;
@@ -715,7 +721,13 @@ export fn slzDecompressAsync(
         .opts = opts,
         .work_stream = @intFromPtr(stream),
     };
-    const rc = runOnWorker(DecompressJobTrueD2D, &true_job);
+    // Run inline on the caller's thread (nvCOMP-style — no per-call
+    // thread spawn). The host front half (walk + scan + prefix-sum +
+    // compact + merge) blocks the caller; the heavy back-half Huff +
+    // LZ kernels and the final D2D output copy ride `stream` and
+    // complete after the caller's cudaStreamSynchronize.
+    DecompressJobTrueD2D.run(&true_job);
+    const rc = true_job.result;
     if (rc >= 0) {
         out_size.* = @intCast(rc);
         return SLZ_SUCCESS;
@@ -745,6 +757,7 @@ export fn slzGetLastTimings(
     // empty (already finalized by sync wrapper or another call). For
     // slzCompressAsync/slzDecompressAsync callers this is where timings
     // materialize — they must have synced the user stream first.
+    // Convenience: slzWaitAndGetLastTimings does the stream sync for them.
     gpu_driver.finalizeProfiling(&h.enc.pending_timings, &h.enc.last_timings);
     gpu_driver.finalizeProfiling(&h.dec.pending_timings, &h.dec.last_timings);
     const enc_list = h.enc.last_timings.items;
@@ -765,4 +778,27 @@ export fn slzGetLastTimings(
         }
     }
     return SLZ_SUCCESS;
+}
+
+// Wait on the caller's CUstream and then drain per-kernel timings.
+// Async convenience: avoids the caller's "cudaStreamSynchronize, then
+// slzGetLastTimings" pair. Passing stream=NULL behaves like the
+// synchronous slzGetLastTimings (no stream sync; assumes already
+// synced).
+const cuda_api = @import("gpu/decode/cuda_api.zig");
+const CUDA_SUCCESS: c_int = 0;
+export fn slzWaitAndGetLastTimings(
+    handle: ?*Context,
+    stream: ?*anyopaque,
+    timings: ?[*]KernelTimingC,
+    capacity: usize,
+    count_out: ?*usize,
+) c_int {
+    _ = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    _ = count_out orelse return SLZ_ERROR_INVALID_ARG;
+    if (stream) |s| {
+        const sync_fn = cuda_api.cuStreamSync_fn orelse return SLZ_ERROR_CUDA;
+        if (sync_fn(@intFromPtr(s)) != CUDA_SUCCESS) return SLZ_ERROR_CUDA;
+    }
+    return slzGetLastTimings(handle, timings, capacity, count_out);
 }

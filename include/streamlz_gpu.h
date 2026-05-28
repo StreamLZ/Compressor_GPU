@@ -112,10 +112,24 @@ typedef struct slzKernelTiming_t {
  * compress/decompress call on this handle. `timings` may be NULL to query
  * the count only. On return, *count is the number of timings the library
  * actually has; only min(capacity, *count) entries are written into
- * `timings`. Returns SLZ_SUCCESS even when capacity < *count. */
+ * `timings`. Returns SLZ_SUCCESS even when capacity < *count.
+ *
+ * For ASYNC callers: you must cudaStreamSynchronize the stream you
+ * passed to slz*Async BEFORE calling this — otherwise the cuEvent pairs
+ * have not completed and their timings will be reported as 0. Use
+ * slzWaitAndGetLastTimings to do the sync + drain in one call. */
 slzStatus_t slzGetLastTimings(slzHandle_t handle,
                               slzKernelTiming_t* timings, size_t capacity,
                               size_t* count);
+
+/* Async convenience: cudaStreamSynchronize(stream) + slzGetLastTimings
+ * in one call. Pass `stream` = NULL to skip the sync (equivalent to
+ * slzGetLastTimings directly; use when you've already synchronized).
+ * Otherwise `stream` is a CUstream / cudaStream_t cast to void*, the
+ * same stream you passed to slzCompressAsync / slzDecompressAsync. */
+slzStatus_t slzWaitAndGetLastTimings(slzHandle_t handle, void* stream,
+                                     slzKernelTiming_t* timings,
+                                     size_t capacity, size_t* count);
 
 /* ---- Size queries --------------------------------------------------- */
 /* Worst-case compressed-frame size for `input_size` input bytes. Use it
@@ -178,6 +192,10 @@ slzStatus_t slzDecompress(slzHandle_t handle,
  * nvcompBatchedXxxAsync pattern: submit GPU work on the caller's stream
  * and return — the caller's cudaStreamSynchronize is the sync point.
  *
+ * The call runs on the CALLER's thread (no internal worker / no per-call
+ * thread spawn). Host-side setup work blocks the caller; only the heavy
+ * back-half kernels and final D2D copy ride `stream` asynchronously.
+ *
  * `stream` is a CUDA driver-API CUstream (== cudaStream_t) cast to
  * void*. NULL is interpreted as the default stream (stream 0), which
  * makes the call behave like the synchronous variant.
@@ -186,20 +204,24 @@ slzStatus_t slzDecompress(slzHandle_t handle,
  * before returning (it knows the size from the frame header / the
  * compressed-frame layout — no cuMemcpy is required after sync).
  *
- * Decompress: the walk + scan + compact + merge phases still block
- * internally (host-dependent values). The heavy Huffman-decode + LZ-
- * decode kernels and the final D2D output copy ride the caller's
- * stream and are NOT waited on; user must cudaStreamSynchronize the
- * stream to consume `d_output`.
+ * Decompress: the walk + scan + compact + merge phases still block the
+ * CALLER's thread (host-dependent values + stream-0 implicit sync).
+ * The heavy Huffman-decode + LZ-decode kernels and the final D2D output
+ * copy ride the caller's stream and are NOT waited on; user must
+ * cudaStreamSynchronize the stream to consume `d_output`.
  *
  * Compress: the LZ-encode + Huff-encode + assemble passes still block
- * internally (data dependencies on per-chunk sizes). Only the final
- * frame-assembly kernel is queued on the caller's stream; for the
+ * the CALLER's thread (data dependencies on per-chunk sizes). Only the
+ * final frame-assembly kernel is queued on the caller's stream; for the
  * pure-D2D path that is where the frame bytes land in d_output.
  *
  * Errors from the synchronous prefix surface as a negative status code
  * the same way as the sync entry points; errors from the queued kernels
- * surface via cudaGetLastError after the user's synchronize. */
+ * surface via cudaGetLastError after the user's synchronize.
+ *
+ * Stack: these functions are stack-cheap (no deep encode/decode
+ * orchestration on the call frame); safe to invoke from any thread with
+ * a normal stack (>= 1 MB). */
 slzStatus_t slzCompressAsync(slzHandle_t handle,
                              const void* d_input, size_t input_size,
                              void* d_temp, size_t temp_size,
