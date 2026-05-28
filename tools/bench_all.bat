@@ -3,26 +3,17 @@ REM ============================================================
 REM tools/bench_all.bat
 REM
 REM Post-phase validation: re-encodes the canonical L1-L5 sets on
-REM enwik8 + silesia, runs -db -r 30 decode benchmarks on each, and
-REM verifies SHA-256 roundtrip. Use after any change that could
-REM plausibly affect the GPU encode or decode hot path.
+REM enwik8 + silesia, runs -db -r 30 decode benchmarks on each,
+REM verifies SHA-256 roundtrip, and prints a summary table with
+REM D2D / e2e / ratio vs the README baseline. Use after any change
+REM that could plausibly affect the GPU encode or decode hot path.
 REM
 REM Sequential by design (per the no-parallel-benchmarks rule).
-REM Shows all output (no grep filtering).
+REM Shows all output (no grep filtering); summary at the end.
 REM
-REM Expected baseline (RTX 4060 Ti, sm_89, May 2026) — see
-REM src/gpu/README.md for the authoritative table:
-REM
-REM   enwik8    L1 D2D 2.91 / e2e 15.57 / ratio 58.6%
-REM   enwik8    L2 D2D 2.93 / e2e 15.59 / ratio 58.6%
-REM   enwik8    L3 D2D 4.09 / e2e 15.66 / ratio 43.7%
-REM   enwik8    L4 D2D 3.93 / e2e 15.42 / ratio 42.7%
-REM   enwik8    L5 D2D 4.12 / e2e 15.39 / ratio 39.6%
-REM   silesia   L1 D2D 5.07 / e2e 30.07 / ratio 47.8%
-REM   silesia   L2 D2D 5.09 / e2e 30.11 / ratio 47.8%
-REM   silesia   L3 D2D 7.15 / e2e 30.84 / ratio 38.0%
-REM   silesia   L4 D2D 6.94 / e2e 30.65 / ratio 37.5%
-REM   silesia   L5 D2D 7.72 / e2e 30.76 / ratio 33.9%
+REM Baseline source: src/gpu/README.md "Decode (ms): D2D wall-
+REM clock and end-to-end" table + the "Compression ratio" table.
+REM Measured on an RTX 4060 Ti (sm_89), May 2026.
 REM ============================================================
 setlocal
 pushd "%~dp0\.."
@@ -65,14 +56,16 @@ echo ============================================================
 for %%L in (1 2 3 4 5) do (
     echo.
     echo --- enwik8 L%%L decode bench ---
-    "%SLZ%" -db -r 30 -gpu "%TMP%\bench_e_L%%L.slz"
+    "%SLZ%" -db -r 30 -gpu "%TMP%\bench_e_L%%L.slz" > "%TMP%\bench_out_e_L%%L.txt"
     if errorlevel 1 (echo bench enwik8 L%%L FAILED & exit /b 1)
+    type "%TMP%\bench_out_e_L%%L.txt"
 )
 for %%L in (1 2 3 4 5) do (
     echo.
     echo --- silesia L%%L decode bench ---
-    "%SLZ%" -db -r 30 -gpu "%TMP%\bench_s_L%%L.slz"
+    "%SLZ%" -db -r 30 -gpu "%TMP%\bench_s_L%%L.slz" > "%TMP%\bench_out_s_L%%L.txt"
     if errorlevel 1 (echo bench silesia L%%L FAILED & exit /b 1)
+    type "%TMP%\bench_out_s_L%%L.txt"
 )
 
 echo.
@@ -87,13 +80,54 @@ for %%L in (1 2 3 4 5) do (
     "%SLZ%" -d -gpu "%TMP%\bench_s_L%%L.slz" -o "%TMP%\bench_s_L%%L.bin" >nul
     if errorlevel 1 (echo decode silesia L%%L FAILED & exit /b 1)
 )
+
+echo.
+echo ============================================================
+echo  Summary
+echo ============================================================
 powershell -NoProfile -Command ^
-    "$e = (Get-FileHash assets/enwik8.txt).Hash;" ^
-    "$s = (Get-FileHash assets/silesia_all.tar).Hash;" ^
-    "Write-Host ('enwik8.txt        SHA = ' + $e);" ^
-    "1..5 | ForEach-Object { $h = (Get-FileHash ('%TMP%/bench_e_L' + $_ + '.bin')).Hash; $ok = if ($h -eq $e) {'OK '} else {'FAIL'}; Write-Host ('enwik8 L'  + $_ + '  ' + $ok + '  ' + $h) };" ^
-    "Write-Host ('silesia_all.tar   SHA = ' + $s);" ^
-    "1..5 | ForEach-Object { $h = (Get-FileHash ('%TMP%/bench_s_L' + $_ + '.bin')).Hash; $ok = if ($h -eq $s) {'OK '} else {'FAIL'}; Write-Host ('silesia L' + $_ + '  ' + $ok + '  ' + $h) }"
+    "$srcEnwik = (Get-Item 'assets/enwik8.txt').Length;" ^
+    "$srcSiles = (Get-Item 'assets/silesia_all.tar').Length;" ^
+    "$shaE = (Get-FileHash 'assets/enwik8.txt').Hash;" ^
+    "$shaS = (Get-FileHash 'assets/silesia_all.tar').Hash;" ^
+    "$base = @{" ^
+        "'e_1' = @{D2D=2.91; E2E=15.57; Ratio=58.6};" ^
+        "'e_2' = @{D2D=2.93; E2E=15.59; Ratio=58.6};" ^
+        "'e_3' = @{D2D=4.09; E2E=15.66; Ratio=43.7};" ^
+        "'e_4' = @{D2D=3.93; E2E=15.42; Ratio=42.7};" ^
+        "'e_5' = @{D2D=4.12; E2E=15.39; Ratio=39.6};" ^
+        "'s_1' = @{D2D=5.07; E2E=30.07; Ratio=47.8};" ^
+        "'s_2' = @{D2D=5.09; E2E=30.11; Ratio=47.8};" ^
+        "'s_3' = @{D2D=7.15; E2E=30.84; Ratio=38.0};" ^
+        "'s_4' = @{D2D=6.94; E2E=30.65; Ratio=37.5};" ^
+        "'s_5' = @{D2D=7.72; E2E=30.76; Ratio=33.9} };" ^
+    "function ParseBench($p) {" ^
+        "$t = Get-Content $p;" ^
+        "$e2e = ($t | Where-Object { $_ -match '^\s+best:\s+([\d.]+) ms' } | ForEach-Object { [double]$matches[1] });" ^
+        "$d2d = ($t | Where-Object { $_ -match '^\s+gpu kernel best:\s+([\d.]+) ms' } | ForEach-Object { [double]$matches[1] });" ^
+        "return @{E2E=$e2e; D2D=$d2d} };" ^
+    "$fmt = '{0,-12} {1,7} {2,7} {3,8}   {4,7} {5,7} {6,8}   {7,6} {8,6} {9,7}   {10,4}';" ^
+    "Write-Host ($fmt -f 'corpus/lvl','D2D','base','d-D2D','e2e','base','d-e2e','ratio','base','d-ratio','SHA');" ^
+    "Write-Host ($fmt -f '------------','-----','-----','-----','-----','-----','-----','-----','-----','-----','---');" ^
+    "function Row($corp, $lvl, $slz, $bin, $srcLen, $srcSha) {" ^
+        "$out = ParseBench (\"$env:TEMP_BENCH/bench_out_${corp}_L${lvl}.txt\" -replace '/', '\\');" ^
+        "$key = \"${corp}_${lvl}\";" ^
+        "$b = $base[$key];" ^
+        "$frame = (Get-Item $slz).Length;" ^
+        "$ratio = [math]::Round(($frame / $srcLen) * 100, 2);" ^
+        "$sha = (Get-FileHash $bin).Hash;" ^
+        "$shaOk = if ($sha -eq $srcSha) {'OK'} else {'FAIL'};" ^
+        "$dD2D = [math]::Round($out.D2D - $b.D2D, 2);" ^
+        "$dE2E = [math]::Round($out.E2E - $b.E2E, 2);" ^
+        "$dRat = [math]::Round($ratio - $b.Ratio, 2);" ^
+        "$label = if ($corp -eq 'e') {\"enwik8  L$lvl\"} else {\"silesia L$lvl\"};" ^
+        "Write-Host ($fmt -f $label, $out.D2D, $b.D2D, $dD2D, $out.E2E, $b.E2E, $dE2E, $ratio, $b.Ratio, $dRat, $shaOk) };" ^
+    "$env:TEMP_BENCH = '%TMP%';" ^
+    "1..5 | ForEach-Object { Row 'e' $_ \"%TMP%/bench_e_L${_}.slz\" \"%TMP%/bench_e_L${_}.bin\" $srcEnwik $shaE };" ^
+    "1..5 | ForEach-Object { Row 's' $_ \"%TMP%/bench_s_L${_}.slz\" \"%TMP%/bench_s_L${_}.bin\" $srcSiles $shaS };" ^
+    "Write-Host '';" ^
+    "Write-Host 'Times in ms (best of 30). d-* columns are now minus baseline; negative = improvement.';" ^
+    "Write-Host 'Baseline source: src/gpu/README.md (RTX 4060 Ti, May 2026).'"
 
 echo.
 echo bench_all done.
