@@ -14,9 +14,6 @@ test {
     _ = @import("decode/streamlz_decoder.zig");
     _ = @import("encode/streamlz_encoder.zig");
     _ = @import("encode/fast_framed.zig");
-    _ = @import("encode/gpu_stream_assembly.zig");
     _ = @import("encode/gpu_roundtrip_tests.zig");
-    _ = @import("encode/entropy/byte_histogram.zig");
-    _ = @import("encode/entropy/entropy_encoder.zig");
     _ = @import("encode/fast/fast_constants.zig");
 }

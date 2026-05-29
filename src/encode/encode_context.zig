@@ -31,7 +31,20 @@ const CUdeviceptr = ffi.CUdeviceptr;
 pub const INITIAL_LITERAL_COPY_BYTES: u32 = 8;
 pub const SC_TAIL_PER_CHUNK_BYTES: u32 = 8;
 pub const CHUNK_INTERNAL_HDR_BYTES: u32 = 6;
+/// Per-chunk header overhead for a compressed chunk: 2-byte internal
+/// block header + 4-byte chunk header word. An uncompressed chunk
+/// carries only the internal block header (with the uncompressed flag
+/// set in byte 0), so its overhead is `UNCOMPRESSED_CHUNK_HDR_BYTES`.
+pub const UNCOMPRESSED_CHUNK_HDR_BYTES: u32 = 2;
 pub const NEXT_HASH_ENTRIES: usize = 65536;
+
+/// Sentinel value the host writes into `per_chunk_asm_off[i]` when chunk
+/// `i` is being emitted uncompressed. The frame-assembly kernel reads
+/// this exact value and switches its per-chunk write path: instead of
+/// copying from `d_asm_out`, it copies `per_chunk_asm_size[i]` raw bytes
+/// from `d_input` at offset `i * eff_chunk_size`. Must stay byte-equal
+/// to `UNCOMPRESSED_CHUNK_MARKER` in assemble_kernel.cu.
+pub const UNCOMPRESSED_CHUNK_MARKER: u32 = 0xFFFFFFFF;
 
 // ── Chunk descriptor (matches CUDA struct) ──────────────────────
 pub const CompressChunkDesc = extern struct {
@@ -92,21 +105,32 @@ pub const EncodeContext = struct {
     // complete. The sync wrapper leaves it at 0 (default stream).
     work_stream: usize = 0,
 
-    // 4d Phase 3: when set to a non-zero device address, gpuCompressImpl
-    // populates d_input_persist via a D2D copy from this pointer instead
-    // of the H2D from the host `input` slice - the caller's data is
-    // already GPU-resident (slzCompress D2D path). The caller resets it
-    // to 0 after the compress call.
+    /// When non-zero, the encode pipeline reads source bytes from this
+    /// device address (D2D copy into `d_input_persist`) instead of H2D-ing
+    /// from the host `input` slice. Set by `slzCompressAsync` (caller's
+    /// device input) and by `compressFramedOne` when it wraps a host
+    /// input through the internal pure-D2D path. Reset to 0 by the caller
+    /// after the compress call.
     d_input_override: u64 = 0,
 
-    // 4d step 8: when set to a non-zero device address, the frame-assembly
-    // path writes the full StreamLZ frame straight to this device buffer
-    // (slzFrameAssembleKernel), skipping the host frame-build loop and
-    // the wrapper's H2D bounce. Caller (slzCompress C-ABI) inspects
-    // `output_written_to_device` after the encode to decide whether the
-    // H2D fallback is needed.
+    /// When non-zero, the frame-assembly kernel writes the entire SLZ1
+    /// frame directly into this device buffer; no host-side frame
+    /// assembly runs. Set by `slzCompressAsync` (caller's device output)
+    /// and by `compressFramedOne` when it wraps. Reset to 0 by the
+    /// caller after the compress call.
     d_output_override: u64 = 0,
     output_written_to_device: bool = false,
+
+    /// Persistent device buffer holding the host source bytes when the
+    /// caller did not provide a device input. Reused across calls;
+    /// grown via `ensureBuf` when a larger input arrives.
+    d_host_wrap_input: CUdeviceptr = 0,
+    d_host_wrap_input_size: usize = 0,
+
+    /// Persistent device buffer holding the assembled frame when the
+    /// caller did not provide a device output. Reused across calls.
+    d_host_wrap_output: CUdeviceptr = 0,
+    d_host_wrap_output_size: usize = 0,
 
     // 4d step 8 scratch - small device buffers populated host-side per call:
     //   d_frame_chunk_dst    - per-chunk dst offsets (n_chunks × u32)
@@ -232,6 +256,8 @@ pub const EncodeContext = struct {
         free_dev(&self.d_frame_prefix_bytes, &self.d_frame_prefix_bytes_size);
         free_dev(&self.d_input_persist, &self.d_input_size);
         free_dev(&self.d_output_persist, &self.d_output_size);
+        free_dev(&self.d_host_wrap_input, &self.d_host_wrap_input_size);
+        free_dev(&self.d_host_wrap_output, &self.d_host_wrap_output_size);
         free_dev(&self.d_descs_persist, &self.d_descs_size);
         free_dev(&self.d_hash_persist, &self.d_hash_size);
         free_dev(&self.d_sizes_persist, &self.d_sizes_size);
@@ -288,10 +314,15 @@ pub fn ensureBuf(ptr: *CUdeviceptr, cur: *usize, needed: usize) bool {
 }
 
 /// Copy `dst.len` bytes from a device address into the host slice `dst`.
-/// Used by 4d Phase 3 D2D encode fallback paths that need a few bytes
-/// of the device-resident input on the host.
 pub fn copyDeviceToHost(dst: []u8, src_device: u64) bool {
     if (!module_loader.init()) return false;
     const f = ffi.cuMemcpyDtoH_fn orelse return false;
     return f(@ptrCast(dst.ptr), src_device, dst.len) == ffi.CUDA_SUCCESS;
+}
+
+/// Copy `src.len` bytes from the host slice `src` to a device address.
+pub fn copyHostToDevice(dst_device: u64, src: []const u8) bool {
+    if (!module_loader.init()) return false;
+    const f = ffi.cuMemcpyHtoD_fn orelse return false;
+    return f(dst_device, @ptrCast(src.ptr), src.len) == ffi.CUDA_SUCCESS;
 }

@@ -32,12 +32,16 @@ pub const CompressChunkDesc = ec.CompressChunkDesc;
 pub const EncodeContext = ec.EncodeContext;
 
 pub const copyDeviceToHost = ec.copyDeviceToHost;
+pub const copyHostToDevice = ec.copyHostToDevice;
+pub const ensureBuf = ec.ensureBuf;
 
 // Wire-format byte sizes re-exported for the CPU-side framer in
 // src/encode/fast_framed.zig (which orchestrates GPU encode + frame
 // assembly). See encode_context.zig for the underlying definitions.
 pub const SC_TAIL_PER_CHUNK_BYTES = ec.SC_TAIL_PER_CHUNK_BYTES;
 pub const CHUNK_INTERNAL_HDR_BYTES = ec.CHUNK_INTERNAL_HDR_BYTES;
+pub const UNCOMPRESSED_CHUNK_HDR_BYTES = ec.UNCOMPRESSED_CHUNK_HDR_BYTES;
+pub const UNCOMPRESSED_CHUNK_MARKER = ec.UNCOMPRESSED_CHUNK_MARKER;
 
 // ── Singletons ────────────────────────────────────────────────
 // `g_default` and `last_kernel_ns` live on the facade so external callers

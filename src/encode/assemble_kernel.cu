@@ -241,12 +241,14 @@ __device__ static uint32_t assembleSubChunk(
         const uint8_t* lo = d_huff_off16 + desc.huff_off16lo_offset;
         const uint32_t hi_sz = desc.huff_off16hi_size;
         const uint32_t lo_sz = desc.huff_off16lo_size;
-        // Huffman wins when (compressed_size + header_overhead_delta)
-        // < raw_count. The delta is the extra bytes a Huffman header
-        // costs versus a raw header: HUFF_CHUNK_HDR_BYTES - RAW_CHUNK_HDR_BYTES.
+        // Huffman wins when the body plus extra-header overhead
+        // beats the raw plane (`raw_count + RAW_CHUNK_HDR_BYTES`). The
+        // explicit `hi_sz > 0` / `lo_sz > 0` guards keep L1/L2 — where
+        // no Huffman pass ran and every size is zero — from emitting a
+        // 5-byte Huffman header that points at a zero-byte body.
         constexpr int HUFF_VS_RAW_HDR_OVERHEAD = HUFF_CHUNK_HDR_BYTES - RAW_CHUNK_HDR_BYTES;
-        const bool hi_huff = (hi_sz + HUFF_VS_RAW_HDR_OVERHEAD < s.off16_count);
-        const bool lo_huff = (lo_sz + HUFF_VS_RAW_HDR_OVERHEAD < s.off16_count);
+        const bool hi_huff = (hi_sz > 0) && (hi_sz + HUFF_VS_RAW_HDR_OVERHEAD < s.off16_count);
+        const bool lo_huff = (lo_sz > 0) && (lo_sz + HUFF_VS_RAW_HDR_OVERHEAD < s.off16_count);
         const uint32_t hi_chunk = hi_huff ? (HUFF_CHUNK_HDR_BYTES + hi_sz)
                                           : (s.off16_count + RAW_CHUNK_HDR_BYTES);
         const uint32_t lo_chunk = lo_huff ? (HUFF_CHUNK_HDR_BYTES + lo_sz)
@@ -364,30 +366,41 @@ extern "C" __global__ void slzAssembleWriteKernel(
 // ── Frame-assemble kernel (4d step 8) ───────────────────────────────
 // Writes the complete StreamLZ frame to d_output on device:
 //   [pre-formed frame_hdr+block_hdr (host-staged via d_prefix_bytes)]
-//   per chunk i:
-//     [2-byte internal_hdr][4-byte chunk_hdr LE u32 = (asm_total-1)]
-//     [asm_total bytes copied from d_asm_out[asm_offsets[i]]]
+//   per chunk i, one of two layouts depending on whether chunk i's
+//   sub-chunks all beat raw or not:
+//     compressed: [2B internal_hdr][4B chunk_hdr LE u32 = (asm_total-1)]
+//                 [asm_total bytes copied from d_asm_out[asm_offsets[i]]]
+//     uncompressed: [2B internal_hdr | 0x80][asm_total bytes copied
+//                                            from d_input + i * eff_chunk_size]
 //   [(n_chunks-1) * 8 B SC tail prefix from d_input]
 //   [4-byte end mark = 0]
 //
-// Replaces the host loop in fast_framed.gpu_compress when SLZ_GPU_ASSEMBLE
-// is set and the slzCompress D2D path is in use. Grid layout:
-//   block_id < n_chunks  → write chunk's bytes (internal_hdr + chunk_hdr + asm).
+// The host pre-computes which chunks are uncompressed by scanning
+// comp_sizes[*] from the LZ kernel: if any sub-chunk in chunk i has
+// `comp_size >= src_size`, the whole chunk is emitted uncompressed.
+// The signal arrives via `d_asm_offsets[i] == UNCOMPRESSED_CHUNK_MARKER`
+// (sentinel; otherwise the value is a real offset into d_asm_out).
+//
+// Grid layout:
+//   block_id < n_chunks  → write chunk's bytes.
 //   block_id == n_chunks → write prefix bytes, SC tail, end mark.
 //
 // All offsets are in d_output's coordinate space.
+static constexpr uint32_t UNCOMPRESSED_CHUNK_MARKER = 0xFFFFFFFFu;
+static constexpr uint8_t  INTERNAL_BLOCK_UNCOMPRESSED_FLAG = 0x80;
+
 extern "C" __global__ void slzFrameAssembleKernel(
-    const uint8_t* __restrict__ d_input,            // for SC tail prefix bytes
+    const uint8_t* __restrict__ d_input,            // for SC tail prefix + uncompressed chunk source
     const uint8_t* __restrict__ d_asm_out,          // assembled sub-chunk blocks
-    const uint32_t* __restrict__ d_asm_offsets,     // per-chunk first asm offset
-    const uint32_t* __restrict__ d_asm_chunk_sizes, // per-chunk total asm size (sum of sub-chunk asm sizes)
+    const uint32_t* __restrict__ d_asm_offsets,     // per-chunk first asm offset, or UNCOMPRESSED_CHUNK_MARKER
+    const uint32_t* __restrict__ d_asm_chunk_sizes, // per-chunk payload size (asm or raw)
     const uint32_t* __restrict__ d_chunk_dst,       // per-chunk dst offset (start of 2B internal_hdr)
     const uint8_t* __restrict__ d_prefix_bytes,     // pre-formed frame_hdr + block_hdr bytes
     uint32_t prefix_size,                            // length of d_prefix_bytes
     uint8_t  internal_hdr0,
     uint8_t  internal_hdr1,
     uint32_t n_chunks,
-    uint32_t eff_chunk_size,                         // source chunk size in bytes (for SC tail src offset)
+    uint32_t eff_chunk_size,                         // source chunk size in bytes
     uint32_t src_len,                                // total source length (for SC tail last-entry clamp)
     uint32_t sc_tail_off,                            // dst offset of SC tail prefix table
     uint32_t end_mark_off,                           // dst offset of end mark
@@ -398,21 +411,39 @@ extern "C" __global__ void slzFrameAssembleKernel(
     const uint32_t bdim = blockDim.x;
 
     if (block_id < n_chunks) {
-        // Per-chunk write: 2B internal_hdr + 4B chunk_hdr + asm bytes.
         const uint32_t dst_off = d_chunk_dst[block_id];
         const uint32_t asm_start = d_asm_offsets[block_id];
-        const uint32_t asm_total = d_asm_chunk_sizes[block_id];
+        const uint32_t payload_size = d_asm_chunk_sizes[block_id];
+        const bool is_uncompressed = (asm_start == UNCOMPRESSED_CHUNK_MARKER);
 
         if (lane == 0) {
-            d_output[dst_off + 0] = internal_hdr0;
+            // Bit 7 of byte 0 = uncompressed-chunk flag.
+            d_output[dst_off + 0] = is_uncompressed
+                ? (uint8_t)(internal_hdr0 | INTERNAL_BLOCK_UNCOMPRESSED_FLAG)
+                : internal_hdr0;
             d_output[dst_off + 1] = internal_hdr1;
-            const uint32_t hdr_u32 = asm_total - 1;  // chunk_hdr LE u32
-            writeU32LE(d_output + dst_off + 2, hdr_u32);
+            if (!is_uncompressed) {
+                // 4-byte LE chunk header carries (asm_total - 1) in its
+                // low 18 bits; no such header is present for uncompressed
+                // chunks (the decoder reads payload_size from the outer
+                // block header instead).
+                const uint32_t hdr_u32 = payload_size - 1;
+                writeU32LE(d_output + dst_off + 2, hdr_u32);
+            }
         }
-        // Cooperative copy of the assembled sub-chunk block(s).
-        const uint32_t payload_dst = dst_off + 6;
-        for (uint32_t i = lane; i < asm_total; i += bdim) {
-            d_output[payload_dst + i] = d_asm_out[asm_start + i];
+        // Cooperative copy of the per-chunk payload. The destination
+        // offset depends on whether the chunk includes the 4-byte
+        // chunk header (compressed) or skips it (uncompressed).
+        const uint32_t payload_dst = is_uncompressed ? (dst_off + 2) : (dst_off + 6);
+        if (is_uncompressed) {
+            const uint32_t src_off = block_id * eff_chunk_size;
+            for (uint32_t i = lane; i < payload_size; i += bdim) {
+                d_output[payload_dst + i] = d_input[src_off + i];
+            }
+        } else {
+            for (uint32_t i = lane; i < payload_size; i += bdim) {
+                d_output[payload_dst + i] = d_asm_out[asm_start + i];
+            }
         }
         return;
     }

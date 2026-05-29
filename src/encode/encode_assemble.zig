@@ -38,16 +38,26 @@ pub fn gpuAssembleFrameImpl(
     const n: u32 = @intCast(chunk_descs.len);
     if (n == 0) return false;
 
-    // Per-stream metadata (offsets + sizes) - always host-side, small;
-    // present iff the matching Huffman pass succeeded.
-    const hl_off = self.huff_lit_offsets orelse return false;
-    const hl_sz = self.huff_lit_sizes orelse return false;
-    const ht_off = self.huff_tok_offsets orelse return false;
-    const ht_sz = self.huff_tok_sizes orelse return false;
-    const hoh_off = self.huff_off16hi_offsets orelse return false;
-    const hoh_sz = self.huff_off16hi_sizes orelse return false;
-    const hol_off = self.huff_off16lo_offsets orelse return false;
-    const hol_sz = self.huff_off16lo_sizes orelse return false;
+    // Per-stream Huffman metadata. L1/L2 do not run the Huffman pass so
+    // all six per-stream slots are null; in that case the assembly
+    // kernel sees `huff_*_size == 0` for every sub-chunk and emits raw
+    // (chunk-type=0) for that stream. Zero-fill scratch arrays let us
+    // keep one kernel-side branch instead of two distinct code paths.
+    const zero_offs = allocator.alloc(u32, n) catch return false;
+    defer allocator.free(zero_offs);
+    @memset(zero_offs, 0);
+    const zero_sizes = allocator.alloc(u32, n) catch return false;
+    defer allocator.free(zero_sizes);
+    @memset(zero_sizes, 0);
+
+    const hl_off = self.huff_lit_offsets orelse zero_offs;
+    const hl_sz = self.huff_lit_sizes orelse zero_sizes;
+    const ht_off = self.huff_tok_offsets orelse zero_offs;
+    const ht_sz = self.huff_tok_sizes orelse zero_sizes;
+    const hoh_off = self.huff_off16hi_offsets orelse zero_offs;
+    const hoh_sz = self.huff_off16hi_sizes orelse zero_sizes;
+    const hol_off = self.huff_off16lo_offsets orelse zero_offs;
+    const hol_sz = self.huff_off16lo_sizes orelse zero_sizes;
     if (hl_off.len < n or ht_off.len < n or hoh_off.len < n or hol_off.len < n) return false;
 
     const h2d = ffi.cuMemcpyHtoD_fn orelse return false;
@@ -232,14 +242,21 @@ pub fn gpuFrameAssembleImpl(
     const launch = ffi.cuLaunchKernel_fn orelse return null;
     const sync = ffi.cuCtxSynchronize_fn orelse return null;
 
-    // Build per-chunk dst offset table on host (prefix sum of
-    // CHUNK_INTERNAL_HDR_BYTES + asm_size).
+    // Build per-chunk dst offset table on host. Compressed chunks pay
+    // `CHUNK_INTERNAL_HDR_BYTES` (2-byte internal block header + 4-byte
+    // chunk header); uncompressed chunks — flagged by the sentinel
+    // `UNCOMPRESSED_CHUNK_MARKER` in `per_chunk_asm_off` — pay only
+    // `UNCOMPRESSED_CHUNK_HDR_BYTES`.
     const per_chunk_dst_buf = allocator.alloc(u32, n_chunks) catch return null;
     defer allocator.free(per_chunk_dst_buf);
     var pos: u32 = @intCast(prefix_bytes.len);
     for (0..n_chunks) |i| {
         per_chunk_dst_buf[i] = pos;
-        pos += ec.CHUNK_INTERNAL_HDR_BYTES + per_chunk_asm_size[i];
+        const overhead: u32 = if (per_chunk_asm_off[i] == ec.UNCOMPRESSED_CHUNK_MARKER)
+            ec.UNCOMPRESSED_CHUNK_HDR_BYTES
+        else
+            ec.CHUNK_INTERNAL_HDR_BYTES;
+        pos += overhead + per_chunk_asm_size[i];
     }
     const sc_tail_off: u32 = pos;
     const sc_tail_bytes: u32 = if (n_chunks > 1) (n_chunks - 1) * ec.SC_TAIL_PER_CHUNK_BYTES else 0;
