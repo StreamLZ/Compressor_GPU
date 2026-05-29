@@ -222,7 +222,7 @@ pub const WriteHeaderOptions = struct {
     block_size: u32 = default_block_size,
     /// SC group size in units of 256KB chunks. 4.0 = default (1MB groups).
     /// 0.25 = 64KB blocks (maximum GPU parallelism).
-    sc_group_size: f32 = @as(f32, @floatFromInt(constants.default_sc_group_size)),
+    sc_group_size: f32 = constants.default_sc_group_size,
     parallel_decode_metadata_present: bool = false,
     content_size: ?u64 = null,
     content_checksum: bool = false,
@@ -400,7 +400,7 @@ test "writeHeader / parseHeader roundtrip, minimal flags" {
     try testing.expectEqual(Codec.fast, hdr.codec);
     try testing.expectEqual(@as(u8, 1), hdr.level);
     try testing.expectEqual(@as(u32, default_block_size), hdr.block_size);
-    try testing.expectEqual(@as(u8, constants.default_sc_group_size), hdr.sc_group_size);
+    try testing.expectEqual(constants.default_sc_group_size, hdr.sc_group_size);
     try testing.expect(!hdr.flags.parallel_decode_metadata_present);
     try testing.expect(hdr.content_size == null);
     try testing.expectEqual(n, hdr.header_size);

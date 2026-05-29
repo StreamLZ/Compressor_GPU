@@ -30,10 +30,11 @@ pub const safe_space: usize = 64;
 // ── Frame-header default ───────────────────────────────────────────────
 
 /// Default value the frame writer stamps into the `sc_group_size` slot
-/// when the encoder did not pick a non-default value. The current GPU
-/// encoder always overrides this via `resolveScGroupSize`; the default
-/// is kept for the canonical-header smoke tests.
-pub const default_sc_group_size: u8 = 4;
+/// when the encoder did not pick a non-default value. Typed as `f32` to
+/// match the v2 wire format; the current GPU encoder always overrides
+/// this via `resolveScGroupSize`, so the constant only flows through the
+/// canonical-header smoke tests.
+pub const default_sc_group_size: f32 = 4.0;
 
 // ── Match-window limits ────────────────────────────────────────────────
 

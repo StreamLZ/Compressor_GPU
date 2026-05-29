@@ -273,16 +273,18 @@ pub const EncodeContext = struct {
 };
 
 /// Reallocate the device buffer at `ptr` if its current size is below
-/// `needed`; otherwise reuse. Caller passes companion `cur` (bytes) which
-/// we update on success. Returns false only when the CUDA alloc fails.
-pub fn ensureBuf(ptr: *CUdeviceptr, cur: *usize, needed: usize) bool {
-    if (cur.* >= needed) return true;
+/// `needed`; otherwise reuse. Caller passes the companion
+/// `current_size` slot which is updated on success. Returns `false`
+/// only when the CUDA allocation fails (matches the encode side's
+/// `bool` convention; the decode side returns `GpuError!void`).
+pub fn ensureBuf(ptr: *CUdeviceptr, current_size: *usize, needed: usize) bool {
+    if (current_size.* >= needed) return true;
     const free_fn = cuda_ffi.cuMemFree_fn orelse return false;
     const alloc_fn = cuda_ffi.cuMemAlloc_fn orelse return false;
     if (ptr.* != 0) _ = free_fn(ptr.*);
-    cur.* = 0;
+    current_size.* = 0;
     if (alloc_fn(ptr, needed) != cuda_ffi.CUDA_SUCCESS) return false;
-    cur.* = needed;
+    current_size.* = needed;
     return true;
 }
 
