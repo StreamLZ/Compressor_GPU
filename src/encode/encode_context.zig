@@ -132,7 +132,8 @@ pub const EncodeContext = struct {
     d_host_wrap_output: CUdeviceptr = 0,
     d_host_wrap_output_size: usize = 0,
 
-    // 4d step 8 scratch - small device buffers populated host-side per call:
+    // Frame-assembly scratch — small device buffers H2D'd per call to
+    // feed slzFrameAssembleKernel:
     //   d_frame_chunk_dst    - per-chunk dst offsets (n_chunks × u32)
     //   d_frame_asm_offsets  - per-chunk asm-out start offsets (n_chunks × u32)
     //   d_frame_asm_chunk_sz - per-chunk total asm size (n_chunks × u32)
@@ -167,8 +168,6 @@ pub const EncodeContext = struct {
     d_huff_codes_size: usize = 0,
     d_huff_scratch_persist: CUdeviceptr = 0,
     d_huff_scratch_size: usize = 0,
-    d_huff_out_persist: CUdeviceptr = 0,
-    d_huff_out_size: usize = 0,
     d_huff_sizes_persist: CUdeviceptr = 0,
     d_huff_sizes_size: usize = 0,
 
@@ -185,47 +184,29 @@ pub const EncodeContext = struct {
     d_asm_out_size: usize = 0,
     d_asm_sizes: CUdeviceptr = 0,
     d_asm_sizes_size: usize = 0,
-    // Host-side assembled result - packed [3-byte sub-chunk hdr][payload]
-    // blocks; the frame assembler splices block i from
-    // assembled_data[assembled_offsets[i]..][0..assembled_sizes[i]].
-    assembled_data: ?[]u8 = null,
+
+    // Per-chunk index tables published by `gpuAssembleFrameImpl`: where
+    // each chunk's assembled-block bytes live inside `d_asm_out` (offset)
+    // and how many bytes long the chunk's slice is (size). The frame
+    // writer consults both when computing per-chunk dst positions for
+    // `slzFrameAssembleKernel`; the assembled bytes themselves stay on
+    // the GPU.
     assembled_offsets: ?[]u32 = null,
     assembled_sizes: ?[]u32 = null,
-    // When set, the three GPU Huffman passes keep their bodies device-
-    // resident in d_asm_huff_{lit,tok,off16} (no host bounce) so the
-    // frame-assembly kernels read them directly. Set by the encoder
-    // before the Huffman passes when SLZ_GPU_ASSEMBLE is active.
-    huff_keep_device: bool = false,
 
-    // ── Result slices - formerly module-global `pub var`. Each encode
-    // operation writes its downloaded host-side payloads here; the frame
-    // assembler reads them back. Moved into the context so the compress
-    // path is reentrant per handle.
-    // OWNERSHIP RULE: huff_off16hi_data and huff_off16lo_data share
-    // one allocation (a flat byte buffer indexed by hi_offsets and
-    // lo_offsets respectively). `huff_off16hi_data` is the owner;
-    // `huff_off16lo_data` is a non-owning alias of the SAME slice. The
-    // only legal teardown is:
-    //   1. `allocator.free(huff_off16hi_data)` (the single real free), then
-    //   2. null out ALL SIX off16 slots so a follow-up encode lands on a
-    //      clean context - sizes/data/offsets for hi AND lo:
-    //        huff_off16hi_sizes, huff_off16hi_data, huff_off16hi_offsets,
-    //        huff_off16lo_sizes, huff_off16lo_data, huff_off16lo_offsets.
-    // See `deinit` below and `fast_framed.zig` for the canonical pattern.
-    // Anyone introducing a new free site must honor that rule or the alias
-    // double-frees.
+    // ── Per-sub-chunk Huffman body size + dst-offset tables ──
+    // The bodies themselves stay device-resident in d_asm_huff_{lit,tok,
+    // off16}; only these small index tables come back to the host and feed
+    // the AssembleDesc construction in `encode_assemble.zig`. hi/lo for
+    // off16 share one device byte buffer, hence two offset tables.
     huff_off16hi_sizes: ?[]u32 = null,
-    huff_off16hi_data: ?[]u8 = null, // OWNS the shared buffer
     huff_off16hi_offsets: ?[]u32 = null,
     huff_off16lo_sizes: ?[]u32 = null,
-    huff_off16lo_data: ?[]u8 = null, // NON-OWNING alias of huff_off16hi_data
     huff_off16lo_offsets: ?[]u32 = null,
 
     huff_lit_sizes: ?[]u32 = null,
-    huff_lit_data: ?[]u8 = null,
     huff_lit_offsets: ?[]u32 = null,
     huff_tok_sizes: ?[]u32 = null,
-    huff_tok_data: ?[]u8 = null,
     huff_tok_offsets: ?[]u32 = null,
 
     /// Free every owned device + host buffer and reset every field to
@@ -265,7 +246,6 @@ pub const EncodeContext = struct {
         free_dev(&self.d_huff_cl_persist, &self.d_huff_cl_size);
         free_dev(&self.d_huff_codes_persist, &self.d_huff_codes_size);
         free_dev(&self.d_huff_scratch_persist, &self.d_huff_scratch_size);
-        free_dev(&self.d_huff_out_persist, &self.d_huff_out_size);
         free_dev(&self.d_huff_sizes_persist, &self.d_huff_sizes_size);
         free_dev(&self.d_asm_huff_lit, &self.d_asm_huff_lit_size);
         free_dev(&self.d_asm_huff_tok, &self.d_asm_huff_tok_size);
@@ -274,24 +254,17 @@ pub const EncodeContext = struct {
         free_dev(&self.d_asm_out, &self.d_asm_out_size);
         free_dev(&self.d_asm_sizes, &self.d_asm_sizes_size);
 
-        if (self.assembled_data) |s| { allocator.free(s); self.assembled_data = null; }
         if (self.assembled_offsets) |s| { allocator.free(s); self.assembled_offsets = null; }
         if (self.assembled_sizes) |s| { allocator.free(s); self.assembled_sizes = null; }
 
-        // huff_off16: hi OWNS the shared byte buffer; lo is a non-owning
-        // alias. Drop the alias FIRST, then free the owner.
-        self.huff_off16lo_data = null;
-        if (self.huff_off16hi_data) |s| { allocator.free(s); self.huff_off16hi_data = null; }
         if (self.huff_off16hi_sizes) |s| { allocator.free(s); self.huff_off16hi_sizes = null; }
         if (self.huff_off16hi_offsets) |s| { allocator.free(s); self.huff_off16hi_offsets = null; }
         if (self.huff_off16lo_sizes) |s| { allocator.free(s); self.huff_off16lo_sizes = null; }
         if (self.huff_off16lo_offsets) |s| { allocator.free(s); self.huff_off16lo_offsets = null; }
 
         if (self.huff_lit_sizes) |s| { allocator.free(s); self.huff_lit_sizes = null; }
-        if (self.huff_lit_data) |s| { allocator.free(s); self.huff_lit_data = null; }
         if (self.huff_lit_offsets) |s| { allocator.free(s); self.huff_lit_offsets = null; }
         if (self.huff_tok_sizes) |s| { allocator.free(s); self.huff_tok_sizes = null; }
-        if (self.huff_tok_data) |s| { allocator.free(s); self.huff_tok_data = null; }
         if (self.huff_tok_offsets) |s| { allocator.free(s); self.huff_tok_offsets = null; }
 
         self.pending_timings.deinit(std.heap.page_allocator);

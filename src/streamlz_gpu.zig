@@ -139,8 +139,6 @@ fn decompressCore(h: *Context, frame_bytes: []const u8, output: []u8, opts: Deco
     return @intCast(r.written);
 }
 
-/// 4d Phase 3 device-resident decode: the decoded bytes are D2D-copied
-/// straight into the caller's device output buffer (no host bounce on
 // ── Worker jobs ───────────────────────────────────────────────────────
 // `d_src`/`d_dst` are 0 for the host->host path, or device addresses for
 // the device->device path (then `src` aliases an internal bounce buffer
@@ -163,20 +161,14 @@ const CompressJob = struct {
             j.result = SLZ_ERROR_CUDA;
             return;
         }
-        // 4d Phase 3 encode-input D2D: the encoder's CPU paths never
-        // dereference `input` for -gpu mode (the GPU LZ kernel + the M2
-        // assembly kernel handle every byte access), so we leave the
-        // host `src` slice's bytes uninitialized. gpuCompressImpl reads
-        // the data from d_input_override (D2D copy from the caller's
-        // device input) instead of H2D-ing the host bounce.
+        // Device-resident input: the encoder reads source bytes from
+        // d_input_override (a caller-supplied device pointer) instead of
+        // H2D-ing them; the `src` host slice is left untouched.
         if (j.d_src != 0) {
             j.h.enc.d_input_override = j.d_src;
         }
-        // 4d step 8: when the caller asked for a device output AND the
-        // encode hits the slzFrameAssembleKernel path, the kernel writes
-        // the frame straight to d_dst — no host bounce. The fallback
-        // host->device H2D below stays as the safety net for paths that
-        // didn't take the pure-D2D branch.
+        // Device-resident output: the frame-assembly kernel writes the
+        // SLZ1 frame straight into d_output_override, no host bounce.
         if (j.d_dst != 0) {
             j.h.enc.d_output_override = j.d_dst;
             j.h.enc.output_written_to_device = false;

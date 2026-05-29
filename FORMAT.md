@@ -213,10 +213,7 @@ Bits   Field
 ─────────────────────────────────────────
  0-17  Compressed size minus 1 (0..262143; chunk_size_bits = 18)
 18-19  Type: 0 = normal LZ, 1 = memset
-20     has_cross_chunk_match (legacy CPU parallel-decode hint;
-                              the GPU decoder ignores this bit and
-                              the GPU encoder writes 0)
-21-31  Reserved (must be 0)
+20-31  Reserved (must be 0)
 ```
 
 ### Type 0 (normal)

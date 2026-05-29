@@ -1,13 +1,15 @@
-//! Device-resident frame assembly (roadmap 4d).
+//! Device-resident frame assembly.
 //!
-//! Two entrypoints:
-//!   * `gpuAssembleFrameImpl` - runs after LZ + the three Huffman passes
-//!     left their bodies device-resident in d_asm_huff_{lit,tok,off16};
-//!     measures, prefix-sums, then writes [3-byte hdr][payload] for every
-//!     sub-chunk and publishes the host-side packed result.
-//!   * `gpuFrameAssembleImpl` - 4d step 8 pure-D2D writer that splices
-//!     the assembled sub-chunk blocks plus host-precomputed layout into
-//!     a complete StreamLZ frame straight into the caller's device buffer.
+//! Two entrypoints called back-to-back from `fast_framed.compressFramedOne`:
+//!   * `gpuAssembleFrameImpl` - measures every sub-chunk's assembled
+//!     payload size, prefix-sums the sizes, then writes [3-byte hdr]
+//!     [payload] for every sub-chunk into `d_asm_out`. Publishes the
+//!     per-chunk offset/size tables on the context; the bytes themselves
+//!     stay on the GPU.
+//!   * `gpuFrameAssembleImpl` - pure-D2D writer that splices the
+//!     device-resident assembled blocks plus host-precomputed per-chunk
+//!     layout into a complete StreamLZ frame straight into the caller's
+//!     device buffer.
 
 const std = @import("std");
 const ffi = @import("cuda_ffi.zig");
@@ -20,13 +22,14 @@ const EncodeContext = ec.EncodeContext;
 const CompressChunkDesc = ec.CompressChunkDesc;
 const AssembleDesc = ec.AssembleDesc;
 
-/// Device-resident frame assembly (roadmap 4d). Runs after gpuCompressImpl
-/// (raw streams resident in d_output) and the three GPU Huffman passes
-/// (run with huff_keep_device - bodies resident in d_asm_huff_*, no host
-/// bounce). Assembles every sub-chunk's [3-byte header][payload] on the
-/// GPU and publishes the packed host-side result in `assembled_*` for the
-/// frame assembler to splice. Returns false - caller keeps the CPU path -
-/// if any prerequisite is absent.
+/// Device-resident frame assembly. Runs after `gpuCompressImpl` (raw
+/// streams resident in `d_output_persist`) and the three GPU Huffman
+/// passes (bodies resident in `d_asm_huff_{lit,tok,off16}`). Assembles
+/// every sub-chunk's `[3-byte header][payload]` on the GPU into
+/// `d_asm_out` and publishes the per-chunk offset/size index tables in
+/// `assembled_offsets` / `assembled_sizes` for the frame writer.
+/// Returns false on any prerequisite failure - the caller treats this
+/// as "destination too small" and propagates.
 pub fn gpuAssembleFrameImpl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
@@ -64,10 +67,6 @@ pub fn gpuAssembleFrameImpl(
     const d2h = ffi.cuMemcpyDtoH_fn orelse return false;
     const launch = ffi.cuLaunchKernel_fn orelse return false;
     const sync = ffi.cuCtxSynchronize_fn orelse return false;
-
-    // The three GPU Huffman passes already left their bodies device-
-    // resident in d_asm_huff_{lit,tok,off16} (huff_keep_device set by the
-    // encoder before they ran) - no host bounce.
 
     // Build per-sub-chunk descriptors (out_offset filled after pass 1).
     var descs = allocator.alloc(AssembleDesc, n) catch return false;
@@ -151,51 +150,34 @@ pub fn gpuAssembleFrameImpl(
     if (launch(module_loader.assemble_write_fn, n, 1, 1, 32, 1, 1, 0, 0, &w_params, &extra) != ffi.CUDA_SUCCESS) return false;
     if (sync() != ffi.CUDA_SUCCESS) return false;
 
-    // Download the assembled blocks; publish the host-side result.
-    const assembled = allocator.alloc(u8, total) catch return false;
-    const off = allocator.alloc(u32, n) catch {
-        allocator.free(assembled);
-        return false;
-    };
+    // Publish the per-chunk offset+size index tables; the assembled
+    // bytes themselves stay in `self.d_asm_out` for the frame writer
+    // to read in place.
+    const off = allocator.alloc(u32, n) catch return false;
     const sz = allocator.alloc(u32, n) catch {
-        allocator.free(assembled);
         allocator.free(off);
         return false;
     };
-    if (d2h(@ptrCast(assembled.ptr), self.d_asm_out, total) != ffi.CUDA_SUCCESS) {
-        allocator.free(assembled);
-        allocator.free(off);
-        allocator.free(sz);
-        return false;
-    }
     for (0..n) |i| {
         off[i] = descs[i].out_offset;
         sz[i] = 3 + enc_sizes[i];
     }
-    self.assembled_data = assembled;
     self.assembled_offsets = off;
     self.assembled_sizes = sz;
     return true;
 }
 
-/// 4d step 8 - Pure-D2D frame writer. Takes the device-resident assembled
-/// sub-chunk blocks (already in `self.d_asm_out` from gpuAssembleFrameImpl)
-/// plus host-precomputed per-chunk layout info, launches
-/// slzFrameAssembleKernel, and writes the complete StreamLZ frame to
-/// `d_output` on device. Returns the total frame byte count or null on
-/// failure.
+/// Pure-D2D frame writer. Takes the device-resident assembled sub-chunk
+/// blocks (already in `self.d_asm_out` from `gpuAssembleFrameImpl`) plus
+/// host-precomputed per-chunk layout, launches `slzFrameAssembleKernel`,
+/// and writes the complete StreamLZ frame straight into `d_output` on
+/// device. Returns the total frame byte count, or null on failure.
 ///
-/// Caller must supply:
-///   `prefix_bytes` - pre-formed frame_hdr + block_hdr (~30-40 B).
-///   `per_chunk_asm_off`  - start of each chunk's sub-chunk(s) in d_asm_out.
-///   `per_chunk_asm_size` - total asm bytes for each chunk (sum across its sub-chunks).
-///   `internal_hdr0/1`    - the 2-byte internal block header (same for every chunk).
-///   `eff_chunk_size`     - source chunk stride in bytes (for SC tail src offsets).
-///   `d_input_dev`        - device source (for SC tail prefix bytes).
-///
-/// Self-contained (`sc_tail_count = n_chunks - 1` when n_chunks > 1, else 0)
-/// is inferred from the chunk count; SC mode is the only one slzCompress
-/// produces.
+/// Self-contained mode (the only mode `slzCompress` produces) is implied
+/// by `n_chunks > 1`: the kernel emits an `(n_chunks - 1) *
+/// SC_TAIL_PER_CHUNK_BYTES` SC tail block right after the per-chunk
+/// payloads.
+
 /// Bytes the frame assembler prepends before the per-chunk payloads -
 /// pre-formed by the caller (frame header + block header) plus the
 /// 2-byte internal block header that gets repeated at each chunk boundary.

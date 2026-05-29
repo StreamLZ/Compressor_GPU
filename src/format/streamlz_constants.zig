@@ -15,13 +15,6 @@ pub const chunk_size_mask: u32 = chunk_size - 1; // 0x3FFFF
 pub const chunk_type_shift: u6 = chunk_size_bits;
 pub const chunk_type_memset: u32 = 1 << chunk_type_shift;
 
-/// Bit 20 of the 4-byte chunk header. Set when at least one LZ match in
-/// the chunk reads bytes produced before the chunk's own destination
-/// start (a cross-chunk back-reference). Legacy CPU-codec hint for
-/// parallel decode; the GPU codec emits zero and the GPU decoder
-/// ignores it.
-pub const chunk_has_cross_chunk_match_mask: u32 = 1 << 20;
-
 /// Sub-chunk size: 128 KB. Each outer 256 KB chunk contains up to two
 /// sub-chunks at sc_group_size = 1.0; the GPU encoder picks 0.25 or 0.5
 /// so it never emits more than one sub-chunk per chunk.

@@ -1,28 +1,15 @@
 //! Device-side decode-scan kernels: frame walker, per-chunk prefix sum,
-//! per-sub-chunk header parser + compaction (roadmap 4d Phase 2/3).
+//! per-sub-chunk header parser + compaction.
 //!
-//! Mirror of `scan_host.zig` but with the parsing work on the GPU and the
-//! compacted descriptor arrays staying device-resident wherever possible.
-//! Each entry point gracefully returns null when its kernel symbol isn't
-//! loaded so the host-scan fallback in `decode_dispatch.zig` can pick up
-//! without a rebuild.
+//! The compacted descriptor arrays stay device-resident wherever
+//! possible; the host gets only the small per-stream counts.
 //!
-//! Convention note: most entry points in this file use the `?T` return
-//! + raw `if (rc != CUDA_SUCCESS) return null;` pattern intentionally,
-//! NOT `GpuError!T` + `try cudaCall(...)` like `decode_dispatch.zig`.
-//! Reason: those scan_gpu functions are best-effort fast paths - null
-//! means "fall back to host scan" (or skip this optimization), not
-//! "the decode has failed". The caller in `fullGpuLaunchImpl` always
-//! has the `scan_host.zig` fallback available. Promoting CUDA failures
-//! to errors there would force the caller to either re-fallback in a
-//! catch (back to null-equivalent) or fail the whole decode on what is
-//! recoverable.
-//!
-//! Exception: `gpuPrefixSumChunksImpl` returns `GpuError!T` because the
-//! prefix-sum has NO host fallback - every GPU decode path requires it.
-//! Null-on-failure would have silently masked alloc/launch/sync failures
-//! as the generic `error.BadMode` at the call site. K5.1's error fan-out
-//! should reach this function too.
+//! Convention: most entry points return `?T` (null on failure) because
+//! callers in `decode_dispatch.zig` translate the failure to an outer
+//! `error.BackendNotAvailable`. The exception is `gpuPrefixSumChunksImpl`,
+//! which returns `GpuError!T` directly because there is no fallback for
+//! the device-side prefix sum and the dispatch needs to distinguish
+//! alloc / launch / sync failures from missing-symbol failures.
 
 const std = @import("std");
 
@@ -39,10 +26,10 @@ const ensureDeviceBuf = dec_ctx.ensureDeviceBuf;
 const GpuError = desc_err.GpuError;
 const cudaCall = desc_err.cudaCall;
 
-/// 4d Phase 3 GPU frame walk - device-only output. Launches the walk
-/// kernel and returns the device pointers it wrote to. NO D2H. Caller
-/// either passes the device pointers to downstream kernels (true D2D
-/// path) or invokes `walkResultToHost` to copy what it needs out.
+/// GPU frame walk - device-only output. Launches the walk kernel and
+/// returns the device pointers it wrote to; NO D2H. Caller either passes
+/// the device pointers to downstream kernels (the true D2D path) or
+/// invokes `walkResultToHost` to copy what it needs out.
 ///
 /// Returns specific GpuError variants like `gpuPrefixSumChunksImpl`:
 /// frame-walk is on the device-resident decode hot path with no host

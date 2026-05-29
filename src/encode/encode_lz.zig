@@ -72,10 +72,9 @@ pub fn gpuCompressImpl(
     const d_descs = self.d_descs_persist;
     const d_sizes = self.d_sizes_persist;
 
-    // Upload input + descriptors, zero sizes. 4d Phase 3: when the
-    // caller's data is already GPU-resident at `d_input_override`,
-    // populate d_input_persist via a D2D copy (no PCIe) instead of the
-    // H2D from the host `input` slice.
+    // Upload input + descriptors. When the caller's data is already
+    // device-resident at `d_input_override`, populate `d_input_persist`
+    // via D2D (no PCIe) instead of an H2D from the host `input` slice.
     if (self.d_input_override != 0) {
         // Caller's data is already GPU-resident; the host `input` slice
         // may be a sentinel (per `EncodeContext.d_input_override` doc).

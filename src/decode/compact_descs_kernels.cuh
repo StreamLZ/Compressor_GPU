@@ -12,7 +12,7 @@
 // Pulled in for HUFF_LUT_ENTRIES - the shared 4-stream Huffman wire format.
 #include "../common/gpu_huffman.cuh"
 
-// ── Compact-huff-descs / Compact-raw-descs (4d Phase 3 step 4) ─────
+// ── Compact-huff-descs / Compact-raw-descs ──────────────────────────
 // Single-threaded device-side compaction of the scan kernel's staged
 // arrays. Each (slzScanParseKernel-produced) staged entry has a `valid`
 // flag; the compaction drops invalid entries and assigns a sequential

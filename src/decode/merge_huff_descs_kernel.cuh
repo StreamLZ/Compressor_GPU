@@ -9,7 +9,7 @@
 
 #include "compact_descs_kernels.cuh"
 
-// ── Merge-huff-descs kernel (4d Phase 3 step 5) ────────────────────
+// ── Merge-huff-descs kernel ─────────────────────────────────────────
 // Combines four per-stream compacted SlzHuffDecChunkDesc arrays into a
 // single merged array, adding the per-stream region offset (lit=0,
 // tok=tok_region, off16hi/lo=off16_region) to out_offset and assigning

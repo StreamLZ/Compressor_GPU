@@ -145,16 +145,17 @@ pub fn init() bool {
     // Optional lean L1/L2-raw kernel - driver routes to it when no entropy
     // is present. Failing to load is fine; falls back to general kernel.
     _ = get_fn(&kernel_raw_fn, module, "slzLzDecodeRawKernel");
-    // Optional GPU decode-scan kernel (roadmap 4d Phase 2). Absent → the
-    // driver keeps the CPU scanForEntropyChunks path.
+    // GPU decode-scan kernel. Required: the decode dispatch fails
+    // BackendNotAvailable when this symbol is missing (the CPU scan
+    // path has been retired).
     _ = get_fn(&scan_parse_fn, module, "slzScanParseKernel");
-    // Optional GPU frame-walk kernel (roadmap 4d Phase 3). Absent → the
-    // D2D decompress path falls back to host bounce.
+    // Optional GPU frame-walk kernel. Absent → the D2D decompress path
+    // falls back to host bounce.
     _ = get_fn(&walk_frame_fn, module, "slzWalkFrameKernel");
-    // Optional GPU prefix-sum-chunks kernel (4d Phase 3 step 2). Absent
-    // → pure-D2D pipeline disabled, host computes first_sub_idx.
+    // Optional GPU prefix-sum-chunks kernel. Absent → pure-D2D pipeline
+    // disabled, host computes `first_sub_idx`.
     _ = get_fn(&prefix_sum_chunks_fn, module, "slzPrefixSumChunksKernel");
-    // Optional pure-D2D compaction + merge kernels (4d Phase 3 steps 4-5).
+    // Optional pure-D2D compaction + merge kernels.
     _ = get_fn(&compact_huff_descs_fn, module, "slzCompactHuffDescsKernel");
     _ = get_fn(&compact_raw_descs_fn, module, "slzCompactRawDescsKernel");
     _ = get_fn(&merge_huff_descs_fn, module, "slzMergeHuffDescsKernel");

@@ -16,7 +16,6 @@ const cuda = @import("cuda_api.zig");
 const ml = @import("module_loader.zig");
 const d = @import("descriptors.zig");
 const dec_ctx = @import("decode_context.zig");
-const scan_host_mod = @import("scan_host.zig");
 const scan_gpu_mod = @import("scan_gpu.zig");
 
 const CUdeviceptr = cuda.CUdeviceptr;
@@ -40,14 +39,13 @@ const finalizeProfiling = dec_ctx.finalizeProfiling;
 
 /// Bundle of the CUDA Driver API function pointers used by the GPU
 /// decode pipeline. Resolved once at `fullGpuLaunchImpl` entry and
-/// threaded into the three K5.2 helpers (runHuffPredecode /
-/// runLzPipeline / finalizeOutput) so they don't each re-resolve the
+/// threaded into the three pipeline helpers (`runHuffPredecode`,
+/// `runLzPipeline`, `finalizeOutput`) so they don't each re-resolve the
 /// same `cuMemcpyHtoD_fn orelse return error.BackendNotAvailable`
-/// patterns. The required fields are non-optional; `d2d` stays
-/// optional because the host-bounce paths work without it (it's only
-/// used by the D2D-source / D2D-output / gather-off16 fallback paths,
-/// and each of those sites unwraps with its own `orelse return
-/// error.BackendNotAvailable` when entered).
+/// patterns. The required fields are non-optional; `d2d` stays optional
+/// because the host-bounce paths work without it - only the D2D-source,
+/// D2D-output, and gather-off16 fallback paths consult it, and each
+/// site unwraps with its own `orelse return error.BackendNotAvailable`.
 const Fns = struct {
     h2d: cuda.FnMemcpyHtoD,
     d2h: cuda.FnMemcpyDtoH,
@@ -98,8 +96,8 @@ fn mergeHuffDescs(
     launch_fn: anytype,
 ) GpuError!void {
     if (scan.device_compact_populated and ml.merge_huff_descs_fn != 0) {
-        // Step 6c: the compact kernels already populated the four per-stream
-        // device buffers in step 6b. Launch the merge kernel - it writes
+        // GPU merge: the compact kernels already populated the four
+        // per-stream device buffers. Launch the merge kernel - it writes
         // straight to self.d_huff_descs and updates the n_merged slot in
         // d_compact_counts. No host arrays, no H2D.
         var k_lit: u64 = self.d_compact_lit;
@@ -128,26 +126,22 @@ fn mergeHuffDescs(
         endKernelTiming(t_merge, stream);
         // No post-launch sync: downstream kernels (huff_build, huff_decode)
         // are queued on the same stream and see merge's output via stream
-        // ordering. In sync mode (work_stream == 0, heavy_stream !=
-        // work_stream) the pre-back-half cross-stream sync in
-        // fullGpuLaunchImpl covers it. Saves one ~50-300 µs host wait
+        // ordering. In sync mode the pre-back-half cross-stream sync in
+        // `fullGpuLaunchImpl` covers it. Saves one ~50-300 µs host wait
         // per call.
         return;
     }
-    // CPU merge fallback: used by the non-pure-D2D / CPU-scan paths.
-    // Storage lives on the DecodeContext (see merged_huff_buf there) so
-    // the dispatch frame stays small.
+    // CPU merge fallback: used when the GPU compact path didn't run
+    // (no compact-kernel symbol, or any compact step failed). Storage
+    // lives on the `DecodeContext.merged_huff_buf` so the dispatch
+    // frame stays small.
     const merged_huff: []HuffDecChunkDesc = self.merged_huff_buf[0..];
 
     // Upfront capacity check: the sum of per-stream counts must fit in
-    // `merged_huff` (sized MAX_HUFF_DESCS_PER_STREAM × 4). Each per-
-    // stream-type input buffer is sized MAX_HUFF_DESCS_PER_STREAM, so
-    // the only way to exceed the merged buffer is if scan_host is ever
-    // changed to relax its per-stream bounds. Reject loudly rather than
-    // silently truncating (the old append loop's `if (m_ptr.* >= dst.len)
-    // return;` would have dropped any overflow without surfacing the
-    // count mismatch, and the downstream kernel-launch grid still used
-    // n_huff = sum-of-scan-counts).
+    // `merged_huff` (sized `MAX_HUFF_DESCS_PER_STREAM × 4`). Each per-
+    // stream-type input buffer is sized `MAX_HUFF_DESCS_PER_STREAM`, so
+    // the merge can only overflow if a future change relaxes those
+    // per-stream bounds. Reject loudly rather than silently truncating.
     const total_huff: usize = @as(usize, scan.num_huff_lit) + scan.num_huff_tok +
         scan.num_huff_off16hi + scan.num_huff_off16lo;
     if (total_huff > merged_huff.len) return error.BadMode;
@@ -395,7 +389,7 @@ fn dumpScanIfRequested(
 /// constructed once per decompress call so the copy cost is invisible
 /// next to the kernel work.
 ///
-/// `d_compressed_src` (4d Phase 3 D2D): when non-null the compressed
+/// `d_compressed_src` (pure-D2D source): when non-null the compressed
 /// block is already device-resident at this address; the source is
 /// D2D-copied into `d_comp_persist` (no PCIe). `compressed_block.ptr`
 /// is then unused (caller may pass an undefined slice with the
@@ -643,10 +637,10 @@ fn runLzPipeline(
 
 /// Writes the decompressed output to the caller-supplied destination.
 /// Two paths:
-///   - D2D (4d Phase 3): the caller passed a device-resident target;
-///     we issue a D2D async copy on `heavy_stream` so it serializes
-///     after the LZ kernel on the same stream. The caller's
-///     `cudaStreamSynchronize` on that stream waits for the result.
+///   - D2D: the caller passed a device-resident target; issue a D2D
+///     async copy on `heavy_stream` so it serializes after the LZ
+///     kernel on the same stream. The caller's `cudaStreamSynchronize`
+///     on that stream waits for the result.
 ///   - D2H: the caller wants the result on the host; the synchronous
 ///     `cuMemcpyDtoH` blocks until the copy completes.
 ///
@@ -731,22 +725,19 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         try cudaCall(h2d_fn(self.d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes), .copy);
     }
 
-    // 4d Phase 3 step 6: prefix-sum runs on device. The 4-byte D2H of
-    // total_subchunks below is launch-plumbing - needed to size the
-    // entropy scratch + compute region offsets host-side; no per-chunk
-    // CPU work remains.
-    // gpuPrefixSumChunksImpl returns GpuError!T (not ?T) because there's
-    // no host fallback for the prefix sum - every GPU decode path needs
-    // it. Specific GpuError variants propagate (OutOfDeviceMemory /
-    // KernelLaunchFailed / SyncFailed / BackendNotAvailable / KernelMissing).
+    // Prefix-sum runs on device. `gpuPrefixSumChunksImpl` returns
+    // `GpuError!T` (not `?T`) because there is no host fallback -
+    // every GPU decode path needs it; specific failure variants
+    // (OutOfDeviceMemory / KernelLaunchFailed / SyncFailed /
+    // BackendNotAvailable / KernelMissing) propagate to the caller.
     _ = try scan_gpu_mod.gpuPrefixSumChunksImpl(self, self.d_descs_persist, @intCast(chunk_descs.len), sub_chunk_cap);
-    // Phase 3: skip the D2H of total_subchunks — use a worst-case bound
-    // computed host-side. Max sub-chunks per chunk = ceil(chunk_size /
+    // Skip the D2H of `total_subchunks` and use a host-computed
+    // worst-case bound: max sub-chunks per chunk = ceil(chunk_size /
     // sub_chunk_cap), clamped to MAX_BLOCKS_PER_SUBCHUNK*2 = 4 in the
-    // tightest 64KB sub-chunk case. Over-allocating entropy_scratch is
-    // safe (kernels self-gate on actual count via d_total_subchunks_buf
-    // / d_compact_counts). Saves a 4-byte D2H + the implicit kernel
-    // sync it forced.
+    // tightest 64 KB sub-chunk case. Over-allocating `entropy_scratch`
+    // is safe — the kernels self-gate on the actual counts via
+    // `d_total_subchunks_buf` / `d_compact_counts`. Saves a 4-byte D2H
+    // plus the implicit kernel sync it would force.
     // Wire format: SLZ_CHUNK_SIZE_BYTES = 256 KB (matches src/gpu/common/gpu_wire_format.cuh)
     const CHUNK_SIZE_BYTES: u32 = 0x40000;
     const max_sub_per_chunk: u32 = if (sub_chunk_cap == 0) 4 else @max(1, (CHUNK_SIZE_BYTES + sub_chunk_cap - 1) / sub_chunk_cap);
@@ -765,22 +756,18 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     const off16_offset = @as(usize, total_subchunks) * per_subchunk_scratch * 2;
     self.d_entropy_off16_scratch = self.d_entropy_scratch + off16_offset;
 
-    // Phase 3: always pass the device prefix-sum to the LZ kernel.
-    // When sub_chunk_cap >= chunk_size the prefix sum is [0, 1, 2, ...]
+    // Always pass the device prefix-sum to the LZ kernel. When
+    // `sub_chunk_cap >= chunk_size` the prefix sum is `[0, 1, 2, ...]`
     // and the kernel reads identity values — same effective behavior as
-    // the prior null-pointer / kernel-side identity branch. The 4 B
-    // saving on the dead D2H of first_subchunk_idx_buf (which no host
-    // code ever read) was a pure removal; nothing downstream depended
-    // on it.
+    // the prior null-pointer / kernel-side identity branch.
     self.d_first_subchunk_idx = self.d_first_sub_idx_persist;
-    if (chunk_descs.len > self.first_subchunk_idx_buf.len) return error.BadMode;
+    if (chunk_descs.len > d.WALK_MAX_CHUNKS) return error.BadMode;
 
-    // 4d Phase 3 D2D: source bytes already device-resident → D2D-copy
-    // them into d_comp_persist (no PCIe). Else H2D from host.
-    // Phase 2: D2D issues on self.work_stream so the post-copy stream-
-    // sync below only waits on the caller's stream (not ctx-wide); H2D
-    // path is sync-on-host, so the only async hand-off to wait on is the
-    // D2D branch.
+    // Source-side input: D2D when the bytes are already device-resident,
+    // H2D otherwise. The D2D copy issues on `self.work_stream` so the
+    // post-copy stream sync below only has to wait on the caller's
+    // stream; the H2D path blocks on the host side, so there is no
+    // async hand-off to wait on.
     if (compressed_block.len > 0) {
         if (d_compressed_src) |dev_src| {
             const d2d = fns.d2d orelse return error.BackendNotAvailable;
@@ -802,46 +789,27 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     };
 
     // ── Scan for entropy chunks (Huffman + raw off16) ─────────
-    // scanForEntropyChunks fills both the Huffman descriptor buffers and the
-    // raw-off16 gather list. GPU produces only Huffman + raw outputs.
+    // The GPU scan kernel reads from `d_comp_persist` (filled by either
+    // the H2D from the host `compressed_block` slice or the D2D copy
+    // from the caller's device pointer); the host bytes themselves are
+    // never touched here, so the same code path handles both decode
+    // entry points.
     var scan: ScanResult = .{ .num_raw_off16 = 0 };
 
     if (ml.huff_build_fn != 0) {
-        // SLZ_GPU_SCAN routes the sub-chunk header walk onto the GPU.
-        // True D2D (d_compressed_src set) forces it: the CPU path would
-        // dereference the sentinel `compressed_block` host slice and
-        // segfault. The GPU scan reads from d_comp_persist (the D2D-
-        // copied data), which is what we want.
-        const want_gpu_scan = ml.scan_parse_fn != 0 and
-            chunk_descs.len <= self.first_subchunk_idx_buf.len and
-            (d_compressed_src != null or std.c.getenv("SLZ_GPU_SCAN") != null);
-        const gpu_scan: ?ScanResult = if (want_gpu_scan)
-            scan_gpu_mod.gpuScanChunks(
-                self,
-                chunk_descs,
-                compressed_block,
-                sub_chunk_cap,
-                total_subchunks,
-                &self.huff_lit_host_buf,
-                &self.huff_tok_host_buf,
-                &self.huff_off16hi_host_buf,
-                &self.huff_off16lo_host_buf,
-                &self.raw_off16_buf,
-            )
-        else
-            null;
-
-        scan = gpu_scan orelse scan_host_mod.scanForEntropyChunks(
+        if (chunk_descs.len > d.WALK_MAX_CHUNKS) return error.BadMode;
+        scan = scan_gpu_mod.gpuScanChunks(
+            self,
             chunk_descs,
             compressed_block,
             sub_chunk_cap,
-            &self.raw_off16_buf,
+            total_subchunks,
             &self.huff_lit_host_buf,
             &self.huff_tok_host_buf,
             &self.huff_off16hi_host_buf,
             &self.huff_off16lo_host_buf,
-            io,
-        );
+            &self.raw_off16_buf,
+        ) orelse return error.BackendNotAvailable;
 
         dumpScanIfRequested(self, chunk_descs, compressed_block, sub_chunk_cap, scan);
 

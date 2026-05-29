@@ -17,7 +17,6 @@
 //!                          (plus internal scan/huff descriptor types)
 //!   decode_context.zig   - DecodeContext, ensureDeviceBuf / Output,
 //!                          alloc/free/copy helpers, profiling fns
-//!   scan_host.zig        - scanForEntropyChunks + local header parsers
 //!   scan_gpu.zig         - gpuWalkFrameImpl, gpuPrefixSumChunksImpl,
 //!                          gpuScanChunks
 //!   decode_dispatch.zig  - fullGpuLaunchImpl + the per-decode helpers

@@ -8,7 +8,7 @@
 
 #include "slz_wire_format.cuh"
 
-// ── Prefix-sum-chunks kernel (roadmap 4d Phase 3 step 2) ───────────
+// ── Prefix-sum-chunks kernel ────────────────────────────────────────
 // Computes the per-chunk first-sub-chunk index plus the total
 // sub-chunk count, on device. Single-threaded sequential sum - n is
 // bounded by WALK_MAX_CHUNKS (16384), so trivial wall-time and not

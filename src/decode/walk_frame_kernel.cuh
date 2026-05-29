@@ -8,7 +8,7 @@
 
 #include "slz_wire_format.cuh"
 
-// ── Frame-walk kernel (roadmap 4d Phase 3) ──────────────────────────
+// ── Frame-walk kernel ───────────────────────────────────────────────
 // Single-threaded GPU port of decompressOneFrame + gpuBatchDecode's
 // per-chunk walk. Reads the entire compressed frame from device memory
 // (d_frame) and produces a device-resident SlzChunkDesc[] array - the

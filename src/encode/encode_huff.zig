@@ -1,8 +1,9 @@
 //! GPU Huffman encode pass and its three stream-specific wrappers
 //! (literals, tokens, off16). All four entrypoints delegate to
 //! `gpuEncodeHuffImpl`, which builds per-block Huffman tables then runs
-//! the 4-stream encoder, optionally leaving the bodies device-resident
-//! for the frame-assembly kernels to consume directly.
+//! the 4-stream encoder, leaving the bodies device-resident in the
+//! caller's `d_asm_huff_*` buffer for the frame-assembly kernels to
+//! consume directly.
 
 const std = @import("std");
 const ffi = @import("cuda_ffi.zig");
@@ -44,18 +45,14 @@ inline fn bilDstCap(count: u32) u32 {
 
 // ── GPU Huffman encode pass ────────────────────────────────────
 
-/// `out_dev`: when non-zero, the encoder writes Huffman bodies straight
-/// into that caller-owned device buffer (which must hold ≥
-/// `total_dst_bytes`) and skips the host download - `out_bytes` is then
-/// unused. This is the 4d device-resident path: the bodies stay on the
-/// GPU for the frame-assembly kernels. When zero, bodies land in the
-/// shared persist buffer and are downloaded into `out_bytes` as before.
+/// The encoder writes Huffman bodies straight into `out_dev` (a
+/// caller-owned device buffer holding ≥ `total_dst_bytes`) and
+/// downloads only the per-block size table into `out_sizes`. The
+/// frame-assembly kernels then read the bodies in place.
 pub fn gpuEncodeHuffImpl(
     self: *EncodeContext,
     descs: []const HuffEncDesc,
-    total_dst_bytes: usize,
     out_sizes: []u32,
-    out_bytes: []u8,
     out_dev: CUdeviceptr,
     /// Two static, null-terminated kernel-name strings the profiler will
     /// store in last_timings. Index 0 is the build kernel, 1 is the encode
@@ -123,7 +120,6 @@ pub fn gpuEncodeHuffImpl(
     if (!ec.ensureBuf(&self.d_huff_cl_persist, &self.d_huff_cl_size, cl_bytes)) return false;
     if (!ec.ensureBuf(&self.d_huff_codes_persist, &self.d_huff_codes_size, codes_bytes)) return false;
     if (!ec.ensureBuf(&self.d_huff_scratch_persist, &self.d_huff_scratch_size, scratch_bytes)) return false;
-    if (out_dev == 0 and !ec.ensureBuf(&self.d_huff_out_persist, &self.d_huff_out_size, total_dst_bytes)) return false;
     if (!ec.ensureBuf(&self.d_huff_sizes_persist, &self.d_huff_sizes_size, sizes_bytes)) return false;
 
     if (h2d_fn(self.d_huff_descs_persist, @ptrCast(descs.ptr), desc_bytes) != ffi.CUDA_SUCCESS) return false;
@@ -157,10 +153,11 @@ pub fn gpuEncodeHuffImpl(
     if (launch_fn(module_loader.huff_tables_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &tbl_params, &extra) != ffi.CUDA_SUCCESS)
         return false;
 
-    // Kernel 2: pack each sub-chunk into a chunk_type=4 body. Device-
-    // resident mode writes straight into the caller's buffer.
+    // Kernel 2: pack each sub-chunk into a chunk_type=4 body. The
+    // bodies land directly in the caller's `out_dev` buffer; only the
+    // small size table is D2H'd back at the end of this function.
     var p_scratch = self.d_huff_scratch_persist;
-    var p_out: CUdeviceptr = if (out_dev != 0) out_dev else self.d_huff_out_persist;
+    var p_out: CUdeviceptr = out_dev;
     var p_sizes = self.d_huff_sizes_persist;
     var p_sps: u32 = @intCast(scratch_per_stream);
     var enc_params = [_]?*anyopaque{
@@ -176,10 +173,6 @@ pub fn gpuEncodeHuffImpl(
     if (sync_fn() != ffi.CUDA_SUCCESS) return false;
 
     if (d2h_fn(@ptrCast(out_sizes.ptr), self.d_huff_sizes_persist, sizes_bytes) != ffi.CUDA_SUCCESS) return false;
-    // Device-resident mode leaves the bodies on the GPU - only the small
-    // sizes array comes back. Else download the full body buffer.
-    if (out_dev == 0)
-        if (d2h_fn(@ptrCast(out_bytes.ptr), self.d_huff_out_persist, total_dst_bytes) != ffi.CUDA_SUCCESS) return false;
     return true;
 }
 
@@ -288,35 +281,19 @@ pub fn gpuEncodeOff16HuffImpl(
         return false;
     };
 
-    // Device-resident mode: hi+lo bodies share one assembly buffer
-    // (d_asm_huff_off16); no host bytes, no D2H bounce.
-    const resident = self.huff_keep_device;
-    var out_dev: CUdeviceptr = 0;
-    if (resident) {
-        if (!ec.ensureBuf(&self.d_asm_huff_off16, &self.d_asm_huff_off16_size, total)) {
-            allocator.free(hi_offsets);
-            allocator.free(lo_offsets);
-            allocator.free(all_sizes);
-            return false;
-        }
-        out_dev = self.d_asm_huff_off16;
-    }
-    // Device-resident mode skips the host bounce buffer entirely; pass
-    // an empty slice so `gpuEncodeHuffImpl`'s `out_bytes` parameter still
-    // has a valid (but unused) backing pointer.
-    const empty_bytes = &[_]u8{};
-    const bytes: []u8 = if (resident) empty_bytes else (allocator.alloc(u8, total) catch {
+    // hi+lo bodies share one assembly buffer (d_asm_huff_off16) read in
+    // place by the frame-assembly kernels.
+    if (!ec.ensureBuf(&self.d_asm_huff_off16, &self.d_asm_huff_off16_size, total)) {
         allocator.free(hi_offsets);
         allocator.free(lo_offsets);
         allocator.free(all_sizes);
         return false;
-    });
+    }
 
-    if (!gpuEncodeHuffImpl(self, descs, total, all_sizes, bytes, out_dev, .{ "huff-off16/build", "huff-off16/encode" })) {
+    if (!gpuEncodeHuffImpl(self, descs, all_sizes, self.d_asm_huff_off16, .{ "huff-off16/build", "huff-off16/encode" })) {
         allocator.free(hi_offsets);
         allocator.free(lo_offsets);
         allocator.free(all_sizes);
-        if (!resident) allocator.free(bytes);
         return false;
     }
 
@@ -325,7 +302,6 @@ pub fn gpuEncodeOff16HuffImpl(
         allocator.free(hi_offsets);
         allocator.free(lo_offsets);
         allocator.free(all_sizes);
-        if (!resident) allocator.free(bytes);
         return false;
     };
     const lo_sizes = allocator.alloc(u32, n) catch {
@@ -333,7 +309,6 @@ pub fn gpuEncodeOff16HuffImpl(
         allocator.free(lo_offsets);
         allocator.free(hi_sizes);
         allocator.free(all_sizes);
-        if (!resident) allocator.free(bytes);
         return false;
     };
     @memcpy(hi_sizes, all_sizes[0..n]);
@@ -344,19 +319,12 @@ pub fn gpuEncodeOff16HuffImpl(
     // write site (where we still know whose buffer would leak) instead of
     // at the free site (where the double-free is harder to trace).
     std.debug.assert(self.huff_off16hi_sizes == null);
-    std.debug.assert(self.huff_off16hi_data == null);
     std.debug.assert(self.huff_off16hi_offsets == null);
     std.debug.assert(self.huff_off16lo_sizes == null);
-    std.debug.assert(self.huff_off16lo_data == null);
     std.debug.assert(self.huff_off16lo_offsets == null);
-    // hi owns `bytes`; lo is a non-owning alias of the same slice.
-    // See the OWNERSHIP RULE on the huff_off16{hi,lo}_data fields in
-    // encode_context.zig for the teardown contract.
     self.huff_off16hi_sizes = hi_sizes;
-    self.huff_off16hi_data = if (resident) null else bytes;
     self.huff_off16hi_offsets = hi_offsets;
     self.huff_off16lo_sizes = lo_sizes;
-    self.huff_off16lo_data = if (resident) null else bytes;
     self.huff_off16lo_offsets = lo_offsets;
     return true;
 }
@@ -423,37 +391,19 @@ pub fn gpuEncodeLiteralsHuffImpl(
         return false;
     };
 
-    // Device-resident mode: write Huffman bodies straight into the
-    // assembly buffer (no host bytes, no D2H bounce).
-    const resident = self.huff_keep_device;
-    var out_dev: CUdeviceptr = 0;
-    if (resident) {
-        if (!ec.ensureBuf(&self.d_asm_huff_lit, &self.d_asm_huff_lit_size, total)) {
-            allocator.free(offsets);
-            allocator.free(sizes);
-            return false;
-        }
-        out_dev = self.d_asm_huff_lit;
-    }
-    // Device-resident mode skips the host bounce buffer entirely; pass
-    // an empty slice so `gpuEncodeHuffImpl`'s `out_bytes` parameter still
-    // has a valid (but unused) backing pointer.
-    const empty_bytes = &[_]u8{};
-    const bytes: []u8 = if (resident) empty_bytes else (allocator.alloc(u8, total) catch {
+    if (!ec.ensureBuf(&self.d_asm_huff_lit, &self.d_asm_huff_lit_size, total)) {
         allocator.free(offsets);
         allocator.free(sizes);
         return false;
-    });
+    }
 
-    if (!gpuEncodeHuffImpl(self, descs, total, sizes, bytes, out_dev, .{ "huff-lit/build", "huff-lit/encode" })) {
+    if (!gpuEncodeHuffImpl(self, descs, sizes, self.d_asm_huff_lit, .{ "huff-lit/build", "huff-lit/encode" })) {
         allocator.free(offsets);
         allocator.free(sizes);
-        if (!resident) allocator.free(bytes);
         return false;
     }
 
     self.huff_lit_sizes = sizes;
-    self.huff_lit_data = if (resident) null else bytes;
     self.huff_lit_offsets = offsets;
     return true;
 }
@@ -523,37 +473,19 @@ pub fn gpuEncodeTokensHuffImpl(
         return false;
     };
 
-    // Device-resident mode: write Huffman bodies straight into the
-    // assembly buffer (no host bytes, no D2H bounce).
-    const resident = self.huff_keep_device;
-    var out_dev: CUdeviceptr = 0;
-    if (resident) {
-        if (!ec.ensureBuf(&self.d_asm_huff_tok, &self.d_asm_huff_tok_size, total)) {
-            allocator.free(offsets);
-            allocator.free(sizes);
-            return false;
-        }
-        out_dev = self.d_asm_huff_tok;
-    }
-    // Device-resident mode skips the host bounce buffer entirely; pass
-    // an empty slice so `gpuEncodeHuffImpl`'s `out_bytes` parameter still
-    // has a valid (but unused) backing pointer.
-    const empty_bytes = &[_]u8{};
-    const bytes: []u8 = if (resident) empty_bytes else (allocator.alloc(u8, total) catch {
+    if (!ec.ensureBuf(&self.d_asm_huff_tok, &self.d_asm_huff_tok_size, total)) {
         allocator.free(offsets);
         allocator.free(sizes);
         return false;
-    });
+    }
 
-    if (!gpuEncodeHuffImpl(self, descs, total, sizes, bytes, out_dev, .{ "huff-tok/build", "huff-tok/encode" })) {
+    if (!gpuEncodeHuffImpl(self, descs, sizes, self.d_asm_huff_tok, .{ "huff-tok/build", "huff-tok/encode" })) {
         allocator.free(offsets);
         allocator.free(sizes);
-        if (!resident) allocator.free(bytes);
         return false;
     }
 
     self.huff_tok_sizes = sizes;
-    self.huff_tok_data = if (resident) null else bytes;
     self.huff_tok_offsets = offsets;
     return true;
 }

@@ -242,8 +242,6 @@ fn gpuEncodeAndAssemble(
     if (!gpu_enc.gpuCompressImpl(enc_ctx, src, gpu_out, descs, comp_sizes, io, opts.level))
         return error.DestinationTooSmall;
 
-    enc_ctx.huff_keep_device = true;
-
     const did_huff_lit = opts.level >= 3 and gpu_enc.gpuEncodeLiteralsHuffImpl(enc_ctx, allocator, gpu_out, descs, comp_sizes);
     defer if (did_huff_lit) freeHuffLit(allocator, enc_ctx);
     const did_huff_tok = opts.level >= 3 and gpu_enc.gpuEncodeTokensHuffImpl(enc_ctx, allocator, gpu_out, descs, comp_sizes);
@@ -369,46 +367,32 @@ fn assembleFrame(
 
 fn freeHuffLit(a: std.mem.Allocator, c: *gpu_enc.EncodeContext) void {
     if (c.huff_lit_sizes) |s| a.free(s);
-    if (c.huff_lit_data) |d| a.free(d);
     if (c.huff_lit_offsets) |o| a.free(o);
     c.huff_lit_sizes = null;
-    c.huff_lit_data = null;
     c.huff_lit_offsets = null;
 }
 
 fn freeHuffTok(a: std.mem.Allocator, c: *gpu_enc.EncodeContext) void {
     if (c.huff_tok_sizes) |s| a.free(s);
-    if (c.huff_tok_data) |d| a.free(d);
     if (c.huff_tok_offsets) |o| a.free(o);
     c.huff_tok_sizes = null;
-    c.huff_tok_data = null;
     c.huff_tok_offsets = null;
 }
 
 fn freeHuffOff16(a: std.mem.Allocator, c: *gpu_enc.EncodeContext) void {
-    // hi_data owns the shared buffer; lo_data is a non-owning alias.
-    // Assert the alias contract so a future change that hands lo_data
-    // its own allocation trips here instead of silently double-freeing.
-    if (c.huff_off16hi_data) |hi| if (c.huff_off16lo_data) |lo|
-        std.debug.assert(hi.ptr == lo.ptr);
     if (c.huff_off16hi_sizes) |s| a.free(s);
     if (c.huff_off16lo_sizes) |s| a.free(s);
     if (c.huff_off16hi_offsets) |o| a.free(o);
     if (c.huff_off16lo_offsets) |o| a.free(o);
-    if (c.huff_off16hi_data) |d| a.free(d);
     c.huff_off16hi_sizes = null;
-    c.huff_off16hi_data = null;
     c.huff_off16hi_offsets = null;
     c.huff_off16lo_sizes = null;
-    c.huff_off16lo_data = null;
     c.huff_off16lo_offsets = null;
 }
 
 fn freeAssembled(a: std.mem.Allocator, c: *gpu_enc.EncodeContext) void {
-    if (c.assembled_data) |d| a.free(d);
     if (c.assembled_offsets) |o| a.free(o);
     if (c.assembled_sizes) |s| a.free(s);
-    c.assembled_data = null;
     c.assembled_offsets = null;
     c.assembled_sizes = null;
 }

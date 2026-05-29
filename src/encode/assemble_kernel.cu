@@ -1,8 +1,7 @@
 // ── StreamLZ GPU frame-assembly kernel ──────────────────────────────
-// Device-resident compress tail (roadmap 4d). Replaces the CPU
-// `reencodeGpuWithEntropy` per-sub-chunk loop in fast_framed.zig: given
-// the LZ kernel's raw sub-chunk streams and the GPU-Huffman bodies - all
-// already device-resident - assemble each sub-chunk's payload on the GPU.
+// Device-resident compress tail: given the LZ kernel's raw sub-chunk
+// streams and the GPU-Huffman bodies - all already device-resident -
+// assemble each sub-chunk's payload on the GPU.
 //
 // Two passes, one warp per sub-chunk:
 //   slzAssembleMeasureKernel - compute each sub-chunk's assembled size.
@@ -363,7 +362,7 @@ extern "C" __global__ void slzAssembleWriteKernel(
     }
 }
 
-// ── Frame-assemble kernel (4d step 8) ───────────────────────────────
+// ── Frame-assemble kernel ───────────────────────────────────────────
 // Writes the complete StreamLZ frame to d_output on device:
 //   [pre-formed frame_hdr+block_hdr (host-staged via d_prefix_bytes)]
 //   per chunk i, one of two layouts depending on whether chunk i's

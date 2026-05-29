@@ -113,15 +113,15 @@ pub const ScanResult = struct {
     num_huff_off16lo: u32 = 0,
     /// Set when gpuScanChunks ran the device-side compact kernels and
     /// `d_compact_*` buffers hold the per-stream compacted descs + counts
-    /// in `d_compact_counts`. fullGpuLaunchImpl uses this to dispatch the
-    /// GPU merge kernel (step 6c) instead of the CPU append loop.
+    /// in `d_compact_counts`. `fullGpuLaunchImpl` then dispatches the
+    /// GPU merge kernel instead of the CPU append loop.
     device_compact_populated: bool = false,
 };
 
-/// 4d Phase 3 step 1: GPU walk-kernel result, device-only. d_chunk_descs
-/// holds up to `WALK_MAX_CHUNKS` SlzChunkDesc entries; d_meta is six
-/// u32s: (n_chunks, decomp_size, sub_chunk_cap, block_start, block_size,
-/// status). Nothing is D2H'd by the walk - downstream kernels read the
+/// GPU walk-kernel result, device-only. `d_chunk_descs` holds up to
+/// `WALK_MAX_CHUNKS` SlzChunkDesc entries; `d_meta` is six u32s:
+/// `(n_chunks, decomp_size, sub_chunk_cap, block_start, block_size,
+/// status)`. Nothing is D2H'd by the walk - downstream kernels read the
 /// device pointers directly.
 pub const WalkFrameResultDev = struct {
     d_chunk_descs: u64,
@@ -138,10 +138,9 @@ pub const walk_meta_offsets = struct {
     pub const bytes: usize = 24;
 };
 
-/// 4d Phase 3 step 2: device-side prefix sum of per-chunk sub-chunk
-/// counts. Reads (d_chunk_descs, d_n_chunks, d_sub_chunk_cap) - all
-/// device-resident - and writes (d_first_sub_idx, d_total_subchunks).
-/// No D2H, no CPU work.
+/// Device-side prefix sum of per-chunk sub-chunk counts. Reads
+/// (d_chunk_descs, d_n_chunks, d_sub_chunk_cap) - all device-resident -
+/// and writes (d_first_sub_idx, d_total_subchunks). No D2H, no CPU work.
 pub const PrefixSumResultDev = struct {
     d_first_sub_idx: u64,
     d_total_subchunks: u64,

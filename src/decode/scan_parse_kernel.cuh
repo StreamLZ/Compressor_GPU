@@ -10,13 +10,13 @@
 #include "slz_wire_format.cuh"
 #include "compact_descs_kernels.cuh"
 
-// ── Decode-scan kernel (roadmap 4d Phase 2) ─────────────────────────
-// GPU port of scanForEntropyChunks (decode/driver.zig): one thread per
-// chunk walks every sub-chunk's literal / token / off16 stream headers
-// and stages a descriptor per stream type per global sub-chunk index.
-// The driver D2H's the staged arrays and compacts them (drops raw /
-// absent slots, assigns lut_offset). Verified byte-identical to the CPU
-// scan in tools/huff_test/scan_test.cu across enwik8 + silesia L3-L5.
+// ── Decode-scan kernel ──────────────────────────────────────────────
+// GPU port of `scanForEntropyChunks`: one thread per chunk walks every
+// sub-chunk's literal / token / off16 stream headers and stages a
+// descriptor per stream type per global sub-chunk index. The driver
+// D2H's the staged arrays and compacts them (drops raw / absent slots,
+// assigns lut_offset). Verified byte-identical to the CPU scan in
+// `tools/huff_test/scan_test.cu` across enwik8 + silesia L3-L5.
 
 // SlzScanHuffDesc + SlzScanRawDesc defined earlier in the compact
 // section so the compact kernels can reference them.

@@ -222,37 +222,38 @@ pub const DecodeContext = struct {
 
     raw_off16_buf: [d.MAX_RAW_OFF16_DESCS]d.RawOff16Desc = undefined,
 
-    // GPU decode-scan staged buffers (roadmap 4d Phase 2). d_scan_staged
-    // packs the six staged arrays (lit/tok/hi/lo huff + raw hi/lo);
-    // d_scan_first_sub holds the per-chunk first-sub-chunk prefix sum.
+    // GPU decode-scan staged buffers. d_scan_staged packs the six staged
+    // arrays the scan kernel writes (lit/tok/hi/lo huff descriptor lists
+    // + raw hi/lo gather lists); d_scan_first_sub holds the per-chunk
+    // first-sub-chunk prefix sum.
     d_scan_staged: CUdeviceptr = 0,
     d_scan_staged_size: usize = 0,
     d_scan_first_sub: CUdeviceptr = 0,
     d_scan_first_sub_size: usize = 0,
 
-    // GPU frame-walk kernel scratch (roadmap 4d Phase 3). d_walk_chunks
-    // holds the kernel-produced ChunkDesc array; d_walk_meta is a single
-    // 6-u32 region for (n_chunks, decomp_size, sub_chunk_cap,
-    // block_start, block_size, status).
+    // GPU frame-walk kernel scratch. d_walk_chunks holds the
+    // kernel-produced ChunkDesc array; d_walk_meta is a 6-u32 region
+    // (n_chunks, decomp_size, sub_chunk_cap, block_start, block_size,
+    // status).
     d_walk_chunks: CUdeviceptr = 0,
     d_walk_chunks_size: usize = 0,
     d_walk_meta: CUdeviceptr = 0,
     d_walk_meta_size: usize = 0,
 
-    // Pure-D2D prefix-sum scratch (step 2): d_first_sub_idx holds the
-    // per-chunk first-sub-chunk index; d_total_subchunks_buf is a single
-    // u32 with the running total (device-resident, never D2H'd on the
-    // pure path).
+    // Pure-D2D prefix-sum scratch: d_first_sub_idx holds the per-chunk
+    // first-sub-chunk index; d_total_subchunks_buf is a single u32 with
+    // the running total (device-resident, never D2H'd on the pure path).
     d_first_sub_idx_persist: CUdeviceptr = 0,
     d_first_sub_idx_persist_size: usize = 0,
     d_total_subchunks_buf: CUdeviceptr = 0,
     d_total_subchunks_buf_size: usize = 0,
 
-    // Pure-D2D compaction outputs (step 6b). Each compact buffer holds
-    // a compacted per-stream HuffDecChunkDesc array (slzCompactHuffDescs-
-    // Kernel output). d_compact_raw holds the interleaved hi/lo
-    // RawOff16Descs (slzCompactRawDescsKernel output). d_compact_counts
-    // is a 6 u32 region: [n_lit, n_tok, n_hi, n_lo, n_raw, n_merged].
+    // Pure-D2D compaction outputs. Each `d_compact_*` buffer holds a
+    // compacted per-stream HuffDecChunkDesc array (output of
+    // slzCompactHuffDescsKernel). `d_compact_raw` holds the interleaved
+    // hi/lo RawOff16Descs (output of slzCompactRawDescsKernel).
+    // `d_compact_counts` is a 6 × u32 region: [n_lit, n_tok, n_hi, n_lo,
+    // n_raw, n_merged].
     d_compact_lit: CUdeviceptr = 0,
     d_compact_lit_size: usize = 0,
     d_compact_tok: CUdeviceptr = 0,
@@ -266,10 +267,10 @@ pub const DecodeContext = struct {
     d_compact_counts: CUdeviceptr = 0,
     d_compact_counts_size: usize = 0,
 
-    // Step 7 launch-plumbing scratch: device-resident 4 B counters used
-    // to feed kernel self-gates when the GPU compact path didn't run
-    // (CPU-scan fallback). The pure-D2D path consumes d_compact_counts
-    // slots directly and never touches these.
+    // Launch-plumbing scratch: device-resident 4 B counters used to feed
+    // kernel self-gates on the host-bounce (CPU-scan) decode path. The
+    // pure-D2D path consumes `d_compact_counts` slots directly and never
+    // touches these.
     d_n_raw_scratch: CUdeviceptr = 0,
     d_n_raw_scratch_size: usize = 0,
     d_n_huff_scratch: CUdeviceptr = 0,
@@ -299,16 +300,10 @@ pub const DecodeContext = struct {
     pipeline_streams_created: bool = false,
 
 
-    // Per-call scratch buffers - pulled off the dispatch-loop stack
-    // because the combined ~384 KiB is uncomfortably large in a recursive
-    // call frame. Reused across calls; capacity is sized for the largest
-    // frame the GPU codec can produce (WALK_MAX_CHUNKS chunks × per-stream-cap).
-    //   merged_huff_buf       - CPU merge fallback, four streams' worth of
-    //                           HuffDecChunkDesc entries (~320 KiB).
-    //   first_subchunk_idx_buf - CPU mirror of the per-chunk first-sub-chunk
-    //                           prefix sum used by the non-pure-D2D path (~64 KiB).
+    // CPU merge fallback scratch (four streams' worth of HuffDecChunkDesc
+    // entries, ~320 KiB). Pulled off the dispatch-loop stack so the
+    // recursive call frame stays small; reused across calls.
     merged_huff_buf: [d.MAX_HUFF_DESCS_PER_STREAM * 4]d.HuffDecChunkDesc = undefined,
-    first_subchunk_idx_buf: [d.WALK_MAX_CHUNKS]u32 = .{0} ** d.WALK_MAX_CHUNKS,
 
     // Per-kernel timing (slzDecompressOpts_t.enable_profiling). When true,
     // every kernel launch in fullGpuLaunchImpl records a cuEvent pair and

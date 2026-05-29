@@ -74,7 +74,7 @@ pub const FrameFlags = packed struct(u8) {
     /// parallel Fast L1-L4 decode. When set, the decoder should locate
     /// and apply the sidecar before spawning phase-2 worker threads.
     parallel_decode_metadata_present: bool = false,
-    /// Bit reserved for future use (was the Phase-2 GPU shared-LUT flag).
+    /// Reserved bits — must be zero on write.
     _reserved: u3 = 0,
 };
 
