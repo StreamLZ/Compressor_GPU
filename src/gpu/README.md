@@ -212,9 +212,10 @@ fill harder.
 
 The 32-stream Huffman pre-decode (L3+) now lands well under half the
 LZ kernel time. LZ kernel time is unchanged across this rewrite. The
-D2H copy of the decompressed output remains the largest e2e cost; for
-D2D callers, it drops to zero (the L1 D2D wall-clock of 2.91 ms is the
-entire decompress time).
+D2H copy of the decompressed output remains the largest e2e cost for
+host-output callers; for D2D callers using `slzDecompressAsync` it
+drops to zero (the LZ kernel writes straight into the caller's device
+buffer — see commit `0440532`).
 
 ### Encode (ms): GPU LZ-encode kernel
 
@@ -245,31 +246,90 @@ nvCOMP 5.2.0, same RTX 4060 Ti. (nvCOMP's hardware decompression engine
 is Hopper or Blackwell only, not available on Ada, so only the CUDA
 decode path applies here.)
 
-| Codec | ratio | D2D wall-clock | decode e2e |
-|-------|------:|---------------:|-----------:|
-| StreamLZ L1 | 58.6% | **2.91 ms** | 15.65 ms |
-| StreamLZ L5 | 39.6% | **4.13 ms** | **16.11 ms** |
-| nvCOMP LZ4  | 60.0% | 5.1 ms | 18.5 ms |
-| nvCOMP Zstd | 40.2% | 6.2 ms | 18.2 ms |
+#### Methodology
 
-nvCOMP figures are best-of-20 from the `nvcomp_bench3` harness (nvCOMP
-5.2.0), measured the same way as StreamLZ's `-db`: D2D wall-clock timed
-by CUDA event around the decode kernel(s), e2e as
-H2D(compressed) + decode + D2H(output) wall-clock, both with a
-correctness verify.
+Three measurement windows are reported because they answer different
+questions, and confusing them is easy. Earlier revisions of this section
+compared StreamLZ's narrow "inner decode kernels" timer against
+nvCOMP's whole-call event bracket, which inflated the reported win.
+The numbers below are apples-to-apples within each row.
 
-**StreamLZ L1 win vs nvCOMP LZ4.** Smaller frame (58.6% vs 60.0%) and
-faster decode on both axes: D2D 2.91 vs 5.1 ms (1.75x faster),
-e2e 15.65 vs 18.5 ms (1.18x faster).
+| Window | What it measures | StreamLZ source | nvCOMP source |
+|--------|------------------|-----------------|---------------|
+| **Pipeline kernel-sum** | Σ `cudaEventElapsedTime` across every kernel in the decode pipeline. Excludes memcpys, scheduler gaps, event overhead. | `bench_d2d` "kernel active best" | `nsys stats --report=cuda_gpu_kern_sum` over the 20 timing iterations |
+| **Async call wall** | cuEvent pair on the caller's stream around the *whole* decompress API call. Includes any internal memcpys + per-kernel event-record overhead. What an async caller actually waits for. | `bench_d2d` "gpu kernel best" | `nvcomp_bench3` "decode kernel best" |
+| **End-to-end host wall** | `chrono` wall around `H2D(compressed) + decompress + D2H(output)` with pageable host input/output. Real cost when payload starts and ends on host. | `bench_all` (`streamlz.exe -db`) "e2e best" | `nvcomp_bench3` "decode e2e best" |
 
-**StreamLZ L5 win vs nvCOMP Zstd.** Smaller frame (39.6% vs 40.2%) and
-faster decode on both axes: D2D 4.13 vs 6.2 ms (1.50x faster),
-e2e 16.11 vs 18.2 ms (1.13x faster). The D2D edge comes from the
-32-stream Huffman decode (all 32 warp lanes active, vs 4 in the prior
-design) combined with the BIL bounded-interleaved refill (one
-coalesced 128-byte sector load per warp, vs 32 scattered per-stream
-loads), the warp-cooperative LUT-build kernel, and the two-phase
-preamble + 2-lookup hot loop described in `ARCHITECTURE.md`.
+Ground truth for per-kernel breakdowns comes from **Nsight Systems 2025.5**:
+
+```
+nsys profile --trace=cuda --sample=none --output=<rep> <bench.exe> [args]
+nsys stats --report=cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_api_sum <rep>.nsys-rep
+```
+
+For nvCOMP LZ4 this surfaces one kernel (`lz4DecompressBatchKernel`)
+per decompress call — its time *is* the kernel sum. For nvCOMP Zstd
+it surfaces five (`zstd::decompression_kernel`, `init_fse_tables`,
+`init_huff_tables`, `classify_frames`, `init_buffer_vals`); their sum
+matches nvCOMP's reported "decode kernel" measurement to within noise,
+which confirms nvCOMP's event bracket is effectively a kernel-sum (no
+hidden internal memcpys).
+
+For StreamLZ nsys surfaces ~10 kernels per call (`slzWalkFrame*`,
+`slzPrefixSumChunks*`, `slzScanParse*`, four `slzCompactHuffDescs*` +
+`slzCompactRawDescs*`, `slzGatherRawOff16*`, `slzMergeHuffDescs*`,
+`slzHuffBuildLut*` + `slzHuffDecode4Stream*` for L3+,
+`slzLzDecode*`). The async-call wall exceeds the kernel-sum by ~0.6 ms
+on L1 — that's the front-half D2D of the compressed block into
+`d_comp_persist` plus per-kernel cuEvent record overhead, both
+on-stream but not in the kernel-sum.
+
+StreamLZ numbers are best-of-30 from a single bench session; nvCOMP
+numbers are best-of-20 from `nvcomp_bench3`.
+
+#### L1 / LZ4
+
+| Window | StreamLZ L1 | nvCOMP LZ4 | StreamLZ win |
+|--------|------------:|-----------:|-------------:|
+| Pipeline kernel-sum | **4.03 ms** | 4.77 ms | 1.18× |
+| Async call wall     | **4.61 ms** | 4.77 ms | 1.03× |
+| End-to-end host wall | **15.51 ms** | 18.29 ms | 1.18× |
+
+Compression ratio: StreamLZ L1 58.6%, nvCOMP LZ4 60.0%.
+
+#### L5 / Zstd
+
+| Window | StreamLZ L5 | nvCOMP Zstd | StreamLZ win |
+|--------|------------:|------------:|-------------:|
+| Pipeline kernel-sum | **5.50 ms** | 6.25 ms | 1.14× |
+| Async call wall     | **5.94 ms** | 6.25 ms | 1.05× |
+| End-to-end host wall | **15.27 ms** | 18.16 ms | 1.19× |
+
+Compression ratio: StreamLZ L5 39.6%, nvCOMP Zstd 40.2%.
+
+#### Where the wins come from
+
+**Kernel-sum gap (~0.75-0.85 ms).** Faster compute per byte: the
+32-stream Huffman decode (all 32 warp lanes active vs ~4 in prior
+designs) combined with the BIL bounded-interleaved refill (one
+coalesced 128-byte sector load per warp vs 32 scattered per-stream
+loads), the warp-cooperative `slzHuffBuildLutKernel` rewrite, and the
+two-phase preamble + 2-lookup hot loop described in `ARCHITECTURE.md`.
+
+**Async-call wall is essentially tied (1.03×, 1.05×).** Both pipelines
+finish one decompress in roughly the same wall budget; StreamLZ's
+kernel-sum advantage is partially absorbed by its longer pipeline (10
+kernels vs 1-5) plus per-kernel cuEvent overhead and the front-half
+compressed-block D2D. For a streaming caller submitting many same-shape
+decompresses on the same stream, the kernel-sum gap is what compounds
+over the long run — the per-call event/setup overhead is fixed.
+
+**End-to-end host gap (~2.8 ms = 1.18-1.19×).** Mostly the D2H of the
+decompressed output. At 100 MB nvCOMP's `cudaMemcpyAsync` from device
+to pageable host runs slower than StreamLZ's D2H into the
+page-locked `h_pinned_output` buffer; the DMA path is the same but the
+pinned-buffer path doesn't stage through a driver-internal bounce
+buffer.
 
 ## Invariants: do not break these
 
