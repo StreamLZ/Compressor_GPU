@@ -206,21 +206,15 @@ pub const DecodeContext = struct {
     d_entropy_scratch_size: usize = 0,
 
     // Off16 scratch view = d_entropy_scratch + off16_offset (set in fullGpuLaunchImpl).
-    // Used by the raw-off16 gather kernel and the D2D/H2D fallback loops.
+    // The raw-off16 gather kernel scatters compressed raw bytes here.
     d_entropy_off16_scratch: CUdeviceptr = 0,
     d_entropy_off16_scratch_size: usize = 0,
-
-    // Raw off16 gather descriptors (one per raw off16 sub-stream).
-    d_raw_off16_descs: CUdeviceptr = 0,
-    d_raw_off16_descs_size: usize = 0,
 
     // Per-chunk first-subchunk-index buffer (multi-sub-chunk-per-chunk support).
     // At sc>0.5 chunks have multiple sub-chunks each; each sub-chunk needs its
     // own entropy scratch slot. This array maps chunk_idx → global sub-chunk index.
     d_first_subchunk_idx: CUdeviceptr = 0,
     d_first_subchunk_idx_size: usize = 0,
-
-    raw_off16_buf: [d.MAX_RAW_OFF16_DESCS]d.RawOff16Desc = undefined,
 
     // GPU decode-scan staged buffers. d_scan_staged packs the six staged
     // arrays the scan kernel writes (lit/tok/hi/lo huff descriptor lists
@@ -267,14 +261,10 @@ pub const DecodeContext = struct {
     d_compact_counts: CUdeviceptr = 0,
     d_compact_counts_size: usize = 0,
 
-    // Launch-plumbing scratch: device-resident 4 B counters used to feed
-    // kernel self-gates on the host-bounce (CPU-scan) decode path. The
-    // pure-D2D path consumes `d_compact_counts` slots directly and never
-    // touches these.
-    d_n_raw_scratch: CUdeviceptr = 0,
-    d_n_raw_scratch_size: usize = 0,
-    d_n_huff_scratch: CUdeviceptr = 0,
-    d_n_huff_scratch_size: usize = 0,
+    // Single-slot launch-plumbing scratch: device-resident 4 B counters
+    // staged via H2D so the kernel can self-gate. `d_n_chunks_scratch`
+    // feeds the scan kernel; `d_n_groups_scratch` feeds the LZ pipeline
+    // dispatch with the per-group chunk count.
     d_n_chunks_scratch: CUdeviceptr = 0,
     d_n_chunks_scratch_size: usize = 0,
     d_n_groups_scratch: CUdeviceptr = 0,
@@ -285,13 +275,6 @@ pub const DecodeContext = struct {
     d_huff_descs_size: usize = 0,
     d_huff_lut: CUdeviceptr = 0,
     d_huff_lut_size: usize = 0,
-    // One host buffer per stream type - scanner appends to each;
-    // mergeHuffDescs merges them into one device array with per-type
-    // out_offset added.
-    huff_lit_host_buf: [d.MAX_HUFF_DESCS_PER_STREAM]d.HuffDecChunkDesc = undefined,
-    huff_tok_host_buf: [d.MAX_HUFF_DESCS_PER_STREAM]d.HuffDecChunkDesc = undefined,
-    huff_off16hi_host_buf: [d.MAX_HUFF_DESCS_PER_STREAM]d.HuffDecChunkDesc = undefined,
-    huff_off16lo_host_buf: [d.MAX_HUFF_DESCS_PER_STREAM]d.HuffDecChunkDesc = undefined,
 
     // Pipeline streams (persistent, created once in init). Stays sized by
     // cuda.NUM_PIPELINE_STREAMS even though it currently equals 1, so a
@@ -300,10 +283,6 @@ pub const DecodeContext = struct {
     pipeline_streams_created: bool = false,
 
 
-    // CPU merge fallback scratch (four streams' worth of HuffDecChunkDesc
-    // entries, ~320 KiB). Pulled off the dispatch-loop stack so the
-    // recursive call frame stays small; reused across calls.
-    merged_huff_buf: [d.MAX_HUFF_DESCS_PER_STREAM * 4]d.HuffDecChunkDesc = undefined,
 
     // Per-kernel timing (slzDecompressOpts_t.enable_profiling). When true,
     // every kernel launch in fullGpuLaunchImpl records a cuEvent pair and
@@ -343,7 +322,6 @@ pub const DecodeContext = struct {
         free_dev(&self.d_descs_persist, &self.d_descs_persist_size);
         free_dev(&self.d_entropy_scratch, &self.d_entropy_scratch_size);
         free_dev(&self.d_entropy_off16_scratch, &self.d_entropy_off16_scratch_size);
-        free_dev(&self.d_raw_off16_descs, &self.d_raw_off16_descs_size);
         free_dev(&self.d_first_subchunk_idx, &self.d_first_subchunk_idx_size);
         free_dev(&self.d_scan_staged, &self.d_scan_staged_size);
         free_dev(&self.d_scan_first_sub, &self.d_scan_first_sub_size);
@@ -357,8 +335,6 @@ pub const DecodeContext = struct {
         free_dev(&self.d_compact_lo, &self.d_compact_lo_size);
         free_dev(&self.d_compact_raw, &self.d_compact_raw_size);
         free_dev(&self.d_compact_counts, &self.d_compact_counts_size);
-        free_dev(&self.d_n_raw_scratch, &self.d_n_raw_scratch_size);
-        free_dev(&self.d_n_huff_scratch, &self.d_n_huff_scratch_size);
         free_dev(&self.d_n_chunks_scratch, &self.d_n_chunks_scratch_size);
         free_dev(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size);
         free_dev(&self.d_huff_descs, &self.d_huff_descs_size);

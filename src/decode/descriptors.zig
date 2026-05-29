@@ -111,11 +111,6 @@ pub const ScanResult = struct {
     num_huff_tok: u32 = 0,
     num_huff_off16hi: u32 = 0,
     num_huff_off16lo: u32 = 0,
-    /// Set when gpuScanChunks ran the device-side compact kernels and
-    /// `d_compact_*` buffers hold the per-stream compacted descs + counts
-    /// in `d_compact_counts`. `fullGpuLaunchImpl` then dispatches the
-    /// GPU merge kernel instead of the CPU append loop.
-    device_compact_populated: bool = false,
 };
 
 /// GPU walk-kernel result, device-only. `d_chunk_descs` holds up to

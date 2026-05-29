@@ -50,7 +50,8 @@ pub fn gpuWalkFrameImpl(
     if (!ensureDeviceBuf(&self.d_walk_meta, &self.d_walk_meta_size, d.walk_meta_offsets.bytes)) return error.OutOfDeviceMemory;
     try cudaCall(memset(self.d_walk_meta, 0, d.walk_meta_offsets.bytes), .copy);
 
-    // Phase 3c: launch on work_stream (sync=0, async=caller's stream).
+    // Launch on `work_stream` (= 0 in the sync wrapper, caller's stream
+    // in the async wrapper).
     // No post-kernel sync here — the caller's walkMetaToHostAsync (or
     // any subsequent kernel on the same stream) serializes naturally.
     const stream = self.work_stream;
@@ -102,11 +103,12 @@ pub fn gpuPrefixSumChunksImpl(
     if (!ensureDeviceBuf(&self.d_first_sub_idx_persist, &self.d_first_sub_idx_persist_size, first_bytes)) return error.OutOfDeviceMemory;
     if (!ensureDeviceBuf(&self.d_total_subchunks_buf, &self.d_total_subchunks_buf_size, 4)) return error.OutOfDeviceMemory;
 
-    // Phase 2: launch on caller's stream when async (0 otherwise).
-    // Phase 3: no internal sync — downstream consumers are kernels on
-    // the same stream and serialize naturally. Result device pointers
-    // (d_first_sub_idx, d_total_subchunks_buf) are read by kernels, not
-    // by host.
+    // Launch on caller's stream (= 0 in the sync wrapper, caller's
+    // stream in the async wrapper). No internal sync: downstream
+    // consumers are kernels queued on the same stream that serialize
+    // naturally; the result device pointers
+    // (`d_first_sub_idx_persist`, `d_total_subchunks_buf`) are read by
+    // kernels, never by host.
     const stream = self.work_stream;
     var k_chunks = d_chunk_descs;
     var k_n = n_chunks;
@@ -134,28 +136,16 @@ pub fn gpuScanChunks(
     compressed_block: []const u8,
     sub_chunk_cap: u32,
     total_subchunks: u32,
-    huff_lit_descs: []d.HuffDecChunkDesc,
-    huff_tok_descs: []d.HuffDecChunkDesc,
-    huff_off16hi_descs: []d.HuffDecChunkDesc,
-    huff_off16lo_descs: []d.HuffDecChunkDesc,
-    raw_off16_descs: []d.RawOff16Desc,
 ) ?d.ScanResult {
     if (ml.scan_parse_fn == 0) return null;
+    if (ml.compact_huff_descs_fn == 0 or ml.compact_raw_descs_fn == 0) return null;
     const n: u32 = @intCast(chunk_descs.len);
     if (n == 0 or total_subchunks == 0) return null;
 
-    const d2h = cuda.cuMemcpyDtoH_fn orelse return null;
     const h2d = cuda.cuMemcpyHtoD_fn orelse return null;
     const launch = cuda.cuLaunchKernel_fn orelse return null;
-    const stream_sync = cuda.cuStreamSync_fn orelse return null;
     const memset = cuda.cuMemsetD8_fn orelse return null;
-    // Phase 2: launch on caller's work_stream when async, stream 0 when
-    // sync. Stream-targeted sync below preserves caller's other-stream
-    // parallelism.
     const stream = self.work_stream;
-    // The scan kernel reads the device-resident prefix sum
-    // (d_first_sub_idx_persist) directly; no host first_subchunk_idx
-    // mirror is needed here.
 
     // Staged buffer: [lit][tok][hi][lo] ScanHuffDesc, then [raw_hi][raw_lo]
     // ScanRawDesc - one entry per global sub-chunk index per stream type.
@@ -170,13 +160,9 @@ pub fn gpuScanChunks(
     var k_block = self.d_comp_persist;
     var k_blen: u32 = @intCast(compressed_block.len);
     var k_chunks = self.d_descs_persist;
-    // Use the device-resident prefix-sum output directly. The legacy
-    // host array (`first_subchunk_idx`) is zero-filled for the
-    // `total_subchunks == n_chunks` case in fullGpuLaunchImpl and
-    // would feed the scan kernel a bogus prefix sum.
     var k_first = self.d_first_sub_idx_persist;
-    // Step 7: scan kernel self-gates on `*d_n_chunks`. Stage host n
-    // into d_n_chunks_scratch (4 B H2D).
+    // Scan kernel self-gates on `*d_n_chunks` - stage host n into a
+    // device-resident 4 B slot.
     if (!ensureDeviceBuf(&self.d_n_chunks_scratch, &self.d_n_chunks_scratch_size, 4)) return null;
     var host_n_chunks: u32 = n;
     if (h2d(self.d_n_chunks_scratch, @ptrCast(&host_n_chunks), 4) != CUDA_SUCCESS) return null;
@@ -202,24 +188,14 @@ pub fn gpuScanChunks(
     dec_ctx.endKernelTiming(t_scan, stream);
     // No post-scan sync: the compact kernels below queue on the same
     // stream and see scan_parse's writes to d_scan_staged via stream
-    // ordering. The CPU-merge fallback at the bottom still syncs before
-    // its D2H of compact counts — that one IS load-bearing.
+    // ordering.
 
-    // ── Step 6b: device-side compaction ─────────────────────────────
-    // 4 × slzCompactHuffDescsKernel + 1 × slzCompactRawDescsKernel
-    // produce compacted per-stream arrays + counts entirely on device.
-    // Total D2H from this fn: 5 × u32 counts (20 B). Falls back to the
-    // host-side compact path if any compact-kernel symbol is missing.
-    const gpu_compact_ok =
-        ml.compact_huff_descs_fn != 0 and ml.compact_raw_descs_fn != 0;
-
-    var num_lit: u32 = 0;
-    var num_tok: u32 = 0;
-    var num_hi: u32 = 0;
-    var num_lo: u32 = 0;
-    var num_raw: u32 = 0;
-
-    if (gpu_compact_ok) {
+    // Device-side compaction: 4 × slzCompactHuffDescsKernel + 1 ×
+    // slzCompactRawDescsKernel produce compacted per-stream arrays
+    // + per-stream counts entirely on device. Nothing comes back to
+    // the host here - downstream kernels (merge, huff_build, gather)
+    // read straight from d_compact_*.
+    {
         // Size compact buffers. n_huff bound: WALK_MAX_CHUNKS * 4
         // (sub-chunks per chunk at sc>=1). n_raw bound: 2 × that.
         const huff_compact_max = @as(usize, d.WALK_MAX_CHUNKS) * 4;
@@ -278,110 +254,23 @@ pub fn gpuScanChunks(
             if (launch(ml.compact_raw_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &cr_params, &cr_extra) != CUDA_SUCCESS) return null;
             dec_ctx.endKernelTiming(t_cr, stream);
         }
-        if (ml.merge_huff_descs_fn != 0) {
-            // Phase 3d (pure-D2D merge path, the common case): skip the
-            // compact-counts D2H + the cuStreamSynchronize that gated
-            // it. The merge kernel + huff_build + huff_decode + the
-            // raw-gather kernel all read their counts from
-            // d_compact_counts as device pointers (already wired up
-            // below) and self-gate. Downstream allocations use
-            // worst-case bounds (= total_subchunks per Huff stream type
-            // + 2× total_subchunks for the two raw streams).
-            //
-            // Cost: on L1/L2 frames (no entropy → actual counts 0) the
-            // merge / huff_build / huff_decode kernels still launch
-            // with worst-case grids and early-exit on
-            // *d_n_merged == 0. Estimated ~15 μs additional GPU time
-            // on the L1/L2 D2D path.
-            num_lit = total_subchunks;
-            num_tok = total_subchunks;
-            num_hi = total_subchunks;
-            num_lo = total_subchunks;
-            num_raw = total_subchunks * 2;
-        } else {
-            // Legacy host-merge fallback (merge_huff_descs_fn unloaded):
-            // need actual counts host-side to size the host-buf appends
-            // + D2H the compacted descriptors into the host buffers.
-            // Hot path doesn't take this branch on any in-tree build —
-            // it's defensive against a future driver build dropping the
-            // merge kernel.
-            if (stream_sync(stream) != CUDA_SUCCESS) return null;
-            var counts: [5]u32 = .{ 0, 0, 0, 0, 0 };
-            if (d2h(@ptrCast(&counts), self.d_compact_counts, 5 * 4) != CUDA_SUCCESS) return null;
-            num_lit = counts[0];
-            num_tok = counts[1];
-            num_hi = counts[2];
-            num_lo = counts[3];
-            num_raw = counts[4];
-
-            if (num_lit > 0 and num_lit <= huff_lit_descs.len)
-                if (d2h(@ptrCast(huff_lit_descs.ptr), self.d_compact_lit, @as(usize, num_lit) * @sizeOf(d.HuffDecChunkDesc)) != CUDA_SUCCESS) return null;
-            if (num_tok > 0 and num_tok <= huff_tok_descs.len)
-                if (d2h(@ptrCast(huff_tok_descs.ptr), self.d_compact_tok, @as(usize, num_tok) * @sizeOf(d.HuffDecChunkDesc)) != CUDA_SUCCESS) return null;
-            if (num_hi > 0 and num_hi <= huff_off16hi_descs.len)
-                if (d2h(@ptrCast(huff_off16hi_descs.ptr), self.d_compact_hi, @as(usize, num_hi) * @sizeOf(d.HuffDecChunkDesc)) != CUDA_SUCCESS) return null;
-            if (num_lo > 0 and num_lo <= huff_off16lo_descs.len)
-                if (d2h(@ptrCast(huff_off16lo_descs.ptr), self.d_compact_lo, @as(usize, num_lo) * @sizeOf(d.HuffDecChunkDesc)) != CUDA_SUCCESS) return null;
-            if (num_raw > 0 and num_raw <= raw_off16_descs.len)
-                if (d2h(@ptrCast(raw_off16_descs.ptr), self.d_compact_raw, @as(usize, num_raw) * @sizeOf(d.RawOff16Desc)) != CUDA_SUCCESS) return null;
-        }
-    } else {
-        // Fallback: D2H the staged arrays and compact on host.
-        const alloc = std.heap.page_allocator;
-        const staged = alloc.alloc(u8, staged_bytes) catch return null;
-        defer alloc.free(staged);
-        if (d2h(@ptrCast(staged.ptr), base, staged_bytes) != CUDA_SUCCESS) return null;
-
-        const lit_st: [*]const d.ScanHuffDesc = @ptrCast(@alignCast(staged.ptr));
-        const tok_st: [*]const d.ScanHuffDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes));
-        const hi_st: [*]const d.ScanHuffDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes * 2));
-        const lo_st: [*]const d.ScanHuffDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes * 3));
-        const rhi_st: [*]const d.ScanRawDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes * 4));
-        const rlo_st: [*]const d.ScanRawDesc = @ptrCast(@alignCast(staged.ptr + huff_arr_bytes * 4 + raw_arr_bytes));
-
-        const compactHuff = struct {
-            fn run(st: [*]const d.ScanHuffDesc, tot: u32, out: []d.HuffDecChunkDesc) u32 {
-                var k: u32 = 0;
-                var i: u32 = 0;
-                while (i < tot) : (i += 1) {
-                    if (st[i].valid == 0) continue;
-                    if (k >= out.len) break;
-                    out[k] = .{
-                        .in_offset = st[i].in_offset,
-                        .in_size = st[i].in_size,
-                        .out_offset = st[i].out_offset,
-                        .out_size = st[i].out_size,
-                        .lut_offset = k * @as(u32, @intCast(d.HUFF_LUT_ENTRIES)),
-                    };
-                    k += 1;
-                }
-                return k;
-            }
-        }.run;
-        num_lit = compactHuff(lit_st, total_subchunks, huff_lit_descs);
-        num_tok = compactHuff(tok_st, total_subchunks, huff_tok_descs);
-        num_hi = compactHuff(hi_st, total_subchunks, huff_off16hi_descs);
-        num_lo = compactHuff(lo_st, total_subchunks, huff_off16lo_descs);
-
-        var si: u32 = 0;
-        while (si < total_subchunks) : (si += 1) {
-            if (rhi_st[si].valid != 0 and num_raw < raw_off16_descs.len) {
-                raw_off16_descs[num_raw] = .{ .src_offset = rhi_st[si].src_offset, .size = rhi_st[si].size, .gpu_offset = rhi_st[si].gpu_offset };
-                num_raw += 1;
-            }
-            if (rlo_st[si].valid != 0 and num_raw < raw_off16_descs.len) {
-                raw_off16_descs[num_raw] = .{ .src_offset = rlo_st[si].src_offset, .size = rlo_st[si].size, .gpu_offset = rlo_st[si].gpu_offset };
-                num_raw += 1;
-            }
-        }
+        if (ml.merge_huff_descs_fn == 0) return null;
     }
 
+    // Counts stay device-resident in d_compact_counts; downstream merge,
+    // huff_build, huff_decode, and gather kernels read them as device
+    // pointers and self-gate. The ScanResult reports worst-case bounds
+    // (= total_subchunks per Huffman stream type + 2× for the two raw
+    // streams) so the dispatch's allocator sizes scratch correctly; the
+    // actual non-zero work happens at kernel time. On L1/L2 frames (no
+    // entropy → real counts of 0) the downstream kernels still launch
+    // with worst-case grids and early-exit on the first thread's check
+    // (~15 μs of empty GPU time).
     return .{
-        .num_raw_off16 = num_raw,
-        .num_huff_lit = num_lit,
-        .num_huff_tok = num_tok,
-        .num_huff_off16hi = num_hi,
-        .num_huff_off16lo = num_lo,
-        .device_compact_populated = gpu_compact_ok,
+        .num_raw_off16    = total_subchunks * 2,
+        .num_huff_lit     = total_subchunks,
+        .num_huff_tok     = total_subchunks,
+        .num_huff_off16hi = total_subchunks,
+        .num_huff_off16lo = total_subchunks,
     };
 }

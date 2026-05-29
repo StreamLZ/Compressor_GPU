@@ -176,6 +176,48 @@ pub fn gpuEncodeHuffImpl(
     return true;
 }
 
+/// Launch the GPU Huffman encoder over a finished descriptor list,
+/// publish the resulting per-sub-chunk size + offset tables on the
+/// context, and own all error-path cleanup. The helper takes
+/// ownership of `offsets` (the caller pre-allocates it while filling
+/// `descs`); on failure the helper frees it before returning false.
+/// On success the caller's `out_sizes_field` and `out_offsets_field`
+/// point at fresh allocations the deinit / freeHuff* paths will reap.
+fn encodeStreamAndPublish(
+    self: *EncodeContext,
+    allocator: std.mem.Allocator,
+    descs: []const HuffEncDesc,
+    offsets: []u32,
+    total: u32,
+    d_out: *CUdeviceptr,
+    d_out_size: *usize,
+    out_sizes_field: *?[]u32,
+    out_offsets_field: *?[]u32,
+    profile_names: [2][*:0]const u8,
+) bool {
+    if (total == 0) {
+        allocator.free(offsets);
+        return false;
+    }
+    const sizes = allocator.alloc(u32, descs.len) catch {
+        allocator.free(offsets);
+        return false;
+    };
+    if (!ec.ensureBuf(d_out, d_out_size, total)) {
+        allocator.free(offsets);
+        allocator.free(sizes);
+        return false;
+    }
+    if (!gpuEncodeHuffImpl(self, descs, sizes, d_out.*, profile_names)) {
+        allocator.free(offsets);
+        allocator.free(sizes);
+        return false;
+    }
+    out_sizes_field.* = sizes;
+    out_offsets_field.* = offsets;
+    return true;
+}
+
 /// Entropy-codes off16 hi/lo byte planes with the GPU Huffman encoder
 /// (chunk_type=4). The `>= 32` gate skips streams too short to amortize
 /// the 5-byte Huffman chunk header. Populates `huff_off16{hi,lo}_*` on
@@ -275,21 +317,21 @@ pub fn gpuEncodeOff16HuffImpl(
         return false;
     }
 
+    // Run the encoder over the combined 2n descriptors, capturing one
+    // size array that we then split into hi (first n) and lo (next n).
+    // We can't use `encodeStreamAndPublish` directly because it
+    // publishes one (sizes, offsets) pair, and off16 needs two.
     const all_sizes = allocator.alloc(u32, num_descs) catch {
         allocator.free(hi_offsets);
         allocator.free(lo_offsets);
         return false;
     };
-
-    // hi+lo bodies share one assembly buffer (d_asm_huff_off16) read in
-    // place by the frame-assembly kernels.
     if (!ec.ensureBuf(&self.d_asm_huff_off16, &self.d_asm_huff_off16_size, total)) {
         allocator.free(hi_offsets);
         allocator.free(lo_offsets);
         allocator.free(all_sizes);
         return false;
     }
-
     if (!gpuEncodeHuffImpl(self, descs, all_sizes, self.d_asm_huff_off16, .{ "huff-off16/build", "huff-off16/encode" })) {
         allocator.free(hi_offsets);
         allocator.free(lo_offsets);
@@ -297,7 +339,6 @@ pub fn gpuEncodeOff16HuffImpl(
         return false;
     }
 
-    // Split sizes into hi (first n) and lo (next n).
     const hi_sizes = allocator.alloc(u32, n) catch {
         allocator.free(hi_offsets);
         allocator.free(lo_offsets);
@@ -315,9 +356,9 @@ pub fn gpuEncodeOff16HuffImpl(
     @memcpy(lo_sizes, all_sizes[n..]);
     allocator.free(all_sizes);
 
-    // No-clobber assert: catch the double-encode-without-free bug at the
-    // write site (where we still know whose buffer would leak) instead of
-    // at the free site (where the double-free is harder to trace).
+    // No-clobber assert: catch a double-encode-without-free at the
+    // write site (where we still know whose buffer would leak) instead
+    // of at the free site (where the double-free is harder to trace).
     std.debug.assert(self.huff_off16hi_sizes == null);
     std.debug.assert(self.huff_off16hi_offsets == null);
     std.debug.assert(self.huff_off16lo_sizes == null);
@@ -329,8 +370,102 @@ pub fn gpuEncodeOff16HuffImpl(
     return true;
 }
 
-/// Entropy-codes each sub-chunk's literal stream with the GPU Huffman
-/// encoder (chunk_type=4). Populates `huff_lit_*` on the context.
+/// Walk a sub-chunk's stream-header chain. Returns the (src_offset,
+/// count) pair for the requested stream, or null when the chain is
+/// truncated / the stream is absent / too small. `which == .lit` stops
+/// after the literal header; `.tok` walks past it to the token header.
+const SubStream = enum { lit, tok };
+const StreamSlice = struct { src: u32, count: u32 };
+inline fn walkStream(
+    output: []const u8,
+    base: u32,
+    cs: u32,
+    init_b: u32,
+    which: SubStream,
+) ?StreamSlice {
+    const min_chain: u32 = switch (which) { .lit => 3, .tok => 6 };
+    if (cs < init_b + min_chain) return null;
+    const lit_hdr: u32 = base + init_b;
+    const lit_count: u32 =
+        (@as(u32, output[lit_hdr]) << 16) |
+        (@as(u32, output[lit_hdr + 1]) << 8) |
+        @as(u32, output[lit_hdr + 2]);
+    switch (which) {
+        .lit => {
+            if (lit_count == 0) return null;
+            const lit_src: u32 = lit_hdr + 3;
+            if (lit_src + lit_count > base + cs) return null;
+            return .{ .src = lit_src, .count = lit_count };
+        },
+        .tok => {
+            const tok_hdr: u32 = lit_hdr + 3 + lit_count;
+            if (tok_hdr + 3 > base + cs) return null;
+            const tok_count: u32 =
+                (@as(u32, output[tok_hdr]) << 16) |
+                (@as(u32, output[tok_hdr + 1]) << 8) |
+                @as(u32, output[tok_hdr + 2]);
+            if (tok_count == 0) return null;
+            const tok_src: u32 = tok_hdr + 3;
+            if (tok_src + tok_count > base + cs) return null;
+            return .{ .src = tok_src, .count = tok_count };
+        },
+    }
+}
+
+/// Entropy-code one byte-stride sub-stream per sub-chunk (literals or
+/// tokens). The two callable wrappers differ only by which stream they
+/// pull out of the LZ output, which device buffer they target, and
+/// which context fields they publish to.
+fn encodeByteStreamHuff(
+    self: *EncodeContext,
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    chunk_descs: []const CompressChunkDesc,
+    comp_sizes: []const u32,
+    which: SubStream,
+    d_out: *CUdeviceptr,
+    d_out_size: *usize,
+    out_sizes_field: *?[]u32,
+    out_offsets_field: *?[]u32,
+    profile_names: [2][*:0]const u8,
+) bool {
+    if (!module_loader.init()) return false;
+    if (module_loader.huff_tables_kernel_fn == 0 or module_loader.huff_encode_kernel_fn == 0) return false;
+    const n = chunk_descs.len;
+    if (n == 0) return false;
+
+    var descs = allocator.alloc(HuffEncDesc, n) catch return false;
+    defer allocator.free(descs);
+    var offsets = allocator.alloc(u32, n) catch return false;
+
+    var total: u32 = 0;
+    for (0..n) |i| {
+        const init_b: u32 = if (chunk_descs[i].is_first != 0) ec.INITIAL_LITERAL_COPY_BYTES else 0;
+        offsets[i] = total;
+        descs[i] = .{ .src_offset = 0, .src_size = 0, .src_stride = 1, .dst_offset = total, .dst_capacity = 0 };
+
+        const slice = walkStream(output, chunk_descs[i].dst_offset, comp_sizes[i], init_b, which) orelse continue;
+        // Huffman BIL body worst case = HUFF_BODY_FIXED_BYTES (228 header
+        // + 96 rounding + 32 slack = 356) + count×11/8 per-stream bits.
+        // See the HUFF_BODY_FIXED_BYTES constant docstring above.
+        const dst_cap: u32 = bilDstCap(slice.count);
+        descs[i] = .{
+            .src_offset = slice.src,
+            .src_size = slice.count,
+            .src_stride = 1,
+            .dst_offset = total,
+            .dst_capacity = dst_cap,
+        };
+        total += dst_cap;
+    }
+
+    return encodeStreamAndPublish(
+        self, allocator, descs, offsets, total,
+        d_out, d_out_size, out_sizes_field, out_offsets_field, profile_names,
+    );
+}
+
+/// Entropy-codes each sub-chunk's literal stream. Populates `huff_lit_*`.
 pub fn gpuEncodeLiteralsHuffImpl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
@@ -338,78 +473,15 @@ pub fn gpuEncodeLiteralsHuffImpl(
     chunk_descs: []const CompressChunkDesc,
     comp_sizes: []const u32,
 ) bool {
-    if (!module_loader.init()) return false;
-    if (module_loader.huff_tables_kernel_fn == 0 or module_loader.huff_encode_kernel_fn == 0) return false;
-    const n = chunk_descs.len;
-    if (n == 0) return false;
-
-    var descs = allocator.alloc(HuffEncDesc, n) catch return false;
-    defer allocator.free(descs);
-    // bool-return function - errdefer would never fire; cleanup lives
-    // in the explicit catch blocks below.
-    var offsets = allocator.alloc(u32, n) catch return false;
-
-    var total: u32 = 0;
-    for (0..n) |i| {
-        const cs = comp_sizes[i];
-        const base: u32 = chunk_descs[i].dst_offset;
-        const init_b: u32 = if (chunk_descs[i].is_first != 0) ec.INITIAL_LITERAL_COPY_BYTES else 0;
-        offsets[i] = total;
-        descs[i] = .{ .src_offset = 0, .src_size = 0, .src_stride = 1, .dst_offset = total, .dst_capacity = 0 };
-
-        if (cs < init_b + 3) continue;
-        const lit_hdr: u32 = base + init_b;
-        const lit_count: u32 =
-            (@as(u32, output[lit_hdr]) << 16) |
-            (@as(u32, output[lit_hdr + 1]) << 8) |
-            @as(u32, output[lit_hdr + 2]);
-        if (lit_count == 0) continue;
-        const lit_src: u32 = lit_hdr + 3;
-        if (lit_src + lit_count > base + cs) continue;
-
-        // Huffman BIL body worst case = HUFF_BODY_FIXED_BYTES (228 header
-        // + 96 rounding + 32 slack = 356) + count×11/8 per-stream bits.
-        // See the HUFF_BODY_FIXED_BYTES constant docstring above.
-        const dst_cap: u32 = bilDstCap(lit_count);
-        descs[i] = .{
-            .src_offset = lit_src,
-            .src_size = lit_count,
-            .src_stride = 1,
-            .dst_offset = total,
-            .dst_capacity = dst_cap,
-        };
-        total += dst_cap;
-    }
-
-    if (total == 0) {
-        allocator.free(offsets);
-        return false;
-    }
-
-    const sizes = allocator.alloc(u32, n) catch {
-        allocator.free(offsets);
-        return false;
-    };
-
-    if (!ec.ensureBuf(&self.d_asm_huff_lit, &self.d_asm_huff_lit_size, total)) {
-        allocator.free(offsets);
-        allocator.free(sizes);
-        return false;
-    }
-
-    if (!gpuEncodeHuffImpl(self, descs, sizes, self.d_asm_huff_lit, .{ "huff-lit/build", "huff-lit/encode" })) {
-        allocator.free(offsets);
-        allocator.free(sizes);
-        return false;
-    }
-
-    self.huff_lit_sizes = sizes;
-    self.huff_lit_offsets = offsets;
-    return true;
+    return encodeByteStreamHuff(
+        self, allocator, output, chunk_descs, comp_sizes, .lit,
+        &self.d_asm_huff_lit, &self.d_asm_huff_lit_size,
+        &self.huff_lit_sizes, &self.huff_lit_offsets,
+        .{ "huff-lit/build", "huff-lit/encode" },
+    );
 }
 
-/// Entropy-codes each sub-chunk's token stream with the GPU Huffman
-/// encoder (chunk_type=4). Populates `huff_tok_*` on the context.
+/// Entropy-codes each sub-chunk's token stream. Populates `huff_tok_*`.
 pub fn gpuEncodeTokensHuffImpl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
@@ -417,75 +489,10 @@ pub fn gpuEncodeTokensHuffImpl(
     chunk_descs: []const CompressChunkDesc,
     comp_sizes: []const u32,
 ) bool {
-    if (!module_loader.init()) return false;
-    if (module_loader.huff_tables_kernel_fn == 0 or module_loader.huff_encode_kernel_fn == 0) return false;
-    const n = chunk_descs.len;
-    if (n == 0) return false;
-
-    var descs = allocator.alloc(HuffEncDesc, n) catch return false;
-    defer allocator.free(descs);
-    // bool-return function - errdefer would never fire; cleanup lives
-    // in the explicit catch blocks below.
-    var offsets = allocator.alloc(u32, n) catch return false;
-
-    var total: u32 = 0;
-    for (0..n) |i| {
-        const cs = comp_sizes[i];
-        const base: u32 = chunk_descs[i].dst_offset;
-        const init_b: u32 = if (chunk_descs[i].is_first != 0) ec.INITIAL_LITERAL_COPY_BYTES else 0;
-        offsets[i] = total;
-        descs[i] = .{ .src_offset = 0, .src_size = 0, .src_stride = 1, .dst_offset = total, .dst_capacity = 0 };
-
-        if (cs < init_b + 6) continue;
-        const lit_hdr: u32 = base + init_b;
-        const lit_count: u32 =
-            (@as(u32, output[lit_hdr]) << 16) |
-            (@as(u32, output[lit_hdr + 1]) << 8) |
-            @as(u32, output[lit_hdr + 2]);
-        const tok_hdr: u32 = lit_hdr + 3 + lit_count;
-        if (tok_hdr + 3 > base + cs) continue;
-        const tok_count: u32 =
-            (@as(u32, output[tok_hdr]) << 16) |
-            (@as(u32, output[tok_hdr + 1]) << 8) |
-            @as(u32, output[tok_hdr + 2]);
-        if (tok_count == 0) continue;
-        const tok_src: u32 = tok_hdr + 3;
-        if (tok_src + tok_count > base + cs) continue;
-
-        const dst_cap: u32 = bilDstCap(tok_count);
-        descs[i] = .{
-            .src_offset = tok_src,
-            .src_size = tok_count,
-            .src_stride = 1,
-            .dst_offset = total,
-            .dst_capacity = dst_cap,
-        };
-        total += dst_cap;
-    }
-
-    if (total == 0) {
-        allocator.free(offsets);
-        return false;
-    }
-
-    const sizes = allocator.alloc(u32, n) catch {
-        allocator.free(offsets);
-        return false;
-    };
-
-    if (!ec.ensureBuf(&self.d_asm_huff_tok, &self.d_asm_huff_tok_size, total)) {
-        allocator.free(offsets);
-        allocator.free(sizes);
-        return false;
-    }
-
-    if (!gpuEncodeHuffImpl(self, descs, sizes, self.d_asm_huff_tok, .{ "huff-tok/build", "huff-tok/encode" })) {
-        allocator.free(offsets);
-        allocator.free(sizes);
-        return false;
-    }
-
-    self.huff_tok_sizes = sizes;
-    self.huff_tok_offsets = offsets;
-    return true;
+    return encodeByteStreamHuff(
+        self, allocator, output, chunk_descs, comp_sizes, .tok,
+        &self.d_asm_huff_tok, &self.d_asm_huff_tok_size,
+        &self.huff_tok_sizes, &self.huff_tok_offsets,
+        .{ "huff-tok/build", "huff-tok/encode" },
+    );
 }

@@ -20,8 +20,7 @@
 //!   scan_gpu.zig         - gpuWalkFrameImpl, gpuPrefixSumChunksImpl,
 //!                          gpuScanChunks
 //!   decode_dispatch.zig  - fullGpuLaunchImpl + the per-decode helpers
-//!                          (dumpScanIfRequested, emitE2eTrace,
-//!                          gatherRawOff16, mergeHuffDescs)
+//!                          (emitE2eTrace, gatherRawOff16, mergeHuffDescs)
 
 const cuda = @import("cuda_api.zig");
 const ml = @import("module_loader.zig");

@@ -11,8 +11,8 @@
 //!
 //! Options:
 //!   `-l <1..5>`   level                    `-r <N>`     bench runs
-//!   `-t <N>`      thread count (0=auto)    `-o <path>`  output path
-//!   `--sc <f>`    sc_group override        `-gpu`       accepted, no-op
+//!   `-o <path>`   output path              `-gpu`       accepted, no-op
+//!   `--sc <f>`    sc_group override
 //!   `-mem`        print peak process memory at exit
 //!
 //! The `-gpu` flag is accepted as a no-op for backwards compatibility with
@@ -41,7 +41,6 @@ const Args = struct {
     mode: Mode = .compress,
     level: u8 = 1,
     runs: ?u32 = null,
-    threads: u32 = 0,
     input: ?[]const u8 = null,
     output: ?[]const u8 = null,
     report_mem: bool = false,
@@ -67,7 +66,6 @@ fn parseArgs(raw: []const []const u8, w: *std.Io.Writer) Args {
         if (eql(arg, "-gpu")) continue;
         if (eql(arg, "-l")) { i += 1; result.level = parseInt(u8, expect(raw, i, "-l", w), w, "-l"); continue; }
         if (eql(arg, "-r")) { i += 1; result.runs = parseInt(u32, expect(raw, i, "-r", w), w, "-r"); continue; }
-        if (eql(arg, "-t")) { i += 1; result.threads = parseInt(u32, expect(raw, i, "-t", w), w, "-t"); continue; }
         if (eql(arg, "-o")) { i += 1; result.output = expect(raw, i, "-o", w); continue; }
         if (eql(arg, "--sc")) {
             i += 1;
@@ -187,7 +185,6 @@ fn printUsage(w: *std.Io.Writer) !void {
         \\Options:
         \\  -l <1..5>       Compression level (default: 1)
         \\  -r <runs>       Benchmark runs (default: 3 for -b, 10 for -db)
-        \\  -t <threads>    Thread hint (0 = auto)
         \\  -o <file>       Output path
         \\  --sc <float>    sc_group_size override (0.25 = 64 KB sub-chunks)
         \\  -gpu            Accepted, no-op (GPU is the only backend)
@@ -702,13 +699,12 @@ fn runBenchAll(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
     const runs = args.runs orelse 3;
     if (runs == 0) die(w, "error: runs must be >= 1\n");
 
-    const num_threads: usize = if (args.threads == 0) (std.Thread.getCpuCount() catch 1) else args.threads;
     const src = readFile(allocator, io, in_path, w);
     defer allocator.free(src);
 
     const mb: f64 = @as(f64, @floatFromInt(src.len)) / (1024.0 * 1024.0);
-    try w.print("streamlz bench-all: {s} ({d} bytes, {d} threads, {d} decompress runs)\n", .{
-        in_path, src.len, num_threads, runs,
+    try w.print("streamlz bench-all: {s} ({d} bytes, {d} decompress runs)\n", .{
+        in_path, src.len, runs,
     });
 
     const bound = encoder.compressBound(src.len);
