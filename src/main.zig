@@ -24,4 +24,5 @@ test {
     _ = @import("encode/streamlz_encoder.zig");
     _ = @import("encode/fast_framed.zig");
     _ = @import("encode/gpu_stream_assembly.zig");
+    _ = @import("encode/gpu_roundtrip_tests.zig");
 }

@@ -148,6 +148,7 @@ pub fn parseHeader(src: []const u8) ParseError!FrameHeader {
     const sc_group_size: f32 = @bitCast(std.mem.readInt(u32, src[pos..][0..4], .little));
     pos += 4;
     pos += 1; // reserved
+    if (!(sc_group_size > 0)) return error.BadScGroupSize;
 
     var content_size: ?u64 = null;
     if (raw_flags.content_size_present) {
