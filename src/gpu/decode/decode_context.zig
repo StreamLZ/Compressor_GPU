@@ -284,8 +284,9 @@ pub const DecodeContext = struct {
     d_huff_descs_size: usize = 0,
     d_huff_lut: CUdeviceptr = 0,
     d_huff_lut_size: usize = 0,
-    // One host buffer per stream type - scanner appends to each; fullGpuLaunch
-    // merges them into one device array with per-type out_offset added.
+    // One host buffer per stream type - scanner appends to each;
+    // mergeHuffDescs merges them into one device array with per-type
+    // out_offset added.
     huff_lit_host_buf: [d.MAX_HUFF_DESCS_PER_STREAM]d.HuffDecChunkDesc = undefined,
     huff_tok_host_buf: [d.MAX_HUFF_DESCS_PER_STREAM]d.HuffDecChunkDesc = undefined,
     huff_off16hi_host_buf: [d.MAX_HUFF_DESCS_PER_STREAM]d.HuffDecChunkDesc = undefined,

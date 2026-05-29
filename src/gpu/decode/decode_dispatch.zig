@@ -430,30 +430,6 @@ pub const DecodeRequest = struct {
     d_n_chunks_dev: ?u64 = null,
 };
 
-pub fn fullGpuLaunch(
-    chunk_descs: []const ChunkDesc,
-    compressed_block: []const u8,
-    dst_full: [*]u8,
-    dst_start_off: usize,
-    decompressed_size: usize,
-    chunks_per_group: u32,
-    sub_chunk_cap: u32,
-    io: ?std.Io,
-) GpuError!void {
-    return fullGpuLaunchImpl(&@import("driver.zig").g_default, .{
-        .chunk_descs = chunk_descs,
-        .compressed_block = compressed_block,
-        .dst_full = dst_full,
-        .dst_start_off = dst_start_off,
-        .decompressed_size = decompressed_size,
-        .chunks_per_group = chunks_per_group,
-        .sub_chunk_cap = sub_chunk_cap,
-        .io = io,
-        .d_output_target = null,
-        .d_compressed_src = null,
-    });
-}
-
 /// Launches the Huffman LUT-build kernel and the 4-stream decode
 /// kernel into `heavy_stream`. Both kernels self-gate on `*d_n_huff`,
 /// so it is safe to launch them with the chunk count even if some

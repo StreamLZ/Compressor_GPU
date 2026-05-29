@@ -21,9 +21,9 @@
 //!   scan_host.zig        - scanForEntropyChunks + local header parsers
 //!   scan_gpu.zig         - gpuWalkFrameImpl, gpuPrefixSumChunksImpl,
 //!                          gpuScanChunks
-//!   decode_dispatch.zig  - fullGpuLaunch / fullGpuLaunchImpl + the
-//!                          per-decode helpers (dumpScanIfRequested,
-//!                          emitE2eTrace, gatherRawOff16, mergeHuffDescs)
+//!   decode_dispatch.zig  - fullGpuLaunchImpl + the per-decode helpers
+//!                          (dumpScanIfRequested, emitE2eTrace,
+//!                          gatherRawOff16, mergeHuffDescs)
 
 const cuda = @import("cuda_api.zig");
 const ml = @import("module_loader.zig");
@@ -70,7 +70,6 @@ pub const finalizeProfiling = dc.finalizeProfiling;
 // ── Decode pipeline entry points ──────────────────────────────
 pub const gpuWalkFrameImpl = sg.gpuWalkFrameImpl;
 pub const gpuPrefixSumChunksImpl = sg.gpuPrefixSumChunksImpl;
-pub const fullGpuLaunch = dd.fullGpuLaunch;
 pub const fullGpuLaunchImpl = dd.fullGpuLaunchImpl;
 
 // ── Singletons ────────────────────────────────────────────────

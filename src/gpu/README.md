@@ -33,7 +33,7 @@ decode/                         GPU decode
                                 + fallback when the GPU scan kernels are absent)
   scan_gpu.zig                  GPU walk / prefix-sum / scan / compact
                                 (pure-D2D entry; CPU has no readable copy)
-  decode_dispatch.zig           fullGpuLaunch / fullGpuLaunchImpl + per-decode
+  decode_dispatch.zig           fullGpuLaunchImpl + per-decode
                                 helpers (dumpScanIfRequested, emitE2eTrace,
                                 gatherRawOff16, mergeHuffDescs)
   lz_kernel.cu                  LZ decode aggregator; #includes:
