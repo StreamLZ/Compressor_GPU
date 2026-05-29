@@ -29,7 +29,7 @@ fn roundtripOne(allocator: std.mem.Allocator, case: Case) !void {
         allocator,
         case.bytes,
         compressed,
-        .{ .level = case.level, .gpu_mode = true },
+        .{ .level = case.level },
         &gpu_encoder.g_default,
     ) catch |err| {
         std.debug.print("compress failed for {s}: {s}\n", .{ case.label, @errorName(err) });
@@ -141,7 +141,7 @@ test "compressBound is a strict upper bound on real frames" {
         const bound = encoder.compressBound(sz);
         const dst = try allocator.alloc(u8, bound);
         defer allocator.free(dst);
-        const n = try encoder.compressFramed(allocator, buf, dst, .{ .level = 3, .gpu_mode = true }, &gpu_encoder.g_default);
+        const n = try encoder.compressFramed(allocator, buf, dst, .{ .level = 3 }, &gpu_encoder.g_default);
         try testing.expect(n <= bound);
     }
 }
@@ -167,6 +167,6 @@ test "compressFramed rejects undersized destination" {
     const src = "hello world, this needs more than 4 bytes of output space";
     try testing.expectError(
         error.DestinationTooSmall,
-        encoder.compressFramed(allocator, src, &dst, .{ .level = 1, .gpu_mode = true }, &gpu_encoder.g_default),
+        encoder.compressFramed(allocator, src, &dst, .{ .level = 1 }, &gpu_encoder.g_default),
     );
 }

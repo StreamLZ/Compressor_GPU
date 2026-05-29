@@ -357,8 +357,6 @@ fn runCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
 
     const written = encoder.compressFramedWithIo(allocator, io, src, out_map.slice(), .{
         .level = args.level,
-        .num_threads = args.threads,
-        .gpu_mode = true,
         .sc_group_size_override = args.sc_group,
     }, &gpu_encoder.g_default) catch |err| {
         out_map.unmap();
@@ -506,8 +504,6 @@ fn runBenchCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer,
 
     const comp_opts: encoder.Options = .{
         .level = args.level,
-        .num_threads = args.threads,
-        .gpu_mode = true,
         .sc_group_size_override = args.sc_group,
     };
 
@@ -736,8 +732,6 @@ fn runBenchAll(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
         const idx = level - 1;
         const comp_opts: encoder.Options = .{
             .level = level,
-            .num_threads = @intCast(num_threads),
-            .gpu_mode = true,
             .sc_group_size_override = args.sc_group,
         };
         const t_comp = std.Io.Clock.awake.now(io);

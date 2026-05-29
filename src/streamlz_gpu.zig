@@ -120,7 +120,7 @@ fn compressCore(h: *Context, input: []const u8, output: []u8, opts: CompressOpts
         allocator,
         input,
         output,
-        .{ .level = @intCast(opts.level), .gpu_mode = true },
+        .{ .level = @intCast(opts.level) },
         &h.enc,
     ) catch |err| return mapCompressError(err);
     return @intCast(n);

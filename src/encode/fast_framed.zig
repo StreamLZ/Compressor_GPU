@@ -31,7 +31,6 @@ const fast_constants = @import("fast/fast_constants.zig");
 const encoder = @import("streamlz_encoder.zig");
 const Options = encoder.Options;
 const CompressError = encoder.CompressError;
-const entropyOptionsForLevel = encoder.entropyOptionsForLevel;
 
 const gpu_assembly = @import("gpu_stream_assembly.zig");
 const gpu_enc = @import("driver.zig");
@@ -120,9 +119,10 @@ pub fn compressFramedOne(
     }
 
     const can_compress = src.len > fast_constants.min_source_length;
-    const self_contained: bool = opts.self_contained or opts.two_phase or true; // L1-L5 are always SC
-    const sc_flag_bit: u8 = if (self_contained) 0x10 else 0;
-    const two_phase_flag_bit: u8 = if (opts.two_phase) 0x20 else 0;
+    // L1-L5 are always self-contained: every chunk carries its own
+    // initial bytes and the encoder appends the SC tail prefix table.
+    const sc_flag_bit: u8 = 0x10;
+    const two_phase_flag_bit: u8 = 0;
 
     const frame_block_hdr_pos: usize = pos;
     pos += 8;
@@ -595,9 +595,6 @@ fn writeSubChunk(
 
     if (opts.level >= 3) {
         const sub_size = @min(gpu_block, chunk_size - si * gpu_block);
-        var entropy_options = entropyOptionsForLevel(opts.level);
-        entropy_options.allow_tans = false;
-        entropy_options.allow_tans32 = false;
 
         const huff_streams: gpu_assembly.GpuHuffStreams = .{
             .lit = if (did_huff_lit) gpuHuffSlice(enc_ctx.huff_lit_sizes, enc_ctx.huff_lit_data, enc_ctx.huff_lit_offsets, gpu_bi_idx) else null,
@@ -613,14 +610,9 @@ fn writeSubChunk(
             allocator,
             raw_payload,
             enc_buf,
-            entropy_options,
-            0.0,
             init_bytes,
             sub_size,
             huff_streams,
-            .none,
-            .none,
-            .none,
         ) catch 0;
 
         if (enc_n > 0 and enc_n < raw_cs and pos + 3 + enc_n <= dst.len) {
