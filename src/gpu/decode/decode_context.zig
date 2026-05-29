@@ -298,33 +298,11 @@ pub const DecodeContext = struct {
     pipeline_streams: [cuda.NUM_PIPELINE_STREAMS]usize = @splat(0),
     pipeline_streams_created: bool = false,
 
-    // Phase 4: cached CUDA graph executable for the back-half region.
-    // Captured on first decode (when SLZ_GPU_GRAPHS is on) and replayed
-    // on subsequent calls. Currently re-captured every call — a real
-    // shape-cache is a later step. Destroyed in deinit; the caller is
-    // expected to have synced their stream before calling slzDestroy
-    // or before the next decompress (the next decompress's own
-    // stream_sync at the front of the back-half satisfies this).
-    graph_exec: usize = 0,
-    graph_captured: usize = 0,
-
-    // Phase 4 Step 1: persistent kernel-param storage for every launch
-    // inside the captured region. Stack-local `var p_*: u64 = ...; var
-    // params = [...]&p_*...;` patterns invalidate the moment the launching
-    // function returns - the graph captured *addresses*, not values - so
-    // every captured launch must read/write its params out of stable
-    // memory. `bindAll` wires up each nested `params[i]` array to point
-    // at the matching value fields; called once per process from
-    // `fullGpuLaunchImpl` (idempotent).
+    // Per-kernel param storage for the back-half launches. Kept on the
+    // context so each kernel's `params[i]` array of pointers points at
+    // stable memory; `bindAll` wires the arrays up once per process
+    // from `fullGpuLaunchImpl` (idempotent).
     graph_params: graph_params_mod.BackHalfGraphParams = .{},
-
-    // Phase 4 Step 4: identifies the shape of the call that produced
-    // `graph_exec`. A subsequent call whose `GraphShapeKey.matches()` the
-    // cached one can replay via cuGraphLaunch without paying the
-    // cuGraphInstantiate cost (~hundreds of µs). `valid = false` means
-    // the cache is empty (first call, or a prior mismatch tore it down).
-    graph_shape_key: graph_params_mod.GraphShapeKey = .{},
-    graph_shape_valid: bool = false,
 
     // Per-call scratch buffers - pulled off the dispatch-loop stack
     // because the combined ~384 KiB is uncomfortably large in a recursive
@@ -402,18 +380,6 @@ pub const DecodeContext = struct {
             self.h_pinned_output = null;
         }
         self.h_pinned_output_size = 0;
-
-        // Phase 4: cached CUDA graph + graph_exec from the last
-        // back-half capture. By deinit time the caller has destroyed
-        // their stream, so any pending graph_exec launch has completed.
-        if (self.graph_exec != 0) {
-            if (cuda.cuGraphExecDestroy_fn) |ged| _ = ged(self.graph_exec);
-            self.graph_exec = 0;
-        }
-        if (self.graph_captured != 0) {
-            if (cuda.cuGraphDestroy_fn) |gd| _ = gd(self.graph_captured);
-            self.graph_captured = 0;
-        }
 
         // Persistent pipeline streams created in ensurePipelineStreams.
         if (self.pipeline_streams_created) {
