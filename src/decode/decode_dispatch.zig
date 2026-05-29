@@ -467,6 +467,10 @@ fn uploadInputAndPrefixSum(
     if (req.dst_start_off > 0)
         try cudaCall(procs.h2d(self.d_output, @ptrCast(req.dst_full), req.dst_start_off), .copy);
 
+    // `cuMemAlloc(0)` is a CUDA error; route an empty-input frame
+    // through a small dummy allocation so the ensureDeviceBuf below
+    // succeeds and the empty input flows through to the end-mark
+    // emit without a special case.
     const comp_bytes = if (req.compressed_block.len > 0) req.compressed_block.len else 4;
     const desc_bytes = req.chunk_descs.len * @sizeOf(ChunkDesc);
     try ensureDeviceBuf(&self.d_comp_persist, &self.d_comp_persist_size, comp_bytes + 16);

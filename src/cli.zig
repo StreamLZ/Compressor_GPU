@@ -35,11 +35,11 @@ const bench_decompress_cmd = @import("cli/bench_decompress.zig");
 const bench_all_cmd = @import("cli/bench_all.zig");
 const info_cmd = @import("cli/info.zig");
 
-pub fn run(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    const io = init.io;
+pub fn run(process_init: std.process.Init) !void {
+    const allocator = process_init.gpa;
+    const io = process_init.io;
 
-    var args_it = try init.minimal.args.iterateAllocator(allocator);
+    var args_it = try process_init.minimal.args.iterateAllocator(allocator);
     defer args_it.deinit();
     var args_list: std.ArrayList([]const u8) = .empty;
     defer args_list.deinit(allocator);

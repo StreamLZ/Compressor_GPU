@@ -145,11 +145,11 @@ pub fn decompressFramedFromDevice(
     const block_start: u32 = 14 + 8 + 8;
     const block_size: u32 = frame_size - fixed_overhead;
 
-    // sc_group=0.25 ⇒ eff_chunk_size = 64 KB. The walk kernel writes the
-    // real chunk count to d_meta+0; the bound below just sizes the
-    // descriptor + grid space.
-    const eff_chunk_64k: u32 = 0x10000;
-    const n_chunks_bound: u32 = (decomp_size + eff_chunk_64k - 1) / eff_chunk_64k;
+    // sc_group=0.25 → effective chunk size of 64 KB, the smallest the
+    // GPU encoder produces. The walk kernel writes the real chunk count
+    // to d_meta+0; this bound only sizes the descriptor + grid space.
+    const min_eff_chunk_size: u32 = 0x10000; // 64 KB
+    const n_chunks_bound: u32 = (decomp_size + min_eff_chunk_size - 1) / min_eff_chunk_size;
     if (n_chunks_bound == 0 or n_chunks_bound > gpu_driver.WALK_MAX_CHUNKS) return error.BadMode;
 
     const dev = try gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size);
@@ -224,7 +224,7 @@ fn decompressFrameInner(
     // GPU codec never produces dictionary frames. The dictionary subsystem
     // was removed during the GPU-only strip; any frame carrying a
     // dictionary_id originated from the legacy CPU encoder.
-    if (hdr.dictionary_id != null) return error.UnknownDictionary;
+    if (hdr.dictionary_id) |_| return error.UnknownDictionary;
 
     if (hdr.content_size) |cs| {
         if (cs > max_content_size) return error.ContentSizeTooLarge;

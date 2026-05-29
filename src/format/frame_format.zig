@@ -438,7 +438,7 @@ test "writeHeader / parseHeader roundtrip, custom sc_group_size + parallel flag"
 
 test "block header end mark detected" {
     const em = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
-    const block_hdr= try parseBlockHeader(&em);
+    const block_hdr = try parseBlockHeader(&em);
     try testing.expect(block_hdr.isEndMark());
 }
 
@@ -450,7 +450,7 @@ test "block header uncompressed flag roundtrip" {
         .uncompressed = true,
         .parallel_decode_metadata = false,
     });
-    const block_hdr= try parseBlockHeader(&buf);
+    const block_hdr = try parseBlockHeader(&buf);
     try testing.expect(block_hdr.uncompressed);
     try testing.expect(!block_hdr.parallel_decode_metadata);
     try testing.expectEqual(@as(u32, 41), block_hdr.compressed_size);
@@ -465,7 +465,7 @@ test "block header parallel_decode_metadata flag roundtrip" {
         .uncompressed = false,
         .parallel_decode_metadata = true,
     });
-    const block_hdr= try parseBlockHeader(&buf);
+    const block_hdr = try parseBlockHeader(&buf);
     try testing.expect(block_hdr.parallel_decode_metadata);
     try testing.expect(!block_hdr.uncompressed);
     try testing.expectEqual(@as(u32, 123), block_hdr.compressed_size);

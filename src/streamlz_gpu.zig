@@ -88,13 +88,13 @@ comptime {
 const CompressOpts = extern struct {
     level: c_int = 5,
     enable_profiling: c_int = 0,
-    reserved: [6]c_int = .{0} ** 6,
+    reserved: [6]c_int = @splat(0),
 };
 
 /// Mirror of `slzDecompressOpts_t`.
 const DecompressOpts = extern struct {
     enable_profiling: c_int = 0,
-    reserved: [7]c_int = .{0} ** 7,
+    reserved: [7]c_int = @splat(0),
 };
 
 /// Mirror of `slzKernelTiming_t`.
@@ -468,7 +468,7 @@ export fn slzCompressBound(
     max_output_size: ?*usize,
 ) c_int {
     _ = opts;
-    if (handle == null) return SLZ_ERROR_INVALID_HANDLE;
+    _ = handle orelse return SLZ_ERROR_INVALID_HANDLE;
     const out = max_output_size orelse return SLZ_ERROR_INVALID_ARG;
     out.* = encoder.compressBound(input_size);
     return SLZ_SUCCESS;
@@ -485,7 +485,7 @@ export fn slzGetDecompressedSize(
     host_bytes: ?*const anyopaque,
     decompressed_size: ?*usize,
 ) c_int {
-    if (handle == null) return SLZ_ERROR_INVALID_HANDLE;
+    _ = handle orelse return SLZ_ERROR_INVALID_HANDLE;
     const hdr_ptr = host_bytes orelse return SLZ_ERROR_INVALID_ARG;
     const out = decompressed_size orelse return SLZ_ERROR_INVALID_ARG;
     const bytes: [*]const u8 = @ptrCast(hdr_ptr);

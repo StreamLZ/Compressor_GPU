@@ -1,8 +1,8 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 
-pub fn main(init: std.process.Init) !void {
-    try cli.run(init);
+pub fn main(process_init: std.process.Init) !void {
+    try cli.run(process_init);
 }
 
 test {
