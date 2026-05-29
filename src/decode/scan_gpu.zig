@@ -26,9 +26,9 @@ const GpuError = descriptors.GpuError;
 const cudaCall = descriptors.cudaCall;
 
 /// GPU frame walk - device-only output. Launches the walk kernel and
-/// returns the device pointers it wrote to; NO D2H. Caller either passes
-/// the device pointers to downstream kernels (the true D2D path) or
-/// invokes `walkResultToHost` to copy what it needs out.
+/// returns the device pointers it wrote to; NO D2H. Caller passes the
+/// device pointers to downstream kernels directly — no host bounce
+/// remains.
 ///
 /// Returns specific GpuError variants like `gpuPrefixSumChunksImpl`:
 /// frame-walk is on the device-resident decode hot path with no host
@@ -50,9 +50,8 @@ pub fn gpuWalkFrameImpl(
     try cudaCall(memset(self.d_walk_meta, 0, descriptors.walk_meta_offsets.bytes), .copy);
 
     // Launch on `work_stream` (= 0 in the sync wrapper, caller's stream
-    // in the async wrapper).
-    // No post-kernel sync here — the caller's walkMetaToHostAsync (or
-    // any subsequent kernel on the same stream) serializes naturally.
+    // in the async wrapper). No post-kernel sync here — any subsequent
+    // kernel queued on the same stream serializes via stream ordering.
     const stream = self.work_stream;
     var k_frame = d_frame;
     var k_size = frame_size;
@@ -195,9 +194,10 @@ pub fn gpuScanChunks(
     // the host here - downstream kernels (merge, huff_build, gather)
     // read straight from d_compact_*.
     {
-        // Size compact buffers. n_huff bound: WALK_MAX_CHUNKS * 4
-        // (sub-chunks per chunk at sc>=1). n_raw bound: 2 × that.
-        const huff_compact_max = @as(usize, descriptors.WALK_MAX_CHUNKS) * 4;
+        // Size compact buffers. `n_huff` bound: `WALK_MAX_CHUNKS *
+        // MAX_SUB_CHUNKS_PER_CHUNK` (worst-case sub-chunks per chunk at
+        // sc >= 1). `n_raw` bound: 2 × that (hi + lo planes).
+        const huff_compact_max = @as(usize, descriptors.WALK_MAX_CHUNKS) * @as(usize, descriptors.MAX_SUB_CHUNKS_PER_CHUNK);
         const huff_compact_bytes = huff_compact_max * @sizeOf(descriptors.HuffDecChunkDesc);
         const raw_compact_max = huff_compact_max * 2;
         const raw_compact_bytes = raw_compact_max * @sizeOf(descriptors.RawOff16Desc);

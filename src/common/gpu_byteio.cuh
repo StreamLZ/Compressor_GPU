@@ -1,5 +1,5 @@
 // ── StreamLZ GPU - little/big-endian byte-IO primitives ─────────
-// Shared by every CUDA kernel in src/gpu/. Pure header: #pragma once,
+// Shared by every CUDA kernel in src/. Pure header: #pragma once,
 // inline device helpers only, no kernels and no translation-unit
 // state. #include'd via "../common/gpu_byteio.cuh" into the existing
 // single .cu translation units.

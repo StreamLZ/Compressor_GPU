@@ -182,9 +182,10 @@ slzStatus_t slzGetDecompressedSize(slzHandle_t handle,
                                    const void* host_bytes,
                                    size_t* output_size);
 
-/* Worst-case compressed-frame size for `input_size` input bytes at the
- * level/opts specified. Sync, pure-host call. Use it to size d_output
- * for slzCompressAsync. */
+/* Worst-case compressed-frame size for `input_size` input bytes. The
+ * bound is level-independent — callers may pass slzCompressDefaultOpts()
+ * or any per-call configuration without affecting the result. Sync,
+ * pure-host call. Use it to size d_output for slzCompressAsync. */
 slzStatus_t slzCompressBound(slzHandle_t handle, size_t input_size,
                              slzCompressOpts_t opts, size_t* max_output_size);
 
@@ -228,13 +229,22 @@ slzStatus_t slzDecompressAsync(slzHandle_t handle,
  *                   (use slzCompressBound to size this)
  *   max_compressed  capacity of d_output
  *   compressed_size HOST pointer; the library writes the actual
- *                   compressed frame length here. Valid AFTER the
- *                   caller's cudaStreamSynchronize(stream) — the
- *                   library queues an internal D2H on `stream` after
- *                   the compress kernels finish.
+ *                   compressed frame length here. Valid as soon as
+ *                   slzCompressAsync returns — the size is computed
+ *                   host-side during the compress pipeline's setup
+ *                   phase and does not depend on the GPU work queued
+ *                   on `stream`.
  *   stream          caller's CUstream (void*); NULL = default stream
  *
- * Queue all compress work on `stream`, then return. */
+ * Queue all GPU compress work on `stream`, then return.
+ *
+ * NOTE on stack usage: the async entry points run inline on the
+ * caller's thread (no internal worker spawn), and the compress
+ * orchestration has multi-MB host stack frames. Callers on small-
+ * stack threads (default thread pools, libuv workers, etc.) should
+ * either size the thread stack to at least 32 MiB or use the
+ * synchronous slzCompressHost/slzDecompressHost entry points, which
+ * spawn an internal worker with a 32 MiB stack. */
 slzStatus_t slzCompressAsync(slzHandle_t handle,
                              const void* d_input, size_t input_size,
                              void* d_output, size_t max_compressed_size,

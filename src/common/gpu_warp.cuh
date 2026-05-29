@@ -1,5 +1,5 @@
 // ── StreamLZ GPU - warp / lane / bit-width constants ────────────
-// Shared by every CUDA kernel in src/gpu/ (LZ + Huffman, decode +
+// Shared by every CUDA kernel in src/ (LZ + Huffman, decode +
 // encode). Pure header: #pragma once, constants and one trivial
 // helper, no kernels and no translation-unit state.
 //
@@ -20,7 +20,7 @@ static constexpr uint32_t LANE_MASK      = WARP_SIZE - 1;   // threadIdx.x & 31 
 // FULL_WARP_MASK is the "all 32 lanes active" mask passed to warp-wide
 // intrinsics (__shfl_sync / __ballot_sync / __match_any_sync). It is
 // orthogonal to the geometry constants above - every existing kernel in
-// src/gpu/ launches with a full warp and so only ever needs this one
+// src/ launches with a full warp and so only ever needs this one
 // mask.
 static constexpr uint32_t FULL_WARP_MASK = 0xFFFFFFFFu;     // all 32 lanes active
 

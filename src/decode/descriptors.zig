@@ -3,7 +3,7 @@
 //! Kept free of CUDA bindings on purpose - sub-modules import this for the
 //! struct shapes and the few constants without dragging in `cuda_api.zig`.
 //! `extern struct` layouts here MUST stay in sync with the C/CUDA mirrors
-//! in `src/gpu/decode/slz_wire_format.cuh` and the `*_kernel.cuh` headers
+//! in `src/decode/slz_wire_format.cuh` and the `*_kernel.cuh` headers
 //! that consume them (each has its own `static_assert` on sizeof).
 
 const std = @import("std");
@@ -18,16 +18,17 @@ pub const ChunkDesc = extern struct {
     dst_offset: u32,
     flags: u32,
     memset_fill: u8,
-    /// Trailing pad to bring the struct to a 4-byte alignment so the
-    /// kernel can load via `uint4`. Must stay zeroed - the device side
-    /// does not read it but the layout assertions check size.
+    /// Trailing pad keeping `memset_fill` from leaving the struct at a
+    /// non-u32-aligned size, so `SlzChunkDesc[]` arrays stay 4-byte
+    /// aligned. The device side never reads these bytes but the layout
+    /// `static_assert` on `sizeof(SlzChunkDesc) == 24` checks the total.
     reserved: [3]u8 = @splat(0),
 };
 
 // ── Huffman literal descriptors - matches decode/huffman_kernel.cu HuffDecChunkDesc.
 // in_offset/in_size cover the FULL payload (128 B weights + 93 B sub-header +
 // 32 stream payloads, per HUFF_NUM_STREAMS / HUFF_SUBHEADER_BYTES /
-// HUFF_BODY_HEADER_BYTES in src/gpu/common/gpu_huffman.cuh). Build kernel
+// HUFF_BODY_HEADER_BYTES in src/common/gpu_huffman.cuh). Build kernel
 // reads first 128 B; decode kernel skips 128.
 pub const HuffDecChunkDesc = extern struct {
     in_offset: u32,

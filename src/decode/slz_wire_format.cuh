@@ -63,9 +63,8 @@ static constexpr uint32_t HEADER_LONG_FORM_BIT  = 0x80;
 // Type-0 (raw) header sizes.
 static constexpr uint32_t TYPE0_SHORT_SIZE_MASK = 0xFFF;  // 12-bit size, short form
 
-// Entropy chunk-header field layout. GPU emits only type 4 (Huffman); the
-// same short/long format is also used by legacy types 1/6 that the decoder
-// must still skip when reading older frames.
+// Entropy chunk-header field layout. The GPU encoder emits only type 4
+// (Huffman); unknown types are rejected at scan-walk time.
 static constexpr uint32_t ENTROPY_HEADER_SHORT_BYTES = 3;
 static constexpr uint32_t ENTROPY_HEADER_LONG_BYTES  = 5;
 static constexpr uint32_t ENTROPY_SHORT_COMP_MASK    = 0x3FF;   // 10-bit comp size
@@ -74,10 +73,6 @@ static constexpr uint32_t ENTROPY_SHORT_DELTA_MASK   = 0x3FF;
 static constexpr uint32_t ENTROPY_LONG_SIZE_MASK     = 0x3FFFF; // 18-bit size field
 static constexpr uint32_t ENTROPY_LONG_DELTA_SHIFT   = 18;      // dst-size reconstruction
 static constexpr uint32_t ENTROPY_LONG_HI_SHIFT      = 14;
-
-// Paired-stream header sizes.
-//   paired-primary  : [0x70][countA:u24][inner type-6 stream]
-//   paired-secondary: [0x50][countA:u24][countB:u24], no payload
 
 // Off16 stream: OFF16_ENTROPY_MARKER (0xFFFF in ../common/gpu_wire_format.cuh)
 // signals an entropy-coded off16 pair (hi/lo split). The hi/lo halves
@@ -122,13 +117,13 @@ static_assert(sizeof(SlzChunkDesc) == 24, "ABI: keep in sync with decode/descrip
 
 // ── Raw off16 gather descriptor ────────────────────────────────
 // ABI struct - must stay byte-identical to `RawOff16Desc` in
-// src/gpu/decode/driver.zig.
+// `src/decode/descriptors.zig`.
 struct SlzRawOff16Desc {
     uint32_t src_offset;   // byte offset into comp_base
     uint32_t size;         // bytes to copy
     uint32_t gpu_offset;   // byte offset into scratch_base
 };
-static_assert(sizeof(SlzRawOff16Desc) == 12, "ABI: keep in sync with decode/driver.zig");
+static_assert(sizeof(SlzRawOff16Desc) == 12, "ABI: keep in sync with decode/descriptors.zig");
 
 // ── Parsed sub-chunk streams ───────────────────────────────────
 // Filled by parseSubChunkHeaders, consumed by the decoders. Lives on

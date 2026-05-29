@@ -8,7 +8,7 @@
 //                                 encodes HUFF_NUM_STREAMS streams in
 //                                 parallel - one per warp lane, currently
 //                                 32). Mirrors the decoder name pattern
-//                                 in src/gpu/decode/huffman_kernel.cu.
+//                                 in src/decode/huffman_kernel.cu.
 //
 // Both mirror the production CPU Huffman encoder exactly, so the output
 // pairs bit-for-bit with the production Huffman decoder. Codes are

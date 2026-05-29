@@ -73,7 +73,7 @@ static constexpr uint64_t HASH_A_MUL      = HASH_MUL_A;
 static constexpr uint64_t FIB_HASH_MUL_64 = HASH_MUL_FIB_64;
 
 // ── Per-chunk LZ-pass descriptor ────────────────────────────────
-// ABI-mirrored by CompressChunkDesc in src/gpu/encode/driver.zig - do
+// ABI-mirrored by CompressChunkDesc in src/encode/driver.zig - do
 // not reorder fields or change types. is_first triggers the 8-byte
 // INITIAL_COPY verbatim prefix at the start of the output.
 struct CompressChunkDesc {

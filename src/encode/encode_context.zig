@@ -185,12 +185,18 @@ pub const EncodeContext = struct {
     d_asm_sizes: CUdeviceptr = 0,
     d_asm_sizes_size: usize = 0,
 
-    // Per-chunk index tables published by `gpuAssembleFrameImpl`: where
-    // each chunk's assembled-block bytes live inside `d_asm_out` (offset)
-    // and how many bytes long the chunk's slice is (size). The frame
-    // writer consults both when computing per-chunk dst positions for
-    // `slzFrameAssembleKernel`; the assembled bytes themselves stay on
-    // the GPU.
+    // Per-SUB-CHUNK index tables published by `gpuAssembleFrameImpl`:
+    // where each sub-chunk's assembled-block bytes live inside
+    // `d_asm_out` (offset) and how many bytes long the sub-chunk's
+    // slice is (size). The frame writer consults both when computing
+    // per-chunk dst positions for `slzFrameAssembleKernel`; the
+    // assembled bytes themselves stay on the GPU.
+    //
+    // The current encoder produces exactly one sub-chunk per chunk
+    // (`resolveScGroupSize` returns 0.25 or 0.5), so the frame writer
+    // indexes these tables with chunk index. A future `sc_group_size
+    // >= 1.0` override would invalidate that 1:1 mapping; see the
+    // assertion in `fast_framed.assembleFrame`.
     assembled_offsets: ?[]u32 = null,
     assembled_sizes: ?[]u32 = null,
 
@@ -210,12 +216,10 @@ pub const EncodeContext = struct {
     huff_tok_offsets: ?[]u32 = null,
 
     /// Free every owned device + host buffer and reset every field to
-    /// its default. Intended for a per-handle library API teardown; the
-    /// long-lived `driver.g_default` singleton in the current CLI / C ABI
-    /// never calls this (its lifetime is the process).
-    ///
-    /// Honors the huff_off16 OWNERSHIP RULE above: hi owns the shared
-    /// allocation, lo is a non-owning alias.
+    /// its default. Called by `slzDestroy` on the per-handle
+    /// `Context.enc`. The CLI also has a `driver.g_default` singleton
+    /// that is intentionally never deinit'd — its lifetime is the
+    /// process.
     pub fn deinit(self: *EncodeContext, allocator: std.mem.Allocator) void {
         const free_dev = struct {
             fn f(ptr: *CUdeviceptr, sz: *usize) void {

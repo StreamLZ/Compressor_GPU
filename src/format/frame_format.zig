@@ -3,21 +3,23 @@
 //! Terminology: "sc" / "SC" = "self-contained" throughout this module.
 //!
 //! Wire layout (little-endian) — StreamLZ v2:
-//!   [4] magic = 0x534C5A31 ('SLZ1' byte order S,L,Z,1)
+//!   [4] magic = 0x534C5A31 ('SLZ1' as a big-endian mnemonic;
+//!                           on-disk bytes are 0x31, 0x5A, 0x4C, 0x53)
 //!   [1] version = 2                         ← bumped from 1; breaking change
 //!   [1] flags
 //!   [1] codec (0=High, 1=Fast, 2=Turbo)
 //!   [1] level (internal: High L5/L7/L9 or Fast L1/L2/L3/L5/L6)
 //!   [1] block_size_log2 (offset from log2(min_block_size) = 16)
-//!   [1] sc_group_size (number of chunks per SC group; 1..255)
-//!   [4] reserved (future use — must be zero on write)
+//!   [4] sc_group_size (LE f32, units of 256 KB chunks; e.g. 0.25 / 1.0 / 4.0)
+//!   [1] reserved (must be zero on write)
 //!   [8] content_size (LE i64, present iff flags.ContentSize)
 //!   [4] dictionary_id (LE u32, present iff flags.DictionaryId)
 //!
 //! Changes from v1:
 //!   * version byte is now 2 (was 1). v1 files are rejected by v2 decoders.
-//!   * The old 1-byte reserved slot is replaced by a dedicated sc_group_size
-//!     byte plus 4 fresh reserved bytes (10 → 14 byte fixed-header size).
+//!   * The old 1-byte reserved slot is replaced by a 4-byte LE f32
+//!     `sc_group_size` plus 1 reserved byte (10 → 14 byte fixed-header
+//!     size).
 //!   * FrameFlags gains bit 4 = parallel_decode_metadata_present, signaling
 //!     the presence of a phase-1 sidecar block for Fast L1-L4 parallel decode.
 //!
@@ -39,23 +41,18 @@ pub const end_mark: u32 = 0;
 pub const block_uncompressed_flag: u32 = 0x80000000;
 
 /// v2: bit 30 of the block header's `compressed_size` field marks the
-/// block as a parallel-decode metadata (sidecar) block. The block's
-/// body is a `parallel_decode_metadata` payload (see format/parallel_decode_metadata.zig).
-/// Sidecar blocks contribute zero decompressed output — decoders that
-/// don't use the sidecar must skip the `compressed_size` bytes and
-/// move on without advancing `dst_off`.
+/// block as a parallel-decode metadata (sidecar) block. Legacy CPU-codec
+/// hint; the GPU decoder skips these blocks via the check at
+/// `decode/streamlz_decoder.zig:dispatchCompressedBlock` and the GPU
+/// encoder never emits the bit.
 pub const block_parallel_decode_metadata_flag: u32 = 0x40000000;
 
-// v2 header is 14 bytes fixed (up from 10 in v1): magic(4) + version(1) +
-// flags(1) + codec(1) + level(1) + block_size_log2(1) + sc_group_size(1)
-// + reserved(4). With optional content_size(8) + dictionary_id(4) the
+// v2 header is 14 bytes fixed (up from 10 in v1): magic(4) + version(1)
+// + flags(1) + codec(1) + level(1) + block_size_log2(1) + sc_group_size(4)
+// + reserved(1). With optional content_size(8) + dictionary_id(4) the
 // fixed-portion max is 26 bytes (up from 22 in v1).
 pub const min_header_size: usize = 14;
-/// Includes worst-case GPU shared-LUTs section: 4 × (2B length + up to
-/// 512B bit-packed probability table) = 2056B. Total: 26 + 2056 ≈ 2082B.
-/// Most frames are 14-26 bytes; only GPU encodes with shared LUTs hit
-/// the upper bound.
-pub const max_header_size: usize = 26 + 2056;
+pub const max_header_size: usize = 26;
 
 pub const default_block_size: usize = constants.chunk_size;
 pub const min_block_size: usize = 0x10000; // 64 KB
@@ -83,7 +80,8 @@ pub const FrameFlags = packed struct(u8) {
     /// Bit 4: the frame carries a parallel-decode metadata sidecar
     /// block for the legacy CPU codec's parallel Fast L1-L4 path.
     /// The GPU decoder skips these blocks; the GPU encoder never
-    /// emits them.
+    /// sets the flag (`WriteHeaderOptions` plumbs it through for
+    /// symmetry, but no current call site supplies `true`).
     parallel_decode_metadata_present: bool = false,
     /// Bits 5-7: reserved. Must be zero on write; non-zero values
     /// reject with `error.BadFrame`.
@@ -122,15 +120,19 @@ pub const FrameHeader = struct {
 pub const ParseError = error{
     /// First 4 bytes did not match the SLZ1 frame magic (`0x534C5A31`).
     BadMagic,
-    /// `version` field is not `1`. The reserved values stop here so a
-    /// forward-incompatible bump can be added without silent skew.
+    /// `version` field is not the current `version` constant (= 2).
+    /// Frames produced by older encoders hit this; future wire-format
+    /// bumps will reuse it.
     UnsupportedVersion,
-    /// `codec` field does not name a supported codec (only `.fast`).
+    /// `codec` byte is not one of `.high` / `.fast` / `.turbo`. The
+    /// GPU encoder only emits `.fast`; the other two are accepted for
+    /// backward compat with frames produced by the now-retired CPU
+    /// codec.
     BadCodec,
     /// Advertised `block_size` is not a power of two in
     /// `[min_block_size, max_block_size]`.
     BadBlockSize,
-    /// `sc_group_size` (an `f32` post-v2) is `<= 0` or `> 4.0`.
+    /// `sc_group_size` (an `f32` post-v2) is `<= 0`.
     BadScGroupSize,
     /// `src` was shorter than the parser needed to reach the next
     /// header field.
@@ -382,8 +384,8 @@ test "parseHeader rejects sc_group_size == 0" {
         0x01, // codec: Fast
         0x01, // level: 1
         0x02, // block_size_log2
-        0x00, // sc_group_size = 0  ← invalid
-        0, 0, 0, 0, // reserved
+        0x00, 0x00, 0x00, 0x00, // sc_group_size = 0.0f32  ← invalid
+        0x00, // reserved
     };
     try testing.expectError(error.BadScGroupSize, parseHeader(&bad));
 }
@@ -432,7 +434,7 @@ test "writeHeader / parseHeader roundtrip, custom sc_group_size + parallel flag"
     });
     const hdr = try parseHeader(buf[0..n]);
     try testing.expectEqual(@as(u8, 2), hdr.version);
-    try testing.expectEqual(@as(u8, 8), hdr.sc_group_size);
+    try testing.expectEqual(@as(f32, 8.0), hdr.sc_group_size);
     try testing.expect(hdr.flags.parallel_decode_metadata_present);
 }
 

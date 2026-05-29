@@ -23,10 +23,13 @@ const std = @import("std");
 const constants = @import("streamlz_constants.zig");
 
 /// Decoder-type field of the block header. The GPU encoder only emits
-/// `.fast`; `.high` and `.turbo` are accepted by the decoder for
-/// backward compatibility with frames produced by the now-deleted CPU
-/// codec. The open `_` member is required because the wire field is
-/// a `u8` (any non-listed value parses as `error.BadDecoderType`).
+/// `.fast`; `.turbo` is also accepted by the GPU dispatch for
+/// backward compatibility with frames produced by the legacy CPU
+/// codec. `.high` parses (per the wire format) but is rejected at
+/// dispatch with `error.InvalidInternalHeader` — the GPU kernel set
+/// is fast-codec specific. The open `_` member is required because the
+/// wire field is a `u8` (any non-listed value parses as
+/// `error.BadDecoderType`).
 pub const CodecType = enum(u8) {
     high = 0,
     fast = 1,
@@ -83,9 +86,10 @@ pub const ParseError = error{
     /// Block header's low nibble of byte 0 was not `0x5` (the SLZ
     /// internal block magic).
     BadMagic,
-    /// Decoder-type field is not `High` / `Fast` / `Turbo`; the GPU
-    /// codec only emits `Fast` but the decoder also accepts the other
-    /// two for backward compatibility.
+    /// Decoder-type field is not `High` / `Fast` / `Turbo`. (Of those
+    /// three, only `Fast` and `Turbo` make it past the GPU dispatch
+    /// — `High` parses cleanly but the dispatch rejects it with
+    /// `InvalidInternalHeader`.)
     BadDecoderType,
     /// Chunk-header type field is not `0` (LZ-compressed) or `1`
     /// (memset fill). Types 2+ are reserved.

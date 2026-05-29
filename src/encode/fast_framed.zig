@@ -292,6 +292,16 @@ fn assembleFrame(
     const offsets = enc_ctx.assembled_offsets orelse return error.DestinationTooSmall;
     if (sizes.len < n_chunks or offsets.len < n_chunks) return error.DestinationTooSmall;
 
+    // `assembled_offsets`/`assembled_sizes` are indexed per SUB-CHUNK by
+    // `gpuAssembleFrameImpl`, but the walk below indexes them by chunk
+    // index `ci`. That is correct only when every chunk has exactly one
+    // sub-chunk — which holds for any `sc_group_size <= 0.5` (the
+    // current adaptive picker's range). A future override of
+    // `sc_group_size >= 1.0` would let `eff_chunk > sub_chunk_cap` and
+    // produce more than one sub-chunk per chunk, breaking the 1:1
+    // index mapping. Assert it loudly here.
+    std.debug.assert(comp_sizes.len == n_chunks);
+
     const internal_block_flags: u8 = 0x05 | 0x10 | 0x40; // magic | self_contained | keyframe
     const internal_block_codec: u8 = @intFromEnum(block_header.CodecType.fast);
 

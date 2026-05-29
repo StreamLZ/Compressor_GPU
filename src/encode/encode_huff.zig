@@ -34,7 +34,7 @@ const CompressChunkDesc = encode_context.CompressChunkDesc;
 //     = ≤ 96 bytes per block.
 //   - 32 bytes of slack against minor estimate drift.
 // Total = 228 + 96 + 32 = 356. KEEP IN SYNC with HUFF_BODY_HEADER_BYTES
-// and HUFF_NUM_STREAMS in src/gpu/common/gpu_huffman.cuh.
+// and HUFF_NUM_STREAMS in src/common/gpu_huffman.cuh.
 const HUFF_BODY_FIXED_BYTES: u32 = 356;
 
 /// Per-block dst slot size, 4-byte aligned so cumulative `dst_offset`
@@ -76,12 +76,12 @@ pub fn gpuEncodeHuffImpl(
 
     // Per-stream scratch sized from the largest descriptor (one slab fits
     // every block). NUM_STREAMS mirrors HUFF_NUM_STREAMS in
-    // src/gpu/common/gpu_huffman.cuh - the encoder kernel uses that
+    // src/common/gpu_huffman.cuh - the encoder kernel uses that
     // constant directly; this Zig side has to match so the scratch slab
     // has the right per-stream stride. Each stream gets src_size/N
     // symbols of ≤ 11 bits; 2 bytes/symbol is a safe bound.
     //
-    // KEEP IN SYNC: HUFF_NUM_STREAMS in src/gpu/common/gpu_huffman.cuh.
+    // KEEP IN SYNC: HUFF_NUM_STREAMS in src/common/gpu_huffman.cuh.
     // There is NO compile-time check that this constant matches the .cuh
     // side. If they drift, the encoder splits the input into the wrong
     // number of slices while the kernel reads/writes the right number,

@@ -141,10 +141,12 @@ const Context = struct {
 ///     SyncFailed, CopyFailed, KernelMissing, BackendNotAvailable,
 ///     BadMode}`) → `SLZ_ERROR_CUDA`
 ///
-/// The switch is exhaustive against the `CompressError` set so a new
-/// member added upstream is a compile error here. `else` only catches
-/// `anyerror` for the rare untyped throw and is mapped to `SLZ_ERROR_CUDA`
-/// (the safe fallback - "something opaque went wrong inside the codec").
+/// The parameter is `anyerror` (not `CompressError`) so the Zig
+/// compiler does NOT flag a new member added to `CompressError` or
+/// the embedded `GpuError` upstream — such a variant silently falls
+/// through to `else => SLZ_ERROR_CUDA`. The arms below enumerate
+/// every current member explicitly; audit this switch whenever a
+/// variant is added.
 fn mapCompressError(err: anyerror) c_int {
     return switch (err) {
         error.BadLevel, error.BadScGroupSize, error.BadBlockSize => SLZ_ERROR_UNSUPPORTED,

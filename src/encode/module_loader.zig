@@ -9,15 +9,18 @@
 //! Encode `init()` always defers to the decode driver's `init()` first so
 //! exactly one CUDA context is created per process. A second
 //! `cuCtxCreate` would clobber decode's existing allocations. After that,
-//! encode loads its own `nvcuda.dll` handle and resolves encode-specific
-//! entries (cuMemsetD8, cuMemcpyDtoDAsync) that decode does not use.
+//! encode loads its own `nvcuda.dll` handle and resolves the driver
+//! entrypoints it uses into its parallel `cuda_ffi.zig` slots — the
+//! decode side resolves the same entries (including `cuMemsetD8` and
+//! `cuMemcpyDtoDAsync`) into its own slots. The duplication is a
+//! per-side namespace, not a capability split.
 //!
-//! Consequence: encode cannot stand alone. Importing only `gpu/encode/`
+//! Consequence: encode cannot stand alone. Importing only `encode/`
 //! still works because the encode init explicitly imports
 //! `../decode/driver.zig`, but the binary still links the decode driver.
 //!
 //! The PTX `@embedFile` calls *must* live in a file located in
-//! `src/gpu/encode/` so the relative paths resolve to the .ptx blobs
+//! `src/encode/` so the relative paths resolve to the .ptx blobs
 //! that the build emits alongside the .cu sources.
 
 const std = @import("std");

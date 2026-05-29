@@ -75,10 +75,12 @@ pub const DecompressError = error{
 } || gpu_driver.GpuError || std.mem.Allocator.Error;
 
 pub const DecompressResult = struct {
+    /// Number of bytes written into `dst`. Always equal to the frame's
+    /// `content_size` on success.
     written: usize,
-    /// Always 0 in the GPU-only codec. Reserved for compatibility with
-    /// the original dictionary-prefix offset returned by the CPU decoder
-    /// — the field is still read by some callers.
+    /// Always 0 in the GPU-only codec. Kept for shape compatibility
+    /// with the legacy CPU decoder, which used to return a non-zero
+    /// dictionary-prefix offset; no in-tree caller reads it.
     offset: usize = 0,
 };
 
@@ -104,13 +106,13 @@ pub fn decompressFramed(
 /// Same contract as `decompressFramed`, plus optional `std.Io` for
 /// telemetry (per-phase elapsed times via `SLZ_E2E_TIMER` /
 /// `SLZ_SPLIT_TIMER` are gated on `io != null`). Returns the structured
-/// `DecompressResult` so the offset field is observable to callers that
-/// want it; `decompressFramed` is a `.written`-only convenience.
+/// `DecompressResult`; `decompressFramed` is a `.written`-only
+/// convenience.
 ///
 /// The `allocator` parameter is currently unused (the dispatch takes
-/// the allocator from the encode/decode context). Plumbed in for ABI
-/// compat with the previous CPU codec entry point; callers can pass
-/// `undefined`.
+/// the allocator from the encode/decode context). Plumbed in for
+/// shape compatibility with the previous CPU codec entry point;
+/// callers can pass `undefined`.
 pub fn decompressFramedThreaded(
     allocator: std.mem.Allocator,
     io: ?std.Io,
@@ -199,8 +201,8 @@ pub const DecompressContext = struct {
 
     /// No-op today: the wrapper owns no allocations of its own (the
     /// `g_default` GPU context outlives every call). Defined so call
-    /// sites can use the canonical `init()` / `defer deinit()` pattern
-    /// without remembering the wrapper is stateless.
+    /// sites can use the canonical `initWithIo` / `defer deinit()`
+    /// pattern without remembering the wrapper is stateless.
     pub fn deinit(self: *DecompressContext) void {
         _ = self;
     }

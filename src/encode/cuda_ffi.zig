@@ -1,4 +1,4 @@
-//! CUDA Driver API FFI shim - shared by every src/gpu/encode/*.zig module.
+//! CUDA Driver API FFI shim - shared by every src/encode/*.zig module.
 //!
 //! Holds the Win32 LoadLibrary handles, the CUresult/CUdevice typedefs,
 //! the function-pointer typedefs (`FnXxx`), and the `pub var` slots the
@@ -9,10 +9,13 @@
 //! The encode side does NOT own CUDA context creation: `module_loader.init`
 //! calls into the decode driver first so that exactly one cuCtxCreate runs
 //! per process (a second context would clobber the decode side's
-//! allocations). Encode loads its own `nvcuda.dll` handle + function
-//! pointers because it needs encode-specific entries that decode does not
-//! (e.g. memset, async D2D). There are no `cuInit_fn`, `cuDeviceGet_fn`,
-//! or `cuCtxCreate_fn` slots here on purpose - encode never resolves them.
+//! allocations). Encode then loads its own `nvcuda.dll` handle + function
+//! pointers because every encode sub-module imports `cuda_ffi.zig` for
+//! its function-pointer slots — this is a per-side namespace
+//! duplication, not a capability gap; the decode side already resolves
+//! the same nvcuda entries into its own slots. There are no
+//! `cuInit_fn`, `cuDeviceGet_fn`, or `cuCtxCreate_fn` slots here on
+//! purpose — encode never resolves them.
 
 const std = @import("std");
 

@@ -165,7 +165,7 @@ pub fn init() bool {
     // `slzHuffDecode4StreamKernel`: the "4Stream" suffix is historical
     // (Zig dispatch ABI introduced by the prior 4-stream design); the
     // kernel now decodes HUFF_NUM_STREAMS = 32 streams in parallel
-    // (one per warp lane). See src/gpu/common/gpu_huffman.cuh.
+    // (one per warp lane). See src/common/gpu_huffman.cuh.
     const huff_ptx = nullTerminatedPtx(HUFF_PTX_NAME);
     if (load_fn(&huff_module, huff_ptx.ptr) == CUDA_SUCCESS) {
         _ = get_fn(&huff_build_fn, huff_module, "slzHuffBuildLutKernel");
