@@ -25,8 +25,8 @@ const builtin = @import("builtin");
 const frame = @import("format/frame_format.zig");
 const encoder = @import("encode/streamlz_encoder.zig");
 const decoder = @import("decode/streamlz_decoder.zig");
-const gpu_encoder = @import("gpu/encode/driver.zig");
-const gpu_driver = @import("gpu/decode/driver.zig");
+const gpu_encoder = @import("encode/driver.zig");
+const gpu_driver = @import("decode/driver.zig");
 const mmap_helpers = @import("platform/mmap.zig");
 const cache_detect = @import("platform/cache_detect.zig");
 

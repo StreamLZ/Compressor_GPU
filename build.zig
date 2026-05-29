@@ -88,10 +88,12 @@ pub fn build(b: *std.Build) void {
 //  PTX freshness check
 // ────────────────────────────────────────────────────────────────────────
 //
-// Walks `src/gpu/` for `.cu`/`.cuh`/`.ptx` files and fails the build if any
-// source is newer than any committed PTX. Catches the "I edited a kernel
-// but forgot to run tools/build_gpu.bat" mistake that would otherwise
-// silently embed stale device code.
+// Walks the kernel directories for `.cu`/`.cuh`/`.ptx` files and fails the
+// build if any source is newer than any committed PTX. Catches the "I
+// edited a kernel but forgot to run tools/build_gpu.bat" mistake that
+// would otherwise silently embed stale device code.
+
+const kernel_dirs = [_][]const u8{ "src/encode", "src/decode", "src/common" };
 
 fn newPtxFreshnessStep(b: *std.Build) *std.Build.Step {
     const step = b.allocator.create(std.Build.Step) catch @panic("oom");
@@ -110,48 +112,50 @@ fn ptxFreshnessCheck(step: *std.Build.Step, opts: std.Build.Step.MakeOptions) an
     const alloc = b.allocator;
     const io = b.graph.io;
 
-    var dir = b.build_root.handle.openDir(io, "src/gpu", .{ .iterate = true }) catch |err| {
-        return step.fail("cannot open src/gpu: {s}", .{@errorName(err)});
-    };
-    defer dir.close(io);
-
     var newest_src_path: ?[]u8 = null;
     var newest_src_mtime: i96 = std.math.minInt(i96);
     var oldest_ptx_path: ?[]u8 = null;
     var oldest_ptx_mtime: i96 = std.math.maxInt(i96);
 
-    var walker = dir.walk(alloc) catch |err| {
-        return step.fail("walk src/gpu failed: {s}", .{@errorName(err)});
-    };
-    defer walker.deinit();
+    for (kernel_dirs) |sub| {
+        var dir = b.build_root.handle.openDir(io, sub, .{ .iterate = true }) catch |err| {
+            return step.fail("cannot open {s}: {s}", .{ sub, @errorName(err) });
+        };
+        defer dir.close(io);
 
-    while (walker.next(io) catch |err| {
-        return step.fail("walk src/gpu next failed: {s}", .{@errorName(err)});
-    }) |entry| {
-        if (entry.kind != .file) continue;
-        const is_src = std.mem.endsWith(u8, entry.basename, ".cu") or
-            std.mem.endsWith(u8, entry.basename, ".cuh");
-        const is_ptx = std.mem.endsWith(u8, entry.basename, ".ptx");
-        if (!is_src and !is_ptx) continue;
+        var walker = dir.walk(alloc) catch |err| {
+            return step.fail("walk {s} failed: {s}", .{ sub, @errorName(err) });
+        };
+        defer walker.deinit();
 
-        const stat = entry.dir.statFile(io, entry.basename, .{}) catch continue;
-        const mtime_ns: i96 = stat.mtime.toNanoseconds();
-        if (is_src and mtime_ns > newest_src_mtime) {
-            if (newest_src_path) |p| alloc.free(p);
-            newest_src_path = alloc.dupe(u8, entry.path) catch unreachable;
-            newest_src_mtime = mtime_ns;
-        }
-        if (is_ptx and mtime_ns < oldest_ptx_mtime) {
-            if (oldest_ptx_path) |p| alloc.free(p);
-            oldest_ptx_path = alloc.dupe(u8, entry.path) catch unreachable;
-            oldest_ptx_mtime = mtime_ns;
+        while (walker.next(io) catch |err| {
+            return step.fail("walk {s} next failed: {s}", .{ sub, @errorName(err) });
+        }) |entry| {
+            if (entry.kind != .file) continue;
+            const is_src = std.mem.endsWith(u8, entry.basename, ".cu") or
+                std.mem.endsWith(u8, entry.basename, ".cuh");
+            const is_ptx = std.mem.endsWith(u8, entry.basename, ".ptx");
+            if (!is_src and !is_ptx) continue;
+
+            const stat = entry.dir.statFile(io, entry.basename, .{}) catch continue;
+            const mtime_ns: i96 = stat.mtime.toNanoseconds();
+            if (is_src and mtime_ns > newest_src_mtime) {
+                if (newest_src_path) |p| alloc.free(p);
+                newest_src_path = std.fmt.allocPrint(alloc, "{s}/{s}", .{ sub, entry.path }) catch unreachable;
+                newest_src_mtime = mtime_ns;
+            }
+            if (is_ptx and mtime_ns < oldest_ptx_mtime) {
+                if (oldest_ptx_path) |p| alloc.free(p);
+                oldest_ptx_path = std.fmt.allocPrint(alloc, "{s}/{s}", .{ sub, entry.path }) catch unreachable;
+                oldest_ptx_mtime = mtime_ns;
+            }
         }
     }
 
     if (newest_src_path == null) return;
     if (oldest_ptx_path == null) {
         return step.fail(
-            "no .ptx files found under src/gpu/.\n" ++
+            "no .ptx files found under src/encode | src/decode | src/common.\n" ++
                 "Run tools\\build_gpu.bat to compile every kernel and rebuild the exe.",
             .{},
         );
@@ -159,8 +163,8 @@ fn ptxFreshnessCheck(step: *std.Build.Step, opts: std.Build.Step.MakeOptions) an
     if (newest_src_mtime > oldest_ptx_mtime) {
         return step.fail(
             "PTX is stale relative to .cu/.cuh sources.\n" ++
-                "  newest source: src/gpu/{s}\n" ++
-                "  oldest PTX:    src/gpu/{s}\n" ++
+                "  newest source: {s}\n" ++
+                "  oldest PTX:    {s}\n" ++
                 "Run tools\\build_gpu.bat to rebuild every kernel + the embedding exe.",
             .{ newest_src_path.?, oldest_ptx_path.? },
         );

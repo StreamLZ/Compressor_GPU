@@ -15,7 +15,7 @@ const entropy_enc = @import("entropy/entropy_encoder.zig");
 const EntropyOptions = entropy_enc.EntropyOptions;
 
 const fast_framed = @import("fast_framed.zig");
-const gpu_encoder = @import("../gpu/encode/driver.zig");
+const gpu_encoder = @import("driver.zig");
 
 /// Default match-window distance written to the resolved params (1 GB).
 /// The GPU LZ kernel does not consult this directly — it sizes its own

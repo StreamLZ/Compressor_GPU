@@ -18,9 +18,9 @@
 
 const std = @import("std");
 const encoder = @import("encode/streamlz_encoder.zig");
-const gpu_encoder = @import("gpu/encode/driver.zig");
+const gpu_encoder = @import("encode/driver.zig");
 const decoder = @import("decode/streamlz_decoder.zig");
-const gpu_driver = @import("gpu/decode/driver.zig");
+const gpu_driver = @import("decode/driver.zig");
 const frame = @import("format/frame_format.zig");
 
 const allocator = std.heap.c_allocator;
@@ -559,7 +559,7 @@ export fn slzGetLastTimings(
 // slzGetLastTimings" pair. Passing stream=NULL behaves like the
 // synchronous slzGetLastTimings (no stream sync; assumes already
 // synced).
-const cuda_api = @import("gpu/decode/cuda_api.zig");
+const cuda_api = @import("decode/cuda_api.zig");
 const CUDA_SUCCESS: c_int = 0;
 export fn slzWaitAndGetLastTimings(
     handle: ?*Context,

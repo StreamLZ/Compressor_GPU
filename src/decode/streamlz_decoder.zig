@@ -20,7 +20,7 @@ const std = @import("std");
 const frame = @import("../format/frame_format.zig");
 const block_header = @import("../format/block_header.zig");
 const constants = @import("../format/streamlz_constants.zig");
-const gpu_driver = @import("../gpu/decode/driver.zig");
+const gpu_driver = @import("driver.zig");
 
 /// Bytes the decoder is allowed to overshoot past the requested output
 /// length. Several copy helpers prefetch and write ahead by up to this

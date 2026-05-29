@@ -34,8 +34,8 @@ const CompressError = encoder.CompressError;
 const entropyOptionsForLevel = encoder.entropyOptionsForLevel;
 
 const gpu_assembly = @import("gpu_stream_assembly.zig");
-const gpu_enc = @import("../gpu/encode/driver.zig");
-const cuda_api = @import("../gpu/decode/cuda_api.zig");
+const gpu_enc = @import("driver.zig");
+const cuda_api = @import("../decode/cuda_api.zig");
 
 const areAllBytesEqual = block_header.areAllBytesEqual;
 
