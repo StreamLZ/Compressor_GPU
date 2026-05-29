@@ -1,9 +1,0 @@
-prefix=@PREFIX@
-libdir=${prefix}/lib
-includedir=${prefix}/include
-
-Name: streamlz
-Description: StreamLZ fast LZ77 compression library
-Version: 2.0.0
-Libs: -L${libdir} -lstreamlz
-Cflags: -I${includedir}

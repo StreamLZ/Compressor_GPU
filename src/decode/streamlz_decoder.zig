@@ -1,38 +1,36 @@
-//! Top-level StreamLZ framed decompressor.
+//! StreamLZ framed decompressor — public API.
 //!
-//! Terminology: "sc" / "SC" = "self-contained" throughout this module.
+//! The decoder walks an SLZ1 frame's outer block list, parses each block's
+//! internal header, builds per-chunk descriptors, and hands the descriptor
+//! list to the GPU dispatch (`gpu_driver.fullGpuLaunchImpl`).
 //!
-//! Handles the framed decompress loop and inner block dispatcher.
+//! Two entry points exist:
 //!
-//! Current coverage:
-//!   * Frame-level uncompressed block path (phase 3a)
-//!   * Fast codec (L1-5) compressed path via fast_lz_decoder (phase 3b)
-//!   * High codec (L6-11) compressed path via high_lz_decoder
+//!   * `decompressFramed` / `decompressFramedThreaded` — host-input,
+//!     host-output. The decoder fills the caller's `dst` slice; the
+//!     compressed `src` and the chunk descriptors are H2D-copied inside
+//!     the dispatch.
+//!   * `decompressFramedFromDevice` — device-input, device-output (the
+//!     pure-D2D path used by the v3 C ABI). The frame and output never
+//!     leave VRAM; the chunk walk runs on the GPU via
+//!     `gpu_driver.gpuWalkFrameImpl`.
 
 const std = @import("std");
-const build_options = @import("build_options");
-/// Compile-time: was the GPU backend linked in? False for CPU-only
-/// builds. The GPU dispatch sites below gate on (gpu_compiled_in AND
-/// the runtime per-call `use_gpu` flag), so a CPU-only build skips
-/// the GPU code entirely while a GPU build still respects the
-/// caller's `-gpu` CLI flag.
-const gpu_compiled_in = if (@hasDecl(build_options, "gpu")) build_options.gpu else false;
+
 const frame = @import("../format/frame_format.zig");
 const block_header = @import("../format/block_header.zig");
 const constants = @import("../format/streamlz_constants.zig");
-const fast = @import("fast/fast_lz_decoder.zig");
-const high = @import("high/high_lz_decoder.zig");
-const parallel = @import("decompress_parallel.zig");
 const gpu_driver = @import("../gpu/decode/driver.zig");
 
-/// Extra bytes the decoder is allowed to write past `dst_len`.
+/// Bytes the decoder is allowed to overshoot past the requested output
+/// length. Several copy helpers prefetch and write ahead by up to this
+/// many bytes; the caller-supplied buffer must include the slack.
 pub const safe_space = constants.safe_space;
 
-/// Maximum content size the decoder will accept from a frame header.
-/// Protects against malicious headers claiming absurd sizes (e.g. 281 TB)
-/// that would cause OOM before any real decompression begins. Callers
-/// needing larger outputs should stream in chunks.
-pub const max_content_size: u64 = 4 * 1024 * 1024 * 1024; // 4 GB
+/// Upper bound on `content_size` the decoder will honor. A malicious frame
+/// header can claim absurd sizes; the decoder rejects anything above this
+/// cap rather than allocating into hostile territory.
+pub const max_content_size: u64 = 4 * 1024 * 1024 * 1024;
 
 pub const DecompressError = error{
     BadFrame,
@@ -47,13 +45,13 @@ pub const DecompressError = error{
     ChunkSizeMismatch,
     UnknownDictionary,
     ContentSizeTooLarge,
-} || gpu_driver.GpuError || fast.DecodeError || high.DecodeError || std.mem.Allocator.Error || std.Thread.CpuCountError;
+} || gpu_driver.GpuError || std.mem.Allocator.Error;
 
-/// Streams `src` (an SLZ1-framed buffer) into `dst`, returning the number
-/// of bytes written to `dst`. `dst.len` must be at least `content_size + safe_space`
-/// bytes when the frame declares a content size.
 pub const DecompressResult = struct {
     written: usize,
+    /// Always 0 in the GPU-only codec. Reserved for compatibility with
+    /// the original dictionary-prefix offset returned by the CPU decoder
+    /// — the field is still read by some callers.
     offset: usize = 0,
 };
 
@@ -62,58 +60,30 @@ pub fn decompressFramed(
     dst: []u8,
     dec_ctx: *gpu_driver.DecodeContext,
 ) DecompressError!usize {
-    const r = try decompressFramedInner(null, null, src, dst, 0, dec_ctx, null, true);
-    if (r.offset > 0 and r.written > 0) {
-        std.mem.copyForwards(u8, dst[0..r.written], dst[r.offset..][0..r.written]);
-    }
+    const r = try decompressFrameInner(src, dst, dec_ctx, null, null);
     return r.written;
 }
 
-/// Parallel variant of `decompressFramed`. Uses `allocator` to spawn
-/// worker threads + allocate per-thread scratch for SC (L6-L8) blocks.
-/// Non-SC blocks fall through to the serial path. `use_gpu` is the
-/// per-call runtime gate on the GPU dispatch path (see DecompressContext
-/// docs); pass `false` to measure the pure-CPU decode path even on a
-/// GPU build.
-pub fn decompressFramedParallel(
-    allocator: std.mem.Allocator,
-    src: []const u8,
-    dst: []u8,
-    dec_ctx: *gpu_driver.DecodeContext,
-    use_gpu: bool,
-) DecompressError!usize {
-    const r = try decompressFramedInner(allocator, null, src, dst, 0, dec_ctx, null, use_gpu);
-    if (r.offset > 0 and r.written > 0) {
-        std.mem.copyForwards(u8, dst[0..r.written], dst[r.offset..][0..r.written]);
-    }
-    return r.written;
-}
-
-pub fn decompressFramedParallelThreaded(
+pub fn decompressFramedThreaded(
     allocator: std.mem.Allocator,
     io: ?std.Io,
     src: []const u8,
     dst: []u8,
-    max_threads: usize,
     dec_ctx: *gpu_driver.DecodeContext,
-    use_gpu: bool,
 ) DecompressError!DecompressResult {
-    return decompressFramedInner(allocator, io, src, dst, max_threads, dec_ctx, null, use_gpu);
+    _ = allocator;
+    return decompressFrameInner(src, dst, dec_ctx, null, io);
 }
 
-/// True-D2D decompress for the v3 C ABI. Compressed frame is device-
-/// resident at `d_frame`; the walk runs on the GPU and writes the chunk
-/// descriptors + meta directly to device memory; the LZ kernel writes
-/// straight into the caller's `d_output`. Zero host bounce.
+/// True-D2D decompress for the v3 C ABI. Compressed frame and output
+/// stay on device throughout. `decomp_size` is the caller-supplied
+/// decompressed-byte count (from `slzGetDecompressedSize` or caller
+/// metadata) — the v3 contract requires it.
 ///
-/// `decomp_size` is the caller-supplied decompressed byte count (from
-/// slzGetDecompressedSize or the caller's own metadata); the v3 C ABI
-/// contract requires it. Frame shape is the slzCompress invariant:
-/// Fast codec, no dictionary / PDM / checksums, single block,
-/// content_size_present, sc_group=0.25 → eff_chunk_size 64 KB. Frames
-/// that violate the shape produce garbage output (per CPU/GPU separate
-/// formats contract); the C ABI rejects them via the SHA verify in the
-/// caller's stream-sync.
+/// Accepts only the slzCompress-shape frame: Fast codec, single block,
+/// content_size present, sc_group ≤ 1.0, no dictionary. Anything else
+/// returns `error.BadMode` and the C ABI falls back to the host-bounce
+/// entry points.
 pub fn decompressFramedFromDevice(
     io: ?std.Io,
     d_frame: u64,
@@ -122,112 +92,61 @@ pub fn decompressFramedFromDevice(
     dec_ctx: *gpu_driver.DecodeContext,
     decomp_size: u32,
 ) DecompressError!u32 {
-    // Frame layout: [14 hdr][8 content_size][8 block hdr][block][4 end].
-    const block_start: u32 = 30;
-    if (frame_size < 34) return error.BadMode;
-    const block_size: u32 = frame_size - 34;
-    // sc_group=0.25 ⇒ eff_chunk_size = 64 KB ⇒ n_chunks = ceil(decomp / 64 KB).
-    // The LZ kernel self-gates on d_walk_meta+0 (real count written by the
-    // walk kernel), so this bound only sizes the chunk-desc + grid space.
-    const EFF_CHUNK_SIZE_64K: u32 = 0x10000;
-    const n_chunks_bound: u32 = (decomp_size + EFF_CHUNK_SIZE_64K - 1) / EFF_CHUNK_SIZE_64K;
-    if (n_chunks_bound == 0 or n_chunks_bound > gpu_driver.WALK_MAX_CHUNKS) return error.BadMode;
-    if (std.c.getenv("SLZ_E2E_TIMER") != null)
-        std.debug.print("[walk] decomp={d} block_start={d} block_size={d} n_chunks_bound={d}\n", .{ decomp_size, block_start, block_size, n_chunks_bound });
+    // Frame layout: [hdr 14][content_size 8][block_hdr 8][block][end 4]
+    const fixed_overhead: u32 = 14 + 8 + 8 + 4;
+    if (frame_size < fixed_overhead + 1) return error.BadMode;
+    const block_start: u32 = 14 + 8 + 8;
+    const block_size: u32 = frame_size - fixed_overhead;
 
-    // Walk runs on the device; meta + chunk descs flow back through
-    // d_walk_meta / d_walk_chunks without any D2H.
+    // sc_group=0.25 ⇒ eff_chunk_size = 64 KB. The walk kernel writes the
+    // real chunk count to d_meta+0; the bound below just sizes the
+    // descriptor + grid space.
+    const eff_chunk_64k: u32 = 0x10000;
+    const n_chunks_bound: u32 = (decomp_size + eff_chunk_64k - 1) / eff_chunk_64k;
+    if (n_chunks_bound == 0 or n_chunks_bound > gpu_driver.WALK_MAX_CHUNKS) return error.BadMode;
+
     const dev = try gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size);
 
-    // The chunks and compressed_block slices are length-only stubs — the
-    // LZ kernel reads from d_chunk_descs_override and d_compressed_src
-    // directly. Stub pointers (0x10) just satisfy the slice type.
-    const stub_ptr: [*]const u8 = @ptrFromInt(0x10);
-    const compressed_block: []const u8 = stub_ptr[0..block_size];
-    const chunk_stub_ptr: [*]const gpu_driver.ChunkDesc = @ptrFromInt(0x10);
-    const chunks_stub: []const gpu_driver.ChunkDesc = chunk_stub_ptr[0..n_chunks_bound];
+    // Stub slices: the kernel reads from `d_chunk_descs_override` and
+    // `d_compressed_src`; the host slices are length-only.
+    const stub_chunks_ptr: [*]const gpu_driver.ChunkDesc = @ptrFromInt(0x10);
+    const chunks_stub: []const gpu_driver.ChunkDesc = stub_chunks_ptr[0..n_chunks_bound];
+    const stub_bytes_ptr: [*]const u8 = @ptrFromInt(0x10);
+    const compressed_block: []const u8 = stub_bytes_ptr[0..block_size];
 
     var dst_dummy: u8 = 0;
-    gpu_driver.fullGpuLaunchImpl(dec_ctx, .{
+    try gpu_driver.fullGpuLaunchImpl(dec_ctx, .{
         .chunk_descs = chunks_stub,
         .compressed_block = compressed_block,
         .dst_full = @ptrCast(&dst_dummy),
         .dst_start_off = 0,
         .decompressed_size = decomp_size,
         .chunks_per_group = 1,
-        // sub_chunk_cap is unconditionally the entropy-scratch slot stride
-        // (the walk kernel writes this exact constant to d_meta).
         .sub_chunk_cap = @intCast(gpu_driver.ENTROPY_SCRATCH_SLOT_BYTES),
         .io = io,
         .d_output_target = d_output,
         .d_compressed_src = d_frame + block_start,
         .d_chunk_descs_override = dev.d_chunk_descs,
-        // LZ kernel reads its self-gate count from d_walk_meta + offset
-        // via stream ordering — no H2D round trip.
         .d_n_chunks_dev = dev.d_meta + gpu_driver.walk_meta_offsets.n_chunks,
-    }) catch |err| return err;
+    });
     return decomp_size;
 }
 
-/// Reusable decompression context that keeps configuration across
-/// multiple `decompress` calls. Library consumers who decompress many
-/// buffers should create one context, call `decompress` repeatedly, and
-/// `deinit` when done.
 pub const DecompressContext = struct {
     allocator: std.mem.Allocator,
     io: ?std.Io,
-    max_threads: usize,
-    /// GPU decode context backing this handle's decode calls. Points at
-    /// the module-global default so existing behavior is unchanged; a
-    /// future library API will hand each handle its own DecodeContext.
     dec_ctx: *gpu_driver.DecodeContext = &gpu_driver.g_default,
-    /// Per-handle runtime gate on the GPU dispatch path. Defaults to
-    /// `true` so existing callers keep current behavior; the CLI sets
-    /// it from the `-gpu` flag so `-b` (without `-gpu`) measures the
-    /// pure-CPU decode path even on a GPU build. The dispatch sites
-    /// gate on `(gpu_compiled_in and ctx.use_gpu)`, so a CPU-only build
-    /// short-circuits to host regardless of this field.
-    use_gpu: bool = true,
 
     pub fn init(allocator: std.mem.Allocator) DecompressContext {
-        return .{
-            .allocator = allocator,
-            .io = null,
-            .max_threads = 0,
-        };
+        return .{ .allocator = allocator, .io = null };
     }
 
-    pub fn initThreaded(allocator: std.mem.Allocator, max_threads: usize) DecompressContext {
-        return .{
-            .allocator = allocator,
-            .io = null,
-            .max_threads = max_threads,
-        };
-    }
-
-    pub fn initThreadedWithIo(allocator: std.mem.Allocator, io: std.Io, max_threads: usize) DecompressContext {
-        return .{
-            .allocator = allocator,
-            .io = io,
-            .max_threads = max_threads,
-        };
+    pub fn initWithIo(allocator: std.mem.Allocator, io: std.Io) DecompressContext {
+        return .{ .allocator = allocator, .io = io };
     }
 
     pub fn decompress(self: *DecompressContext, src: []const u8, dst: []u8) DecompressError!DecompressResult {
-        if (src.len == 0) return .{ .written = 0, .offset = 0 };
-        var src_pos: usize = 0;
-        var dst_off: usize = 0;
-        var dict_off: usize = 0;
-        while (src_pos < src.len) {
-            const piece_src = src[src_pos..];
-            const piece_dst = dst[dst_off..];
-            const pair = try decompressOneFrame(self.allocator, self.io, piece_src, piece_dst, self.max_threads, self.dec_ctx, null, self.use_gpu);
-            src_pos += pair.src_consumed;
-            if (dict_off == 0 and pair.dst_offset > 0) dict_off = pair.dst_offset;
-            dst_off += pair.dst_offset + pair.dst_written;
-            if (pair.src_consumed == 0) break;
-        }
-        return .{ .written = dst_off - dict_off, .offset = dict_off };
+        return decompressFrameInner(src, dst, self.dec_ctx, null, self.io);
     }
 
     pub fn deinit(self: *DecompressContext) void {
@@ -235,149 +154,33 @@ pub const DecompressContext = struct {
     }
 };
 
-fn decompressFramedInner(
-    allocator_opt: ?std.mem.Allocator,
-    io_opt: ?std.Io,
+// ────────────────────────────────────────────────────────────────────────
+//  Frame walk
+// ────────────────────────────────────────────────────────────────────────
+
+fn decompressFrameInner(
     src: []const u8,
     dst: []u8,
-    max_threads: usize,
     dec_ctx: *gpu_driver.DecodeContext,
-    /// 4d Phase 3: when non-null, the GPU decode path D2D-copies decoded
-    /// bytes to `d_output_target + dst_off` instead of D2H-copying into
-    /// `dst`. Non-GPU dispatch paths (uncompressed blocks, CPU fallback,
-    /// Vulkan) cannot satisfy this contract; the inner loop returns
-    /// error.BadMode if it has to fall back to a non-GPU branch.
     d_output_target: ?u64,
-    /// Per-call runtime gate on the GPU dispatch path. See
-    /// decompressOneFrame's same-named param for the full rationale.
-    use_gpu: bool,
+    io: ?std.Io,
 ) DecompressError!DecompressResult {
-    if (src.len == 0) return .{ .written = 0, .offset = 0 };
-
-    // Multi-piece support: the encoder's `compressFramed` retry
-    // ladder (step 39) emits concatenated SLZ1 frames when the
-    // single-shot path OOMs. Loop over pieces, decoding each
-    // complete frame in order. Single-piece inputs exit after one
-    // iteration via the empty-trailer check.
-    var src_pos: usize = 0;
-    var dst_off: usize = 0;
-    var dict_off: usize = 0;
-    while (src_pos < src.len) {
-        const piece_src = src[src_pos..];
-        const piece_dst = dst[dst_off..];
-        // Pre-shift d_output_target by dst_off so the inner block loop
-        // can keep its dst_off relative to the piece (matches the host
-        // `dst` slicing one line above).
-        const piece_dev_target = if (d_output_target) |t| t + dst_off else null;
-        const pair = try decompressOneFrame(allocator_opt, io_opt, piece_src, piece_dst, max_threads, dec_ctx, piece_dev_target, use_gpu);
-        src_pos += pair.src_consumed;
-        if (dict_off == 0 and pair.dst_offset > 0) dict_off = pair.dst_offset;
-        dst_off += pair.dst_offset + pair.dst_written;
-        if (pair.src_consumed == 0) break;
-    }
-    return .{ .written = dst_off - dict_off, .offset = dict_off };
-}
-
-const FrameResult = struct {
-    src_consumed: usize,
-    dst_written: usize,
-    dst_offset: usize = 0,
-};
-
-fn decompressOneFrame(
-    allocator_opt: ?std.mem.Allocator,
-    io_opt: ?std.Io,
-    src: []const u8,
-    dst: []u8,
-    max_threads: usize,
-    dec_ctx: *gpu_driver.DecodeContext,
-    /// 4d Phase 3: see decompressFramedInner. Forwarded as-is to the
-    /// per-block dispatch — null = legacy host-output path.
-    d_output_target: ?u64,
-    /// Per-call gate on the GPU dispatch path. Combined with the
-    /// comptime `gpu_compiled_in` to produce the final decision: GPU
-    /// is taken only when both are true. CLI sets this from `-gpu`;
-    /// CPU-only tests/callers pass `false`; GPU-required paths (D2D,
-    /// C ABI's slzDecompress) pass `true`.
-    use_gpu: bool,
-) DecompressError!FrameResult {
-    if (src.len == 0) return .{ .src_consumed = 0, .dst_written = 0 };
+    if (src.len == 0) return .{ .written = 0 };
 
     const hdr = frame.parseHeader(src) catch return error.BadFrame;
 
-    const dict_mod = @import("../dict/dictionary.zig");
-
-    // 4d Phase 3 D2D: dictionary frames aren't supported (the prefix
-    // copy below targets the host dst, which the caller did not supply).
-    // Bail with BadMode so the wrapper falls back to the host-bounce.
-    if (d_output_target != null and hdr.dictionary_id != null) return error.BadMode;
+    // GPU codec never produces dictionary frames. The dictionary subsystem
+    // was removed during the GPU-only strip; any frame carrying a
+    // dictionary_id originated from the legacy CPU encoder.
+    if (hdr.dictionary_id != null) return error.UnknownDictionary;
 
     if (hdr.content_size) |cs| {
         if (cs > max_content_size) return error.ContentSizeTooLarge;
-        const needed: usize = @intCast(cs + safe_space);
-        // Extra space for dictionary prefix (matches are resolved
-        // relative to dict + output, then the prefix is stripped).
-        const dict_overhead: usize = if (hdr.dictionary_id) |did|
-            if (dict_mod.findById(did)) |d| d.data.len + safe_space else 0
-        else
-            0;
-        // Skip the host-dst size check on the D2D path — the caller's
-        // device buffer is sized separately and `dst` is intentionally
-        // empty in that mode.
-        if (d_output_target == null and dst.len < needed + dict_overhead) return error.OutputTooSmall;
+        if (d_output_target == null and dst.len < @as(usize, @intCast(cs + safe_space))) return error.OutputTooSmall;
     }
 
     var pos: usize = hdr.header_size;
-    var dict_prefix_len: usize = 0;
-    if (hdr.dictionary_id) |dict_id| {
-        const d = dict_mod.findById(dict_id) orelse return error.UnknownDictionary;
-        const needed = d.data.len + (if (hdr.content_size) |cs| @as(usize, @intCast(cs)) else 0) + safe_space;
-        if (needed > dst.len) return error.OutputTooSmall;
-        @memcpy(dst[0..d.data.len], d.data);
-        dict_prefix_len = d.data.len;
-    }
-
-    // Output starts after the dictionary prefix. The chunk decoder
-    // uses dst.ptr as dst_start for LZ back-references, so the
-    // dictionary bytes at dst[0..dict_prefix_len] are reachable
-    // via negative offsets from the output region.
-    var dst_off: usize = dict_prefix_len;
-    // Scratch buffer for Fast decoder tables and stream storage.
-    var scratch: [constants.scratch_size]u8 = undefined;
-
-    // v2: if the frame advertises a parallel-decode sidecar AND the
-    // caller provided an allocator, pre-scan the frame blocks to
-    // locate the sidecar body. The sidecar is emitted AFTER the
-    // compressed blocks it applies to, so we can't discover it lazily
-    // during the main iteration; we have to find it up front.
-    //
-    // For this initial cut we only use the sidecar if there's exactly
-    // one sidecar block in the frame. Multi-sidecar frames fall
-    // through to the serial path.
-    var sidecar_body: ?[]const u8 = null;
-    if (hdr.flags.parallel_decode_metadata_present and allocator_opt != null) {
-        var scan_pos: usize = pos;
-        var sidecar_count: usize = 0;
-        while (scan_pos + 4 <= src.len) {
-            const w = std.mem.readInt(u32, src[scan_pos..][0..4], .little);
-            if (w == frame.end_mark) break;
-            const bh_peek = frame.parseBlockHeader(src[scan_pos..]) catch break;
-            if (bh_peek.isEndMark()) break;
-            scan_pos += 8;
-            if (bh_peek.parallel_decode_metadata) {
-                if (scan_pos + bh_peek.compressed_size > src.len) break;
-                sidecar_count += 1;
-                if (sidecar_count == 1) {
-                    sidecar_body = src[scan_pos..][0..bh_peek.compressed_size];
-                } else {
-                    // More than one sidecar — unsupported for now.
-                    sidecar_body = null;
-                    break;
-                }
-            }
-            scan_pos += bh_peek.compressed_size;
-        }
-    }
+    var dst_off: usize = 0;
 
     while (pos + 4 <= src.len) {
         const first_word = std.mem.readInt(u32, src[pos..][0..4], .little);
@@ -386,17 +189,16 @@ fn decompressOneFrame(
             break;
         }
 
-        const block_hdr= frame.parseBlockHeader(src[pos..]) catch return error.InvalidBlockHeader;
+        const block_hdr = frame.parseBlockHeader(src[pos..]) catch return error.InvalidBlockHeader;
         if (block_hdr.isEndMark()) {
             pos += 8;
             break;
         }
         pos += 8;
 
-        // v2: parallel-decode-metadata (sidecar) block. Serial decoders
-        // skip it — the sidecar is optional metadata for parallel decode
-        // paths, and contributes zero bytes to dst. The compressed_size
-        // bytes carry the sidecar payload, which we advance past here.
+        // Skip any legacy sidecar (parallel-decode metadata) blocks the
+        // wire format may still carry from older encoders. The GPU codec
+        // does not emit them; bytes contribute 0 to dst.
         if (block_hdr.parallel_decode_metadata) {
             if (pos + block_hdr.compressed_size > src.len) return error.BlockDataTruncated;
             pos += block_hdr.compressed_size;
@@ -405,855 +207,152 @@ fn decompressOneFrame(
 
         if (block_hdr.uncompressed) {
             if (pos + block_hdr.decompressed_size > src.len) return error.BlockDataTruncated;
-            // D2D output (4d Phase 3): H2D the uncompressed block straight
-            // into the caller's device buffer; the host `dst` is unused.
             if (d_output_target) |dev_target| {
                 if (!gpu_driver.copyHostToDevice(dev_target + dst_off, src[pos..][0..block_hdr.decompressed_size]))
                     return error.BadMode;
             } else {
                 if (dst_off + block_hdr.decompressed_size > dst.len) return error.OutputTooSmall;
-                @memcpy(
-                    dst[dst_off..][0..block_hdr.decompressed_size],
-                    src[pos..][0..block_hdr.decompressed_size],
-                );
+                @memcpy(dst[dst_off..][0..block_hdr.decompressed_size], src[pos..][0..block_hdr.decompressed_size]);
             }
             dst_off += block_hdr.decompressed_size;
             pos += block_hdr.compressed_size;
             continue;
         }
 
-        // Dispatch: if caller provided an allocator AND this block
-        // has multiple chunks, try the appropriate parallel path —
-        //   * Fast L1-L4 with sidecar (v2) → decompressFastL14Parallel
-        //   * SC (L6-L8)  → DecompressCoreParallel
-        //   * non-SC High → DecompressCoreTwoPhase (entropy parallel,
-        //                   match resolve serial)
-        // Anything else (single-chunk, Fast without sidecar, mixed
-        // decoder types) falls through to the existing serial loop.
         const block_src = src[pos .. pos + block_hdr.compressed_size];
-        var dispatched_parallel: bool = false;
-
-        // GPU batch path: GPU LZ kernel iterates sub-chunks within each chunk,
-        // so it handles any sc_group_size. At sc>0.5 the encoder gates off tANS
-        // (raw streams only) so the per-chunk tANS scratch isn't needed there.
-        if (gpu_compiled_in and use_gpu) gpu_frame: {
-            const gpu = @import("../gpu/decode/driver.zig");
-            if (!gpu.isAvailable()) break :gpu_frame;
-            if (block_src.len < 2) break :gpu_frame;
-            const peek = block_header.parseBlockHeader(block_src) catch break :gpu_frame;
-            const is_fast = peek.decoder_type == .fast or peek.decoder_type == .turbo;
-            if (!is_fast) break :gpu_frame;
-            if (block_hdr.decompressed_size <= constants.chunk_size) break :gpu_frame;
-
-            const eff_cs_gpu = @min(frame.scGroupSizeToBytes(hdr.sc_group_size), constants.chunk_size);
-            const num_chunks_est = (block_hdr.decompressed_size + eff_cs_gpu - 1) / eff_cs_gpu;
-            const prefix_sz: usize = if (peek.self_contained and num_chunks_est > 1) (num_chunks_est - 1) * 8 else 0;
-            const block_payload = block_src[0 .. block_src.len - prefix_sz];
-
-            gpuBatchDecode(block_payload, dst, dst_off, block_hdr.decompressed_size, hdr.sc_group_size, &scratch, io_opt, dec_ctx, d_output_target) catch |err| {
-                std.debug.print("GPU decode FAILED (NO FALLBACK): {s}\n", .{@errorName(err)});
-                return error.BadMode;
-            };
-            dst_off += block_hdr.decompressed_size;
-
-            if (prefix_sz != 0) {
-                const prefix_base: [*]const u8 = block_src[block_src.len - prefix_sz ..].ptr;
-                var pi: usize = 0;
-                while (pi + 1 < num_chunks_est) : (pi += 1) {
-                    const cdst = dst_off - block_hdr.decompressed_size + (pi + 1) * eff_cs_gpu;
-                    var csz: usize = 8;
-                    if ((pi + 1) * eff_cs_gpu + csz > block_hdr.decompressed_size) csz = block_hdr.decompressed_size - (pi + 1) * eff_cs_gpu;
-                    // D2D output (4d Phase 3): patch the sub-chunk prefix
-                    // bytes onto the device-resident output directly.
-                    if (d_output_target) |dev_target| {
-                        if (!gpu_driver.copyHostToDevice(dev_target + cdst, prefix_base[pi * 8 ..][0..csz]))
-                            return error.BadMode;
-                    } else {
-                        @memcpy(dst[cdst..][0..csz], prefix_base[pi * 8 ..][0..csz]);
-                    }
-                }
-            }
-            dispatched_parallel = true;
-        }
-
-        // Vulkan fallback: try Vulkan compute when CUDA is unavailable
-        if (gpu_compiled_in and !dispatched_parallel and use_gpu and hdr.sc_group_size <= 1.0) vk_frame: {
-            const vk = @import("../gpu/decode/vulkan_driver.zig");
-            if (!vk.isAvailable()) break :vk_frame;
-            if (block_src.len < 2) break :vk_frame;
-            const peek_vk = block_header.parseBlockHeader(block_src) catch break :vk_frame;
-            const is_fast_vk = peek_vk.decoder_type == .fast or peek_vk.decoder_type == .turbo;
-            if (!is_fast_vk) break :vk_frame;
-            if (block_hdr.decompressed_size <= constants.chunk_size) break :vk_frame;
-
-            const eff_cs_vk = @min(frame.scGroupSizeToBytes(hdr.sc_group_size), constants.chunk_size);
-            const num_chunks_vk = (block_hdr.decompressed_size + eff_cs_vk - 1) / eff_cs_vk;
-            const prefix_sz_vk: usize = if (peek_vk.self_contained and num_chunks_vk > 1) (num_chunks_vk - 1) * 8 else 0;
-            const block_payload_vk = block_src[0 .. block_src.len - prefix_sz_vk];
-
-            vkBatchDecode(block_payload_vk, dst, dst_off, block_hdr.decompressed_size, hdr.sc_group_size, &scratch, io_opt) catch break :vk_frame;
-            dst_off += block_hdr.decompressed_size;
-
-            if (prefix_sz_vk != 0) {
-                const prefix_base_vk: [*]const u8 = block_src[block_src.len - prefix_sz_vk ..].ptr;
-                var pvi: usize = 0;
-                while (pvi + 1 < num_chunks_vk) : (pvi += 1) {
-                    const cdst_vk = dst_off - block_hdr.decompressed_size + (pvi + 1) * eff_cs_vk;
-                    var csz_vk: usize = 8;
-                    if ((pvi + 1) * eff_cs_vk + csz_vk > block_hdr.decompressed_size) csz_vk = block_hdr.decompressed_size - (pvi + 1) * eff_cs_vk;
-                    @memcpy(dst[cdst_vk..][0..csz_vk], prefix_base_vk[pvi * 8 ..][0..csz_vk]);
-                }
-            }
-            dispatched_parallel = true;
-        }
-
-        if (!dispatched_parallel and allocator_opt != null and hdr.sc_group_size >= 1.0) {
-            const allocator = allocator_opt.?;
-            if (block_src.len >= 2) {
-                const peek = block_header.parseBlockHeader(block_src) catch null;
-                if (peek) |ph| {
-                    const has_many_chunks = block_hdr.decompressed_size > constants.chunk_size;
-                    const is_fast_like = ph.decoder_type == .fast or ph.decoder_type == .turbo;
-                    // Resolve io for parallel dispatch. When no io
-                    // is available, use std.Io.failing which causes
-                    // ConcurrencyUnavailable on dispatch, falling
-                    // back to inline (serial) execution.
-                    const io = io_opt orelse std.Io.failing;
-                    if (is_fast_like and !ph.self_contained and sidecar_body != null and has_many_chunks) {
-                        // v2 Fast L1-L4 parallel path: uses the pre-
-                        // located sidecar to resolve cross-sub-chunk
-                        // matches, then dispatches sub-chunks across
-                        // worker threads.
-                        try parallel.decompressFastL14Parallel(
-                            allocator,
-                            io,
-                            block_src,
-                            sidecar_body.?,
-                            dst,
-                            &dst_off,
-                            block_hdr.decompressed_size,
-                            max_threads,
-                        );
-                        dispatched_parallel = true;
-                    } else if (ph.self_contained and has_many_chunks) {
-                        try parallel.decompressCoreParallel(
-                            allocator,
-                            io,
-                            block_src,
-                            dst,
-                            &dst_off,
-                            block_hdr.decompressed_size,
-                            hdr.sc_group_size,
-                            max_threads,
-                        );
-                        dispatched_parallel = true;
-                    } else if (ph.decoder_type == .high and has_many_chunks) {
-                        const ok = try parallel.decompressCoreTwoPhase(
-                            allocator,
-                            io,
-                            block_src,
-                            dst,
-                            &dst_off,
-                            block_hdr.decompressed_size,
-                            max_threads,
-                        );
-                        if (ok) dispatched_parallel = true;
-                    }
+        try dispatchCompressedBlock(
+            block_src,
+            dst,
+            dst_off,
+            block_hdr.decompressed_size,
+            hdr.sc_group_size,
+            dec_ctx,
+            d_output_target,
+            io,
+        );
+        // Restore the 8-byte SC tail prefix bytes that the encoder
+        // appended at the end of the block. The decoder kernel writes
+        // garbage into the first 8 bytes of every chunk past the first
+        // (no Copy64 fires when base_offset != 0).
+        const eff_cs = @min(frame.scGroupSizeToBytes(hdr.sc_group_size), constants.chunk_size);
+        const num_chunks = (block_hdr.decompressed_size + eff_cs - 1) / eff_cs;
+        const prefix_sz: usize = if (num_chunks > 1) (num_chunks - 1) * 8 else 0;
+        if (prefix_sz != 0) {
+            const prefix_base: [*]const u8 = block_src[block_src.len - prefix_sz ..].ptr;
+            for (0..num_chunks - 1) |pi| {
+                const cdst = dst_off + (pi + 1) * eff_cs;
+                var csz: usize = 8;
+                if ((pi + 1) * eff_cs + csz > block_hdr.decompressed_size)
+                    csz = block_hdr.decompressed_size - (pi + 1) * eff_cs;
+                if (d_output_target) |dev_target| {
+                    if (!gpu_driver.copyHostToDevice(dev_target + cdst, prefix_base[pi * 8 ..][0..csz]))
+                        return error.BadMode;
+                } else {
+                    @memcpy(dst[cdst..][0..csz], prefix_base[pi * 8 ..][0..csz]);
                 }
             }
         }
-
-        if (!dispatched_parallel) {
-            // D2D output (4d Phase 3) requires the GPU dispatch to take
-            // every block; the serial CPU path would write into the host
-            // `dst`, which the caller did not supply. Caller falls back.
-            if (d_output_target != null) return error.BadMode;
-            // Compressed block — iterate 256 KB chunks inside serially.
-            try decompressCompressedBlock(
-                block_src,
-                dst,
-                &dst_off,
-                block_hdr.decompressed_size,
-                &scratch,
-                hdr.sc_group_size,
-                hdr.level,
-                dec_ctx,
-                use_gpu,
-            );
-        }
+        dst_off += block_hdr.decompressed_size;
         pos += block_hdr.compressed_size;
     }
 
-    const actual_output = dst_off - dict_prefix_len;
     if (hdr.content_size) |cs| {
-        if (actual_output != cs) return error.SizeMismatch;
+        if (dst_off != cs) return error.SizeMismatch;
     }
-    return .{
-        .src_consumed = pos,
-        .dst_written = actual_output,
-        .dst_offset = dict_prefix_len,
-    };
+    return .{ .written = dst_off };
 }
 
-/// Whole-chunk match copy: reads `length` bytes from `dst - offset` into
-/// `dst[0..length]`. Used for "whole-match" chunk variants where the entire
-/// chunk is a single back-reference to earlier output.
-///
-/// Uses 8-byte chunks when `offset >= 8` so the load and store regions
-/// don't overlap. Falls through to byte-at-a-time for the tail.
-///
-/// Unreachable via the current encoder (no compressor populates
-/// `chunk_header.whole_match_distance`) but kept for completeness and
-/// to match the wire format reservation.
-fn copyWholeMatch(dst: [*]u8, offset: u32, length: usize) void {
-    std.debug.assert(offset > 0);
-    const src_addr: usize = @intFromPtr(dst) - offset;
-    const src: [*]const u8 = @ptrFromInt(src_addr);
-    var i: usize = 0;
-    if (offset >= 8) {
-        while (i + 8 <= length) : (i += 8) {
-            const word = std.mem.readInt(u64, src[i..][0..8], .little);
-            std.mem.writeInt(u64, dst[i..][0..8], word, .little);
-        }
-    }
-    while (i < length) : (i += 1) dst[i] = src[i];
-}
+// ────────────────────────────────────────────────────────────────────────
+//  Per-block GPU dispatch
+// ────────────────────────────────────────────────────────────────────────
 
-/// Streaming decompression options.
-pub const StreamDecompressOptions = struct {
-    /// Sliding window size in bytes. LZ back-references can reach this far
-    /// into previously-decoded output. Clamped to `[block_size, max_window_size]`
-    /// where `block_size` comes from the frame header. Default 4 MB.
-    window_size: u32 = 4 * 1024 * 1024,
-    /// Maximum allowed total decompressed output bytes. 0 = no limit.
-    /// Maximum decompressed size limit
-    /// `StreamLzFrameDecompressor.Decompress` — protects against decompression
-    /// bombs where a small malicious frame claims a huge output.
-    max_decompressed_size: u64 = 0,
-    /// If the frame has `content_checksum` set, verify the XXH32 at the end
-    /// and return `error.ChecksumMismatch` on failure. Default true.
-    verify_checksum: bool = true,
-};
-
-/// Streams an SLZ1 frame from `src` to `writer`, maintaining a sliding
-/// window for cross-block LZ back-references and optionally verifying the
-/// XXH32 content checksum. Returns the total number of decompressed bytes
-/// written.
-///
-/// `src` is a single byte slice (the caller is responsible for reading the
-/// file / memory-mapping); output goes to any `std.Io.Writer`. For
-/// file-to-file streaming, the caller can wrap a file writer.
-pub fn decompressStream(
-    allocator: std.mem.Allocator,
-    src: []const u8,
-    writer: *std.Io.Writer,
-    opts: StreamDecompressOptions,
-    dec_ctx: *gpu_driver.DecodeContext,
-) DecompressError!u64 {
-    if (src.len == 0) return 0;
-
-    const hdr = frame.parseHeader(src) catch return error.BadFrame;
-    const block_size: usize = @intCast(hdr.block_size);
-
-    // Window size clamp: must hold at least one full block plus safe_space
-    // slack; capped at the maximum window.
-    var window_size: usize = @intCast(opts.window_size);
-    if (window_size < block_size) window_size = block_size;
-    if (window_size > frame.max_window_size) window_size = frame.max_window_size;
-
-    // Window buffer layout: [dict ... current block output ... safe_space].
-    // The dict portion holds the sliding window for cross-block back-refs;
-    // the current block's output is written past dict_bytes.
-    const window_buf_size: usize = window_size + block_size + safe_space * 2;
-    const window_buf = try allocator.alloc(u8, window_buf_size);
-    defer allocator.free(window_buf);
-
-    var hasher: ?std.hash.XxHash32 = if (hdr.flags.content_checksum and opts.verify_checksum)
-        std.hash.XxHash32.init(0)
-    else
-        null;
-
-    var pos: usize = hdr.header_size;
-    var total_written: u64 = 0;
-    var dict_bytes: usize = 0;
-
-    while (pos + 4 <= src.len) {
-        // Check for end mark.
-        const first_word = std.mem.readInt(u32, src[pos..][0..4], .little);
-        if (first_word == frame.end_mark) {
-            pos += 4;
-            break;
-        }
-
-        if (pos + 8 > src.len) return error.Truncated;
-        const block_hdr= frame.parseBlockHeader(src[pos..]) catch return error.InvalidBlockHeader;
-        if (block_hdr.isEndMark()) {
-            pos += 4;
-            break;
-        }
-        pos += 8;
-
-        // Sanity caps.
-        if (block_hdr.decompressed_size > frame.max_decompressed_block_size) return error.BadFrame;
-        if (block_hdr.compressed_size > frame.max_decompressed_block_size) return error.BadFrame;
-
-        // v2: skip parallel-decode-metadata (sidecar) blocks.
-        if (block_hdr.parallel_decode_metadata) {
-            if (pos + block_hdr.compressed_size > src.len) return error.BlockDataTruncated;
-            pos += block_hdr.compressed_size;
-            continue;
-        }
-
-        // Grow the output budget check before decoding.
-        if (dict_bytes + block_hdr.decompressed_size + safe_space > window_buf.len) return error.OutputTooSmall;
-
-        if (block_hdr.uncompressed) {
-            if (pos + block_hdr.decompressed_size > src.len) return error.BlockDataTruncated;
-            @memcpy(
-                window_buf[dict_bytes..][0..block_hdr.decompressed_size],
-                src[pos..][0..block_hdr.decompressed_size],
-            );
-            pos += block_hdr.compressed_size;
-        } else {
-            if (pos + block_hdr.compressed_size > src.len) return error.BlockDataTruncated;
-            const n = try decompressBlockWithDict(
-                src[pos .. pos + block_hdr.compressed_size],
-                window_buf,
-                dict_bytes,
-                block_hdr.decompressed_size,
-                dec_ctx,
-            );
-            if (n != block_hdr.decompressed_size) return error.SizeMismatch;
-            pos += block_hdr.compressed_size;
-        }
-
-        const decoded = window_buf[dict_bytes..][0..block_hdr.decompressed_size];
-
-        // Hash before writing so a later flush failure doesn't corrupt state.
-        if (hasher) |*h| h.update(decoded);
-
-        writer.writeAll(decoded) catch return error.OutputTooSmall;
-        total_written += block_hdr.decompressed_size;
-
-        if (opts.max_decompressed_size != 0 and total_written > opts.max_decompressed_size) {
-            return error.OutputTooSmall;
-        }
-
-        // Slide the window: keep the last `window_size` bytes so the next
-        // block's LZ back-references can still reach them.
-        const total_used: usize = dict_bytes + block_hdr.decompressed_size;
-        if (total_used > window_size) {
-            const keep: usize = window_size;
-            const discard: usize = total_used - keep;
-            std.mem.copyForwards(u8, window_buf[0..keep], window_buf[discard .. discard + keep]);
-            dict_bytes = keep;
-        } else {
-            dict_bytes = total_used;
-        }
-    }
-
-    // Optional XXH32 content checksum verification (4 bytes after the end mark).
-    if (hasher) |*h| {
-        if (pos + 4 > src.len) return error.ChecksumMismatch;
-        const stored = std.mem.readInt(u32, src[pos..][0..4], .little);
-        const computed = h.final();
-        if (stored != computed) return error.ChecksumMismatch;
-    }
-
-    return total_written;
-}
-
-/// Decompresses a raw StreamLZ block (no SLZ1 frame wrapper) into `dst[0..decompressed_size]`.
-///
-/// `src` is a raw compressed block -- a
-/// sequence of internal 2-byte block headers + 4-byte chunk headers +
-/// chunk payloads (no frame header, no end mark). `dst.len` must be at
-/// least `decompressed_size + safe_space`.
-///
-/// Returns the number of bytes decompressed (equal to `decompressed_size`
-/// on success).
-pub fn decompressBlock(
-    src: []const u8,
-    dst: []u8,
-    decompressed_size: usize,
-    dec_ctx: *gpu_driver.DecodeContext,
-) DecompressError!usize {
-    return decompressBlockWithDict(src, dst, 0, decompressed_size, dec_ctx);
-}
-
-/// Decompresses a raw StreamLZ block into `dst[dst_offset..dst_offset + decompressed_size]`,
-/// with `dst[0..dst_offset]` treated as a pre-populated dictionary window.
-///
-/// LZ back-references in the compressed
-/// stream can reach into the dictionary bytes at `dst[0..dst_offset]`.
-///
-/// `dst.len` must be at least `dst_offset + decompressed_size + safe_space`.
-/// Returns the number of bytes decompressed (NOT including the dictionary).
-pub fn decompressBlockWithDict(
-    src: []const u8,
-    dst: []u8,
-    dst_offset: usize,
-    decompressed_size: usize,
-    dec_ctx: *gpu_driver.DecodeContext,
-) DecompressError!usize {
-    if (decompressed_size == 0) return 0;
-    if (dst_offset + decompressed_size + safe_space > dst.len) return error.OutputTooSmall;
-
-    var scratch: [constants.scratch_size]u8 = undefined;
-    var dst_off: usize = dst_offset;
-    // Block-level APIs have no frame-header context, so we use the
-    // v2 default sc_group_size. Streaming / framed callers should
-    // instead use `decompressFramed` / `decompressStream` so the
-    // header-declared sc_group_size flows through.
-    // Block-level API has no CLI -gpu plumbing; default to GPU when
-    // the binary supports it (mirrors pre-flag behavior).
-    try decompressCompressedBlock(src, dst, &dst_off, decompressed_size, &scratch, @as(f32, @floatFromInt(constants.default_sc_group_size)), 0, dec_ctx, true);
-    return dst_off - dst_offset;
-}
-
-/// Walks 256 KB chunks inside a single compressed frame block. Parses the
-/// internal 2-byte block header at every 256 KB boundary and the 4-byte
-/// chunk header before each chunk's payload, dispatching to the codec.
-///
-/// **Self-contained (L6–L8) handling:** when the first internal block
-/// header has `self_contained` set, the encoder stores `(num_chunks-1)*8`
-/// "delta prefix" bytes at the very end of the block payload. After the
-/// main decode, the first 8 bytes of every chunk except chunk 0 are
-/// overwritten with those tail bytes. The parallel SC decode path
-/// forms per-group dst_start boundaries; our serial equivalent just
-/// decodes sequentially with a buffer-wide dst_start (which is safe
-/// because a well-formed encoder emits no cross-group references
-/// beyond what the tail-prefix restoration then overwrites).
-fn decompressCompressedBlock(
-    block_src_in: []const u8,
-    dst: []u8,
-    dst_off_inout: *usize,
-    decompressed_size: usize,
-    scratch: []u8,
-    sc_group_size: f32,
-    frame_level: u8,
-    dec_ctx: *gpu_driver.DecodeContext,
-    /// Per-call runtime gate on the GPU dispatch path. See
-    /// decompressOneFrame's same-named param for the full rationale.
-    use_gpu: bool,
-) DecompressError!void {
-    _ = frame_level;
-    // Peek the first 2-byte internal block header to detect SC mode up-front.
-    const is_sc = blk: {
-        if (block_src_in.len < 2) break :blk false;
-        const peek = block_header.parseBlockHeader(block_src_in) catch break :blk false;
-        break :blk peek.self_contained;
-    };
-    const eff_cs = @min(frame.scGroupSizeToBytes(sc_group_size), constants.chunk_size);
-    const num_chunks: usize = if (is_sc)
-        (decompressed_size + eff_cs - 1) / eff_cs
-    else
-        0;
-    const prefix_size: usize = if (is_sc and num_chunks > 1) (num_chunks - 1) * 8 else 0;
-    if (prefix_size > block_src_in.len) return error.Truncated;
-    const block_src: []const u8 = block_src_in[0 .. block_src_in.len - prefix_size];
-    const sc_start_dst_off: usize = dst_off_inout.*;
-    // Index of the chunk within this frame block (0-based). Used to compute
-    // the group-local dst_start for SC mode so each group's first chunk
-    // decodes with base_offset == 0 and fires the initial 8-byte Copy64.
-    var chunk_idx_in_block: usize = 0;
-
-    // GPU batch path — only for per-chunk independent data (sc_group <= 1)
-    // Cross-chunk off32 references can't be resolved in parallel GPU decode.
-    // tANS literal/token streams are pre-decoded by the tANS kernel (Pass 1).
-    // Entropy-coded off16 streams are decoded on the CPU and uploaded.
-    if (gpu_compiled_in and use_gpu and sc_group_size <= 1.0) gpu_batch: {
-        const gpu = @import("../gpu/decode/driver.zig");
-        if (!gpu.isAvailable()) break :gpu_batch;
-        gpuBatchDecode(block_src, dst, sc_start_dst_off, decompressed_size, sc_group_size, scratch, null, dec_ctx, null) catch {
-            break :gpu_batch;
-        };
-        dst_off_inout.* = sc_start_dst_off + decompressed_size;
-        // Fall through to tail prefix restoration below.
-        // Skip the serial chunk loop.
-        if (prefix_size != 0) {
-            const prefix_base: [*]const u8 = block_src_in[block_src_in.len - prefix_size ..].ptr;
-            var i: usize = 0;
-            while (i + 1 < num_chunks) : (i += 1) {
-                const eff_cs_tail = @min(frame.scGroupSizeToBytes(sc_group_size), constants.chunk_size);
-                const chunk_dst_off: usize = sc_start_dst_off + (i + 1) * eff_cs_tail;
-                var copy_size: usize = 8;
-                const remaining_in_chunk: usize = decompressed_size - (i + 1) * eff_cs_tail;
-                if (copy_size > remaining_in_chunk) copy_size = remaining_in_chunk;
-                @memcpy(dst[chunk_dst_off..][0..copy_size], prefix_base[i * 8 ..][0..copy_size]);
-            }
-        }
-        return;
-    }
-
-    var src_pos: usize = 0;
-    var dst_remaining: usize = decompressed_size;
-    var internal_hdr: ?block_header.BlockHeader = null;
-
-    while (dst_remaining > 0) {
-        const dst_off = dst_off_inout.*;
-        const eff_chunk_size = @min(frame.scGroupSizeToBytes(sc_group_size), constants.chunk_size);
-        const at_chunk_boundary = ((dst_off - sc_start_dst_off) % eff_chunk_size) == 0;
-
-        if (at_chunk_boundary or internal_hdr == null) {
-            if (src_pos + 2 > block_src.len) return error.Truncated;
-            internal_hdr = block_header.parseBlockHeader(block_src[src_pos..]) catch return error.InvalidInternalHeader;
-            src_pos += 2;
-        }
-        const hdr = internal_hdr.?;
-
-        const sc_group_bytes: usize = frame.scGroupSizeToBytes(sc_group_size);
-        var dst_this_chunk: usize = @min(sc_group_bytes, constants.chunk_size);
-        if (dst_this_chunk > dst_remaining) dst_this_chunk = dst_remaining;
-
-        // ── Uncompressed chunk (header says so) — raw copy ──
-        if (hdr.uncompressed) {
-            if (src_pos + dst_this_chunk > block_src.len) return error.Truncated;
-            if (dst_off + dst_this_chunk > dst.len) return error.OutputTooSmall;
-            @memcpy(dst[dst_off..][0..dst_this_chunk], block_src[src_pos..][0..dst_this_chunk]);
-            dst_off_inout.* += dst_this_chunk;
-            dst_remaining -= dst_this_chunk;
-            src_pos += dst_this_chunk;
-            continue;
-        }
-
-        // ── Parse 4-byte chunk header ──
-        const ch = block_header.parseChunkHeader(block_src[src_pos..], hdr.use_checksums) catch {
-            return error.BadChunkHeader;
-        };
-        src_pos += ch.bytes_consumed;
-
-        if (ch.is_memset) {
-            // When compressed_size == 0, prefer
-            // whole-match over memset if whole_match_distance is set.
-            // `ParseChunkHeader` on both sides never populates this field,
-            // so the branch is unreachable in practice — keeping it for
-            //
-            if (ch.whole_match_distance != 0) {
-                if (ch.whole_match_distance > dst_off) return error.BadChunkHeader;
-                if (dst_off + dst_this_chunk > dst.len) return error.OutputTooSmall;
-                copyWholeMatch(
-                    dst[dst_off..].ptr,
-                    ch.whole_match_distance,
-                    dst_this_chunk,
-                );
-            } else {
-                if (dst_off + dst_this_chunk > dst.len) return error.OutputTooSmall;
-                @memset(dst[dst_off..][0..dst_this_chunk], ch.memset_fill);
-            }
-            dst_off_inout.* += dst_this_chunk;
-            dst_remaining -= dst_this_chunk;
-            continue;
-        }
-
-        const comp_size: usize = ch.compressed_size;
-        if (src_pos + comp_size > block_src.len) return error.Truncated;
-        if (comp_size > dst_this_chunk) {
-            return error.BadChunkHeader;
-        }
-
-        if (comp_size == dst_this_chunk) {
-            // Stored raw within a "compressed" flag block.
-            if (dst_off + dst_this_chunk > dst.len) return error.OutputTooSmall;
-            @memcpy(dst[dst_off..][0..dst_this_chunk], block_src[src_pos..][0..dst_this_chunk]);
-            dst_off_inout.* += dst_this_chunk;
-            dst_remaining -= dst_this_chunk;
-            src_pos += comp_size;
-            continue;
-        }
-
-        // Dispatch to codec decoder.
-        switch (hdr.decoder_type) {
-            .fast, .turbo => {
-                if (dst_off + dst_this_chunk + safe_space > dst.len) return error.OutputTooSmall;
-                const src_slice_start: [*]const u8 = block_src[src_pos..].ptr;
-                const src_slice_end: [*]const u8 = src_slice_start + comp_size;
-                const dst_ptr: [*]u8 = dst[dst_off..].ptr;
-                const dst_end_ptr: [*]u8 = dst_ptr + dst_this_chunk;
-                const scratch_ptr: [*]u8 = scratch.ptr;
-                const scratch_end_ptr: [*]u8 = scratch.ptr + scratch.len;
-
-                const dst_start_ptr: [*]const u8 = if (is_sc) blk: {
-                    const gs: usize = if (sc_group_size >= 1.0) @max(1, @as(usize, @intFromFloat(sc_group_size))) else 1;
-                    const group_start_chunk = (chunk_idx_in_block / gs) * gs;
-                    const group_start_offset = sc_start_dst_off + group_start_chunk * eff_chunk_size;
-                    break :blk dst[group_start_offset..].ptr;
-                } else dst.ptr;
-
-                const eff_sc_sub = constants.sub_chunk_size;
-                const n = try fast.decodeChunkWithSubSize(
-                    dst_ptr,
-                    dst_end_ptr,
-                    dst_start_ptr,
-                    src_slice_start,
-                    src_slice_end,
-                    scratch_ptr,
-                    scratch_end_ptr,
-                    eff_sc_sub,
-                );
-                if (n != comp_size) return error.SizeMismatch;
-            },
-            .high => {
-                if (dst_off + dst_this_chunk + safe_space > dst.len) return error.OutputTooSmall;
-                const src_slice_start: [*]const u8 = block_src[src_pos..].ptr;
-                const src_slice_end: [*]const u8 = src_slice_start + comp_size;
-                const dst_ptr: [*]u8 = dst[dst_off..].ptr;
-                const dst_end_ptr: [*]u8 = dst_ptr + dst_this_chunk;
-                const scratch_ptr: [*]u8 = scratch.ptr;
-                const scratch_end_ptr: [*]u8 = scratch.ptr + scratch.len;
-
-                const n = if (is_sc) blk: {
-                    const gs: usize = if (sc_group_size >= 1.0) @max(1, @as(usize, @intFromFloat(sc_group_size))) else 1;
-                    const group_start_chunk = (chunk_idx_in_block / gs) * gs;
-                    const group_start_offset = sc_start_dst_off + group_start_chunk * eff_chunk_size;
-                    break :blk try high.decodeChunkSc(
-                        dst_ptr,
-                        dst_end_ptr,
-                        dst[group_start_offset..].ptr,
-                        dst.ptr,
-                        src_slice_start,
-                        src_slice_end,
-                        scratch_ptr,
-                        scratch_end_ptr,
-                    );
-                } else try high.decodeChunk(
-                    dst_ptr,
-                    dst_end_ptr,
-                    dst.ptr,
-                    src_slice_start,
-                    src_slice_end,
-                    scratch_ptr,
-                    scratch_end_ptr,
-                );
-                if (n != comp_size) return error.SizeMismatch;
-            },
-            else => return error.InvalidInternalHeader,
-        }
-
-        dst_off_inout.* += dst_this_chunk;
-        dst_remaining -= dst_this_chunk;
-        src_pos += comp_size;
-        chunk_idx_in_block += 1;
-    }
-
-    // Any trailing source bytes in the frame block are a corruption signal.
-    if (src_pos != block_src.len) return error.SizeMismatch;
-
-    // SC: restore the first 8 bytes of each chunk (except chunk 0) from the
-    // tail prefix table that we excluded from `block_src` above.
-    if (prefix_size != 0) {
-        const prefix_base: [*]const u8 = block_src_in[block_src_in.len - prefix_size ..].ptr;
-        var i: usize = 0;
-        while (i + 1 < num_chunks) : (i += 1) {
-            const chunk_dst_off: usize = sc_start_dst_off + (i + 1) * eff_cs;
-            var copy_size: usize = 8;
-            const remaining_in_chunk: usize = decompressed_size - (i + 1) * eff_cs;
-            if (copy_size > remaining_in_chunk) copy_size = remaining_in_chunk;
-            @memcpy(
-                dst[chunk_dst_off..][0..copy_size],
-                prefix_base[i * 8 ..][0..copy_size],
-            );
-        }
-    }
-}
-
-// ────────────────────────────────────────────────────────────
-//  GPU batch decode orchestration
-// ────────────────────────────────────────────────────────────
-
-fn gpuBatchDecode(
+fn dispatchCompressedBlock(
     block_src: []const u8,
     dst: []u8,
     dst_start_off: usize,
     decompressed_size: usize,
-    sc_group_size_in: f32,
-    scratch: []u8,
-    io_opt: ?std.Io,
+    sc_group_size: f32,
     dec_ctx: *gpu_driver.DecodeContext,
-    /// 4d Phase 3: when non-null, the decoder D2D-copies the decoded
-    /// bytes to `d_output_target + dst_start_off` instead of D2H-copying
-    /// to `dst + dst_start_off` — `dst` is then unused for the payload.
     d_output_target: ?u64,
+    io: ?std.Io,
 ) DecompressError!void {
-    _ = scratch;
-    const gpu = @import("../gpu/decode/driver.zig");
-    const alloc = std.heap.page_allocator;
+    const eff_chunk_size = @min(frame.scGroupSizeToBytes(sc_group_size), constants.chunk_size);
+    const num_chunks = (decompressed_size + eff_chunk_size - 1) / eff_chunk_size;
+    if (num_chunks == 0) return;
+    // Strip the SC tail prefix bytes before parsing chunks — they sit
+    // after the last chunk and are not part of any chunk's payload.
+    if (block_src.len < 2) return error.Truncated;
+    const peek = block_header.parseBlockHeader(block_src) catch return error.InvalidInternalHeader;
+    const is_fast = peek.decoder_type == .fast or peek.decoder_type == .turbo;
+    if (!is_fast) return error.InvalidInternalHeader;
+    const prefix_sz: usize = if (peek.self_contained and num_chunks > 1) (num_chunks - 1) * 8 else 0;
+    if (prefix_sz >= block_src.len) return error.Truncated;
+    const block_payload = block_src[0 .. block_src.len - prefix_sz];
 
-    const eff_chunk_sz = @min(frame.scGroupSizeToBytes(sc_group_size_in), constants.chunk_size);
-    const num_chunks = (decompressed_size + eff_chunk_sz - 1) / eff_chunk_sz;
+    const sc_grp_chunks: usize = if (sc_group_size >= 1.0)
+        @max(1, @as(usize, @intFromFloat(sc_group_size)))
+    else
+        1;
+    const chunks_per_group: u32 = if (peek.self_contained and sc_grp_chunks < num_chunks)
+        @intCast(sc_grp_chunks)
+    else
+        @intCast(num_chunks);
 
-    // For SC blocks, use the SC group size (chunks are independent across groups).
-    // For non-SC blocks, all chunks must be in one group (cross-chunk dependencies).
-    const block_is_sc = blk: {
-        if (block_src.len < 2) break :blk false;
-        const peek = block_header.parseBlockHeader(block_src) catch break :blk false;
-        break :blk peek.self_contained;
-    };
-    // Group size in chunks (rounded up to 1 minimum). For sc_group < 1.0,
-    // each chunk is its own group (fractional means sub-chunk-level SC).
-    const sc_grp_chunks: usize = if (sc_group_size_in >= 1.0) @max(1, @as(usize, @intFromFloat(sc_group_size_in))) else 1;
-    const effective_group_size = if (block_is_sc and sc_grp_chunks < num_chunks) sc_grp_chunks else num_chunks;
-    const chunks_per_group: u32 = @intCast(effective_group_size);
-
-    var chunk_descs = alloc.alloc(gpu.ChunkDesc, num_chunks) catch return error.OutOfMemory;
-    defer alloc.free(chunk_descs);
+    var chunk_descs_buf: [gpu_driver.WALK_MAX_CHUNKS]gpu_driver.ChunkDesc = undefined;
+    if (num_chunks > chunk_descs_buf.len) return error.BadFrame;
+    const chunk_descs = chunk_descs_buf[0..num_chunks];
     @memset(std.mem.sliceAsBytes(chunk_descs), 0);
 
-    var src_pos: usize = 0;
-    var dst_remaining: usize = decompressed_size;
-    var internal_hdr: ?block_header.BlockHeader = null;
-    var chunk_idx: usize = 0;
-    var dst_off: usize = dst_start_off;
+    try buildChunkDescriptors(
+        block_payload,
+        chunk_descs,
+        eff_chunk_size,
+        decompressed_size,
+        dst_start_off,
+    );
 
-    while (dst_remaining > 0) {
-        const eff_chunk_size_gpu = @min(frame.scGroupSizeToBytes(sc_group_size_in), constants.chunk_size);
-        const at_chunk_boundary = ((dst_off - dst_start_off) % eff_chunk_size_gpu) == 0;
-        if (at_chunk_boundary or internal_hdr == null) {
-            if (src_pos + 2 > block_src.len) return error.Truncated;
-            internal_hdr = block_header.parseBlockHeader(block_src[src_pos..]) catch return error.InvalidInternalHeader;
-            src_pos += 2;
-        }
-        const hdr = internal_hdr.?;
-        const sc_group_bytes_gpu: usize = frame.scGroupSizeToBytes(sc_group_size_in);
-        var dst_this_chunk: usize = @min(sc_group_bytes_gpu, constants.chunk_size);
-        if (dst_this_chunk > dst_remaining) dst_this_chunk = dst_remaining;
-
-        if (hdr.uncompressed) {
-            chunk_descs[chunk_idx] = .{
-                .src_offset = @intCast(src_pos),
-                .comp_size = @intCast(dst_this_chunk),
-                .decomp_size = @intCast(dst_this_chunk),
-                .dst_offset = @intCast(dst_off),
-                .flags = 1,
-                .memset_fill = 0,
-            };
-            dst_off += dst_this_chunk;
-            dst_remaining -= dst_this_chunk;
-            src_pos += dst_this_chunk;
-            chunk_idx += 1;
-            continue;
-        }
-
-        const ch = block_header.parseChunkHeader(block_src[src_pos..], hdr.use_checksums) catch return error.BadChunkHeader;
-        src_pos += ch.bytes_consumed;
-        const comp_size = ch.compressed_size;
-
-        if (ch.is_memset) {
-            chunk_descs[chunk_idx] = .{
-                .src_offset = 0,
-                .comp_size = 0,
-                .decomp_size = @intCast(dst_this_chunk),
-                .dst_offset = @intCast(dst_off),
-                .flags = 2,
-                .memset_fill = ch.memset_fill,
-            };
-            dst_off += dst_this_chunk;
-            dst_remaining -= dst_this_chunk;
-            chunk_idx += 1;
-            continue;
-        }
-
-        if (src_pos + comp_size > block_src.len) return error.Truncated;
-
-        if (comp_size == dst_this_chunk) {
-            chunk_descs[chunk_idx] = .{
-                .src_offset = @intCast(src_pos),
-                .comp_size = @intCast(comp_size),
-                .decomp_size = @intCast(dst_this_chunk),
-                .dst_offset = @intCast(dst_off),
-                .flags = 1,
-                .memset_fill = 0,
-            };
-            dst_off += dst_this_chunk;
-            dst_remaining -= dst_this_chunk;
-            src_pos += comp_size;
-            chunk_idx += 1;
-            continue;
-        }
-
-        if (hdr.decoder_type != .fast and hdr.decoder_type != .turbo) return error.InvalidInternalHeader;
-
-        chunk_descs[chunk_idx] = .{
-            .src_offset = @intCast(src_pos),
-            .comp_size = @intCast(comp_size),
-            .decomp_size = @intCast(dst_this_chunk),
-            .dst_offset = @intCast(dst_off),
-            .flags = 0,
-            .memset_fill = 0,
-        };
-
-        dst_off += dst_this_chunk;
-        dst_remaining -= dst_this_chunk;
-        src_pos += comp_size;
-        chunk_idx += 1;
-    }
-
-    const eff_sc_cap: u32 = @intCast(constants.sub_chunk_size);
-    try gpu.fullGpuLaunchImpl(dec_ctx, .{
-        .chunk_descs = chunk_descs[0..chunk_idx],
-        .compressed_block = block_src,
+    try gpu_driver.fullGpuLaunchImpl(dec_ctx, .{
+        .chunk_descs = chunk_descs,
+        .compressed_block = block_payload,
         .dst_full = dst.ptr,
         .dst_start_off = dst_start_off,
         .decompressed_size = decompressed_size,
         .chunks_per_group = chunks_per_group,
-        .sub_chunk_cap = eff_sc_cap,
-        .io = io_opt,
+        .sub_chunk_cap = @intCast(constants.sub_chunk_size),
+        .io = io,
         .d_output_target = d_output_target,
-        .d_compressed_src = null, // legacy path: source is host
+        .d_compressed_src = null,
     });
 }
 
-// ────────────────────────────────────────────────────────────
-//  Vulkan batch decode (mirrors gpuBatchDecode for Vulkan path)
-// ────────────────────────────────────────────────────────────
-
-fn vkBatchDecode(
-    block_src: []const u8,
-    dst: []u8,
-    dst_start_off: usize,
+/// Walk the internal block to fill `chunk_descs` (one entry per chunk).
+/// Sets flags=2 for memset chunks, flags=1 for "whole match equals chunk"
+/// shortcuts, and flags=0 for LZ-compressed chunks. The GPU decoder reads
+/// these flags to pick its per-chunk fast path.
+fn buildChunkDescriptors(
+    block_payload: []const u8,
+    chunk_descs: []gpu_driver.ChunkDesc,
+    eff_chunk_size: usize,
     decompressed_size: usize,
-    sc_group_size_in: f32,
-    scratch: []u8,
-    io_opt: ?std.Io,
+    dst_start_off: usize,
 ) DecompressError!void {
-    _ = scratch;
-    const vk = @import("../gpu/decode/vulkan_driver.zig");
-    const alloc = std.heap.page_allocator;
-
-    const eff_chunk_sz = @min(frame.scGroupSizeToBytes(sc_group_size_in), constants.chunk_size);
-    const num_chunks = (decompressed_size + eff_chunk_sz - 1) / eff_chunk_sz;
-
-    const block_is_sc = blk: {
-        if (block_src.len < 2) break :blk false;
-        const peek = block_header.parseBlockHeader(block_src) catch break :blk false;
-        break :blk peek.self_contained;
-    };
-    const sc_grp_chunks: usize = if (sc_group_size_in >= 1.0) @max(1, @as(usize, @intFromFloat(sc_group_size_in))) else 1;
-    const effective_group_size = if (block_is_sc and sc_grp_chunks < num_chunks) sc_grp_chunks else num_chunks;
-    const num_groups: u32 = @intCast((num_chunks + effective_group_size - 1) / effective_group_size);
-    const chunks_per_group: u32 = @intCast(effective_group_size);
-
-    var chunk_descs = alloc.alloc(vk.ChunkDesc, num_chunks) catch return error.OutOfMemory;
-    defer alloc.free(chunk_descs);
-    @memset(std.mem.sliceAsBytes(chunk_descs), 0);
-
     var src_pos: usize = 0;
     var dst_remaining: usize = decompressed_size;
     var internal_hdr: ?block_header.BlockHeader = null;
     var chunk_idx: usize = 0;
     var dst_off: usize = dst_start_off;
 
-    while (dst_remaining > 0) {
-        const eff_chunk_size_vk = @min(frame.scGroupSizeToBytes(sc_group_size_in), constants.chunk_size);
-        const at_chunk_boundary = ((dst_off - dst_start_off) % eff_chunk_size_vk) == 0;
+    while (dst_remaining > 0 and chunk_idx < chunk_descs.len) {
+        const at_chunk_boundary = ((dst_off - dst_start_off) % eff_chunk_size) == 0;
         if (at_chunk_boundary or internal_hdr == null) {
-            if (src_pos + 2 > block_src.len) return error.Truncated;
-            internal_hdr = block_header.parseBlockHeader(block_src[src_pos..]) catch return error.InvalidInternalHeader;
+            if (src_pos + 2 > block_payload.len) return error.Truncated;
+            internal_hdr = block_header.parseBlockHeader(block_payload[src_pos..]) catch
+                return error.InvalidInternalHeader;
             src_pos += 2;
         }
         const hdr = internal_hdr.?;
-        const sc_group_bytes_vk: usize = frame.scGroupSizeToBytes(sc_group_size_in);
-        var dst_this_chunk: usize = @min(sc_group_bytes_vk, constants.chunk_size);
+
+        var dst_this_chunk: usize = @min(eff_chunk_size, constants.chunk_size);
         if (dst_this_chunk > dst_remaining) dst_this_chunk = dst_remaining;
 
         if (hdr.uncompressed) {
@@ -1272,9 +371,9 @@ fn vkBatchDecode(
             continue;
         }
 
-        const ch = block_header.parseChunkHeader(block_src[src_pos..], hdr.use_checksums) catch return error.BadChunkHeader;
+        const ch = block_header.parseChunkHeader(block_payload[src_pos..], hdr.use_checksums) catch
+            return error.BadChunkHeader;
         src_pos += ch.bytes_consumed;
-        const comp_size = ch.compressed_size;
 
         if (ch.is_memset) {
             chunk_descs[chunk_idx] = .{
@@ -1291,12 +390,15 @@ fn vkBatchDecode(
             continue;
         }
 
-        if (src_pos + comp_size > block_src.len) return error.Truncated;
+        if (src_pos + ch.compressed_size > block_payload.len) return error.Truncated;
 
-        if (comp_size == dst_this_chunk) {
+        // Whole-chunk shortcut: comp_size == decomp_size means the chunk
+        // is raw bytes verbatim (no LZ tokens). The GPU decoder copies
+        // src to dst directly.
+        if (ch.compressed_size == dst_this_chunk) {
             chunk_descs[chunk_idx] = .{
                 .src_offset = @intCast(src_pos),
-                .comp_size = @intCast(comp_size),
+                .comp_size = @intCast(ch.compressed_size),
                 .decomp_size = @intCast(dst_this_chunk),
                 .dst_offset = @intCast(dst_off),
                 .flags = 1,
@@ -1304,308 +406,22 @@ fn vkBatchDecode(
             };
             dst_off += dst_this_chunk;
             dst_remaining -= dst_this_chunk;
-            src_pos += comp_size;
+            src_pos += ch.compressed_size;
             chunk_idx += 1;
             continue;
         }
 
-        if (hdr.decoder_type != .fast and hdr.decoder_type != .turbo) return error.InvalidInternalHeader;
-
         chunk_descs[chunk_idx] = .{
             .src_offset = @intCast(src_pos),
-            .comp_size = @intCast(comp_size),
+            .comp_size = @intCast(ch.compressed_size),
             .decomp_size = @intCast(dst_this_chunk),
             .dst_offset = @intCast(dst_off),
             .flags = 0,
             .memset_fill = 0,
         };
-
         dst_off += dst_this_chunk;
         dst_remaining -= dst_this_chunk;
-        src_pos += comp_size;
+        src_pos += ch.compressed_size;
         chunk_idx += 1;
     }
-
-    const eff_sc_cap: u32 = @intCast(constants.sub_chunk_size);
-    try vk.fullVkLaunch(
-        chunk_descs[0..chunk_idx],
-        block_src,
-        dst.ptr,
-        dst_start_off,
-        decompressed_size,
-        num_groups,
-        chunks_per_group,
-        eff_sc_cap,
-        io_opt,
-    );
-}
-
-// ────────────────────────────────────────────────────────────
-//  Tests
-// ────────────────────────────────────────────────────────────
-
-const testing = std.testing;
-
-test "decompressFramed roundtrips a tiny uncompressed L1 fixture (synthesized)" {
-    const payload = "Hello, world\n";
-    const content_size: u64 = payload.len;
-
-    var buf: [256]u8 = undefined;
-    const hdr_len = try frame.writeHeader(&buf, .{
-        .codec = .fast,
-        .level = 1,
-        .content_size = content_size,
-    });
-
-    frame.writeBlockHeader(buf[hdr_len..], .{
-        .compressed_size = payload.len,
-        .decompressed_size = payload.len,
-        .uncompressed = true,
-        .parallel_decode_metadata = false,
-    });
-    @memcpy(buf[hdr_len + 8 ..][0..payload.len], payload);
-    frame.writeEndMark(buf[hdr_len + 8 + payload.len ..]);
-    const total_len = hdr_len + 8 + payload.len + 4;
-
-    var out: [256]u8 = @splat(0);
-    const written = try decompressFramed(buf[0..total_len], out[0..], &gpu_driver.g_default);
-    try testing.expectEqual(@as(usize, payload.len), written);
-    try testing.expectEqualSlices(u8, payload, out[0..written]);
-}
-
-test "decompressFramed rejects bad magic" {
-    const junk = [_]u8{ 'N', 'O', 'P', 'E', 1, 0, 0, 1, 2, 0 };
-    var out: [32]u8 = undefined;
-    try testing.expectError(error.BadFrame, decompressFramed(&junk, &out, &gpu_driver.g_default));
-}
-
-test "decompressBlock roundtrips a raw compressed block (no frame wrapper)" {
-    // Build a highly compressible payload (repeating pattern) large enough
-    // to clear min_source_length (128) and always trigger the compressed path.
-    var payload: [1024]u8 = undefined;
-    const pat = "The quick brown fox jumps. ";
-    for (&payload, 0..) |*b, i| b.* = pat[i % pat.len];
-
-    const allocator = testing.allocator;
-    const encoder = @import("../encode/streamlz_encoder.zig");
-    const gpu_encoder = @import("../gpu/encode/driver.zig");
-
-    // Compress via the framed API, then strip the SLZ1 frame header + 8-byte
-    // outer block header to get the raw inner compressed block that
-    // `decompressBlock` expects.
-    var framed: [2048]u8 = undefined;
-    const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 }, &gpu_encoder.g_default);
-
-    const hdr = try frame.parseHeader(framed[0..framed_len]);
-    const block_hdr = try frame.parseBlockHeader(framed[hdr.header_size..]);
-    if (block_hdr.uncompressed) {
-        // Uncompressed path: the raw payload bytes follow the outer block
-        // header directly; verify the frame roundtrips correctly.
-        const raw_start = hdr.header_size + 8;
-        try testing.expectEqualSlices(u8, &payload, framed[raw_start .. raw_start + payload.len]);
-        return;
-    }
-    const inner_start = hdr.header_size + 8;
-    const inner = framed[inner_start .. inner_start + block_hdr.compressed_size];
-
-    var out: [2048]u8 = @splat(0);
-    const written = try decompressBlock(inner, &out, payload.len, &gpu_driver.g_default);
-    try testing.expectEqual(payload.len, written);
-    try testing.expectEqualSlices(u8, &payload, out[0..payload.len]);
-}
-
-test "decompressBlockWithDict writes output at dst_offset for an uncompressed block" {
-    // Hand-craft a minimal uncompressed internal block:
-    //   byte 0: magic 0x5 | uncompressed flag 0x80
-    //   byte 1: decoder type 0x01 (fast)
-    //   bytes 2..N: raw payload
-    // No SLZ1 frame wrapper, no outer 8-byte block header — exactly what
-    // `decompressBlock` expects as input.
-    //
-    // The uncompressed path doesn't depend on `base_offset == 0` for an
-    // initial Copy64, so it exercises the dst_offset plumbing cleanly. The
-    // compressed path needs encoder-side dictionary support (D11) to test
-    // end-to-end with dst_offset != 0.
-    const payload_len: usize = 64;
-    var block: [2 + payload_len]u8 = undefined;
-    block[0] = 0x05 | 0x80; // magic nibble + uncompressed flag
-    block[1] = 0x01; // decoder = fast
-    for (block[2..], 0..) |*b, i| b.* = @intCast(i);
-
-    const dict_len: usize = 100;
-    var out: [256]u8 = @splat(0xAA);
-    const written = try decompressBlockWithDict(&block, &out, dict_len, payload_len, &gpu_driver.g_default);
-    try testing.expectEqual(payload_len, written);
-    // Dictionary prefix untouched.
-    for (out[0..dict_len]) |b| try testing.expectEqual(@as(u8, 0xAA), b);
-    // Decoded bytes land at dst[dict_len..dict_len + payload_len].
-    for (out[dict_len .. dict_len + payload_len], 0..) |b, i| {
-        try testing.expectEqual(@as(u8, @intCast(i)), b);
-    }
-    // Post-output trailing bytes untouched (except safe_space slack).
-    for (out[dict_len + payload_len + safe_space ..]) |b| {
-        try testing.expectEqual(@as(u8, 0xAA), b);
-    }
-}
-
-test "decompressBlockWithDict matches decompressBlock when dst_offset == 0" {
-    // Equivalence check: `decompressBlockWithDict(..., 0, ...)` must produce
-    // identical output to `decompressBlock(..., ...)` on the same input.
-    // Use a highly compressible payload to ensure the compressed path is taken.
-    var payload: [1024]u8 = undefined;
-    const pat = "ABCDEFGHIJKLMNOP";
-    for (&payload, 0..) |*b, i| b.* = pat[i % pat.len];
-
-    const allocator = testing.allocator;
-    const encoder = @import("../encode/streamlz_encoder.zig");
-    const gpu_encoder = @import("../gpu/encode/driver.zig");
-
-    var framed: [2048]u8 = undefined;
-    const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 }, &gpu_encoder.g_default);
-
-    const hdr = try frame.parseHeader(framed[0..framed_len]);
-    const block_hdr = try frame.parseBlockHeader(framed[hdr.header_size..]);
-    if (block_hdr.uncompressed) {
-        // Even on the uncompressed path, verify roundtrip via the frame.
-        const raw_start = hdr.header_size + 8;
-        try testing.expectEqualSlices(u8, &payload, framed[raw_start .. raw_start + payload.len]);
-        return;
-    }
-    const inner_start = hdr.header_size + 8;
-    const inner = framed[inner_start .. inner_start + block_hdr.compressed_size];
-
-    var out_a: [2048]u8 = @splat(0);
-    var out_b: [2048]u8 = @splat(0);
-    const n_a = try decompressBlock(inner, &out_a, payload.len, &gpu_driver.g_default);
-    const n_b = try decompressBlockWithDict(inner, &out_b, 0, payload.len, &gpu_driver.g_default);
-    try testing.expectEqual(n_a, n_b);
-    try testing.expectEqualSlices(u8, out_a[0..n_a], out_b[0..n_b]);
-    try testing.expectEqualSlices(u8, &payload, out_a[0..payload.len]);
-}
-
-test "decompressBlock rejects undersized output buffer" {
-    const dummy_src = [_]u8{ 0x05, 0x01, 0x00, 0x00, 0x00, 0x00 };
-    var out: [16]u8 = undefined;
-    try testing.expectError(error.OutputTooSmall, decompressBlock(&dummy_src, &out, 1024, &gpu_driver.g_default));
-}
-
-test "decompressStream roundtrips a compressed frame into a Writer" {
-    var payload: [1024]u8 = undefined;
-    for (&payload, 0..) |*b, i| b.* = @intCast((i * 23 + 11) & 0xFF);
-    @memcpy(payload[200..264], payload[0..64]);
-    @memcpy(payload[500..564], payload[0..64]);
-    @memcpy(payload[800..864], payload[0..64]);
-
-    const allocator = testing.allocator;
-    const encoder = @import("../encode/streamlz_encoder.zig");
-    const gpu_encoder = @import("../gpu/encode/driver.zig");
-
-    var framed: [2048]u8 = undefined;
-    const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 }, &gpu_encoder.g_default);
-
-    var out_buf: [2048]u8 = @splat(0);
-    var out_writer: std.Io.Writer = .fixed(&out_buf);
-    const written = try decompressStream(
-        allocator,
-        framed[0..framed_len],
-        &out_writer,
-        .{},
-        &gpu_driver.g_default,
-    );
-    try testing.expectEqual(@as(u64, payload.len), written);
-    try testing.expectEqualSlices(u8, &payload, out_buf[0..payload.len]);
-}
-
-test "decompressStream enforces max_decompressed_size cap" {
-    var payload: [512]u8 = undefined;
-    for (&payload, 0..) |*b, i| b.* = @truncate(i);
-
-    const allocator = testing.allocator;
-    const encoder = @import("../encode/streamlz_encoder.zig");
-    const gpu_encoder = @import("../gpu/encode/driver.zig");
-
-    var framed: [1024]u8 = undefined;
-    const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 }, &gpu_encoder.g_default);
-
-    var out_buf: [1024]u8 = @splat(0);
-    var out_writer: std.Io.Writer = .fixed(&out_buf);
-    const err = decompressStream(
-        allocator,
-        framed[0..framed_len],
-        &out_writer,
-        .{ .max_decompressed_size = 100 },
-        &gpu_driver.g_default,
-    );
-    try testing.expectError(error.OutputTooSmall, err);
-}
-
-test "encoder sets RestartDecoder flag on first internal block header" {
-    // Parity check for A9: the encoder writes `keyframe` = true for
-    // the first 256 KB block inside a frame, which sets bit 6 of the
-    // 2-byte internal block header (`restart_decoder` on the decoder side).
-    // Consumers don't act on it but the flag IS written; confirm Zig
-    // is consistent.
-    // Use a highly compressible payload to ensure the compressed path is taken.
-    var payload: [1024]u8 = undefined;
-    const pat = "ABCDEFGHIJKLMNOP";
-    for (&payload, 0..) |*b, i| b.* = pat[i % pat.len];
-
-    const allocator = testing.allocator;
-    const encoder = @import("../encode/streamlz_encoder.zig");
-    const gpu_encoder = @import("../gpu/encode/driver.zig");
-
-    var framed: [2048]u8 = undefined;
-    const framed_len = try encoder.compressFramed(allocator, &payload, &framed, .{ .level = 1 }, &gpu_encoder.g_default);
-
-    const hdr = try frame.parseHeader(framed[0..framed_len]);
-    const block_hdr = try frame.parseBlockHeader(framed[hdr.header_size..]);
-    if (block_hdr.uncompressed) {
-        // Even if uncompressed, the internal header should still exist
-        // in the framed format — but the flag check only applies to the
-        // compressed path. Fail loudly so we know the test isn't covering
-        // the intended codepath.
-        return error.SkipZigTest;
-    }
-    const inner_start = hdr.header_size + 8;
-    const internal = try block_header.parseBlockHeader(framed[inner_start..]);
-    try testing.expect(internal.restart_decoder);
-}
-
-test "copyWholeMatch with large offset uses 8-byte chunks" {
-    // Seed the buffer with a pattern, then call copyWholeMatch to copy
-    // from earlier in the buffer to a new position.
-    var buf: [64]u8 = undefined;
-    for (buf[0..16], 0..) |*b, i| b.* = @intCast(i + 1); // [1..16]
-    // Copy buf[0..16] to buf[32..48] via copyWholeMatch(dst=buf+32, offset=32, length=16).
-    copyWholeMatch(buf[32..].ptr, 32, 16);
-    for (buf[32..48], 0..) |b, i| {
-        try testing.expectEqual(@as(u8, @intCast(i + 1)), b);
-    }
-}
-
-test "copyWholeMatch with small offset uses scalar path" {
-    // offset < 8 exercises the byte-at-a-time tail loop (no 8-byte chunking
-    // because a wide load would read unwritten bytes past the write cursor).
-    var buf: [32]u8 = @splat(0);
-    buf[0] = 0xAA;
-    // Copy buf[0..1] → buf[1..5] with offset=1 → repeats the byte.
-    copyWholeMatch(buf[1..].ptr, 1, 4);
-    try testing.expectEqual(@as(u8, 0xAA), buf[1]);
-    try testing.expectEqual(@as(u8, 0xAA), buf[2]);
-    try testing.expectEqual(@as(u8, 0xAA), buf[3]);
-    try testing.expectEqual(@as(u8, 0xAA), buf[4]);
-}
-
-test "decompressStream handles empty source" {
-    const allocator = testing.allocator;
-    var out_buf: [16]u8 = undefined;
-    var out_writer: std.Io.Writer = .fixed(&out_buf);
-    const written = try decompressStream(
-        allocator,
-        &[_]u8{},
-        &out_writer,
-        .{},
-        &gpu_driver.g_default,
-    );
-    try testing.expectEqual(@as(u64, 0), written);
 }

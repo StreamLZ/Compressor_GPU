@@ -129,18 +129,13 @@ fn compressCore(h: *Context, input: []const u8, output: []u8, opts: CompressOpts
 fn decompressCore(h: *Context, frame_bytes: []const u8, output: []u8, opts: DecompressOpts) c_int {
     h.dec.enable_profiling = opts.enable_profiling != 0;
     defer h.dec.enable_profiling = false;
-    const r = decoder.decompressFramedParallelThreaded(
+    const r = decoder.decompressFramedThreaded(
         allocator,
         null,
         frame_bytes,
         output,
-        0,
         &h.dec,
-        true, // C ABI slzDecompress: always allow GPU when compiled in
     ) catch |err| return mapDecompressError(err);
-    if (r.offset > 0 and r.written > 0) {
-        std.mem.copyForwards(u8, output[0..r.written], output[r.offset..][0..r.written]);
-    }
     return @intCast(r.written);
 }
 
