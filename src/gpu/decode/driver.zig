@@ -12,10 +12,9 @@
 //!                          getProc, qpcNow / qpcMs, NUM_PIPELINE_STREAMS
 //!   module_loader.zig    - PTX load, kernel-handle pub vars, init(),
 //!                          isAvailable(), ensurePipelineStreams
-//!   descriptors.zig      - ChunkDesc / HuffDecChunkDesc / RawOff16Desc /
-//!                          ScanResult / WalkFrameResultDev /
-//!                          KernelTiming / PendingTiming, HUFF_LUT_ENTRIES,
-//!                          WALK_MAX_CHUNKS, GpuError
+//!   descriptors.zig      - ChunkDesc, KernelTiming, PendingTiming,
+//!                          WALK_MAX_CHUNKS, GpuError, walk_meta_offsets
+//!                          (plus internal scan/huff descriptor types)
 //!   decode_context.zig   - DecodeContext, ensureDeviceBuf / Output,
 //!                          alloc/free/copy helpers, profiling fns
 //!   scan_host.zig        - scanForEntropyChunks + local header parsers
@@ -42,16 +41,9 @@ pub const isAvailable = ml.isAvailable;
 
 // ── Descriptor / error types ──────────────────────────────────
 pub const ChunkDesc = d.ChunkDesc;
-pub const HuffDecChunkDesc = d.HuffDecChunkDesc;
-pub const RawOff16Desc = d.RawOff16Desc;
-pub const ScanHuffDesc = d.ScanHuffDesc;
-pub const ScanRawDesc = d.ScanRawDesc;
-pub const ScanResult = d.ScanResult;
-pub const WalkFrameResultDev = d.WalkFrameResultDev;
 pub const KernelTiming = d.KernelTiming;
 pub const PendingTiming = d.PendingTiming;
 pub const GpuError = d.GpuError;
-pub const HUFF_LUT_ENTRIES = d.HUFF_LUT_ENTRIES;
 pub const WALK_MAX_CHUNKS = d.WALK_MAX_CHUNKS;
 pub const ENTROPY_SCRATCH_SLOT_BYTES = d.ENTROPY_SCRATCH_SLOT_BYTES;
 pub const walk_meta_offsets = d.walk_meta_offsets;
@@ -69,7 +61,6 @@ pub const finalizeProfiling = dc.finalizeProfiling;
 
 // ── Decode pipeline entry points ──────────────────────────────
 pub const gpuWalkFrameImpl = sg.gpuWalkFrameImpl;
-pub const gpuPrefixSumChunksImpl = sg.gpuPrefixSumChunksImpl;
 pub const fullGpuLaunchImpl = dd.fullGpuLaunchImpl;
 
 // ── Singletons ────────────────────────────────────────────────
