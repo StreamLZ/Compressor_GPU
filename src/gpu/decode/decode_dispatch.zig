@@ -456,13 +456,6 @@ fn runHuffPredecode(
     split_timer: bool,
     t_huff_start: anytype,
     io: ?std.Io,
-    /// Phase 4 Step 4 cache-hit path: when true, write persistent
-    /// kernel-params on self.graph_params.huff_* but DO NOT submit
-    /// cuLaunchKernel — the captured graph already holds the launches
-    /// and will re-execute via cuGraphLaunch reading the (updated)
-    /// persistent fields. Required so a same-shape cache hit can skip
-    /// the per-call instantiate.
-    skip_launch: bool,
 ) GpuError!i64 {
     const h2d_fn = fns.h2d;
     const launch_fn = fns.launch;
@@ -483,17 +476,14 @@ fn runHuffPredecode(
         break :d_nh self.d_n_huff_scratch;
     };
     {
-        // Phase 4 Step 2: persistent param storage on self.graph_params.huff_build.
         const hb = &self.graph_params.huff_build;
         hb.p_comp  = self.d_comp_persist;
         hb.p_descs = self.d_huff_descs;
         hb.p_lut   = self.d_huff_lut;
         hb.p_n     = d_n_huff;
-        if (!skip_launch) {
-            const t_hb = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffBuildLutKernel", huff_stream);
-            try cudaCall(launch_fn(ml.huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &hb.params, &hb.extra), .launch);
-            endKernelTiming(t_hb, huff_stream);
-        }
+        const t_hb = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffBuildLutKernel", huff_stream);
+        try cudaCall(launch_fn(ml.huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &hb.params, &hb.extra), .launch);
+        endKernelTiming(t_hb, huff_stream);
     }
     // Split fence: time the LUT build separately from the decode.
     if (split_timer) {
@@ -511,12 +501,10 @@ fn runHuffPredecode(
         hd.p_lut   = self.d_huff_lut;
         hd.p_out   = self.d_entropy_scratch;
         hd.p_n     = d_n_huff;
-        if (!skip_launch) {
-            const shared_bytes: c_uint = HUFF_LUT_ENTRIES * @sizeOf(u32);
-            const t_hd = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffDecode4StreamKernel", huff_stream);
-            try cudaCall(launch_fn(ml.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, shared_bytes, huff_stream, &hd.params, &hd.extra), .launch);
-            endKernelTiming(t_hd, huff_stream);
-        }
+        const shared_bytes: c_uint = HUFF_LUT_ENTRIES * @sizeOf(u32);
+        const t_hd = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffDecode4StreamKernel", huff_stream);
+        try cudaCall(launch_fn(ml.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, shared_bytes, huff_stream, &hd.params, &hd.extra), .launch);
+        endKernelTiming(t_hd, huff_stream);
     }
     return split_huff_build_ns;
 }
@@ -541,15 +529,11 @@ fn runLzPipeline(
     heavy_stream: usize,
     split_timer: bool,
     io: ?std.Io,
-    /// Phase 4 Step 4 cache-hit path: set persistent params on
-    /// self.graph_params.lz_* but skip cuLaunchKernel — the captured
-    /// graph already holds the LZ launches.
-    skip_launch: bool,
-    /// Phase 3-final: device address holding the self-gate count
-    /// (`*p_total` for the LZ kernel). When the D2D path supplies
-    /// `req.d_n_chunks_dev`, this is `d_walk_meta + offset(n_chunks)`
-    /// (no H2D round-trip); otherwise `self.d_n_groups_scratch` after
-    /// the host-staging H2D in `fullGpuLaunchImpl`.
+    /// Device address holding the self-gate count (`*p_total` for the
+    /// LZ kernel). When the D2D path supplies `req.d_n_chunks_dev`,
+    /// this is `d_walk_meta + offset(n_chunks)` (no H2D round-trip);
+    /// otherwise `self.d_n_groups_scratch` after the host-staging H2D
+    /// in `fullGpuLaunchImpl`.
     total_dev: CUdeviceptr,
     /// Base device address the LZ kernel writes decompressed bytes
     /// into. Normally `self.d_output` (library scratch). On the D2D
@@ -594,13 +578,6 @@ fn runLzPipeline(
         // Huffman literals require the general kernel (it reads entropy_scratch).
         const use_raw_kernel = n_huff == 0 and ml.kernel_raw_fn != 0;
 
-        // Phase 4 Step 2: persistent param storage on
-        // self.graph_params.lz_raw / .lz_gen. The six shared fields
-        // (comp, descs_dev, dst, cpg, total, sc_cap) duplicate between
-        // the two variants; only one variant launches per call so the
-        // duplication is cheap and the alternative (a shared common-
-        // struct + per-variant tails) re-introduces the stack-local
-        // problem this whole step exists to avoid.
         const comp_addr: CUdeviceptr = self.d_comp_persist;
         const descs_addr: CUdeviceptr = self.d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc);
         const dst_addr: CUdeviceptr = dst_base;
@@ -614,11 +591,9 @@ fn runLzPipeline(
             lr.p_cpg       = chunks_per_group;
             lr.p_total     = total_addr;
             lr.p_sc_cap    = sub_chunk_cap;
-            if (!skip_launch) {
-                const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", stream);
-                try cudaCall(launch_fn(ml.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lr.params, &lr.extra), .launch);
-                endKernelTiming(t_lzr, stream);
-            }
+            const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", stream);
+            try cudaCall(launch_fn(ml.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lr.params, &lr.extra), .launch);
+            endKernelTiming(t_lzr, stream);
         } else {
             const lg = &self.graph_params.lz_gen;
             lg.p_comp                = comp_addr;
@@ -632,11 +607,9 @@ fn runLzPipeline(
             lg.p_first_sub_idx       = self.d_first_subchunk_idx +
                 if (self.d_first_subchunk_idx != 0) @as(u64, chunk_start) * @sizeOf(u32) else 0;
 
-            if (!skip_launch) {
-                const t_lz = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeKernel", stream);
-                try cudaCall(launch_fn(ml.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lg.params, &lg.extra), .launch);
-                endKernelTiming(t_lz, stream);
-            }
+            const t_lz = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeKernel", stream);
+            try cudaCall(launch_fn(ml.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lg.params, &lg.extra), .launch);
+            endKernelTiming(t_lz, stream);
         }
 
         if (split_timer) {
@@ -966,55 +939,13 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         const write_direct: bool = req.d_output_target != null and req.dst_start_off == 0;
         const lz_dst_base: CUdeviceptr = if (write_direct) req.d_output_target.? else self.d_output;
 
-        // ── Phase 4: opt-in CUDA Graph capture of the back-half ────────
-        // Conditions for enabling graph mode this call. Any "no" falls
-        // through to the existing direct-launch path.
-        const want_graph = std.c.getenv("SLZ_GPU_GRAPHS") != null;
-        const huff_safe = !have_huff or (scan.device_compact_populated and ml.merge_huff_descs_fn != 0);
-        const can_graph = want_graph
-            and !split_timer
-            and self.work_stream != 0           // async path only
-            and req.d_output_target != null     // D2D output (caller stream sync waits)
-            and huff_safe                       // pure-D2D huff path, no sync H2D
-            and cuda.cuStreamBeginCapture_fn != null
-            and cuda.cuStreamEndCapture_fn != null
-            and cuda.cuGraphInstantiate_fn != null
-            and cuda.cuGraphLaunch_fn != null;
-
-        // Phase 4 Step 4: shape-cache decision. Hit = same shape AND a
-        // graph_exec already lives on the context; miss = fresh shape (or
-        // first call) → tear down + re-capture + re-instantiate.
-        const cur_shape = graph_params_mod.GraphShapeKey{
-            .n_chunks = total_chunks,
-            .n_huff = n_huff,
-            .chunks_per_group = chunks_per_group,
-        };
-        const cache_hit = can_graph
-            and self.graph_exec != 0
-            and self.graph_shape_valid
-            and self.graph_shape_key.matches(cur_shape);
-        const cache_miss = can_graph and !cache_hit;
-
-        if (cache_miss) {
-            if (self.graph_exec != 0) {
-                if (cuda.cuGraphExecDestroy_fn) |fge| _ = fge(self.graph_exec);
-                self.graph_exec = 0;
-            }
-            if (self.graph_captured != 0) {
-                if (cuda.cuGraphDestroy_fn) |fgd| _ = fgd(self.graph_captured);
-                self.graph_captured = 0;
-            }
-            self.graph_shape_valid = false;
-            try cudaCall(cuda.cuStreamBeginCapture_fn.?(heavy_stream, cuda.CU_STREAM_CAPTURE_MODE_GLOBAL), .launch);
-        }
-
         const t_huff_start = if (split_timer and have_huff)
             if (io) |io_val| std.Io.Clock.awake.now(io_val) else null
         else
             null;
         var split_huff_build_ns: i64 = 0;
         if (have_huff) {
-            split_huff_build_ns = try runHuffPredecode(self, &fns, scan, n_huff, heavy_stream, split_timer, t_huff_start, io, cache_hit);
+            split_huff_build_ns = try runHuffPredecode(self, &fns, scan, n_huff, heavy_stream, split_timer, t_huff_start, io);
         }
 
         // Launch pipelined groups: one LZ launch per pipeline stream.
@@ -1052,39 +983,9 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             heavy_stream,
             split_timer,
             io,
-            cache_hit,
             lz_total_dev,
             lz_dst_base,
         );
-
-        // End capture (cache_miss only) and submit the graph (any
-        // graph-mode call). The cuGraphLaunch makes the captured kernels
-        // run on heavy_stream; the D2D memcpy in finalizeOutput is NOT
-        // captured (so a changing d_output_target between cache-hit calls
-        // doesn't poison the captured node) — it runs as a normal stream
-        // op below the closing brace.
-        if (cache_miss) {
-            var graph_handle: usize = 0;
-            try cudaCall(cuda.cuStreamEndCapture_fn.?(heavy_stream, &graph_handle), .launch);
-            self.graph_captured = graph_handle;
-            var error_node: usize = 0;
-            var log_buf: [256]u8 = .{0} ** 256;
-            const inst_rc = cuda.cuGraphInstantiate_fn.?(&self.graph_exec, graph_handle, &error_node, @ptrCast(&log_buf), log_buf.len);
-            if (inst_rc != CUDA_SUCCESS) {
-                std.debug.print("GPU graph instantiate FAILED rc={d}\n", .{inst_rc});
-                return error.KernelLaunchFailed;
-            }
-            self.graph_shape_key = cur_shape;
-            self.graph_shape_valid = true;
-        }
-        if (can_graph) {
-            try cudaCall(cuda.cuGraphLaunch_fn.?(self.graph_exec, heavy_stream), .launch);
-        }
-        // finalizeOutput is now always run after the back-half block,
-        // including graph mode — keeps the captured graph free of memcpy
-        // nodes that would need cuGraphExecMemcpyNodeSetParams to update
-        // on a per-call basis. The D2D copy is a single async op on
-        // heavy_stream; the caller's stream sync waits for it too.
 
         // Sync all pipeline streams - UNLESS the caller is async
         // (work_stream set). In async mode we leave the queued work on
