@@ -325,9 +325,7 @@ pub fn gpuScanChunks(
             // merge / huff_build / huff_decode kernels still launch
             // with worst-case grids and early-exit on
             // *d_n_merged == 0. Estimated ~15 μs additional GPU time
-            // on the L1/L2 D2D path. Phase 4 (CUDA Graphs) recovers
-            // this and more by eliminating per-call launch latency on
-            // the captured pipeline.
+            // on the L1/L2 D2D path.
             num_lit = total_subchunks;
             num_tok = total_subchunks;
             num_hi = total_subchunks;

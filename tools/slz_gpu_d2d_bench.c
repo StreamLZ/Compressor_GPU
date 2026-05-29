@@ -24,8 +24,9 @@
  *                               (via slzGetLastTimings) — strictly the
  *                               GPU's busy-time, excluding stream-idle
  *                               gaps. The delta vs `gpu kernel best`
- *                               is the room CUDA Graphs (Phase 4) can
- *                               recover by eliminating those gaps.
+ *                               reflects on-stream memcpy time + cuEvent
+ *                               record overhead — work that's real but
+ *                               not classified as a kernel.
  *
  * Usage:
  *   slz_gpu_d2d_bench <frame.slz> <source.bin> [--runs N]

@@ -139,7 +139,7 @@ powershell -NoProfile -Command ^
     "Write-Host '  wall = host submit-to-sync (slzDecompressAsync + cudaStreamSync) — what game/LLM devs see.';" ^
     "Write-Host '  D2D  = cudaEvent pair around entire slzDecompressAsync work on the caller stream.';" ^
     "Write-Host '  kern = sum of per-kernel cudaEventElapsedTime (slzGetLastTimings) — pure GPU active time.';" ^
-    "Write-Host '  gap  = D2D - kern = stream-idle time between kernel launches; the recoverable headroom for Phase 4 (CUDA Graphs).';" ^
+    "Write-Host '  gap  = D2D - kern = on-stream memcpy time + cuEvent record overhead between kernels.';" ^
     "Write-Host 'Ratio baselines from src/gpu/README.md. Wall/D2D/kern have no baseline yet — first run sets the expectation.'"
 
 echo.

@@ -590,13 +590,13 @@ fn runLzPipeline(
         const lz_groups_in_pipe = (group_chunks + chunks_per_group - 1) / chunks_per_group;
         const lz_grid_x = (lz_groups_in_pipe + 1) / 2;
 
-        // d_n_groups_scratch is staged by the caller (fullGpuLaunchImpl)
-        // before this function runs. Phase 4 (graph capture) needs the H2D
-        // outside the captured stream region; hoisting it once at NUM_PIPELINE_
-        // STREAMS == 1 is correct because chunk_end - chunk_start == total_chunks
-        // when the loop runs once. If NUM_PIPELINE_STREAMS ever > 1, this hoist
-        // needs to either move back inline (re-introducing graph-mode H2D
-        // problems) or be re-thought as N device counters.
+        // The LZ kernel's self-gate count comes via the `total_dev`
+        // parameter; fullGpuLaunchImpl is responsible for arranging the
+        // backing storage (either `d_n_groups_scratch` staged by host
+        // H2D, or `d_walk_meta + offset(n_chunks)` on the D2D path).
+        // At NUM_PIPELINE_STREAMS == 1 this hoist is correct because
+        // chunk_end - chunk_start == total_chunks when the loop runs once;
+        // a future bump to N > 1 needs N device counters.
 
         // Fast path: no entropy in this scan → use lean L1/L2 raw kernel.
         // Huffman literals require the general kernel (it reads entropy_scratch).
