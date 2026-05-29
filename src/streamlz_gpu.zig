@@ -231,11 +231,11 @@ const DecompressJob = struct {
     }
 };
 
-/// 4d Phase 3 TRUE D2D decompress worker: frame stays on device, walk
-/// runs on GPU, output stays on device — zero host bounce of payload
-/// or frame bytes. On -1 (slzCompress-shape constraint failed, e.g.
-/// dict / PDM / multi-block frame) the caller falls back to the host-
-/// frame D2D path; on -2 to the full host-bounce path.
+/// TRUE D2D decompress worker: frame stays on device, walk runs on
+/// GPU, output stays on device — zero host bounce of payload or frame
+/// bytes. Sets `fall_back = true` if the frame shape doesn't fit the
+/// slzCompress invariant (dict / PDM / multi-block / size out of bounds)
+/// so the C ABI entry point can return SLZ_ERROR_UNSUPPORTED.
 const DecompressJobTrueD2D = struct {
     h: *Context,
     d_src: u64,
@@ -511,10 +511,10 @@ export fn slzDecompressAsync(
     DecompressJobTrueD2D.run(&true_job);
     const rc = true_job.result;
     if (rc >= 0) return SLZ_SUCCESS;
-    // Async path doesn't fall back. If the TrueD2D shape isn't satisfied
-    // (dict frame / PDM / multi-block), the caller should use the sync
-    // slzDecompress entry point which handles fallback through the
-    // half-D2D and full-host paths.
+    // The async path can't bounce through the host on the caller's
+    // behalf. If the TrueD2D shape isn't satisfied (dict frame / PDM /
+    // multi-block / size out of bounds), return SLZ_ERROR_UNSUPPORTED
+    // so the caller can retry via slzDecompressHost.
     if (true_job.fall_back) return SLZ_ERROR_UNSUPPORTED;
     return rc;
 }
