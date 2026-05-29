@@ -46,7 +46,6 @@ pub fn gpuCompressImpl(
     const sizes_bytes = @as(usize, num_chunks) * 4;
     const hash_bits: u32 = levels.hashBitsForLevel(level);
     const hash_size: usize = @as(usize, 1) << @intCast(hash_bits);
-    const global = levels.useGlobalHash(level);
     const chain = levels.useChainParser(level);
 
     if (!ec.ensureBuf(&self.d_input_persist, &self.d_input_size, input.len)) return false;
@@ -54,14 +53,16 @@ pub fn gpuCompressImpl(
     if (!ec.ensureBuf(&self.d_descs_persist, &self.d_descs_size, desc_bytes)) return false;
     if (!ec.ensureBuf(&self.d_sizes_persist, &self.d_sizes_size, sizes_bytes)) return false;
 
-    // Global hash tables - chain mode uses 3 tables per block:
-    //   first_hash (hash_size u32) + long_hash (hash_size u32) + next_hash (32768 u16 = 16384 u32)
+    // Global hash tables. Chain mode uses 3 tables per block (first_hash +
+    // long_hash + next_hash); non-chain modes use a single hash table
+    // (L1 needs more than CUDA shared-mem allows, and global also dodges
+    // the shared-mem-hash corruption seen at L2 sc>=0.5).
     if (chain) {
         const next_hash_words: usize = ec.NEXT_HASH_ENTRIES / 2; // u16 entries packed into u32 words
         const table_stride = hash_size + hash_size + next_hash_words;
         const hash_bytes = @as(usize, num_chunks) * table_stride * 4;
         if (!ec.ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) return false;
-    } else if (global) {
+    } else {
         const hash_bytes = @as(usize, num_chunks) * hash_size * 4;
         if (!ec.ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) return false;
     }
@@ -94,7 +95,7 @@ pub fn gpuCompressImpl(
     var p_input = d_input;
     var p_output = d_output;
     var p_descs = d_descs;
-    var p_global_hash: CUdeviceptr = if (global or chain) self.d_hash_persist else 0;
+    var p_global_hash: CUdeviceptr = self.d_hash_persist;
     var p_sizes = d_sizes;
     var p_total = num_chunks;
     var p_hash_bits = hash_bits;
@@ -117,7 +118,8 @@ pub fn gpuCompressImpl(
     };
     var extra = [_]?*anyopaque{null};
 
-    const shared_bytes: u32 = if (global or chain) 0 else @intCast(hash_size * 4);
+    // Hash tables always live in global memory; no dynamic shared mem needed.
+    const shared_bytes: u32 = 0;
     const t_lz = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzEncodeKernel", 0);
     // Defer endKernelTiming so the pending begin event always gets a
     // matching end record - even on launch failure. Otherwise

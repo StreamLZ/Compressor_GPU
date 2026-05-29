@@ -57,7 +57,7 @@ encode/                         GPU encode
   cuda_ffi.zig                  CUDA Driver API FFI
   module_loader.zig             PTX load + kernel handles + init
   encode_context.zig            EncodeContext + ABI structs + ensureBuf
-  levels.zig                    hashBitsForLevel / useGlobalHash / useChainParser
+  levels.zig                    hashBitsForLevel / useChainParser
   encode_lz.zig                 gpuCompressImpl (LZ launcher)
   encode_huff.zig               gpuEncodeHuffImpl + per-stream {Literals,Tokens,Off16}
   encode_assemble.zig           gpuAssembleFrameImpl + gpuFrameAssembleImpl

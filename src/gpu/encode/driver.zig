@@ -11,7 +11,7 @@
 //!   module_loader.zig    - PTX load, kernel-handle pub vars, init(), isAvailable()
 //!   encode_context.zig   - EncodeContext, CompressChunkDesc / AssembleDesc /
 //!                          HuffEncDesc, ensureBuf, copyDeviceToHost
-//!   levels.zig           - hashBitsForLevel / useGlobalHash / useChainParser
+//!   levels.zig           - hashBitsForLevel / useChainParser
 //!   encode_lz.zig        - gpuCompressImpl (LZ launcher)
 //!   encode_huff.zig      - gpuEncodeHuffImpl + per-stream {Literals,Tokens,Off16} Impls
 //!   encode_assemble.zig  - gpuAssembleFrameImpl, gpuFrameAssembleImpl (4d device-resident)

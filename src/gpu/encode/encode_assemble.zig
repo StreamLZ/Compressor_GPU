@@ -75,7 +75,7 @@ pub fn gpuAssembleFrameImpl(
             .huff_off16lo_offset = hol_off[i],
             .huff_off16lo_size = hol_sz[i],
             .sub_decomp_size = chunk_descs[i].src_size,
-            .init_bytes = if (chunk_descs[i].is_first != 0) 8 else 0,
+            .init_bytes = if (chunk_descs[i].is_first != 0) ec.INITIAL_LITERAL_COPY_BYTES else 0,
             .out_offset = 0,
         };
     }
