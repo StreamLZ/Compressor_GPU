@@ -119,13 +119,11 @@ static_assert(DEFAULT_SUB_CHUNK_CAP == LZ_BLOCK_SIZE,
 static constexpr uint32_t EXT_LENGTH_THRESHOLD       = 251;
 
 // ── LZ-substream header sizes (encode side writes, decode side reads) ──
-// LZ_SUBSTREAM_COUNT_HDR_BYTES = bytes for the per-substream count prefix
-// (BE u24). STREAM_HEADER_BYTES is the old name retained for back-compat
-// with the existing encode references; prefer the new name in new code.
+// `LZ_SUBSTREAM_COUNT_HDR_BYTES` is the byte count for the per-substream
+// count prefix (a BE u24). `OFF16_HEADER_BYTES` is the count prefix for
+// the off16 plane (an LE u16).
 static constexpr uint32_t LZ_SUBSTREAM_COUNT_HDR_BYTES = 3;
-// DEPRECATED - use LZ_SUBSTREAM_COUNT_HDR_BYTES in new code.
-static constexpr uint32_t STREAM_HEADER_BYTES       = LZ_SUBSTREAM_COUNT_HDR_BYTES;
-static constexpr uint32_t OFF16_HEADER_BYTES        = 2; // little-endian u16
+static constexpr uint32_t OFF16_HEADER_BYTES        = 2;
 
 // ── 5-byte non-compact entropy chunk header (assemble_kernel.cu) ────
 // Layout (encoder writes, decoder reads):

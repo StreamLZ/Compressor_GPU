@@ -29,9 +29,8 @@
 #include "lz_chain_parser.cuh"
 
 // ── Output framing constants ────────────────────────────────────
-// All wire-format constants (STREAM_HEADER_BYTES, OFF16_HEADER_BYTES,
-// OFF32_COUNT_FIELD_BITS, OFF32_COUNT_PACK_MAX, ...) come from
-// ../common/gpu_wire_format.cuh (transitively via lz_format.cuh).
+// All wire-format constants come from `../common/gpu_wire_format.cuh`,
+// pulled in transitively via `lz_format.cuh`.
 
 // ── slzLzEncodeKernel ───────────────────────────────────────────
 // LZ encode kernel entry point. One block per chunk, one warp (32
@@ -85,7 +84,7 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
     const uint32_t src_size = desc.src_size;
 
     uint8_t* dst = output + desc.dst_offset;
-    const uint32_t lit_data_start = (desc.is_first ? INITIAL_LITERAL_COPY_BYTES : 0) + STREAM_HEADER_BYTES;
+    const uint32_t lit_data_start = (desc.is_first ? INITIAL_LITERAL_COPY_BYTES : 0) + LZ_SUBSTREAM_COUNT_HDR_BYTES;
 
     // Sub-stream working buffers carved out of dst. Each region is sized
     // for its worst case relative to src_size:
@@ -203,10 +202,10 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
         }
 
         writeBE24(dst + out_pos, streams.lit_count);
-        out_pos += STREAM_HEADER_BYTES + streams.lit_count;
+        out_pos += LZ_SUBSTREAM_COUNT_HDR_BYTES + streams.lit_count;
 
         writeBE24(dst + out_pos, streams.token_count);
-        out_pos += STREAM_HEADER_BYTES;
+        out_pos += LZ_SUBSTREAM_COUNT_HDR_BYTES;
         memcpy(dst + out_pos, streams.token_buf, streams.token_count);
         out_pos += streams.token_count;
 

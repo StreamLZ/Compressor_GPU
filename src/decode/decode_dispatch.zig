@@ -38,13 +38,12 @@ const finalizeProfiling = dec_ctx.finalizeProfiling;
 
 /// Bundle of the CUDA Driver API function pointers used by the GPU
 /// decode pipeline. Resolved once at `fullGpuLaunchImpl` entry and
-/// threaded into the three pipeline helpers (`runHuffPredecode`,
+/// threaded into the pipeline helpers (`runHuffPredecode`,
 /// `runLzPipeline`, `finalizeOutput`) so they don't each re-resolve the
 /// same `cuMemcpyHtoD_fn orelse return error.BackendNotAvailable`
-/// patterns. The required fields are non-optional; `d2d` stays optional
-/// because the host-bounce paths work without it - only the D2D-source,
-/// D2D-output, and gather-off16 fallback paths consult it, and each
-/// site unwraps with its own `orelse return error.BackendNotAvailable`.
+/// patterns. `d2d` is optional because only the D2D source and D2D
+/// output paths consult it; each site unwraps with its own `orelse
+/// return error.BackendNotAvailable`.
 const Fns = struct {
     h2d: cuda.FnMemcpyHtoD,
     d2h: cuda.FnMemcpyDtoH,
@@ -241,13 +240,12 @@ pub const DecodeRequest = struct {
 
 /// Launches the Huffman LUT-build kernel and the 4-stream decode
 /// kernel into `heavy_stream`. Both kernels self-gate on `*d_n_huff`,
-/// so it is safe to launch them with the chunk count even if some
-/// chunks have no Huffman streams.
+/// so it is safe to launch them with the worst-case chunk count even
+/// if some chunks have no Huffman streams.
 ///
-/// Returns the LUT-build elapsed nanoseconds when `split_timer` is
-/// set (driven by SLZ_SPLIT_TIMER); otherwise zero. The caller is
-/// responsible for computing the full huff-total time after the
-/// pipeline-stream sync.
+/// Returns the LUT-build elapsed nanoseconds when `split_timer` is set
+/// (driven by `SLZ_SPLIT_TIMER`); otherwise zero. The caller computes
+/// the full huff-total time after the back-half stream sync.
 fn runHuffPredecode(
     self: *DecodeContext,
     fns: *const Fns,
