@@ -32,18 +32,45 @@ pub const safe_space = constants.safe_space;
 /// cap rather than allocating into hostile territory.
 pub const max_content_size: u64 = 4 * 1024 * 1024 * 1024;
 
+/// Errors the decoder can surface. Members embed `gpu_driver.GpuError`
+/// (CUDA-side failures) and `std.mem.Allocator.Error` (host alloc), so a
+/// `try`-chain through the GPU dispatch propagates without re-wrapping.
 pub const DecompressError = error{
+    /// Frame header failed magic / version / codec / flag validation.
     BadFrame,
+    /// Source ran out of bytes before the parser could complete a header
+    /// field. The caller did not pass the whole frame.
     Truncated,
+    /// A nested length field disagrees with its container - e.g. the
+    /// frame's `content_size` is smaller than the sum of decompressed
+    /// block sizes.
     SizeMismatch,
+    /// The 2-byte SLZ internal block header (magic / decoder / checksum
+    /// bit) is malformed.
     InvalidBlockHeader,
+    /// The 4-byte chunk header word carries a reserved type or sets
+    /// a reserved bit.
     InvalidInternalHeader,
+    /// A chunk header's `compressed_size` field is invalid (zero or
+    /// larger than the surrounding block payload).
     BadChunkHeader,
+    /// The block claimed more compressed bytes than the frame contains.
     BlockDataTruncated,
+    /// `dst` is smaller than the frame's declared / computed
+    /// decompressed-byte count plus `safe_space`.
     OutputTooSmall,
+    /// A per-block or per-chunk CRC24 / content checksum mismatched
+    /// (currently parsed-but-not-verified; reserved for a future
+    /// strict-mode flag).
     ChecksumMismatch,
+    /// A chunk's `decompressed_size` disagrees with its dst-stride.
     ChunkSizeMismatch,
+    /// The frame carries a `dictionary_id`; the GPU decoder has no
+    /// dictionary store. Always rejected.
     UnknownDictionary,
+    /// `content_size` exceeds `max_content_size` (4 GiB). Either the
+    /// frame is hostile or it was produced by an encoder that exceeds
+    /// this decoder's cap.
     ContentSizeTooLarge,
 } || gpu_driver.GpuError || std.mem.Allocator.Error;
 

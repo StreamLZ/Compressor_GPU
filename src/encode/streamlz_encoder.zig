@@ -14,10 +14,29 @@ const lz_constants = @import("../format/streamlz_constants.zig");
 const fast_framed = @import("fast_framed.zig");
 const gpu_encoder = @import("driver.zig");
 
+/// Errors the encoder can surface. Members embed
+/// `std.mem.Allocator.Error` (host alloc) so the encoder propagates
+/// `error.OutOfMemory` from any internal allocation without re-wrapping;
+/// `gpu_encoder.GpuError` is reachable via `error.DestinationTooSmall`
+/// (the only way the encoder currently surfaces a CUDA failure - the
+/// downstream pipeline maps every kernel-side error to "destination
+/// too small" so the caller's retry shape stays simple).
 pub const CompressError = error{
+    /// `opts.level` was outside the supported range. Only levels 1..5
+    /// are accepted; anything else returns this immediately.
     BadLevel,
+    /// `opts.block_size` is not a power of two in `[64 KiB, 4 MiB]`.
     BadBlockSize,
+    /// `opts.sc_group_size_override` is non-null and non-positive (the
+    /// header writer rejects `<= 0`); also returned when the resolved
+    /// `sc_group_size` would push `sub_chunk_count` past the kernel
+    /// grid limit.
     BadScGroupSize,
+    /// `dst` is smaller than `compressBound(src.len)` OR the GPU
+    /// pipeline returned a kernel-side failure. Callers cannot
+    /// distinguish the two cases at this surface; the typical
+    /// remediation (grow the output buffer) helps the first case and
+    /// is a no-op against the second.
     DestinationTooSmall,
 } || std.mem.Allocator.Error;
 

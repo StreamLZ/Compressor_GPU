@@ -141,35 +141,53 @@ pub const PrefixSumResultDev = struct {
     d_total_subchunks: u64,
 };
 
-/// Error set returned by the GPU decode path. Names are intentionally
-/// backend-neutral so the same set works for the CUDA driver and the
-/// Vulkan compute backend (`vulkan_driver.zig`). `BadMode` stays as a
-/// member because (a) it's part of `fast.DecodeError` (see
-/// `src/decode/fast/fast_lz_decoder.zig`) so callers that return
-/// `DecompressError` already unify, and (b) the C ABI in
-/// `src/streamlz_gpu.zig` switches on `error.BadMode` as the
-/// "fall back to CPU" signal. Treat the new members as more-informative
-/// variants that ALSO trigger fallback - the higher-level catch sites
-/// catch the full `GpuError` set, not just `BadMode`.
+/// Errors the GPU decode path surfaces. The C ABI in
+/// `src/streamlz_gpu.zig` switches on these to route between
+/// `SLZ_ERROR_CUDA` (every CUDA-side failure) and `SLZ_ERROR_UNSUPPORTED`
+/// (the `BadMode` shape-rejected fallback signal).
 pub const GpuError = error{
-    BackendNotAvailable, // dlopen/getProc, cuInit, vkCreateInstance failed
-    OutOfDeviceMemory, // cuMemAlloc / vkAllocateMemory failed
-    KernelLaunchFailed, // cuLaunchKernel / vkCmdDispatch+QueueSubmit failed
-    SyncFailed, // cuCtxSync / cuStreamSync / vkWaitForFences failed
-    CopyFailed, // cuMemcpy[HtoD|DtoH|DtoDAsync] / vkCmdCopyBuffer failed
-    KernelMissing, // a required kernel handle is 0 (PTX loaded but symbol absent)
-    BadMode, // ABI-compat + catch-all fallback signal
+    /// CUDA driver could not be brought up. Causes: `nvcuda.dll` /
+    /// `libcuda.so` missing, `cuInit` failed, no compatible device
+    /// present, or a required FFI symbol was absent from `getProc`.
+    BackendNotAvailable,
+    /// `cuMemAlloc` returned out-of-memory for a device buffer the
+    /// dispatch needed to grow.
+    OutOfDeviceMemory,
+    /// `cuLaunchKernel` returned non-success for one of the decode
+    /// pipeline kernels (walk / prefix-sum / scan / compact / merge /
+    /// huff-build / huff-decode / LZ-decode / gather-raw).
+    KernelLaunchFailed,
+    /// `cuCtxSynchronize` or `cuStreamSynchronize` returned non-success.
+    /// Usually the symptom of an earlier kernel that ran but faulted.
+    SyncFailed,
+    /// Any `cuMemcpy*` call (HtoD / DtoH / DtoDAsync) or `cuMemsetD8*`
+    /// returned non-success.
+    CopyFailed,
+    /// A required kernel symbol's handle is `0`. The PTX loaded but the
+    /// extern entry point was not present - usually a build/version
+    /// skew between the Zig side and the PTX.
+    KernelMissing,
+    /// The frame shape is not supported by the device-resident decoder
+    /// (multi-block, dictionary, content-size out of bounds, etc.).
+    /// The C ABI translates this to `SLZ_ERROR_UNSUPPORTED` and the
+    /// caller falls back to the host-bounce decode path.
+    BadMode,
 };
 
 /// Tag categorizing what the wrapped CUDA call was doing, so `cudaCall`
-/// can return the right `GpuError` member on failure. Threaded as a
+/// can return the right `GpuError` member on failure. Passed as a
 /// `comptime` parameter so the switch is constant-folded.
 pub const ErrorKind = enum {
-    launch, // cuLaunchKernel
-    sync, // cuCtxSynchronize / cuStreamSynchronize
-    copy, // cuMemcpy* (any direction, sync or async) + cuMemsetD8*
-    alloc, // cuMemAlloc (and the bool-returning ensureDeviceBuf wrappers)
-    init, // cuInit / cuDeviceGet / cuCtxCreate / cuModuleLoadData
+    /// `cuLaunchKernel`.
+    launch,
+    /// `cuCtxSynchronize` / `cuStreamSynchronize`.
+    sync,
+    /// Any `cuMemcpy*` (sync or async, any direction) or `cuMemsetD8*`.
+    copy,
+    /// `cuMemAlloc` (and the bool-returning `ensureDeviceBuf` wrappers).
+    alloc,
+    /// `cuInit` / `cuDeviceGet` / `cuCtxCreate` / `cuModuleLoadData`.
+    init,
 };
 
 /// Funnel any CUDA Driver API return code into the GpuError surface so

@@ -108,11 +108,20 @@ pub const FrameHeader = struct {
 };
 
 pub const ParseError = error{
+    /// First 4 bytes did not match the SLZ1 frame magic (`0x534C5A31`).
     BadMagic,
+    /// `version` field is not `1`. The reserved values stop here so a
+    /// forward-incompatible bump can be added without silent skew.
     UnsupportedVersion,
+    /// `codec` field does not name a supported codec (only `.fast`).
     BadCodec,
+    /// Advertised `block_size` is not a power of two in
+    /// `[min_block_size, max_block_size]`.
     BadBlockSize,
+    /// `sc_group_size` (an `f32` post-v2) is `<= 0` or `> 4.0`.
     BadScGroupSize,
+    /// `src` was shorter than the parser needed to reach the next
+    /// header field.
     Truncated,
 };
 
@@ -209,7 +218,16 @@ pub const WriteHeaderOptions = struct {
     dictionary_id: ?u32 = null,
 };
 
-pub const WriteError = error{ BadLevel, BadBlockSize, BadScGroupSize };
+pub const WriteError = error{
+    /// `opts.level` is outside `[1, 9]` (the frame header's level field
+    /// is 4 bits; this catches an overflow before the bit-pack).
+    BadLevel,
+    /// `opts.block_size` is not a power of two in
+    /// `[min_block_size, max_block_size]`.
+    BadBlockSize,
+    /// `opts.sc_group_size` is `<= 0`.
+    BadScGroupSize,
+};
 
 /// Writes a frame header to `dst` and returns the number of bytes written.
 /// Caller must ensure `dst.len >= max_header_size`.

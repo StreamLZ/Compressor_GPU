@@ -56,9 +56,18 @@ pub const ChunkHeader = struct {
 };
 
 pub const ParseError = error{
+    /// `src` was shorter than the 2-byte block header, or shorter than
+    /// the 4-byte (or 7-byte with checksum) chunk header.
     TooShort,
+    /// Block header's low nibble of byte 0 was not `0x5` (the SLZ
+    /// internal block magic).
     BadMagic,
+    /// Decoder-type field is not `High` / `Fast` / `Turbo`; the GPU
+    /// codec only emits `Fast` but the decoder also accepts the other
+    /// two for backward compatibility.
     BadDecoderType,
+    /// Chunk-header type field is not `0` (LZ-compressed) or `1`
+    /// (memset fill). Types 2+ are reserved.
     BadChunkType,
 };
 

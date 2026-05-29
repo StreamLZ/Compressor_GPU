@@ -29,6 +29,35 @@ const allocator = std.heap.c_allocator;
 /// frames; this keeps callers safe even on small-stack threads.
 const worker_stack_size: usize = 32 << 20;
 
+/// Non-dereferenceable address embedded in the host slice that
+/// `slzCompressAsync` hands to `CompressJob` when the input lives on the
+/// device. The pipeline reads source bytes from `d_input_override`
+/// instead; the slice's `.ptr` exists only because the job carries the
+/// `.len` for size calculations.
+///
+/// Address 0x10 is never a valid user-space pointer on any supported
+/// platform; dereferencing it crashes immediately and visibly, which is
+/// the desired behaviour if anything downstream forgets the contract
+/// and tries to read the bytes.
+const device_only_host_stub_addr: usize = 0x10;
+
+/// Build a sentinel host slice whose `.ptr` is `device_only_host_stub_addr`
+/// and whose `.len` is `len`. Encoder paths that consult `.len` (for
+/// chunk-count math, descriptor sizing, etc.) work normally; any
+/// accidental read of the bytes will fault on a guaranteed-invalid
+/// pointer rather than corrupting silently.
+fn deviceOnlySrcStub(len: usize) []const u8 {
+    const ptr: [*]const u8 = @ptrFromInt(device_only_host_stub_addr);
+    return ptr[0..len];
+}
+
+/// True if `src` is a sentinel slice built by `deviceOnlySrcStub`.
+/// Use at every host-read site that takes a `src: []const u8` to
+/// catch a forgotten device-resident path before it segfaults.
+fn isDeviceOnlySrcStub(src: []const u8) bool {
+    return @intFromPtr(src.ptr) == device_only_host_stub_addr;
+}
+
 // ── Status codes — must match streamlz_gpu.h slzStatus_t ──────────────
 const SLZ_SUCCESS: c_int = 0;
 const SLZ_ERROR_INVALID_HANDLE: c_int = 1;
@@ -65,32 +94,87 @@ const Context = struct {
     dec: gpu_driver.DecodeContext = .{},
 };
 
+/// Map an `encoder.CompressError` (which embeds `gpu_driver.GpuError`
+/// and `Allocator.Error`) to the C ABI status code.
+///
+/// Categories:
+///   - shape rejected by the encoder (`BadLevel`, `BadScGroupSize`,
+///     `BadBlockSize`) → `SLZ_ERROR_UNSUPPORTED`
+///   - host alloc / GPU alloc failure → `SLZ_ERROR_OUT_OF_MEMORY`
+///   - output buffer too small → `SLZ_ERROR_BUFFER_TOO_SMALL`
+///   - every CUDA-side failure (`GpuError.{KernelLaunchFailed,
+///     SyncFailed, CopyFailed, KernelMissing, BackendNotAvailable,
+///     BadMode}`) → `SLZ_ERROR_CUDA`
+///
+/// The switch is exhaustive against the `CompressError` set so a new
+/// member added upstream is a compile error here. `else` only catches
+/// `anyerror` for the rare untyped throw and is mapped to `SLZ_ERROR_CUDA`
+/// (the safe fallback - "something opaque went wrong inside the codec").
 fn mapCompressError(err: anyerror) c_int {
     return switch (err) {
+        error.BadLevel, error.BadScGroupSize, error.BadBlockSize => SLZ_ERROR_UNSUPPORTED,
         error.DestinationTooSmall => SLZ_ERROR_BUFFER_TOO_SMALL,
-        error.OutOfMemory => SLZ_ERROR_OUT_OF_MEMORY,
-        error.BadLevel, error.BadScGroupSize => SLZ_ERROR_UNSUPPORTED,
+        error.OutOfMemory, error.OutOfDeviceMemory => SLZ_ERROR_OUT_OF_MEMORY,
+        error.BackendNotAvailable,
+        error.KernelLaunchFailed,
+        error.SyncFailed,
+        error.CopyFailed,
+        error.KernelMissing,
+        error.BadMode,
+        => SLZ_ERROR_CUDA,
         else => SLZ_ERROR_CUDA,
     };
 }
 
+/// Map a `decoder.DecompressError` (which embeds `gpu_driver.GpuError`
+/// and `Allocator.Error`) to the C ABI status code.
+///
+/// Categories:
+///   - frame-parsing failure (header, block, chunk, checksum, dictionary,
+///     content-size cap) → `SLZ_ERROR_CORRUPT_FRAME`
+///   - caller output buffer too small → `SLZ_ERROR_BUFFER_TOO_SMALL`
+///   - host alloc / GPU alloc failure → `SLZ_ERROR_OUT_OF_MEMORY`
+///   - every CUDA-side failure → `SLZ_ERROR_CUDA`
+///
+/// `BadMode` here means the frame shape is not supported by the
+/// device-resident decoder (multi-block, dictionary, etc.); the C ABI
+/// can fall back to the host-bounce entry point, so the caller sees
+/// `SLZ_ERROR_UNSUPPORTED`.
 fn mapDecompressError(err: anyerror) c_int {
     return switch (err) {
         error.OutputTooSmall => SLZ_ERROR_BUFFER_TOO_SMALL,
-        error.OutOfMemory => SLZ_ERROR_OUT_OF_MEMORY,
-        else => SLZ_ERROR_CORRUPT_FRAME,
+        error.OutOfMemory, error.OutOfDeviceMemory => SLZ_ERROR_OUT_OF_MEMORY,
+        error.BadFrame,
+        error.Truncated,
+        error.SizeMismatch,
+        error.InvalidBlockHeader,
+        error.InvalidInternalHeader,
+        error.BadChunkHeader,
+        error.BlockDataTruncated,
+        error.ChecksumMismatch,
+        error.ChunkSizeMismatch,
+        error.UnknownDictionary,
+        error.ContentSizeTooLarge,
+        => SLZ_ERROR_CORRUPT_FRAME,
+        error.BadMode => SLZ_ERROR_UNSUPPORTED,
+        error.BackendNotAvailable,
+        error.KernelLaunchFailed,
+        error.SyncFailed,
+        error.CopyFailed,
+        error.KernelMissing,
+        => SLZ_ERROR_CUDA,
+        else => SLZ_ERROR_CUDA,
     };
 }
 
-/// Returns true iff `err` is one of `gpu_driver.GpuError`'s members.
-/// Used by both GPU C-ABI entry points to map any GpuError uniformly
-/// to "host fallback" (SLZ_ERROR_CUDA / -1) rather than misclassify a
-/// CUDA failure as a corrupt frame via `mapDecompressError`.
+/// Returns true when `err` belongs to `gpu_driver.GpuError`. The
+/// device-resident decode path (`DecompressJobTrueD2D`) uses this to
+/// route any GPU-side failure into the host-bounce fallback rather
+/// than letting `mapDecompressError` misclassify it.
 ///
 /// The comptime block locks the listed members against
 /// `descriptors.zig:GpuError`: adding a new member there without
-/// updating the switch below is a compile error, so silent drift is
-/// impossible.
+/// updating the switch below is a compile error.
 fn isGpuFallbackError(err: anyerror) bool {
     comptime {
         const expected_members: usize = @typeInfo(gpu_driver.GpuError).error_set.?.len;
@@ -311,7 +395,14 @@ export fn slzCreate(out_handle: ?*?*Context) c_int {
 }
 
 export fn slzDestroy(handle: ?*Context) c_int {
-    if (handle) |h| allocator.destroy(h);
+    if (handle) |h| {
+        // Free every device + host buffer the encode/decode contexts
+        // own. Without this, every `cuMemAlloc` and `cuMemAllocHost`
+        // made on the handle's behalf leaks until the process exits.
+        h.enc.deinit(allocator);
+        h.dec.deinit();
+        allocator.destroy(h);
+    }
     return SLZ_SUCCESS;
 }
 
@@ -436,15 +527,30 @@ export fn slzCompressAsync(
     const out_dev = d_output orelse return SLZ_ERROR_INVALID_ARG;
     const out_size = compressed_size orelse return SLZ_ERROR_INVALID_ARG;
 
+    // The encode pipeline writes an uncompressed-body frame on the host
+    // when the input is too small or too large to feed the LZ kernel
+    // grid. Both paths `@memcpy` from the host `src` slice, which is
+    // the device-only sentinel here. Reject upfront so the caller
+    // retries on the host-bounce entry point; the path is not safe to
+    // take silently.
+    //
+    // The thresholds match the gates inside `fast_framed.compressFramedOne`
+    // (`min_source_length = 128`) and `gpuEncodeAndAssemble`
+    // (`assembly_chunk_cap = 16384` * minimum 64 KB sub-chunk).
+    // ToDo.md: we could D2H from `d_input` instead of bouncing the
+    // whole call. Not done yet — the threshold rejects only inputs no
+    // realistic D2D caller would feed.
+    const async_min_input: usize = 128 + 1;
+    const async_max_input: usize = @as(usize, 16384) * 65536;
+    if (input_size < async_min_input or input_size > async_max_input)
+        return SLZ_ERROR_UNSUPPORTED;
+
     const host_out = allocator.alloc(u8, max_compressed_size) catch return SLZ_ERROR_OUT_OF_MEMORY;
     defer allocator.free(host_out);
 
-    const sentinel_ptr: [*]const u8 = @ptrFromInt(0x10);
-    const src_stub: []const u8 = sentinel_ptr[0..input_size];
-
     var job = CompressJob{
         .h = h,
-        .src = src_stub,
+        .src = deviceOnlySrcStub(input_size),
         .dst = host_out,
         .opts = opts,
         .d_src = @intFromPtr(in_dev),
