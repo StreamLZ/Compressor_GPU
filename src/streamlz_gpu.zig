@@ -220,8 +220,6 @@ const DecompressJob = struct {
     src: []const u8,
     dst: []u8,
     opts: DecompressOpts = .{},
-    d_src: u64 = 0,
-    d_dst: u64 = 0,
     result: c_int = SLZ_ERROR_CUDA,
 
     fn run(j: *DecompressJob) void {
@@ -229,20 +227,7 @@ const DecompressJob = struct {
             j.result = SLZ_ERROR_CUDA;
             return;
         }
-        if (j.d_src != 0 and !gpu_driver.copyDeviceToHost(@constCast(j.src), j.d_src)) {
-            j.result = SLZ_ERROR_CUDA;
-            return;
-        }
-        const rc = decompressCore(j.h, j.src, j.dst, j.opts);
-        if (rc < 0) {
-            j.result = rc;
-            return;
-        }
-        if (j.d_dst != 0 and !gpu_driver.copyHostToDevice(j.d_dst, j.dst[0..@intCast(rc)])) {
-            j.result = SLZ_ERROR_CUDA;
-            return;
-        }
-        j.result = rc;
+        j.result = decompressCore(j.h, j.src, j.dst, j.opts);
     }
 };
 
