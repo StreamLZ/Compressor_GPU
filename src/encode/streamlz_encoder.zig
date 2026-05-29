@@ -41,7 +41,11 @@ pub const CompressError = error{
 } || std.mem.Allocator.Error;
 
 pub const Options = struct {
-    /// Compression level. L1-L2 are LZ-only; L3-L5 add 32-stream Huffman.
+    /// Compression level (1..5). L1-L2 are LZ-only; L3-L5 add 32-stream
+    /// Huffman. The default of `1` matches the Zig CLI's speed
+    /// preference; the C ABI's `slzCompressOpts_t` defaults to `5` for
+    /// compression-ratio parity with nvCOMP — the two surfaces serve
+    /// different audiences.
     level: u8 = 1,
 
     /// Emit the 8-byte content-size field in the frame header. Always
@@ -79,6 +83,17 @@ pub fn compressBound(src_len: usize) usize {
         + sc_prefix_upper_bound;
 }
 
+/// Compress host bytes `src` into host bytes `dst`, producing one
+/// SLZ1 frame. Returns the number of bytes written to `dst`.
+///
+/// `dst.len` must be at least `compressBound(src.len)`. `allocator` is
+/// used for small per-call host scratch (descriptor arrays, raw-LZ
+/// staging); persistent device buffers live on `enc_ctx`. The caller
+/// owns `enc_ctx`; the encoder grows its buffers across calls and the
+/// caller is responsible for `enc_ctx.deinit(allocator)`.
+///
+/// Errors: every member of `CompressError`. See the per-variant
+/// docs on the error set above for trigger conditions.
 pub fn compressFramed(
     allocator: std.mem.Allocator,
     src: []const u8,
@@ -89,6 +104,11 @@ pub fn compressFramed(
     return compressFramedWithIo(allocator, std.Io.failing, src, dst, opts, enc_ctx);
 }
 
+/// Same contract as `compressFramed`, plus a `std.Io` for telemetry
+/// instrumentation. The `io` plumbing is consulted only when the
+/// `SLZ_E2E_TIMER` / `SLZ_SPLIT_TIMER` env vars are set; passing
+/// `std.Io.failing` (which `compressFramed` does) disables the timers
+/// cheaply.
 pub fn compressFramedWithIo(
     allocator: std.mem.Allocator,
     io: std.Io,

@@ -58,7 +58,10 @@ fn isDeviceOnlySrcStub(src: []const u8) bool {
     return @intFromPtr(src.ptr) == device_only_host_stub_addr;
 }
 
-// ── Status codes — must match streamlz_gpu.h slzStatus_t ──────────────
+// ── Status codes ───────────────────────────────────────────────────────
+// Mirror of `slzStatus_t` in `include/streamlz_gpu.h`. The comptime
+// asserts below lock the values; adding or reordering the C enum
+// without updating these is a compile-time error here.
 const SLZ_SUCCESS: c_int = 0;
 const SLZ_ERROR_INVALID_HANDLE: c_int = 1;
 const SLZ_ERROR_INVALID_ARG: c_int = 2;
@@ -68,24 +71,54 @@ const SLZ_ERROR_UNSUPPORTED: c_int = 5;
 const SLZ_ERROR_CUDA: c_int = 6;
 const SLZ_ERROR_OUT_OF_MEMORY: c_int = 7;
 
-// ── slzCompressOpts_t — must match the header struct layout ───────────
+comptime {
+    // If the C enum's numeric values ever change, the explicit
+    // constants above and the switch in slzStatusString must be
+    // updated together. Pin the values here.
+    std.debug.assert(SLZ_SUCCESS == 0);
+    std.debug.assert(SLZ_ERROR_OUT_OF_MEMORY == 7);
+}
+
+/// Mirror of `slzCompressOpts_t`. Default `level = 5` matches the C
+/// header doc; the Zig-side encoder `Options.level` defaults to 1
+/// because the Zig CLI prioritizes speed. Both surfaces are public; the
+/// difference is intentional and the per-call value carries through.
 const CompressOpts = extern struct {
     level: c_int = 5,
     enable_profiling: c_int = 0,
     reserved: [6]c_int = .{0} ** 6,
 };
 
-// ── slzDecompressOpts_t — must match the header struct layout ─────────
+/// Mirror of `slzDecompressOpts_t`.
 const DecompressOpts = extern struct {
     enable_profiling: c_int = 0,
     reserved: [7]c_int = .{0} ** 7,
 };
 
-// ── slzKernelTiming_t — must match the header struct layout ───────────
+/// Mirror of `slzKernelTiming_t`.
 const KernelTimingC = extern struct {
     name: [*:0]const u8,
     ms: f32,
 };
+
+comptime {
+    // Both Opts structs are `8 * sizeof(c_int)` = 32 bytes on every
+    // platform we target (LP64 / LLP64 with 32-bit `int`). Lock the
+    // size so a stray field addition that breaks the C ABI fails to
+    // compile.
+    std.debug.assert(@sizeOf(CompressOpts) == 8 * @sizeOf(c_int));
+    std.debug.assert(@sizeOf(DecompressOpts) == 8 * @sizeOf(c_int));
+    std.debug.assert(@offsetOf(CompressOpts, "level") == 0);
+    std.debug.assert(@offsetOf(CompressOpts, "enable_profiling") == @sizeOf(c_int));
+    std.debug.assert(@offsetOf(CompressOpts, "reserved") == 2 * @sizeOf(c_int));
+    std.debug.assert(@offsetOf(DecompressOpts, "enable_profiling") == 0);
+    std.debug.assert(@offsetOf(DecompressOpts, "reserved") == @sizeOf(c_int));
+    // `slzKernelTiming_t` is `const char* + float` with trailing pad to
+    // pointer alignment on 64-bit. Lock the offset, leave the trailing
+    // padding to the platform.
+    std.debug.assert(@offsetOf(KernelTimingC, "name") == 0);
+    std.debug.assert(@offsetOf(KernelTimingC, "ms") == @sizeOf(*anyopaque));
+}
 
 /// Library handle. Owns the per-operation GPU contexts so concurrent
 /// handles cannot corrupt one another.
@@ -416,6 +449,14 @@ export fn slzDecompressDefaultOpts() DecompressOpts {
 }
 
 // ── Size queries ──────────────────────────────────────────────────────
+
+/// Worst-case compressed-frame size for `input_size` input bytes. The
+/// bound is level-independent: it sizes the worst-case
+/// uncompressed-body shape (verbatim source + all frame / block /
+/// chunk / sub-chunk headers + the SC tail prefix table). `opts` is
+/// therefore intentionally unread - callers may pass
+/// `slzCompressDefaultOpts()` or a per-call configuration without
+/// affecting the result.
 export fn slzCompressBound(
     handle: ?*Context,
     input_size: usize,

@@ -82,6 +82,16 @@ pub const DecompressResult = struct {
     offset: usize = 0,
 };
 
+/// Decompress one SLZ1 frame from host bytes `src` into host bytes
+/// `dst`. The compressed bytes are H2D-copied inside the GPU dispatch;
+/// the decompressed bytes are D2H'd back into `dst`.
+///
+/// Returns the number of bytes written to `dst` (always equal to the
+/// frame's declared `content_size` when the call succeeds).
+///
+/// Caller owns `dec_ctx`. The context is reused across calls so its
+/// device buffers can grow; the caller is responsible for calling
+/// `dec_ctx.deinit()` when done with the context.
 pub fn decompressFramed(
     src: []const u8,
     dst: []u8,
@@ -91,6 +101,16 @@ pub fn decompressFramed(
     return r.written;
 }
 
+/// Same contract as `decompressFramed`, plus optional `std.Io` for
+/// telemetry (per-phase elapsed times via `SLZ_E2E_TIMER` /
+/// `SLZ_SPLIT_TIMER` are gated on `io != null`). Returns the structured
+/// `DecompressResult` so the offset field is observable to callers that
+/// want it; `decompressFramed` is a `.written`-only convenience.
+///
+/// The `allocator` parameter is currently unused (the dispatch takes
+/// the allocator from the encode/decode context). Plumbed in for ABI
+/// compat with the previous CPU codec entry point; callers can pass
+/// `undefined`.
 pub fn decompressFramedThreaded(
     allocator: std.mem.Allocator,
     io: ?std.Io,
