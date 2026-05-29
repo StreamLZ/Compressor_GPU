@@ -9,7 +9,7 @@
 //!
 //! Sub-module layout:
 //!   cuda_api.zig         - nvcuda.dll handle, CU* typedefs, cu*_fn slots,
-//!                          getProc, qpcNow / qpcMs, NUM_PIPELINE_STREAMS
+//!                          getProc, qpcNow / qpcMs
 //!   module_loader.zig    - PTX load, kernel-handle pub vars, init(),
 //!                          isAvailable(), ensurePipelineStreams
 //!   descriptors.zig      - ChunkDesc, KernelTiming, PendingTiming,

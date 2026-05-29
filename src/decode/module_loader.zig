@@ -199,23 +199,11 @@ pub fn init() bool {
 /// fall through to the non-pipelined branch of fullGpuLaunchImpl, which
 /// never launches the Huffman kernels and silently produces zero literals.
 ///
-/// On partial failure (some streams created, then a later one fails) we
-/// destroy the partials before returning the error, so the context never
-/// observes `pipeline_streams_created = true` with a half-populated array.
 pub fn ensurePipelineStreams(d_ctx: *dec_ctx.DecodeContext) d.GpuError!void {
-    if (d_ctx.pipeline_streams_created) return;
+    if (d_ctx.pipeline_stream_created) return;
     const create_fn = cuda.cuStreamCreate_fn orelse return error.BackendNotAvailable;
-    var created: usize = 0;
-    errdefer if (cuda.cuStreamDestroy_fn) |destroy_fn| {
-        for (d_ctx.pipeline_streams[0..created]) |s| {
-            if (s != 0) _ = destroy_fn(s);
-        }
-        d_ctx.pipeline_streams = .{0} ** cuda.NUM_PIPELINE_STREAMS;
-    };
-    while (created < cuda.NUM_PIPELINE_STREAMS) : (created += 1) {
-        if (create_fn(&d_ctx.pipeline_streams[created], 1) != CUDA_SUCCESS) return error.BackendNotAvailable;
-    }
-    d_ctx.pipeline_streams_created = true;
+    if (create_fn(&d_ctx.pipeline_stream, 1) != CUDA_SUCCESS) return error.BackendNotAvailable;
+    d_ctx.pipeline_stream_created = true;
 }
 
 pub fn isAvailable() bool {

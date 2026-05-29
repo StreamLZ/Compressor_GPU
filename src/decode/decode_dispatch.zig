@@ -20,7 +20,6 @@ const scan_gpu_mod = @import("scan_gpu.zig");
 
 const CUdeviceptr = cuda.CUdeviceptr;
 const CUDA_SUCCESS = cuda.CUDA_SUCCESS;
-const NUM_PIPELINE_STREAMS = cuda.NUM_PIPELINE_STREAMS;
 
 const ChunkDesc = d.ChunkDesc;
 const HuffDecChunkDesc = d.HuffDecChunkDesc;
@@ -309,14 +308,12 @@ fn runHuffPredecode(
     return split_huff_build_ns;
 }
 
-/// Launches the per-pipeline-stream LZ decode kernels. Uses the lean
-/// raw kernel when no Huffman streams are present (L1/L2 path);
-/// otherwise the general kernel that consumes `d_entropy_scratch`.
-/// Operations within a stream are ordered; across streams they can
-/// overlap.
+/// Launches the LZ decode kernel. Uses the lean raw kernel when no
+/// Huffman streams are present (L1/L2 path); otherwise the general
+/// kernel that consumes `d_entropy_scratch`.
 ///
-/// Returns the per-launch summed LZ elapsed nanoseconds when
-/// `split_timer` is set; otherwise zero.
+/// Returns the kernel's elapsed nanoseconds when `split_timer` is set;
+/// otherwise zero.
 fn runLzPipeline(
     self: *DecodeContext,
     fns: *const Fns,
@@ -325,115 +322,92 @@ fn runLzPipeline(
     n_huff: u32,
     total_chunks: u32,
     total_subchunks: u32,
-    pipe_chunk_count: u32,
     heavy_stream: usize,
     split_timer: bool,
     io: ?std.Io,
-    /// Device address holding the self-gate count (`*p_total` for the
-    /// LZ kernel). When the D2D path supplies `req.d_n_chunks_dev`,
+    /// Device address holding the self-gate count. On the D2D path
     /// this is `d_walk_meta + offset(n_chunks)` (no H2D round-trip);
     /// otherwise `self.d_n_groups_scratch` after the host-staging H2D
     /// in `fullGpuLaunchImpl`.
     total_dev: CUdeviceptr,
     /// Base device address the LZ kernel writes decompressed bytes
-    /// into. Normally `self.d_output` (library scratch). On the D2D
-    /// fast path the caller routes the caller-supplied
-    /// `req.d_output_target` here so the kernel writes straight to
-    /// the caller's buffer — skips the ~1.1 ms / 100 MB finalize D2D
-    /// copy that otherwise stages through d_output. Requires
-    /// `req.dst_start_off == 0` (no host-side prefix to splice in).
+    /// into. Normally `self.d_output`; on the direct-write fast path
+    /// the caller routes `req.d_output_target` here so the kernel
+    /// skips the finalize D2D copy.
     dst_base: CUdeviceptr,
 ) GpuError!i64 {
     const launch_fn = fns.launch;
     const stream_sync_fn = fns.stream_sync;
+    const stream = heavy_stream;
 
     var split_lz_ns: i64 = 0;
+    if (total_chunks == 0) return split_lz_ns;
 
-    for (0..NUM_PIPELINE_STREAMS) |g| {
-        const stream: usize = if (comptime NUM_PIPELINE_STREAMS == 1) heavy_stream else self.pipeline_streams[g];
-        const chunk_start = @as(u32, @intCast(g)) * pipe_chunk_count;
-        const chunk_end = @min(chunk_start + pipe_chunk_count, total_chunks);
-        const group_chunks = chunk_end - chunk_start;
-        if (group_chunks == 0) continue;
+    const t_lz_start = if (split_timer)
+        if (io) |io_val| std.Io.Clock.awake.now(io_val) else null
+    else
+        null;
 
-        const t_lz_start = if (split_timer)
-            if (io) |io_val| std.Io.Clock.awake.now(io_val) else null
-        else
-            null;
+    const lz_groups = (total_chunks + chunks_per_group - 1) / chunks_per_group;
+    const lz_grid_x = (lz_groups + 1) / 2;
 
-        // chunks pointer = full array (NOT offset), chunk_base = chunk_start
-        // total = chunk_end so the kernel's bounds check (chunk_idx >= total) works
-        const lz_groups_in_pipe = (group_chunks + chunks_per_group - 1) / chunks_per_group;
-        const lz_grid_x = (lz_groups_in_pipe + 1) / 2;
+    // Fast path: no entropy in this scan → use lean L1/L2 raw kernel.
+    // Huffman literals require the general kernel (it reads entropy_scratch).
+    const use_raw_kernel = n_huff == 0 and ml.kernel_raw_fn != 0;
 
-        // The LZ kernel's self-gate count comes via the `total_dev`
-        // parameter; fullGpuLaunchImpl is responsible for arranging the
-        // backing storage (either `d_n_groups_scratch` staged by host
-        // H2D, or `d_walk_meta + offset(n_chunks)` on the D2D path).
-        // At NUM_PIPELINE_STREAMS == 1 this hoist is correct because
-        // chunk_end - chunk_start == total_chunks when the loop runs once;
-        // a future bump to N > 1 needs N device counters.
+    // The six shared params (comp, descs_dev, dst, cpg, total, sc_cap)
+    // live in a small struct so each field has a stable address for the
+    // kernel-params array.
+    var common = LzCommonParams{
+        .comp = self.d_comp_persist,
+        .descs_dev = self.d_descs_persist,
+        .dst = dst_base,
+        .cpg = chunks_per_group,
+        .total = total_dev,
+        .sc_cap = sub_chunk_cap,
+    };
 
-        // Fast path: no entropy in this scan → use lean L1/L2 raw kernel.
-        // Huffman literals require the general kernel (it reads entropy_scratch).
-        const use_raw_kernel = n_huff == 0 and ml.kernel_raw_fn != 0;
-
-        // The six shared params (comp, descs_dev, dst, cpg, total, sc_cap)
-        // live in a small struct so each field has a stable address for
-        // the kernel-params array.
-        var common = LzCommonParams{
-            .comp = self.d_comp_persist,
-            .descs_dev = self.d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc),
-            .dst = dst_base,
-            .cpg = chunks_per_group,
-            .total = total_dev,
-            .sc_cap = sub_chunk_cap,
+    if (use_raw_kernel) {
+        var raw_params = [_]?*anyopaque{
+            @ptrCast(&common.comp),
+            @ptrCast(&common.descs_dev),
+            @ptrCast(&common.dst),
+            @ptrCast(&common.cpg),
+            @ptrCast(&common.total),
+            @ptrCast(&common.sc_cap),
         };
+        var raw_extra = [_]?*anyopaque{null};
+        const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", stream);
+        try cudaCall(launch_fn(ml.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra), .launch);
+        endKernelTiming(t_lzr, stream);
+    } else {
+        var p_entropy_scratch: u64 = self.d_entropy_scratch;
+        var p_entropy_slot_stride: u64 = @as(u64, total_subchunks) * d.ENTROPY_SCRATCH_SLOT_BYTES;
+        var p_first_sub_idx: CUdeviceptr = self.d_first_subchunk_idx;
 
-        if (use_raw_kernel) {
-            var raw_params = [_]?*anyopaque{
-                @ptrCast(&common.comp),
-                @ptrCast(&common.descs_dev),
-                @ptrCast(&common.dst),
-                @ptrCast(&common.cpg),
-                @ptrCast(&common.total),
-                @ptrCast(&common.sc_cap),
-            };
-            var raw_extra = [_]?*anyopaque{null};
-            const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", stream);
-            try cudaCall(launch_fn(ml.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra), .launch);
-            endKernelTiming(t_lzr, stream);
-        } else {
-            // General kernel adds entropy_scratch + slot_stride + first_sub_idx.
-            var p_entropy_scratch: u64 = self.d_entropy_scratch;
-            var p_entropy_slot_stride: u64 = @as(u64, total_subchunks) * d.ENTROPY_SCRATCH_SLOT_BYTES;
-            var p_first_sub_idx: CUdeviceptr = self.d_first_subchunk_idx +
-                if (self.d_first_subchunk_idx != 0) @as(u64, chunk_start) * @sizeOf(u32) else 0;
+        var lz_params = [_]?*anyopaque{
+            @ptrCast(&common.comp),
+            @ptrCast(&common.descs_dev),
+            @ptrCast(&common.dst),
+            @ptrCast(&common.cpg),
+            @ptrCast(&common.total),
+            @ptrCast(&common.sc_cap),
+            @ptrCast(&p_entropy_scratch),
+            @ptrCast(&p_entropy_slot_stride),
+            @ptrCast(&p_first_sub_idx),
+        };
+        var lz_extra = [_]?*anyopaque{null};
 
-            var lz_params = [_]?*anyopaque{
-                @ptrCast(&common.comp),
-                @ptrCast(&common.descs_dev),
-                @ptrCast(&common.dst),
-                @ptrCast(&common.cpg),
-                @ptrCast(&common.total),
-                @ptrCast(&common.sc_cap),
-                @ptrCast(&p_entropy_scratch),
-                @ptrCast(&p_entropy_slot_stride),
-                @ptrCast(&p_first_sub_idx),
-            };
-            var lz_extra = [_]?*anyopaque{null};
+        const t_lz = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeKernel", stream);
+        try cudaCall(launch_fn(ml.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra), .launch);
+        endKernelTiming(t_lz, stream);
+    }
 
-            const t_lz = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeKernel", stream);
-            try cudaCall(launch_fn(ml.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra), .launch);
-            endKernelTiming(t_lz, stream);
-        }
-
-        if (split_timer) {
-            try cudaCall(stream_sync_fn(stream), .sync);
-            if (t_lz_start) |ts_start| {
-                if (io) |io_val| {
-                    split_lz_ns += nsSince(ts_start, io_val);
-                }
+    if (split_timer) {
+        try cudaCall(stream_sync_fn(stream), .sync);
+        if (t_lz_start) |ts_start| {
+            if (io) |io_val| {
+                split_lz_ns += nsSince(ts_start, io_val);
             }
         }
     }
@@ -627,30 +601,15 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     }
 
     const total_chunks: u32 = @intCast(chunk_descs.len);
-    // `ml.ensurePipelineStreams(self)` at entry to this function
-    // guarantees `pipeline_streams_created` here; the check is a
-    // belt-and-suspenders against a future refactor that reorders init.
-    if (!self.pipeline_streams_created) return error.BackendNotAvailable;
-    // When the caller is slzDecompressAsync, work_stream is the caller's
-    // CUstream so its cudaStreamSynchronize waits for the decompress to
-    // land in d_output. The sync wrapper leaves work_stream at 0 and
-    // falls back to the library's own pipeline_streams[0].
-    const heavy_stream: usize = if (self.work_stream != 0) self.work_stream else self.pipeline_streams[0];
+    if (!self.pipeline_stream_created) return error.BackendNotAvailable;
+    // `heavy_stream` carries the back half (huff + LZ + finalize). In
+    // async mode the caller's stream IS the heavy stream so their
+    // `cudaStreamSynchronize` waits for the decompress to land. In sync
+    // mode we use the library-owned `pipeline_stream`; the front-half
+    // work was queued on stream 0, so a cross-stream barrier is needed
+    // before the back half can read its results.
+    const heavy_stream: usize = if (self.work_stream != 0) self.work_stream else self.pipeline_stream;
     {
-        const pipe_chunk_count = (total_chunks + NUM_PIPELINE_STREAMS - 1) / NUM_PIPELINE_STREAMS;
-        // Front-half work (walk + prefix-sum + scan + compact + merge +
-        // gather + descs D2D) is queued on self.work_stream. Back-half
-        // (huff + LZ + finalize) is queued on heavy_stream.
-        //
-        // In async mode (self.work_stream != 0) the caller's stream is
-        // both work_stream and heavy_stream — same stream, so stream
-        // ordering alone gives the back-half its view of front-half
-        // results. The sync is pure host-wait overhead. nsys measured
-        // 12 µs median, 1.6 ms worst case on the bench.
-        //
-        // In sync mode (work_stream == 0) heavy_stream is
-        // pipeline_streams[0], a different stream — the back-half won't
-        // see the front-half's writes without an explicit barrier.
         if (heavy_stream != self.work_stream) {
             try cudaCall(fns.stream_sync(self.work_stream), .sync);
         }
@@ -704,18 +663,16 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             split_huff_build_ns = try runHuffPredecode(self, &fns, n_huff, heavy_stream, split_timer, t_huff_start, io);
         }
 
-        // Launch pipelined groups: one LZ launch per pipeline stream.
-        // Operations within a stream are ordered; across streams they can overlap.
         const stream_sync_fn = fns.stream_sync;
 
         var split_lz_ns: i64 = 0;
         var split_huff_ns: i64 = 0;
 
-        // Close Huff time slice: sync the pipeline stream so the LZ
-        // measurement excludes Huff time. (split_timer rules out graph
-        // mode above; the inner sync is safe.)
+        // Close the Huff time slice: sync `heavy_stream` so the LZ
+        // measurement excludes Huff time. `split_timer` rules out a
+        // future graph-mode capture, so the inner sync is safe.
         if (split_timer and have_huff) {
-            try cudaCall(stream_sync_fn(self.pipeline_streams[0]), .sync);
+            try cudaCall(stream_sync_fn(heavy_stream), .sync);
             if (t_huff_start) |hs| {
                 if (io) |io_val| {
                     split_huff_ns = nsSince(hs, io_val);
@@ -735,7 +692,6 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             n_huff,
             total_chunks,
             total_subchunks,
-            pipe_chunk_count,
             heavy_stream,
             split_timer,
             io,
@@ -743,25 +699,14 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             lz_dst_base,
         );
 
-        // Sync all pipeline streams - UNLESS the caller is async
-        // (work_stream set). In async mode we leave the queued work on
-        // the user's stream and let them sync; blocking here would
-        // defeat the purpose.
-        //
-        // Failure handling: first stream's sync failure aborts and
-        // returns; remaining streams' work is left running on the
-        // device. Safe at NUM_PIPELINE_STREAMS == 1 (only one stream
-        // exists). If the constant is ever bumped to > 1, revisit:
-        // either drain remaining streams before returning (loses the
-        // specific failing stream's rc in the print) or accept the
-        // existing first-fail-wins semantics with a clearer comment.
+        // Sync the back-half stream — unless the caller is async, in
+        // which case we leave the queued work on their stream for them
+        // to sync.
         if (self.work_stream == 0) {
-            for (0..NUM_PIPELINE_STREAMS) |g| {
-                const sync_rc = stream_sync_fn(self.pipeline_streams[g]);
-                if (sync_rc != CUDA_SUCCESS) {
-                    std.debug.print("GPU pipe[{d}]: stream sync FAILED rc={d}\n", .{ g, sync_rc });
-                    return error.SyncFailed;
-                }
+            const sync_rc = stream_sync_fn(heavy_stream);
+            if (sync_rc != CUDA_SUCCESS) {
+                std.debug.print("GPU heavy stream: sync FAILED rc={d}\n", .{sync_rc});
+                return error.SyncFailed;
             }
         }
 

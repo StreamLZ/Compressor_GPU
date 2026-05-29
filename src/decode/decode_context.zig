@@ -276,11 +276,11 @@ pub const DecodeContext = struct {
     d_huff_lut: CUdeviceptr = 0,
     d_huff_lut_size: usize = 0,
 
-    // Pipeline streams (persistent, created once in init). Stays sized by
-    // cuda.NUM_PIPELINE_STREAMS even though it currently equals 1, so a
-    // future bump just re-evaluates the comptime length.
-    pipeline_streams: [cuda.NUM_PIPELINE_STREAMS]usize = @splat(0),
-    pipeline_streams_created: bool = false,
+    // Library-owned CUstream used as `heavy_stream` whenever the caller
+    // didn't provide one (sync wrapper). Created once at init and
+    // destroyed in deinit.
+    pipeline_stream: usize = 0,
+    pipeline_stream_created: bool = false,
 
 
 
@@ -347,15 +347,13 @@ pub const DecodeContext = struct {
         }
         self.h_pinned_output_size = 0;
 
-        // Persistent pipeline streams created in ensurePipelineStreams.
-        if (self.pipeline_streams_created) {
+        // Persistent pipeline stream created in `ensurePipelineStreams`.
+        if (self.pipeline_stream_created) {
             if (cuda.cuStreamDestroy_fn) |destroy_fn| {
-                for (self.pipeline_streams) |s| {
-                    if (s != 0) _ = destroy_fn(s);
-                }
+                if (self.pipeline_stream != 0) _ = destroy_fn(self.pipeline_stream);
             }
-            self.pipeline_streams = @splat(0);
-            self.pipeline_streams_created = false;
+            self.pipeline_stream = 0;
+            self.pipeline_stream_created = false;
         }
 
         self.pending_timings.deinit(std.heap.page_allocator);
