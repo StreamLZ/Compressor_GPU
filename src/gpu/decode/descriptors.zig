@@ -138,18 +138,6 @@ pub const walk_meta_offsets = struct {
     pub const bytes: usize = 24;
 };
 
-/// Host-side mirror of the walk kernel's meta. Used only by code paths
-/// that still need the values on the host (the legacy / fallback
-/// decompress entries). The pure-D2D path never calls this.
-pub const WalkMeta = struct {
-    n_chunks: u32,
-    decomp_size: u32,
-    sub_chunk_cap: u32,
-    block_start: u32,
-    block_size: u32,
-    status: u32,
-};
-
 /// 4d Phase 3 step 2: device-side prefix sum of per-chunk sub-chunk
 /// counts. Reads (d_chunk_descs, d_n_chunks, d_sub_chunk_cap) - all
 /// device-resident - and writes (d_first_sub_idx, d_total_subchunks).

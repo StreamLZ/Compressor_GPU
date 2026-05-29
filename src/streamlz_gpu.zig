@@ -291,12 +291,9 @@ const DecompressJobTrueD2D = struct {
     /// When non-zero, the decode driver queues huff + LZ + output D2D on
     /// this stream and skips its final sync — the caller is the sync.
     work_stream: usize = 0,
-    /// Phase 3-final C: caller-known decompressed size (typically from
-    /// slzGetDecompressedSize). When > 0, the decoder skips the
-    /// walkMetaToHost D2H sync (~0.66 ms host block) and computes the
-    /// block_start / block_size from the slzCompress-shape invariants.
-    /// 0 = legacy path with D2H meta on host.
-    expected_decomp_size: u32 = 0,
+    /// Caller-supplied decompressed byte count, required by the v3 ABI
+    /// (slzGetDecompressedSize gives it once per archive).
+    decomp_size: u32 = 0,
     result: c_int = SLZ_ERROR_CUDA,
     fall_back: bool = false,
 
@@ -312,13 +309,12 @@ const DecompressJobTrueD2D = struct {
             j.h.dec.work_stream = 0;
         }
         const n = decoder.decompressFramedFromDevice(
-            allocator,
             null,
             j.d_src,
             j.src_size,
             j.d_dst,
             &j.h.dec,
-            j.expected_decomp_size,
+            j.decomp_size,
         ) catch |err| {
             if (isGpuFallbackError(err)) {
                 j.fall_back = true;
@@ -577,11 +573,7 @@ export fn slzDecompressAsync(
         .d_dst = @intFromPtr(out_dev),
         .opts = opts,
         .work_stream = @intFromPtr(stream),
-        // Phase 3-final C: pass through to skip walkMetaToHost. The
-        // caller normally gets output_size from slzGetDecompressedSize
-        // (one 64-byte D2H per archive, not per call). Passing 0 keeps
-        // the legacy walkMetaToHost path for compatibility.
-        .expected_decomp_size = @intCast(output_size),
+        .decomp_size = @intCast(output_size),
     };
     // Run inline on the caller's thread (nvCOMP-style — no per-call
     // thread spawn). The host front half (walk + scan + prefix-sum +

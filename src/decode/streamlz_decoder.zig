@@ -101,94 +101,49 @@ pub fn decompressFramedParallelThreaded(
     return decompressFramedInner(allocator, io, src, dst, max_threads, dec_ctx, null, use_gpu);
 }
 
-/// 4d Phase 3 TRUE D2D decompress. The compressed frame is already at
-/// `d_frame` (device); the walk runs on the GPU (gpuWalkFrameImpl), the
-/// decode pipeline reads from the device-resident frame and writes the
-/// decoded bytes to `d_output` (device). Zero host bounce of the payload
-/// or frame bytes. Limited to the slzCompress shape — Fast codec, no
-/// dictionary, no parallel-decode-metadata, no checksums, single block;
-/// returns error.BadMode otherwise so the caller can fall back to the
-/// host-bounce path. Returns the decompressed byte count.
+/// True-D2D decompress for the v3 C ABI. Compressed frame is device-
+/// resident at `d_frame`; the walk runs on the GPU and writes the chunk
+/// descriptors + meta directly to device memory; the LZ kernel writes
+/// straight into the caller's `d_output`. Zero host bounce.
+///
+/// `decomp_size` is the caller-supplied decompressed byte count (from
+/// slzGetDecompressedSize or the caller's own metadata); the v3 C ABI
+/// contract requires it. Frame shape is the slzCompress invariant:
+/// Fast codec, no dictionary / PDM / checksums, single block,
+/// content_size_present, sc_group=0.25 → eff_chunk_size 64 KB. Frames
+/// that violate the shape produce garbage output (per CPU/GPU separate
+/// formats contract); the C ABI rejects them via the SHA verify in the
+/// caller's stream-sync.
 pub fn decompressFramedFromDevice(
-    allocator: std.mem.Allocator,
     io: ?std.Io,
     d_frame: u64,
     frame_size: u32,
     d_output: u64,
     dec_ctx: *gpu_driver.DecodeContext,
-    /// Phase 3-final C: when > 0, the caller has already obtained the
-    /// decompressed size (typically from slzGetDecompressedSize once per
-    /// archive). The decoder skips the post-walk walkMetaToHost D2H +
-    /// stream sync (~0.6 ms host block on enwik8-class workloads) and
-    /// computes block_start / block_size from the slzCompress-shape
-    /// frame layout invariants:
-    ///   frame: [14 hdr][8 content_size][8 block hdr][block payload][4 end]
-    ///   block_start = 30
-    ///   block_size  = frame_size - 34
-    /// The LZ kernel's self-gate count (n_chunks) flows device-only via
-    /// d_walk_meta + n_chunks_offset — no H2D restage. Pass 0 to fall
-    /// back to the legacy walkMetaToHost path.
-    expected_decomp_size: u32,
+    decomp_size: u32,
 ) DecompressError!u32 {
-    _ = allocator; // Phase 3: chunks no longer allocated host-side.
-    // Step 1: walk kernel — device-only result, no D2H inside the launch.
-    // GpuError variants from gpuWalkFrameImpl (OutOfDeviceMemory /
-    // KernelLaunchFailed / SyncFailed / BackendNotAvailable / KernelMissing /
-    // CopyFailed for the memset) propagate to the caller; no flattening.
+    // Frame layout: [14 hdr][8 content_size][8 block hdr][block][4 end].
+    const block_start: u32 = 30;
+    if (frame_size < 34) return error.BadMode;
+    const block_size: u32 = frame_size - 34;
+    // sc_group=0.25 ⇒ eff_chunk_size = 64 KB ⇒ n_chunks = ceil(decomp / 64 KB).
+    // The LZ kernel self-gates on d_walk_meta+0 (real count written by the
+    // walk kernel), so this bound only sizes the chunk-desc + grid space.
+    const EFF_CHUNK_SIZE_64K: u32 = 0x10000;
+    const n_chunks_bound: u32 = (decomp_size + EFF_CHUNK_SIZE_64K - 1) / EFF_CHUNK_SIZE_64K;
+    if (n_chunks_bound == 0 or n_chunks_bound > gpu_driver.WALK_MAX_CHUNKS) return error.BadMode;
+    if (std.c.getenv("SLZ_E2E_TIMER") != null)
+        std.debug.print("[walk] decomp={d} block_start={d} block_size={d} n_chunks_bound={d}\n", .{ decomp_size, block_start, block_size, n_chunks_bound });
+
+    // Walk runs on the device; meta + chunk descs flow back through
+    // d_walk_meta / d_walk_chunks without any D2H.
     const dev = try gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size);
 
-    var decomp_size: u32 = undefined;
-    var block_start: u32 = undefined;
-    var block_size: u32 = undefined;
-    var n_chunks_bound: u32 = undefined;
-
-    if (expected_decomp_size > 0) {
-        // Phase 3-final C fast path: caller-known size + slzCompress-shape
-        // constants. No host block on the walk kernel.
-        decomp_size = expected_decomp_size;
-        block_start = 30; // SLZ_FRAME_MIN_HDR_SIZE (14) + content_size (8) + block hdr (8)
-        if (frame_size < 34) return error.BadMode;
-        block_size = frame_size - 34; // strip header + block hdr + end marker
-        // slzCompress-shape frames use sc_group_size = 0.25 → eff_chunk_size
-        // = 64KB (the GPU encode default; see project_gpu_sc025_status). The
-        // walk produces ceil(decomp_size / 64KB) chunks, NOT
-        // ceil(decomp / 256KB). Hard-coding the 0.25 invariant: a future
-        // caller that wants to feed non-0.25 frames through the async D2D
-        // path must either fall back to the legacy walkMetaToHost branch
-        // (pass expected_decomp_size = 0) or extend the public API with
-        // a sc_group hint.
-        const EFF_CHUNK_SIZE_64K: u32 = 0x10000;
-        n_chunks_bound = (decomp_size + EFF_CHUNK_SIZE_64K - 1) / EFF_CHUNK_SIZE_64K;
-        if (n_chunks_bound == 0 or n_chunks_bound > gpu_driver.WALK_MAX_CHUNKS) return error.BadMode;
-        if (std.c.getenv("SLZ_E2E_TIMER") != null)
-            std.debug.print("[fast-walk] decomp={d} block_start={d} block_size={d} n_chunks_bound={d}\n", .{ decomp_size, block_start, block_size, n_chunks_bound });
-    } else {
-        // Legacy slow path: D2H meta from device — keeps source-compat
-        // with callers that haven't plumbed output_size through.
-        const meta = try gpu_driver.walkMetaToHost(dev.d_meta, dec_ctx.work_stream);
-        if (meta.n_chunks == 0 or meta.n_chunks > gpu_driver.WALK_MAX_CHUNKS) return error.BadMode;
-        if (std.c.getenv("SLZ_E2E_TIMER") != null)
-            std.debug.print("[walk] n_chunks={d} decomp={d} block_start={d} block_size={d} status={d}\n", .{ meta.n_chunks, meta.decomp_size, meta.block_start, meta.block_size, meta.status });
-        decomp_size = meta.decomp_size;
-        block_start = meta.block_start;
-        block_size = meta.block_size;
-        n_chunks_bound = meta.n_chunks;
-    }
-
-    const chunks_per_group: u32 = 1;
-
-    // src_offsets in chunks are block-payload-relative — matches the CPU
-    // walk in gpuBatchDecode. d_compressed_src points at the block payload
-    // (d_frame + block_start) so d_comp_persist holds exactly the block,
-    // matching the CLI path's H2D layout.
+    // The chunks and compressed_block slices are length-only stubs — the
+    // LZ kernel reads from d_chunk_descs_override and d_compressed_src
+    // directly. Stub pointers (0x10) just satisfy the slice type.
     const stub_ptr: [*]const u8 = @ptrFromInt(0x10);
     const compressed_block: []const u8 = stub_ptr[0..block_size];
-
-    // chunks slice is a length-only stub. In the fast path .len is a
-    // host-computed upper bound on actual n_chunks; the LZ kernel
-    // self-gates on the device-resident d_walk_meta+0 (real count
-    // written by the walk kernel via stream ordering), so over-launched
-    // CTAs just return early.
     const chunk_stub_ptr: [*]const gpu_driver.ChunkDesc = @ptrFromInt(0x10);
     const chunks_stub: []const gpu_driver.ChunkDesc = chunk_stub_ptr[0..n_chunks_bound];
 
@@ -199,19 +154,16 @@ pub fn decompressFramedFromDevice(
         .dst_full = @ptrCast(&dst_dummy),
         .dst_start_off = 0,
         .decompressed_size = decomp_size,
-        .chunks_per_group = chunks_per_group,
-        // sub_chunk_cap is unconditionally the entropy-scratch slot
-        // stride — the walk kernel writes this exact constant to
-        // d_meta (walk_frame_kernel.cuh:97), we used to D2H it back
-        // and pass it through. Use the constant directly.
+        .chunks_per_group = 1,
+        // sub_chunk_cap is unconditionally the entropy-scratch slot stride
+        // (the walk kernel writes this exact constant to d_meta).
         .sub_chunk_cap = @intCast(gpu_driver.ENTROPY_SCRATCH_SLOT_BYTES),
         .io = io,
         .d_output_target = d_output,
         .d_compressed_src = d_frame + block_start,
         .d_chunk_descs_override = dev.d_chunk_descs,
-        // Phase 3-final B: LZ kernel reads its self-gate count from
-        // the walk kernel's d_meta output region via stream ordering.
-        // No H2D round trip.
+        // LZ kernel reads its self-gate count from d_walk_meta + offset
+        // via stream ordering — no H2D round trip.
         .d_n_chunks_dev = dev.d_meta + gpu_driver.walk_meta_offsets.n_chunks,
     }) catch |err| return err;
     return decomp_size;

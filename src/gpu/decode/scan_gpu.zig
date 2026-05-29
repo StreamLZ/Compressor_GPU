@@ -141,26 +141,6 @@ pub fn gpuPrefixSumChunksImpl(
     };
 }
 
-/// D2H the walk metadata struct from the device.
-/// Phase 3c: now async on `stream` + stream-targeted sync — preserves
-/// caller's other-stream parallelism (the prior synchronous cuMemcpyDtoH
-/// implicitly stalled stream 0 against every other stream in the context).
-/// Status check is the caller's responsibility — the GPU decode contract
-/// is that the input frame came from the GPU encode path; CPU-produced
-/// frames (dict / multi-block / PDM / checksumed) are out of scope and
-/// allowed to fail loudly (see feedback_cpu_gpu_separate_formats).
-pub fn walkMetaToHost(d_meta: u64, stream: usize) GpuError!d.WalkMeta {
-    const d2h_async = cuda.cuMemcpyDtoHAsync_fn orelse return error.BackendNotAvailable;
-    const stream_sync = cuda.cuStreamSync_fn orelse return error.BackendNotAvailable;
-    var m: [6]u32 = .{0} ** 6;
-    try cudaCall(d2h_async(@ptrCast(&m), d_meta, d.walk_meta_offsets.bytes, stream), .copy);
-    try cudaCall(stream_sync(stream), .sync);
-    return .{
-        .n_chunks = m[0], .decomp_size = m[1], .sub_chunk_cap = m[2],
-        .block_start = m[3], .block_size = m[4], .status = m[5],
-    };
-}
-
 pub fn gpuScanChunks(
     self: *DecodeContext,
     chunk_descs: []const d.ChunkDesc,

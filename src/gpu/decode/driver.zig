@@ -13,14 +13,14 @@
 //!   module_loader.zig    - PTX load, kernel-handle pub vars, init(),
 //!                          isAvailable(), ensurePipelineStreams
 //!   descriptors.zig      - ChunkDesc / HuffDecChunkDesc / RawOff16Desc /
-//!                          ScanResult / WalkFrameResultDev / WalkMeta /
+//!                          ScanResult / WalkFrameResultDev /
 //!                          KernelTiming / PendingTiming, HUFF_LUT_ENTRIES,
 //!                          WALK_MAX_CHUNKS, GpuError
 //!   decode_context.zig   - DecodeContext, ensureDeviceBuf / Output,
 //!                          alloc/free/copy helpers, profiling fns
 //!   scan_host.zig        - scanForEntropyChunks + local header parsers
 //!   scan_gpu.zig         - gpuWalkFrameImpl, gpuPrefixSumChunksImpl,
-//!                          walkMetaToHost, gpuScanChunks
+//!                          gpuScanChunks
 //!   decode_dispatch.zig  - fullGpuLaunch / fullGpuLaunchImpl + the
 //!                          per-decode helpers (dumpScanIfRequested,
 //!                          emitE2eTrace, gatherRawOff16, mergeHuffDescs)
@@ -48,7 +48,6 @@ pub const ScanHuffDesc = d.ScanHuffDesc;
 pub const ScanRawDesc = d.ScanRawDesc;
 pub const ScanResult = d.ScanResult;
 pub const WalkFrameResultDev = d.WalkFrameResultDev;
-pub const WalkMeta = d.WalkMeta;
 pub const KernelTiming = d.KernelTiming;
 pub const PendingTiming = d.PendingTiming;
 pub const GpuError = d.GpuError;
@@ -71,7 +70,6 @@ pub const finalizeProfiling = dc.finalizeProfiling;
 // ── Decode pipeline entry points ──────────────────────────────
 pub const gpuWalkFrameImpl = sg.gpuWalkFrameImpl;
 pub const gpuPrefixSumChunksImpl = sg.gpuPrefixSumChunksImpl;
-pub const walkMetaToHost = sg.walkMetaToHost;
 pub const fullGpuLaunch = dd.fullGpuLaunch;
 pub const fullGpuLaunchImpl = dd.fullGpuLaunchImpl;
 
