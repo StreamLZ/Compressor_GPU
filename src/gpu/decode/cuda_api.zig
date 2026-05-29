@@ -89,44 +89,6 @@ pub const FnEventSynchronize = *const fn (usize) callconv(.c) CUresult;
 pub const FnEventElapsedTime = *const fn (*f32, usize, usize) callconv(.c) CUresult;
 pub const FnEventDestroy = *const fn (usize) callconv(.c) CUresult;
 
-// ── CUDA Graph API ────────────────────────────────────────────────────
-// Phase 4: capture the post-walk-meta decode pipeline as a CUgraph once,
-// then replay it via cuGraphLaunch on subsequent calls. The per-call
-// kernel params (n_chunks, decomp_size, etc.) get updated via
-// cuGraphExecKernelNodeSetParams.
-//
-// CUstreamCaptureMode_enum — global mode is the standard, simplest choice
-// (capture everything submitted on this stream until cuStreamEndCapture).
-pub const CU_STREAM_CAPTURE_MODE_GLOBAL: c_uint = 0;
-
-// CUDA_KERNEL_NODE_PARAMS_st — CUDA 12+ layout, 11 fields. ABI must
-// match nvcuda.dll. The struct is mirrored here as `extern` so its
-// layout is stable for cuGraphExecKernelNodeSetParams calls.
-pub const CudaKernelNodeParams = extern struct {
-    func: usize, // CUfunction
-    grid_dim_x: c_uint,
-    grid_dim_y: c_uint,
-    grid_dim_z: c_uint,
-    block_dim_x: c_uint,
-    block_dim_y: c_uint,
-    block_dim_z: c_uint,
-    shared_mem_bytes: c_uint,
-    kernel_params: ?[*]?*anyopaque,
-    extra: ?[*]?*anyopaque,
-    // CUDA 12+ additions; pass null/zero for normal use.
-    kern: usize, // CUkernel
-    ctx: usize, // CUcontext
-};
-
-pub const FnStreamBeginCapture = *const fn (usize, c_uint) callconv(.c) CUresult;
-pub const FnStreamEndCapture = *const fn (usize, *usize) callconv(.c) CUresult;
-pub const FnGraphInstantiate = *const fn (*usize, usize, *usize, [*]u8, usize) callconv(.c) CUresult;
-pub const FnGraphLaunch = *const fn (usize, usize) callconv(.c) CUresult;
-pub const FnGraphDestroy = *const fn (usize) callconv(.c) CUresult;
-pub const FnGraphExecDestroy = *const fn (usize) callconv(.c) CUresult;
-pub const FnGraphGetNodes = *const fn (usize, [*]usize, *usize) callconv(.c) CUresult;
-pub const FnGraphExecKernelNodeSetParams = *const fn (usize, usize, *const CudaKernelNodeParams) callconv(.c) CUresult;
-
 pub var cuInit_fn: ?FnInit = null;
 pub var cuDeviceGet_fn: ?FnDeviceGet = null;
 pub var cuDeviceGetAttribute_fn: ?FnDeviceGetAttribute = null;
@@ -165,15 +127,6 @@ pub var cuEventRecord_fn: ?FnEventRecord = null;
 pub var cuEventSynchronize_fn: ?FnEventSynchronize = null;
 pub var cuEventElapsedTime_fn: ?FnEventElapsedTime = null;
 pub var cuEventDestroy_fn: ?FnEventDestroy = null;
-
-pub var cuStreamBeginCapture_fn: ?FnStreamBeginCapture = null;
-pub var cuStreamEndCapture_fn: ?FnStreamEndCapture = null;
-pub var cuGraphInstantiate_fn: ?FnGraphInstantiate = null;
-pub var cuGraphLaunch_fn: ?FnGraphLaunch = null;
-pub var cuGraphDestroy_fn: ?FnGraphDestroy = null;
-pub var cuGraphExecDestroy_fn: ?FnGraphExecDestroy = null;
-pub var cuGraphGetNodes_fn: ?FnGraphGetNodes = null;
-pub var cuGraphExecKernelNodeSetParams_fn: ?FnGraphExecKernelNodeSetParams = null;
 
 /// Pipeline streams (persistent, created once in init). Owned by each
 /// DecodeContext; the numeric width drives `DecodeContext.pipeline_streams`.
