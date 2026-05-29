@@ -67,6 +67,6 @@ pub const gpuEncodeLiteralsHuffImpl = encode_huff.gpuEncodeLiteralsHuffImpl;
 pub const gpuEncodeTokensHuffImpl = encode_huff.gpuEncodeTokensHuffImpl;
 pub const gpuEncodeOff16HuffImpl = encode_huff.gpuEncodeOff16HuffImpl;
 
-// ── Frame assembly (4d device-resident compress) ──────────────
+// ── Frame assembly (device-resident compress) ────────────────────────
 pub const gpuAssembleFrameImpl = encode_assemble.gpuAssembleFrameImpl;
 pub const gpuFrameAssembleImpl = encode_assemble.gpuFrameAssembleImpl;

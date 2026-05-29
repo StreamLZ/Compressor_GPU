@@ -171,7 +171,7 @@ pub const EncodeContext = struct {
     d_huff_sizes_persist: CUdeviceptr = 0,
     d_huff_sizes_size: usize = 0,
 
-    // ── Frame-assembly (4d device-resident compress) device buffers ──
+    // ── Frame-assembly (device-resident compress) device buffers ─────
     d_asm_huff_lit: CUdeviceptr = 0,
     d_asm_huff_lit_size: usize = 0,
     d_asm_huff_tok: CUdeviceptr = 0,

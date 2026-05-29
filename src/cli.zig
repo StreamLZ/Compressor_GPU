@@ -70,6 +70,6 @@ pub fn run(process_init: std.process.Init) !void {
 
     if (args.report_mem) {
         const mem = util.getMemInfo();
-        try w.print("MEMORY: {d:.0} MB peak commit\n", .{mem.commit_mb});
+        try w.print("MEMORY: {d:.0} MB peak RSS, {d:.0} MB peak commit\n", .{ mem.peak_rss_mb, mem.commit_mb });
     }
 }

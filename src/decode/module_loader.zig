@@ -179,12 +179,12 @@ pub fn init() bool {
         });
     }
 
-    // Create persistent pipeline streams (CU_STREAM_NON_BLOCKING = 1)
+    // Create the persistent pipeline stream (CU_STREAM_NON_BLOCKING = 1)
     // on the module-default context. Per-handle DecodeContexts get the
-    // same treatment lazily in `ensurePipelineStreams` below. Failure
+    // same treatment lazily in `ensurePipelineStream` below. Failure
     // here transitions the loader to `.failed` (the errdefer above doesn't
     // fire because the call returns void - propagate manually).
-    ensurePipelineStreams(&@import("driver.zig").g_default) catch {
+    ensurePipelineStream(&@import("driver.zig").g_default) catch {
         cuda.init_state = .failed;
         return false;
     };
@@ -193,13 +193,10 @@ pub fn init() bool {
     return true;
 }
 
-/// Lazily allocate the persistent pipeline streams on `ctx`. Called from
+/// Lazily allocate the persistent pipeline stream on `ctx`. Called from
 /// init() for g_default and from fullGpuLaunchImpl for any per-handle
-/// context that hasn't created them yet. Without this, h.dec contexts
-/// fall through to the non-pipelined branch of fullGpuLaunchImpl, which
-/// never launches the Huffman kernels and silently produces zero literals.
-///
-pub fn ensurePipelineStreams(d_ctx: *decode_context.DecodeContext) descriptors.GpuError!void {
+/// context that hasn't created its stream yet.
+pub fn ensurePipelineStream(d_ctx: *decode_context.DecodeContext) descriptors.GpuError!void {
     if (d_ctx.pipeline_stream_created) return;
     const create_fn = cuda.cuStreamCreate_fn orelse return error.BackendNotAvailable;
     if (create_fn(&d_ctx.pipeline_stream, 1) != CUDA_SUCCESS) return error.BackendNotAvailable;

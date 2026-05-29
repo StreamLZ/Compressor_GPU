@@ -360,7 +360,7 @@ pub const DecodeContext = struct {
         }
         self.h_pinned_output_size = 0;
 
-        // Persistent pipeline stream created in `ensurePipelineStreams`.
+        // Persistent pipeline stream created in `ensurePipelineStream`.
         if (self.pipeline_stream_created) {
             if (cuda.cuStreamDestroy_fn) |destroy_fn| {
                 if (self.pipeline_stream != 0) _ = destroy_fn(self.pipeline_stream);

@@ -38,6 +38,8 @@ const cuda_api = @import("../decode/cuda_api.zig");
 /// (more sub-chunks → more parallel warps) beats sc_group=0.5 (larger
 /// sub-chunks → better ratio).
 const decoder_warps_per_sm: usize = 48;
+/// Bytes each decoder warp consumes per sub-chunk at sc_group=0.5
+/// (the 128 KB sub-chunk size — sc_group encodes a fraction of 256 KB).
 const sc05_bytes_per_warp: usize = 128 * 1024;
 
 /// Per-sub-chunk staging headroom for the raw LZ payload. Three bytes

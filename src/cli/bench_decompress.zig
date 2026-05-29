@@ -5,7 +5,7 @@
 const std = @import("std");
 const util = @import("util.zig");
 const decoder = @import("../decode/streamlz_decoder.zig");
-const gpu_driver = @import("../decode/driver.zig");
+const gpu_dec_driver = @import("../decode/driver.zig");
 const frame = @import("../format/frame_format.zig");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: util.Args) !void {
@@ -33,7 +33,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     const dst_size = content_size + decoder.safe_space;
     const DstBuf = struct { buf: []u8, pinned: bool };
     const dh: DstBuf = blk: {
-        if (gpu_driver.allocHost(dst_size)) |p| break :blk .{ .buf = p, .pinned = true };
+        if (gpu_dec_driver.allocHost(dst_size)) |p| break :blk .{ .buf = p, .pinned = true };
         break :blk .{ .buf = allocator.alloc(u8, dst_size) catch |err| {
             try w.print("error: cannot allocate {d} bytes: {s}\n", .{ dst_size, @errorName(err) });
             try w.flush();
@@ -41,7 +41,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
         }, .pinned = false };
     };
     const dst = dh.buf;
-    defer if (dh.pinned) gpu_driver.freeHost(dst) else allocator.free(dst);
+    defer if (dh.pinned) gpu_dec_driver.freeHost(dst) else allocator.free(dst);
 
     var dec_ctx = decoder.DecompressContext.initWithIo(allocator, io);
     defer dec_ctx.deinit();
@@ -68,17 +68,17 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
         const elapsed = @as(u64, @intCast(t0.untilNow(io, .awake).toNanoseconds()));
         if (elapsed < best_ns) best_ns = elapsed;
         total_ns += elapsed;
-        if (gpu_driver.last_kernel_ns > 0) {
-            if (gpu_driver.last_kernel_ns < best_kern_ns) best_kern_ns = gpu_driver.last_kernel_ns;
-            total_kern_ns += gpu_driver.last_kernel_ns;
+        if (gpu_dec_driver.last_kernel_ns > 0) {
+            if (gpu_dec_driver.last_kernel_ns < best_kern_ns) best_kern_ns = gpu_dec_driver.last_kernel_ns;
+            total_kern_ns += gpu_dec_driver.last_kernel_ns;
         }
-        if (gpu_driver.last_lz_kernel_ns > 0) {
-            if (gpu_driver.last_lz_kernel_ns < best_lz_ns) best_lz_ns = gpu_driver.last_lz_kernel_ns;
-            total_lz_ns += gpu_driver.last_lz_kernel_ns;
+        if (gpu_dec_driver.last_lz_kernel_ns > 0) {
+            if (gpu_dec_driver.last_lz_kernel_ns < best_lz_ns) best_lz_ns = gpu_dec_driver.last_lz_kernel_ns;
+            total_lz_ns += gpu_dec_driver.last_lz_kernel_ns;
         }
-        if (gpu_driver.last_huff_kernel_ns > 0) {
-            if (gpu_driver.last_huff_kernel_ns < best_huff_ns) best_huff_ns = gpu_driver.last_huff_kernel_ns;
-            total_huff_ns += gpu_driver.last_huff_kernel_ns;
+        if (gpu_dec_driver.last_huff_kernel_ns > 0) {
+            if (gpu_dec_driver.last_huff_kernel_ns < best_huff_ns) best_huff_ns = gpu_dec_driver.last_huff_kernel_ns;
+            total_huff_ns += gpu_dec_driver.last_huff_kernel_ns;
         }
     }
 

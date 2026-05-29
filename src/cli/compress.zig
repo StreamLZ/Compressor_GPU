@@ -3,7 +3,7 @@
 const std = @import("std");
 const util = @import("util.zig");
 const encoder = @import("../encode/streamlz_encoder.zig");
-const gpu_encoder = @import("../encode/driver.zig");
+const gpu_enc_driver = @import("../encode/driver.zig");
 const mmap_helpers = @import("../mmap.zig");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: util.Args) !void {
@@ -63,7 +63,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     const written = encoder.compressFramedWithIo(allocator, io, src, out_map.slice(), .{
         .level = args.level,
         .sc_group_size_override = args.sc_group,
-    }, &gpu_encoder.g_default) catch |err| {
+    }, &gpu_enc_driver.g_default) catch |err| {
         out_map.unmap();
         try w.print("error: compression failed: {s}\n", .{@errorName(err)});
         try w.flush();
@@ -82,10 +82,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
         src.len, written, ratio, args.level, in_path, out_path,
     });
 
-    if (gpu_encoder.last_kernel_ns > 0) {
-        const kms: f64 = @as(f64, @floatFromInt(gpu_encoder.last_kernel_ns)) / 1e6;
+    if (gpu_enc_driver.last_kernel_ns > 0) {
+        const kms: f64 = @as(f64, @floatFromInt(gpu_enc_driver.last_kernel_ns)) / 1e6;
         const kmbps: f64 = @as(f64, @floatFromInt(src.len)) / (1024.0 * 1024.0) * 1e9 /
-            @as(f64, @floatFromInt(gpu_encoder.last_kernel_ns));
+            @as(f64, @floatFromInt(gpu_enc_driver.last_kernel_ns));
         try w.print("  GPU kernel: {d:.1}ms ({d:.0} MB/s)\n", .{ kms, kmbps });
     }
 }

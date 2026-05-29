@@ -77,6 +77,24 @@ const LzCommonParams = struct {
     sub_chunk_cap: u32,
 };
 
+/// `slzMergeHuffDescsKernel` parameter bundle. Held as a struct so
+/// every field has a stable address for the CUDA kernel-params array
+/// (which takes `&field` pointers).
+const MergeHuffParams = struct {
+    lit: u64,
+    tok: u64,
+    hi: u64,
+    lo: u64,
+    n_lit: u64,
+    n_tok: u64,
+    n_hi: u64,
+    n_lo: u64,
+    tok_region: u32,
+    off16_region: u32,
+    merged: u64,
+    n_merged: u64,
+};
+
 /// Pre-decode preparation: combine the four per-stream-type Huffman
 /// descriptor arrays into one merged device array in `self.d_huff_descs`,
 /// with out_offsets adjusted by the per-stream-type region offset and
@@ -90,23 +108,25 @@ fn mergeHuffDescs(
     off16_offset: usize,
     launch_fn: anytype,
 ) GpuError!void {
-    var k_lit: u64 = self.d_compact_lit;
-    var k_tok: u64 = self.d_compact_tok;
-    var k_hi: u64 = self.d_compact_hi;
-    var k_lo: u64 = self.d_compact_lo;
-    var k_n_lit: u64 = self.d_compact_counts + 0;
-    var k_n_tok: u64 = self.d_compact_counts + 4;
-    var k_n_hi: u64 = self.d_compact_counts + 8;
-    var k_n_lo: u64 = self.d_compact_counts + 12;
-    var k_tok_region: u32 = @intCast(tok_offset);
-    var k_off16_region: u32 = @intCast(off16_offset);
-    var k_merged: u64 = self.d_huff_descs;
-    var k_n_merged: u64 = self.d_compact_counts + 20;
+    var args = MergeHuffParams{
+        .lit = self.d_compact_lit,
+        .tok = self.d_compact_tok,
+        .hi = self.d_compact_hi,
+        .lo = self.d_compact_lo,
+        .n_lit = self.d_compact_counts,
+        .n_tok = self.d_compact_counts + 4,
+        .n_hi = self.d_compact_counts + 8,
+        .n_lo = self.d_compact_counts + 12,
+        .tok_region = @intCast(tok_offset),
+        .off16_region = @intCast(off16_offset),
+        .merged = self.d_huff_descs,
+        .n_merged = self.d_compact_counts + 20,
+    };
     var m_params = [_]?*anyopaque{
-        @ptrCast(&k_lit),         @ptrCast(&k_tok),          @ptrCast(&k_hi),       @ptrCast(&k_lo),
-        @ptrCast(&k_n_lit),       @ptrCast(&k_n_tok),        @ptrCast(&k_n_hi),     @ptrCast(&k_n_lo),
-        @ptrCast(&k_tok_region),  @ptrCast(&k_off16_region),
-        @ptrCast(&k_merged),      @ptrCast(&k_n_merged),
+        @ptrCast(&args.lit),        @ptrCast(&args.tok),          @ptrCast(&args.hi),       @ptrCast(&args.lo),
+        @ptrCast(&args.n_lit),      @ptrCast(&args.n_tok),        @ptrCast(&args.n_hi),     @ptrCast(&args.n_lo),
+        @ptrCast(&args.tok_region), @ptrCast(&args.off16_region),
+        @ptrCast(&args.merged),     @ptrCast(&args.n_merged),
     };
     var m_extra = [_]?*anyopaque{null};
     const stream = self.work_stream;
@@ -128,12 +148,17 @@ fn mergeHuffDescs(
 fn gatherRawOff16(
     self: *DecodeContext,
     scan: ScanResult,
-    compressed_block: []const u8,
+    comp_len: u32,
     launch_fn: anytype,
 ) GpuError!void {
+    // Defensive guard: `num_raw_off16` is unconditionally set to
+    // `total_subchunks * 2` by `gpuScanChunks`, and `total_subchunks
+    // == 0` is filtered earlier in the dispatch. The zero-check is
+    // kept against a future scan implementation that does report real
+    // raw counts; today it never fires.
     if (scan.num_raw_off16 == 0) return;
     var p_comp: u64 = self.d_comp_persist;
-    var p_comp_len: u32 = @intCast(compressed_block.len);
+    var p_comp_len: u32 = comp_len;
     var p_scratch: u64 = self.d_entropy_off16_scratch;
     var p_descs: u64 = self.d_compact_raw;
     var p_count: u64 = self.d_compact_counts + 16;
@@ -158,10 +183,13 @@ fn gatherRawOff16(
 /// nanoseconds since `t0`. Populated incrementally between phases of
 /// `fullGpuLaunchImpl` so `emitE2eTrace` can recover per-phase deltas.
 const E2eCumulative = struct {
-    /// End of host-to-device input upload (or D2D copy).
+    /// End of upload + prefix-sum (the H2D / D2D of the chunk descs and
+    /// compressed bytes plus the device-side prefix-sum kernel). The
+    /// `preBlk` column in the trace is the slice from here to
+    /// `postscan` (the in-line scan kernel queue), which after the
+    /// phase extraction is empty — the column is kept so emitted
+    /// columns line up with historical traces.
     h2d: i64 = 0,
-    /// Just before the entropy scan kernel queues.
-    prescan: i64 = 0,
     /// Just after the scan kernel, before raw-off16 gather.
     postscan: i64 = 0,
     /// End of the scan phase (after raw-off16 gather).
@@ -192,8 +220,12 @@ fn emitE2eTrace(
     last_kernel: i64,
 ) void {
     const cum_end_ns: i64 = nsSince(t0, io);
-    const preblk_ns = cum.prescan - cum.h2d;
-    const scanfn_ns = cum.postscan - cum.prescan;
+    // After the phase extraction the `preBlk` slice is empty (the
+    // prefix-sum kernel queue moved into `uploadInputAndPrefixSum`,
+    // so there is no code between the `h2d` and `postscan` boundaries).
+    // Keep the column for trace-format stability; it reads as 0.000.
+    const preblk_ns: i64 = 0;
+    const scanfn_ns = cum.postscan - cum.h2d;
     const rawcopy_ns = cum.scan - cum.postscan;
     const prep_ns = (cum.predh - cum.scan) - last_kernel;
     std.debug.print("  [e2e] setup+H2D {d:.3}  preBlk {d:.3}  scanFn {d:.3}  rawD2D {d:.3}  prep {d:.3}  kernels {d:.3}  D2H {d:.3}  total {d:.3} ms\n", .{
@@ -244,6 +276,17 @@ pub const DecodeRequest = struct {
     /// host round-trip. Null preserves the CLI / host-bounce behavior
     /// (`total_chunks` H2D'd into `d_n_groups_scratch`).
     d_n_chunks_dev: ?u64 = null,
+
+    /// True when the LZ kernel can write decompressed bytes straight
+    /// into the caller's device buffer (no `dst_start_off` prefix to
+    /// splice in, and a `d_output_target` was supplied). On this path
+    /// the back half routes the LZ kernel's `dst` to `d_output_target`
+    /// and the finalize phase skips the D2D copy that would otherwise
+    /// stage through `self.d_output`. Used by `runBackHalf` and
+    /// `fullGpuLaunchImpl` to keep the predicate in one place.
+    pub fn writesDirectlyToTarget(self: DecodeRequest) bool {
+        return self.d_output_target != null and self.dst_start_off == 0;
+    }
 };
 
 /// Launches the Huffman LUT-build kernel and the 4-stream decode
@@ -581,8 +624,7 @@ fn runBackHalf(
     // device output target AND there's no host prefix to splice in,
     // the LZ kernel writes straight to the caller's buffer, skipping
     // the finalize D2D copy.
-    const write_direct: bool = req.d_output_target != null and req.dst_start_off == 0;
-    const lz_dst_base_dev: CUdeviceptr = if (write_direct) req.d_output_target.? else self.d_output;
+    const lz_dst_base_dev: CUdeviceptr = if (req.writesDirectlyToTarget()) req.d_output_target.? else self.d_output;
 
     const t_huff_start = if (split_timer and have_huff)
         if (io) |io_val| std.Io.Clock.awake.now(io_val) else null
@@ -593,7 +635,6 @@ fn runBackHalf(
         split_huff_build_ns = try runHuffBuildAndDecode(self, procs, n_huff, heavy_stream, split_timer, t_huff_start, io);
     }
 
-    var split_lz_ns: i64 = 0;
     var split_huff_ns: i64 = 0;
 
     // Close the Huff time slice: sync `heavy_stream` so the LZ
@@ -612,7 +653,7 @@ fn runBackHalf(
         });
     }
 
-    split_lz_ns = try runLzPipeline(
+    const split_lz_ns = try runLzPipeline(
         self, procs,
         req.chunks_per_group, req.sub_chunk_cap, n_huff,
         total_chunks, layout.total_subchunks,
@@ -647,7 +688,7 @@ fn runBackHalf(
 pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void {
     if (!module_loader.init()) return error.BackendNotAvailable;
     if (module_loader.kernel_fn == 0) return error.KernelMissing;
-    try module_loader.ensurePipelineStreams(self);
+    try module_loader.ensurePipelineStream(self);
 
     const facade = @import("driver.zig");
     const io = req.io;
@@ -666,7 +707,10 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     const layout = try uploadInputAndPrefixSum(self, req, &procs);
     if (t_e2e0) |t0| if (io) |io_val| {
         e2e_cum.h2d = nsSince(t0, io_val);
-        e2e_cum.prescan = nsSince(t0, io_val);
+        // `postscan` defaults to the same boundary so the trace columns
+        // collapse cleanly when the scan-skipped path runs (rare:
+        // requires `huff_build_fn == 0`).
+        e2e_cum.postscan = e2e_cum.h2d;
     };
 
     // Phase 2: scan + raw-off16 gather. The GPU scan kernel reads from
@@ -685,7 +729,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         if (t_e2e0) |t0| if (io) |io_val| {
             e2e_cum.postscan = nsSince(t0, io_val);
         };
-        try gatherRawOff16(self, scan, req.compressed_block, procs.launch);
+        try gatherRawOff16(self, scan, @intCast(req.compressed_block.len), procs.launch);
     }
     if (t_e2e0) |t0| if (io) |io_val| {
         e2e_cum.scan = nsSince(t0, io_val);
@@ -703,10 +747,10 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         try mergeHuffDescs(self, layout.tok_offset, layout.off16_offset, procs.launch);
     }
 
-    if (!self.pipeline_stream_created) return error.BackendNotAvailable;
     // `heavy_stream` carries the back half (huff + LZ + finalize). In
     // async mode the caller's stream IS the heavy stream; in sync mode
-    // we use the library-owned `pipeline_stream`.
+    // we use the library-owned `pipeline_stream` (guaranteed populated
+    // by the unconditional `ensurePipelineStream` call above).
     const heavy_stream: usize = if (self.work_stream != 0) self.work_stream else self.pipeline_stream;
     const total_chunks: u32 = @intCast(req.chunk_descs.len);
 
@@ -716,11 +760,10 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         e2e_cum.predh = nsSince(t0, io_val);
     };
 
-    // Phase 5: finalize, profiling drain, e2e emit. The
-    // direct-write-to-output fast path also skips the finalize D2D,
-    // matching the `write_direct` branch inside runBackHalf.
-    const skip_finalize = req.d_output_target != null and req.dst_start_off == 0;
-    if (!skip_finalize) {
+    // Phase 5: finalize, profiling drain, e2e emit. Skip the finalize
+    // D2D when the LZ kernel already wrote straight to the caller's
+    // device buffer — same predicate as the LZ dst-pick in runBackHalf.
+    if (!req.writesDirectlyToTarget()) {
         try finalizeOutput(self, &procs, req, heavy_stream);
     }
     if (self.work_stream == 0) {

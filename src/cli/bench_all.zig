@@ -5,7 +5,7 @@ const std = @import("std");
 const util = @import("util.zig");
 const encoder = @import("../encode/streamlz_encoder.zig");
 const decoder = @import("../decode/streamlz_decoder.zig");
-const gpu_encoder = @import("../encode/driver.zig");
+const gpu_enc_driver = @import("../encode/driver.zig");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: util.Args) !void {
     const in_path = util.requireInput(args, w);
@@ -44,7 +44,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
             .sc_group_size_override = args.sc_group,
         };
         const t_comp = std.Io.Clock.awake.now(io);
-        const comp_size = encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_encoder.g_default) catch |err| {
+        const comp_size = encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_enc_driver.g_default) catch |err| {
             try w.print("  L{d}: compress failed: {s}\n", .{ level, @errorName(err) });
             results[idx] = .{ .level = level, .comp_size = 0, .ratio = 0, .comp_mbps = 0, .dec_mbps = 0, .pass = false };
             continue;

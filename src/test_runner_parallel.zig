@@ -37,12 +37,17 @@ fn workerFn() void {
 pub fn main() void {
     test_fns = builtin.test_functions;
 
+    // 16 is the cap on parallel workers — past that, GPU contention
+    // (limited streams + serialized cuLaunchKernel) erases parallelism
+    // benefits while inflating peak memory. The stack array uses the
+    // same constant to match.
+    const MAX_WORKERS = 16;
     const cpu_count = std.Thread.getCpuCount() catch 4;
-    const worker_count: usize = @min(cpu_count, 16);
+    const worker_count: usize = @min(cpu_count, MAX_WORKERS);
 
     std.debug.print("Running {d} tests on {d} threads...\n", .{ test_fns.len, worker_count });
 
-    var threads: [16]?std.Thread = @splat(null);
+    var threads: [MAX_WORKERS]?std.Thread = @splat(null);
     for (0..worker_count) |wi| {
         threads[wi] = std.Thread.spawn(.{}, workerFn, .{}) catch null;
     }

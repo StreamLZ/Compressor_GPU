@@ -4,7 +4,7 @@
 const std = @import("std");
 const util = @import("util.zig");
 const decoder = @import("../decode/streamlz_decoder.zig");
-const gpu_driver = @import("../decode/driver.zig");
+const gpu_dec_driver = @import("../decode/driver.zig");
 const frame = @import("../format/frame_format.zig");
 const mmap_helpers = @import("../mmap.zig");
 
@@ -80,7 +80,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
         std.process.exit(1);
     };
 
-    const result = decoder.decompressFramedThreaded(allocator, io, src, out_map.slice(), &gpu_driver.g_default) catch |err| {
+    const result = decoder.decompressFramedThreaded(allocator, io, src, out_map.slice(), &gpu_dec_driver.g_default) catch |err| {
         out_map.unmap();
         try w.print("error: decompression failed: {s}\n", .{@errorName(err)});
         try w.flush();

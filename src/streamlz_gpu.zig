@@ -47,17 +47,13 @@ const device_only_host_stub_addr: usize = 0x10;
 /// and whose `.len` is `len`. Encoder paths that consult `.len` (for
 /// chunk-count math, descriptor sizing, etc.) work normally; any
 /// accidental read of the bytes will fault on a guaranteed-invalid
-/// pointer rather than corrupting silently.
+/// pointer rather than corrupting silently. The encoder's only
+/// remaining host-read site (`fast_framed.writeUncompressedFrame`)
+/// is unreachable for async-D2D inputs thanks to the size guards in
+/// `slzCompressAsync` below.
 fn deviceOnlySrcStub(len: usize) []const u8 {
     const ptr: [*]const u8 = @ptrFromInt(device_only_host_stub_addr);
     return ptr[0..len];
-}
-
-/// True if `src` is a sentinel slice built by `deviceOnlySrcStub`.
-/// Use at every host-read site that takes a `src: []const u8` to
-/// catch a forgotten device-resident path before it segfaults.
-fn isDeviceOnlySrcStub(src: []const u8) bool {
-    return @intFromPtr(src.ptr) == device_only_host_stub_addr;
 }
 
 // ── Status codes ───────────────────────────────────────────────────────
@@ -120,6 +116,7 @@ comptime {
     // padding to the platform.
     std.debug.assert(@offsetOf(KernelTimingC, "name") == 0);
     std.debug.assert(@offsetOf(KernelTimingC, "ms") == @sizeOf(*anyopaque));
+    std.debug.assert(@sizeOf(KernelTimingC) == 2 * @sizeOf(*anyopaque));
 }
 
 /// Library handle. Owns the per-operation GPU contexts so concurrent
@@ -236,7 +233,8 @@ fn isGpuFallbackError(err: anyerror) bool {
 // ── Codec cores — run on the worker thread ────────────────────────────
 // Each returns the byte count (>= 0) or a negative SLZ_ERROR_* code.
 fn compressCore(h: *Context, input: []const u8, output: []u8, opts: CompressOpts) c_int {
-    if (opts.level < 1 or opts.level > 5) return SLZ_ERROR_UNSUPPORTED;
+    // Level range is validated by `encoder.compressFramed` (returns
+    // `error.BadLevel` → SLZ_ERROR_UNSUPPORTED via mapCompressError).
     const n = encoder.compressFramed(
         allocator,
         input,
@@ -593,6 +591,10 @@ export fn slzCompressAsync(
     // whole call. Not done yet — the threshold rejects only inputs no
     // realistic D2D caller would feed.
     const async_min_input: usize = 128 + 1;
+    // 16384 sub-chunks × 64 KB minimum sub-chunk = 1 GiB. Inputs above
+    // this would either overflow the assembly chunk cap or, at larger
+    // sc_group, are gated by a higher per-call ceiling we don't apply
+    // here (callers chunk on the API side for that case).
     const async_max_input: usize = @as(usize, 16384) * 65536;
     if (input_size < async_min_input or input_size > async_max_input)
         return SLZ_ERROR_UNSUPPORTED;

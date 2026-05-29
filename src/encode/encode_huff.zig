@@ -258,21 +258,11 @@ pub fn gpuEncodeOff16HuffImpl(
         descs[i] = .{ .src_offset = 0, .src_size = 0, .src_stride = 2, .dst_offset = total, .dst_capacity = 0 };
         descs[n + i] = .{ .src_offset = 0, .src_size = 0, .src_stride = 2, .dst_offset = total, .dst_capacity = 0 };
 
-        if (cs < init_b + 6) continue;
-        const lit_hdr: u32 = base + init_b;
-        const lit_count: u32 =
-            (@as(u32, output[lit_hdr]) << 16) |
-            (@as(u32, output[lit_hdr + 1]) << 8) |
-            @as(u32, output[lit_hdr + 2]);
-        const tok_hdr: u32 = lit_hdr + 3 + lit_count;
-        if (tok_hdr + 3 > base + cs) continue;
-        const tok_count: u32 =
-            (@as(u32, output[tok_hdr]) << 16) |
-            (@as(u32, output[tok_hdr + 1]) << 8) |
-            @as(u32, output[tok_hdr + 2]);
-
+        // Walk the LZ output to the end of the token stream, then jump
+        // the optional cmd_stream2_offset to land on the off16 header.
+        const tok = walkStream(output, base, cs, init_b, .tok) orelse continue;
+        const after_tok: u32 = tok.src + tok.count;
         // cmd_stream2_offset (2 bytes) is present when sub-chunk > 64KB.
-        const after_tok: u32 = tok_hdr + 3 + tok_count;
         const cmd2_size: u32 = if (chunk_descs[i].src_size > 0x10000) 2 else 0;
         const off16_hdr: u32 = after_tok + cmd2_size;
         if (off16_hdr + 2 > base + cs) continue;

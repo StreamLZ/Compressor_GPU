@@ -6,8 +6,8 @@ const std = @import("std");
 const util = @import("util.zig");
 const encoder = @import("../encode/streamlz_encoder.zig");
 const decoder = @import("../decode/streamlz_decoder.zig");
-const gpu_encoder = @import("../encode/driver.zig");
-const gpu_driver = @import("../decode/driver.zig");
+const gpu_enc_driver = @import("../encode/driver.zig");
+const gpu_dec_driver = @import("../decode/driver.zig");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: util.Args) !void {
     const in_path = util.requireInput(args, w);
@@ -32,10 +32,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
         .sc_group_size_override = args.sc_group,
     };
 
-    var comp_size: usize = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_encoder.g_default);
+    var comp_size: usize = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_enc_driver.g_default);
     {
         const t0 = std.Io.Clock.awake.now(io);
-        comp_size = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_encoder.g_default);
+        comp_size = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_enc_driver.g_default);
         const ns = @as(u64, @intCast(t0.untilNow(io, .awake).toNanoseconds()));
         const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
         try w.print("  Compress: {d:.0}ms ({d:.1} MB/s)\n", .{ ms, mb * 1000.0 / ms });
@@ -61,7 +61,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
         const t0 = std.Io.Clock.awake.now(io);
         _ = try dec_ctx.decompress(compressed[0..comp_size], decompressed);
         dec_times[r] = @as(u64, @intCast(t0.untilNow(io, .awake).toNanoseconds()));
-        kern_times[r] = gpu_driver.last_kernel_ns;
+        kern_times[r] = gpu_dec_driver.last_kernel_ns;
         const ms = @as(f64, @floatFromInt(dec_times[r])) / 1_000_000.0;
         const kms = @as(f64, @floatFromInt(kern_times[r])) / 1_000_000.0;
         if (kern_times[r] > 0) {
@@ -75,9 +75,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
 
     const dec_med_ns = util.medianOrMean(dec_times);
     const dec_med_ms = @as(f64, @floatFromInt(dec_med_ns)) / 1_000_000.0;
-    var nonzero_kerns: [256]i64 = undefined;
+    const nonzero_kerns = try allocator.alloc(i64, runs);
+    defer allocator.free(nonzero_kerns);
     var nz_count: usize = 0;
-    for (kern_times) |k| if (k > 0 and nz_count < nonzero_kerns.len) {
+    for (kern_times) |k| if (k > 0) {
         nonzero_kerns[nz_count] = k;
         nz_count += 1;
     };

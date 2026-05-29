@@ -166,9 +166,9 @@ pub fn parseChunkHeader(src: []const u8, use_checksum: bool) ParseError!ChunkHea
 }
 
 
-// ────────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────
 //  Tests
-// ────────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 test "parseBlockHeader rejects bad magic" {
@@ -237,8 +237,3 @@ test "parseChunkHeader parses memset chunk" {
     try testing.expectEqual(@as(u8, 0x42), ch.memset_fill);
     try testing.expectEqual(@as(usize, 5), ch.bytes_consumed);
 }
-
-// ────────────────────────────────────────────────────────────
-//  Write-side tests
-// ────────────────────────────────────────────────────────────
-

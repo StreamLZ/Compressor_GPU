@@ -7,7 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const version_mod = @import("../version.zig");
 
-pub const version_string = version_mod.string;
+const version_string = version_mod.string;
 
 pub const Mode = enum { compress, decompress, bench, bench_decompress, bench_all, info, version, help };
 
@@ -65,9 +65,9 @@ pub fn parseArgs(raw: []const []const u8, w: *std.Io.Writer) Args {
     return result;
 }
 
-pub fn eql(a: []const u8, b: []const u8) bool { return std.mem.eql(u8, a, b); }
+fn eql(a: []const u8, b: []const u8) bool { return std.mem.eql(u8, a, b); }
 
-pub fn expect(raw: []const []const u8, i: usize, flag: []const u8, w: *std.Io.Writer) []const u8 {
+fn expect(raw: []const []const u8, i: usize, flag: []const u8, w: *std.Io.Writer) []const u8 {
     if (i >= raw.len) {
         w.print("error: {s} requires a value\n", .{flag}) catch {};
         w.flush() catch {};
@@ -76,7 +76,7 @@ pub fn expect(raw: []const []const u8, i: usize, flag: []const u8, w: *std.Io.Wr
     return raw[i];
 }
 
-pub fn parseInt(comptime T: type, s: []const u8, w: *std.Io.Writer, flag: []const u8) T {
+fn parseInt(comptime T: type, s: []const u8, w: *std.Io.Writer, flag: []const u8) T {
     return std.fmt.parseInt(T, s, 10) catch {
         w.print("error: invalid {s} value '{s}'\n", .{ flag, s }) catch {};
         w.flush() catch {};
@@ -106,7 +106,7 @@ pub fn printUsage(w: *std.Io.Writer) !void {
         \\  -d              Decompress
         \\  -b              Compress + decompress + round-trip verify
         \\  -db             Decompress benchmark on a .slz file
-        \\  -ba             Sweep levels L1-L5: compress + decompress ratio/speed table
+        \\  -ba             Sweep levels L1-L5: compress + decompress ratio/speed table (-l ignored)
         \\  -i              Dump frame header + block list
         \\
         \\Options:
@@ -225,7 +225,7 @@ pub fn fmtMbps(buf: []u8, value: f64) []const u8 {
 
 // ── Process memory ─────────────────────────────────────────────────────
 
-pub const MemInfo = struct { peak_rss_mb: f64, commit_mb: f64 };
+const MemInfo = struct { peak_rss_mb: f64, commit_mb: f64 };
 
 pub fn getMemInfo() MemInfo {
     const os = builtin.os.tag;

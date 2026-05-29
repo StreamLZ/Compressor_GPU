@@ -44,23 +44,22 @@ pub fn gpuAssembleFrameImpl(
     // Per-stream Huffman metadata. L1/L2 do not run the Huffman pass so
     // all six per-stream slots are null; in that case the assembly
     // kernel sees `huff_*_size == 0` for every sub-chunk and emits raw
-    // (chunk-type=0) for that stream. Zero-fill scratch arrays let us
-    // keep one kernel-side branch instead of two distinct code paths.
-    const zero_offs = allocator.alloc(u32, n) catch return false;
-    defer allocator.free(zero_offs);
-    @memset(zero_offs, 0);
-    const zero_sizes = allocator.alloc(u32, n) catch return false;
-    defer allocator.free(zero_sizes);
-    @memset(zero_sizes, 0);
+    // (chunk-type=0) for that stream. A single zero-filled scratch
+    // buffer covers both the offsets and sizes orelse fallbacks (each
+    // `orelse` site only reads `.len` and `[i]`, and the two semantic
+    // roles are observationally identical for an all-zero array).
+    const zero_buf = allocator.alloc(u32, n) catch return false;
+    defer allocator.free(zero_buf);
+    @memset(zero_buf, 0);
 
-    const huff_lit_offsets = self.huff_lit_offsets orelse zero_offs;
-    const huff_lit_sizes = self.huff_lit_sizes orelse zero_sizes;
-    const huff_tok_offsets = self.huff_tok_offsets orelse zero_offs;
-    const huff_tok_sizes = self.huff_tok_sizes orelse zero_sizes;
-    const huff_off16hi_offsets = self.huff_off16hi_offsets orelse zero_offs;
-    const huff_off16hi_sizes = self.huff_off16hi_sizes orelse zero_sizes;
-    const huff_off16lo_offsets = self.huff_off16lo_offsets orelse zero_offs;
-    const huff_off16lo_sizes = self.huff_off16lo_sizes orelse zero_sizes;
+    const huff_lit_offsets = self.huff_lit_offsets orelse zero_buf;
+    const huff_lit_sizes = self.huff_lit_sizes orelse zero_buf;
+    const huff_tok_offsets = self.huff_tok_offsets orelse zero_buf;
+    const huff_tok_sizes = self.huff_tok_sizes orelse zero_buf;
+    const huff_off16hi_offsets = self.huff_off16hi_offsets orelse zero_buf;
+    const huff_off16hi_sizes = self.huff_off16hi_sizes orelse zero_buf;
+    const huff_off16lo_offsets = self.huff_off16lo_offsets orelse zero_buf;
+    const huff_off16lo_sizes = self.huff_off16lo_sizes orelse zero_buf;
     if (huff_lit_offsets.len < n or huff_tok_offsets.len < n or
         huff_off16hi_offsets.len < n or huff_off16lo_offsets.len < n) return false;
 

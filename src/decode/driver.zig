@@ -10,7 +10,7 @@
 //!   cuda_api.zig         - nvcuda.dll handle, CU* typedefs, cu*_fn slots,
 //!                          getProc, qpcNow / qpcMs
 //!   module_loader.zig    - PTX load, kernel-handle pub vars, init(),
-//!                          isAvailable(), ensurePipelineStreams
+//!                          isAvailable(), ensurePipelineStream
 //!   descriptors.zig      - ChunkDesc, KernelTiming, PendingTiming,
 //!                          WALK_MAX_CHUNKS, GpuError, walk_meta_offsets
 //!                          (plus internal scan/huff descriptor types)
