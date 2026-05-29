@@ -435,29 +435,212 @@ fn finalizeOutput(self: *DecodeContext, fns: *const Fns, req: DecodeRequest, hea
     }
 }
 
-pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void {
-    // Shadow request fields as locals so the function body below - which
-    // predates the struct-arg refactor and references the bare names -
-    // doesn't need a full rename. Zig folds these into the same registers
-    // it would have used for the old direct params.
-    const chunk_descs = req.chunk_descs;
-    const compressed_block = req.compressed_block;
-    const dst_full = req.dst_full;
-    const dst_start_off = req.dst_start_off;
-    const decompressed_size = req.decompressed_size;
-    const chunks_per_group = req.chunks_per_group;
-    const sub_chunk_cap = req.sub_chunk_cap;
-    const io = req.io;
-    const d_compressed_src = req.d_compressed_src;
+/// Result of the input-upload + prefix-sum phase: the worst-case
+/// sub-chunk count drives entropy-scratch sizing, and the per-stream
+/// region offsets within the scratch must match the merge-kernel
+/// writer and the LZ-kernel reader.
+const FrameLayout = struct {
+    total_subchunks: u32,
+    tok_offset: usize,
+    off16_offset: usize,
+};
 
+/// Upload phase: ensure persistent buffers, H2D/D2D the chunk descs,
+/// H2D/D2D the compressed block, run the device-side prefix sum, and
+/// size the entropy scratch. Returns the FrameLayout the back-half
+/// kernels need.
+fn uploadInputAndPrefixSum(
+    self: *DecodeContext,
+    req: DecodeRequest,
+    fns: *const Fns,
+) GpuError!FrameLayout {
+    const total_output = req.dst_start_off + req.decompressed_size;
+    try ensureDeviceOutput(self, total_output + 64);
+    if (req.dst_start_off > 0)
+        try cudaCall(fns.h2d(self.d_output, @ptrCast(req.dst_full), req.dst_start_off), .copy);
+
+    const comp_bytes = if (req.compressed_block.len > 0) req.compressed_block.len else 4;
+    const desc_bytes = req.chunk_descs.len * @sizeOf(ChunkDesc);
+    try ensureDeviceBuf(&self.d_comp_persist, &self.d_comp_persist_size, comp_bytes + 16);
+    try ensureDeviceBuf(&self.d_descs_persist, &self.d_descs_persist_size, desc_bytes);
+
+    // Chunk descs: D2D from a caller-supplied buffer when the walk
+    // kernel already wrote them to d_walk_chunks, else H2D from the
+    // host slice. H2D blocks on the host; D2D queues on work_stream
+    // and serializes with the prefix-sum kernel via stream ordering.
+    if (req.d_chunk_descs_override) |dev_ptr| {
+        const d2d = fns.d2d orelse return error.BackendNotAvailable;
+        try cudaCall(d2d(self.d_descs_persist, dev_ptr, desc_bytes, self.work_stream), .copy);
+    } else {
+        try cudaCall(fns.h2d(self.d_descs_persist, @ptrCast(req.chunk_descs.ptr), desc_bytes), .copy);
+    }
+
+    // `gpuPrefixSumChunksImpl` returns `GpuError!T` (not `?T`) because
+    // there is no host fallback - every GPU decode path needs it.
+    _ = try scan_gpu.gpuPrefixSumChunksImpl(self, self.d_descs_persist, @intCast(req.chunk_descs.len), req.sub_chunk_cap);
+
+    // Skip the D2H of `total_subchunks` and use a host-computed
+    // worst-case bound: `chunk_count * ceil(chunk_size / sub_chunk_cap)`.
+    // Over-allocating entropy_scratch is safe - the kernels self-gate
+    // on the actual counts via d_total_subchunks_buf / d_compact_counts.
+    const chunk_size_bytes: u32 = 0x40000; // = `constants.chunk_size`, inlined to avoid the format-layer import
+    const max_sub_per_chunk: u32 = if (req.sub_chunk_cap == 0) 4 else @max(1, (chunk_size_bytes + req.sub_chunk_cap - 1) / req.sub_chunk_cap);
+    const total_subchunks: u32 = @as(u32, @intCast(req.chunk_descs.len)) * max_sub_per_chunk;
+    // descriptors.ENTROPY_SCRATCH_SLOT_BYTES holds the largest sub-chunk's
+    // lit/tok streams; off16-hi at +0, off16-lo at +OFF16_HILO_SPLIT_OFFSET
+    // within each slot. Layout: [lit: total*slot] [tok: total*slot] [off16: total*slot].
+    const per_subchunk_scratch: usize = @intCast(descriptors.ENTROPY_SCRATCH_SLOT_BYTES);
+    const entropy_scratch_bytes = @as(usize, total_subchunks) * per_subchunk_scratch * 3;
+    try ensureDeviceBuf(&self.d_entropy_scratch, &self.d_entropy_scratch_size, entropy_scratch_bytes);
+    const tok_offset = @as(usize, total_subchunks) * per_subchunk_scratch;
+    const off16_offset = @as(usize, total_subchunks) * per_subchunk_scratch * 2;
+    self.d_entropy_off16_scratch = self.d_entropy_scratch + off16_offset;
+
+    // Always pass the device prefix-sum to the LZ kernel. When
+    // `sub_chunk_cap >= chunk_size` the prefix sum is `[0, 1, 2, ...]`
+    // and the kernel reads identity values.
+    self.d_first_subchunk_idx = self.d_first_sub_idx_persist;
+    if (req.chunk_descs.len > descriptors.WALK_MAX_CHUNKS) return error.BadMode;
+
+    // Source-side input: D2D when the bytes are already device-resident,
+    // H2D otherwise. The D2D copy issues on `self.work_stream` so the
+    // post-copy stream sync only has to wait on the caller's stream;
+    // the H2D path is host-synchronous, so there is no async hand-off
+    // to wait on.
+    if (req.compressed_block.len > 0) {
+        if (req.d_compressed_src) |dev_src| {
+            const d2d = fns.d2d orelse return error.BackendNotAvailable;
+            try cudaCall(d2d(self.d_comp_persist, dev_src, req.compressed_block.len, self.work_stream), .copy);
+        } else {
+            try cudaCall(fns.h2d(self.d_comp_persist, @ptrCast(req.compressed_block.ptr), req.compressed_block.len), .copy);
+        }
+    }
+
+    return .{
+        .total_subchunks = total_subchunks,
+        .tok_offset = tok_offset,
+        .off16_offset = off16_offset,
+    };
+}
+
+/// Back-half phase: pick the heavy stream, stage the LZ self-gate
+/// count, run the Huffman predecode (if any), run the LZ pipeline,
+/// then sync. Records `last_*_kernel_ns` onto the facade on the way
+/// out. The caller is responsible for the e2e timer slice that
+/// surrounds this call.
+fn runBackHalf(
+    self: *DecodeContext,
+    req: DecodeRequest,
+    fns: *const Fns,
+    layout: FrameLayout,
+    n_huff: u32,
+    have_huff: bool,
+    total_chunks: u32,
+    heavy_stream: usize,
+    facade: anytype,
+) GpuError!void {
+    const io = req.io;
+    const stream_sync_fn = fns.stream_sync;
+
+    // Cross-stream barrier: in sync mode `heavy_stream` is the library-
+    // owned `pipeline_stream` so the front-half work queued on
+    // stream 0 has to drain before the back half can read its results.
+    if (heavy_stream != self.work_stream) {
+        try cudaCall(stream_sync_fn(self.work_stream), .sync);
+    }
+
+    // KERNEL TIMER: only pure GPU kernel time from here.
+    const t_before_kern = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
+
+    // SLZ_SPLIT_TIMER: separate Huff predecode from LZ decode timing.
+    const split_timer = std.c.getenv("SLZ_SPLIT_TIMER") != null;
+
+    // Stage the LZ kernel's self-gate count. D2D path: the caller
+    // supplies `d_n_chunks_dev` (typically `d_walk_meta + offset`).
+    // Else stage `total_chunks` into `d_n_groups_scratch` via 4 B H2D.
+    const lz_total_dev: u64 = if (req.d_n_chunks_dev) |dev| dev else blk: {
+        try ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4);
+        var host_total_chunks: u32 = total_chunks;
+        try cudaCall(fns.h2d(self.d_n_groups_scratch, @ptrCast(&host_total_chunks), 4), .copy);
+        break :blk self.d_n_groups_scratch;
+    };
+
+    // Direct-write-to-output fast path: when the caller supplied a
+    // device output target AND there's no host prefix to splice in,
+    // the LZ kernel writes straight to the caller's buffer, skipping
+    // the finalize D2D copy.
+    const write_direct: bool = req.d_output_target != null and req.dst_start_off == 0;
+    const lz_dst_base: CUdeviceptr = if (write_direct) req.d_output_target.? else self.d_output;
+
+    const t_huff_start = if (split_timer and have_huff)
+        if (io) |io_val| std.Io.Clock.awake.now(io_val) else null
+    else
+        null;
+    var split_huff_build_ns: i64 = 0;
+    if (have_huff) {
+        split_huff_build_ns = try runHuffPredecode(self, fns, n_huff, heavy_stream, split_timer, t_huff_start, io);
+    }
+
+    var split_lz_ns: i64 = 0;
+    var split_huff_ns: i64 = 0;
+
+    // Close the Huff time slice: sync `heavy_stream` so the LZ
+    // measurement excludes Huff time. `split_timer` rules out a future
+    // graph-mode capture, so the inner sync is safe.
+    if (split_timer and have_huff) {
+        try cudaCall(stream_sync_fn(heavy_stream), .sync);
+        if (t_huff_start) |hs| {
+            if (io) |io_val| {
+                split_huff_ns = nsSince(hs, io_val);
+            }
+        }
+        std.debug.print("  [huff split] build {d:.3} ms  decode {d:.3} ms\n", .{
+            @as(f64, @floatFromInt(split_huff_build_ns)) / 1e6,
+            @as(f64, @floatFromInt(split_huff_ns - split_huff_build_ns)) / 1e6,
+        });
+    }
+
+    split_lz_ns = try runLzPipeline(
+        self, fns,
+        req.chunks_per_group, req.sub_chunk_cap, n_huff,
+        total_chunks, layout.total_subchunks,
+        heavy_stream, split_timer, io,
+        lz_total_dev, lz_dst_base,
+    );
+
+    // Back-half stream sync: skip in async mode (caller's stream
+    // carries the queued work; they sync themselves).
+    if (self.work_stream == 0) {
+        const sync_rc = stream_sync_fn(heavy_stream);
+        if (sync_rc != CUDA_SUCCESS) {
+            std.debug.print("GPU heavy stream: sync FAILED rc={d}\n", .{sync_rc});
+            return error.SyncFailed;
+        }
+    }
+
+    if (t_before_kern) |t_start| {
+        if (io) |io_val| {
+            facade.last_kernel_ns = nsSince(t_start, io_val);
+            if (split_timer) {
+                facade.last_lz_kernel_ns = split_lz_ns;
+                facade.last_huff_kernel_ns = split_huff_ns;
+            } else {
+                facade.last_lz_kernel_ns = 0;
+                facade.last_huff_kernel_ns = 0;
+            }
+        }
+    }
+}
+
+pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void {
     if (!module_loader.init()) return error.BackendNotAvailable;
     if (module_loader.kernel_fn == 0) return error.KernelMissing;
     try module_loader.ensurePipelineStreams(self);
 
     const facade = @import("driver.zig");
+    const io = req.io;
 
-    // SLZ_E2E_TIMER: end-to-end decode phase breakdown - setup+H2D /
-    // host scan+prep / kernels / D2H. Off by default.
+    // SLZ_E2E_TIMER: end-to-end decode phase breakdown.
     const e2e_timer = std.c.getenv("SLZ_E2E_TIMER") != null;
     const t_e2e0 = if (e2e_timer)
         (if (io) |iv| std.Io.Clock.awake.now(iv) else null)
@@ -466,278 +649,68 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     var e2e_cum: E2eCumulative = .{};
 
     const fns = try Fns.resolve();
-    const h2d_fn = fns.h2d;
-    const launch_fn = fns.launch;
 
-    const total_output = dst_start_off + decompressed_size;
-    if (!ensureDeviceOutput(self, total_output + 64)) return error.OutOfDeviceMemory;
-
-    if (dst_start_off > 0)
-        try cudaCall(h2d_fn(self.d_output, @ptrCast(dst_full), dst_start_off), .copy);
-
-    const comp_bytes = if (compressed_block.len > 0) compressed_block.len else 4;
-    const desc_bytes = chunk_descs.len * @sizeOf(ChunkDesc);
-
-    if (!ensureDeviceBuf(&self.d_comp_persist, &self.d_comp_persist_size, comp_bytes + 16)) return error.OutOfDeviceMemory;
-    if (!ensureDeviceBuf(&self.d_descs_persist, &self.d_descs_persist_size, desc_bytes)) return error.OutOfDeviceMemory;
-
-    // Chunk descs land in d_descs_persist either by D2D-copy from a
-    // caller-supplied device buffer (D2D path - saves a D2H+H2D round
-    // trip because the walk-frame kernel already wrote them to
-    // `d_walk_chunks`) or by H2D from the host slice. The H2D is
-    // sync-on-host, while `cuMemcpyDtoDAsync` on `work_stream`
-    // serializes with the prefix-sum kernel below via stream ordering.
-    if (req.d_chunk_descs_override) |dev_ptr| {
-        const d2d = fns.d2d orelse return error.BackendNotAvailable;
-        try cudaCall(d2d(self.d_descs_persist, dev_ptr, desc_bytes, self.work_stream), .copy);
-    } else {
-        try cudaCall(h2d_fn(self.d_descs_persist, @ptrCast(chunk_descs.ptr), desc_bytes), .copy);
-    }
-
-    // Prefix-sum runs on device. `gpuPrefixSumChunksImpl` returns
-    // `GpuError!T` (not `?T`) because there is no host fallback -
-    // every GPU decode path needs it; specific failure variants
-    // (OutOfDeviceMemory / KernelLaunchFailed / SyncFailed /
-    // BackendNotAvailable / KernelMissing) propagate to the caller.
-    _ = try scan_gpu.gpuPrefixSumChunksImpl(self, self.d_descs_persist, @intCast(chunk_descs.len), sub_chunk_cap);
-    // Skip the D2H of `total_subchunks` and use a host-computed
-    // worst-case bound: max sub-chunks per chunk = ceil(chunk_size /
-    // sub_chunk_cap), clamped to MAX_BLOCKS_PER_SUBCHUNK*2 = 4 in the
-    // tightest 64 KB sub-chunk case. Over-allocating `entropy_scratch`
-    // is safe — the kernels self-gate on the actual counts via
-    // `d_total_subchunks_buf` / `d_compact_counts`. Saves a 4-byte D2H
-    // plus the implicit kernel sync it would force.
-    // Wire format: SLZ_CHUNK_SIZE_BYTES = 256 KB (matches src/gpu/common/gpu_wire_format.cuh)
-    const CHUNK_SIZE_BYTES: u32 = 0x40000;
-    const max_sub_per_chunk: u32 = if (sub_chunk_cap == 0) 4 else @max(1, (CHUNK_SIZE_BYTES + sub_chunk_cap - 1) / sub_chunk_cap);
-    // Worst-case upper bound on total sub-chunks across the frame; used
-    // for entropy_scratch sizing + region offsets that must match between
-    // the merge-kernel writer and the LZ-kernel reader. Naming kept as
-    // `total_subchunks` so downstream call sites are unchanged.
-    const total_subchunks: u32 = @as(u32, @intCast(chunk_descs.len)) * max_sub_per_chunk;
-    // descriptors.ENTROPY_SCRATCH_SLOT_BYTES holds the largest sub-chunk's lit/tok
-    // streams; off16-hi at +0, off16-lo at +descriptors.OFF16_HILO_SPLIT_OFFSET
-    // within each slot. Layout: [lit: total*slot] [tok: total*slot] [off16: total*slot].
-    const per_subchunk_scratch: usize = @intCast(descriptors.ENTROPY_SCRATCH_SLOT_BYTES);
-    const entropy_scratch_bytes = @as(usize, total_subchunks) * per_subchunk_scratch * 3;
-    if (!ensureDeviceBuf(&self.d_entropy_scratch, &self.d_entropy_scratch_size, entropy_scratch_bytes)) return error.OutOfDeviceMemory;
-    const tok_offset = @as(usize, total_subchunks) * per_subchunk_scratch;
-    const off16_offset = @as(usize, total_subchunks) * per_subchunk_scratch * 2;
-    self.d_entropy_off16_scratch = self.d_entropy_scratch + off16_offset;
-
-    // Always pass the device prefix-sum to the LZ kernel. When
-    // `sub_chunk_cap >= chunk_size` the prefix sum is `[0, 1, 2, ...]`
-    // and the kernel reads identity values — same effective behavior as
-    // the prior null-pointer / kernel-side identity branch.
-    self.d_first_subchunk_idx = self.d_first_sub_idx_persist;
-    if (chunk_descs.len > descriptors.WALK_MAX_CHUNKS) return error.BadMode;
-
-    // Source-side input: D2D when the bytes are already device-resident,
-    // H2D otherwise. The D2D copy issues on `self.work_stream` so the
-    // post-copy stream sync below only has to wait on the caller's
-    // stream; the H2D path blocks on the host side, so there is no
-    // async hand-off to wait on.
-    if (compressed_block.len > 0) {
-        if (d_compressed_src) |dev_src| {
-            const d2d = fns.d2d orelse return error.BackendNotAvailable;
-            // No post-D2D sync: every downstream consumer of d_comp_persist
-            // (gpuPrefixSumChunksImpl, gpuScanChunks, runHuffPredecode,
-            // runLzPipeline) runs on the same `work_stream` and sees the
-            // copy via stream ordering, so an explicit post-D2D sync is
-            // unnecessary.
-            try cudaCall(d2d(self.d_comp_persist, dev_src, compressed_block.len, self.work_stream), .copy);
-        } else {
-            try cudaCall(h2d_fn(self.d_comp_persist, @ptrCast(compressed_block.ptr), compressed_block.len), .copy);
-        }
-    }
+    // Phase 1: upload + prefix sum.
+    const layout = try uploadInputAndPrefixSum(self, req, &fns);
     if (t_e2e0) |t0| if (io) |iv| {
         e2e_cum.h2d = nsSince(t0, iv);
         e2e_cum.prescan = nsSince(t0, iv);
     };
 
-    // ── Scan for entropy chunks (Huffman + raw off16) ─────────
-    // The GPU scan kernel reads from `d_comp_persist` (filled by either
-    // the H2D from the host `compressed_block` slice or the D2D copy
-    // from the caller's device pointer); the host bytes themselves are
-    // never touched here, so the same code path handles both decode
-    // entry points.
+    // Phase 2: scan + raw-off16 gather. The GPU scan kernel reads from
+    // `d_comp_persist` (filled by the prior H2D / D2D), so the same
+    // code path handles both decode entry points.
     var scan: ScanResult = .{ .num_raw_off16 = 0 };
-
     if (module_loader.huff_build_fn != 0) {
-        if (chunk_descs.len > descriptors.WALK_MAX_CHUNKS) return error.BadMode;
+        if (req.chunk_descs.len > descriptors.WALK_MAX_CHUNKS) return error.BadMode;
         scan = scan_gpu.gpuScanChunks(
             self,
-            chunk_descs,
-            compressed_block,
-            sub_chunk_cap,
-            total_subchunks,
+            req.chunk_descs,
+            req.compressed_block,
+            req.sub_chunk_cap,
+            layout.total_subchunks,
         ) orelse return error.BackendNotAvailable;
-
         if (t_e2e0) |t0| if (io) |iv| {
             e2e_cum.postscan = nsSince(t0, iv);
         };
-
-        try gatherRawOff16(self, scan, compressed_block, launch_fn);
+        try gatherRawOff16(self, scan, req.compressed_block, fns.launch);
     }
-
     if (t_e2e0) |t0| if (io) |iv| {
         e2e_cum.scan = nsSince(t0, iv);
     };
 
-    // ── Huffman pre-decode (Pass 1.5): merge per-stream-type descriptors
-    // into a single device array with correct out_offsets, then upload.
+    // Phase 3: Huffman descriptor merge (LUT + descriptor allocations).
     const n_huff: u32 = scan.num_huff_lit + scan.num_huff_tok +
         scan.num_huff_off16hi + scan.num_huff_off16lo;
     const have_huff = n_huff > 0 and module_loader.huff_build_fn != 0 and module_loader.huff_decode_fn != 0;
     if (have_huff) {
         const huff_desc_bytes = @as(usize, n_huff) * @sizeOf(HuffDecChunkDesc);
         const huff_lut_bytes = @as(usize, n_huff) * HUFF_LUT_ENTRIES * @sizeOf(u32);
-        if (!ensureDeviceBuf(&self.d_huff_descs, &self.d_huff_descs_size, huff_desc_bytes)) return error.OutOfDeviceMemory;
-        if (!ensureDeviceBuf(&self.d_huff_lut, &self.d_huff_lut_size, huff_lut_bytes)) return error.OutOfDeviceMemory;
-
-        try mergeHuffDescs(self, tok_offset, off16_offset, launch_fn);
+        try ensureDeviceBuf(&self.d_huff_descs, &self.d_huff_descs_size, huff_desc_bytes);
+        try ensureDeviceBuf(&self.d_huff_lut, &self.d_huff_lut_size, huff_lut_bytes);
+        try mergeHuffDescs(self, layout.tok_offset, layout.off16_offset, fns.launch);
     }
 
-    const total_chunks: u32 = @intCast(chunk_descs.len);
     if (!self.pipeline_stream_created) return error.BackendNotAvailable;
     // `heavy_stream` carries the back half (huff + LZ + finalize). In
-    // async mode the caller's stream IS the heavy stream so their
-    // `cudaStreamSynchronize` waits for the decompress to land. In sync
-    // mode we use the library-owned `pipeline_stream`; the front-half
-    // work was queued on stream 0, so a cross-stream barrier is needed
-    // before the back half can read its results.
+    // async mode the caller's stream IS the heavy stream; in sync mode
+    // we use the library-owned `pipeline_stream`.
     const heavy_stream: usize = if (self.work_stream != 0) self.work_stream else self.pipeline_stream;
-    {
-        if (heavy_stream != self.work_stream) {
-            try cudaCall(fns.stream_sync(self.work_stream), .sync);
-        }
+    const total_chunks: u32 = @intCast(req.chunk_descs.len);
 
-        // ── KERNEL TIMER: only pure GPU kernel time from here ──
-        const t_before_kern = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
-
-        // SLZ_SPLIT_TIMER hoisted above the Huff launches so we can fence
-        // around them too. Without split, Huff time gets pipelined into LZ.
-        const split_timer = std.c.getenv("SLZ_SPLIT_TIMER") != null;
-
-        // Stage the LZ kernel's self-gate count. Two modes:
-        //   1. `req.d_n_chunks_dev` non-null (D2D path): point the LZ
-        //      kernel directly at the caller-supplied device counter
-        //      (typically `d_walk_meta + walk_meta_offsets.n_chunks`,
-        //      which the walk kernel populated on this stream).
-        //   2. Otherwise (CLI / host-bounce): allocate / restage
-        //      `d_n_groups_scratch` with `total_chunks`. Hoisted out of
-        //      `runLzPipeline` so a future graph-mode capture of the
-        //      back half doesn't see a sync H2D inside the captured
-        //      region.
-        const lz_total_dev: u64 = if (req.d_n_chunks_dev) |dev| dev else blk: {
-            if (!ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4)) return error.OutOfDeviceMemory;
-            var host_total_chunks: u32 = total_chunks;
-            try cudaCall(h2d_fn(self.d_n_groups_scratch, @ptrCast(&host_total_chunks), 4), .copy);
-            break :blk self.d_n_groups_scratch;
-        };
-
-        // ── Direct-write-to-output fast path ───────────────────────────
-        // When the caller supplied a device output buffer AND there's no
-        // host-side prefix to splice in (dst_start_off == 0), point the
-        // LZ kernel directly at that buffer. The finalize-D2D copy
-        // (~1.1 ms on a 100 MB output measured by nsys) is then skipped
-        // — the LZ kernel was already going to write `decompressed_size`
-        // bytes; writing them to the caller's address instead of our
-        // scratch saves that whole copy.
-        //
-        // The legacy path (dst_start_off > 0, or host D2H output) still
-        // stages through self.d_output: the host needs to H2D the prefix
-        // bytes into our buffer first, and the D2H output path needs a
-        // device source to D2H from anyway.
-        const write_direct: bool = req.d_output_target != null and req.dst_start_off == 0;
-        const lz_dst_base: CUdeviceptr = if (write_direct) req.d_output_target.? else self.d_output;
-
-        const t_huff_start = if (split_timer and have_huff)
-            if (io) |io_val| std.Io.Clock.awake.now(io_val) else null
-        else
-            null;
-        var split_huff_build_ns: i64 = 0;
-        if (have_huff) {
-            split_huff_build_ns = try runHuffPredecode(self, &fns, n_huff, heavy_stream, split_timer, t_huff_start, io);
-        }
-
-        const stream_sync_fn = fns.stream_sync;
-
-        var split_lz_ns: i64 = 0;
-        var split_huff_ns: i64 = 0;
-
-        // Close the Huff time slice: sync `heavy_stream` so the LZ
-        // measurement excludes Huff time. `split_timer` rules out a
-        // future graph-mode capture, so the inner sync is safe.
-        if (split_timer and have_huff) {
-            try cudaCall(stream_sync_fn(heavy_stream), .sync);
-            if (t_huff_start) |hs| {
-                if (io) |io_val| {
-                    split_huff_ns = nsSince(hs, io_val);
-                }
-            }
-            std.debug.print("  [huff split] build {d:.3} ms  decode {d:.3} ms\n", .{
-                @as(f64, @floatFromInt(split_huff_build_ns)) / 1e6,
-                @as(f64, @floatFromInt(split_huff_ns - split_huff_build_ns)) / 1e6,
-            });
-        }
-
-        split_lz_ns = try runLzPipeline(
-            self,
-            &fns,
-            chunks_per_group,
-            sub_chunk_cap,
-            n_huff,
-            total_chunks,
-            total_subchunks,
-            heavy_stream,
-            split_timer,
-            io,
-            lz_total_dev,
-            lz_dst_base,
-        );
-
-        // Sync the back-half stream — unless the caller is async, in
-        // which case we leave the queued work on their stream for them
-        // to sync.
-        if (self.work_stream == 0) {
-            const sync_rc = stream_sync_fn(heavy_stream);
-            if (sync_rc != CUDA_SUCCESS) {
-                std.debug.print("GPU heavy stream: sync FAILED rc={d}\n", .{sync_rc});
-                return error.SyncFailed;
-            }
-        }
-
-        if (t_before_kern) |t_start| {
-            if (io) |io_val| {
-                facade.last_kernel_ns = nsSince(t_start, io_val);
-                if (split_timer) {
-                    facade.last_lz_kernel_ns = split_lz_ns;
-                    facade.last_huff_kernel_ns = split_huff_ns;
-                } else {
-                    facade.last_lz_kernel_ns = 0;
-                    facade.last_huff_kernel_ns = 0;
-                }
-            }
-        }
-    }
-
+    // Phase 4: back half (Huff predecode + LZ pipeline + sync + timing).
+    try runBackHalf(self, req, &fns, layout, n_huff, have_huff, total_chunks, heavy_stream, facade);
     if (t_e2e0) |t0| if (io) |iv| {
         e2e_cum.predh = nsSince(t0, iv);
     };
-    // Skip finalizeOutput when the LZ kernel wrote straight to the
-    // caller's device buffer (req.d_output_target with dst_start_off
-    // == 0). Same condition as `write_direct` inside the back-half
-    // block; inlined here because `write_direct` was scoped to that
-    // block. Saves the ~1.1 ms / 100 MB D2D copy the legacy path did.
+
+    // Phase 5: finalize, profiling drain, e2e emit. The
+    // direct-write-to-output fast path also skips the finalize D2D,
+    // matching the `write_direct` branch inside runBackHalf.
     const skip_finalize = req.d_output_target != null and req.dst_start_off == 0;
     if (!skip_finalize) {
         try finalizeOutput(self, &fns, req, heavy_stream);
     }
-
-    // Profiling: drain pending cuEvent pairs into last_timings. Skip in
-    // async mode (caller hasn't synced yet; the events may still be
-    // pending). slzGetLastTimings finalizes on demand.
     if (self.work_stream == 0) {
         finalizeProfiling(&self.pending_timings, &self.last_timings);
     }

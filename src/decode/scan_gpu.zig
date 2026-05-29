@@ -45,8 +45,8 @@ pub fn gpuWalkFrameImpl(
     const memset = cuda.cuMemsetD8_fn orelse return error.BackendNotAvailable;
 
     const chunks_bytes: usize = @as(usize, descriptors.WALK_MAX_CHUNKS) * @sizeOf(descriptors.ChunkDesc);
-    if (!ensureDeviceBuf(&self.d_walk_chunks, &self.d_walk_chunks_size, chunks_bytes)) return error.OutOfDeviceMemory;
-    if (!ensureDeviceBuf(&self.d_walk_meta, &self.d_walk_meta_size, descriptors.walk_meta_offsets.bytes)) return error.OutOfDeviceMemory;
+    try ensureDeviceBuf(&self.d_walk_chunks, &self.d_walk_chunks_size, chunks_bytes);
+    try ensureDeviceBuf(&self.d_walk_meta, &self.d_walk_meta_size, descriptors.walk_meta_offsets.bytes);
     try cudaCall(memset(self.d_walk_meta, 0, descriptors.walk_meta_offsets.bytes), .copy);
 
     // Launch on `work_stream` (= 0 in the sync wrapper, caller's stream
@@ -99,8 +99,8 @@ pub fn gpuPrefixSumChunksImpl(
     const launch = cuda.cuLaunchKernel_fn orelse return error.BackendNotAvailable;
 
     const first_bytes: usize = @as(usize, descriptors.WALK_MAX_CHUNKS) * 4;
-    if (!ensureDeviceBuf(&self.d_first_sub_idx_persist, &self.d_first_sub_idx_persist_size, first_bytes)) return error.OutOfDeviceMemory;
-    if (!ensureDeviceBuf(&self.d_total_subchunks_buf, &self.d_total_subchunks_buf_size, 4)) return error.OutOfDeviceMemory;
+    try ensureDeviceBuf(&self.d_first_sub_idx_persist, &self.d_first_sub_idx_persist_size, first_bytes);
+    try ensureDeviceBuf(&self.d_total_subchunks_buf, &self.d_total_subchunks_buf_size, 4);
 
     // Launch on caller's stream (= 0 in the sync wrapper, caller's
     // stream in the async wrapper). No internal sync: downstream
@@ -151,7 +151,7 @@ pub fn gpuScanChunks(
     const huff_arr_bytes: usize = @as(usize, total_subchunks) * @sizeOf(descriptors.ScanHuffDesc);
     const raw_arr_bytes: usize = @as(usize, total_subchunks) * @sizeOf(descriptors.ScanRawDesc);
     const staged_bytes: usize = huff_arr_bytes * 4 + raw_arr_bytes * 2;
-    if (!ensureDeviceBuf(&self.d_scan_staged, &self.d_scan_staged_size, staged_bytes)) return null;
+    ensureDeviceBuf(&self.d_scan_staged, &self.d_scan_staged_size, staged_bytes) catch return null;
     // Zero so sub-chunk slots that no thread reaches keep valid=0.
     if (memset(self.d_scan_staged, 0, staged_bytes) != CUDA_SUCCESS) return null;
 
@@ -162,7 +162,7 @@ pub fn gpuScanChunks(
     var k_first = self.d_first_sub_idx_persist;
     // Scan kernel self-gates on `*d_n_chunks` - stage host n into a
     // device-resident 4 B slot.
-    if (!ensureDeviceBuf(&self.d_n_chunks_scratch, &self.d_n_chunks_scratch_size, 4)) return null;
+    ensureDeviceBuf(&self.d_n_chunks_scratch, &self.d_n_chunks_scratch_size, 4) catch return null;
     var host_n_chunks: u32 = n;
     if (h2d(self.d_n_chunks_scratch, @ptrCast(&host_n_chunks), 4) != CUDA_SUCCESS) return null;
     var k_n: u64 = self.d_n_chunks_scratch;
@@ -201,14 +201,14 @@ pub fn gpuScanChunks(
         const huff_compact_bytes = huff_compact_max * @sizeOf(descriptors.HuffDecChunkDesc);
         const raw_compact_max = huff_compact_max * 2;
         const raw_compact_bytes = raw_compact_max * @sizeOf(descriptors.RawOff16Desc);
-        if (!ensureDeviceBuf(&self.d_compact_lit, &self.d_compact_lit_size, huff_compact_bytes)) return null;
-        if (!ensureDeviceBuf(&self.d_compact_tok, &self.d_compact_tok_size, huff_compact_bytes)) return null;
-        if (!ensureDeviceBuf(&self.d_compact_hi, &self.d_compact_hi_size, huff_compact_bytes)) return null;
-        if (!ensureDeviceBuf(&self.d_compact_lo, &self.d_compact_lo_size, huff_compact_bytes)) return null;
-        if (!ensureDeviceBuf(&self.d_compact_raw, &self.d_compact_raw_size, raw_compact_bytes)) return null;
+        ensureDeviceBuf(&self.d_compact_lit, &self.d_compact_lit_size, huff_compact_bytes) catch return null;
+        ensureDeviceBuf(&self.d_compact_tok, &self.d_compact_tok_size, huff_compact_bytes) catch return null;
+        ensureDeviceBuf(&self.d_compact_hi, &self.d_compact_hi_size, huff_compact_bytes) catch return null;
+        ensureDeviceBuf(&self.d_compact_lo, &self.d_compact_lo_size, huff_compact_bytes) catch return null;
+        ensureDeviceBuf(&self.d_compact_raw, &self.d_compact_raw_size, raw_compact_bytes) catch return null;
         // 6 u32: [n_lit, n_tok, n_hi, n_lo, n_raw, n_merged]. n_merged is
         // written by slzMergeHuffDescsKernel in step 6c.
-        if (!ensureDeviceBuf(&self.d_compact_counts, &self.d_compact_counts_size, 6 * 4)) return null;
+        ensureDeviceBuf(&self.d_compact_counts, &self.d_compact_counts_size, 6 * 4) catch return null;
         if (memset(self.d_compact_counts, 0, 6 * 4) != CUDA_SUCCESS) return null;
 
         const huff_streams = [_]struct { staged_off: usize, dst: u64, n_off: u32 }{

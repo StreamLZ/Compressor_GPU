@@ -20,22 +20,31 @@ const CUDA_SUCCESS = cuda.CUDA_SUCCESS;
 // `gpu_decode.last_kernel_ns` must reach actual storage in the facade.
 // Sub-modules write back via `@import("driver.zig").last_kernel_ns = ...`.
 
-pub fn ensureDeviceBuf(ptr: *CUdeviceptr, current_size: *usize, needed: usize) bool {
-    if (current_size.* >= needed) return true;
-    // The free's result is intentionally dropped: at this point we
-    // are about to grow the buffer regardless, and a failed free leaks at
-    // worst a single allocation (cleaned up at process exit / context
-    // destroy). Surfacing the failure here would force every caller to
-    // distinguish "alloc failed" from "free failed before alloc", which
-    // adds no actionable signal.
-    if (ptr.* != 0) _ = (cuda.cuMemFree_fn orelse return false)(ptr.*);
+/// Grow `*ptr` to hold at least `needed` bytes. No-op when the
+/// current allocation is already large enough. Used everywhere
+/// the dispatch needs scratch sized to a per-frame quantity; the
+/// `GpuError!void` shape matches every other CUDA call in the
+/// pipeline so the caller's `try`-chain is uniform.
+///
+/// The free's result is intentionally dropped: at this point we are
+/// about to grow the buffer regardless, and a failed free leaks at
+/// worst a single allocation (cleaned up at process exit / context
+/// destroy). Surfacing the failure here would force every caller to
+/// distinguish "alloc failed" from "free failed before alloc", which
+/// adds no actionable signal.
+pub fn ensureDeviceBuf(ptr: *CUdeviceptr, current_size: *usize, needed: usize) descriptors.GpuError!void {
+    if (current_size.* >= needed) return;
+    const free_fn = cuda.cuMemFree_fn orelse return error.BackendNotAvailable;
+    const alloc_fn = cuda.cuMemAlloc_fn orelse return error.BackendNotAvailable;
+    if (ptr.* != 0) _ = free_fn(ptr.*);
     current_size.* = 0;
-    if ((cuda.cuMemAlloc_fn orelse return false)(ptr, needed) != CUDA_SUCCESS) return false;
+    if (alloc_fn(ptr, needed) != CUDA_SUCCESS) return error.OutOfDeviceMemory;
     current_size.* = needed;
-    return true;
 }
 
-pub fn ensureDeviceOutput(self: *DecodeContext, size: usize) bool {
+/// Convenience: grow `self.d_output` to `size`. Same shape as
+/// `ensureDeviceBuf` — `try`-friendly from the dispatch.
+pub fn ensureDeviceOutput(self: *DecodeContext, size: usize) descriptors.GpuError!void {
     return ensureDeviceBuf(&self.d_output, &self.d_output_size, size);
 }
 
