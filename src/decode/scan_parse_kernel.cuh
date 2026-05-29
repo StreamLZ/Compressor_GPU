@@ -78,6 +78,10 @@ __device__ static bool scanParseType0(
 }
 
 // Skip an entropy/raw stream header + payload. 0xFFFFFFFF = truncated.
+// Only chunk types 0 (raw) and 4 (Huffman) are emitted by the GPU
+// encoder; any other type is rejected as truncated rather than
+// silently advanced — the LZ kernel would not be able to consume it
+// anyway, so the scan kernel surfaces the unsupported shape early.
 __device__ static uint32_t scanSkipStreamHeader(
     const uint8_t* chunk_src, uint32_t chunk_len, uint32_t pos) {
     if (pos >= chunk_len) return 0xFFFFFFFFu;
@@ -88,18 +92,12 @@ __device__ static uint32_t scanSkipStreamHeader(
         if (pos + need > chunk_len) return 0xFFFFFFFFu;
         const Type0HdrFields h = parseType0HdrFields(chunk_src + pos);
         return pos + h.header_bytes + h.size;
-    } else if (ct == 1 || ct == 2 || ct == 4 || ct == 6) {
+    } else if (ct == HUFF_CHUNK_TYPE) {
         const uint32_t need = (first >= HEADER_LONG_FORM_BIT)
             ? ENTROPY_HEADER_SHORT_BYTES : ENTROPY_HEADER_LONG_BYTES;
         if (pos + need > chunk_len) return 0xFFFFFFFFu;
         const EntropyHdrFields h = parseEntropyHdrFields(chunk_src + pos);
         return pos + h.header_bytes + h.comp_size;
-    } else if (ct == 5) {
-        if (pos + PAIRED_SECONDARY_HEADER_BYTES > chunk_len) return 0xFFFFFFFFu;
-        return pos + PAIRED_SECONDARY_HEADER_BYTES;
-    } else if (ct == 7) {
-        if (pos + PAIRED_PRIMARY_HEADER_BYTES > chunk_len) return 0xFFFFFFFFu;
-        return scanSkipStreamHeader(chunk_src, chunk_len, pos + PAIRED_PRIMARY_HEADER_BYTES);
     }
     return 0xFFFFFFFFu;
 }

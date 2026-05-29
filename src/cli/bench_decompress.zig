@@ -11,6 +11,7 @@ const frame = @import("../format/frame_format.zig");
 pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: util.Args) !void {
     const in_path = util.requireInput(args, w);
     const runs = args.runs orelse 10;
+    if (runs == 0) util.die(w, "error: runs must be >= 1\n");
 
     const src = util.readFile(allocator, io, in_path, w);
     defer allocator.free(src);

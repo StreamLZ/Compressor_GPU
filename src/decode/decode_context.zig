@@ -214,16 +214,17 @@ pub const DecodeContext = struct {
     d_entropy_scratch: CUdeviceptr = 0,
     d_entropy_scratch_size: usize = 0,
 
-    // Off16 scratch view = d_entropy_scratch + off16_offset (set in fullGpuLaunchImpl).
-    // The raw-off16 gather kernel scatters compressed raw bytes here.
+    // Off16 scratch VIEW (not owned): set in fullGpuLaunchImpl to
+    // `d_entropy_scratch + off16_offset`. The raw-off16 gather kernel
+    // scatters compressed raw bytes here. Not freed by deinit because
+    // `d_entropy_scratch` owns the allocation.
     d_entropy_off16_scratch: CUdeviceptr = 0,
-    d_entropy_off16_scratch_size: usize = 0,
 
-    // Per-chunk first-subchunk-index buffer (multi-sub-chunk-per-chunk support).
-    // At sc>0.5 chunks have multiple sub-chunks each; each sub-chunk needs its
-    // own entropy scratch slot. This array maps chunk_idx → global sub-chunk index.
+    // Per-chunk first-subchunk-index ALIAS (not owned): the dispatch
+    // sets this to `d_first_sub_idx_persist` so the LZ kernel reads the
+    // device-resident prefix sum directly. Not freed by deinit because
+    // `d_first_sub_idx_persist` owns the allocation.
     d_first_subchunk_idx: CUdeviceptr = 0,
-    d_first_subchunk_idx_size: usize = 0,
 
     // GPU decode-scan staged buffers. d_scan_staged packs the six staged
     // arrays the scan kernel writes (lit/tok/hi/lo huff descriptor lists
@@ -330,8 +331,11 @@ pub const DecodeContext = struct {
         free_dev(&self.d_comp_persist, &self.d_comp_persist_size);
         free_dev(&self.d_descs_persist, &self.d_descs_persist_size);
         free_dev(&self.d_entropy_scratch, &self.d_entropy_scratch_size);
-        free_dev(&self.d_entropy_off16_scratch, &self.d_entropy_off16_scratch_size);
-        free_dev(&self.d_first_subchunk_idx, &self.d_first_subchunk_idx_size);
+        // `d_entropy_off16_scratch` and `d_first_subchunk_idx` are views
+        // / aliases into other owned buffers (see field docs). Zero them
+        // so the alias does not survive teardown, but do NOT cuMemFree.
+        self.d_entropy_off16_scratch = 0;
+        self.d_first_subchunk_idx = 0;
         free_dev(&self.d_scan_staged, &self.d_scan_staged_size);
         free_dev(&self.d_scan_first_sub, &self.d_scan_first_sub_size);
         free_dev(&self.d_walk_chunks, &self.d_walk_chunks_size);

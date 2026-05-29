@@ -78,8 +78,6 @@ static constexpr uint32_t ENTROPY_LONG_HI_SHIFT      = 14;
 // Paired-stream header sizes.
 //   paired-primary  : [0x70][countA:u24][inner type-6 stream]
 //   paired-secondary: [0x50][countA:u24][countB:u24], no payload
-static constexpr uint32_t PAIRED_PRIMARY_HEADER_BYTES   = 4;
-static constexpr uint32_t PAIRED_SECONDARY_HEADER_BYTES = 7;
 
 // Off16 stream: OFF16_ENTROPY_MARKER (0xFFFF in ../common/gpu_wire_format.cuh)
 // signals an entropy-coded off16 pair (hi/lo split). The hi/lo halves
@@ -275,45 +273,21 @@ __device__ inline uint32_t parseEntropyHeader(const uint8_t*& src,
     return h.dst_size;
 }
 
-// ── Paired-primary inner-stream skip ───────────────────────────
-// For a paired-primary header [0x70][countA:u24][inner type-6 stream]:
-// reads countA, advances src past the whole marker + inner stream, and
-// returns countA.
-__device__ inline uint32_t skipPairedPrimary(const uint8_t*& src) {
-    uint32_t count_a = readBE24(src + 1);
-    const uint8_t* inner = src + PAIRED_PRIMARY_HEADER_BYTES;
-    EntropyHdrFields h = parseEntropyHdrFields(inner);
-    src = inner + h.header_bytes + h.comp_size;
-    return count_a;
-}
-
 // ── Helper: skip an entropy-coded stream header + payload ──────
-// Reads the header at *src, advances src past the header + payload, and
-// returns the decompressed (or count) size for the stream's chunk type:
-//   type 0    raw                          - returns raw size
-//   type 4    Huffman                      - returns dst size (GPU encoder emits)
-//   type 1, 2, 6  legacy entropy (decoder-skip-only) - returns dst size
-//   type 7    paired-primary               - returns countA
-//   type 5    paired-secondary             - returns countB
+// Reads the header at `*src`, advances `src` past the header + payload,
+// and returns the decompressed size:
+//   type 0    raw         — returns raw size
+//   type 4    Huffman     — returns dst size (only type the GPU encoder emits)
+// Any other type is treated as a generic entropy header (advance via
+// `parseEntropyHeader` so subsequent parsers see correct offsets); the
+// returned size is not meaningful for the caller.
 __device__ inline uint32_t skipEntropyStream(const uint8_t*& src) {
     uint32_t ct = (src[0] >> CHUNK_TYPE_SHIFT) & CHUNK_TYPE_MASK;
     if (ct == 0) {
         uint32_t sz = parseRawStreamSize(src);
         src += sz;
         return sz;
-    } else if (ct == 1) {
-        uint32_t comp_size;
-        return parseEntropyHeader(src, comp_size);
-    } else if (ct == 7) {
-        return skipPairedPrimary(src);
-    } else if (ct == 5) {
-        // Paired-secondary: [0x50][countA:u24][countB:u24], no payload.
-        uint32_t count_b = readBE24(src + 4);
-        src += PAIRED_SECONDARY_HEADER_BYTES;
-        return count_b;
-    } else {
-        // Huffman type 4 (GPU emits) or legacy entropy types 2/6 - parse header to skip.
-        uint32_t comp_size;
-        return parseEntropyHeader(src, comp_size);
     }
+    uint32_t comp_size;
+    return parseEntropyHeader(src, comp_size);
 }

@@ -16,10 +16,6 @@ kernels (NVIDIA Driver API, target `sm_89`) do the per-chunk LZ
 encode + decode and the Huffman pre-decode pass; Zig drivers manage
 the kernel launches and the host-side wire-format assembly.
 
-There is only one backend — CUDA. There used to be a CPU codec and a
-Vulkan compute-shader fallback; both were stripped on 2026-05-29 (see
-FAILED_EXPERIMENTS.md "Maintaining parallel CPU and GPU codebases").
-
 ---
 
 ## Source layout

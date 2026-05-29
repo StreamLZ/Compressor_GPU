@@ -241,7 +241,10 @@ pub fn gpuEncodeOff16HuffImpl(
     // fire. Cleanup on subsequent failure is handled by the explicit
     // `allocator.free(...)` calls in each `catch { ... }` block below.
     var hi_offsets = allocator.alloc(u32, n) catch return false;
-    var lo_offsets = allocator.alloc(u32, n) catch return false;
+    var lo_offsets = allocator.alloc(u32, n) catch {
+        allocator.free(hi_offsets);
+        return false;
+    };
 
     var total: u32 = 0;
     for (0..n) |i| {

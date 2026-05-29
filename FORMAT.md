@@ -273,8 +273,7 @@ concatenated in this order:
 [length stream]        extended-length tail bytes
 ```
 
-Each stream has its own per-stream header that picks raw vs Huffman
-vs (for paired primaries only) tANS.
+Each stream has its own per-stream header that picks raw vs Huffman.
 
 ### Literal and token streams
 
@@ -284,13 +283,9 @@ Both use the entropy-chunk header convention:
 |------------------------|-------------|
 | 0                      | Raw memcpy: `[3-byte BE size][raw bytes]` |
 | 4                      | Huffman-coded: `[5-byte non-compact header][Huffman body]` |
-| 5                      | tANS paired-secondary marker (literals or tokens shared a combined tANS body with the prior sub-chunk's primary). 7-byte fixed header carrying countA + countB. |
-| 6                      | tANS-32 (non-compact 5-byte header + tANS body). Used only by the host-side paired-primary path. |
-| 7                      | tANS paired-primary marker. `[0x70][countA:u24 BE][combined tANS body]`. |
 | 8 (high bit set)       | Compact memcpy (2-byte header, payload ≤ 0xFFF bytes). |
 
-The 5-byte **non-compact header** layout used by chunk types 1, 4, 6
-is:
+The 5-byte **non-compact header** layout used by chunk type 4 is:
 
 ```
 byte 0:   [type:4 | dst_size_minus_1[17:14]:4]
@@ -301,11 +296,10 @@ bytes 1-4 (BE u32): [dst_size_minus_1[13:0]:14 | comp_size:18]
 compressed-payload size occupies the low 18 bits of the BE u32 at
 bytes 1..4.
 
-The GPU encoder emits type 0 (raw) and type 4 (Huffman) for literals
-and tokens. Type 6 (tANS-32) and types 5/7 (paired) come from the
-host-side paired-primary path that runs when two adjacent 64 KB
-sub-chunks compress better as a single combined tANS body — used
-sparingly and only at L3-L5.
+The GPU encoder only emits type 0 (raw) and type 4 (Huffman) for
+literals and tokens. Any other chunk-type byte in a sub-chunk's
+literal or token header is rejected at scan-walk time as an
+unsupported stream shape.
 
 ### off16 stream
 
