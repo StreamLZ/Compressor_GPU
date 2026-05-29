@@ -10,7 +10,6 @@
 const std = @import("std");
 const frame = @import("../format/frame_format.zig");
 const lz_constants = @import("../format/streamlz_constants.zig");
-const fast_constants = @import("fast/fast_constants.zig");
 
 const fast_framed = @import("fast_framed.zig");
 const gpu_encoder = @import("driver.zig");
@@ -47,7 +46,7 @@ pub const Options = struct {
 /// and the SC tail prefix table.
 pub fn compressBound(src_len: usize) usize {
     const chunk_count: usize = (src_len + lz_constants.chunk_size - 1) / lz_constants.chunk_size;
-    const sub_chunks: usize = (src_len + fast_constants.sub_chunk_size - 1) / fast_constants.sub_chunk_size;
+    const sub_chunks: usize = (src_len + lz_constants.sub_chunk_size - 1) / lz_constants.sub_chunk_size;
     // Per sub-chunk: 3-byte BE header + 8 initial raw bytes + 3-byte
     // literal-stream header + 256 bytes of slack for the token / off16 /
     // off32 / length headers that follow.

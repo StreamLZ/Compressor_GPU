@@ -20,7 +20,11 @@ const std = @import("std");
 const frame = @import("../format/frame_format.zig");
 const block_header = @import("../format/block_header.zig");
 const lz_constants = @import("../format/streamlz_constants.zig");
-const fast_constants = @import("fast/fast_constants.zig");
+
+/// Inputs at or below this size are too small for the LZ kernel's
+/// per-warp setup cost to ever produce a smaller output; emit them as a
+/// whole-frame uncompressed body.
+const min_source_length: usize = 128;
 
 const encoder = @import("streamlz_encoder.zig");
 const Options = encoder.Options;
@@ -115,7 +119,7 @@ pub fn compressFramedOne(
     const frame_block_hdr_pos: usize = pos;
     const frame_block_start: usize = pos + 8;
 
-    const can_compress = src.len > fast_constants.min_source_length;
+    const can_compress = src.len > min_source_length;
     if (!can_compress) {
         return writeUncompressedFrame(dst, frame_block_hdr_pos, frame_block_start, src);
     }

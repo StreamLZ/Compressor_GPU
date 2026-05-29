@@ -1,156 +1,51 @@
-//! Centralized magic numbers for the StreamLZ codec family.
+//! Shared StreamLZ wire-format constants used by both the encode and
+//! decode sides on the host. The matching device-side constants live in
+//! `src/common/gpu_wire_format.cuh` — the two files must agree byte for
+//! byte (the `static_assert`s on the CUDA side catch drift).
 //!
 //! Terminology: "sc" / "SC" = "self-contained" throughout this module.
 
-// ────────────────────────────────────────────────────────────
-//  Chunk and buffer sizing
-// ────────────────────────────────────────────────────────────
-
+// ── Chunk sizing and header bit layout ─────────────────────────────────
 pub const chunk_size: usize = 0x40000; // 256 KB
 pub const chunk_size_bits: u6 = 18;
-pub const chunk_header_size: usize = 4;
 pub const chunk_size_mask: u32 = chunk_size - 1; // 0x3FFFF
+
+/// 4-byte chunk-header type field. Bits 18-19. Type 0 = LZ-compressed,
+/// type 1 = memset (single fill byte follows the 4-byte header).
 pub const chunk_type_shift: u6 = chunk_size_bits;
-pub const chunk_type_mask: u32 = 0b11 << chunk_type_shift; // bits 18..19
 pub const chunk_type_memset: u32 = 1 << chunk_type_shift;
 
-/// v2 chunk-header flag: bit 20 of the 4-byte chunk header, set when
-/// at least one LZ match in the chunk reads bytes produced before the
-/// chunk's own dst start (cross-chunk back-reference). Parallel decode
-/// uses this bit to gate phase-1 state requirements per chunk.
-pub const chunk_has_cross_chunk_match_shift: u6 = 20;
-pub const chunk_has_cross_chunk_match_mask: u32 = 1 << chunk_has_cross_chunk_match_shift;
+/// Bit 20 of the 4-byte chunk header. Set when at least one LZ match in
+/// the chunk reads bytes produced before the chunk's own destination
+/// start (a cross-chunk back-reference). Legacy CPU-codec hint for
+/// parallel decode; the GPU codec emits zero and the GPU decoder
+/// ignores it.
+pub const chunk_has_cross_chunk_match_mask: u32 = 1 << 20;
 
-pub const bt4_max_read_size: usize = 8 * 1024 * 1024;
-
-/// Default sliding-window size for the SLZ1 frame compressor. Matches
-/// Default window size (128 MB). Each frame
-/// block can reference up to this many bytes of previously-compressed
-/// data for match finding.
-pub const default_window_size: usize = 128 * 1024 * 1024;
-
-pub const compress_buffer_padding: usize = 16;
-
-/// Extra bytes the decoder is allowed to write past `dst_len`.
-pub const safe_space: usize = 64;
-
-/// Sub-chunk size: 128 KB. Each outer 256 KB chunk contains up to 2 sub-chunks.
+/// Sub-chunk size: 128 KB. Each outer 256 KB chunk contains up to two
+/// sub-chunks at sc_group_size = 1.0; the GPU encoder picks 0.25 or 0.5
+/// so it never emits more than one sub-chunk per chunk.
 pub const sub_chunk_size: usize = 0x20000;
 
-/// Maximum length value that fits in a single byte of the length stream.
-pub const extended_length_threshold: u32 = 251;
+// ── Decoder slack ──────────────────────────────────────────────────────
 
-pub const sub_chunk_type_shift: u6 = 19;
-pub const chunk_header_compressed_flag: u32 = 0x800000;
+/// Extra bytes the decoder is allowed to write past `dst_len`. Several
+/// copy helpers prefetch and store ahead by up to this many bytes; the
+/// caller's destination buffer must include this trailing slack.
+pub const safe_space: usize = 64;
 
-pub const scratch_size: usize = 0x6C000; // 442,368
-pub const entropy_scratch_size: usize = 0xD000; // 53,248
+// ── Frame-header default ───────────────────────────────────────────────
 
-/// Return the scratch buffer size needed for entropy coding a block of `dst_count` bytes.
-pub fn calculateScratchSize(dst_count: usize) usize {
-    const needed = 3 * dst_count + 32 + entropy_scratch_size;
-    return if (needed < scratch_size) needed else scratch_size;
-}
-
-pub const initial_recent_offset: u32 = 8;
-pub const max_dictionary_size: usize = 0x40000000; // 1 GB
-
-// ────────────────────────────────────────────────────────────
-//  Offset encoding constants
-// ────────────────────────────────────────────────────────────
-
-pub const offset_bias_constant: u32 = 760;
-pub const high_offset_threshold: u32 = 16_776_456;
-pub const low_offset_encoding_limit: u32 = 16_710_912;
-pub const high_offset_marker: u8 = 0xF0;
-pub const high_offset_cost_adjust: u32 = 0xE0;
-
-// ────────────────────────────────────────────────────────────
-//  Huffman lookup table sizing
-// ────────────────────────────────────────────────────────────
-
-pub const huffman_lut_bits: u6 = 11;
-pub const huffman_lut_size: usize = 1 << huffman_lut_bits; // 2048
-pub const huffman_lut_mask: u32 = @intCast(huffman_lut_size - 1);
-pub const huffman_bitpos_clamp_mask: u32 = 0x18;
-pub const huffman_lut_overflow: usize = 16;
-
-// ────────────────────────────────────────────────────────────
-//  Entropy block-size encoding masks
-// ────────────────────────────────────────────────────────────
-
-pub const block_size_mask_10: u32 = 0x3FF;
-pub const block_size_mask_12: u32 = 0xFFF;
-pub const rle_short_command_threshold: u32 = 0x2F;
-
-// ────────────────────────────────────────────────────────────
-//  Symbol alphabet
-// ────────────────────────────────────────────────────────────
-
-pub const alphabet_size: usize = 256;
-
-// ────────────────────────────────────────────────────────────
-//  Match finder / hash table
-// ────────────────────────────────────────────────────────────
-
-pub const hash_position_mask: u32 = 0x01FFFFFF;
-pub const hash_position_bits: u6 = 25;
-pub const hash_tag_mask: u32 = 0xFE000000;
-pub const fast_large_offset_threshold: u32 = 0xC00000;
-
-// ────────────────────────────────────────────────────────────
-//  Match distance thresholds
-// ────────────────────────────────────────────────────────────
-
-pub const offset_threshold_12kb: u32 = 0x3000;
-pub const offset_threshold_96kb: u32 = 0x18000;
-pub const offset_threshold_768kb: u32 = 0xC0000;
-pub const offset_threshold_1_5mb: u32 = 0x180000;
-pub const offset_threshold_3mb: u32 = 0x300000;
-
-// ────────────────────────────────────────────────────────────
-//  Cost model
-// ────────────────────────────────────────────────────────────
-
-pub const invalid_cost: f32 = @import("std").math.floatMax(f32) / 2;
-pub const cost_scale_factor: i32 = 32;
-
-// ────────────────────────────────────────────────────────────
-//  Entropy table sizing
-// ────────────────────────────────────────────────────────────
-
-pub const log2_lookup_table_size: usize = 4097;
-
-// ────────────────────────────────────────────────────────────
-//  Hashing
-// ────────────────────────────────────────────────────────────
-
-pub const fibonacci_hash_multiplier: u64 = 0x9E3779B97F4A7C15;
-
-// ────────────────────────────────────────────────────────────
-//  Threading
-// ────────────────────────────────────────────────────────────
-
-/// Legacy hardcoded SC group size (= 4 chunks = 1 MB). Kept for
-/// encoder-side use where the group-size choice is made at compress
-/// time. Decoders should prefer `FrameHeader.sc_group_size` (v2+)
-/// rather than this constant so future encoders can pick different
-/// values without a format bump.
-pub const sc_group_size: usize = 4;
-
-/// Canonical default for the v2 frame-header `sc_group_size` byte.
-/// Alias of `sc_group_size` for API clarity at header-write sites.
+/// Default value the frame writer stamps into the `sc_group_size` slot
+/// when the encoder did not pick a non-default value. The current GPU
+/// encoder always overrides this via `resolveScGroupSize`; the default
+/// is kept for the canonical-header smoke tests.
 pub const default_sc_group_size: u8 = 4;
 
-pub const per_thread_memory_estimate: usize = 40 * 1024 * 1024;
+// ── Match-window limits ────────────────────────────────────────────────
 
-// ────────────────────────────────────────────────────────────
-//  Debug sanity checks (compile-time)
-// ────────────────────────────────────────────────────────────
-
-comptime {
-    const std = @import("std");
-    std.debug.assert(huffman_lut_size == (@as(usize, 1) << huffman_lut_bits));
-    std.debug.assert(high_offset_threshold == (@as(u32, 1) << 24) - offset_bias_constant);
-    std.debug.assert(high_offset_cost_adjust == high_offset_marker - 16);
-}
+/// Maximum back-reference distance any LZ encoder is allowed to consult
+/// (1 GB). The GPU encoder does not consult this directly — it sizes
+/// its hash tables via `hashBitsForLevel` — but the constant still
+/// flows through the public `compressBound` upper bound.
+pub const max_dictionary_size: usize = 0x40000000;
