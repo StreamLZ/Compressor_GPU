@@ -10,7 +10,6 @@ const std = @import("std");
 
 const cuda = @import("cuda_api.zig");
 const d = @import("descriptors.zig");
-const graph_params_mod = @import("graph_params.zig");
 
 const CUdeviceptr = cuda.CUdeviceptr;
 const CUDA_SUCCESS = cuda.CUDA_SUCCESS;
@@ -298,11 +297,6 @@ pub const DecodeContext = struct {
     pipeline_streams: [cuda.NUM_PIPELINE_STREAMS]usize = @splat(0),
     pipeline_streams_created: bool = false,
 
-    // Per-kernel param storage for the back-half launches. Kept on the
-    // context so each kernel's `params[i]` array of pointers points at
-    // stable memory; `bindAll` wires the arrays up once per process
-    // from `fullGpuLaunchImpl` (idempotent).
-    graph_params: graph_params_mod.BackHalfGraphParams = .{},
 
     // Per-call scratch buffers - pulled off the dispatch-loop stack
     // because the combined ~384 KiB is uncomfortably large in a recursive

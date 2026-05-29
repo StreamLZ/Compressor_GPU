@@ -18,7 +18,6 @@ const d = @import("descriptors.zig");
 const dec_ctx = @import("decode_context.zig");
 const scan_host_mod = @import("scan_host.zig");
 const scan_gpu_mod = @import("scan_gpu.zig");
-const graph_params_mod = @import("graph_params.zig");
 
 const CUdeviceptr = cuda.CUdeviceptr;
 const CUDA_SUCCESS = cuda.CUDA_SUCCESS;
@@ -69,6 +68,18 @@ const Fns = struct {
     }
 };
 
+/// The six params shared by both LZ-decode kernel variants (raw and
+/// general). Kept as a struct so each field has a stable address for the
+/// CUDA kernel-params array (which takes `&field` pointers).
+const LzCommonParams = struct {
+    comp: CUdeviceptr,
+    descs_dev: CUdeviceptr,
+    dst: CUdeviceptr,
+    cpg: u32, // chunks_per_group
+    total: CUdeviceptr, // device pointer to the LZ kernel self-gate count
+    sc_cap: u32, // sub_chunk_cap
+};
+
 /// Pre-decode preparation: combine the four per-stream-type Huffman
 /// descriptor arrays (lit / tok / off16-hi / off16-lo) into one merged
 /// device array in `self.d_huff_descs`, with out_offsets adjusted by
@@ -91,26 +102,29 @@ fn mergeHuffDescs(
         // device buffers in step 6b. Launch the merge kernel - it writes
         // straight to self.d_huff_descs and updates the n_merged slot in
         // d_compact_counts. No host arrays, no H2D.
-        // Phase 4 Step 2: persistent param storage. Write field values
-        // into self.graph_params.merge and launch with its pre-bound
-        // params/extra arrays.
-        const mp = &self.graph_params.merge;
-        mp.p_lit         = self.d_compact_lit;
-        mp.p_tok         = self.d_compact_tok;
-        mp.p_hi          = self.d_compact_hi;
-        mp.p_lo          = self.d_compact_lo;
-        mp.p_n_lit       = self.d_compact_counts + 0;
-        mp.p_n_tok       = self.d_compact_counts + 4;
-        mp.p_n_hi        = self.d_compact_counts + 8;
-        mp.p_n_lo        = self.d_compact_counts + 12;
-        mp.p_tok_region  = @intCast(tok_offset);
-        mp.p_off16_region = @intCast(off16_offset);
-        mp.p_merged      = self.d_huff_descs;
-        mp.p_n_merged    = self.d_compact_counts + 20;
-        // Phase 2: stream-targeted launch + sync on caller's work_stream.
+        var k_lit: u64 = self.d_compact_lit;
+        var k_tok: u64 = self.d_compact_tok;
+        var k_hi: u64 = self.d_compact_hi;
+        var k_lo: u64 = self.d_compact_lo;
+        var k_n_lit: u64 = self.d_compact_counts + 0;
+        var k_n_tok: u64 = self.d_compact_counts + 4;
+        var k_n_hi: u64 = self.d_compact_counts + 8;
+        var k_n_lo: u64 = self.d_compact_counts + 12;
+        var k_tok_region: u32 = @intCast(tok_offset);
+        var k_off16_region: u32 = @intCast(off16_offset);
+        var k_merged: u64 = self.d_huff_descs;
+        var k_n_merged: u64 = self.d_compact_counts + 20;
+        var m_params = [_]?*anyopaque{
+            @ptrCast(&k_lit),         @ptrCast(&k_tok),          @ptrCast(&k_hi),       @ptrCast(&k_lo),
+            @ptrCast(&k_n_lit),       @ptrCast(&k_n_tok),        @ptrCast(&k_n_hi),     @ptrCast(&k_n_lo),
+            @ptrCast(&k_tok_region),  @ptrCast(&k_off16_region),
+            @ptrCast(&k_merged),      @ptrCast(&k_n_merged),
+        };
+        var m_extra = [_]?*anyopaque{null};
+        // Phase 2: stream-targeted launch on caller's work_stream.
         const stream = self.work_stream;
         const t_merge = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzMergeHuffDescsKernel", stream);
-        try cudaCall(launch_fn(ml.merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &mp.params, &mp.extra), .launch);
+        try cudaCall(launch_fn(ml.merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &m_params, &m_extra), .launch);
         endKernelTiming(t_merge, stream);
         // No post-launch sync: downstream kernels (huff_build, huff_decode)
         // are queued on the same stream and see merge's output via stream
@@ -205,14 +219,16 @@ fn gatherRawOff16(
             break :d_cnt self.d_n_raw_scratch;
         };
         {
-            // Phase 4 Step 2: persistent param storage on
-            // self.graph_params.gather.
-            const gp = &self.graph_params.gather;
-            gp.p_comp     = self.d_comp_persist;
-            gp.p_comp_len = @intCast(compressed_block.len);
-            gp.p_scratch  = self.d_entropy_off16_scratch;
-            gp.p_descs    = desc_dev;
-            gp.p_count    = d_count;
+            var p_comp: u64 = self.d_comp_persist;
+            var p_comp_len: u32 = @intCast(compressed_block.len);
+            var p_scratch: u64 = self.d_entropy_off16_scratch;
+            var p_descs: u64 = desc_dev;
+            var p_count: u64 = d_count;
+            var params = [_]?*anyopaque{
+                @ptrCast(&p_comp), @ptrCast(&p_comp_len), @ptrCast(&p_scratch),
+                @ptrCast(&p_descs), @ptrCast(&p_count),
+            };
+            var extra = [_]?*anyopaque{null};
             // ndesc is exact (host already knows the count); no over-launch.
             // The self-gate inside the kernel makes over-launch safe regardless.
             //
@@ -232,7 +248,7 @@ fn gatherRawOff16(
             const grid_x: u32 = ndesc;
             const stream = self.work_stream;
             const t_gather = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzGatherRawOff16Kernel", stream);
-            const launch_rc = launch_fn(ml.gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, stream, &gp.params, &gp.extra);
+            const launch_rc = launch_fn(ml.gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, stream, &params, &extra);
             if (launch_rc == CUDA_SUCCESS) {
                 endKernelTiming(t_gather, stream);
                 // No post-launch sync: downstream LZ kernel reads
@@ -476,13 +492,17 @@ fn runHuffPredecode(
         break :d_nh self.d_n_huff_scratch;
     };
     {
-        const hb = &self.graph_params.huff_build;
-        hb.p_comp  = self.d_comp_persist;
-        hb.p_descs = self.d_huff_descs;
-        hb.p_lut   = self.d_huff_lut;
-        hb.p_n     = d_n_huff;
+        var p_comp: u64 = self.d_comp_persist;
+        var p_descs: u64 = self.d_huff_descs;
+        var p_lut: u64 = self.d_huff_lut;
+        var p_n: u64 = d_n_huff;
+        var params = [_]?*anyopaque{
+            @ptrCast(&p_comp), @ptrCast(&p_descs),
+            @ptrCast(&p_lut),  @ptrCast(&p_n),
+        };
+        var extra = [_]?*anyopaque{null};
         const t_hb = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffBuildLutKernel", huff_stream);
-        try cudaCall(launch_fn(ml.huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &hb.params, &hb.extra), .launch);
+        try cudaCall(launch_fn(ml.huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra), .launch);
         endKernelTiming(t_hb, huff_stream);
     }
     // Split fence: time the LUT build separately from the decode.
@@ -494,16 +514,20 @@ fn runHuffPredecode(
         }
     }
     {
-        // Phase 4 Step 2: persistent param storage on self.graph_params.huff_dec.
-        const hd = &self.graph_params.huff_dec;
-        hd.p_comp  = self.d_comp_persist;
-        hd.p_descs = self.d_huff_descs;
-        hd.p_lut   = self.d_huff_lut;
-        hd.p_out   = self.d_entropy_scratch;
-        hd.p_n     = d_n_huff;
+        var p_comp: u64 = self.d_comp_persist;
+        var p_descs: u64 = self.d_huff_descs;
+        var p_lut: u64 = self.d_huff_lut;
+        var p_out: u64 = self.d_entropy_scratch;
+        var p_n: u64 = d_n_huff;
+        var params = [_]?*anyopaque{
+            @ptrCast(&p_comp), @ptrCast(&p_descs),
+            @ptrCast(&p_lut),  @ptrCast(&p_out),
+            @ptrCast(&p_n),
+        };
+        var extra = [_]?*anyopaque{null};
         const shared_bytes: c_uint = HUFF_LUT_ENTRIES * @sizeOf(u32);
         const t_hd = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffDecode4StreamKernel", huff_stream);
-        try cudaCall(launch_fn(ml.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, shared_bytes, huff_stream, &hd.params, &hd.extra), .launch);
+        try cudaCall(launch_fn(ml.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, shared_bytes, huff_stream, &params, &extra), .launch);
         endKernelTiming(t_hd, huff_stream);
     }
     return split_huff_build_ns;
@@ -578,37 +602,53 @@ fn runLzPipeline(
         // Huffman literals require the general kernel (it reads entropy_scratch).
         const use_raw_kernel = n_huff == 0 and ml.kernel_raw_fn != 0;
 
-        const comp_addr: CUdeviceptr = self.d_comp_persist;
-        const descs_addr: CUdeviceptr = self.d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc);
-        const dst_addr: CUdeviceptr = dst_base;
-        const total_addr: CUdeviceptr = total_dev;
+        // The six shared params (comp, descs_dev, dst, cpg, total, sc_cap)
+        // live in a small struct so each field has a stable address for
+        // the kernel-params array.
+        var common = LzCommonParams{
+            .comp = self.d_comp_persist,
+            .descs_dev = self.d_descs_persist + @as(u64, chunk_start) * @sizeOf(ChunkDesc),
+            .dst = dst_base,
+            .cpg = chunks_per_group,
+            .total = total_dev,
+            .sc_cap = sub_chunk_cap,
+        };
 
         if (use_raw_kernel) {
-            const lr = &self.graph_params.lz_raw;
-            lr.p_comp      = comp_addr;
-            lr.p_descs_dev = descs_addr;
-            lr.p_dst       = dst_addr;
-            lr.p_cpg       = chunks_per_group;
-            lr.p_total     = total_addr;
-            lr.p_sc_cap    = sub_chunk_cap;
+            var raw_params = [_]?*anyopaque{
+                @ptrCast(&common.comp),
+                @ptrCast(&common.descs_dev),
+                @ptrCast(&common.dst),
+                @ptrCast(&common.cpg),
+                @ptrCast(&common.total),
+                @ptrCast(&common.sc_cap),
+            };
+            var raw_extra = [_]?*anyopaque{null};
             const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", stream);
-            try cudaCall(launch_fn(ml.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lr.params, &lr.extra), .launch);
+            try cudaCall(launch_fn(ml.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra), .launch);
             endKernelTiming(t_lzr, stream);
         } else {
-            const lg = &self.graph_params.lz_gen;
-            lg.p_comp                = comp_addr;
-            lg.p_descs_dev           = descs_addr;
-            lg.p_dst                 = dst_addr;
-            lg.p_cpg                 = chunks_per_group;
-            lg.p_total               = total_addr;
-            lg.p_sc_cap              = sub_chunk_cap;
-            lg.p_entropy_scratch     = self.d_entropy_scratch;
-            lg.p_entropy_slot_stride = @as(u64, total_subchunks) * d.ENTROPY_SCRATCH_SLOT_BYTES;
-            lg.p_first_sub_idx       = self.d_first_subchunk_idx +
+            // General kernel adds entropy_scratch + slot_stride + first_sub_idx.
+            var p_entropy_scratch: u64 = self.d_entropy_scratch;
+            var p_entropy_slot_stride: u64 = @as(u64, total_subchunks) * d.ENTROPY_SCRATCH_SLOT_BYTES;
+            var p_first_sub_idx: CUdeviceptr = self.d_first_subchunk_idx +
                 if (self.d_first_subchunk_idx != 0) @as(u64, chunk_start) * @sizeOf(u32) else 0;
 
+            var lz_params = [_]?*anyopaque{
+                @ptrCast(&common.comp),
+                @ptrCast(&common.descs_dev),
+                @ptrCast(&common.dst),
+                @ptrCast(&common.cpg),
+                @ptrCast(&common.total),
+                @ptrCast(&common.sc_cap),
+                @ptrCast(&p_entropy_scratch),
+                @ptrCast(&p_entropy_slot_stride),
+                @ptrCast(&p_first_sub_idx),
+            };
+            var lz_extra = [_]?*anyopaque{null};
+
             const t_lz = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeKernel", stream);
-            try cudaCall(launch_fn(ml.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lg.params, &lg.extra), .launch);
+            try cudaCall(launch_fn(ml.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra), .launch);
             endKernelTiming(t_lz, stream);
         }
 
@@ -665,13 +705,6 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     if (!ml.init()) return error.BackendNotAvailable;
     if (ml.kernel_fn == 0) return error.KernelMissing;
     try ml.ensurePipelineStreams(self);
-
-    // Phase 4 Step 2: wire up persistent kernel-param storage. Idempotent;
-    // every launch in the back half reads/writes self.graph_params.*.p_*
-    // fields and uses self.graph_params.*.params as its kernelParams
-    // pointer. Required so a future cuStreamBeginCapture wrap (Step 3)
-    // captures stable addresses instead of stack-local variables.
-    self.graph_params.bindAll();
 
     const facade = @import("driver.zig");
 
