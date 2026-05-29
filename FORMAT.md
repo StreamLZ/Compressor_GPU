@@ -1,474 +1,444 @@
 # SLZ1 Frame Format Specification
 
 **Version:** 2
-**Status:** Stable (backward-compatible changes only)
-**Byte order:** Little-endian unless otherwise noted
-**Notation:** `BSR(x)` denotes Bit Scan Reverse — the 0-based index of the most significant set bit, equivalent to `floor(log2(x))` for x > 0.
+**Byte order:** Little-endian unless otherwise noted ("BE" labels the
+big-endian fields explicitly).
 
-> **Scope note (3.0):** The CPU codec was retired on 2026-05-29. The
-> GPU codec emits only a subset of the SLZ1 surface: Fast codec
-> (codec ID 1), levels 1-5, no dictionary, no parallel-decode
-> sidecar, sc_group_size ∈ {0.25, 0.5} as a float, single block,
-> content_size present. Decoders still accept the full spec for
-> legacy frames; encoders only produce the GPU subset. Sections
-> covering High-codec block layouts, sidecar bodies, and the
-> dictionary_id field are marked **Legacy** below and apply only to
-> frames produced by StreamLZ ≤ 2.x.
+This document specifies the wire format the StreamLZ GPU encoder
+produces and the GPU decoder accepts. The format is shared with the
+pre-3.0 CPU codec at the frame and block level; this document covers
+only the GPU subset.
 
----
-
-## Overview
-
-SLZ1 is a framed container format for StreamLZ compressed data. It wraps one or more independently compressed blocks with a header describing the codec, level, and optional metadata. The frame format enables streaming compression/decompression of arbitrarily large data using a sliding window.
-
-The design is similar in spirit to LZ4 frames and Zstandard frames: a magic number, a descriptor, a sequence of blocks, and an optional checksum.
+The constants in this document are mirrored byte-for-byte in
+`src/format/streamlz_constants.zig` (host side) and
+`src/common/gpu_wire_format.cuh` / `src/common/gpu_huffman.cuh`
+(device side). Discrepancies are bugs.
 
 ---
 
-## Frame Structure
+## Frame structure
 
 ```
-┌──────────────────────────┐
-│    Frame Header           │  14-26 bytes
-├──────────────────────────┤
-│    Block 0                │  8 bytes header + payload
-├──────────────────────────┤
-│    Block 1                │  8 bytes header + payload
-├──────────────────────────┤
-│    ...                    │
-├──────────────────────────┤
-│    Sidecar Block          │  (optional, legacy; not emitted by current encoder)
-├──────────────────────────┤
-│    End Mark               │  4 bytes (0x00000000)
-├──────────────────────────┤
-│    Content Checksum       │  4 bytes (optional)
-└──────────────────────────┘
+┌───────────────────────────┐
+│    Frame header           │  14-26 bytes
+├───────────────────────────┤
+│    Block 0                │  8-byte block header + block payload
+├───────────────────────────┤
+│    End mark               │  4 bytes (0x00000000)
+├───────────────────────────┤
+│    Content checksum       │  4 bytes (optional, XXH32)
+└───────────────────────────┘
 ```
+
+The GPU encoder always emits exactly one block. The decoder accepts
+multi-block frames at the parser level but, in practice, every frame
+the encoder produces today is single-block.
 
 ---
 
-## Frame Header
+## Frame header
 
-**Minimum size:** 14 bytes (no optional fields)
-**Maximum size:** 26 bytes (all optional fields present)
+Minimum 14 bytes (no optional fields). Maximum 26 bytes (all optional
+fields).
 
 ```
 Offset  Size  Field
 ─────────────────────────────────────────
-0       4     Magic number (0x53_4C_5A_31 = "SLZ1")
-4       1     Version (must be 2; decoders must reject unknown values)
-5       1     Flags (see below)
-6       1     Codec ID
-7       1     Compression level (1-9 codec level; user-facing levels 1-11 map to these)
-8       1     Block size (log2 encoding, see below)
-9       1     SC group size (chunks per self-contained group; typically 4)
-10      4     Reserved (must be 0)
-14      8     Content size (int64, present if flag bit 0 set)
-22      4     Dictionary ID (uint32, present if flag bit 3 set)
+ 0       4    Magic = 0x534C5A31 ("SLZ1" little-endian)
+ 4       1    Version. Must be 2; decoders reject any other value.
+ 5       1    Flags (see below)
+ 6       1    Codec ID. The GPU encoder always writes 1 (Fast).
+ 7       1    Internal level (1-6; see Level mapping below)
+ 8       1    Block-size log2 offset from 16 (so 2 → 256 KB)
+ 9       4    SC group size (IEEE 754 binary32 little-endian)
+13       1    Reserved (must be 0)
+14       8    Content size (int64 LE, present iff flag bit 0 set)
+22       4    Dictionary ID (uint32 LE, present iff flag bit 3 set)
 ```
 
-### Flags (byte at offset 5)
+### Flags byte at offset 5
 
-| Bit | Name                         | Meaning                                           |
-|-----|------------------------------|---------------------------------------------------|
-| 0   | ContentSizePresent           | 8-byte content size follows the fixed header       |
-| 1   | ContentChecksum              | 4-byte XXH32 checksum after the end mark           |
-| 2   | BlockChecksums               | 4-byte XXH32 checksum after each block payload     |
-| 3   | DictionaryIdPresent          | 4-byte dictionary ID follows content size (if any) |
-| 4   | ParallelDecodeMetadataPresent | Frame contains a sidecar block for parallel Fast decode. **Legacy:** current encoder (v2.0+) does not set this flag; L2-L5 now use SC group-parallel decode instead. Decoders must still handle it for backward compatibility with older frames. |
-| 5-7 | Reserved                     | Must be 0                                          |
+| Bit | Name                | Meaning |
+|-----|---------------------|---------|
+| 0   | ContentSizePresent  | 8-byte content size follows the fixed header. The GPU encoder always sets this bit. |
+| 1   | ContentChecksum     | 4-byte XXH32 checksum follows the end mark. The GPU encoder does not set this bit. |
+| 2   | BlockChecksums      | Per-block XXH32 checksum follows each block payload. The GPU encoder does not set this bit. |
+| 3   | DictionaryIdPresent | 4-byte dictionary ID follows the optional content size. The GPU encoder does not set this bit; decoders reject frames with this bit set (`error.UnknownDictionary`). |
+| 4-7 | Reserved            | Must be 0. |
 
-### Codec ID (byte at offset 6)
+### Codec ID at offset 6
 
-| Value | Codec | Description                              |
-|-------|-------|------------------------------------------|
-| 0     | High  | High-ratio codec (optimal/lazy parsing)  |
-| 1     | Fast  | Fast codec (greedy/lazy parsing)         |
+| Value | Meaning |
+|-------|---------|
+| 1     | Fast codec. The only value the GPU encoder writes. |
 
-### Block Size Encoding (byte at offset 8)
+Decoders reject any other value.
 
-The block size is stored as `log2(blockSize) - 16`. To decode:
+### Level mapping
 
-```
-blockSize = 1 << (value + 16)
-```
+The byte at offset 7 is the **internal** (engine) level, not the
+user-facing level. User L1-L5 maps to internal 1, 2, 3, 5, 6
+respectively (internal 4 is skipped because the parser variant it
+would have selected consistently lost to internal 5 on every
+workload we measured).
 
-| Stored value | Block size |
-|-------------|------------|
-| 0           | 64 KB      |
-| 1           | 128 KB     |
-| 2           | 256 KB (default) |
-| 3           | 512 KB     |
-| 4           | 1 MB       |
-| 5           | 2 MB       |
-| 6           | 4 MB (maximum)   |
+### Block size at offset 8
 
-The block size must be a power of 2 in the range [64 KB, 4 MB].
+Stored as `log2(block_size) - 16`. The GPU encoder always writes 2
+(256 KB block size). Decoders accept any value in `[0, 6]` (64 KB up
+to 4 MB).
 
-### SC Group Size (byte at offset 9)
+### sc_group_size at offset 9
 
-Number of 256 KB chunks per self-contained group. Must be 1-255 (0 is
-invalid). Default is 4; the encoder adaptively scales this based on file
-size (targeting ~16 groups for parallel decode). Decoders must use this
-value, not a hardcoded constant, when walking SC-block group boundaries.
+A 32-bit IEEE 754 little-endian float in units of 256 KB chunks. The
+GPU encoder picks adaptively from `{0.25, 0.5}`:
+
+- **0.25** (64 KB sub-chunks) below the GPU saturation threshold —
+  each decoder warp gets its own sub-chunk, more sub-chunks =
+  more parallelism.
+- **0.5** (128 KB sub-chunks) at or above saturation — larger
+  sub-chunks compress better and the decoder is already saturated.
+
+The saturation threshold is `sm_count × 48 warps × 128 KB`. On an
+RTX 4060 Ti (34 SMs) this is ~209 MB.
+
+Decoders must use the parsed value when computing chunk boundaries;
+no hard-coded SC group size is correct.
+
+### Content size at offset 14 (optional)
+
+64-bit signed integer little-endian (negative values mean "unknown",
+but the GPU encoder never writes a negative value). Capped at 4 GB
+on the decoder side — frames claiming more return
+`error.ContentSizeTooLarge`.
 
 ---
 
-## Block Header
+## Block header
 
 Each block is preceded by an 8-byte header:
 
 ```
 Offset  Size  Field
 ─────────────────────────────────────────
-0       4     Compressed size (uint32, with flag bits)
-4       4     Decompressed size (uint32)
+ 0       4    Compressed payload size, packed with flag bits
+ 4       4    Decompressed payload size (uint32 LE)
 ```
 
-**Compressed size field flags:**
+The compressed-size field packs flags into the high bits:
 
-| Bit | Name                        | Meaning |
-|-----|-----------------------------|---------|
-| 31  | Uncompressed                | Block is stored (raw bytes, no chunk headers) |
-| 30  | ParallelDecodeMetadata      | Block is a sidecar (see below), not decompressible data |
-| 0-29 | Size                       | Compressed payload size in bytes |
+| Bit  | Name                   | Meaning |
+|------|------------------------|---------|
+| 31   | Uncompressed           | Payload is raw bytes (no internal block header, no chunk headers). |
+| 30   | ParallelDecodeMetadata | Legacy sidecar marker. The GPU encoder does not set this bit. Decoders skip such blocks (they contribute 0 to dst). |
+| 0-29 | Size                   | Payload size in bytes. |
 
-- A value of `0x00000000` in the first 4 bytes is the **end mark** (no decompressed size follows).
-
-**Uncompressed blocks:** When bit 31 is set, the entire payload is raw data with no internal block header and no chunk headers. The decompressor copies the payload directly to the output.
-
-**Sidecar blocks:** When bit 30 is set, the block carries parallel-decode metadata. Its `decompressed_size` is 0; it produces no output. Serial decoders must skip the `compressed_size` bytes and advance without writing to dst. See the [Sidecar Block](#sidecar-block-parallel-decode-metadata) section.
-
-**Decompressed size:** The number of bytes this block produces when decompressed. For the last block in a stream, this may be smaller than the frame's block size.
+An entire 4-byte word of zeros at the block position is the **end
+mark** — no decompressed-size field follows.
 
 ---
 
-## End Mark
+## End mark and content checksum
 
-The end of the block sequence is signaled by 4 zero bytes:
+The block list ends with 4 zero bytes:
 
 ```
 00 00 00 00
 ```
 
-This is distinguished from a valid block header because no valid block has a compressed size of 0.
+If `ContentChecksum` is set in the frame flags, a 4-byte XXH32 of the
+uncompressed content follows the end mark. The GPU encoder does not
+set this flag.
 
 ---
 
-## Content Checksum (optional)
+## Block payload
 
-If the `ContentChecksum` flag is set in the frame header, a 4-byte XXH32 checksum of the entire uncompressed content follows immediately after the end mark.
+Every compressed block payload begins with a 2-byte **internal block
+header**, followed by a sequence of chunk-aligned payloads, optionally
+followed by an **SC tail prefix table**.
 
----
+### Internal block header (2 bytes)
 
-## Block Payload: Internal Block Header
-
-Within each compressed block payload, a 2-byte **internal block header** describes the codec and flags for the block's chunks:
+Bytes 0 and 1 are not the same byte order as the rest of the frame —
+this header is **inspected byte-by-byte**, not read as a u16.
 
 ```
 Byte 0 (bit layout):
-  [3:0]  Magic nibble (must be 0x5)
-  [4]    SelfContained flag
-  [5]    TwoPhase flag
-  [6]    RestartDecoder flag
-  [7]    Uncompressed flag
+  [3:0]  Magic nibble. Must be 0x5.
+  [4]    SelfContained flag. The GPU encoder always sets this bit.
+  [5]    TwoPhase flag. The GPU encoder never sets this bit.
+  [6]    RestartDecoder ("keyframe") flag. Always set on the first
+         block of every frame; the encoder also sets it on every
+         block when SelfContained is on.
+  [7]    Uncompressed flag. Set when this block decoded as memcpy
+         (no LZ tokens). For uncompressed chunks see the chunk
+         header type-1 path below.
 
 Byte 1 (bit layout):
-  [6:0]  DecoderType (0=High, 1=Fast, 2=Turbo)
-  [7]    UseChecksums flag
+  [6:0]  Decoder type. The GPU encoder writes 1 (Fast); decoders
+         also accept 2 (Turbo) since the wire format is identical.
+  [7]    UseChecksums flag. The GPU encoder never sets this bit.
 ```
 
-### DecoderType values
+### SelfContained mode
 
-| Value | Type  | Description                                    |
-|-------|-------|------------------------------------------------|
-| 0     | High  | 4-stream format (cmd, offs, lit, len)          |
-| 1     | Fast  | 6-stream format (lit, deltalit, cmd, off16, off32, len) |
-| 2     | Turbo | Same wire format as Fast                       |
+When SelfContained is set, the block payload is divided into chunks
+that decode independently. The encoder guarantees no LZ
+back-reference reaches across a chunk boundary, so each chunk can be
+handed to its own decoder warp.
 
-### SelfContained flag
+The first eight bytes of each chunk past the first arrive at the
+decoder garbage — the decoder's initial `Copy64` only fires when the
+chunk's `base_offset == 0`, and SC chunks 1..N-1 do not satisfy that.
+The encoder repairs this by appending an **SC tail prefix table**
+after the last chunk's payload:
 
-When set, chunks are grouped (default: 4 chunks per group, stored in the frame header's `sc_group_size` field) for parallel decompression. Within a group, chunks are decoded sequentially and may reference output from earlier chunks in the same group via LZ back-references. Between groups, there are no cross-references, enabling full parallelism across groups.
+```
+[chunk-1 first 8 bytes][chunk-2 first 8 bytes]...[chunk-N-1 first 8 bytes]
+```
 
-**Self-contained prefix table:** When SelfContained is set, the block payload is followed by a suffix table containing the first 8 bytes of each chunk except the first. This table has `(numChunks - 1) * 8` bytes. During parallel decompression, each chunk's initial 8 bytes may be decoded incorrectly (the LZ back-reference for `InitialRecentOffset = 8` cannot reach the prior chunk's output). After all chunks are decoded, the decompressor overwrites each chunk's first 8 bytes from this table to restore correctness.
+Total table size: `(num_chunks - 1) × 8` bytes. The decoder
+overwrites each chunk's first 8 bytes from this table after
+parallel decode completes.
 
 ---
 
-## Sub-chunk Structure (Fast codec)
+## Chunk header
 
-Each 256 KB chunk in the Fast codec is divided into two **sub-chunks** of up to 128 KB each. Each sub-chunk has its own independent set of six encoded streams. The first sub-chunk covers bytes [0, 131072) of the chunk output; the second covers [131072, 262144).
-
-Sub-chunk boundaries are significant for the legacy sidecar path: the cross-chunk dependency analysis operates at chunk granularity, and the parallel decode worker assignment operates at slice boundaries that are multiples of 16 chunks (4 MB). The current encoder uses SC group-parallel mode for all Fast levels, so sidecar-based slicing is only relevant when decoding older frames.
-
----
-
-## Chunk Structure
-
-Each block is divided into one or more **chunks** of up to 256 KB (262,144 bytes). The chunk is the fundamental unit of compression.
-
-### Chunk Header
-
-Each chunk begins with a 4-byte little-endian header, optionally followed by a 3-byte checksum:
+Each chunk starts with a 4-byte little-endian header:
 
 ```
-Bytes 0-3 (little-endian uint32):
-  [ChunkSizeBits-1 : 0]  Compressed size minus 1
-  [ChunkSizeBits+1 : ChunkSizeBits]  Type (0=normal, 1=memset)
-  [31 : ChunkSizeBits+2]  Reserved (must be 0)
-```
-
-With the default `ChunkSizeBits = 18` (256 KB chunk):
-- Bits [17:0] = compressed size minus 1 (0 .. 262,143)
-- Bits [19:18] = type
-- Bits [31:20] = reserved
-
-**Type values:**
-
-| Value | Meaning | Payload |
-|-------|---------|---------|
-| 0 | Normal | Compressed data follows |
-| 1 | Memset | Byte at offset 4 is the fill value |
-
-If the `UseChecksums` flag is set in the internal block header, 3 bytes of checksum follow the 4-byte header (bytes 4-6). This is the upper 24 bits of a CRC32 of the chunk's compressed payload (big-endian byte order).
-
-**Chunk sizes:**
-- Normal chunk: 4 bytes header (+ 3 bytes checksum if enabled) + compressed payload
-- Memset chunk: 5 bytes total (4-byte header + 1-byte fill value)
-- Uncompressed chunk: compressed size equals decompressed size; payload is raw bytes
-
----
-
-## Sidecar Block (Parallel-Decode Metadata)
-
-> **Legacy wire format.** The current encoder (v2.0+) uses SC
-> (self-contained) group-parallel mode for L1-L5 and no longer emits
-> sidecar blocks. This section documents the sidecar wire format so
-> that decoders can still read older .slz frames that contain sidecars.
-
-The sidecar block enables parallel Fast decode for frames that were
-encoded without SC mode. It is an optional block marked with bit 30
-(`ParallelDecodeMetadata`) in the block header's compressed_size field.
-Sidecar blocks have `decompressed_size == 0` and produce no output.
-
-The sidecar carries the pre-computed cross-chunk dependency data that
-the parallel decoder needs to execute before spawning per-slice worker
-threads: match copy operations and literal byte values that cross slice
-boundaries.
-
-### When present
-
-The sidecar is present when the frame header's flag bit 4
-(`ParallelDecodeMetadataPresent`) is set. In older encoders this
-occurred for non-SC Fast codec (L2-L5) frames. The current encoder
-(v2.0+) no longer sets this flag — all Fast levels now use SC
-group-parallel decode instead. L1 has always used SC mode.
-High codec (L6-L11) frames never carry a sidecar — L6-L8 use SC
-group-parallel decode, and L9-L11 use two-phase parallel decode,
-neither of which requires a sidecar.
-
-### Sidecar block body wire format
-
-```
-Offset  Size      Field
+Bits   Field
 ─────────────────────────────────────────
-0       4         Magic: 'PDSC' (0x43534450 LE)
-4       1         Sidecar version (must be 2)
-5       3         Reserved (must be 0)
-8       varint    num_match_ops (LEB128 u32)
-8+N     varint    num_literal_runs (LEB128 u32)
+ 0-17  Compressed size minus 1 (0..262143; chunk_size_bits = 18)
+18-19  Type: 0 = normal LZ, 1 = memset
+20     has_cross_chunk_match (legacy CPU parallel-decode hint;
+                              the GPU decoder ignores this bit and
+                              the GPU encoder writes 0)
+21-31  Reserved (must be 0)
 ```
 
-Followed by two sections:
+### Type 0 (normal)
 
-#### Match ops section
+Followed by `compressed_size` bytes of payload. The payload is one
+or more sub-chunks back-to-back. There is no extra header between
+the chunk header and the first sub-chunk.
 
-For each match op (in monotonically-increasing target_start order):
+### Type 1 (memset)
 
-| Field | Encoding | Description |
-|-------|----------|-------------|
-| delta_target | varint | `target_start - prev_target_start` (prev = 0 for first) |
-| offset | varint | `target_start - src_start` (always > 0) |
-| length | varint | Number of bytes to copy |
-
-The decoder executes these as byte-wise forward copies: `dst[target_start .. target_start+length] = dst[src_start .. src_start+length]`. These propagate cross-slice match chain values.
-
-#### Literal runs section
-
-For each run (consecutive-position byte groups, sorted by position):
-
-| Field | Encoding | Description |
-|-------|----------|-------------|
-| delta_position | varint | `run_start - prev_run_end` (prev_run_end = 0 for first) |
-| run_length | varint | Number of consecutive bytes |
-| bytes | raw | `run_length` literal byte values |
-
-The decoder writes these directly to dst at the indicated positions.
-
-### Compression characteristics
-
-Delta encoding makes positions 1-2 varint bytes each instead of 8 raw bytes. Match offsets are stored as `target - src` (small positive integers). Literal bytes are grouped into maximal consecutive runs to amortize the per-byte position overhead.
-
-Typical sidecar sizes (legacy frames only; the current encoder does not emit sidecars):
-- L1-L4 enwik8 (100 MB): ~150 KB (~0.15% of input)
-- L5 enwik8 (100 MB): ~1.2 MB (~1.2% of input)
-
-L5 sidecars are larger because the lazy parser produces longer-distance matches with deeper transitive cross-chunk dependency chains.
-
-### Decoder behavior (legacy sidecar path)
-
-1. Parse the sidecar block body.
-2. Execute all `literal_bytes` as scattered writes to dst (serial).
-3. Execute all `match_ops` as sequential forward copies to dst (serial).
-4. Dispatch parallel workers, each decoding a contiguous slice of chunks.
-
-Decoders that recognize the block flag but don't support parallel decode
-must skip the sidecar block by advancing past its `compressed_size`
-bytes. The sidecar is redundant — the serial decoder produces identical
-output without it.
+Followed by 1 byte: the fill value. The chunk decompresses to
+`decompressed_size` copies of that byte. The encoder produces this
+shape when every byte in the chunk is equal.
 
 ---
 
-## Codec Wire Formats
+## Sub-chunk header
 
-### Fast/Turbo Codec (6-stream format)
-
-The Fast codec splits each chunk into up to two 128 KB sub-chunks, with six parallel byte streams per sub-chunk:
-
-| Stream      | Type     | Content                                         |
-|-------------|----------|-------------------------------------------------|
-| Cmd         | byte     | Flag/command tokens encoding literal+match pairs |
-| Lit         | byte     | Raw literal bytes                                |
-| DeltaLit    | byte     | Delta-coded literal bytes (optional)             |
-| Off16       | uint16   | Near (16-bit) match offsets                      |
-| Off32       | uint32   | Far (32-bit) match offsets                       |
-| Length      | byte     | Variable-length extra lengths                    |
-
-**Flag byte encoding (Cmd stream):**
-
-| Value      | Meaning                                                |
-|------------|--------------------------------------------------------|
-| >= 24      | Inline literal+match: bits[2:0]=literal count, bits[6:3]=match length, bit[7]=use recent offset |
-| 0          | Long literal run: read length from Length stream (+64)  |
-| 1          | Long near-offset match: read length from Length stream (+91) |
-| 2          | Long far-offset match: read length from Length stream (+29) |
-| 3..23      | Short far-offset match: length = flagbyte + 5          |
-
-Each sub-chunk's streams are entropy-coded (Huffman or tANS) or stored raw, with a per-stream header indicating the encoding method.
-
-### High Codec (4-stream format)
-
-The High codec uses four streams per chunk:
-
-| Stream  | Type    | Content                                        |
-|---------|---------|------------------------------------------------|
-| Cmd     | byte    | Interleaved literal-length and match-length tokens |
-| Offs    | int32   | Match offsets (when not using a recent offset)  |
-| Lit     | byte    | Raw literal bytes                               |
-| Len     | int32   | Overflow lengths (when token can't hold the full length) |
-
-The command stream encodes (literal_length, match_length, use_recent_offset) triples. Short lengths are packed inline; longer lengths spill into the Len stream. The High codec supports a recent-offset carousel of the last 3 offsets, selectable by index in the command token.
-
----
-
-## Entropy Coding
-
-Individual streams within a chunk are compressed using one of:
-
-1. **Raw (memcopy)** — stream is stored uncompressed
-2. **Huffman** — canonical Huffman coding with code lengths transmitted as a compact header
-3. **tANS** — table-based asymmetric numeral systems with 4-way interleaved state
-
-The choice is made per-stream based on a cost model that estimates the compressed size of each option. The stream header byte identifies which method was used.
-
-### Huffman Code Length Encoding
-
-Code lengths (0-11 bits) are transmitted using a two-level scheme: first a set of "code length code lengths" (3-bit values for a small alphabet), then the actual code lengths are entropy-coded using that meta-code.
-
-### tANS Table Encoding
-
-The tANS frequency table is transmitted as a sequence of symbol counts using variable-length coding. The decoder rebuilds the decoding table from these frequencies. Four interleaved tANS states are maintained for throughput.
-
----
-
-## Sliding Window
-
-In the framed streaming API, a **sliding window** provides cross-block back-references:
-
-- The compressor maintains a buffer of `windowSize + blockSize` bytes.
-- After compressing each block, decoded output slides forward: the most recent `windowSize` bytes are retained as dictionary context for the next block.
-- The decompressor maintains the same window and passes the dictionary context to the block decoder so LZ back-references can reach into previously decoded blocks.
-- Default window size: 128 MB. L11 uses 128 MB for best ratio.
-
-When `SelfContained` mode is enabled, chunks are grouped (4 per group by default). Cross-group references are disabled, enabling parallel decompression. Within a group, chunks are decoded sequentially with cross-chunk context. Cross-block references via the sliding window are still active unless the frame compressor operates in fully independent mode.
-
-**Dictionary ID:** The optional `DictionaryId` field in the frame header is an opaque 4-byte identifier that tags which pre-shared dictionary was used during compression. It does **not** carry dictionary content — both compressor and decompressor must have the dictionary available externally. If present, the dictionary is logically prepended to the sliding window before the first block (i.e., it occupies the initial window state so the first block can reference it via LZ back-references).
-
----
-
-## Offset Encoding
-
-Match offsets are encoded in two ranges:
-
-### Low range (offset < 16,776,456)
+Within a chunk's payload, each sub-chunk starts with a 3-byte
+**big-endian** header:
 
 ```
-bucket = BSR(offset + 760) - 9
-nibble = (offset - 8) & 0xF
-packed = nibble + 16 * bucket
+Bit   Field
+─────────────────────────────────────────
+23    LZ flag. 1 = sub-chunk is LZ-compressed (use the LZ decode
+      pipeline); 0 = sub-chunk is raw bytes (just memcpy).
+22-19 Decode mode (4 bits). Identifies the entropy-stream layout
+      inside the LZ-compressed payload.
+18-0  Compressed payload size (19 bits, up to 512 KB; the encoder
+      never emits a sub-chunk larger than 128 KB).
 ```
 
-This produces a single byte (0x00..0xEF) that the entropy coder compresses.
+The decode-mode nibble switches between sub-chunk variants. Today the
+GPU encoder uses only two:
 
-### High range (offset >= 16,776,456)
+- **Mode = 0**: raw sub-chunk. The payload is uncompressed bytes.
+- **Mode = 1**: LZ-compressed sub-chunk with per-stream entropy
+  selection (see Sub-chunk payload below).
 
-```
-extraBits = BSR(offset - 16,710,912)
-packed = extraBits | 0xF0
-```
-
-The packed byte (0xF0..0xFF) is followed by `extraBits` raw bits encoding the remainder.
+Other mode values are reserved.
 
 ---
 
-## Constants Summary
+## Sub-chunk payload (LZ-compressed)
 
-| Constant           | Value       | Description                        |
-|--------------------|-------------|------------------------------------|
-| Magic number       | 0x534C5A31  | "SLZ1" in little-endian            |
-| Version            | 2           | Current format version             |
-| Chunk size         | 262,144     | 256 KB                             |
-| Sub-chunk size     | 131,072     | 128 KB (Fast codec only)           |
-| Min block size     | 65,536      | 64 KB                              |
-| Max block size     | 4,194,304   | 4 MB                               |
-| Default block size | 262,144     | 256 KB (= chunk size)              |
-| Max dictionary     | 1,073,741,824 | 1 GB                             |
-| Default window     | 134,217,728 | 128 MB                             |
-| SafeSpace          | 64          | Extra bytes needed past output end |
-| Huffman LUT bits   | 11          | 2048-entry decode table            |
-| Initial copy bytes | 8           | Verbatim bytes at chunk start      |
-| SC group size      | 4 (default) | Chunks per group in self-contained mode; adaptive 4-255 |
-| Sidecar magic      | 0x43534450  | "PDSC" in little-endian (legacy)   |
-| Sidecar version    | 2           | Sidecar format version (legacy)    |
+An LZ-compressed sub-chunk's payload contains six byte streams,
+concatenated in this order:
+
+```
+[8 raw init bytes]     present only on the first sub-chunk of the
+                       frame; matches INITIAL_LITERAL_COPY_BYTES
+[literals stream]      see below
+[tokens stream]        see below
+[off16 stream]         16-bit match offsets (split hi/lo when
+                       entropy-coded)
+[off32 stream]         match offsets that didn't fit in 16 bits
+[length stream]        extended-length tail bytes
+```
+
+Each stream has its own per-stream header that picks raw vs Huffman
+vs (for paired primaries only) tANS.
+
+### Literal and token streams
+
+Both use the entropy-chunk header convention:
+
+| First byte high nibble | Stream form |
+|------------------------|-------------|
+| 0                      | Raw memcpy: `[3-byte BE size][raw bytes]` |
+| 4                      | Huffman-coded: `[5-byte non-compact header][Huffman body]` |
+| 5                      | tANS paired-secondary marker (literals or tokens shared a combined tANS body with the prior sub-chunk's primary). 7-byte fixed header carrying countA + countB. |
+| 6                      | tANS-32 (non-compact 5-byte header + tANS body). Used only by the host-side paired-primary path. |
+| 7                      | tANS paired-primary marker. `[0x70][countA:u24 BE][combined tANS body]`. |
+| 8 (high bit set)       | Compact memcpy (2-byte header, payload ≤ 0xFFF bytes). |
+
+The 5-byte **non-compact header** layout used by chunk types 1, 4, 6
+is:
+
+```
+byte 0:   [type:4 | dst_size_minus_1[17:14]:4]
+bytes 1-4 (BE u32): [dst_size_minus_1[13:0]:14 | comp_size:18]
+```
+
+`dst_size_minus_1` reconstructs as `(top4 << 14) | low14`. The
+compressed-payload size occupies the low 18 bits of the BE u32 at
+bytes 1..4.
+
+The GPU encoder emits type 0 (raw) and type 4 (Huffman) for literals
+and tokens. Type 6 (tANS-32) and types 5/7 (paired) come from the
+host-side paired-primary path that runs when two adjacent 64 KB
+sub-chunks compress better as a single combined tANS body — used
+sparingly and only at L3-L5.
+
+### off16 stream
+
+```
+[2-byte LE count]   number of 16-bit offsets in this sub-chunk
+                    (or 0xFFFF, see below)
+[2 × count bytes]   the offsets, little-endian u16 pairs
+```
+
+When the count field equals `0xFFFF` (the **entropy marker**), the
+off16 stream is split into hi/lo byte planes, each entropy-coded:
+
+```
+[2-byte 0xFFFF marker]
+[hi-plane entropy chunk]   chunk_type = 4 (Huffman) when worthwhile,
+                           chunk_type = 0 (raw bytes) otherwise.
+[lo-plane entropy chunk]   same shape, separate decision.
+```
+
+Each plane's chunk uses the same 5-byte non-compact header as
+literals + tokens (chunk_type=4) or the 3-byte raw header
+(chunk_type=0).
+
+The split decision is made per-plane: a plane uses Huffman only when
+`5 + huff_body < 3 + count` (i.e., Huffman beats raw). The combined
+split form is emitted only when the two-plane total beats the
+unsplit `count + 2` raw form.
+
+### off32 stream
+
+The off32 header is a packed 3-byte field, plus optional u16 extras,
+plus the offset payload itself:
+
+```
+[3-byte packed counts]
+  bits 23..12  block-0 off32 count (12 bits; 4095 escapes)
+  bits 11..0   block-1 off32 count (12 bits; 4095 escapes)
+[optional 2-byte LE extra for block 0 count] iff packed-bits-23..12 == 4095
+[optional 2-byte LE extra for block 1 count] iff packed-bits-11..0  == 4095
+[off32 entries]
+```
+
+Each off32 entry is either 3 or 4 bytes. The high byte of the third
+byte selects the form: values `< 0xC0` mean a 3-byte entry,
+values `>= 0xC0` mean a 4-byte entry that encodes an offset wider
+than 22 bits.
+
+### length stream
+
+Raw bytes, no header. Tokens that mark themselves as "extended
+length" name a number of bytes to consume from this stream. The
+extended-length marker threshold is 251: token-stream bytes with raw
+value > 251 (i.e., 252-255) indicate the length spills into the
+length stream.
 
 ---
 
-## Parallel Decode Strategy Summary
+## 32-stream BIL Huffman wire format
 
-### Decode
+Chunk type 4 (Huffman) bodies use the bounded-interleaved (BIL)
+layout. The body decomposes into:
 
-| Levels | Codec | Strategy | Mechanism |
-|--------|-------|----------|-----------|
-| L1     | Fast  | SC group-parallel | Encoder emits self-contained chunks (1 chunk per group). Decoded via `decompressCoreParallel`. No sidecar needed. |
-| L2-L4  | Fast  | SC group-parallel | Encoder emits self-contained groups (adaptive sizing, ~16 groups per file). Each group decoded independently, no sidecar needed. Legacy frames may contain a sidecar instead; decoders must handle both paths. |
-| L5     | Fast  | SC group-parallel | Same as L2-L4. Legacy frames may contain a larger sidecar (~1.2% overhead); decoders must handle both paths. |
-| L6-L8  | High  | SC group-parallel | Encoder constrains chunks to self-contained groups (adaptive size, ~16 groups per file). Each group decoded independently, no sidecar needed. |
-| L9-L11 | High  | Two-phase parallel | Phase 1: parallel entropy decode + token resolution. Phase 2: serial token execution. No sidecar (64 MB dictionary window makes cross-slice deps ubiquitous). |
+```
+[128 B weights]      256 4-bit code lengths, packed low-nibble first
+[96 B sub-header]    32 × u24 LE per-stream byte sizes
+[4 B K]              u32 LE interleaved-word count
+                     K = min(words[s] for s in 0..31), with
+                     words[s] = (size[s] + 3) / 4
+[K × 128 B]          interleaved area: K rows × 32 streams × 4 bytes;
+                     row w holds lane s's word w at byte offset
+                     (w × 128 + s × 4)
+[tail area]          per-stream bytes from word K onward, concatenated
+                     at exclusive-prefix-sum-of-tail-sizes offsets
+```
 
-### Compress
+Why this layout: in the hot loop every warp lane refills the same
+word index simultaneously. The interleaved area lets that refill be
+**one coalesced 128-byte sector load** instead of 32 scattered
+4-byte loads — measured ~12-13% kernel speedup over the prior
+concatenated layout at ~0.01% header growth.
 
-| Levels | Codec | Threading |
-|--------|-------|-----------|
-| L1     | Fast  | Parallel (per-chunk workers, SC mode) |
-| L2-L5  | Fast  | Parallel (SC, per-group workers, adaptive group sizing) |
-| L6-L8  | High  | Parallel (per-group workers, SC mode) |
-| L9-L11 | High  | Parallel (per-block workers, sliding window) |
+All 32 stream sizes are stored explicitly so each lane can compute
+its own `words[s]` locally and warp-min-reduce to K without an
+extra total-payload round trip.
+
+Code lengths are limited to **11 bits**. The decode-side LUT is
+1024 entries wide and indexed by 10 bits of the bit buffer; an
+11-bit code can't be resolved by 10 bits and falls into an escape
+entry that consumes one extra bit before re-indexing.
+
+The encoder writes streams zero-padded up to a 4-byte BIL word
+boundary so the decoder's u32 reads never tear across the
+last-byte-of-stream / start-of-next-allocation boundary.
+
+---
+
+## Constants summary
+
+| Constant                       | Value         | Source                         |
+|--------------------------------|---------------|--------------------------------|
+| Magic                          | `0x534C5A31`  | `SLZ_FRAME_MAGIC`              |
+| Version                        | `2`           | `SLZ_FRAME_VERSION`            |
+| Codec (Fast)                   | `1`           | `SLZ_CODEC_FAST_LZ`            |
+| Min frame-header size          | `14`          | `SLZ_FRAME_MIN_HDR_SIZE`       |
+| Chunk size                     | `262144`      | `SLZ_CHUNK_SIZE_BYTES` (256 KB)|
+| Chunk size bits                | `18`          | `chunk_size_bits`              |
+| Sub-chunk header bytes         | `3`           | `SUBCHUNK_HDR_BYTES`           |
+| Sub-chunk LZ flag bit          | `0x800000`    | `SUBCHUNK_LZ_FLAG_BIT`         |
+| Sub-chunk mode shift / mask    | `19` / `0xF`  | `SUBCHUNK_MODE_*`              |
+| Sub-chunk comp-size mask       | `0x7FFFF`     | `SUBCHUNK_COMP_SIZE_MASK`      |
+| LZ block size                  | `0x10000`     | `LZ_BLOCK_SIZE` (64 KB)        |
+| Initial literal copy bytes     | `8`           | `INITIAL_LITERAL_COPY_BYTES`   |
+| Initial recent offset          | `-8`          | `INITIAL_RECENT_OFFSET`        |
+| Off16 entropy marker           | `0xFFFF`      | `OFF16_ENTROPY_MARKER`         |
+| Off32 long-entry tag           | `0xC0`        | `OFF32_LONG_ENTRY_TAG`         |
+| Off32 count-field bits         | `12`          | `OFF32_COUNT_FIELD_BITS`       |
+| Extended-length threshold      | `251`         | `EXT_LENGTH_THRESHOLD`         |
+| Huffman chunk type             | `4`           | `HUFF_CHUNK_TYPE`              |
+| Huffman max code length        | `11`          | `HUFF_MAX_CODE_LEN`            |
+| Huffman LUT entries            | `1024`        | `HUFF_LUT_ENTRIES`             |
+| Huffman stream count           | `32`          | `HUFF_NUM_STREAMS`             |
+| Huffman weights bytes          | `128`         | `HUFF_WEIGHTS_BYTES`           |
+| Huffman sub-header bytes       | `96`          | `HUFF_SUBHEADER_BYTES`         |
+| Huffman BIL K bytes            | `4`           | `HUFF_BIL_K_BYTES`             |
+| Block-uncompressed flag        | `0x80000000`  | `block_uncompressed_flag`      |
+| End mark                       | `0x00000000`  | `end_mark`                     |
+| Block internal magic nibble    | `0x05`        | `SLZ_INT_BLOCK_MAGIC`          |
+| Decoder ID (Fast / Turbo)      | `1` / `2`     | `SLZ_DECODER_FAST/TURBO`       |
+| Safe space                     | `64`          | `safe_space` (decoder slack)   |
+
+For the algorithmic reasoning behind the BIL layout, the parallel-
+parse hot loop, and the warp-cooperative byte copies, see
+[docs/GPU_ARCHITECTURE.md](docs/GPU_ARCHITECTURE.md).
