@@ -38,13 +38,13 @@ const finalizeProfiling = decode_context.finalizeProfiling;
 
 /// Bundle of the CUDA Driver API function pointers used by the GPU
 /// decode pipeline. Resolved once at `fullGpuLaunchImpl` entry and
-/// threaded into the pipeline helpers (`runHuffPredecode`,
+/// threaded into the pipeline helpers (`runHuffBuildAndDecode`,
 /// `runLzPipeline`, `finalizeOutput`) so they don't each re-resolve the
 /// same `cuMemcpyHtoD_fn orelse return error.BackendNotAvailable`
 /// patterns. `d2d` is optional because only the D2D source and D2D
 /// output paths consult it; each site unwraps with its own `orelse
 /// return error.BackendNotAvailable`.
-const Fns = struct {
+const CudaProcs = struct {
     h2d: cuda.FnMemcpyHtoD,
     d2h: cuda.FnMemcpyDtoH,
     launch: cuda.FnLaunchKernel,
@@ -52,7 +52,7 @@ const Fns = struct {
     stream_sync: cuda.FnStreamSync,
     d2d: ?cuda.FnMemcpyDtoDAsync,
 
-    fn resolve() GpuError!Fns {
+    fn resolve() GpuError!CudaProcs {
         return .{
             .h2d = cuda.cuMemcpyHtoD_fn orelse return error.BackendNotAvailable,
             .d2h = cuda.cuMemcpyDtoH_fn orelse return error.BackendNotAvailable,
@@ -65,15 +65,16 @@ const Fns = struct {
 };
 
 /// The six params shared by both LZ-decode kernel variants (raw and
-/// general). Kept as a struct so each field has a stable address for the
-/// CUDA kernel-params array (which takes `&field` pointers).
+/// general). Held as a struct so each field has a stable address for
+/// the CUDA kernel-params array (which takes `&field` pointers).
 const LzCommonParams = struct {
     comp: CUdeviceptr,
     descs_dev: CUdeviceptr,
     dst: CUdeviceptr,
-    cpg: u32, // chunks_per_group
-    total: CUdeviceptr, // device pointer to the LZ kernel self-gate count
-    sc_cap: u32, // sub_chunk_cap
+    chunks_per_group: u32,
+    /// Device pointer to the LZ kernel's self-gate count.
+    total: CUdeviceptr,
+    sub_chunk_cap: u32,
 };
 
 /// Pre-decode preparation: combine the four per-stream-type Huffman
@@ -153,50 +154,57 @@ fn gatherRawOff16(
     // d_entropy_off16_scratch from the same stream.
 }
 
-/// SLZ_E2E_TIMER trace fields, populated incrementally by fullGpuLaunchImpl.
+/// SLZ_E2E_TIMER cumulative timestamps, each measured as elapsed
+/// nanoseconds since `t0`. Populated incrementally between phases of
+/// `fullGpuLaunchImpl` so `emitE2eTrace` can recover per-phase deltas.
 const E2eCumulative = struct {
+    /// End of host-to-device input upload (or D2D copy).
     h2d: i64 = 0,
+    /// Just before the entropy scan kernel queues.
     prescan: i64 = 0,
+    /// Just after the scan kernel, before raw-off16 gather.
     postscan: i64 = 0,
+    /// End of the scan phase (after raw-off16 gather).
     scan: i64 = 0,
+    /// End of the back half (Huff predecode + LZ pipeline), before
+    /// the finalize copy.
     predh: i64 = 0,
 };
 
-/// Nanoseconds elapsed between `t0` (a `std.Io.Clock.awake.now(...)`
-/// reading) and now, as i64. `anytype` because the Clock reading type
-/// isn't directly nameable at the call site.
-inline fn nsSince(t0: anytype, iv: std.Io) i64 {
-    return @intCast(t0.untilNow(iv, .awake).toNanoseconds());
+/// Nanoseconds elapsed between `t0` and now. `t0` is a
+/// `std.Io.Clock.Awake` reading captured at function entry; the
+/// `anytype` is because the Clock reading type is not directly
+/// nameable at the use site.
+inline fn nsSince(t0: anytype, io: std.Io) i64 {
+    return @intCast(t0.untilNow(io, .awake).toNanoseconds());
 }
 
-/// SLZ_E2E_TIMER: phase breakdown print at the end of the decode call.
-/// `t0` is the start clock reading captured at function entry - `anytype`
-/// because the std.Io.Clock reading type is not directly nameable here.
+inline fn nsToMs(ns: i64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1e6;
+}
+
+/// SLZ_E2E_TIMER: per-phase breakdown print at the end of the decode
+/// call. `t0` is the start clock reading captured at function entry.
 fn emitE2eTrace(
     t0: anytype,
-    iv: std.Io,
+    io: std.Io,
     cum: E2eCumulative,
     last_kernel: i64,
 ) void {
-    const cum_end_ns: i64 = nsSince(t0, iv);
-    const ms = struct {
-        fn f(ns: i64) f64 {
-            return @as(f64, @floatFromInt(ns)) / 1e6;
-        }
-    }.f;
+    const cum_end_ns: i64 = nsSince(t0, io);
     const preblk_ns = cum.prescan - cum.h2d;
     const scanfn_ns = cum.postscan - cum.prescan;
     const rawcopy_ns = cum.scan - cum.postscan;
     const prep_ns = (cum.predh - cum.scan) - last_kernel;
     std.debug.print("  [e2e] setup+H2D {d:.3}  preBlk {d:.3}  scanFn {d:.3}  rawD2D {d:.3}  prep {d:.3}  kernels {d:.3}  D2H {d:.3}  total {d:.3} ms\n", .{
-        ms(cum.h2d),
-        ms(preblk_ns),
-        ms(scanfn_ns),
-        ms(rawcopy_ns),
-        ms(prep_ns),
-        ms(last_kernel),
-        ms(cum_end_ns - cum.predh),
-        ms(cum_end_ns),
+        nsToMs(cum.h2d),
+        nsToMs(preblk_ns),
+        nsToMs(scanfn_ns),
+        nsToMs(rawcopy_ns),
+        nsToMs(prep_ns),
+        nsToMs(last_kernel),
+        nsToMs(cum_end_ns - cum.predh),
+        nsToMs(cum_end_ns),
     });
 }
 
@@ -246,16 +254,16 @@ pub const DecodeRequest = struct {
 /// Returns the LUT-build elapsed nanoseconds when `split_timer` is set
 /// (driven by `SLZ_SPLIT_TIMER`); otherwise zero. The caller computes
 /// the full huff-total time after the back-half stream sync.
-fn runHuffPredecode(
+fn runHuffBuildAndDecode(
     self: *DecodeContext,
-    fns: *const Fns,
+    procs: *const CudaProcs,
     n_huff: u32,
     heavy_stream: usize,
     split_timer: bool,
     t_huff_start: anytype,
     io: ?std.Io,
 ) GpuError!i64 {
-    const launch_fn = fns.launch;
+    const launch_fn = procs.launch;
 
     const huff_stream = heavy_stream;
     var split_huff_build_ns: i64 = 0;
@@ -280,7 +288,7 @@ fn runHuffPredecode(
     }
     // Split fence: time the LUT build separately from the decode.
     if (split_timer) {
-        try cudaCall(fns.stream_sync(huff_stream), .sync);
+        try cudaCall(procs.stream_sync(huff_stream), .sync);
         if (t_huff_start) |hs| {
             if (io) |io_val|
                 split_huff_build_ns = nsSince(hs, io_val);
@@ -314,7 +322,7 @@ fn runHuffPredecode(
 /// otherwise zero.
 fn runLzPipeline(
     self: *DecodeContext,
-    fns: *const Fns,
+    procs: *const CudaProcs,
     chunks_per_group: u32,
     sub_chunk_cap: u32,
     n_huff: u32,
@@ -327,15 +335,15 @@ fn runLzPipeline(
     /// this is `d_walk_meta + offset(n_chunks)` (no H2D round-trip);
     /// otherwise `self.d_n_groups_scratch` after the host-staging H2D
     /// in `fullGpuLaunchImpl`.
-    total_dev: CUdeviceptr,
+    lz_total_count_dev: CUdeviceptr,
     /// Base device address the LZ kernel writes decompressed bytes
     /// into. Normally `self.d_output`; on the direct-write fast path
     /// the caller routes `req.d_output_target` here so the kernel
     /// skips the finalize D2D copy.
-    dst_base: CUdeviceptr,
+    lz_dst_base_dev: CUdeviceptr,
 ) GpuError!i64 {
-    const launch_fn = fns.launch;
-    const stream_sync_fn = fns.stream_sync;
+    const launch_fn = procs.launch;
+    const stream_sync_fn = procs.stream_sync;
     const stream = heavy_stream;
 
     var split_lz_ns: i64 = 0;
@@ -359,10 +367,10 @@ fn runLzPipeline(
     var common = LzCommonParams{
         .comp = self.d_comp_persist,
         .descs_dev = self.d_descs_persist,
-        .dst = dst_base,
-        .cpg = chunks_per_group,
-        .total = total_dev,
-        .sc_cap = sub_chunk_cap,
+        .dst = lz_dst_base_dev,
+        .chunks_per_group = chunks_per_group,
+        .total = lz_total_count_dev,
+        .sub_chunk_cap = sub_chunk_cap,
     };
 
     if (use_raw_kernel) {
@@ -370,9 +378,9 @@ fn runLzPipeline(
             @ptrCast(&common.comp),
             @ptrCast(&common.descs_dev),
             @ptrCast(&common.dst),
-            @ptrCast(&common.cpg),
+            @ptrCast(&common.chunks_per_group),
             @ptrCast(&common.total),
-            @ptrCast(&common.sc_cap),
+            @ptrCast(&common.sub_chunk_cap),
         };
         var raw_extra = [_]?*anyopaque{null};
         const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", stream);
@@ -387,9 +395,9 @@ fn runLzPipeline(
             @ptrCast(&common.comp),
             @ptrCast(&common.descs_dev),
             @ptrCast(&common.dst),
-            @ptrCast(&common.cpg),
+            @ptrCast(&common.chunks_per_group),
             @ptrCast(&common.total),
-            @ptrCast(&common.sc_cap),
+            @ptrCast(&common.sub_chunk_cap),
             @ptrCast(&p_entropy_scratch),
             @ptrCast(&p_entropy_slot_stride),
             @ptrCast(&p_first_sub_idx),
@@ -425,13 +433,13 @@ fn runLzPipeline(
 /// In sync mode (work_stream == 0) the D2D path also issues a
 /// ctx-wide sync to ensure the caller observes a settled output
 /// when this function returns.
-fn finalizeOutput(self: *DecodeContext, fns: *const Fns, req: DecodeRequest, heavy_stream: usize) GpuError!void {
+fn finalizeOutput(self: *DecodeContext, procs: *const CudaProcs, req: DecodeRequest, heavy_stream: usize) GpuError!void {
     if (req.d_output_target) |dev_target| {
-        const d2d = fns.d2d orelse return error.BackendNotAvailable;
+        const d2d = procs.d2d orelse return error.BackendNotAvailable;
         try cudaCall(d2d(dev_target + req.dst_start_off, self.d_output + req.dst_start_off, req.decompressed_size, heavy_stream), .copy);
-        if (self.work_stream == 0) try cudaCall(fns.sync(), .sync);
+        if (self.work_stream == 0) try cudaCall(procs.sync(), .sync);
     } else {
-        try cudaCall(fns.d2h(@ptrCast(req.dst_full + req.dst_start_off), self.d_output + req.dst_start_off, req.decompressed_size), .copy);
+        try cudaCall(procs.d2h(@ptrCast(req.dst_full + req.dst_start_off), self.d_output + req.dst_start_off, req.decompressed_size), .copy);
     }
 }
 
@@ -452,12 +460,12 @@ const FrameLayout = struct {
 fn uploadInputAndPrefixSum(
     self: *DecodeContext,
     req: DecodeRequest,
-    fns: *const Fns,
+    procs: *const CudaProcs,
 ) GpuError!FrameLayout {
     const total_output = req.dst_start_off + req.decompressed_size;
     try ensureDeviceOutput(self, total_output + 64);
     if (req.dst_start_off > 0)
-        try cudaCall(fns.h2d(self.d_output, @ptrCast(req.dst_full), req.dst_start_off), .copy);
+        try cudaCall(procs.h2d(self.d_output, @ptrCast(req.dst_full), req.dst_start_off), .copy);
 
     const comp_bytes = if (req.compressed_block.len > 0) req.compressed_block.len else 4;
     const desc_bytes = req.chunk_descs.len * @sizeOf(ChunkDesc);
@@ -469,10 +477,10 @@ fn uploadInputAndPrefixSum(
     // host slice. H2D blocks on the host; D2D queues on work_stream
     // and serializes with the prefix-sum kernel via stream ordering.
     if (req.d_chunk_descs_override) |dev_ptr| {
-        const d2d = fns.d2d orelse return error.BackendNotAvailable;
+        const d2d = procs.d2d orelse return error.BackendNotAvailable;
         try cudaCall(d2d(self.d_descs_persist, dev_ptr, desc_bytes, self.work_stream), .copy);
     } else {
-        try cudaCall(fns.h2d(self.d_descs_persist, @ptrCast(req.chunk_descs.ptr), desc_bytes), .copy);
+        try cudaCall(procs.h2d(self.d_descs_persist, @ptrCast(req.chunk_descs.ptr), desc_bytes), .copy);
     }
 
     // `gpuPrefixSumChunksImpl` returns `GpuError!T` (not `?T`) because
@@ -509,10 +517,10 @@ fn uploadInputAndPrefixSum(
     // to wait on.
     if (req.compressed_block.len > 0) {
         if (req.d_compressed_src) |dev_src| {
-            const d2d = fns.d2d orelse return error.BackendNotAvailable;
+            const d2d = procs.d2d orelse return error.BackendNotAvailable;
             try cudaCall(d2d(self.d_comp_persist, dev_src, req.compressed_block.len, self.work_stream), .copy);
         } else {
-            try cudaCall(fns.h2d(self.d_comp_persist, @ptrCast(req.compressed_block.ptr), req.compressed_block.len), .copy);
+            try cudaCall(procs.h2d(self.d_comp_persist, @ptrCast(req.compressed_block.ptr), req.compressed_block.len), .copy);
         }
     }
 
@@ -531,7 +539,7 @@ fn uploadInputAndPrefixSum(
 fn runBackHalf(
     self: *DecodeContext,
     req: DecodeRequest,
-    fns: *const Fns,
+    procs: *const CudaProcs,
     layout: FrameLayout,
     n_huff: u32,
     have_huff: bool,
@@ -540,7 +548,7 @@ fn runBackHalf(
     facade: anytype,
 ) GpuError!void {
     const io = req.io;
-    const stream_sync_fn = fns.stream_sync;
+    const stream_sync_fn = procs.stream_sync;
 
     // Cross-stream barrier: in sync mode `heavy_stream` is the library-
     // owned `pipeline_stream` so the front-half work queued on
@@ -558,10 +566,10 @@ fn runBackHalf(
     // Stage the LZ kernel's self-gate count. D2D path: the caller
     // supplies `d_n_chunks_dev` (typically `d_walk_meta + offset`).
     // Else stage `total_chunks` into `d_n_groups_scratch` via 4 B H2D.
-    const lz_total_dev: u64 = if (req.d_n_chunks_dev) |dev| dev else blk: {
+    const lz_total_count_dev: u64 = if (req.d_n_chunks_dev) |dev| dev else blk: {
         try ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4);
         var host_total_chunks: u32 = total_chunks;
-        try cudaCall(fns.h2d(self.d_n_groups_scratch, @ptrCast(&host_total_chunks), 4), .copy);
+        try cudaCall(procs.h2d(self.d_n_groups_scratch, @ptrCast(&host_total_chunks), 4), .copy);
         break :blk self.d_n_groups_scratch;
     };
 
@@ -570,7 +578,7 @@ fn runBackHalf(
     // the LZ kernel writes straight to the caller's buffer, skipping
     // the finalize D2D copy.
     const write_direct: bool = req.d_output_target != null and req.dst_start_off == 0;
-    const lz_dst_base: CUdeviceptr = if (write_direct) req.d_output_target.? else self.d_output;
+    const lz_dst_base_dev: CUdeviceptr = if (write_direct) req.d_output_target.? else self.d_output;
 
     const t_huff_start = if (split_timer and have_huff)
         if (io) |io_val| std.Io.Clock.awake.now(io_val) else null
@@ -578,7 +586,7 @@ fn runBackHalf(
         null;
     var split_huff_build_ns: i64 = 0;
     if (have_huff) {
-        split_huff_build_ns = try runHuffPredecode(self, fns, n_huff, heavy_stream, split_timer, t_huff_start, io);
+        split_huff_build_ns = try runHuffBuildAndDecode(self, procs, n_huff, heavy_stream, split_timer, t_huff_start, io);
     }
 
     var split_lz_ns: i64 = 0;
@@ -601,11 +609,11 @@ fn runBackHalf(
     }
 
     split_lz_ns = try runLzPipeline(
-        self, fns,
+        self, procs,
         req.chunks_per_group, req.sub_chunk_cap, n_huff,
         total_chunks, layout.total_subchunks,
         heavy_stream, split_timer, io,
-        lz_total_dev, lz_dst_base,
+        lz_total_count_dev, lz_dst_base_dev,
     );
 
     // Back-half stream sync: skip in async mode (caller's stream
@@ -643,18 +651,18 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // SLZ_E2E_TIMER: end-to-end decode phase breakdown.
     const e2e_timer = std.c.getenv("SLZ_E2E_TIMER") != null;
     const t_e2e0 = if (e2e_timer)
-        (if (io) |iv| std.Io.Clock.awake.now(iv) else null)
+        (if (io) |io_val| std.Io.Clock.awake.now(io_val) else null)
     else
         null;
     var e2e_cum: E2eCumulative = .{};
 
-    const fns = try Fns.resolve();
+    const procs = try CudaProcs.resolve();
 
     // Phase 1: upload + prefix sum.
-    const layout = try uploadInputAndPrefixSum(self, req, &fns);
-    if (t_e2e0) |t0| if (io) |iv| {
-        e2e_cum.h2d = nsSince(t0, iv);
-        e2e_cum.prescan = nsSince(t0, iv);
+    const layout = try uploadInputAndPrefixSum(self, req, &procs);
+    if (t_e2e0) |t0| if (io) |io_val| {
+        e2e_cum.h2d = nsSince(t0, io_val);
+        e2e_cum.prescan = nsSince(t0, io_val);
     };
 
     // Phase 2: scan + raw-off16 gather. The GPU scan kernel reads from
@@ -670,13 +678,13 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             req.sub_chunk_cap,
             layout.total_subchunks,
         ) orelse return error.BackendNotAvailable;
-        if (t_e2e0) |t0| if (io) |iv| {
-            e2e_cum.postscan = nsSince(t0, iv);
+        if (t_e2e0) |t0| if (io) |io_val| {
+            e2e_cum.postscan = nsSince(t0, io_val);
         };
-        try gatherRawOff16(self, scan, req.compressed_block, fns.launch);
+        try gatherRawOff16(self, scan, req.compressed_block, procs.launch);
     }
-    if (t_e2e0) |t0| if (io) |iv| {
-        e2e_cum.scan = nsSince(t0, iv);
+    if (t_e2e0) |t0| if (io) |io_val| {
+        e2e_cum.scan = nsSince(t0, io_val);
     };
 
     // Phase 3: Huffman descriptor merge (LUT + descriptor allocations).
@@ -688,7 +696,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         const huff_lut_bytes = @as(usize, n_huff) * HUFF_LUT_ENTRIES * @sizeOf(u32);
         try ensureDeviceBuf(&self.d_huff_descs, &self.d_huff_descs_size, huff_desc_bytes);
         try ensureDeviceBuf(&self.d_huff_lut, &self.d_huff_lut_size, huff_lut_bytes);
-        try mergeHuffDescs(self, layout.tok_offset, layout.off16_offset, fns.launch);
+        try mergeHuffDescs(self, layout.tok_offset, layout.off16_offset, procs.launch);
     }
 
     if (!self.pipeline_stream_created) return error.BackendNotAvailable;
@@ -699,9 +707,9 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     const total_chunks: u32 = @intCast(req.chunk_descs.len);
 
     // Phase 4: back half (Huff predecode + LZ pipeline + sync + timing).
-    try runBackHalf(self, req, &fns, layout, n_huff, have_huff, total_chunks, heavy_stream, facade);
-    if (t_e2e0) |t0| if (io) |iv| {
-        e2e_cum.predh = nsSince(t0, iv);
+    try runBackHalf(self, req, &procs, layout, n_huff, have_huff, total_chunks, heavy_stream, facade);
+    if (t_e2e0) |t0| if (io) |io_val| {
+        e2e_cum.predh = nsSince(t0, io_val);
     };
 
     // Phase 5: finalize, profiling drain, e2e emit. The
@@ -709,12 +717,12 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // matching the `write_direct` branch inside runBackHalf.
     const skip_finalize = req.d_output_target != null and req.dst_start_off == 0;
     if (!skip_finalize) {
-        try finalizeOutput(self, &fns, req, heavy_stream);
+        try finalizeOutput(self, &procs, req, heavy_stream);
     }
     if (self.work_stream == 0) {
         finalizeProfiling(&self.pending_timings, &self.last_timings);
     }
-    if (t_e2e0) |t0| if (io) |iv| {
-        emitE2eTrace(t0, iv, e2e_cum, facade.last_kernel_ns);
+    if (t_e2e0) |t0| if (io) |io_val| {
+        emitE2eTrace(t0, io_val, e2e_cum, facade.last_kernel_ns);
     };
 }

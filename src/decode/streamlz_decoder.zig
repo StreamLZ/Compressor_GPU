@@ -179,14 +179,15 @@ pub fn decompressFramedFromDevice(
     return decomp_size;
 }
 
+/// Per-call decompress wrapper used by the CLI. Bundles the allocator
+/// and an optional `std.Io` for the SLZ_E2E_TIMER / SLZ_SPLIT_TIMER
+/// telemetry plumbing, and delegates to the module-level
+/// `g_default` GPU context. Library callers that hold their own
+/// `gpu_driver.DecodeContext` should call `decompressFramed*` directly.
 pub const DecompressContext = struct {
     allocator: std.mem.Allocator,
     io: ?std.Io,
     dec_ctx: *gpu_driver.DecodeContext = &gpu_driver.g_default,
-
-    pub fn init(allocator: std.mem.Allocator) DecompressContext {
-        return .{ .allocator = allocator, .io = null };
-    }
 
     pub fn initWithIo(allocator: std.mem.Allocator, io: std.Io) DecompressContext {
         return .{ .allocator = allocator, .io = io };
@@ -196,6 +197,10 @@ pub const DecompressContext = struct {
         return decompressFrameInner(src, dst, self.dec_ctx, null, self.io);
     }
 
+    /// No-op today: the wrapper owns no allocations of its own (the
+    /// `g_default` GPU context outlives every call). Defined so call
+    /// sites can use the canonical `init()` / `defer deinit()` pattern
+    /// without remembering the wrapper is stateless.
     pub fn deinit(self: *DecompressContext) void {
         _ = self;
     }

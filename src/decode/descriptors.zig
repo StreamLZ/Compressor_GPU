@@ -8,7 +8,9 @@
 
 const std = @import("std");
 
-// ── LZ chunk descriptor (C ABI mirror: SlzChunkDesc) ────────────────
+/// LZ chunk descriptor. Wire-compatible with the CUDA-side
+/// `SlzChunkDesc` struct (`src/decode/slz_wire_format.cuh`); the
+/// `static_assert`s on the device side catch any size or offset drift.
 pub const ChunkDesc = extern struct {
     src_offset: u32,
     comp_size: u32,
@@ -16,7 +18,10 @@ pub const ChunkDesc = extern struct {
     dst_offset: u32,
     flags: u32,
     memset_fill: u8,
-    _pad: [3]u8 = .{ 0, 0, 0 },
+    /// Trailing pad to bring the struct to a 4-byte alignment so the
+    /// kernel can load via `uint4`. Must stay zeroed - the device side
+    /// does not read it but the layout assertions check size.
+    reserved: [3]u8 = @splat(0),
 };
 
 // ── Huffman literal descriptors - matches decode/huffman_kernel.cu HuffDecChunkDesc.
@@ -67,11 +72,20 @@ pub const CHUNK_TYPE_MASK: u8 = 0x7;
 // is wrapped in a cuEvent pair. After the final sync, finalizeProfiling
 // computes elapsed time per kernel and stores results in `last_timings`,
 // which slzGetLastTimings exposes via the C ABI.
+
+/// Resolved per-kernel timing reported across the C ABI. Wire-compatible
+/// with `slzKernelTiming_t` in `include/streamlz_gpu.h`; `name` is a
+/// static string with process lifetime, `ms` is wall-clock elapsed time
+/// measured via `cuEventElapsedTime` after the matching kernel finished.
 pub const KernelTiming = extern struct {
     name: [*:0]const u8,
     ms: f32,
 };
 
+/// In-flight per-kernel timing entry held internally on a DecodeContext
+/// while the matching kernel is queued or running. NOT crossing the
+/// C ABI - `finalizeProfiling` converts these to `KernelTiming` after
+/// it drains the cuEvent pair.
 pub const PendingTiming = struct {
     name: [*:0]const u8,
     start_event: usize,

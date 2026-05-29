@@ -28,8 +28,9 @@ const decoder = @import("decode/streamlz_decoder.zig");
 const gpu_encoder = @import("encode/driver.zig");
 const gpu_driver = @import("decode/driver.zig");
 const mmap_helpers = @import("mmap.zig");
+const version = @import("version.zig");
 
-const version_string = "3.0.0";
+const version_string = version.string;
 
 // ────────────────────────────────────────────────────────────────────────
 //  Argument parsing

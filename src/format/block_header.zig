@@ -22,6 +22,11 @@
 const std = @import("std");
 const constants = @import("streamlz_constants.zig");
 
+/// Decoder-type field of the block header. The GPU encoder only emits
+/// `.fast`; `.high` and `.turbo` are accepted by the decoder for
+/// backward compatibility with frames produced by the now-deleted CPU
+/// codec. The open `_` member is required because the wire field is
+/// a `u8` (any non-listed value parses as `error.BadDecoderType`).
 pub const CodecType = enum(u8) {
     high = 0,
     fast = 1,
@@ -30,11 +35,27 @@ pub const CodecType = enum(u8) {
 };
 
 pub const BlockHeader = struct {
+    /// Which codec produced the block. Drives kernel selection at decode.
     decoder_type: CodecType,
+    /// Bit 6: when set, the decoder discards any cross-block carry
+    /// state and treats the block as a fresh start. Always true for
+    /// frames the GPU codec produces (every block is self-contained).
     restart_decoder: bool,
+    /// Bit 7: block body is verbatim source bytes (no LZ encoding).
+    /// The decoder copies `decompressed_size` bytes from the body
+    /// directly into `dst`.
     uncompressed: bool,
+    /// Top bit of byte 1: per-chunk CRC24 checksums are present after
+    /// each 4-byte chunk header. The GPU decoder parses but does not
+    /// verify them today (reserved for a future strict mode).
     use_checksums: bool,
+    /// Bit 4: every sub-chunk in this block decodes independently
+    /// (no cross-sub-chunk back-references). Always true for the GPU
+    /// codec.
     self_contained: bool,
+    /// Bit 5: a phase-1 parallel-decode sidecar block precedes this
+    /// block in the frame. Legacy CPU-codec hint; never set by the
+    /// GPU codec, ignored by the GPU decoder.
     two_phase: bool,
 
     pub const size: usize = 2;

@@ -66,15 +66,27 @@ pub const default_window_size: usize = 128 * 1024 * 1024;
 pub const max_window_size: usize = constants.max_dictionary_size;
 
 pub const FrameFlags = packed struct(u8) {
+    /// Bit 0: the 8 bytes immediately after the flags carry the
+    /// decompressed content size as a little-endian u64. The GPU
+    /// encoder always sets this; `slzGetDecompressedSize` requires it.
     content_size_present: bool = false,
+    /// Bit 1: a content-wide checksum trailer follows the end-mark.
+    /// Parsed but not verified by the GPU decoder today.
     content_checksum: bool = false,
+    /// Bit 2: every block carries a CRC24 trailer. Parsed but not
+    /// verified today.
     block_checksums: bool = false,
+    /// Bit 3: a 4-byte `dictionary_id` follows the optional content
+    /// size. The GPU codec has no dictionary store, so any frame
+    /// carrying one is rejected with `error.UnknownDictionary`.
     dictionary_id_present: bool = false,
-    /// v2: set iff the frame carries a phase-1 sidecar block for
-    /// parallel Fast L1-L4 decode. When set, the decoder should locate
-    /// and apply the sidecar before spawning phase-2 worker threads.
+    /// Bit 4: the frame carries a parallel-decode metadata sidecar
+    /// block for the legacy CPU codec's parallel Fast L1-L4 path.
+    /// The GPU decoder skips these blocks; the GPU encoder never
+    /// emits them.
     parallel_decode_metadata_present: bool = false,
-    /// Reserved bits — must be zero on write.
+    /// Bits 5-7: reserved. Must be zero on write; non-zero values
+    /// reject with `error.BadFrame`.
     _reserved: u3 = 0,
 };
 

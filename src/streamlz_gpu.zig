@@ -22,6 +22,8 @@ const gpu_encoder = @import("encode/driver.zig");
 const decoder = @import("decode/streamlz_decoder.zig");
 const gpu_driver = @import("decode/driver.zig");
 const frame = @import("format/frame_format.zig");
+const version = @import("version.zig");
+const cuda_api = @import("decode/cuda_api.zig");
 
 const allocator = std.heap.c_allocator;
 
@@ -412,8 +414,10 @@ export fn slzStatusString(status: c_int) [*:0]const u8 {
     };
 }
 
+/// Library version: `MAJOR.MINOR.PATCH`, null-terminated, valid for
+/// the lifetime of the process.
 export fn slzVersionString() [*:0]const u8 {
-    return "3.0.0";
+    return version.string;
 }
 
 // ── Handle lifecycle ──────────────────────────────────────────────────
@@ -488,7 +492,12 @@ export fn slzGetDecompressedSize(
     // 64-byte slice is safely longer than any header we produce (max ~26 B)
     // and the caller contract requires that many bytes be readable.
     const parsed = frame.parseHeader(bytes[0..64]) catch return SLZ_ERROR_CORRUPT_FRAME;
-    out.* = parsed.content_size orelse return SLZ_ERROR_CORRUPT_FRAME;
+    const size = parsed.content_size orelse return SLZ_ERROR_CORRUPT_FRAME;
+    // Match the decoder's `DecompressError.ContentSizeTooLarge` gate so
+    // the caller learns about the cap here rather than allocating
+    // a >4 GiB device buffer that the dispatch will then reject.
+    if (size > decoder.max_content_size) return SLZ_ERROR_CORRUPT_FRAME;
+    out.* = size;
     return SLZ_SUCCESS;
 }
 
@@ -693,13 +702,14 @@ export fn slzGetLastTimings(
     return SLZ_SUCCESS;
 }
 
-// Wait on the caller's CUstream and then drain per-kernel timings.
-// Async convenience: avoids the caller's "cudaStreamSynchronize, then
-// slzGetLastTimings" pair. Passing stream=NULL behaves like the
-// synchronous slzGetLastTimings (no stream sync; assumes already
-// synced).
-const cuda_api = @import("decode/cuda_api.zig");
-const CUDA_SUCCESS: c_int = 0;
+/// Wait on the caller's CUstream and then drain per-kernel timings.
+/// Async convenience: avoids the caller's `cudaStreamSynchronize` +
+/// `slzGetLastTimings` pair. Passing `stream = NULL` behaves like the
+/// synchronous `slzGetLastTimings` (no stream sync; assumes the
+/// caller has already synced).
+///
+/// Handle and argument validation are delegated to `slzGetLastTimings`
+/// to avoid double-validating.
 export fn slzWaitAndGetLastTimings(
     handle: ?*Context,
     stream: ?*anyopaque,
@@ -707,11 +717,9 @@ export fn slzWaitAndGetLastTimings(
     capacity: usize,
     count_out: ?*usize,
 ) c_int {
-    _ = handle orelse return SLZ_ERROR_INVALID_HANDLE;
-    _ = count_out orelse return SLZ_ERROR_INVALID_ARG;
     if (stream) |s| {
         const sync_fn = cuda_api.cuStreamSync_fn orelse return SLZ_ERROR_CUDA;
-        if (sync_fn(@intFromPtr(s)) != CUDA_SUCCESS) return SLZ_ERROR_CUDA;
+        if (sync_fn(@intFromPtr(s)) != cuda_api.CUDA_SUCCESS) return SLZ_ERROR_CUDA;
     }
     return slzGetLastTimings(handle, timings, capacity, count_out);
 }

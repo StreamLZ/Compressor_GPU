@@ -110,7 +110,7 @@ static constexpr int      LZ_KERNEL_MIN_BLOCKS_PER_SM = 24;
 
 // ── Chunk descriptor ───────────────────────────────────────────
 // ABI struct - must stay byte-identical to `pub const ChunkDesc` in
-// src/gpu/decode/driver.zig (which uses an explicit `_pad: [3]u8`).
+// `src/decode/descriptors.zig` (which uses a `reserved: [3]u8` field).
 struct SlzChunkDesc {
     uint32_t src_offset;    // byte offset into compressed block
     uint32_t comp_size;     // compressed payload size
@@ -118,9 +118,9 @@ struct SlzChunkDesc {
     uint32_t dst_offset;    // absolute output position
     uint32_t flags;         // bit 0: uncompressed, bit 1: memset
     uint8_t  memset_fill;   // fill byte for memset chunks
-    uint8_t  _pad[3];       // alignment pad, keep in sync with Zig ChunkDesc
+    uint8_t  reserved[3];   // alignment pad, keep in sync with Zig ChunkDesc.reserved
 };
-static_assert(sizeof(SlzChunkDesc) == 24, "ABI: keep in sync with decode/driver.zig");
+static_assert(sizeof(SlzChunkDesc) == 24, "ABI: keep in sync with decode/descriptors.zig");
 
 // ── Raw off16 gather descriptor ────────────────────────────────
 // ABI struct - must stay byte-identical to `RawOff16Desc` in
