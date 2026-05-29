@@ -169,29 +169,6 @@ pub fn decompressFramedFromDevice(
     return decomp_size;
 }
 
-/// 4d Phase 3 device-resident decode. `src` is a host-readable mirror of
-/// the compressed frame (the CPU needs the bytes to walk frame/block/
-/// chunk headers — caller D2H's into a host buffer once). The decoded
-/// bytes are D2D-copied to `d_output + dst_off` for each block — never
-/// touching the host output side. Every block must be GPU-decodable;
-/// returns error.BadMode if any block requires the CPU fallback path,
-/// so the caller can retry via the host-bounce path.
-pub fn decompressFramedParallelToDevice(
-    allocator: std.mem.Allocator,
-    io: ?std.Io,
-    src: []const u8,
-    d_output: u64,
-    max_threads: usize,
-    dec_ctx: *gpu_driver.DecodeContext,
-) DecompressError!DecompressResult {
-    // D2D path is GPU-only by definition (every block must be
-    // GPU-decodable); pass use_gpu=true unconditionally.
-    const r = try decompressFramedInner(allocator, io, src, &[_]u8{}, max_threads, dec_ctx, d_output, true);
-    if (std.c.getenv("SLZ_E2E_TIMER") != null)
-        std.debug.print("[d2d] decompressFramedParallelToDevice wrote {d} bytes to device\n", .{r.written});
-    return r;
-}
-
 /// Reusable decompression context that keeps configuration across
 /// multiple `decompress` calls. Library consumers who decompress many
 /// buffers should create one context, call `decompress` repeatedly, and

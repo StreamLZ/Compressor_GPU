@@ -112,12 +112,6 @@ fn isGpuFallbackError(err: anyerror) bool {
     };
 }
 
-/// GPU C-ABI return mapping: GpuError → -1 (host fallback signal),
-/// any other error → mapDecompressError's standard mapping.
-fn mapGpuFallbackOrDecompress(err: anyerror) c_int {
-    return if (isGpuFallbackError(err)) -1 else mapDecompressError(err);
-}
-
 // ── Codec cores — run on the worker thread ────────────────────────────
 // Each returns the byte count (>= 0) or a negative SLZ_ERROR_* code.
 fn compressCore(h: *Context, input: []const u8, output: []u8, opts: CompressOpts) c_int {
@@ -152,30 +146,6 @@ fn decompressCore(h: *Context, frame_bytes: []const u8, output: []u8, opts: Deco
 
 /// 4d Phase 3 device-resident decode: the decoded bytes are D2D-copied
 /// straight into the caller's device output buffer (no host bounce on
-/// the output). The CPU still needs the frame bytes (host-readable) to
-/// walk frame/block/chunk headers — full GPU-side header walk is a
-/// follow-up. Returns -1 on the GPU-only contract failing so the caller
-/// can fall back to the host-bounce path.
-fn decompressCoreD2D(h: *Context, frame_bytes: []const u8, d_output: u64, opts: DecompressOpts) c_int {
-    h.dec.enable_profiling = opts.enable_profiling != 0;
-    defer h.dec.enable_profiling = false;
-    const r = decoder.decompressFramedParallelToDevice(
-        allocator,
-        null,
-        frame_bytes,
-        d_output,
-        0,
-        &h.dec,
-    ) catch |err| return mapGpuFallbackOrDecompress(err);
-    // For a frame with a dictionary prefix, the decoded content sits at
-    // d_output[r.offset..r.offset+r.written]. The library API contract
-    // returns the *content* size, so callers expect the bytes at
-    // d_output[0..]. Dictionary frames aren't supported on the D2D path
-    // for now — return -1 to fall back.
-    if (r.offset > 0) return -1;
-    return @intCast(r.written);
-}
-
 // ── Worker jobs ───────────────────────────────────────────────────────
 // `d_src`/`d_dst` are 0 for the host->host path, or device addresses for
 // the device->device path (then `src` aliases an internal bounce buffer
@@ -325,38 +295,6 @@ const DecompressJobTrueD2D = struct {
             return;
         };
         j.result = @intCast(n);
-    }
-};
-
-/// 4d Phase 3 D2D decompress worker: D2H the frame into a host scratch
-/// (CPU header walk needs it), then decompress directly to the caller's
-/// device output via decompressCoreD2D (D2D output, no host bounce).
-/// On a -1 return the caller falls back to `DecompressJob`'s host path.
-const DecompressJobD2D = struct {
-    h: *Context,
-    host_frame: []u8,
-    d_src: u64,
-    d_dst: u64,
-    opts: DecompressOpts = .{},
-    result: c_int = SLZ_ERROR_CUDA,
-    fall_back: bool = false,
-
-    fn run(j: *DecompressJobD2D) void {
-        if (!gpu_driver.bindContextToCallingThread()) {
-            j.result = SLZ_ERROR_CUDA;
-            return;
-        }
-        if (!gpu_driver.copyDeviceToHost(j.host_frame, j.d_src)) {
-            j.result = SLZ_ERROR_CUDA;
-            return;
-        }
-        const rc = decompressCoreD2D(j.h, j.host_frame, j.d_dst, j.opts);
-        if (rc == -1) {
-            j.fall_back = true;
-            j.result = SLZ_ERROR_CUDA;
-            return;
-        }
-        j.result = rc;
     }
 };
 
