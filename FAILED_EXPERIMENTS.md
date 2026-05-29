@@ -3068,3 +3068,68 @@ None pursued in this session. The 21-25 % gain from parallel parse
 Going further would need different ideas than per-instruction
 optimization. Stop here unless format change or major restructure is
 on the table.
+
+## Maintaining parallel CPU and GPU codebases (abandoned 2026-05-29)
+
+**Context**: StreamLZ began as a CPU LZ77 codec aimed at outperforming
+zstd on decompression speed at comparable ratios. Once the codec was
+production-ready, GPU compute (decompression first, encode second)
+was added as a second implementation. Both targeted the same wire
+format up to a point — the GPU side eventually diverged for
+saturation-friendly reasons (sc=0.25 sub-chunk size, raw-only at
+L1/L2, no dictionary support, 32-stream Huffman BIL layout) and the
+two wire formats became mutually incompatible by design.
+
+**The problem**: Every wire-format-touching change had to land twice.
+Bug fixes had to either survive both formats or get reasoned about
+across two codepaths. The CPU codec carried its own parser variants
+(greedy / lazy / optimal / BT4 / chain), entropy coders (tANS, Huffman,
+RLE), parallel dispatch infrastructure, dictionary trainer, and
+comparison-vendor harnesses (zstd, lz4, LZTurbo). The GPU codec had
+its own orchestration, CUDA-driver FFI, six bookkeeping kernels and
+a Vulkan decode-shader backend. The combined surface was
+~42 kLoC of Zig + several kLoC of CUDA; small invariants drifted
+between sides faster than they could be checked.
+
+**The decision**: Strip the CPU codec entirely. GPU becomes the only
+backend. Build flag `-Dgpu=true` goes away; `zig build` produces a
+GPU-only `streamlz.exe` + `streamlz_gpu.dll`. The previously-required
+CPU-decoder fallback for hosts without CUDA is gone — callers on
+GPU-less hosts must use a different library.
+
+**Strip outcome**: ~30 kLoC of Zig + ~95 kLoC of vendored C
+(zstd 1.5.7 + LZ4 1.10.0) removed. The Vulkan decode-shader backend
+went with it (CUDA-only). The host-side wire-format orchestration
+that the GPU codec depends on stays: the Fast-codec frame builder
+(now `src/encode/fast_framed.zig`), the host re-encode helpers (now
+`src/encode/gpu_stream_assembly.zig`), the CPU Huffman / tANS
+encoders the orchestrator calls into, and the frame walk in the
+decoder.
+
+**Layout reorganization**: `src/gpu/` is flattened up to `src/`. There
+is no longer a CPU vs GPU split to model in directory names —
+everything that remains is GPU code or supporting infrastructure.
+
+**Verification**: bench_all.bat on enwik8 (100 MB) + silesia (213 MB),
+L1-L5, `-db -r 30`, RTX 4060 Ti sm_89. All ten rows SHA-256 OK
+pre- and post-strip. D2D wall-clock and end-to-end timings stayed
+within ±0.05 ms / ±0.23 ms of the pre-strip baseline; ratios within
+±0.04 pp. Most deltas were small improvements (the simpler dispatch
+shaved a handful of microseconds per call).
+
+**Trade-offs accepted**:
+  * Dropped CPU-only ports / hosts. The codec is now GPU-only and
+    the C ABI is GPU-only.
+  * Dropped the `-bc` / `-bcf` benchmark modes that compared StreamLZ
+    against zstd, lz4, LZTurbo. The comparison data lives in
+    historical README tables.
+  * Dropped the dictionary trainer + the seven built-in dictionaries.
+    The GPU codec never produced dictionary frames; the feature was
+    CPU-only.
+  * Dropped High-codec levels L6-L11. The GPU encoder only implements
+    L1-L5 (Fast codec). L6+ scoring the user input now returns
+    `error.BadLevel`.
+
+The two-codebase phase produced the best CPU and GPU LZ77 decoders
+the author has measured. Maintaining both was the limiting factor on
+further work; the strip restores that bandwidth.
