@@ -10,8 +10,8 @@
 const std = @import("std");
 
 const cuda = @import("cuda_api.zig");
-const dec_ctx = @import("decode_context.zig");
-const d = @import("descriptors.zig");
+const decode_context = @import("decode_context.zig");
+const descriptors = @import("descriptors.zig");
 
 const CUresult = cuda.CUresult;
 const CUdevice = cuda.CUdevice;
@@ -199,7 +199,7 @@ pub fn init() bool {
 /// fall through to the non-pipelined branch of fullGpuLaunchImpl, which
 /// never launches the Huffman kernels and silently produces zero literals.
 ///
-pub fn ensurePipelineStreams(d_ctx: *dec_ctx.DecodeContext) d.GpuError!void {
+pub fn ensurePipelineStreams(d_ctx: *decode_context.DecodeContext) descriptors.GpuError!void {
     if (d_ctx.pipeline_stream_created) return;
     const create_fn = cuda.cuStreamCreate_fn orelse return error.BackendNotAvailable;
     if (create_fn(&d_ctx.pipeline_stream, 1) != CUDA_SUCCESS) return error.BackendNotAvailable;

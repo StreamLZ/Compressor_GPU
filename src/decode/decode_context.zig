@@ -9,7 +9,7 @@
 const std = @import("std");
 
 const cuda = @import("cuda_api.zig");
-const d = @import("descriptors.zig");
+const descriptors = @import("descriptors.zig");
 
 const CUdeviceptr = cuda.CUdeviceptr;
 const CUDA_SUCCESS = cuda.CUDA_SUCCESS;
@@ -90,7 +90,7 @@ pub fn bindContextToCallingThread() bool {
 /// never blocks the encode/decode path).
 pub fn beginKernelTiming(
     ctx_enabled: bool,
-    pending: *std.ArrayListUnmanaged(d.PendingTiming),
+    pending: *std.ArrayListUnmanaged(descriptors.PendingTiming),
     name: [*:0]const u8,
     stream: usize,
 ) ?usize {
@@ -140,8 +140,8 @@ pub fn endKernelTiming(end_event: ?usize, stream: usize) void {
 /// `last_timings`. Destroys the events. Idempotent (safe to call when
 /// pending is empty).
 pub fn finalizeProfiling(
-    pending: *std.ArrayListUnmanaged(d.PendingTiming),
-    last_timings: *std.ArrayListUnmanaged(d.KernelTiming),
+    pending: *std.ArrayListUnmanaged(descriptors.PendingTiming),
+    last_timings: *std.ArrayListUnmanaged(descriptors.KernelTiming),
 ) void {
     // Idempotent when pending is empty: leave last_timings untouched so the
     // values populated by the prior call survive. slzGetLastTimings calls
@@ -200,8 +200,8 @@ pub const DecodeContext = struct {
     // ── Entropy-decoded scratch ────────────────────────────────
     // Holds the Huffman pre-decode output that the LZ kernel reads.
     // Layout per sub-chunk slot: [lit][tok at +tok_offset][off16 at +off16_offset].
-    // off16 sub-region: hi bytes at chunk_idx*d.ENTROPY_SCRATCH_SLOT_BYTES,
-    // lo bytes at +d.OFF16_HILO_SPLIT_OFFSET.
+    // off16 sub-region: hi bytes at chunk_idx*descriptors.ENTROPY_SCRATCH_SLOT_BYTES,
+    // lo bytes at +descriptors.OFF16_HILO_SPLIT_OFFSET.
     d_entropy_scratch: CUdeviceptr = 0,
     d_entropy_scratch_size: usize = 0,
 
@@ -290,8 +290,8 @@ pub const DecodeContext = struct {
     // final sync) drains pending → `last_timings`, which slzGetLastTimings
     // reads out via the C ABI.
     enable_profiling: bool = false,
-    pending_timings: std.ArrayListUnmanaged(d.PendingTiming) = .empty,
-    last_timings: std.ArrayListUnmanaged(d.KernelTiming) = .empty,
+    pending_timings: std.ArrayListUnmanaged(descriptors.PendingTiming) = .empty,
+    last_timings: std.ArrayListUnmanaged(descriptors.KernelTiming) = .empty,
 
     // CUDA stream used for the heavy-phase kernel launches (huff build/
     // decode, LZ decode) and the final D2D output copy. slzDecompressAsync

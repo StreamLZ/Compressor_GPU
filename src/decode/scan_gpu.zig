@@ -14,17 +14,16 @@
 const std = @import("std");
 
 const cuda = @import("cuda_api.zig");
-const ml = @import("module_loader.zig");
-const d = @import("descriptors.zig");
-const dec_ctx = @import("decode_context.zig");
-const desc_err = @import("descriptors.zig");
+const module_loader = @import("module_loader.zig");
+const descriptors = @import("descriptors.zig");
+const decode_context = @import("decode_context.zig");
 
 const CUdeviceptr = cuda.CUdeviceptr;
 const CUDA_SUCCESS = cuda.CUDA_SUCCESS;
-const DecodeContext = dec_ctx.DecodeContext;
-const ensureDeviceBuf = dec_ctx.ensureDeviceBuf;
-const GpuError = desc_err.GpuError;
-const cudaCall = desc_err.cudaCall;
+const DecodeContext = decode_context.DecodeContext;
+const ensureDeviceBuf = decode_context.ensureDeviceBuf;
+const GpuError = descriptors.GpuError;
+const cudaCall = descriptors.cudaCall;
 
 /// GPU frame walk - device-only output. Launches the walk kernel and
 /// returns the device pointers it wrote to; NO D2H. Caller either passes
@@ -39,16 +38,16 @@ pub fn gpuWalkFrameImpl(
     self: *DecodeContext,
     d_frame: u64,
     frame_size: u32,
-) GpuError!d.WalkFrameResultDev {
-    if (!ml.init()) return error.BackendNotAvailable;
-    if (ml.walk_frame_fn == 0) return error.KernelMissing;
+) GpuError!descriptors.WalkFrameResultDev {
+    if (!module_loader.init()) return error.BackendNotAvailable;
+    if (module_loader.walk_frame_fn == 0) return error.KernelMissing;
     const launch = cuda.cuLaunchKernel_fn orelse return error.BackendNotAvailable;
     const memset = cuda.cuMemsetD8_fn orelse return error.BackendNotAvailable;
 
-    const chunks_bytes: usize = @as(usize, d.WALK_MAX_CHUNKS) * @sizeOf(d.ChunkDesc);
+    const chunks_bytes: usize = @as(usize, descriptors.WALK_MAX_CHUNKS) * @sizeOf(descriptors.ChunkDesc);
     if (!ensureDeviceBuf(&self.d_walk_chunks, &self.d_walk_chunks_size, chunks_bytes)) return error.OutOfDeviceMemory;
-    if (!ensureDeviceBuf(&self.d_walk_meta, &self.d_walk_meta_size, d.walk_meta_offsets.bytes)) return error.OutOfDeviceMemory;
-    try cudaCall(memset(self.d_walk_meta, 0, d.walk_meta_offsets.bytes), .copy);
+    if (!ensureDeviceBuf(&self.d_walk_meta, &self.d_walk_meta_size, descriptors.walk_meta_offsets.bytes)) return error.OutOfDeviceMemory;
+    try cudaCall(memset(self.d_walk_meta, 0, descriptors.walk_meta_offsets.bytes), .copy);
 
     // Launch on `work_stream` (= 0 in the sync wrapper, caller's stream
     // in the async wrapper).
@@ -58,13 +57,13 @@ pub fn gpuWalkFrameImpl(
     var k_frame = d_frame;
     var k_size = frame_size;
     var k_chunks = self.d_walk_chunks;
-    var k_max = d.WALK_MAX_CHUNKS;
-    var k_meta_n: u64 = self.d_walk_meta + d.walk_meta_offsets.n_chunks;
-    var k_meta_decomp: u64 = self.d_walk_meta + d.walk_meta_offsets.decomp_size;
-    var k_meta_sccap: u64 = self.d_walk_meta + d.walk_meta_offsets.sub_chunk_cap;
-    var k_meta_bstart: u64 = self.d_walk_meta + d.walk_meta_offsets.block_start;
-    var k_meta_bsize: u64 = self.d_walk_meta + d.walk_meta_offsets.block_size;
-    var k_meta_status: u64 = self.d_walk_meta + d.walk_meta_offsets.status;
+    var k_max = descriptors.WALK_MAX_CHUNKS;
+    var k_meta_n: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.n_chunks;
+    var k_meta_decomp: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.decomp_size;
+    var k_meta_sccap: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.sub_chunk_cap;
+    var k_meta_bstart: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.block_start;
+    var k_meta_bsize: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.block_size;
+    var k_meta_status: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.status;
     var params = [_]?*anyopaque{
         @ptrCast(&k_frame),       @ptrCast(&k_size),
         @ptrCast(&k_chunks),      @ptrCast(&k_max),
@@ -73,9 +72,9 @@ pub fn gpuWalkFrameImpl(
         @ptrCast(&k_meta_bsize),  @ptrCast(&k_meta_status),
     };
     var extra = [_]?*anyopaque{null};
-    const t_walk = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzWalkFrameKernel", stream);
-    try cudaCall(launch(ml.walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, stream, &params, &extra), .launch);
-    dec_ctx.endKernelTiming(t_walk, stream);
+    const t_walk = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzWalkFrameKernel", stream);
+    try cudaCall(launch(module_loader.walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, stream, &params, &extra), .launch);
+    decode_context.endKernelTiming(t_walk, stream);
 
     return .{
         .d_chunk_descs = self.d_walk_chunks,
@@ -94,12 +93,12 @@ pub fn gpuPrefixSumChunksImpl(
     d_chunk_descs: u64,
     n_chunks: u32,
     sub_chunk_cap: u32,
-) GpuError!d.PrefixSumResultDev {
-    if (!ml.init()) return error.BackendNotAvailable;
-    if (ml.prefix_sum_chunks_fn == 0) return error.KernelMissing;
+) GpuError!descriptors.PrefixSumResultDev {
+    if (!module_loader.init()) return error.BackendNotAvailable;
+    if (module_loader.prefix_sum_chunks_fn == 0) return error.KernelMissing;
     const launch = cuda.cuLaunchKernel_fn orelse return error.BackendNotAvailable;
 
-    const first_bytes: usize = @as(usize, d.WALK_MAX_CHUNKS) * 4;
+    const first_bytes: usize = @as(usize, descriptors.WALK_MAX_CHUNKS) * 4;
     if (!ensureDeviceBuf(&self.d_first_sub_idx_persist, &self.d_first_sub_idx_persist_size, first_bytes)) return error.OutOfDeviceMemory;
     if (!ensureDeviceBuf(&self.d_total_subchunks_buf, &self.d_total_subchunks_buf_size, 4)) return error.OutOfDeviceMemory;
 
@@ -120,9 +119,9 @@ pub fn gpuPrefixSumChunksImpl(
         @ptrCast(&k_first), @ptrCast(&k_total),
     };
     var extra = [_]?*anyopaque{null};
-    const t_prefix = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzPrefixSumChunksKernel", stream);
-    try cudaCall(launch(ml.prefix_sum_chunks_fn, 1, 1, 1, 1, 1, 1, 0, stream, &params, &extra), .launch);
-    dec_ctx.endKernelTiming(t_prefix, stream);
+    const t_prefix = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzPrefixSumChunksKernel", stream);
+    try cudaCall(launch(module_loader.prefix_sum_chunks_fn, 1, 1, 1, 1, 1, 1, 0, stream, &params, &extra), .launch);
+    decode_context.endKernelTiming(t_prefix, stream);
 
     return .{
         .d_first_sub_idx = self.d_first_sub_idx_persist,
@@ -132,13 +131,13 @@ pub fn gpuPrefixSumChunksImpl(
 
 pub fn gpuScanChunks(
     self: *DecodeContext,
-    chunk_descs: []const d.ChunkDesc,
+    chunk_descs: []const descriptors.ChunkDesc,
     compressed_block: []const u8,
     sub_chunk_cap: u32,
     total_subchunks: u32,
-) ?d.ScanResult {
-    if (ml.scan_parse_fn == 0) return null;
-    if (ml.compact_huff_descs_fn == 0 or ml.compact_raw_descs_fn == 0) return null;
+) ?descriptors.ScanResult {
+    if (module_loader.scan_parse_fn == 0) return null;
+    if (module_loader.compact_huff_descs_fn == 0 or module_loader.compact_raw_descs_fn == 0) return null;
     const n: u32 = @intCast(chunk_descs.len);
     if (n == 0 or total_subchunks == 0) return null;
 
@@ -149,8 +148,8 @@ pub fn gpuScanChunks(
 
     // Staged buffer: [lit][tok][hi][lo] ScanHuffDesc, then [raw_hi][raw_lo]
     // ScanRawDesc - one entry per global sub-chunk index per stream type.
-    const huff_arr_bytes: usize = @as(usize, total_subchunks) * @sizeOf(d.ScanHuffDesc);
-    const raw_arr_bytes: usize = @as(usize, total_subchunks) * @sizeOf(d.ScanRawDesc);
+    const huff_arr_bytes: usize = @as(usize, total_subchunks) * @sizeOf(descriptors.ScanHuffDesc);
+    const raw_arr_bytes: usize = @as(usize, total_subchunks) * @sizeOf(descriptors.ScanRawDesc);
     const staged_bytes: usize = huff_arr_bytes * 4 + raw_arr_bytes * 2;
     if (!ensureDeviceBuf(&self.d_scan_staged, &self.d_scan_staged_size, staged_bytes)) return null;
     // Zero so sub-chunk slots that no thread reaches keep valid=0.
@@ -183,9 +182,9 @@ pub fn gpuScanChunks(
     var extra = [_]?*anyopaque{null};
     const tpb: u32 = 256;
     const blocks: u32 = (n + tpb - 1) / tpb;
-    const t_scan = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzScanParseKernel", stream);
-    if (launch(ml.scan_parse_fn, blocks, 1, 1, tpb, 1, 1, 0, stream, &params, &extra) != CUDA_SUCCESS) return null;
-    dec_ctx.endKernelTiming(t_scan, stream);
+    const t_scan = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzScanParseKernel", stream);
+    if (launch(module_loader.scan_parse_fn, blocks, 1, 1, tpb, 1, 1, 0, stream, &params, &extra) != CUDA_SUCCESS) return null;
+    decode_context.endKernelTiming(t_scan, stream);
     // No post-scan sync: the compact kernels below queue on the same
     // stream and see scan_parse's writes to d_scan_staged via stream
     // ordering.
@@ -198,10 +197,10 @@ pub fn gpuScanChunks(
     {
         // Size compact buffers. n_huff bound: WALK_MAX_CHUNKS * 4
         // (sub-chunks per chunk at sc>=1). n_raw bound: 2 × that.
-        const huff_compact_max = @as(usize, d.WALK_MAX_CHUNKS) * 4;
-        const huff_compact_bytes = huff_compact_max * @sizeOf(d.HuffDecChunkDesc);
+        const huff_compact_max = @as(usize, descriptors.WALK_MAX_CHUNKS) * 4;
+        const huff_compact_bytes = huff_compact_max * @sizeOf(descriptors.HuffDecChunkDesc);
         const raw_compact_max = huff_compact_max * 2;
-        const raw_compact_bytes = raw_compact_max * @sizeOf(d.RawOff16Desc);
+        const raw_compact_bytes = raw_compact_max * @sizeOf(descriptors.RawOff16Desc);
         if (!ensureDeviceBuf(&self.d_compact_lit, &self.d_compact_lit_size, huff_compact_bytes)) return null;
         if (!ensureDeviceBuf(&self.d_compact_tok, &self.d_compact_tok_size, huff_compact_bytes)) return null;
         if (!ensureDeviceBuf(&self.d_compact_hi, &self.d_compact_hi_size, huff_compact_bytes)) return null;
@@ -234,9 +233,9 @@ pub fn gpuScanChunks(
                 @ptrCast(&k_dst), @ptrCast(&k_count),
             };
             var c_extra = [_]?*anyopaque{null};
-            const t_ch = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, compact_names[ci], stream);
-            if (launch(ml.compact_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &c_params, &c_extra) != CUDA_SUCCESS) return null;
-            dec_ctx.endKernelTiming(t_ch, stream);
+            const t_ch = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, compact_names[ci], stream);
+            if (launch(module_loader.compact_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &c_params, &c_extra) != CUDA_SUCCESS) return null;
+            decode_context.endKernelTiming(t_ch, stream);
         }
         // Raw compact.
         {
@@ -250,11 +249,11 @@ pub fn gpuScanChunks(
                 @ptrCast(&cr_dst), @ptrCast(&cr_count),
             };
             var cr_extra = [_]?*anyopaque{null};
-            const t_cr = dec_ctx.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzCompactRawDescsKernel", stream);
-            if (launch(ml.compact_raw_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &cr_params, &cr_extra) != CUDA_SUCCESS) return null;
-            dec_ctx.endKernelTiming(t_cr, stream);
+            const t_cr = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzCompactRawDescsKernel", stream);
+            if (launch(module_loader.compact_raw_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &cr_params, &cr_extra) != CUDA_SUCCESS) return null;
+            decode_context.endKernelTiming(t_cr, stream);
         }
-        if (ml.merge_huff_descs_fn == 0) return null;
+        if (module_loader.merge_huff_descs_fn == 0) return null;
     }
 
     // Counts stay device-resident in d_compact_counts; downstream merge,

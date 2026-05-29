@@ -8,15 +8,15 @@
 //! `EncodeContext`.
 
 const std = @import("std");
-const ffi = @import("cuda_ffi.zig");
+const cuda_ffi = @import("cuda_ffi.zig");
 const module_loader = @import("module_loader.zig");
-const ec = @import("encode_context.zig");
+const encode_context = @import("encode_context.zig");
 const levels = @import("levels.zig");
 const gpu_decode = @import("../decode/driver.zig");
 
-const CUdeviceptr = ffi.CUdeviceptr;
-const EncodeContext = ec.EncodeContext;
-const CompressChunkDesc = ec.CompressChunkDesc;
+const CUdeviceptr = cuda_ffi.CUdeviceptr;
+const EncodeContext = encode_context.EncodeContext;
+const CompressChunkDesc = encode_context.CompressChunkDesc;
 
 pub fn gpuCompressImpl(
     self: *EncodeContext,
@@ -36,10 +36,10 @@ pub fn gpuCompressImpl(
     // `cuMemsetD8_fn` below, which is wrapped in an `if (...) |fn|` so
     // its absence doesn't kill the encode (zeroing isn't strictly
     // required when the kernel writes every output byte).
-    const h2d_fn = ffi.cuMemcpyHtoD_fn orelse return false;
-    const d2h_fn = ffi.cuMemcpyDtoH_fn orelse return false;
-    const launch_fn = ffi.cuLaunchKernel_fn orelse return false;
-    const sync_fn = ffi.cuCtxSynchronize_fn orelse return false;
+    const h2d_fn = cuda_ffi.cuMemcpyHtoD_fn orelse return false;
+    const d2h_fn = cuda_ffi.cuMemcpyDtoH_fn orelse return false;
+    const launch_fn = cuda_ffi.cuLaunchKernel_fn orelse return false;
+    const sync_fn = cuda_ffi.cuCtxSynchronize_fn orelse return false;
 
     const num_chunks: u32 = @intCast(chunk_descs.len);
     const desc_bytes = chunk_descs.len * @sizeOf(CompressChunkDesc);
@@ -48,23 +48,23 @@ pub fn gpuCompressImpl(
     const hash_size: usize = @as(usize, 1) << @intCast(hash_bits);
     const chain = levels.useChainParser(level);
 
-    if (!ec.ensureBuf(&self.d_input_persist, &self.d_input_size, input.len)) return false;
-    if (!ec.ensureBuf(&self.d_output_persist, &self.d_output_size, output.len)) return false;
-    if (!ec.ensureBuf(&self.d_descs_persist, &self.d_descs_size, desc_bytes)) return false;
-    if (!ec.ensureBuf(&self.d_sizes_persist, &self.d_sizes_size, sizes_bytes)) return false;
+    if (!encode_context.ensureBuf(&self.d_input_persist, &self.d_input_size, input.len)) return false;
+    if (!encode_context.ensureBuf(&self.d_output_persist, &self.d_output_size, output.len)) return false;
+    if (!encode_context.ensureBuf(&self.d_descs_persist, &self.d_descs_size, desc_bytes)) return false;
+    if (!encode_context.ensureBuf(&self.d_sizes_persist, &self.d_sizes_size, sizes_bytes)) return false;
 
     // Global hash tables. Chain mode uses 3 tables per block (first_hash +
     // long_hash + next_hash); non-chain modes use a single hash table
     // (L1 needs more than CUDA shared-mem allows, and global also dodges
     // the shared-mem-hash corruption seen at L2 sc>=0.5).
     if (chain) {
-        const next_hash_words: usize = ec.NEXT_HASH_ENTRIES / 2; // u16 entries packed into u32 words
+        const next_hash_words: usize = encode_context.NEXT_HASH_ENTRIES / 2; // u16 entries packed into u32 words
         const table_stride = hash_size + hash_size + next_hash_words;
         const hash_bytes = @as(usize, num_chunks) * table_stride * 4;
-        if (!ec.ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) return false;
+        if (!encode_context.ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) return false;
     } else {
         const hash_bytes = @as(usize, num_chunks) * hash_size * 4;
-        if (!ec.ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) return false;
+        if (!encode_context.ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) return false;
     }
 
     const d_input = self.d_input_persist;
@@ -79,15 +79,15 @@ pub fn gpuCompressImpl(
         // Caller's data is already GPU-resident; the host `input` slice
         // may be a sentinel (per `EncodeContext.d_input_override` doc).
         // If D2D-async is unavailable, fail rather than H2D-ing a stub.
-        const d2d = ffi.cuMemcpyDtoDAsync_fn orelse return false;
-        if (d2d(d_input, self.d_input_override, input.len, 0) != ffi.CUDA_SUCCESS) return false;
+        const d2d = cuda_ffi.cuMemcpyDtoDAsync_fn orelse return false;
+        if (d2d(d_input, self.d_input_override, input.len, 0) != cuda_ffi.CUDA_SUCCESS) return false;
     } else {
-        if (h2d_fn(d_input, @ptrCast(input.ptr), input.len) != ffi.CUDA_SUCCESS) return false;
+        if (h2d_fn(d_input, @ptrCast(input.ptr), input.len) != cuda_ffi.CUDA_SUCCESS) return false;
     }
-    if (h2d_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes) != ffi.CUDA_SUCCESS) return false;
-    if (ffi.cuMemsetD8_fn) |memset_fn|
-        if (memset_fn(d_sizes, 0, sizes_bytes) != ffi.CUDA_SUCCESS) return false;
-    if (sync_fn() != ffi.CUDA_SUCCESS) return false;
+    if (h2d_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes) != cuda_ffi.CUDA_SUCCESS) return false;
+    if (cuda_ffi.cuMemsetD8_fn) |memset_fn|
+        if (memset_fn(d_sizes, 0, sizes_bytes) != cuda_ffi.CUDA_SUCCESS) return false;
+    if (sync_fn() != cuda_ffi.CUDA_SUCCESS) return false;
 
     const t_before = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
 
@@ -124,10 +124,10 @@ pub fn gpuCompressImpl(
     // matching end record - even on launch failure. Otherwise
     // finalizeProfiling would block on an unrecorded end event.
     defer gpu_decode.endKernelTiming(t_lz, 0);
-    if (launch_fn(module_loader.kernel_fn, num_chunks, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra) != ffi.CUDA_SUCCESS)
+    if (launch_fn(module_loader.kernel_fn, num_chunks, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra) != cuda_ffi.CUDA_SUCCESS)
         return false;
 
-    if (sync_fn() != ffi.CUDA_SUCCESS) return false;
+    if (sync_fn() != cuda_ffi.CUDA_SUCCESS) return false;
 
     if (t_before) |t_start| {
         if (io) |io_val| {
@@ -139,13 +139,13 @@ pub fn gpuCompressImpl(
     }
 
     // Download comp_sizes first, then only the actual compressed bytes per block
-    if (d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes) != ffi.CUDA_SUCCESS) return false;
+    if (d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes) != cuda_ffi.CUDA_SUCCESS) return false;
 
     for (0..chunk_descs.len) |i| {
         const cs = comp_sizes_out[i];
         if (cs > 0) {
             const dst_off = chunk_descs[i].dst_offset;
-            if (d2h_fn(@ptrCast(output.ptr + dst_off), d_output + dst_off, cs) != ffi.CUDA_SUCCESS) return false;
+            if (d2h_fn(@ptrCast(output.ptr + dst_off), d_output + dst_off, cs) != cuda_ffi.CUDA_SUCCESS) return false;
         }
     }
 

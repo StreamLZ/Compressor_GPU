@@ -22,43 +22,43 @@
 //!                          (emitE2eTrace, gatherRawOff16, mergeHuffDescs)
 
 const cuda = @import("cuda_api.zig");
-const ml = @import("module_loader.zig");
-const d = @import("descriptors.zig");
-const dc = @import("decode_context.zig");
-const sg = @import("scan_gpu.zig");
-const dd = @import("decode_dispatch.zig");
+const module_loader = @import("module_loader.zig");
+const descriptors = @import("descriptors.zig");
+const decode_context = @import("decode_context.zig");
+const scan_gpu = @import("scan_gpu.zig");
+const decode_dispatch = @import("decode_dispatch.zig");
 
 // ── Clock helpers ─────────────────────────────────────────────
 pub const qpcNow = cuda.qpcNow;
 pub const qpcMs = cuda.qpcMs;
 
 // ── Module lifecycle ──────────────────────────────────────────
-pub const init = ml.init;
-pub const isAvailable = ml.isAvailable;
+pub const init = module_loader.init;
+pub const isAvailable = module_loader.isAvailable;
 
 // ── Descriptor / error types ──────────────────────────────────
-pub const ChunkDesc = d.ChunkDesc;
-pub const KernelTiming = d.KernelTiming;
-pub const PendingTiming = d.PendingTiming;
-pub const GpuError = d.GpuError;
-pub const WALK_MAX_CHUNKS = d.WALK_MAX_CHUNKS;
-pub const ENTROPY_SCRATCH_SLOT_BYTES = d.ENTROPY_SCRATCH_SLOT_BYTES;
-pub const walk_meta_offsets = d.walk_meta_offsets;
+pub const ChunkDesc = descriptors.ChunkDesc;
+pub const KernelTiming = descriptors.KernelTiming;
+pub const PendingTiming = descriptors.PendingTiming;
+pub const GpuError = descriptors.GpuError;
+pub const WALK_MAX_CHUNKS = descriptors.WALK_MAX_CHUNKS;
+pub const ENTROPY_SCRATCH_SLOT_BYTES = descriptors.ENTROPY_SCRATCH_SLOT_BYTES;
+pub const walk_meta_offsets = descriptors.walk_meta_offsets;
 
 // ── Per-decode context + host I/O helpers ─────────────────────
-pub const DecodeContext = dc.DecodeContext;
-pub const allocHost = dc.allocHost;
-pub const freeHost = dc.freeHost;
-pub const copyDeviceToHost = dc.copyDeviceToHost;
-pub const copyHostToDevice = dc.copyHostToDevice;
-pub const bindContextToCallingThread = dc.bindContextToCallingThread;
-pub const beginKernelTiming = dc.beginKernelTiming;
-pub const endKernelTiming = dc.endKernelTiming;
-pub const finalizeProfiling = dc.finalizeProfiling;
+pub const DecodeContext = decode_context.DecodeContext;
+pub const allocHost = decode_context.allocHost;
+pub const freeHost = decode_context.freeHost;
+pub const copyDeviceToHost = decode_context.copyDeviceToHost;
+pub const copyHostToDevice = decode_context.copyHostToDevice;
+pub const bindContextToCallingThread = decode_context.bindContextToCallingThread;
+pub const beginKernelTiming = decode_context.beginKernelTiming;
+pub const endKernelTiming = decode_context.endKernelTiming;
+pub const finalizeProfiling = decode_context.finalizeProfiling;
 
 // ── Decode pipeline entry points ──────────────────────────────
-pub const gpuWalkFrameImpl = sg.gpuWalkFrameImpl;
-pub const fullGpuLaunchImpl = dd.fullGpuLaunchImpl;
+pub const gpuWalkFrameImpl = scan_gpu.gpuWalkFrameImpl;
+pub const fullGpuLaunchImpl = decode_dispatch.fullGpuLaunchImpl;
 
 // ── Singletons ────────────────────────────────────────────────
 // `g_default` and the three `last_*_kernel_ns` telemetry vars live on

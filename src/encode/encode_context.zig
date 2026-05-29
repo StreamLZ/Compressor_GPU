@@ -8,11 +8,11 @@
 //! the top-level driver.
 
 const std = @import("std");
-const ffi = @import("cuda_ffi.zig");
+const cuda_ffi = @import("cuda_ffi.zig");
 const module_loader = @import("module_loader.zig");
 const gpu_decode = @import("../decode/driver.zig");
 
-const CUdeviceptr = ffi.CUdeviceptr;
+const CUdeviceptr = cuda_ffi.CUdeviceptr;
 
 // ── Wire-format byte sizes (Zig mirrors of common/gpu_wire_format.cuh) ──
 //
@@ -225,7 +225,7 @@ pub const EncodeContext = struct {
                     // means the driver/context is dying - there's
                     // nothing useful we can do in a deinit path, so
                     // ignore the CUresult.
-                    if (ffi.cuMemFree_fn) |free_fn| _ = free_fn(ptr.*);
+                    if (cuda_ffi.cuMemFree_fn) |free_fn| _ = free_fn(ptr.*);
                     ptr.* = 0;
                 }
                 sz.* = 0;
@@ -277,11 +277,11 @@ pub const EncodeContext = struct {
 /// we update on success. Returns false only when the CUDA alloc fails.
 pub fn ensureBuf(ptr: *CUdeviceptr, cur: *usize, needed: usize) bool {
     if (cur.* >= needed) return true;
-    const free_fn = ffi.cuMemFree_fn orelse return false;
-    const alloc_fn = ffi.cuMemAlloc_fn orelse return false;
+    const free_fn = cuda_ffi.cuMemFree_fn orelse return false;
+    const alloc_fn = cuda_ffi.cuMemAlloc_fn orelse return false;
     if (ptr.* != 0) _ = free_fn(ptr.*);
     cur.* = 0;
-    if (alloc_fn(ptr, needed) != ffi.CUDA_SUCCESS) return false;
+    if (alloc_fn(ptr, needed) != cuda_ffi.CUDA_SUCCESS) return false;
     cur.* = needed;
     return true;
 }
@@ -289,13 +289,13 @@ pub fn ensureBuf(ptr: *CUdeviceptr, cur: *usize, needed: usize) bool {
 /// Copy `dst.len` bytes from a device address into the host slice `dst`.
 pub fn copyDeviceToHost(dst: []u8, src_device: u64) bool {
     if (!module_loader.init()) return false;
-    const f = ffi.cuMemcpyDtoH_fn orelse return false;
-    return f(@ptrCast(dst.ptr), src_device, dst.len) == ffi.CUDA_SUCCESS;
+    const f = cuda_ffi.cuMemcpyDtoH_fn orelse return false;
+    return f(@ptrCast(dst.ptr), src_device, dst.len) == cuda_ffi.CUDA_SUCCESS;
 }
 
 /// Copy `src.len` bytes from the host slice `src` to a device address.
 pub fn copyHostToDevice(dst_device: u64, src: []const u8) bool {
     if (!module_loader.init()) return false;
-    const f = ffi.cuMemcpyHtoD_fn orelse return false;
-    return f(dst_device, @ptrCast(src.ptr), src.len) == ffi.CUDA_SUCCESS;
+    const f = cuda_ffi.cuMemcpyHtoD_fn orelse return false;
+    return f(dst_device, @ptrCast(src.ptr), src.len) == cuda_ffi.CUDA_SUCCESS;
 }

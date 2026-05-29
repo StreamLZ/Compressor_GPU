@@ -12,15 +12,15 @@
 //!     device buffer.
 
 const std = @import("std");
-const ffi = @import("cuda_ffi.zig");
+const cuda_ffi = @import("cuda_ffi.zig");
 const module_loader = @import("module_loader.zig");
-const ec = @import("encode_context.zig");
+const encode_context = @import("encode_context.zig");
 const gpu_decode = @import("../decode/driver.zig");
 
-const CUdeviceptr = ffi.CUdeviceptr;
-const EncodeContext = ec.EncodeContext;
-const CompressChunkDesc = ec.CompressChunkDesc;
-const AssembleDesc = ec.AssembleDesc;
+const CUdeviceptr = cuda_ffi.CUdeviceptr;
+const EncodeContext = encode_context.EncodeContext;
+const CompressChunkDesc = encode_context.CompressChunkDesc;
+const AssembleDesc = encode_context.AssembleDesc;
 
 /// Device-resident frame assembly. Runs after `gpuCompressImpl` (raw
 /// streams resident in `d_output_persist`) and the three GPU Huffman
@@ -53,20 +53,21 @@ pub fn gpuAssembleFrameImpl(
     defer allocator.free(zero_sizes);
     @memset(zero_sizes, 0);
 
-    const hl_off = self.huff_lit_offsets orelse zero_offs;
-    const hl_sz = self.huff_lit_sizes orelse zero_sizes;
-    const ht_off = self.huff_tok_offsets orelse zero_offs;
-    const ht_sz = self.huff_tok_sizes orelse zero_sizes;
-    const hoh_off = self.huff_off16hi_offsets orelse zero_offs;
-    const hoh_sz = self.huff_off16hi_sizes orelse zero_sizes;
-    const hol_off = self.huff_off16lo_offsets orelse zero_offs;
-    const hol_sz = self.huff_off16lo_sizes orelse zero_sizes;
-    if (hl_off.len < n or ht_off.len < n or hoh_off.len < n or hol_off.len < n) return false;
+    const huff_lit_offsets = self.huff_lit_offsets orelse zero_offs;
+    const huff_lit_sizes = self.huff_lit_sizes orelse zero_sizes;
+    const huff_tok_offsets = self.huff_tok_offsets orelse zero_offs;
+    const huff_tok_sizes = self.huff_tok_sizes orelse zero_sizes;
+    const huff_off16hi_offsets = self.huff_off16hi_offsets orelse zero_offs;
+    const huff_off16hi_sizes = self.huff_off16hi_sizes orelse zero_sizes;
+    const huff_off16lo_offsets = self.huff_off16lo_offsets orelse zero_offs;
+    const huff_off16lo_sizes = self.huff_off16lo_sizes orelse zero_sizes;
+    if (huff_lit_offsets.len < n or huff_tok_offsets.len < n or
+        huff_off16hi_offsets.len < n or huff_off16lo_offsets.len < n) return false;
 
-    const h2d = ffi.cuMemcpyHtoD_fn orelse return false;
-    const d2h = ffi.cuMemcpyDtoH_fn orelse return false;
-    const launch = ffi.cuLaunchKernel_fn orelse return false;
-    const sync = ffi.cuCtxSynchronize_fn orelse return false;
+    const h2d = cuda_ffi.cuMemcpyHtoD_fn orelse return false;
+    const d2h = cuda_ffi.cuMemcpyDtoH_fn orelse return false;
+    const launch = cuda_ffi.cuLaunchKernel_fn orelse return false;
+    const sync = cuda_ffi.cuCtxSynchronize_fn orelse return false;
 
     // Build per-sub-chunk descriptors (out_offset filled after pass 1).
     var descs = allocator.alloc(AssembleDesc, n) catch return false;
@@ -75,50 +76,52 @@ pub fn gpuAssembleFrameImpl(
         descs[i] = .{
             .raw_offset = chunk_descs[i].dst_offset,
             .raw_size = comp_sizes[i],
-            .huff_lit_offset = hl_off[i],
-            .huff_lit_size = hl_sz[i],
-            .huff_tok_offset = ht_off[i],
-            .huff_tok_size = ht_sz[i],
-            .huff_off16hi_offset = hoh_off[i],
-            .huff_off16hi_size = hoh_sz[i],
-            .huff_off16lo_offset = hol_off[i],
-            .huff_off16lo_size = hol_sz[i],
+            .huff_lit_offset = huff_lit_offsets[i],
+            .huff_lit_size = huff_lit_sizes[i],
+            .huff_tok_offset = huff_tok_offsets[i],
+            .huff_tok_size = huff_tok_sizes[i],
+            .huff_off16hi_offset = huff_off16hi_offsets[i],
+            .huff_off16hi_size = huff_off16hi_sizes[i],
+            .huff_off16lo_offset = huff_off16lo_offsets[i],
+            .huff_off16lo_size = huff_off16lo_sizes[i],
             .sub_decomp_size = chunk_descs[i].src_size,
-            .init_bytes = if (chunk_descs[i].is_first != 0) ec.INITIAL_LITERAL_COPY_BYTES else 0,
+            .init_bytes = if (chunk_descs[i].is_first != 0) encode_context.INITIAL_LITERAL_COPY_BYTES else 0,
             .out_offset = 0,
         };
     }
 
     const desc_bytes: usize = @as(usize, n) * @sizeOf(AssembleDesc);
     const sizes_bytes: usize = @as(usize, n) * 4;
-    if (!ec.ensureBuf(&self.d_asm_descs, &self.d_asm_descs_size, desc_bytes)) return false;
-    if (!ec.ensureBuf(&self.d_asm_sizes, &self.d_asm_sizes_size, sizes_bytes)) return false;
-    if (h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes) != ffi.CUDA_SUCCESS) return false;
-    if (sync() != ffi.CUDA_SUCCESS) return false;
+    if (!encode_context.ensureBuf(&self.d_asm_descs, &self.d_asm_descs_size, desc_bytes)) return false;
+    if (!encode_context.ensureBuf(&self.d_asm_sizes, &self.d_asm_sizes_size, sizes_bytes)) return false;
+    if (h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes) != cuda_ffi.CUDA_SUCCESS) return false;
+    if (sync() != cuda_ffi.CUDA_SUCCESS) return false;
 
-    var p_raw = self.d_output_persist;
-    var p_hl = self.d_asm_huff_lit;
-    var p_ht = self.d_asm_huff_tok;
-    var p_ho = self.d_asm_huff_off16;
-    var p_descs = self.d_asm_descs;
-    var p_sizes = self.d_asm_sizes;
-    var p_n = n;
+    // Kernel-arg locals. Each parameter is taken by `&local`, so every
+    // value the kernel reads needs its own addressable slot here.
+    var arg_raw = self.d_output_persist;
+    var arg_huff_lit = self.d_asm_huff_lit;
+    var arg_huff_tok = self.d_asm_huff_tok;
+    var arg_huff_off16 = self.d_asm_huff_off16;
+    var arg_descs = self.d_asm_descs;
+    var arg_sizes = self.d_asm_sizes;
+    var arg_n = n;
     var extra = [_]?*anyopaque{null};
 
     // Pass 1 - measure each sub-chunk's assembled payload size.
-    var m_params = [_]?*anyopaque{
-        @ptrCast(&p_raw),   @ptrCast(&p_hl),    @ptrCast(&p_ht),
-        @ptrCast(&p_ho),    @ptrCast(&p_descs), @ptrCast(&p_sizes),
-        @ptrCast(&p_n),
+    var measure_params = [_]?*anyopaque{
+        @ptrCast(&arg_raw),       @ptrCast(&arg_huff_lit), @ptrCast(&arg_huff_tok),
+        @ptrCast(&arg_huff_off16),@ptrCast(&arg_descs),    @ptrCast(&arg_sizes),
+        @ptrCast(&arg_n),
     };
     const t_am = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleMeasureKernel", 0);
     defer gpu_decode.endKernelTiming(t_am, 0);
-    if (launch(module_loader.assemble_measure_fn, n, 1, 1, 32, 1, 1, 0, 0, &m_params, &extra) != ffi.CUDA_SUCCESS) return false;
-    if (sync() != ffi.CUDA_SUCCESS) return false;
+    if (launch(module_loader.assemble_measure_fn, n, 1, 1, 32, 1, 1, 0, 0, &measure_params, &extra) != cuda_ffi.CUDA_SUCCESS) return false;
+    if (sync() != cuda_ffi.CUDA_SUCCESS) return false;
 
     const enc_sizes = allocator.alloc(u32, n) catch return false;
     defer allocator.free(enc_sizes);
-    if (d2h(@ptrCast(enc_sizes.ptr), self.d_asm_sizes, sizes_bytes) != ffi.CUDA_SUCCESS) return false;
+    if (d2h(@ptrCast(enc_sizes.ptr), self.d_asm_sizes, sizes_bytes) != cuda_ffi.CUDA_SUCCESS) return false;
 
     // Prefix-sum: each sub-chunk block is 3 (header) + enc_n bytes.
     var total: u32 = 0;
@@ -137,18 +140,18 @@ pub fn gpuAssembleFrameImpl(
     }
 
     // Pass 2 - write [3-byte header][payload] for every sub-chunk.
-    if (h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes) != ffi.CUDA_SUCCESS) return false;
-    if (!ec.ensureBuf(&self.d_asm_out, &self.d_asm_out_size, @max(total, 1))) return false;
-    var p_out = self.d_asm_out;
-    var w_params = [_]?*anyopaque{
-        @ptrCast(&p_raw),   @ptrCast(&p_hl),    @ptrCast(&p_ht),
-        @ptrCast(&p_ho),    @ptrCast(&p_descs), @ptrCast(&p_out),
-        @ptrCast(&p_n),
+    if (h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes) != cuda_ffi.CUDA_SUCCESS) return false;
+    if (!encode_context.ensureBuf(&self.d_asm_out, &self.d_asm_out_size, @max(total, 1))) return false;
+    var arg_out = self.d_asm_out;
+    var write_params = [_]?*anyopaque{
+        @ptrCast(&arg_raw),       @ptrCast(&arg_huff_lit), @ptrCast(&arg_huff_tok),
+        @ptrCast(&arg_huff_off16),@ptrCast(&arg_descs),    @ptrCast(&arg_out),
+        @ptrCast(&arg_n),
     };
     const t_aw = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleWriteKernel", 0);
     defer gpu_decode.endKernelTiming(t_aw, 0);
-    if (launch(module_loader.assemble_write_fn, n, 1, 1, 32, 1, 1, 0, 0, &w_params, &extra) != ffi.CUDA_SUCCESS) return false;
-    if (sync() != ffi.CUDA_SUCCESS) return false;
+    if (launch(module_loader.assemble_write_fn, n, 1, 1, 32, 1, 1, 0, 0, &write_params, &extra) != cuda_ffi.CUDA_SUCCESS) return false;
+    if (sync() != cuda_ffi.CUDA_SUCCESS) return false;
 
     // Publish the per-chunk offset+size index tables; the assembled
     // bytes themselves stay in `self.d_asm_out` for the frame writer
@@ -220,9 +223,9 @@ pub fn gpuFrameAssembleImpl(
     const internal_hdr1 = preamble.internal_hdr1;
     if (n_chunks == 0 or per_chunk_asm_off.len < n_chunks or per_chunk_asm_size.len < n_chunks) return null;
 
-    const h2d = ffi.cuMemcpyHtoD_fn orelse return null;
-    const launch = ffi.cuLaunchKernel_fn orelse return null;
-    const sync = ffi.cuCtxSynchronize_fn orelse return null;
+    const h2d = cuda_ffi.cuMemcpyHtoD_fn orelse return null;
+    const launch = cuda_ffi.cuLaunchKernel_fn orelse return null;
+    const sync = cuda_ffi.cuCtxSynchronize_fn orelse return null;
 
     // Build per-chunk dst offset table on host. Compressed chunks pay
     // `CHUNK_INTERNAL_HDR_BYTES` (2-byte internal block header + 4-byte
@@ -234,29 +237,29 @@ pub fn gpuFrameAssembleImpl(
     var pos: u32 = @intCast(prefix_bytes.len);
     for (0..n_chunks) |i| {
         per_chunk_dst_buf[i] = pos;
-        const overhead: u32 = if (per_chunk_asm_off[i] == ec.UNCOMPRESSED_CHUNK_MARKER)
-            ec.UNCOMPRESSED_CHUNK_HDR_BYTES
+        const overhead: u32 = if (per_chunk_asm_off[i] == encode_context.UNCOMPRESSED_CHUNK_MARKER)
+            encode_context.UNCOMPRESSED_CHUNK_HDR_BYTES
         else
-            ec.CHUNK_INTERNAL_HDR_BYTES;
+            encode_context.CHUNK_INTERNAL_HDR_BYTES;
         pos += overhead + per_chunk_asm_size[i];
     }
     const sc_tail_off: u32 = pos;
-    const sc_tail_bytes: u32 = if (n_chunks > 1) (n_chunks - 1) * ec.SC_TAIL_PER_CHUNK_BYTES else 0;
+    const sc_tail_bytes: u32 = if (n_chunks > 1) (n_chunks - 1) * encode_context.SC_TAIL_PER_CHUNK_BYTES else 0;
     pos += sc_tail_bytes;
     const end_mark_off: u32 = pos;
     pos += 4;
     const total_frame_size: u32 = pos;
 
     const ent_bytes: usize = @as(usize, n_chunks) * 4;
-    if (!ec.ensureBuf(&self.d_frame_chunk_dst, &self.d_frame_chunk_dst_size, ent_bytes)) return null;
-    if (!ec.ensureBuf(&self.d_frame_asm_offsets, &self.d_frame_asm_offsets_size, ent_bytes)) return null;
-    if (!ec.ensureBuf(&self.d_frame_asm_chunk_sz, &self.d_frame_asm_chunk_sz_size, ent_bytes)) return null;
-    if (!ec.ensureBuf(&self.d_frame_prefix_bytes, &self.d_frame_prefix_bytes_size, prefix_bytes.len)) return null;
+    if (!encode_context.ensureBuf(&self.d_frame_chunk_dst, &self.d_frame_chunk_dst_size, ent_bytes)) return null;
+    if (!encode_context.ensureBuf(&self.d_frame_asm_offsets, &self.d_frame_asm_offsets_size, ent_bytes)) return null;
+    if (!encode_context.ensureBuf(&self.d_frame_asm_chunk_sz, &self.d_frame_asm_chunk_sz_size, ent_bytes)) return null;
+    if (!encode_context.ensureBuf(&self.d_frame_prefix_bytes, &self.d_frame_prefix_bytes_size, prefix_bytes.len)) return null;
 
-    if (h2d(self.d_frame_chunk_dst, @ptrCast(per_chunk_dst_buf.ptr), ent_bytes) != ffi.CUDA_SUCCESS) return null;
-    if (h2d(self.d_frame_asm_offsets, @ptrCast(per_chunk_asm_off.ptr), ent_bytes) != ffi.CUDA_SUCCESS) return null;
-    if (h2d(self.d_frame_asm_chunk_sz, @ptrCast(per_chunk_asm_size.ptr), ent_bytes) != ffi.CUDA_SUCCESS) return null;
-    if (h2d(self.d_frame_prefix_bytes, @ptrCast(prefix_bytes.ptr), prefix_bytes.len) != ffi.CUDA_SUCCESS) return null;
+    if (h2d(self.d_frame_chunk_dst, @ptrCast(per_chunk_dst_buf.ptr), ent_bytes) != cuda_ffi.CUDA_SUCCESS) return null;
+    if (h2d(self.d_frame_asm_offsets, @ptrCast(per_chunk_asm_off.ptr), ent_bytes) != cuda_ffi.CUDA_SUCCESS) return null;
+    if (h2d(self.d_frame_asm_chunk_sz, @ptrCast(per_chunk_asm_size.ptr), ent_bytes) != cuda_ffi.CUDA_SUCCESS) return null;
+    if (h2d(self.d_frame_prefix_bytes, @ptrCast(prefix_bytes.ptr), prefix_bytes.len) != cuda_ffi.CUDA_SUCCESS) return null;
 
     var k_input = d_input_dev;
     var k_asm_out = self.d_asm_out;
@@ -295,11 +298,11 @@ pub fn gpuFrameAssembleImpl(
     const heavy_stream: usize = self.work_stream;
     const t_fa = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzFrameAssembleKernel", heavy_stream);
     defer gpu_decode.endKernelTiming(t_fa, heavy_stream);
-    if (launch(module_loader.frame_assemble_fn, grid_x, 1, 1, 128, 1, 1, 0, heavy_stream, &params, &extra) != ffi.CUDA_SUCCESS) return null;
+    if (launch(module_loader.frame_assemble_fn, grid_x, 1, 1, 128, 1, 1, 0, heavy_stream, &params, &extra) != cuda_ffi.CUDA_SUCCESS) return null;
     // In async mode we leave the kernel in flight on the caller's stream
     // (their cudaStreamSynchronize is the sync point); else block here.
     if (heavy_stream == 0) {
-        if (sync() != ffi.CUDA_SUCCESS) return null;
+        if (sync() != cuda_ffi.CUDA_SUCCESS) return null;
     }
 
     return total_frame_size;

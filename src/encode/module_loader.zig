@@ -21,7 +21,7 @@
 //! that the build emits alongside the .cu sources.
 
 const std = @import("std");
-const ffi = @import("cuda_ffi.zig");
+const cuda_ffi = @import("cuda_ffi.zig");
 
 /// Embed a `.ptx` file as a null-terminated byte slice. The CUDA Driver
 /// API's `cuModuleLoadData` takes a C-string pointer; embedding the file
@@ -33,15 +33,15 @@ fn nullTerminatedPtx(comptime name: []const u8) [:0]const u8 {
 
 // Per-module handles. CUDA context comes from the decode driver - see
 // the file-level doc above.
-pub var module: ffi.CUmodule = 0;
-pub var kernel_fn: ffi.CUfunction = 0;
-pub var huff_module: ffi.CUmodule = 0;
-pub var huff_tables_kernel_fn: ffi.CUfunction = 0;
-pub var huff_encode_kernel_fn: ffi.CUfunction = 0;
-pub var assemble_module: ffi.CUmodule = 0;
-pub var assemble_measure_fn: ffi.CUfunction = 0;
-pub var assemble_write_fn: ffi.CUfunction = 0;
-pub var frame_assemble_fn: ffi.CUfunction = 0;
+pub var module: cuda_ffi.CUmodule = 0;
+pub var kernel_fn: cuda_ffi.CUfunction = 0;
+pub var huff_module: cuda_ffi.CUmodule = 0;
+pub var huff_tables_kernel_fn: cuda_ffi.CUfunction = 0;
+pub var huff_encode_kernel_fn: cuda_ffi.CUfunction = 0;
+pub var assemble_module: cuda_ffi.CUmodule = 0;
+pub var assemble_measure_fn: cuda_ffi.CUfunction = 0;
+pub var assemble_write_fn: cuda_ffi.CUfunction = 0;
+pub var frame_assemble_fn: cuda_ffi.CUfunction = 0;
 pub var initialized: bool = false;
 
 pub fn init() bool {
@@ -53,31 +53,31 @@ pub fn init() bool {
     const dec_gpu = @import("../decode/driver.zig");
     if (!dec_gpu.init()) return false;
 
-    ffi._lib = ffi.win32.LoadLibraryA("nvcuda.dll");
-    if (ffi._lib == null) return false;
+    cuda_ffi._lib = cuda_ffi.win32.LoadLibraryA("nvcuda.dll");
+    if (cuda_ffi._lib == null) return false;
 
-    ffi.cuModuleLoadData_fn = ffi.getProc(ffi.FnModuleLoadData, "cuModuleLoadData");
-    ffi.cuModuleGetFunction_fn = ffi.getProc(ffi.FnModuleGetFunction, "cuModuleGetFunction");
-    ffi.cuMemAlloc_fn = ffi.getProc(ffi.FnMemAlloc, "cuMemAlloc_v2");
-    ffi.cuMemFree_fn = ffi.getProc(ffi.FnMemFree, "cuMemFree_v2");
-    ffi.cuMemcpyHtoD_fn = ffi.getProc(ffi.FnMemcpyHtoD, "cuMemcpyHtoD_v2");
-    ffi.cuMemcpyDtoH_fn = ffi.getProc(ffi.FnMemcpyDtoH, "cuMemcpyDtoH_v2");
-    ffi.cuMemcpyDtoDAsync_fn = ffi.getProc(ffi.FnMemcpyDtoDAsync, "cuMemcpyDtoDAsync_v2");
-    ffi.cuLaunchKernel_fn = ffi.getProc(ffi.FnLaunchKernel, "cuLaunchKernel");
-    ffi.cuCtxSynchronize_fn = ffi.getProc(ffi.FnCtxSync, "cuCtxSynchronize");
-    ffi.cuMemsetD8_fn = ffi.getProc(ffi.FnMemsetD8, "cuMemsetD8_v2");
+    cuda_ffi.cuModuleLoadData_fn = cuda_ffi.getProc(cuda_ffi.FnModuleLoadData, "cuModuleLoadData");
+    cuda_ffi.cuModuleGetFunction_fn = cuda_ffi.getProc(cuda_ffi.FnModuleGetFunction, "cuModuleGetFunction");
+    cuda_ffi.cuMemAlloc_fn = cuda_ffi.getProc(cuda_ffi.FnMemAlloc, "cuMemAlloc_v2");
+    cuda_ffi.cuMemFree_fn = cuda_ffi.getProc(cuda_ffi.FnMemFree, "cuMemFree_v2");
+    cuda_ffi.cuMemcpyHtoD_fn = cuda_ffi.getProc(cuda_ffi.FnMemcpyHtoD, "cuMemcpyHtoD_v2");
+    cuda_ffi.cuMemcpyDtoH_fn = cuda_ffi.getProc(cuda_ffi.FnMemcpyDtoH, "cuMemcpyDtoH_v2");
+    cuda_ffi.cuMemcpyDtoDAsync_fn = cuda_ffi.getProc(cuda_ffi.FnMemcpyDtoDAsync, "cuMemcpyDtoDAsync_v2");
+    cuda_ffi.cuLaunchKernel_fn = cuda_ffi.getProc(cuda_ffi.FnLaunchKernel, "cuLaunchKernel");
+    cuda_ffi.cuCtxSynchronize_fn = cuda_ffi.getProc(cuda_ffi.FnCtxSync, "cuCtxSynchronize");
+    cuda_ffi.cuMemsetD8_fn = cuda_ffi.getProc(cuda_ffi.FnMemsetD8, "cuMemsetD8_v2");
 
     const ptx = nullTerminatedPtx("lz_kernel.ptx");
-    if ((ffi.cuModuleLoadData_fn orelse return false)(&module, ptx.ptr) != ffi.CUDA_SUCCESS) return false;
+    if ((cuda_ffi.cuModuleLoadData_fn orelse return false)(&module, ptx.ptr) != cuda_ffi.CUDA_SUCCESS) return false;
 
-    const get_fn = ffi.cuModuleGetFunction_fn orelse return false;
-    if (get_fn(&kernel_fn, module, "slzLzEncodeKernel") != ffi.CUDA_SUCCESS) return false;
+    const get_fn = cuda_ffi.cuModuleGetFunction_fn orelse return false;
+    if (get_fn(&kernel_fn, module, "slzLzEncodeKernel") != cuda_ffi.CUDA_SUCCESS) return false;
 
     // GPU Huffman encoder (chunk_type=4). Optional - if the module or
     // either kernel is missing, gpuEncode*Huff returns false and the
     // caller falls back to the CPU Huffman encoder.
     const huff_ptx = nullTerminatedPtx("huffman_kernel.ptx");
-    if ((ffi.cuModuleLoadData_fn orelse return false)(&huff_module, huff_ptx.ptr) == ffi.CUDA_SUCCESS) {
+    if ((cuda_ffi.cuModuleLoadData_fn orelse return false)(&huff_module, huff_ptx.ptr) == cuda_ffi.CUDA_SUCCESS) {
         _ = get_fn(&huff_tables_kernel_fn, huff_module, "slzHuffBuildTablesKernel");
         _ = get_fn(&huff_encode_kernel_fn, huff_module, "slzHuffEncode4StreamKernel");
     }
@@ -85,7 +85,7 @@ pub fn init() bool {
     // GPU frame-assembly kernels (chunk_type=4 device-resident compress
     // tail). Optional - gpuAssembleFrameImpl returns false if absent.
     const asm_ptx = nullTerminatedPtx("assemble_kernel.ptx");
-    if ((ffi.cuModuleLoadData_fn orelse return false)(&assemble_module, asm_ptx.ptr) == ffi.CUDA_SUCCESS) {
+    if ((cuda_ffi.cuModuleLoadData_fn orelse return false)(&assemble_module, asm_ptx.ptr) == cuda_ffi.CUDA_SUCCESS) {
         _ = get_fn(&assemble_measure_fn, assemble_module, "slzAssembleMeasureKernel");
         _ = get_fn(&assemble_write_fn, assemble_module, "slzAssembleWriteKernel");
         _ = get_fn(&frame_assemble_fn, assemble_module, "slzFrameAssembleKernel");

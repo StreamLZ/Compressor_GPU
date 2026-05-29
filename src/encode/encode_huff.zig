@@ -6,15 +6,15 @@
 //! consume directly.
 
 const std = @import("std");
-const ffi = @import("cuda_ffi.zig");
+const cuda_ffi = @import("cuda_ffi.zig");
 const module_loader = @import("module_loader.zig");
-const ec = @import("encode_context.zig");
+const encode_context = @import("encode_context.zig");
 const gpu_decode = @import("../decode/driver.zig");
 
-const CUdeviceptr = ffi.CUdeviceptr;
-const EncodeContext = ec.EncodeContext;
-const HuffEncDesc = ec.HuffEncDesc;
-const CompressChunkDesc = ec.CompressChunkDesc;
+const CUdeviceptr = cuda_ffi.CUdeviceptr;
+const EncodeContext = encode_context.EncodeContext;
+const HuffEncDesc = encode_context.HuffEncDesc;
+const CompressChunkDesc = encode_context.CompressChunkDesc;
 
 // Per-block dst capacity fixed component for the BIL Huffman encoder.
 // Each entropy-stream descriptor sizes its `dst_capacity` as
@@ -63,10 +63,10 @@ pub fn gpuEncodeHuffImpl(
     if (!module_loader.init()) return false;
     if (module_loader.huff_tables_kernel_fn == 0 or module_loader.huff_encode_kernel_fn == 0) return false;
 
-    const h2d_fn = ffi.cuMemcpyHtoD_fn orelse return false;
-    const d2h_fn = ffi.cuMemcpyDtoH_fn orelse return false;
-    const launch_fn = ffi.cuLaunchKernel_fn orelse return false;
-    const sync_fn = ffi.cuCtxSynchronize_fn orelse return false;
+    const h2d_fn = cuda_ffi.cuMemcpyHtoD_fn orelse return false;
+    const d2h_fn = cuda_ffi.cuMemcpyDtoH_fn orelse return false;
+    const launch_fn = cuda_ffi.cuLaunchKernel_fn orelse return false;
+    const sync_fn = cuda_ffi.cuCtxSynchronize_fn orelse return false;
 
     const n: u32 = @intCast(descs.len);
     // Convention across all four entrypoints: empty input → false (no
@@ -116,19 +116,19 @@ pub fn gpuEncodeHuffImpl(
     const codes_bytes: usize = descs.len * 256 * 4;
     const scratch_bytes: usize = descs.len * NUM_STREAMS * scratch_per_stream;
 
-    if (!ec.ensureBuf(&self.d_huff_descs_persist, &self.d_huff_descs_size, desc_bytes)) return false;
-    if (!ec.ensureBuf(&self.d_huff_cl_persist, &self.d_huff_cl_size, cl_bytes)) return false;
-    if (!ec.ensureBuf(&self.d_huff_codes_persist, &self.d_huff_codes_size, codes_bytes)) return false;
-    if (!ec.ensureBuf(&self.d_huff_scratch_persist, &self.d_huff_scratch_size, scratch_bytes)) return false;
-    if (!ec.ensureBuf(&self.d_huff_sizes_persist, &self.d_huff_sizes_size, sizes_bytes)) return false;
+    if (!encode_context.ensureBuf(&self.d_huff_descs_persist, &self.d_huff_descs_size, desc_bytes)) return false;
+    if (!encode_context.ensureBuf(&self.d_huff_cl_persist, &self.d_huff_cl_size, cl_bytes)) return false;
+    if (!encode_context.ensureBuf(&self.d_huff_codes_persist, &self.d_huff_codes_size, codes_bytes)) return false;
+    if (!encode_context.ensureBuf(&self.d_huff_scratch_persist, &self.d_huff_scratch_size, scratch_bytes)) return false;
+    if (!encode_context.ensureBuf(&self.d_huff_sizes_persist, &self.d_huff_sizes_size, sizes_bytes)) return false;
 
-    if (h2d_fn(self.d_huff_descs_persist, @ptrCast(descs.ptr), desc_bytes) != ffi.CUDA_SUCCESS) return false;
+    if (h2d_fn(self.d_huff_descs_persist, @ptrCast(descs.ptr), desc_bytes) != cuda_ffi.CUDA_SUCCESS) return false;
     // (No memset of d_huff_sizes_persist needed: slzHuffEncode4StreamKernel
     // writes out_sizes[block_id] for every block_id < n_blocks, including
     // empty descs (which write 0). The downstream d2h reads exactly
     // sizes_bytes for this call's descs.len, so stale tail bytes can't
     // leak in.)
-    if (sync_fn() != ffi.CUDA_SUCCESS) return false;
+    if (sync_fn() != cuda_ffi.CUDA_SUCCESS) return false;
 
     // Kernel 1: build per-block Huffman tables from the source streams.
     // Huffman source = LZ output (raw streams written by gpuCompressImpl
@@ -150,7 +150,7 @@ pub fn gpuEncodeHuffImpl(
     // launch failure - finalizeProfiling otherwise blocks on the unrecorded
     // end event.
     defer gpu_decode.endKernelTiming(t_htbl, 0);
-    if (launch_fn(module_loader.huff_tables_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &tbl_params, &extra) != ffi.CUDA_SUCCESS)
+    if (launch_fn(module_loader.huff_tables_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &tbl_params, &extra) != cuda_ffi.CUDA_SUCCESS)
         return false;
 
     // Kernel 2: pack each sub-chunk into a chunk_type=4 body. The
@@ -168,11 +168,11 @@ pub fn gpuEncodeHuffImpl(
     };
     const t_henc = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, profile_names[1], 0);
     defer gpu_decode.endKernelTiming(t_henc, 0);
-    if (launch_fn(module_loader.huff_encode_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &enc_params, &extra) != ffi.CUDA_SUCCESS)
+    if (launch_fn(module_loader.huff_encode_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &enc_params, &extra) != cuda_ffi.CUDA_SUCCESS)
         return false;
-    if (sync_fn() != ffi.CUDA_SUCCESS) return false;
+    if (sync_fn() != cuda_ffi.CUDA_SUCCESS) return false;
 
-    if (d2h_fn(@ptrCast(out_sizes.ptr), self.d_huff_sizes_persist, sizes_bytes) != ffi.CUDA_SUCCESS) return false;
+    if (d2h_fn(@ptrCast(out_sizes.ptr), self.d_huff_sizes_persist, sizes_bytes) != cuda_ffi.CUDA_SUCCESS) return false;
     return true;
 }
 
@@ -203,7 +203,7 @@ fn encodeStreamAndPublish(
         allocator.free(offsets);
         return false;
     };
-    if (!ec.ensureBuf(d_out, d_out_size, total)) {
+    if (!encode_context.ensureBuf(d_out, d_out_size, total)) {
         allocator.free(offsets);
         allocator.free(sizes);
         return false;
@@ -247,7 +247,7 @@ pub fn gpuEncodeOff16HuffImpl(
     for (0..n) |i| {
         const cs = comp_sizes[i];
         const base: u32 = chunk_descs[i].dst_offset;
-        const init_b: u32 = if (chunk_descs[i].is_first != 0) ec.INITIAL_LITERAL_COPY_BYTES else 0;
+        const init_b: u32 = if (chunk_descs[i].is_first != 0) encode_context.INITIAL_LITERAL_COPY_BYTES else 0;
 
         // Default to empty (no entropy coding for this sub-chunk).
         hi_offsets[i] = total;
@@ -326,7 +326,7 @@ pub fn gpuEncodeOff16HuffImpl(
         allocator.free(lo_offsets);
         return false;
     };
-    if (!ec.ensureBuf(&self.d_asm_huff_off16, &self.d_asm_huff_off16_size, total)) {
+    if (!encode_context.ensureBuf(&self.d_asm_huff_off16, &self.d_asm_huff_off16_size, total)) {
         allocator.free(hi_offsets);
         allocator.free(lo_offsets);
         allocator.free(all_sizes);
@@ -440,7 +440,7 @@ fn encodeByteStreamHuff(
 
     var total: u32 = 0;
     for (0..n) |i| {
-        const init_b: u32 = if (chunk_descs[i].is_first != 0) ec.INITIAL_LITERAL_COPY_BYTES else 0;
+        const init_b: u32 = if (chunk_descs[i].is_first != 0) encode_context.INITIAL_LITERAL_COPY_BYTES else 0;
         offsets[i] = total;
         descs[i] = .{ .src_offset = 0, .src_size = 0, .src_stride = 1, .dst_offset = total, .dst_capacity = 0 };
 

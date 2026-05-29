@@ -13,28 +13,28 @@
 const std = @import("std");
 
 const cuda = @import("cuda_api.zig");
-const ml = @import("module_loader.zig");
-const d = @import("descriptors.zig");
-const dec_ctx = @import("decode_context.zig");
-const scan_gpu_mod = @import("scan_gpu.zig");
+const module_loader = @import("module_loader.zig");
+const descriptors = @import("descriptors.zig");
+const decode_context = @import("decode_context.zig");
+const scan_gpu = @import("scan_gpu.zig");
 
 const CUdeviceptr = cuda.CUdeviceptr;
 const CUDA_SUCCESS = cuda.CUDA_SUCCESS;
 
-const ChunkDesc = d.ChunkDesc;
-const HuffDecChunkDesc = d.HuffDecChunkDesc;
-const RawOff16Desc = d.RawOff16Desc;
-const ScanResult = d.ScanResult;
-const GpuError = d.GpuError;
-const cudaCall = d.cudaCall;
-const HUFF_LUT_ENTRIES = d.HUFF_LUT_ENTRIES;
+const ChunkDesc = descriptors.ChunkDesc;
+const HuffDecChunkDesc = descriptors.HuffDecChunkDesc;
+const RawOff16Desc = descriptors.RawOff16Desc;
+const ScanResult = descriptors.ScanResult;
+const GpuError = descriptors.GpuError;
+const cudaCall = descriptors.cudaCall;
+const HUFF_LUT_ENTRIES = descriptors.HUFF_LUT_ENTRIES;
 
-const DecodeContext = dec_ctx.DecodeContext;
-const ensureDeviceBuf = dec_ctx.ensureDeviceBuf;
-const ensureDeviceOutput = dec_ctx.ensureDeviceOutput;
-const beginKernelTiming = dec_ctx.beginKernelTiming;
-const endKernelTiming = dec_ctx.endKernelTiming;
-const finalizeProfiling = dec_ctx.finalizeProfiling;
+const DecodeContext = decode_context.DecodeContext;
+const ensureDeviceBuf = decode_context.ensureDeviceBuf;
+const ensureDeviceOutput = decode_context.ensureDeviceOutput;
+const beginKernelTiming = decode_context.beginKernelTiming;
+const endKernelTiming = decode_context.endKernelTiming;
+const finalizeProfiling = decode_context.finalizeProfiling;
 
 /// Bundle of the CUDA Driver API function pointers used by the GPU
 /// decode pipeline. Resolved once at `fullGpuLaunchImpl` entry and
@@ -110,7 +110,7 @@ fn mergeHuffDescs(
     var m_extra = [_]?*anyopaque{null};
     const stream = self.work_stream;
     const t_merge = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzMergeHuffDescsKernel", stream);
-    try cudaCall(launch_fn(ml.merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &m_params, &m_extra), .launch);
+    try cudaCall(launch_fn(module_loader.merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &m_params, &m_extra), .launch);
     endKernelTiming(t_merge, stream);
     // No post-launch sync: downstream kernels (huff_build, huff_decode)
     // are queued on the same stream and see merge's output via stream
@@ -148,7 +148,7 @@ fn gatherRawOff16(
     const stream = self.work_stream;
     const t_gather = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzGatherRawOff16Kernel", stream);
     defer endKernelTiming(t_gather, stream);
-    try cudaCall(launch_fn(ml.gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, stream, &params, &extra), .launch);
+    try cudaCall(launch_fn(module_loader.gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, stream, &params, &extra), .launch);
     // No post-launch sync: downstream LZ kernel reads
     // d_entropy_off16_scratch from the same stream.
 }
@@ -275,7 +275,7 @@ fn runHuffPredecode(
         };
         var extra = [_]?*anyopaque{null};
         const t_hb = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffBuildLutKernel", huff_stream);
-        try cudaCall(launch_fn(ml.huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra), .launch);
+        try cudaCall(launch_fn(module_loader.huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra), .launch);
         endKernelTiming(t_hb, huff_stream);
     }
     // Split fence: time the LUT build separately from the decode.
@@ -300,7 +300,7 @@ fn runHuffPredecode(
         var extra = [_]?*anyopaque{null};
         const shared_bytes: c_uint = HUFF_LUT_ENTRIES * @sizeOf(u32);
         const t_hd = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffDecode4StreamKernel", huff_stream);
-        try cudaCall(launch_fn(ml.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, shared_bytes, huff_stream, &params, &extra), .launch);
+        try cudaCall(launch_fn(module_loader.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, shared_bytes, huff_stream, &params, &extra), .launch);
         endKernelTiming(t_hd, huff_stream);
     }
     return split_huff_build_ns;
@@ -351,7 +351,7 @@ fn runLzPipeline(
 
     // Fast path: no entropy in this scan → use lean L1/L2 raw kernel.
     // Huffman literals require the general kernel (it reads entropy_scratch).
-    const use_raw_kernel = n_huff == 0 and ml.kernel_raw_fn != 0;
+    const use_raw_kernel = n_huff == 0 and module_loader.kernel_raw_fn != 0;
 
     // The six shared params (comp, descs_dev, dst, cpg, total, sc_cap)
     // live in a small struct so each field has a stable address for the
@@ -376,11 +376,11 @@ fn runLzPipeline(
         };
         var raw_extra = [_]?*anyopaque{null};
         const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", stream);
-        try cudaCall(launch_fn(ml.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra), .launch);
+        try cudaCall(launch_fn(module_loader.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra), .launch);
         endKernelTiming(t_lzr, stream);
     } else {
         var p_entropy_scratch: u64 = self.d_entropy_scratch;
-        var p_entropy_slot_stride: u64 = @as(u64, total_subchunks) * d.ENTROPY_SCRATCH_SLOT_BYTES;
+        var p_entropy_slot_stride: u64 = @as(u64, total_subchunks) * descriptors.ENTROPY_SCRATCH_SLOT_BYTES;
         var p_first_sub_idx: CUdeviceptr = self.d_first_subchunk_idx;
 
         var lz_params = [_]?*anyopaque{
@@ -397,7 +397,7 @@ fn runLzPipeline(
         var lz_extra = [_]?*anyopaque{null};
 
         const t_lz = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeKernel", stream);
-        try cudaCall(launch_fn(ml.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra), .launch);
+        try cudaCall(launch_fn(module_loader.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra), .launch);
         endKernelTiming(t_lz, stream);
     }
 
@@ -450,9 +450,9 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     const io = req.io;
     const d_compressed_src = req.d_compressed_src;
 
-    if (!ml.init()) return error.BackendNotAvailable;
-    if (ml.kernel_fn == 0) return error.KernelMissing;
-    try ml.ensurePipelineStreams(self);
+    if (!module_loader.init()) return error.BackendNotAvailable;
+    if (module_loader.kernel_fn == 0) return error.KernelMissing;
+    try module_loader.ensurePipelineStreams(self);
 
     const facade = @import("driver.zig");
 
@@ -499,7 +499,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // every GPU decode path needs it; specific failure variants
     // (OutOfDeviceMemory / KernelLaunchFailed / SyncFailed /
     // BackendNotAvailable / KernelMissing) propagate to the caller.
-    _ = try scan_gpu_mod.gpuPrefixSumChunksImpl(self, self.d_descs_persist, @intCast(chunk_descs.len), sub_chunk_cap);
+    _ = try scan_gpu.gpuPrefixSumChunksImpl(self, self.d_descs_persist, @intCast(chunk_descs.len), sub_chunk_cap);
     // Skip the D2H of `total_subchunks` and use a host-computed
     // worst-case bound: max sub-chunks per chunk = ceil(chunk_size /
     // sub_chunk_cap), clamped to MAX_BLOCKS_PER_SUBCHUNK*2 = 4 in the
@@ -515,10 +515,10 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // the merge-kernel writer and the LZ-kernel reader. Naming kept as
     // `total_subchunks` so downstream call sites are unchanged.
     const total_subchunks: u32 = @as(u32, @intCast(chunk_descs.len)) * max_sub_per_chunk;
-    // d.ENTROPY_SCRATCH_SLOT_BYTES holds the largest sub-chunk's lit/tok
-    // streams; off16-hi at +0, off16-lo at +d.OFF16_HILO_SPLIT_OFFSET
+    // descriptors.ENTROPY_SCRATCH_SLOT_BYTES holds the largest sub-chunk's lit/tok
+    // streams; off16-hi at +0, off16-lo at +descriptors.OFF16_HILO_SPLIT_OFFSET
     // within each slot. Layout: [lit: total*slot] [tok: total*slot] [off16: total*slot].
-    const per_subchunk_scratch: usize = @intCast(d.ENTROPY_SCRATCH_SLOT_BYTES);
+    const per_subchunk_scratch: usize = @intCast(descriptors.ENTROPY_SCRATCH_SLOT_BYTES);
     const entropy_scratch_bytes = @as(usize, total_subchunks) * per_subchunk_scratch * 3;
     if (!ensureDeviceBuf(&self.d_entropy_scratch, &self.d_entropy_scratch_size, entropy_scratch_bytes)) return error.OutOfDeviceMemory;
     const tok_offset = @as(usize, total_subchunks) * per_subchunk_scratch;
@@ -530,7 +530,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // and the kernel reads identity values — same effective behavior as
     // the prior null-pointer / kernel-side identity branch.
     self.d_first_subchunk_idx = self.d_first_sub_idx_persist;
-    if (chunk_descs.len > d.WALK_MAX_CHUNKS) return error.BadMode;
+    if (chunk_descs.len > descriptors.WALK_MAX_CHUNKS) return error.BadMode;
 
     // Source-side input: D2D when the bytes are already device-resident,
     // H2D otherwise. The D2D copy issues on `self.work_stream` so the
@@ -563,9 +563,9 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // entry points.
     var scan: ScanResult = .{ .num_raw_off16 = 0 };
 
-    if (ml.huff_build_fn != 0) {
-        if (chunk_descs.len > d.WALK_MAX_CHUNKS) return error.BadMode;
-        scan = scan_gpu_mod.gpuScanChunks(
+    if (module_loader.huff_build_fn != 0) {
+        if (chunk_descs.len > descriptors.WALK_MAX_CHUNKS) return error.BadMode;
+        scan = scan_gpu.gpuScanChunks(
             self,
             chunk_descs,
             compressed_block,
@@ -588,7 +588,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // into a single device array with correct out_offsets, then upload.
     const n_huff: u32 = scan.num_huff_lit + scan.num_huff_tok +
         scan.num_huff_off16hi + scan.num_huff_off16lo;
-    const have_huff = n_huff > 0 and ml.huff_build_fn != 0 and ml.huff_decode_fn != 0;
+    const have_huff = n_huff > 0 and module_loader.huff_build_fn != 0 and module_loader.huff_decode_fn != 0;
     if (have_huff) {
         const huff_desc_bytes = @as(usize, n_huff) * @sizeOf(HuffDecChunkDesc);
         const huff_lut_bytes = @as(usize, n_huff) * HUFF_LUT_ENTRIES * @sizeOf(u32);

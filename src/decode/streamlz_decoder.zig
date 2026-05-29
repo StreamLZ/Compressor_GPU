@@ -286,16 +286,16 @@ fn decompressFrameInner(
         const prefix_sz: usize = if (num_chunks > 1) (num_chunks - 1) * 8 else 0;
         if (prefix_sz != 0) {
             const prefix_base: [*]const u8 = block_src[block_src.len - prefix_sz ..].ptr;
-            for (0..num_chunks - 1) |pi| {
-                const cdst = dst_off + (pi + 1) * eff_cs;
-                var csz: usize = 8;
-                if ((pi + 1) * eff_cs + csz > block_hdr.decompressed_size)
-                    csz = block_hdr.decompressed_size - (pi + 1) * eff_cs;
+            for (0..num_chunks - 1) |prefix_idx| {
+                const chunk_dst_off = dst_off + (prefix_idx + 1) * eff_cs;
+                var copy_size: usize = 8;
+                if ((prefix_idx + 1) * eff_cs + copy_size > block_hdr.decompressed_size)
+                    copy_size = block_hdr.decompressed_size - (prefix_idx + 1) * eff_cs;
                 if (d_output_target) |dev_target| {
-                    if (!gpu_driver.copyHostToDevice(dev_target + cdst, prefix_base[pi * 8 ..][0..csz]))
+                    if (!gpu_driver.copyHostToDevice(dev_target + chunk_dst_off, prefix_base[prefix_idx * 8 ..][0..copy_size]))
                         return error.BadMode;
                 } else {
-                    @memcpy(dst[cdst..][0..csz], prefix_base[pi * 8 ..][0..csz]);
+                    @memcpy(dst[chunk_dst_off..][0..copy_size], prefix_base[prefix_idx * 8 ..][0..copy_size]);
                 }
             }
         }

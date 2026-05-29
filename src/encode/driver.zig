@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const module_loader = @import("module_loader.zig");
-const ec = @import("encode_context.zig");
+const encode_context = @import("encode_context.zig");
 const encode_lz = @import("encode_lz.zig");
 const encode_huff = @import("encode_huff.zig");
 const encode_assemble = @import("encode_assemble.zig");
@@ -27,20 +27,20 @@ pub const init = module_loader.init;
 pub const isAvailable = module_loader.isAvailable;
 
 // ── Shared types ──────────────────────────────────────────────
-pub const CompressChunkDesc = ec.CompressChunkDesc;
-pub const EncodeContext = ec.EncodeContext;
+pub const CompressChunkDesc = encode_context.CompressChunkDesc;
+pub const EncodeContext = encode_context.EncodeContext;
 
-pub const copyDeviceToHost = ec.copyDeviceToHost;
-pub const copyHostToDevice = ec.copyHostToDevice;
-pub const ensureBuf = ec.ensureBuf;
+pub const copyDeviceToHost = encode_context.copyDeviceToHost;
+pub const copyHostToDevice = encode_context.copyHostToDevice;
+pub const ensureBuf = encode_context.ensureBuf;
 
 // Wire-format byte sizes re-exported for the CPU-side framer in
 // src/encode/fast_framed.zig (which orchestrates GPU encode + frame
 // assembly). See encode_context.zig for the underlying definitions.
-pub const SC_TAIL_PER_CHUNK_BYTES = ec.SC_TAIL_PER_CHUNK_BYTES;
-pub const CHUNK_INTERNAL_HDR_BYTES = ec.CHUNK_INTERNAL_HDR_BYTES;
-pub const UNCOMPRESSED_CHUNK_HDR_BYTES = ec.UNCOMPRESSED_CHUNK_HDR_BYTES;
-pub const UNCOMPRESSED_CHUNK_MARKER = ec.UNCOMPRESSED_CHUNK_MARKER;
+pub const SC_TAIL_PER_CHUNK_BYTES = encode_context.SC_TAIL_PER_CHUNK_BYTES;
+pub const CHUNK_INTERNAL_HDR_BYTES = encode_context.CHUNK_INTERNAL_HDR_BYTES;
+pub const UNCOMPRESSED_CHUNK_HDR_BYTES = encode_context.UNCOMPRESSED_CHUNK_HDR_BYTES;
+pub const UNCOMPRESSED_CHUNK_MARKER = encode_context.UNCOMPRESSED_CHUNK_MARKER;
 
 // ── Singletons ────────────────────────────────────────────────
 // `g_default` and `last_kernel_ns` live on the facade so external callers
