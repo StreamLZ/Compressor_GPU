@@ -5,6 +5,16 @@
 **Byte order:** Little-endian unless otherwise noted
 **Notation:** `BSR(x)` denotes Bit Scan Reverse — the 0-based index of the most significant set bit, equivalent to `floor(log2(x))` for x > 0.
 
+> **Scope note (3.0):** The CPU codec was retired on 2026-05-29. The
+> GPU codec emits only a subset of the SLZ1 surface: Fast codec
+> (codec ID 1), levels 1-5, no dictionary, no parallel-decode
+> sidecar, sc_group_size ∈ {0.25, 0.5} as a float, single block,
+> content_size present. Decoders still accept the full spec for
+> legacy frames; encoders only produce the GPU subset. Sections
+> covering High-codec block layouts, sidecar bodies, and the
+> dictionary_id field are marked **Legacy** below and apply only to
+> frames produced by StreamLZ ≤ 2.x.
+
 ---
 
 ## Overview

@@ -1,5 +1,12 @@
 # N-gram Forward Scatter — Design Document
 
+> **Historical.** Design notes for an optimization targeting the
+> CPU High codec (L9-L11) that was retired with the GPU-only strip
+> on 2026-05-29. The idea was never built. Kept because the
+> cache-warming-via-pre-scatter analysis may be useful for the GPU
+> LZ kernel if it ever becomes memory-bandwidth-bound at larger
+> inputs.
+
 ## The Problem
 
 StreamLZ's High codec (L9-L11) decompresses at ~1,050 MB/s single-threaded

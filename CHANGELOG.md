@@ -1,68 +1,87 @@
 # Changelog
 
+## [3.0.0] — 2026-05-29
+
+GPU-only release. The CPU codec (all 11 levels, parallel decoder,
+streaming compressor, dictionary subsystem, parallel-decode sidecar)
+and the Vulkan compute-shader decode fallback have been removed; the
+CUDA codec is the only backend.
+
+### Breaking changes
+
+- **CPU backend removed.** Hosts without CUDA can no longer use this
+  library. `nvcuda.dll` is loaded at runtime; missing CUDA returns
+  `error.BackendNotAvailable` / `SLZ_ERROR_CUDA`.
+- **Vulkan decoder removed.** `vulkan_driver.zig` + the `.comp` shader
+  + `.spv` artifacts are deleted. CUDA only.
+- **Levels L6-L11 removed.** The High codec (optimal parser, BT4
+  match finder, full entropy stage) was CPU-only. Encoders return
+  `error.BadLevel` for any level outside 1..5.
+- **Dictionary subsystem removed.** The seven built-in dictionaries,
+  the FASTCOVER trainer, the `-D` / `--no-dict` / `--train` CLI
+  flags, and the `dictionary` / `dictionary_id` encoder options are
+  gone. Frames carrying a `dictionary_id` are rejected with
+  `error.UnknownDictionary`.
+- **CPU-comparison benchmark modes removed.** `-bc` / `-bcf` and the
+  `--zstd` / `--lz4` engine selectors are gone, along with the
+  vendored `zstd 1.5.7` + `LZ4 1.10.0` source trees.
+- **CPU C ABI (`capi.zig` / `include/streamlz.h`) removed.** The GPU
+  C ABI in `src/streamlz_gpu.zig` + `include/streamlz_gpu.h` is the
+  only public C surface.
+- **Build flags removed.** `-Dgpu`, `-Dbench` are gone; `zig build`
+  is unconditionally GPU. The `safe`, `fuzz`, `lib` build steps and
+  the ReleaseSafe + fuzz harness are removed.
+
+### Reorganization
+
+- **`src/gpu/` flattened up to `src/`.** `src/gpu/common/` →
+  `src/common/`, `src/gpu/encode/` → `src/encode/`, `src/gpu/decode/`
+  → `src/decode/`. The `.cu` / `.cuh` `#include "../common/..."`
+  paths stay byte-identical because the relative move preserves
+  them.
+- **Orchestration files rewritten clean.** `src/encode/fast_framed.zig`
+  (2125 LOC → ~660 LOC), `src/encode/streamlz_encoder.zig` (1093
+  → 195), `src/decode/streamlz_decoder.zig` (1611 → ~425), `src/cli.zig`
+  (1878 → ~660). Host-side wire-format helpers extracted into a
+  focused `src/encode/gpu_stream_assembly.zig` module.
+- **GPU docs moved.** `src/gpu/ARCHITECTURE.md` → `docs/GPU_ARCHITECTURE.md`
+  (kept verbatim; the algorithmic notes still apply).
+  `src/gpu/README.md` → `docs/GPU_README.md`. `src/gpu/IDEAS.md` →
+  `docs/GPU_IDEAS.md`.
+
+### Verification
+
+`tools/bench_all.bat` (enwik8 100 MB + silesia 213 MB, L1-L5,
+`-db -r 30`, RTX 4060 Ti sm_89) pre- and post-strip. All ten rows
+SHA-256 OK. D2D wall-clock stayed within ±0.05 ms of the
+pre-strip baseline; e2e within ±0.23 ms; ratios within ±0.04 pp.
+Most deltas were small improvements (the simpler dispatch shaved a
+handful of microseconds per call).
+
+### Performance highlights — RTX 4060 Ti, enwik8 100 MB
+
+| Level | D2D wall ms | e2e ms | ratio |
+|-------|------------:|-------:|------:|
+| L1 | 2.92 | 15.49 | 58.6% |
+| L3 | 4.10 | 15.54 | 43.7% |
+| L5 | 4.12 | 15.24 | 39.6% |
+
+L1 D2D throughput: 33 GB/s. L5 D2D throughput: 24 GB/s. End-to-end
+host-bounce throughput is dominated by the D2H copy of the
+decompressed output; D2D callers see only the wall numbers.
+
+---
+
 ## [2.0.0] — 2026-04-29
 
-Initial native (Zig) release. Full port of the C# StreamLZ library to
-Zig 0.16 with byte-exact wire-format compatibility.
+CPU-only Zig port of the C# StreamLZ codec. Superseded by 3.0.
 
-### Highlights
+### Highlights (historical)
 
-- **All 11 compression levels** (Fast L1-L5, High L6-L11) with compress
-  and decompress at full parity with v1.
-- **Parallel decompress** at all levels: SC group-parallel for L1-L5
-  (adaptive group size), SC group-parallel for L6-L8 (adaptive group
-  size), two-phase parallel for L9-L11.
-- **Dictionary support**: 7 built-in dictionaries (JSON, HTML, CSS, JS,
-  XML, text, general) with auto-detection by file extension. Custom
-  dictionary training via FASTCOVER algorithm. Zero-copy decompress
-  (no memmove overhead).
-- **128 MB dictionary window** for L11 (BT4 match finder).
-- **Flag-driven CLI** (no subcommands): compress, decompress, benchmark,
-  bench-all, decompress-bench, info, train, version.
-- **297 unit tests** + 140 fixture roundtrips against C# reference output.
-- **Fuzz harness** for decompressor safety testing.
-- Streaming decompress to `std.Io.Writer` with XXH32 content-checksum
-  verification.
+- All 11 levels (Fast L1-L5, High L6-L11) implemented in Zig.
+- Parallel decompress at every level.
+- Seven built-in dictionaries + FASTCOVER trainer.
+- 297 unit tests + 140 fixture roundtrips against the C# reference.
+- ReleaseSafe + fuzz-harness builds for production hardening.
 
-### Performance (Arrow Lake-S, 24 cores, enwik8 100 MB, best of 3)
-
-- L1 parallel decompress: 34 GB/s
-- L2-L5 SC group-parallel decompress: 37-39 GB/s
-- L6-L8 SC group-parallel decompress: 11-12 GB/s
-- L9-L11 two-phase parallel decompress: 1.4-2.3 GB/s
-- L1-L5 parallel compress (SC, per-group workers): 2.8 GB/s (L1), 2.0 GB/s (L2), 1.5 GB/s (L3), 1.0 GB/s (L4), 755 MB/s (L5)
-- L9 compress: 7.9 MB/s (SIMD hash probe + dual-bucket prefetch)
-
-### Key optimizations over v1
-
-- L1 ratio 58.6% → 54.9%: u32 hash positions, 17-bit hash table,
-  content-first probe, on-the-fly skip computation
-- L6-L8 ratio 2.3pp improvement: adaptive SC group sizing (~16 groups
-  per file, wider match window per parallel worker)
-- mmap I/O for compress and decompress (disk-to-disk L1 decompress
-  37ms vs lzturbo's 46ms on enwik8)
-- Fast decoder split loop: bounds-check-free fast inner loop + safe
-  tail (+4.6% L1 single-thread decompress)
-- High decoder: redundant match_addr bounds check eliminated from
-  processOneToken fast path (~1.2% L9 decompress improvement)
-- CMOV LIFO swap in Fast short-token loop
-- Far-offset MOVDQU widening for medium/long match paths
-- Conditional far-offset prefetch for L3-L5
-- SIMD hash probe + dual-bucket prefetch for L9-L11 encoder
-- Parallel resolveTokens for L9-L11 (+17-24% decompress)
-- SC group-parallel compress and decompress for L2-L5 (supersedes v2 sidecar frame format)
-- L1 SC per-chunk independence (no sidecar needed)
-- C-ABI exports via `capi.zig` (`slz_compress`, `slz_decompress`, error codes) for FFI consumers
-- 4 GB `content_size` cap in frame header to prevent OOM DoS from malicious inputs
-
-### Build
-
-- Optional vendor libs (`-Dbench=true`): default build excludes
-  zstd/lz4, binary 2.1 MB → 1.3 MB, incremental builds ~200ms
-- Static library caching for zstd/lz4 vendor code
-
-### Format
-
-- v2 frame header: `sc_group_size` byte replaces v1 reserved byte.
-  Encoders write actual group size (1-255); decoders must use this
-  value for SC group boundary calculations.
+See git history at tag `v2.0.0` for the 2.x source tree.

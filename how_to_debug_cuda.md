@@ -19,12 +19,17 @@ $env:PATH = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\T
 
 ### Build PTX (for embedding in Zig via @embedFile):
 ```powershell
-nvcc -ptx -arch=sm_89 -O3 src\gpu\gpu_tans_decode_kernel.cu -o src\gpu\gpu_tans_decode_kernel.ptx
+nvcc -ptx -arch=sm_89 -O3 src\decode\lz_kernel.cu -o src\decode\lz_kernel.ptx
 ```
+
+(The five `.cu` translation units live under `src/encode/` and
+`src/decode/`. `tools\build_gpu.bat` rebuilds all of them in one
+shot and re-runs `zig build` so the freshly-built PTX is embedded
+into the binaries.)
 
 ### Build cubin (for SASS disassembly / resource analysis):
 ```powershell
-nvcc -cubin -arch=sm_89 -O3 src\gpu\gpu_tans_decode_kernel.cu -o c:\tmp\kernel.cubin
+nvcc -cubin -arch=sm_89 -O3 src\decode\lz_kernel.cu -o c:\tmp\kernel.cubin
 ```
 
 ### Build standalone benchmark .exe:

@@ -1,9 +1,16 @@
-# StreamLZ Native
+# StreamLZ
 
-Zig 0.16 implementation of [StreamLZ](https://github.com/StreamLZ/StreamLZ), a fast LZ77-family
-compressor/decompressor. Covers all 11 compression levels (Fast L1-L5,
-High L6-L11) with byte-exact wire-format compatibility with the C#
-reference. Primary goal: **fast decompression** on consumer x86-64.
+GPU-accelerated LZ77 compressor + decompressor. CUDA kernels (NVIDIA
+Driver API, target `sm_89`) do the per-chunk LZ work and 32-stream
+Huffman decode; thin Zig drivers manage the kernel launches and the
+host-side wire-format assembly.
+
+There is one backend: CUDA. The codec was previously available as a
+CPU implementation, byte-exact with a C# reference, plus a Vulkan
+compute-shader decoder fallback. Both were retired on 2026-05-29 so
+the project could maintain one codec rather than three; see
+[FAILED_EXPERIMENTS.md](FAILED_EXPERIMENTS.md) "Maintaining parallel
+CPU and GPU codebases" for the rationale.
 
 ---
 
@@ -13,233 +20,155 @@ reference. Primary goal: **fast decompression** on consumer x86-64.
 zig build -Doptimize=ReleaseFast
 ```
 
-The CLI binary lands at `zig-out/bin/streamlz.exe` (Windows) or
-`zig-out/bin/streamlz` (Linux/macOS).
+That produces `zig-out/bin/streamlz.exe` (the CLI) and
+`zig-out/bin/streamlz_gpu.dll` (the C ABI library that game engines /
+ML pipelines link against).
 
 ```
-streamlz file.txt                    # compress (default L3)
-streamlz -l 9 file.txt              # compress at level 9
-streamlz -d file.slz                # decompress
-streamlz -b -l 5 file.txt           # benchmark level 5
-streamlz -ba file.txt               # benchmark all L1-L11
-streamlz -db file.slz               # decompress-only benchmark
-streamlz -i file.slz                # frame/block info
-streamlz --train -o dict.bin corpus/ # train custom dictionary
+streamlz file.txt                # compress (default L1)
+streamlz -l 3 file.txt           # compress at level 3
+streamlz -d file.slz             # decompress
+streamlz -b -l 5 file.txt        # compress + decompress + verify
+streamlz -ba file.txt            # sweep L1-L5, ratio + throughput
+streamlz -db file.slz            # decompress-only benchmark
+streamlz -i  file.slz            # frame / block header dump
 ```
 
-Dictionary flags: `-D name` selects a built-in dictionary, `--no-dict`
-disables auto-detection.
+Levels: L1-L5. Higher = better ratio, slower encode. Decode speed is
+roughly the same across all five (within ±0.5 ms on a 100 MB input).
+
+The PTX kernel images are committed under `src/encode/` and
+`src/decode/`, so plain `zig build` does not require CUDA installed
+— the Zig drivers `@embedFile` the PTX. The codec needs `nvcuda.dll`
+at runtime; if it is missing or `cuInit` fails, the codec returns
+`error.BackendNotAvailable`.
+
+To rebuild PTX after editing any `.cu` / `.cuh`:
+
+```
+tools\build_gpu.bat
+```
+
+The script invokes `nvcc -arch=sm_89 -O3` on the five CUDA
+translation units, then re-runs `zig build` so the freshly-built PTX
+is embedded. `build.zig` enforces a freshness gate that fails the
+build if any source is newer than any PTX.
 
 ---
 
-## Build, test, fuzz
+## C ABI library
 
+The handle-based C library (`include/streamlz_gpu.h`) mirrors the
+nvCOMP shape:
+
+```c
+slzContext_t ctx;
+slzCreate(&ctx);
+size_t bound;
+slzCompressBound(ctx, src_size, slzCompressDefaultOpts(), &bound);
+// allocate dst...
+size_t comp_size;
+slzCompressHost(ctx, src, src_size, dst, bound, &comp_size, slzCompressDefaultOpts());
+// later:
+slzDecompressHost(ctx, comp, comp_size, out, out_size, &written, slzDecompressDefaultOpts());
+slzDestroy(ctx);
 ```
-zig build -Doptimize=ReleaseFast                # release binary
-zig build -Doptimize=ReleaseFast -Dstrip=false  # release + symbols (VTune)
-zig build test --summary all                    # 329 unit tests
-zig build safe                                  # ReleaseSafe build
-zig build fuzz                                  # fuzz harness
-```
 
-Default target is `x86_64_v3` (Haswell+) for Intel/AMD portability.
-Override with `-Dcpu=native` for host-specific tuning.
+Two buffer models:
 
-The fixture suite (`fixture_tests` + `encode_fixture_tests`) roundtrips
-140 corpus files byte-exact against the C# reference. Generate fixtures
-with `scripts/gen_fixtures.sh` and set `STREAMLZ_FIXTURES_DIR=./fixtures`
-before running tests.
+* `slzCompressHost` / `slzDecompressHost` — caller's data on host;
+  the pipeline does its own H2D + D2H.
+* `slzCompressAsync` / `slzDecompressAsync` — caller's data is
+  GPU-resident; the codec submits all work on the caller's CUstream
+  and never bounces through host memory.
+
+`tools/slz_gpu_d2d_bench.c` is a worked example of the async
+device-resident path.
 
 ---
 
-## Benchmarks
+## Performance
 
-Intel Core Ultra 9 285K (Arrow Lake-S), Windows 11, Zig 0.16 / LLVM 21,
-`-Doptimize=ReleaseFast`. Best of 100 runs.
+Best-of-30 decode on an RTX 4060 Ti (sm_89), `streamlz -db -r 30`.
+Re-run by `tools\bench_all.bat`.
 
-### vs zstd and LZ4 (single-threaded, enwik8 100 MB)
+### Decode (ms): D2D wall-clock and end-to-end
 
-Single-threaded comparison. All compressors use full-stream mode (no block splitting).
+| Level | enwik8 D2D / e2e | silesia D2D / e2e |
+|-------|------------------|-------------------|
+| L1 | **2.92** / 15.49 | **5.08** / 29.89 |
+| L2 | **2.93** / 15.48 | **5.08** / 29.88 |
+| L3 | **4.10** / 15.54 | **7.15** / 30.53 |
+| L4 | **3.94** / 15.30 | **6.97** / 30.30 |
+| L5 | **4.12** / 15.24 | **7.71** / 30.38 |
 
-| Compressor | Ratio | Compress | Decompress |
-|-----------|-------|----------|------------|
-| LZ4       | 57.3% |     683 MB/s |  5,103 MB/s |
-| LZ4 HC 4  | 43.0% |    96.8 MB/s |  4,793 MB/s |
-| LZ4 HC 9  | 42.2% |    51.9 MB/s |  4,912 MB/s |
-| LZ4 HC 12 | 41.9% |    24.9 MB/s |  4,839 MB/s |
-| zstd 1    | 40.7% |     459 MB/s |  1,771 MB/s |
-| zstd 3    | 35.4% |     311 MB/s |  1,435 MB/s |
-| zstd 9    | 31.1% |    78.2 MB/s |  1,556 MB/s |
-| zstd 19   | 26.9% |     2.7 MB/s |  1,571 MB/s |
-| **SLZ L1**  | 53.7% |     308 MB/s |  **6,441 MB/s** |
-| **SLZ L3**  | 51.7% |     222 MB/s |  **4,940 MB/s** |
-| **SLZ L5**  | 41.9% |    71.7 MB/s |  **5,269 MB/s** |
-| **SLZ L6**  | 27.4% |     3.1 MB/s |  1,127 MB/s |
-| **SLZ L8**  | 25.5% |     0.9 MB/s |  1,108 MB/s |
-| **SLZ L9**  | 27.4% |     3.1 MB/s |  1,092 MB/s |
-| **SLZ L11** | 25.5% |     0.2 MB/s |  1,075 MB/s |
+D2D wall-clock = the time a device-resident caller of
+`slzDecompressAsync` sees on the wire. End-to-end adds the host-to-
+device upload of the compressed frame + device-to-host download of
+the decompressed output for the host-bounce path.
 
-At the fast tier: SLZ L1 decompresses **3.6x faster** than zstd 1
-(6.4 vs 1.8 GB/s) and **1.3x faster** than LZ4 (6.4 vs 5.1 GB/s).
-SLZ L5 matches LZ4 HC 12's ratio (41.9%) while decoding **faster**
-(5.3 vs 4.8 GB/s) and compressing **faster** (72 vs 25 MB/s).
-At the best-ratio tier: SLZ L11 achieves 25.5% vs zstd 19's 26.9%.
+### Compression ratio
 
-### vs zstd and LZ4 (single-threaded, silesia 203 MB)
+| Level | enwik8 | silesia |
+|-------|-------:|--------:|
+| L1 | 58.6% | 47.8% |
+| L2 | 58.6% | 47.8% |
+| L3 | 43.7% | 38.0% |
+| L4 | 42.7% | 37.5% |
+| L5 | 39.6% | 33.9% |
 
-| Compressor | Ratio | Compress | Decompress |
-|-----------|-------|----------|------------|
-| LZ4       | 47.5% |     915 MB/s |  5,282 MB/s |
-| LZ4 HC 9  | 36.6% |    55.6 MB/s |  5,440 MB/s |
-| zstd 1    | 34.7% |     555 MB/s |  2,101 MB/s |
-| zstd 3    | 31.4% |     399 MB/s |  1,874 MB/s |
-| zstd 9    | 27.9% |     103 MB/s |  2,024 MB/s |
-| zstd 19   | 24.8% |     4.4 MB/s |  1,847 MB/s |
-| **SLZ L1**  | 44.8% |     488 MB/s |  **6,853 MB/s** |
-| **SLZ L3**  | 43.2% |     328 MB/s |  **5,649 MB/s** |
-| **SLZ L5**  | 35.8% |    95.1 MB/s |  **5,916 MB/s** |
-| **SLZ L6**  | 25.0% |     4.6 MB/s |  1,316 MB/s |
-| **SLZ L8**  | 24.2% |     1.2 MB/s |  1,377 MB/s |
-| **SLZ L9**  | 25.0% |     4.7 MB/s |  1,288 MB/s |
-| **SLZ L11** | 24.2% |     0.3 MB/s |  1,326 MB/s |
+L1-L2 are LZ-only (no entropy stage). L3-L5 add 32-stream GPU Huffman.
 
-### All levels (24 cores, enwik8 100 MB)
+### vs nvCOMP (enwik8 100 MB, RTX 4060 Ti)
 
-Full-speed numbers with all 24 cores. `streamlz -ba -r 100`.
+| Window | StreamLZ L1 | nvCOMP LZ4 | StreamLZ win |
+|--------|------------:|-----------:|-------------:|
+| Pipeline kernel-sum | 4.03 ms | 4.77 ms | 1.18× |
+| Async call wall     | 4.61 ms | 4.77 ms | 1.03× |
+| End-to-end host wall | 15.51 ms | 18.29 ms | 1.18× |
 
-| Level | Compressed | Ratio | Compress | Decompress |
-|-------|------------|-------|----------|------------|
-| L1  | 53,741,965 | 53.7% | 2,706 MB/s | 41,949 MB/s |
-| L2  | 53,045,282 | 53.0% | 2,722 MB/s | 41,756 MB/s |
-| L3  | 51,702,960 | 51.7% | 1,741 MB/s | 37,987 MB/s |
-| L4  | 48,963,945 | 49.0% | 1,074 MB/s | 40,748 MB/s |
-| L5  | 41,929,522 | 41.9% |   805 MB/s | 44,934 MB/s |
-| L6  | 29,137,356 | 29.1% |    42 MB/s | 13,321 MB/s |
-| L7  | 29,031,250 | 29.0% |    30 MB/s | 13,420 MB/s |
-| L8  | 28,639,482 | 28.6% |    17 MB/s | 13,459 MB/s |
-| L9  | 27,430,880 | 27.4% |   7.6 MB/s |  3,726 MB/s |
-| L10 | 27,280,109 | 27.3% |   7.3 MB/s |  3,753 MB/s |
-| L11 | 25,550,450 | 25.6% |   1.5 MB/s |  3,308 MB/s |
+| Window | StreamLZ L5 | nvCOMP Zstd | StreamLZ win |
+|--------|------------:|------------:|-------------:|
+| Pipeline kernel-sum | 5.50 ms | 6.25 ms | 1.14× |
+| Async call wall     | 5.94 ms | 6.25 ms | 1.05× |
+| End-to-end host wall | 15.27 ms | 18.16 ms | 1.19× |
 
-L1-L5 compress is parallel (SC, per-chunk/per-group workers);
-L6-L11 compress parallel (High codec). All decompress is parallel:
-L1-L5 SC group-parallel (adaptive group size), L6-L8 SC group-parallel
-(adaptive group size), L9-L11 two-phase parallel.
-
-### All levels (24 cores, silesia 203 MB)
-
-| Level | Compressed | Ratio | Compress | Decompress |
-|-------|------------|-------|----------|------------|
-| L1  |  97,488,921 | 45.8% | 3,665 MB/s | 36,253 MB/s |
-| L3  |  91,834,394 | 43.2% | 2,128 MB/s | 33,191 MB/s |
-| L5  |  76,285,339 | 35.8% |   897 MB/s | 35,688 MB/s |
-| L6  |  53,934,154 | 25.3% |    42 MB/s | 13,508 MB/s |
-| L8  |  52,746,282 | 24.8% |    13 MB/s | 14,832 MB/s |
-| L9  |  53,090,767 | 24.9% |    11 MB/s |  3,253 MB/s |
-| L11 |  51,541,859 | 24.2% |   3.5 MB/s |  3,954 MB/s |
-
-### Apple M4 Pro — vs zstd and LZ4 (single-threaded, enwik8 100 MB)
-
-Mac Mini, Apple M4 Pro (14 cores), 64 GB RAM, macOS, Zig 0.16 / LLVM 21.
-Best of 30 runs.
-
-| Compressor | Ratio | Compress | Decompress |
-|-----------|-------|----------|------------|
-| LZ4       | 57.3% |     714 MB/s |   5,384 MB/s |
-| LZ4 HC 9  | 42.2% |    48.9 MB/s |   4,810 MB/s |
-| LZ4 HC 12 | 41.9% |    25.0 MB/s |   4,696 MB/s |
-| zstd 1    | 40.7% |     593 MB/s |   1,933 MB/s |
-| zstd 3    | 35.4% |     322 MB/s |   1,755 MB/s |
-| zstd 9    | 31.1% |    83.5 MB/s |   1,942 MB/s |
-| zstd 19   | 26.9% |     3.2 MB/s |   2,000 MB/s |
-| **SLZ L1**  | 53.7% |     321 MB/s | **10,002 MB/s** |
-| **SLZ L3**  | 51.7% |     256 MB/s |  **6,943 MB/s** |
-| **SLZ L5**  | 41.9% |    80.4 MB/s |  **7,741 MB/s** |
-| **SLZ L6**  | 27.4% |     4.0 MB/s |   1,321 MB/s |
-| **SLZ L8**  | 25.5% |     1.2 MB/s |   1,317 MB/s |
-| **SLZ L9**  | 27.4% |     4.1 MB/s |   1,318 MB/s |
-| **SLZ L11** | 25.5% |     0.3 MB/s |   1,319 MB/s |
-
-SLZ L1 decompresses at **10.0 GB/s** — 1.9x faster than LZ4 and
-5.2x faster than zstd 1. SLZ L5 matches LZ4 HC 12's ratio while
-decoding **1.6x faster** (7.7 vs 4.7 GB/s).
-
-### Apple M4 Pro — All levels (14 cores, enwik8 100 MB)
-
-`streamlz -ba -r 100`.
-
-| Level | Compressed | Ratio | Compress | Decompress |
-|-------|------------|-------|----------|------------|
-| L1  | 53,741,965 | 53.7% | 3,052 MB/s | 76,197 MB/s |
-| L2  | 53,045,282 | 53.0% | 2,358 MB/s | 73,463 MB/s |
-| L3  | 51,702,960 | 51.7% | 1,961 MB/s | 56,371 MB/s |
-| L4  | 48,963,945 | 49.0% | 1,556 MB/s | 58,353 MB/s |
-| L5  | 41,929,522 | 41.9% |   563 MB/s | 53,970 MB/s |
-| L6  | 29,137,356 | 29.1% |  32.0 MB/s |  8,992 MB/s |
-| L7  | 29,031,250 | 29.0% |  23.8 MB/s |  9,016 MB/s |
-| L8  | 28,639,482 | 28.6% |  13.9 MB/s |  9,190 MB/s |
-| L9  | 27,430,880 | 27.4% |   8.4 MB/s |  3,788 MB/s |
-| L10 | 27,280,109 | 27.3% |   8.0 MB/s |  3,827 MB/s |
-| L11 | 25,550,450 | 25.6% |   1.8 MB/s |  3,609 MB/s |
-
-L1 parallel decompress hits **76 GB/s** — 1.4x faster than LZ4 MT
-(54 GB/s) and 3.7x faster than zstd 1 MT (20 GB/s). The decoder
-scales with memory bandwidth; the M4 Pro's ~60 GB/s DRAM bandwidth
-is fully saturated.
-
----
-
-## Dictionary support
-
-7 built-in dictionaries (32 KB each, compiled into the binary): JSON,
-HTML, CSS, JS, XML, plain text, and a general-purpose dictionary.
-
-Dictionaries are auto-detected by file extension (`.json` → JSON,
-`.html` → HTML, `.txt` → text, etc.). Unknown extensions fall back to
-the general dictionary. Override with `-D name` or disable with
-`--no-dict`.
-
-Custom dictionaries can be trained from a corpus:
-
-```
-streamlz --train -o my_dict.bin path/to/corpus/
-```
-
-The trainer uses the FASTCOVER algorithm (based on zstd's dictionary
-builder).
-
----
-
-## What's missing (v2.1)
-
-- **Streaming compress wrapper** (`StreamLzFrameCompressor` equivalent)
-- **SlzStream** reader-writer pair
-- **Level enum** (currently takes an integer)
-
-These are API surface gaps; all compression/decompression functionality
-is complete.
+See [docs/GPU_README.md](docs/GPU_README.md) "vs nvCOMP" for the
+methodology behind each measurement window — the pipeline / async /
+end-to-end columns answer different questions and confusing them is
+easy.
 
 ---
 
 ## Project layout
 
 ```
-build.zig              build script
-src/                   all Zig source
-scripts/               fixture generation + fuzz harness
-CODEWIKI.md            source tree map, invariants, glossary
-BENCHMARKS.md          historical benchmark numbers
-CHANGELOG.md           release history
+build.zig              Zig 0.16 build script (always builds GPU)
+include/streamlz_gpu.h C ABI public header
+src/                   All Zig + CUDA source. See CodeWiki.md for the
+                       full per-file map.
+  common/              CUDA headers #include'd by every kernel
+  format/, io/, platform/  Host-side helpers shared by encode + decode
+  encode/              GPU encode driver + kernels + entropy helpers
+  decode/              GPU decode driver + kernels
+docs/                  GPU_ARCHITECTURE.md, GPU_README.md, GPU_IDEAS.md
+tools/                 Build scripts + bench harnesses
+CodeWiki.md            Source tree map + invariants
 FORMAT.md              SLZ1 wire format specification
-FAILED_EXPERIMENTS.md  optimization dead-ends (valuable context)
-SECURITY.md            security policy + fuzz testing
+CHANGELOG.md           Release history
+FAILED_EXPERIMENTS.md  Rejected experiments + war stories
+SECURITY.md            Security policy + threat model
 ```
 
-For the full source tree map, key invariants, and glossary, see
-[CODEWIKI.md](CODEWIKI.md).
+For the source tree map, kernel pipeline, level table, and the six
+"do not break" invariants, see [CodeWiki.md](CodeWiki.md).
+
+For the algorithmic notes (warp mapping, BIL Huffman wire format,
+LUT-build kernel, parallel-parse hot loop), see
+[docs/GPU_ARCHITECTURE.md](docs/GPU_ARCHITECTURE.md).
 
 ---
 
 ## License
 
-MIT — same as the upstream StreamLZ project.
+MIT.

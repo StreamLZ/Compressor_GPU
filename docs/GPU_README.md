@@ -5,8 +5,16 @@ CUDA kernels (NVIDIA Driver API, target `sm_89`) plus thin Zig drivers that
 load them. Entropy coding is canonical Huffman (`chunk_type=4`); GPU frames
 contain only raw and Huffman sub-chunks.
 
-This folder is **standalone**. Nothing under `src/gpu/` imports anything
-outside `src/gpu/`.
+> **Layout note (3.0):** this document was written when the GPU
+> sources lived under `src/gpu/{common,encode,decode}/`. The strip
+> flattened them up to `src/{common,encode,decode}/`. Path
+> references below have not been edited individually — mentally
+> drop the `gpu/` segment from each.
+
+This module was previously **standalone** (nothing imported anything
+outside `src/gpu/`). With the CPU codec removed, that constraint no
+longer applies and the boundary has been dissolved into the regular
+`src/` tree.
 
 ## Layout
 
