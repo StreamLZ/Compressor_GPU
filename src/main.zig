@@ -20,7 +20,7 @@ test {
     _ = @import("encode/entropy/tans_encoder.zig");
     _ = @import("encode/entropy/entropy_encoder.zig");
     _ = @import("encode/fast/fast_match_hasher.zig");
-    _ = @import("platform/cache_detect.zig");
+    _ = @import("mmap.zig");
     _ = @import("encode/streamlz_encoder.zig");
     _ = @import("encode/fast_framed.zig");
     _ = @import("encode/gpu_stream_assembly.zig");

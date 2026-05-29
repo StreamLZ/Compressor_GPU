@@ -27,8 +27,7 @@ const encoder = @import("encode/streamlz_encoder.zig");
 const decoder = @import("decode/streamlz_decoder.zig");
 const gpu_encoder = @import("encode/driver.zig");
 const gpu_driver = @import("decode/driver.zig");
-const mmap_helpers = @import("platform/mmap.zig");
-const cache_detect = @import("platform/cache_detect.zig");
+const mmap_helpers = @import("mmap.zig");
 
 const version_string = "3.0.0";
 
@@ -712,7 +711,6 @@ fn runBenchAll(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
     defer allocator.free(src);
 
     const mb: f64 = @as(f64, @floatFromInt(src.len)) / (1024.0 * 1024.0);
-    cache_detect.printSystemInfo(w, io);
     try w.print("streamlz bench-all: {s} ({d} bytes, {d} threads, {d} decompress runs)\n", .{
         in_path, src.len, num_threads, runs,
     });
