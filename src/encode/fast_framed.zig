@@ -1187,9 +1187,8 @@ pub fn compressFramedOne(
             break :gpu_compress;
 
         // lit/tok/off16 are Huffman-coded on the GPU (chunk_type=4).
-        // GPU tANS encode was retired 2026-05-21; all entropy coding
-        // for GPU paths runs through the Huffman pipeline below.
-        const slz_gpu_huff = true;
+        // GPU tANS encode was retired 2026-05-21; all GPU entropy coding
+        // runs through the Huffman pipeline below.
 
         // 4d device-resident compress: when SLZ_GPU_ASSEMBLE is set the
         // three GPU Huffman passes keep their bodies device-resident
@@ -1199,7 +1198,7 @@ pub fn compressFramedOne(
         // (slzCompress C-ABI), force the device-resident path on so the
         // frame-assemble kernel can consume the assembled blocks.
         const want_gpu_assemble: bool =
-            opts.level >= 3 and slz_gpu_huff and
+            opts.level >= 3 and
             (std.c.getenv("SLZ_GPU_ASSEMBLE") != null or enc_ctx.d_output_override != 0);
         enc_ctx.huff_keep_device = want_gpu_assemble;
 
@@ -1207,7 +1206,7 @@ pub fn compressFramedOne(
         // The pure-Huffman pipeline: every entropy stream is Huffman-
         // coded on the GPU (chunk_type=4). Replaces the GPU tANS passes.
         const gpu_lit_huff_encoded: bool =
-            if (opts.level >= 3 and slz_gpu_huff)
+            if (opts.level >= 3)
                 gpu_enc.gpuEncodeLiteralsHuffImpl(enc_ctx, allocator, gpu_out, descs, comp_sizes)
             else
                 false;
@@ -1220,7 +1219,7 @@ pub fn compressFramedOne(
             enc_ctx.huff_lit_offsets = null;
         };
         const gpu_tok_huff_encoded: bool =
-            if (opts.level >= 3 and slz_gpu_huff)
+            if (opts.level >= 3)
                 gpu_enc.gpuEncodeTokensHuffImpl(enc_ctx, allocator, gpu_out, descs, comp_sizes)
             else
                 false;
@@ -1233,7 +1232,7 @@ pub fn compressFramedOne(
             enc_ctx.huff_tok_offsets = null;
         };
         const gpu_off16_huff_encoded: bool =
-            if (opts.level >= 3 and slz_gpu_huff)
+            if (opts.level >= 3)
                 gpu_enc.gpuEncodeOff16HuffImpl(enc_ctx, allocator, gpu_out, descs, comp_sizes)
             else
                 false;
