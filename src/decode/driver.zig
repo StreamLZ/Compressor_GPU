@@ -1,11 +1,10 @@
 //! GPU decode driver - thin facade.
 //!
-//! The decode driver was split into focused sub-modules during the GPU
-//! cleanup pass (roadmap item 5). External callers continue to import
-//! `gpu/decode/driver.zig` and reach every public symbol unchanged; this
-//! file owns the singleton `g_default` and the three `last_*_kernel_ns`
-//! telemetry `pub var`s (storage must live in the facade - Zig cannot
-//! re-export a `pub var` from another module through `pub const`).
+//! External callers import `decode/driver.zig` and reach every public
+//! symbol unchanged; this file owns the singleton `g_default` and the
+//! three `last_*_kernel_ns` telemetry `pub var`s (storage must live in
+//! the facade - Zig cannot re-export a `pub var` from another module
+//! through `pub const`).
 //!
 //! Sub-module layout:
 //!   cuda_api.zig         - nvcuda.dll handle, CU* typedefs, cu*_fn slots,

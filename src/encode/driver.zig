@@ -1,10 +1,9 @@
 //! GPU encode driver - thin facade.
 //!
-//! The encode driver was split into focused sub-modules during the GPU
-//! cleanup pass (roadmap item 5). External callers continue to import
-//! `gpu/encode/driver.zig` and reach every public symbol unchanged; this
-//! file owns the two `pub var` singletons (`g_default`, `last_kernel_ns`)
-//! plus re-exports the per-handle `*Impl` functions from the sub-modules.
+//! External callers import `encode/driver.zig` and reach every public
+//! symbol unchanged; this file owns the two `pub var` singletons
+//! (`g_default`, `last_kernel_ns`) and re-exports the per-handle `*Impl`
+//! functions from the sub-modules.
 //!
 //! Sub-module layout:
 //!   cuda_ffi.zig         - nvcuda.dll handle, CU* typedefs, FnXxx + cu*_fn slots, getProc
@@ -14,7 +13,7 @@
 //!   levels.zig           - hashBitsForLevel / useChainParser
 //!   encode_lz.zig        - gpuCompressImpl (LZ launcher)
 //!   encode_huff.zig      - gpuEncodeHuffImpl + per-stream {Literals,Tokens,Off16} Impls
-//!   encode_assemble.zig  - gpuAssembleFrameImpl, gpuFrameAssembleImpl (4d device-resident)
+//!   encode_assemble.zig  - gpuAssembleFrameImpl, gpuFrameAssembleImpl
 
 const std = @import("std");
 const module_loader = @import("module_loader.zig");
