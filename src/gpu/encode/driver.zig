@@ -29,8 +29,6 @@ pub const isAvailable = module_loader.isAvailable;
 
 // ── Shared types ──────────────────────────────────────────────
 pub const CompressChunkDesc = ec.CompressChunkDesc;
-pub const AssembleDesc = ec.AssembleDesc;
-pub const HuffEncDesc = ec.HuffEncDesc;
 pub const EncodeContext = ec.EncodeContext;
 
 pub const copyDeviceToHost = ec.copyDeviceToHost;
@@ -38,7 +36,6 @@ pub const copyDeviceToHost = ec.copyDeviceToHost;
 // Wire-format byte sizes re-exported for the CPU-side framer in
 // src/encode/fast_framed.zig (which orchestrates GPU encode + frame
 // assembly). See encode_context.zig for the underlying definitions.
-pub const INITIAL_LITERAL_COPY_BYTES = ec.INITIAL_LITERAL_COPY_BYTES;
 pub const SC_TAIL_PER_CHUNK_BYTES = ec.SC_TAIL_PER_CHUNK_BYTES;
 pub const CHUNK_INTERNAL_HDR_BYTES = ec.CHUNK_INTERNAL_HDR_BYTES;
 
@@ -63,7 +60,6 @@ pub var last_kernel_ns: i64 = 0;
 // Every caller threads its own `*EncodeContext`; the `g_default` singleton
 // above remains the conventional handle used by the CLI / C ABI today.
 pub const gpuCompressImpl = encode_lz.gpuCompressImpl;
-pub const gpuEncodeHuffImpl = encode_huff.gpuEncodeHuffImpl;
 pub const gpuEncodeLiteralsHuffImpl = encode_huff.gpuEncodeLiteralsHuffImpl;
 pub const gpuEncodeTokensHuffImpl = encode_huff.gpuEncodeTokensHuffImpl;
 pub const gpuEncodeOff16HuffImpl = encode_huff.gpuEncodeOff16HuffImpl;
