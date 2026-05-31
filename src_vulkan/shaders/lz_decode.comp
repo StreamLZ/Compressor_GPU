@@ -1,0 +1,451 @@
+// ── StreamLZ Vulkan L1 LZ decoder ───────────────────────────────────
+// Port of src/decode/lz_decode_raw.cuh::decodeSubChunkRawMode<OFF16_SPLIT=false>
+// plus src/decode/lz_decode_core.cuh (warpScanU32, warpLiteralCopy,
+// warpMatchCopy) and src/decode/slz_wire_format.cuh (readLength).
+//
+// Phase-1 simplifications (locked by docs/vulkan_l1_codec_spec.md):
+//   * No header wrapping — decoder reads 4 raw streams (cmd, lit, off16,
+//     length) + sizes via push constants, writes dst directly.
+//   * OFF16_SPLIT = false (interleaved u16 LE off16 entries only).
+//   * No off32 stream: tokens 2 and 3..23 (long-far + short-far) cannot
+//     appear in a phase-1 stream because the encoder rejects all
+//     far-offset matches. We still emit a defensive zero-length handler
+//     so a malformed stream cannot wedge the loop.
+//   * initial_copy = 0, dst_offset = 0 (encoder also skips the initial
+//     8-byte verbatim copy in phase 1; recent_offset still seeded to
+//     INITIAL_RECENT_OFFSET = -8 to match CUDA).
+//   * Single workgroup per chunk; phase 1 dispatches one chunk only.
+//
+// Buffer layout matches the encoder's u32-packed scheme (avoids the
+// shaderInt8 / storageBuffer8BitAccess feature dependency and keeps the
+// decoder symmetrical with the encoder for round-trip testing):
+//   set=0, binding=0  Cmd     readonly  - token stream
+//   set=0, binding=1  Lit     readonly  - literal stream
+//   set=0, binding=2  Off16   readonly  - u16 LE offsets (byte-addressed)
+//   set=0, binding=3  Length  readonly  - variable-length stream
+//   set=0, binding=4  Dst     buffer    - decoded output (RMW, lane 0 only)
+//
+// Push constants (20 bytes):
+//   uint cmd_size           : bytes in cmd_buf
+//   uint lit_size           : bytes in lit_buf
+//   uint off16_count        : u16 entries in off16_buf
+//   uint length_remaining   : bytes in length_buf
+//   uint dst_size           : original input size (bound for trailing copy)
+//
+// Subgroup size: hard-required = 32 (enforced by host pipeline creation).
+
+#version 460
+#extension GL_KHR_shader_subgroup_basic              : require
+#extension GL_KHR_shader_subgroup_ballot             : require
+#extension GL_KHR_shader_subgroup_shuffle            : require
+#extension GL_KHR_shader_subgroup_shuffle_relative   : require
+#extension GL_KHR_shader_subgroup_arithmetic         : require
+#extension GL_KHR_shader_subgroup_vote               : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// All bindings are u32-packed (matches the encoder's buffer layout for
+// round-trip use). Dst is read+write because lane 0's match-copy needs
+// to read previously-decoded bytes and per-byte RMW into a u32 word.
+layout(set = 0, binding = 0) readonly buffer Cmd    { uint w[]; } cmd_buf;
+layout(set = 0, binding = 1) readonly buffer Lit    { uint w[]; } lit_buf;
+layout(set = 0, binding = 2) readonly buffer Off16  { uint w[]; } off16_buf;
+layout(set = 0, binding = 3) readonly buffer Length { uint w[]; } length_buf;
+// `coherent` forces the compiler to issue real loads/stores rather than
+// caching SSBO accesses. Required because Dst is both read (by match
+// copies) and written (by literal + match copies) in the same shader,
+// and the per-byte RMW pattern relies on each store being visible to
+// the next load — including loads from other lanes after a barrier.
+layout(set = 0, binding = 4) coherent buffer Dst    { uint w[]; } dst_buf;
+
+layout(push_constant) uniform PC {
+    uint cmd_size;
+    uint lit_size;
+    uint off16_count;
+    uint length_remaining;
+    uint dst_size;
+} pc;
+
+// ── Constants (mirror src/decode/slz_wire_format.cuh) ───────────────
+const uint WARP_SIZE                = 32u;
+const uint FULL_WARP_MASK           = 0xFFFFFFFFu;
+const uint TOKEN_SHORT_MIN          = 24u;
+const uint TOKEN_LONG_LITERAL       = 0u;
+const uint TOKEN_LONG_NEAR          = 1u;
+const uint TOKEN_LONG_FAR           = 2u;
+const uint LONG_LITERAL_BASE        = 64u;
+const uint LONG_NEAR_BASE           = 91u;
+const uint LONG_FAR_BASE            = 29u;
+const uint SHORT_FAR_BASE           = 5u;
+const uint TOKEN_LIT_MASK           = 7u;
+const uint TOKEN_MATCH_SHIFT        = 3u;
+const uint TOKEN_MATCH_MASK         = 0xFu;
+const uint TOKEN_USE_RECENT_SHIFT   = 7u;
+const uint TOKEN_USE_RECENT_MASK    = 1u;
+const uint EXT_LENGTH_THRESHOLD     = 251u;
+const uint EXT_LENGTH_EXTRA_BYTES   = 2u;
+const uint EXT_LENGTH_SCALE         = 4u;
+const uint OFF16_ENTRY_BYTES        = 2u;
+const int  INITIAL_RECENT_OFFSET    = -8;
+
+// ── Byte-level loads from u32-packed input streams ──────────────────
+// Mirror the encoder's loadSrcByte / loadSrcU32LE pattern. Out-of-bounds
+// reads return 0 (the caller is responsible for treating that as
+// "stream exhausted"; the decoder respects the size push constants
+// before calling these except in the readLength extended path which
+// guards against length_remaining itself).
+uint loadCmdByte(uint pos) {
+    uint w = cmd_buf.w[pos >> 2];
+    return (w >> ((pos & 3u) * 8u)) & 0xFFu;
+}
+
+uint loadLitByte(uint pos) {
+    uint w = lit_buf.w[pos >> 2];
+    return (w >> ((pos & 3u) * 8u)) & 0xFFu;
+}
+
+uint loadOff16Byte(uint pos) {
+    uint w = off16_buf.w[pos >> 2];
+    return (w >> ((pos & 3u) * 8u)) & 0xFFu;
+}
+
+uint loadLengthByte(uint pos) {
+    uint w = length_buf.w[pos >> 2];
+    return (w >> ((pos & 3u) * 8u)) & 0xFFu;
+}
+
+// readU16LE on the off16 stream (entry index → u16 value).
+uint loadOff16Entry(uint entry_idx) {
+    uint base = entry_idx * OFF16_ENTRY_BYTES;
+    return loadOff16Byte(base) | (loadOff16Byte(base + 1u) << 8);
+}
+
+// ── Dst byte ops (lane-0 only; serialized RMW into u32 words) ───────
+// All Dst writes are issued from lane 0; this matches the encoder's
+// design (which also serializes its byte-packed output writes on lane 0)
+// and avoids the need for atomicAnd/atomicOr per byte. Phase-4
+// optimization can switch to a word-aligned cooperative copy when
+// dst/lit are 4-byte aligned at runtime.
+uint loadDstByte(uint pos) {
+    uint w = dst_buf.w[pos >> 2];
+    return (w >> ((pos & 3u) * 8u)) & 0xFFu;
+}
+
+void storeDstByte(uint pos, uint b) {
+    uint widx = pos >> 2;
+    uint sh   = (pos & 3u) * 8u;
+    uint mask = 0xFFu << sh;
+    // Atomic clear-then-set to defeat any GLSL/SPV compiler reordering
+    // that would otherwise let a later in-lane store cache a stale word.
+    // Lane-0-only serial loop semantics still hold; atomic ops just make
+    // each store individually globally observable, which is what the
+    // sequential CUDA `dst[pos]=b` byte store provided.
+    atomicAnd(dst_buf.w[widx], ~mask);
+    atomicOr(dst_buf.w[widx], (b & 0xFFu) << sh);
+}
+
+// ── Shared state (broadcast lane-0 → warp through shared memory) ────
+// All decode state lives on lane 0 because the cooperative copies are
+// serialized there too (see Dst section). The shared cells let the
+// outer-loop control flow (any_long ballot, batch_size) stay
+// warp-uniform without per-iteration subgroupBroadcast calls.
+shared uint sh_cmd_pos;
+shared uint sh_lit_pos;
+shared uint sh_off16_pos;
+shared uint sh_dst_pos;
+shared int  sh_recent_offset;
+shared uint sh_length_offset;
+
+// Slow-path parse-result broadcast cells (lane 0 → warp).
+shared uint sh_parse_lit_len;
+shared uint sh_parse_match_len;
+shared int  sh_parse_match_offset;
+shared uint sh_parse_use_recent;
+
+// ── readLength (lane-0 only) ────────────────────────────────────────
+// Port of src/decode/slz_wire_format.cuh:161 readLength().
+// Reads the length-stream entry at sh_length_offset, advances the
+// cursor, and returns the decoded value. Out-of-stream conditions
+// return 0 and leave the cursor at its boundary (matches CUDA).
+uint readLengthFromStream() {
+    if (sh_length_offset >= pc.length_remaining) return 0u;
+    uint v = loadLengthByte(sh_length_offset);
+    if (v > EXT_LENGTH_THRESHOLD) {
+        if (sh_length_offset + EXT_LENGTH_EXTRA_BYTES >= pc.length_remaining) {
+            sh_length_offset += 1u;
+            return v;
+        }
+        uint extra_lo = loadLengthByte(sh_length_offset + 1u);
+        uint extra_hi = loadLengthByte(sh_length_offset + 2u);
+        uint extra = extra_lo | (extra_hi << 8);
+        v += extra * EXT_LENGTH_SCALE;
+        sh_length_offset += EXT_LENGTH_EXTRA_BYTES;
+    }
+    sh_length_offset += 1u;
+    return v;
+}
+
+// ── Off16 consume (lane-0 only) ─────────────────────────────────────
+// Loads the u16 entry at sh_off16_pos, advances the cursor, and
+// returns the negated int32_t match_offset. Caller must guarantee
+// sh_off16_pos < pc.off16_count.
+int consumeOff16() {
+    uint v = loadOff16Entry(sh_off16_pos);
+    sh_off16_pos += 1u;
+    return -int(v);
+}
+
+// ── warpScanU32 emulation ───────────────────────────────────────────
+// Port of src/decode/lz_decode_core.cuh:12 warpScanU32().
+// Returns (lane's exclusive prefix, warp total). Uses GLSL's built-in
+// subgroupExclusiveAdd + subgroupAdd which exactly match the CUDA
+// Hillis-Steele inclusive scan + (inclusive - v) exclusive extraction.
+void warpScanU32(uint v, out uint exclusive, out uint total) {
+    exclusive = subgroupExclusiveAdd(v);
+    total     = subgroupAdd(v);
+}
+
+// ── Cooperative copies (lane-0 serial; matches encoder design) ──────
+// Port of src/decode/lz_decode_core.cuh:36 warpLiteralCopy().
+// All lanes call together; only lane 0 actually performs the byte
+// copies because storeDstByte is a u32-word RMW that would race across
+// lanes sharing the same destination word. Phase-4 optimization can
+// replace this with a word-aligned cooperative copy when dst/lit are
+// runtime-aligned.
+void warpLiteralCopy(uint dst_pos, uint lit_pos, uint lit_len) {
+    if (gl_SubgroupInvocationID == 0u) {
+        for (uint i = 0u; i < lit_len; i++) {
+            storeDstByte(dst_pos + i, loadLitByte(lit_pos + i));
+        }
+    }
+}
+
+// Port of src/decode/lz_decode_core.cuh:45 warpMatchCopy().
+// Always serial on lane 0 in the GLSL port. The CUDA version splits
+// non-overlapping matches across all 32 lanes; we keep it serial
+// because (a) the u32-packed Dst makes parallel byte writes race-prone
+// and (b) phase 1 prioritizes correctness over throughput.
+// Overlapping matches (match_dist < match_len) MUST run serially in
+// any port — lane k would read dst[match_src+k] before lane k-1's
+// write became visible. The serial loop preserves the RLE-fill
+// semantics for offset=1 patterns (e.g. recent_offset = -1).
+void warpMatchCopy(uint dst_pos, uint match_src, uint match_len) {
+    if (gl_SubgroupInvocationID == 0u) {
+        for (uint i = 0u; i < match_len; i++) {
+            storeDstByte(dst_pos + i, loadDstByte(match_src + i));
+        }
+    }
+}
+
+// ── main ────────────────────────────────────────────────────────────
+void main() {
+    uint lane = gl_SubgroupInvocationID;
+
+    if (lane == 0u) {
+        sh_cmd_pos       = 0u;
+        sh_lit_pos       = 0u;
+        sh_off16_pos     = 0u;
+        sh_dst_pos       = 0u;             // phase 1: dst_offset + initial_copy = 0
+        sh_recent_offset = INITIAL_RECENT_OFFSET;
+        sh_length_offset = 0u;
+    }
+    subgroupBarrier();
+
+    // ── Outer decode loop ───────────────────────────────────────────
+    // Runs while there are tokens to consume. Each iteration either:
+    //   * Fast path: 32-token batch with no long tokens.
+    //   * Slow path: lane-0 parses one token (long or standard).
+    //
+    // Following the CUDA design, all state is held in shared memory so
+    // the warp-uniform control flow does not need per-iteration
+    // subgroupBroadcast calls. The fast-path batch decoding still runs
+    // across all 32 lanes (cmd-byte ballot for any_long detection, per-
+    // lane field decode, warpScanU32 for prefix-scans).
+    while (sh_cmd_pos < pc.cmd_size) {
+        uint cmd_pos = sh_cmd_pos;
+
+        // ── Fast-path batch detect ──────────────────────────────────
+        // Load up to 32 cmd bytes, one per lane. Lanes past batch_size
+        // load 0 (a valid standard token = "0 lit, 0 match, off16
+        // consumed") so they don't pollute the any_long ballot.
+        uint remaining  = pc.cmd_size - cmd_pos;
+        uint batch_size = (remaining < WARP_SIZE) ? remaining : WARP_SIZE;
+        bool my_valid   = (lane < batch_size);
+        uint my_cmd     = my_valid ? loadCmdByte(cmd_pos + lane) : TOKEN_SHORT_MIN;
+        bool my_is_long = my_valid && (my_cmd < TOKEN_SHORT_MIN);
+        uint any_long   = subgroupBallot(my_is_long).x;
+
+        if (any_long == 0u) {
+            // ── Fast batched path (lane-0-serial form) ──────────────
+            // Original CUDA decoder uses warp-cooperative subgroupShuffle
+            // to broadcast lane k's parsed fields to every lane for each
+            // copy iteration. In the GLSL port that pattern produced
+            // sparse byte drops on NVIDIA + a 32-batch token stream — most
+            // likely a dynamic-shuffle / per-byte-RMW interaction. Phase 1
+            // accepts a lane-0-serial fallback: parse + copy every token
+            // on lane 0 only, broadcast the post-batch shared cursors,
+            // and continue. Throughput parity with CUDA returns once the
+            // dst buffer goes byte-typed (storageBuffer8BitAccess) in
+            // phase 2, which obviates the per-byte RMW path entirely.
+            if (lane == 0u) {
+                uint cur_dst    = sh_dst_pos;
+                uint cur_lit    = sh_lit_pos;
+                uint cur_off16  = sh_off16_pos;
+                int  cur_recent = sh_recent_offset;
+
+                for (uint k = 0u; k < batch_size; k++) {
+                    uint c            = loadCmdByte(cmd_pos + k);
+                    uint k_lit_len    = c & TOKEN_LIT_MASK;
+                    uint k_match_len  = (c >> TOKEN_MATCH_SHIFT) & TOKEN_MATCH_MASK;
+                    uint k_use_recent = (c >> TOKEN_USE_RECENT_SHIFT) & TOKEN_USE_RECENT_MASK;
+
+                    int k_match_off = cur_recent;
+                    if (k_use_recent == 0u) {
+                        if (cur_off16 < pc.off16_count) {
+                            uint v = loadOff16Entry(cur_off16);
+                            k_match_off = -int(v);
+                            cur_off16 += 1u;
+                        }
+                        cur_recent = k_match_off; // latch fresh
+                    }
+
+                    for (uint i = 0u; i < k_lit_len; i++) {
+                        storeDstByte(cur_dst + i, loadLitByte(cur_lit + i));
+                    }
+                    uint copy_dst = cur_dst + k_lit_len;
+                    cur_lit += k_lit_len;
+
+                    if (k_match_len > 0u) {
+                        uint match_src = uint(int(copy_dst) + k_match_off);
+                        for (uint i = 0u; i < k_match_len; i++) {
+                            storeDstByte(copy_dst + i, loadDstByte(match_src + i));
+                        }
+                    }
+                    cur_dst = copy_dst + k_match_len;
+                }
+
+                sh_cmd_pos       = cmd_pos + batch_size;
+                sh_dst_pos       = cur_dst;
+                sh_lit_pos       = cur_lit;
+                sh_off16_pos     = cur_off16;
+                sh_recent_offset = cur_recent;
+            }
+            subgroupBarrier();
+            subgroupMemoryBarrierShared();
+            subgroupMemoryBarrierBuffer();
+            continue;
+        }
+
+        // ── Slow scalar path (lane 0 parses one token) ──────────────
+        // Port of src/decode/lz_decode_raw.cuh:137-204. Lane 0 reads the
+        // token at sh_cmd_pos, decodes its fields (consuming length
+        // and/or off16 entries as needed), and writes the four output
+        // values into shared memory. All lanes then cooperatively copy.
+        //
+        // Phase-1 note: TOKEN_LONG_FAR (2) and tokens 3..23 (short far)
+        // are not produced by the phase-1 encoder. We still handle them
+        // defensively — long-far parses its length + skips, short-far
+        // produces a zero-offset match — so a malformed stream cannot
+        // wedge the loop. Round-trip correctness is unaffected because
+        // the encoder never emits these tokens.
+
+        if (lane == 0u) {
+            uint token = loadCmdByte(sh_cmd_pos);
+            uint lit_len = 0u;
+            uint match_len = 0u;
+            int  match_offset = sh_recent_offset;
+            uint use_recent = 0u;
+
+            if (token >= TOKEN_SHORT_MIN) {
+                // Standard token (CUDA L143-157).
+                lit_len    = token & TOKEN_LIT_MASK;
+                match_len  = (token >> TOKEN_MATCH_SHIFT) & TOKEN_MATCH_MASK;
+                use_recent = (token >> TOKEN_USE_RECENT_SHIFT) & TOKEN_USE_RECENT_MASK;
+                if (use_recent == 0u && sh_off16_pos < pc.off16_count) {
+                    match_offset = consumeOff16();
+                }
+            } else if (token == TOKEN_LONG_LITERAL) {
+                // Literal-only command (CUDA L158-161).
+                use_recent = 1u;
+                lit_len    = readLengthFromStream() + LONG_LITERAL_BASE;
+            } else if (token == TOKEN_LONG_NEAR) {
+                // Near-offset long match (CUDA L162-173).
+                match_len = readLengthFromStream() + LONG_NEAR_BASE;
+                if (sh_off16_pos < pc.off16_count) {
+                    match_offset = consumeOff16();
+                }
+            } else if (token == TOKEN_LONG_FAR) {
+                // Far-offset long match — NOT produced by phase-1 encoder.
+                // Defensive: consume the length entry to keep the length
+                // cursor advancing, then drop the match (no off32 stream
+                // exists to decode an offset from). use_recent=1 skips
+                // the recent_offset latch so a corrupt stream cannot
+                // corrupt downstream offsets.
+                uint _ignored = readLengthFromStream();
+                match_len  = 0u;
+                use_recent = 1u;
+            } else {
+                // Short-far match (token in [3, 23]) — also unused at L1.
+                // Defensive: emit nothing.
+                match_len  = 0u;
+                use_recent = 1u;
+            }
+            sh_cmd_pos += 1u;
+
+            // Stash parsed values into shared memory for the warp-wide
+            // cooperative copy. The CUDA path broadcasts via shfl(.., 0);
+            // we route through shared memory because every other lane
+            // reads them in the copy loop below.
+            sh_parse_lit_len      = lit_len;
+            sh_parse_match_len    = match_len;
+            sh_parse_match_offset = match_offset;
+            sh_parse_use_recent   = use_recent;
+        }
+        subgroupBarrier();
+        subgroupMemoryBarrierShared();
+
+        // Cooperative literal + match copy (CUDA L186-199).
+        uint slow_lit_len    = sh_parse_lit_len;
+        uint slow_match_len  = sh_parse_match_len;
+        int  slow_match_off  = sh_parse_match_offset;
+        uint slow_use_recent = sh_parse_use_recent;
+
+        uint slow_dst_pos = sh_dst_pos;
+        uint slow_lit_pos = sh_lit_pos;
+
+        if (slow_lit_len > 0u) {
+            warpLiteralCopy(slow_dst_pos, slow_lit_pos, slow_lit_len);
+            subgroupBarrier();
+            subgroupMemoryBarrierBuffer();
+        }
+        uint slow_copy_dst = slow_dst_pos + slow_lit_len;
+        if (slow_match_len > 0u) {
+            uint match_src = uint(int(slow_copy_dst) + slow_match_off);
+            warpMatchCopy(slow_copy_dst, match_src, slow_match_len);
+            subgroupBarrier();
+            subgroupMemoryBarrierBuffer();
+        }
+
+        if (lane == 0u) {
+            sh_dst_pos += slow_lit_len + slow_match_len;
+            sh_lit_pos += slow_lit_len;
+            if (slow_use_recent == 0u) sh_recent_offset = slow_match_off;
+        }
+        subgroupBarrier();
+        subgroupMemoryBarrierShared();
+    }
+
+    // ── Trailing literals ───────────────────────────────────────────
+    // Port of CUDA L206-209. Any literal bytes after the last token are
+    // copied verbatim into dst[dst_pos..]. The CUDA path uses a 32-lane
+    // strided copy; we serialize on lane 0 for the same reason
+    // warpLiteralCopy does (u32-packed Dst is RMW-unsafe across lanes).
+    if (lane == 0u) {
+        uint trailing = (pc.lit_size > sh_lit_pos) ? (pc.lit_size - sh_lit_pos) : 0u;
+        uint dst_pos = sh_dst_pos;
+        uint lit_pos = sh_lit_pos;
+        for (uint i = 0u; i < trailing; i++) {
+            storeDstByte(dst_pos + i, loadLitByte(lit_pos + i));
+        }
+    }
+}

@@ -1,0 +1,72 @@
+// M5: __match_any_sync emulation microbenchmark shader.
+//
+// Foundation §3.1, deep-dive `match-any-sync-callsites-and-emulation`:
+// CUDA's `__match_any_sync(FULL_WARP_MASK, key)` returns, for every lane,
+// a bitmask of every OTHER lane in the warp that holds an equal key. There
+// is no direct GLSL/SPIR-V equivalent, so we emulate it via a 32-broadcast
+// OR-reduction:
+//
+//   for k in 0..31:
+//       k_key = subgroupShuffle(my_key, k)
+//       if (k_key == my_key) group_mask |= (1u << k)
+//
+// On a 32-wide subgroup this requires 32 subgroupShuffle ops + 32 compares
+// + 32 ORs, ~96 instructions vs CUDA's 1-instruction __match_any_sync.
+// Foundation R1 estimates CUDA at ~1 ns per emulation; AMD/Intel must
+// sustain ≥ 65% to clear the M5 floor.
+//
+// To amortize Vulkan dispatch overhead (a few µs) over many emulations, the
+// shader loops pc.n_iters times. Per-iteration the shuffle source value
+// includes `i` so the optimizer cannot hoist a single shuffle outside the
+// loop, and the result is XORed into the accumulator so the loop body has
+// observable side effects on `group_mask`. Final store writes `group_mask`
+// per-lane to out_buf.masks[lane].
+//
+// Wave size: subgroupSize = 32 is the requiredSubgroupSize on Tier-1
+// (architecture §9.2). local_size_x = 32 makes the workgroup exactly one
+// subgroup so subgroupShuffle's lane domain matches the array index. On
+// Tier-2 (the few wave64 / wave16 backends) the shader runs unchanged but
+// shuffles outside lanes [0..31] return 0 — fine for this benchmark since
+// the upper lanes are idle.
+
+#version 460
+#extension GL_KHR_shader_subgroup_basic   : require
+#extension GL_KHR_shader_subgroup_ballot  : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer InKeys   { uint keys[];  } in_buf;
+layout(set = 0, binding = 1) writeonly buffer OutMasks { uint masks[]; } out_buf;
+
+layout(push_constant) uniform PC {
+    uint n_iters; // Number of emulation iterations per dispatch (≥ 1).
+} pc;
+
+void main() {
+    uint lane    = gl_SubgroupInvocationID;
+    uint my_key  = in_buf.keys[lane];
+    uint group_mask = 0u;
+
+    // First iteration: the canonical 32-broadcast OR-reduction.
+    for (uint k = 0u; k < 32u; k++) {
+        uint k_key = subgroupShuffle(my_key, k);
+        if (k_key == my_key) group_mask |= (1u << k);
+    }
+
+    // Remaining iterations: same shape but with `i` mixed into both the
+    // shuffled value and the local compare key so the optimizer can't
+    // fold the loop into a single emulation. XOR-accumulate the per-iter
+    // result into `group_mask` so each iter remains observable on the
+    // final store.
+    for (uint i = 1u; i < pc.n_iters; i++) {
+        uint sink = 0u;
+        for (uint k = 0u; k < 32u; k++) {
+            uint k_key = subgroupShuffle(my_key + i, k);
+            if (k_key == my_key + i) sink |= (1u << k);
+        }
+        group_mask ^= sink;
+    }
+
+    out_buf.masks[lane] = group_mask;
+}

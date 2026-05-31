@@ -1,0 +1,694 @@
+// ── StreamLZ Vulkan L1 LZ encoder ───────────────────────────────────
+// Port of src/encode/lz_kernel.cu (slzLzEncodeKernel, use_chain=0) +
+// src/encode/lz_greedy_parser.cuh (scanBlock) +
+// src/encode/lz_token_emit.cuh (emitCmd, writeLengthValue).
+//
+// Phase-1 simplifications (locked by docs/vulkan_l1_codec_spec.md):
+//   * No header wrapping — encoder writes 4 raw streams + a sizes
+//     sidecar. lit_buf / cmd_buf / off16_buf / length_buf are separate
+//     SSBOs (u32-addressed with manual byte packing — no
+//     storageBuffer8BitAccess dependency).
+//   * Single workgroup per chunk; phase 1 dispatches one chunk only.
+//   * Initial 8-byte verbatim copy is OMITTED (anchor = 0,
+//     recent_offset = -8 still seeded — matches CUDA's INITIAL_RECENT_OFFSET).
+//   * Far-offset matches are REJECTED (no off32 stream). This is the
+//     §11.4 "(chosen)" stance: when resolved_off > 0xFFFF the parser
+//     advances `pos = match_pos + 1` and tries again.
+//   * enable_match_rehash = 0 (L1 behaviour); the dead branch is still
+//     present for parity but never fires.
+//
+// Buffer layout (all u32 arrays, byte indices packed/unpacked by hand):
+//   set=0, binding=0  Src      readonly  - source bytes
+//   set=0, binding=1  Lit      writeonly - literal stream
+//   set=0, binding=2  Cmd      writeonly - command/token stream
+//   set=0, binding=3  Off16    writeonly - u16 LE offsets (byte-addressed)
+//   set=0, binding=4  Length   writeonly - variable-length stream
+//   set=0, binding=5  Hash     buffer    - 1<<hash_bits u32 (per-chunk slot)
+//   set=0, binding=6  Sizes    writeonly - 4 u32: [lit, cmd, off16_cnt, len]
+//
+// Push constants:
+//   uint src_size    : bytes to encode
+//   uint hash_bits   : log2(hash_size); 17 for L1
+//
+// Subgroup size: hard-required = 32 (enforced by host pipeline-creation).
+
+#version 460
+#extension GL_KHR_shader_subgroup_basic              : require
+#extension GL_KHR_shader_subgroup_ballot             : require
+#extension GL_KHR_shader_subgroup_shuffle            : require
+#extension GL_KHR_shader_subgroup_shuffle_relative   : require
+#extension GL_KHR_shader_subgroup_arithmetic         : require
+#extension GL_KHR_shader_subgroup_vote               : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// Output buffers are u32-typed and accessed via byte-level RMW from
+// lane 0 only, so the `writeonly` qualifier is dropped (RMW requires
+// load access). Host-side they are still semantically write-only — the
+// host clears them before each dispatch and reads them back via
+// transfer ops, never via the descriptor.
+layout(set = 0, binding = 0) readonly buffer Src    { uint w[]; } src_buf;
+layout(set = 0, binding = 1)          buffer Lit    { uint w[]; } lit_buf;
+layout(set = 0, binding = 2)          buffer Cmd    { uint w[]; } cmd_buf;
+layout(set = 0, binding = 3)          buffer Off16  { uint w[]; } off16_buf;
+layout(set = 0, binding = 4)          buffer Length { uint w[]; } length_buf;
+layout(set = 0, binding = 5)          buffer Hash   { uint e[]; } hash_buf;
+layout(set = 0, binding = 6) writeonly buffer Sizes { uint s[4]; } sizes_buf;
+
+layout(push_constant) uniform PC {
+    uint src_size;
+    uint hash_bits;
+} pc;
+
+// ── Constants (mirror src/encode/lz_format.cuh + lz_token_emit.cuh) ──
+const uint WARP_SIZE                   = 32u;
+const uint FULL_WARP_MASK              = 0xFFFFFFFFu;
+const uint HASH_EMPTY                  = 0xFFFFFFFFu;
+const uint MIN_MATCH                   = 4u;
+const uint MIN_HASH_MATCH_OFFSET       = 8u;
+const uint NEAR_OFFSET_MAX             = 0xFFFFu;
+const uint FAR_OFFSET_MIN_MATCH        = 14u;
+const uint HASH_LOOKAHEAD              = 7u;
+const uint XOR_PATTERN_BYTES123_MASK   = 0xFFFFFF00u;
+const uint XOR_MATCH_MIN_LEN           = 3u;
+const uint NO_MATCH_STEP_THRESHOLD     = 128u;
+const uint NO_MATCH_STEP_SHIFT         = 7u;
+const uint NO_MATCH_STEP_MAX           = 16u;
+const uint MAX_INLINE_LITERALS         = 7u;
+const uint MAX_INLINE_MATCH            = 15u;
+const uint TOKEN_MATCH_SHIFT_MUL       = 8u;
+const uint TOKEN_RECENT_FLAG           = 0x80u;
+const uint LITERAL_RUN_LENGTH_THRESHOLD = 64u;
+const uint NEAR_CONT_MATCH_MAX         = 90u;
+const uint LENGTH_INLINE_MAX           = 251u;
+const uint LENGTH_EXT_TAG_BIAS         = 4u;
+const uint LZ_BLOCK_SIZE               = 0x10000u;
+const int  INITIAL_RECENT_OFFSET       = -8;
+const uint enable_match_rehash         = 0u; // L1 hard-zero (§11.5)
+
+// ── Hash multiplier ─────────────────────────────────────────────────
+// FIB_HASH_MUL_K6 = 0x79B97F4A7C150000ULL (= 0x9E3779B97F4A7C15ULL << 16).
+// GLSL has no `uint64_t` literal portable across all drivers without
+// GL_EXT_shader_explicit_arithmetic_types_int64. We do the multiply by
+// hand using 32-bit limbs: word8 (u64 split into lo:hi) × mul (lo:hi)
+// → 64-bit product → shift right by (64 - hash_bits) and mask.
+// FIB_HASH_MUL_K6 split:
+//   lo32 = 0x7C150000u   (low 32 bits of multiplier)
+//   hi32 = 0x79B97F4Au   (high 32 bits)
+const uint FIB_MUL_LO = 0x7C150000u;
+const uint FIB_MUL_HI = 0x79B97F4Au;
+
+// 64-bit unsigned multiply-then-shift, returning the
+// `hash_bits` MSBs of (a * mul) where a is a 64-bit word given as
+// (a_lo, a_hi) and the multiplier is the constant FIB_MUL (lo, hi).
+// Truncation semantics match CUDA's uint64_t * uint64_t mod 2^64.
+//
+// Result = (a * mul) >> (64 - hash_bits)
+//
+// Product layout (64-bit word, taken mod 2^64):
+//   bits 0..63 = a_lo*mul_lo
+//              + ((a_lo*mul_hi) << 32)   (low 32 of a_lo*mul_hi go to bits 32..63)
+//              + ((a_hi*mul_lo) << 32)
+//              + (a_hi*mul_lo top half discarded — overflows past 64)
+//              + a_hi*mul_hi << 64       (entirely overflows — drop)
+//
+// Implemented via umulExtended.
+uint hashKey6_u32(uint a_lo, uint a_hi, uint hash_bits, uint hash_mask) {
+    // p_ll = a_lo * mul_lo  (full 64-bit result via umulExtended)
+    uint ll_lo, ll_hi;
+    umulExtended(a_lo, FIB_MUL_LO, ll_hi, ll_lo);
+    // p_lh = a_lo * mul_hi  (only low 32 contribute to bits 32..63 of product)
+    uint lh_lo, lh_hi;
+    umulExtended(a_lo, FIB_MUL_HI, lh_hi, lh_lo);
+    // p_hl = a_hi * mul_lo  (low 32 → bits 32..63)
+    uint hl_lo, hl_hi;
+    umulExtended(a_hi, FIB_MUL_LO, hl_hi, hl_lo);
+    // p_hh = a_hi * mul_hi  (entirely overflows beyond bit 64; ignored)
+
+    // product_lo = ll_lo
+    // product_hi = ll_hi + lh_lo + hl_lo  (mod 2^32)
+    uint prod_hi = ll_hi + lh_lo + hl_lo;
+
+    // Shift right by (64 - hash_bits). With hash_bits=17, shift=47, so
+    // result is (product >> 47).
+    // shift = 64 - hash_bits; if shift >= 32, result = prod_hi >> (shift - 32).
+    uint shift = 64u - hash_bits;
+    uint h;
+    if (shift >= 32u) {
+        h = prod_hi >> (shift - 32u);
+    } else {
+        // shift < 32 path (only relevant if hash_bits > 32 — never for our use).
+        h = (prod_hi << (32u - shift)) | (ll_lo >> shift);
+    }
+    return h & hash_mask;
+}
+
+// ── src byte / word loads ───────────────────────────────────────────
+uint loadSrcByte(uint pos) {
+    if (pos >= pc.src_size) return 0u;
+    uint w = src_buf.w[pos >> 2];
+    return (w >> ((pos & 3u) * 8u)) & 0xFFu;
+}
+
+// Unaligned u32 LE read; returns 0 for out-of-bounds bytes (matches
+// CUDA's read8safe contract via per-byte fallback).
+uint loadSrcU32LE(uint pos) {
+    return  loadSrcByte(pos)
+         | (loadSrcByte(pos + 1u) << 8)
+         | (loadSrcByte(pos + 2u) << 16)
+         | (loadSrcByte(pos + 3u) << 24);
+}
+
+// ── output stream stores (lane 0 only) ──────────────────────────────
+// All streams are u32 arrays. Each store is a read-modify-write u32
+// (lane 0 only, so no atomics needed).
+void storeLitByte(uint pos, uint b) {
+    uint widx = pos >> 2;
+    uint sh = (pos & 3u) * 8u;
+    uint mask = 0xFFu << sh;
+    // Writeonly buffer + RMW: GLSL allows reading from a writeonly buffer
+    // when accessed as a single-lane scalar (no driver disallows the load
+    // here); however to keep semantics tight we use bit-or pattern that
+    // assumes the destination starts zero. Phase 1 host clears the buffer
+    // before each dispatch.
+    lit_buf.w[widx] = (lit_buf.w[widx] & ~mask) | ((b & 0xFFu) << sh);
+}
+
+void storeCmdByte(uint pos, uint b) {
+    uint widx = pos >> 2;
+    uint sh = (pos & 3u) * 8u;
+    uint mask = 0xFFu << sh;
+    cmd_buf.w[widx] = (cmd_buf.w[widx] & ~mask) | ((b & 0xFFu) << sh);
+}
+
+void storeOff16Byte(uint pos, uint b) {
+    uint widx = pos >> 2;
+    uint sh = (pos & 3u) * 8u;
+    uint mask = 0xFFu << sh;
+    off16_buf.w[widx] = (off16_buf.w[widx] & ~mask) | ((b & 0xFFu) << sh);
+}
+
+void storeLengthByte(uint pos, uint b) {
+    uint widx = pos >> 2;
+    uint sh = (pos & 3u) * 8u;
+    uint mask = 0xFFu << sh;
+    length_buf.w[widx] = (length_buf.w[widx] & ~mask) | ((b & 0xFFu) << sh);
+}
+
+void storeOff16LE(uint pos, uint v) {
+    storeOff16Byte(pos,      v & 0xFFu);
+    storeOff16Byte(pos + 1u, (v >> 8) & 0xFFu);
+}
+
+// ── Shared OutputStreams cursor ─────────────────────────────────────
+// All emit logic is lane-0 only, so the cursors live in shared memory
+// and only lane 0 touches them.
+shared uint lit_count;
+shared uint token_count;
+shared uint off16_count;
+shared uint length_count;
+
+// ── State broadcast across the warp ─────────────────────────────────
+shared uint  sh_anchor;
+shared int   sh_recent_offset;
+shared uint  sh_pos;
+shared uint  sh_match_pos;
+shared uint  sh_match_len;
+shared uint  sh_action; // 0=continue match step, 1=jump (reject), 2=no-match step
+shared uint  sh_no_match_step;
+
+// ── match_any emulation (§7) ────────────────────────────────────────
+// 32 broadcast-and-compare ops. All 32 lanes must call together.
+uint match_any(uint key) {
+    uint mask = 0u;
+    for (uint k = 0u; k < 32u; k++) {
+        uint k_key = subgroupShuffle(key, k);
+        if (k_key == key) mask |= (1u << k);
+    }
+    return mask;
+}
+
+// ── writeLengthValue (lane-0 only) ──────────────────────────────────
+// Port of src/encode/lz_token_emit.cuh:56.
+void writeLengthValue(uint value) {
+    if (value <= LENGTH_INLINE_MAX) {
+        storeLengthByte(length_count, value & 0xFFu);
+        length_count += 1u;
+    } else {
+        // Extended-form tag byte: low 2 bits of value encoded via deliberate
+        // unsigned underflow ((low2 - 4) & 0xFF wraps to 0xFC..0xFF).
+        // GLSL `uint` arithmetic is wrapping mod 2^32 — direct port.
+        uint low2 = value & 3u;
+        uint tag = (low2 - LENGTH_EXT_TAG_BIAS) & 0xFFu;
+        storeLengthByte(length_count, tag);
+        length_count += 1u;
+        uint remainder = (value - (low2 + (LENGTH_INLINE_MAX + 1u))) >> 2;
+        storeLengthByte(length_count,      remainder & 0xFFu);
+        storeLengthByte(length_count + 1u, (remainder >> 8) & 0xFFu);
+        length_count += 2u;
+    }
+}
+
+// ── emitCmd (lane-0 only) ───────────────────────────────────────────
+// Port of src/encode/lz_token_emit.cuh:103 — with phase-1 constraint
+// that any far-offset emit returns failure (caller must filter first).
+// Phase-1 guarantee: caller only invokes emitCmd when resolved_off <=
+// NEAR_OFFSET_MAX (far matches are rejected at the parser). Therefore
+// the Step-4 far-offset branch is dead at L1; we keep its structure
+// for parity but it can never fire.
+void emitCmd(uint lit_len, uint match_len, uint offset, int recent_offset) {
+    uint remaining_lit = lit_len;
+
+    // Step 1: Fast path.
+    if (remaining_lit <= MAX_INLINE_LITERALS && match_len <= MAX_INLINE_MATCH && offset <= NEAR_OFFSET_MAX) {
+        uint token = (remaining_lit + TOKEN_MATCH_SHIFT_MUL * match_len) & 0xFFu;
+        if (offset == 0u) token |= TOKEN_RECENT_FLAG;
+        storeCmdByte(token_count, token);
+        token_count += 1u;
+        if (offset != 0u) {
+            storeOff16LE(off16_count * 2u, offset & 0xFFFFu);
+            off16_count += 1u;
+        }
+        return;
+    }
+
+    // Step 2: Literal encoding.
+    if (remaining_lit < LITERAL_RUN_LENGTH_THRESHOLD) {
+        while (remaining_lit > MAX_INLINE_LITERALS) {
+            storeCmdByte(token_count, (TOKEN_RECENT_FLAG | MAX_INLINE_LITERALS) & 0xFFu);
+            token_count += 1u;
+            remaining_lit -= MAX_INLINE_LITERALS;
+        }
+    } else {
+        writeLengthValue(remaining_lit - LITERAL_RUN_LENGTH_THRESHOLD);
+        storeCmdByte(token_count, 0u);
+        token_count += 1u;
+        remaining_lit = 0u;
+        if (match_len == 0u) return;
+    }
+
+    // Step 3: Near-offset continuation. (Phase 1 guarantees offset is
+    // either 0 or <= NEAR_OFFSET_MAX, so the Step-4 far path is dead.)
+    if (offset <= NEAR_OFFSET_MAX && match_len <= NEAR_CONT_MATCH_MAX) {
+        uint current = (match_len < MAX_INLINE_MATCH) ? match_len : MAX_INLINE_MATCH;
+        uint token = (remaining_lit + TOKEN_MATCH_SHIFT_MUL * current) & 0xFFu;
+        if (offset == 0u) token |= TOKEN_RECENT_FLAG;
+        storeCmdByte(token_count, token);
+        token_count += 1u;
+        if (offset != 0u) {
+            storeOff16LE(off16_count * 2u, offset & 0xFFFFu);
+            off16_count += 1u;
+        }
+        uint remaining_match = match_len - current;
+        while (remaining_match > 0u) {
+            current = (remaining_match < MAX_INLINE_MATCH) ? remaining_match : MAX_INLINE_MATCH;
+            uint cont = (TOKEN_RECENT_FLAG + TOKEN_MATCH_SHIFT_MUL * current) & 0xFFu;
+            storeCmdByte(token_count, cont);
+            token_count += 1u;
+            remaining_match -= current;
+        }
+        return;
+    }
+
+    // Step 4: long near-offset / far-offset path.
+    // Phase 1 only reaches here when offset <= NEAR_OFFSET_MAX (or 0)
+    // AND match_len > NEAR_CONT_MATCH_MAX — i.e. token-type 1 "long near".
+    if (remaining_lit != 0u) {
+        storeCmdByte(token_count, (TOKEN_RECENT_FLAG + remaining_lit) & 0xFFu);
+        token_count += 1u;
+    }
+
+    uint effective_offset = offset;
+    if (effective_offset == 0u) {
+        effective_offset = uint(-recent_offset);
+    }
+
+    // Phase-1 guard: parser must never call emitCmd with a far offset.
+    // If it slipped through somehow, drop the match silently rather than
+    // producing an undecodable off32-referencing token.
+    if (effective_offset > NEAR_OFFSET_MAX) {
+        return;
+    }
+
+    // Token-type 1: long-near-match. Emit the type-1 tag byte + length +
+    // off16 entry.
+    int length_value = int(match_len) - 91; // = NEAR_CONT_MATCH_MAX + 1
+    storeCmdByte(token_count, 1u);
+    token_count += 1u;
+    uint lv = (length_value > 0) ? uint(length_value) : 0u;
+    writeLengthValue(lv);
+    storeOff16LE(off16_count * 2u, effective_offset & 0xFFFFu);
+    off16_count += 1u;
+}
+
+// ── main ────────────────────────────────────────────────────────────
+void main() {
+    uint lane = gl_SubgroupInvocationID;
+
+    // 1. Init shared state + hash table.
+    uint hash_size = 1u << pc.hash_bits;
+    uint hash_mask = hash_size - 1u;
+
+    if (lane == 0u) {
+        lit_count = 0u;
+        token_count = 0u;
+        off16_count = 0u;
+        length_count = 0u;
+        sh_anchor = 0u;                       // phase-1: no initial copy
+        sh_recent_offset = INITIAL_RECENT_OFFSET;
+    }
+
+    // Zero-init the per-chunk hash table.
+    for (uint i = lane; i < hash_size; i += WARP_SIZE) {
+        hash_buf.e[i] = HASH_EMPTY;
+    }
+    subgroupBarrier();
+    subgroupMemoryBarrierBuffer();
+    barrier();
+
+    // 2. Two-pass scanBlock (block 1, then block 2 if src_size > 64KB).
+    for (uint block = 0u; block < 2u; block++) {
+        uint block1_end = (pc.src_size < LZ_BLOCK_SIZE) ? pc.src_size : LZ_BLOCK_SIZE;
+        uint start_pos;
+        uint end_pos;
+        if (block == 0u) {
+            start_pos = sh_anchor;
+            end_pos   = block1_end;
+        } else {
+            if (pc.src_size <= LZ_BLOCK_SIZE) break;
+            start_pos = (sh_anchor > LZ_BLOCK_SIZE) ? sh_anchor : LZ_BLOCK_SIZE;
+            end_pos   = pc.src_size;
+        }
+        if (lane == 0u) sh_pos = start_pos;
+        subgroupBarrier();
+
+        // ── scanBlock inner loop ──────────────────────────────────────
+        // pos lives in sh_pos (broadcast each iteration). All warp ops
+        // require unified pos across all 32 lanes.
+        while (true) {
+            uint pos = sh_pos;
+            if (pos + MIN_MATCH > end_pos) break;
+
+            uint my_pos  = pos + lane;
+            uint my_byte = loadSrcByte(my_pos);
+
+            // Build key4 / key8 via 7 shuffle_downs.
+            uint b1 = subgroupShuffleDown(my_byte, 1u);
+            uint b2 = subgroupShuffleDown(my_byte, 2u);
+            uint b3 = subgroupShuffleDown(my_byte, 3u);
+            uint b4 = subgroupShuffleDown(my_byte, 4u);
+            uint b5 = subgroupShuffleDown(my_byte, 5u);
+            uint b6 = subgroupShuffleDown(my_byte, 6u);
+            uint b7 = subgroupShuffleDown(my_byte, 7u);
+            uint key4   = my_byte | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            uint key8_lo = key4;
+            uint key8_hi = b4 | (b5 << 8) | (b6 << 16) | (b7 << 24);
+
+            // active_count = min(remaining - HASH_LOOKAHEAD, WARP_SIZE - HASH_LOOKAHEAD).
+            uint remaining = end_pos - pos;
+            uint active_count;
+            if (remaining >= WARP_SIZE) active_count = WARP_SIZE - HASH_LOOKAHEAD;
+            else if (remaining >= HASH_LOOKAHEAD + 1u) active_count = remaining - HASH_LOOKAHEAD;
+            else active_count = 0u;
+            bool is_active = (lane < active_count);
+
+            // Hash.
+            uint h = hashKey6_u32(key8_lo, key8_hi, pc.hash_bits, hash_mask);
+
+            // Serial-order simulation. Site §6.1.2.
+            uint bucket_same = match_any(h);
+            uint active_mask = subgroupBallot(is_active).x;
+            uint lower_same_bucket = bucket_same & active_mask & ((1u << lane) - 1u);
+
+            // Highest lower lane with same bucket. Site §6.1.5.
+            uint key_src_lane = (lower_same_bucket != 0u)
+                ? ((WARP_SIZE - 1u) - uint(31 - findMSB(lower_same_bucket)))
+                : lane;
+            // ^^ (WARP_SIZE-1) - clz; clz(x) for non-zero x is `31 - findMSB(x)`.
+            //    Simplify: key_src_lane = findMSB(lower_same_bucket) when nonzero.
+            //    (Both expressions evaluate to the same value; kept the explicit
+            //    form to mirror CUDA's `(WARP_SIZE-1) - __clz(...)` site §6.1.4.)
+            uint their_key4_warp = subgroupShuffle(key4, key_src_lane);
+
+            bool hash_match = false;
+            uint hash_ref   = 0u;
+
+            if (is_active) {
+                if (lower_same_bucket != 0u) {
+                    uint highest_lower = key_src_lane;
+                    // Defensive: re-verify byte-equality via fresh src reload
+                    // rather than trusting subgroupShuffle(key4, key_src_lane).
+                    // The shuffle is issued at warp-uniform scope but consumed
+                    // here in a divergent branch; some SPIR-V compilations can
+                    // mis-converge that, returning a stale key4. Reloading from
+                    // src is guaranteed-correct.
+                    uint their_pos     = pos + highest_lower;
+                    uint rk_intra      = loadSrcU32LE(their_pos);
+                    bool same_key      = (rk_intra == key4);
+                    if (same_key && their_pos + 8u <= my_pos) {
+                        hash_match = true;
+                        hash_ref   = their_pos;
+                    }
+                } else {
+                    uint ref_val = hash_buf.e[h];
+                    if (ref_val != HASH_EMPTY && ref_val + 8u <= my_pos) {
+                        uint rk = loadSrcU32LE(ref_val);
+                        if (rk == key4) {
+                            hash_match = true;
+                            hash_ref   = ref_val;
+                        }
+                    }
+                }
+            }
+
+            // Secondary attempts.
+            bool xor_match = false;
+            bool eight_match = false;
+            int recent_offset = sh_recent_offset;
+            if (is_active && !hash_match && recent_offset < 0) {
+                uint ro_dist = uint(-recent_offset);
+                if (my_pos >= ro_dist) {
+                    uint ref         = my_pos - ro_dist;
+                    uint recent_word = loadSrcU32LE(ref);
+                    uint xor_v       = key4 ^ recent_word;
+                    if ((xor_v & XOR_PATTERN_BYTES123_MASK) == 0u) {
+                        if (my_pos + 1u + XOR_MATCH_MIN_LEN <= end_pos) {
+                            xor_match = true;
+                        }
+                    }
+                }
+            }
+            if (is_active && !hash_match && !xor_match && my_pos >= MIN_HASH_MATCH_OFFSET) {
+                uint eight_ref  = my_pos - MIN_HASH_MATCH_OFFSET;
+                uint eight_word = loadSrcU32LE(eight_ref);
+                if (eight_word == key4) eight_match = true;
+            }
+
+            bool has_match = hash_match || xor_match || eight_match;
+            uint my_match_type = hash_match  ? 0u
+                               : xor_match   ? 1u
+                               : eight_match ? 2u
+                               : 0u;
+            uint my_ref       = hash_ref;
+            uint match_ballot = subgroupBallot(has_match).x;
+
+            uint no_match_step = 1u;
+            if (match_ballot == 0u) {
+                uint dist = pos - sh_anchor;
+                if (dist >= NO_MATCH_STEP_THRESHOLD) {
+                    uint step = (dist >> NO_MATCH_STEP_SHIFT) + 1u;
+                    no_match_step = (step > NO_MATCH_STEP_MAX) ? NO_MATCH_STEP_MAX : step;
+                }
+            }
+
+            // Hash-table writes (highest-lane-wins). Site §6.1.8-10.
+            {
+                uint write_limit = (match_ballot != 0u)
+                    ? (findLSB(match_ballot)) // == __ffs(x)-1 for x != 0
+                    : (no_match_step - 1u);
+                bool is_writer = is_active && (lane <= write_limit);
+                uint write_mask = subgroupBallot(is_writer).x;
+                uint bucket_grp = match_any(h);
+                uint group_mask = bucket_grp & write_mask;
+                int top_lane = (group_mask != 0u) ? int(findMSB(group_mask)) : -1;
+                if (is_writer && int(lane) == top_lane) {
+                    hash_buf.e[h] = my_pos;
+                }
+            }
+            // Hash-table write→read ordering for the next iteration.
+            subgroupMemoryBarrierBuffer();
+            subgroupBarrier();
+
+            if (match_ballot == 0u) {
+                if (lane == 0u) sh_pos = pos + no_match_step;
+                subgroupBarrier();
+                continue;
+            }
+
+            // Winning lane + match resolution.
+            uint first_lane    = findLSB(match_ballot); // __ffs - 1
+            uint winning_type  = subgroupShuffle(my_match_type, first_lane);
+            uint match_pos;
+            uint match_ref;
+            uint min_match_len;
+            if (winning_type == 0u) {
+                match_pos     = pos + first_lane;
+                match_ref     = subgroupShuffle(my_ref, first_lane);
+                min_match_len = MIN_MATCH;
+            } else if (winning_type == 1u) {
+                match_pos     = pos + first_lane + 1u;
+                match_ref     = match_pos - uint(-recent_offset);
+                min_match_len = XOR_MATCH_MIN_LEN;
+            } else {
+                match_pos     = pos + first_lane;
+                match_ref     = match_pos - MIN_HASH_MATCH_OFFSET;
+                min_match_len = MIN_MATCH;
+            }
+
+            // Match extension across the warp.
+            uint match_len  = min_match_len;
+            uint max_match  = end_pos - match_pos;
+            // VULKAN_PORTABILITY: the 32-stride warp-cooperative extension
+            // returned wrong match_len under at least one driver (subgroupBallot
+            // dropped the mismatch bit even when per-lane mm was true). Phase 1
+            // takes the safe lane-0-serial form; phase 4 can revisit once
+            // the divergence-mode is isolated.
+            if (lane == 0u) {
+                uint mlen = min_match_len;
+                while (mlen < max_match) {
+                    if (loadSrcByte(match_pos + mlen) != loadSrcByte(match_ref + mlen)) break;
+                    mlen += 1u;
+                }
+                match_len = mlen;
+            }
+            match_len = subgroupBroadcast(match_len, 0u);
+
+            // Resolve offset / off_param.
+            int neg_off = -int(match_pos - match_ref);
+            uint off_param = (neg_off == recent_offset) ? 0u : uint(-neg_off);
+            uint resolved_off = (off_param == 0u) ? uint(-recent_offset) : off_param;
+
+            // Phase-1: reject all far-offset matches (no off32 stream).
+            // CUDA's FAR_OFFSET_MIN_MATCH rule (resolved_off > 0xFFFF AND
+            // match_len < 14) is extended to ALL match lengths.
+            if (resolved_off > NEAR_OFFSET_MAX) {
+                if (lane == 0u) sh_pos = match_pos + 1u;
+                subgroupBarrier();
+                continue;
+            }
+            // Also keep the original FAR_OFFSET_MIN_MATCH guard for parity
+            // (dead under the above gate but harmless).
+            if (resolved_off > NEAR_OFFSET_MAX && match_len < FAR_OFFSET_MIN_MATCH) {
+                if (lane == 0u) sh_pos = match_pos + 1u;
+                subgroupBarrier();
+                continue;
+            }
+
+            // Backward extension (lane 0 only).
+            uint bw_steps = 0u;
+            if (lane == 0u) {
+                uint mp = match_pos;
+                uint mr = match_ref;
+                uint anchor = sh_anchor;
+                while (mp > anchor && mr > 0u && loadSrcByte(mp - 1u) == loadSrcByte(mr - 1u)) {
+                    mp -= 1u;
+                    mr -= 1u;
+                    bw_steps += 1u;
+                }
+            }
+            bw_steps   = subgroupBroadcast(bw_steps, 0u);
+            match_pos -= bw_steps;
+            match_ref -= bw_steps;
+            match_len += bw_steps;
+
+            // Literal copy + token emit.
+            uint anchor   = sh_anchor;
+            uint lit_len  = match_pos - anchor;
+
+            // Literal copy: lane 0 only. CUDA's cooperative warp copy is
+            // safe because each lane writes to a unique byte address.
+            // GLSL byte-packed RMW into lit_buf would race across lanes
+            // sharing the same destination u32. Phase 1 keeps it simple
+            // (per-byte serial on lane 0); phase 4 can replace this with
+            // a word-aligned cooperative copy when src/lit are
+            // both 4-byte aligned at runtime.
+            uint lit_base = lit_count;
+            if (lane == 0u) {
+                for (uint i = 0u; i < lit_len; i++) {
+                    storeLitByte(lit_base + i, loadSrcByte(anchor + i));
+                }
+                lit_count = lit_base + lit_len;
+
+                if (lit_len <= MAX_INLINE_LITERALS && match_len <= MAX_INLINE_MATCH && resolved_off <= NEAR_OFFSET_MAX) {
+                    // Fast inline path: matches scanBlock's optimised emit.
+                    uint token = (lit_len + TOKEN_MATCH_SHIFT_MUL * match_len) & 0xFFu;
+                    if (off_param == 0u) token |= TOKEN_RECENT_FLAG;
+                    storeCmdByte(token_count, token);
+                    token_count += 1u;
+                    if (off_param != 0u) {
+                        storeOff16LE(off16_count * 2u, off_param & 0xFFFFu);
+                        off16_count += 1u;
+                    }
+                } else {
+                    emitCmd(lit_len, match_len, off_param, recent_offset);
+                }
+
+                sh_recent_offset = neg_off;
+                sh_anchor        = match_pos + match_len;
+                sh_pos           = match_pos + match_len;
+            }
+
+            // enable_match_rehash branch (dead at L1).
+            if (enable_match_rehash != 0u) {
+                uint ri = 1u << lane;
+                uint rp = match_pos + ri;
+                bool rehash_active = (ri < match_len) && (rp + 8u <= pc.src_size);
+                // Build u64 key from src[rp..rp+8] via per-byte loads.
+                uint rk_lo = rehash_active ? loadSrcU32LE(rp)        : 0u;
+                uint rk_hi = rehash_active ? loadSrcU32LE(rp + 4u)   : 0u;
+                uint h_rehash = hashKey6_u32(rk_lo, rk_hi, pc.hash_bits, hash_mask);
+                uint write_mask = subgroupBallot(rehash_active).x;
+                uint bucket_grp = match_any(h_rehash);
+                uint group_mask = bucket_grp & write_mask;
+                int top_lane = (group_mask != 0u) ? int(findMSB(group_mask)) : -1;
+                if (rehash_active && int(lane) == top_lane) {
+                    hash_buf.e[h_rehash] = rp;
+                }
+            }
+
+            subgroupMemoryBarrierBuffer();
+            subgroupBarrier();
+        } // end while inner
+
+        // Inter-pass safety barrier (block-2 reads sh_anchor written by block-1).
+        subgroupBarrier();
+    } // end for block
+
+    // 3. Trailing literals.
+    {
+        uint anchor   = sh_anchor;
+        uint trailing = pc.src_size - anchor;
+        if (trailing > 0u) {
+            uint lit_base = lit_count;
+            if (lane == 0u) {
+                for (uint i = 0u; i < trailing; i++) {
+                    storeLitByte(lit_base + i, loadSrcByte(anchor + i));
+                }
+                lit_count = lit_base + trailing;
+                emitCmd(trailing, 0u, 0u, sh_recent_offset);
+                sh_anchor = pc.src_size;
+            }
+        }
+    }
+
+    subgroupBarrier();
+    subgroupMemoryBarrierBuffer();
+
+    // 4. Write back sizes.
+    if (lane == 0u) {
+        sizes_buf.s[0] = lit_count;
+        sizes_buf.s[1] = token_count;
+        sizes_buf.s[2] = off16_count;
+        sizes_buf.s[3] = length_count;
+    }
+}
