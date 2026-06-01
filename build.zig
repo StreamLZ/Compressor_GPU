@@ -301,6 +301,32 @@ pub fn build(b: *std.Build) void {
     run_vk_l1_test.step.dependOn(&vk_shaders_top.step);
     b.step("vk-l1-test", "Run the phase-4 L1 codec round-trip test").dependOn(&run_vk_l1_test.step);
 
+    // ── Vulkan port (L1 wire-format): SLZ1 wrap/unwrap conformance ─────
+    // Wraps the L1 codec's raw streams into a real .slz file (CPU-side)
+    // and round-trips both directions against the CUDA encoder/decoder
+    // shipping in zig-out/bin/streamlz.exe.  Shells out to streamlz.exe
+    // for the CUDA half; the Vulkan half rides the same SPV blobs the
+    // l1-test loads.  Wired as `zig build vk-wire-format-test`.
+    // Root at the repo top so `wire_format.zig`'s `../src/format/...`
+    // imports stay inside the module's package boundary.  Same pattern
+    // as `tests_root.zig` above.
+    const vk_wire_test_module = b.createModule(.{
+        .root_source_file = b.path("wire_format_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .link_libc = true,
+    });
+    const vk_wire_test_exe = b.addExecutable(.{
+        .name = "vk_wire_format_test",
+        .root_module = vk_wire_test_module,
+    });
+    b.installArtifact(vk_wire_test_exe);
+    const run_vk_wire_test = b.addRunArtifact(vk_wire_test_exe);
+    run_vk_wire_test.step.dependOn(b.getInstallStep());
+    run_vk_wire_test.step.dependOn(&vk_shaders_top.step);
+    b.step("vk-wire-format-test", "Run the L1 SLZ1 wire-format wrap/unwrap test").dependOn(&run_vk_wire_test.step);
+
     // ── Vulkan port (M9): cross-backend conformance harness ────────────
     // 4-direction (CUDA↔CUDA, CUDA→VK, VK→CUDA, VK↔VK) × 5 levels ×
     // 3 corpora matrix. Only D1 runs real codec today; the remaining
