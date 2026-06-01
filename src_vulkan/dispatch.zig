@@ -261,8 +261,11 @@ pub fn releaseContextChassis(ctx: *driver_mod.Context) void {
 ///   → bind descriptor set 0 → push constants (if any) → dispatch
 ///   → write BOTTOM_OF_PIPE @ slot 1
 ///
-/// Submits to ctx.queue with ctx.fence, vkWaitForFences with a 2-second
-/// budget, then reads the timestamp pair and returns the scaled delta.
+/// Submits to ctx.queue with ctx.fence, vkWaitForFences with the budget
+/// in vk_api.VK_M8A_FENCE_WAIT_NS (60 s — generous enough for a 200 MB
+/// L1 silesia encode on an Intel iGPU, tight enough to surface real
+/// hangs in CI), then reads the timestamp pair and returns the scaled
+/// delta.
 ///
 /// `push_constants_bytes.len == 0` skips the push-constant call entirely
 /// (the spec accepts a zero-byte push, but skipping avoids the dispatch
@@ -386,9 +389,11 @@ pub fn submitOne(
         return error.SubmitFailed;
     }
 
-    // Wait with a generous 2-second budget. Anything longer is a hang
-    // (real dispatches at M8a scale are <1ms); surfacing a typed timeout
-    // is more actionable than a deadlocked process.
+    // Wait with the budget in VK_M8A_FENCE_WAIT_NS (60 s). The original
+    // 2 s value was sized for M8a microbenches; production-scale L1
+    // encodes (200 MB silesia, Intel iGPU) routinely exceed that.
+    // 60 s still surfaces a typed timeout fast enough that a genuinely
+    // hung GPU does not deadlock the test process.
     const wait_result = wait_fence(ctx.dev, 1, @ptrCast(&fences), vk.VK_TRUE, vk.VK_M8A_FENCE_WAIT_NS);
     if (wait_result == vk.VK_TIMEOUT) return error.FenceWaitTimeout;
     if (wait_result != vk.VK_SUCCESS) return error.FenceWaitFailed;

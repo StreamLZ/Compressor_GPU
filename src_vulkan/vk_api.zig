@@ -609,10 +609,14 @@ pub const VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: VkPipelineStageFlags = 0x2000;
 pub const VkPipelineBindPoint = c_int;
 pub const VK_PIPELINE_BIND_POINT_COMPUTE: VkPipelineBindPoint = 1;
 
-// Wait timeout for vkWaitForFences. M8a uses a generous 2-second budget
-// per dispatch; anything that takes longer is symptomatic of a hang and
-// we surface a timeout error rather than block indefinitely.
-pub const VK_M8A_FENCE_WAIT_NS: u64 = 2 * 1_000_000_000;
+// Wait timeout for vkWaitForFences. The original 2 s budget was sized
+// for M8a microbenches (<1 ms per dispatch) and tripped on production
+// 200 MB silesia encodes (~3-30 s on an Intel iGPU). Raised to 60 s,
+// which still catches genuinely hung GPUs in CI within a reasonable
+// wall-clock while comfortably covering full-corpus L1 encode/decode
+// at scale. If you ever push past this on real hardware, the right fix
+// is per-dispatch sizing — not bumping this further.
+pub const VK_M8A_FENCE_WAIT_NS: u64 = 60 * 1_000_000_000;
 
 pub const VkCommandPoolCreateInfo = extern struct {
     sType: VkStructureType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
