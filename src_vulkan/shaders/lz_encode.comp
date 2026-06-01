@@ -814,6 +814,21 @@ void main() {
             // a word-aligned cooperative copy when src/lit are
             // both 4-byte aligned at runtime.
             uint lit_base = lit_count;
+            // Subgroup execution barrier between the warp-cooperative
+            // match-resolution / backward-extension phase and the lane-0
+            // emit. Without this barrier, on at least the NVIDIA tier1
+            // driver, the SPIR-V → GPU compiler reorders the lane-0
+            // shared-memory writes (sh_pos / sh_anchor / sh_recent_offset)
+            // around the SSBO RMW stores inside the emit in a way that
+            // causes the next inner-loop iteration to pick up a stale
+            // sh_pos. Discovered via the silesia chunk-77 round-trip
+            // failure at byte 10,206,968 (intra-chunk offset 114,424).
+            // The fix also reduces the chunk-78 silesia failure count
+            // (intra-chunk offset 1,076) from ~214 diffs/128 KiB chunk
+            // down to 4, though a few residual misencodings of the
+            // `e0 ff de 23 03 08 64 44` pattern remain — root cause
+            // pending. Repro: `zig build vk-repro-chunk77`.
+            subgroupBarrier();
             if (lane == 0u) {
                 for (uint i = 0u; i < lit_len; i++) {
                     storeLitByte(lit_base + i, loadSrcByte(anchor + i));

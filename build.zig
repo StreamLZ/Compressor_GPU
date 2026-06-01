@@ -461,6 +461,31 @@ pub fn build(b: *std.Build) void {
     run_vk_wire_scale_test.has_side_effects = true;
     b.step("vk-wire-format-scale-test", "Run the L1 SLZ1 wire-format wrap/unwrap test at production scale (100 MB / 200 MB)").dependOn(&run_vk_wire_scale_test.step);
 
+    // ── Vulkan port: silesia chunk-77 minimal repro ────────────────────
+    // Standalone repro for the silesia chunk-77 round-trip mismatch
+    // observed by vk-l1-scale-test (first_diff = 10,206,968 = chunk 77 /
+    // offset 114424). Loads exactly bytes [10092544, 10223616) of
+    // silesia_all.tar (one 128 KiB chunk = one L1 workgroup) and runs the
+    // Vulkan L1 encode + decode round-trip. Wired as
+    // `zig build vk-repro-chunk77`.
+    const vk_repro_chunk77_module = b.createModule(.{
+        .root_source_file = b.path("repro_chunk77_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .link_libc = true,
+    });
+    const vk_repro_chunk77_exe = b.addExecutable(.{
+        .name = "vk_repro_chunk77",
+        .root_module = vk_repro_chunk77_module,
+    });
+    b.installArtifact(vk_repro_chunk77_exe);
+    const run_vk_repro_chunk77 = b.addRunArtifact(vk_repro_chunk77_exe);
+    run_vk_repro_chunk77.step.dependOn(b.getInstallStep());
+    run_vk_repro_chunk77.step.dependOn(&vk_shaders_top.step);
+    run_vk_repro_chunk77.has_side_effects = true;
+    b.step("vk-repro-chunk77", "Repro for the silesia chunk-77 L1 round-trip mismatch").dependOn(&run_vk_repro_chunk77.step);
+
     // ── Vulkan port: perf measurement bench (l1_perf_bench) ───────────
     // Standalone runner used to capture before/after wall-clock numbers
     // for the decoder fast-batch (piece 2) and encoder warp-parallel match
