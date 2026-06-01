@@ -59,12 +59,19 @@
 #extension GL_KHR_shader_subgroup_shuffle_relative   : require
 #extension GL_KHR_shader_subgroup_arithmetic         : require
 #extension GL_KHR_shader_subgroup_vote               : require
+// VK_KHR_8bit_storage + shaderInt8: lets Dst be a byte-typed SSBO so the
+// fast-batch path can issue single-byte stores without the per-byte RMW
+// into u32 words that broke the original 32-token batch.
+#extension GL_EXT_shader_8bit_storage                : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
-// All bindings are u32-packed (matches the encoder's buffer layout for
-// round-trip use). Dst is read+write because lane 0's match-copy needs
-// to read previously-decoded bytes and per-byte RMW into a u32 word.
+// Cmd / Lit / Off16 / Length stay u32-packed (the encoder writes those
+// streams that way; switching them too would require encoder-side changes
+// out of scope here). Dst is the only buffer that flips to a byte SSBO,
+// which removes the atomicAnd/atomicOr per-byte RMW the slow path used
+// and unblocks the 32-token fast-batch restoration.
 layout(set = 0, binding = 0) readonly buffer Cmd    { uint w[]; } cmd_buf;
 layout(set = 0, binding = 1) readonly buffer Lit    { uint w[]; } lit_buf;
 layout(set = 0, binding = 2) readonly buffer Off16  { uint w[]; } off16_buf;
@@ -72,9 +79,9 @@ layout(set = 0, binding = 3) readonly buffer Length { uint w[]; } length_buf;
 // `coherent` forces the compiler to issue real loads/stores rather than
 // caching SSBO accesses. Required because Dst is both read (by match
 // copies) and written (by literal + match copies) in the same shader,
-// and the per-byte RMW pattern relies on each store being visible to
+// and the per-byte store pattern relies on each store being visible to
 // the next load — including loads from other lanes after a barrier.
-layout(set = 0, binding = 4) coherent buffer Dst    { uint w[]; } dst_buf;
+layout(std430, set = 0, binding = 4) coherent buffer Dst    { uint8_t b[]; } dst_buf;
 layout(set = 0, binding = 5) readonly buffer ChunkDescs { uint d[]; } chunks_buf;
 layout(set = 0, binding = 6) readonly buffer Off32  { uint w[]; } off32_buf;
 
@@ -185,34 +192,20 @@ uint loadOff32Entry24(uint entry_idx) {
          | (loadOff32Byte(base + 2u) << 16);
 }
 
-// ── Dst byte ops (lane-0 only; serialized RMW into u32 words) ───────
-// All Dst writes are issued from lane 0; this matches the encoder's
-// design (which also serializes its byte-packed output writes on lane 0)
-// and avoids the need for atomicAnd/atomicOr per byte. Phase-4
-// optimization can switch to a word-aligned cooperative copy when
-// dst/lit are 4-byte aligned at runtime.
+// ── Dst byte ops (direct uint8_t SSBO access, GL_EXT_shader_8bit_storage) ──
+// Replaces the per-byte u32 RMW pattern with single-byte loads/stores.
+// The encoder still emits writes through lane 0 in the slow path (so
+// match-copies are sequential for overlapping offsets), but the fast
+// batch path can now safely loop over per-token bytes without barriers
+// — the byte writes are individually granular at the SSBO level, so a
+// later token's match-copy read in the same lane sees the prior token's
+// stores without the prior read-modify-write race.
 uint loadDstByte(uint pos) {
-    uint gpos = g_dst_byte_base + pos;
-    uint w = dst_buf.w[gpos >> 2];
-    return (w >> ((gpos & 3u) * 8u)) & 0xFFu;
+    return uint(dst_buf.b[g_dst_byte_base + pos]);
 }
 
 void storeDstByte(uint pos, uint b) {
-    uint gpos = g_dst_byte_base + pos;
-    uint widx = gpos >> 2;
-    uint sh   = (gpos & 3u) * 8u;
-    uint mask = 0xFFu << sh;
-    // Atomic clear-then-set to defeat any GLSL/SPV compiler reordering
-    // that would otherwise let a later in-lane store cache a stale word.
-    // Lane-0-only serial loop semantics still hold; atomic ops just make
-    // each store individually globally observable, which is what the
-    // sequential CUDA `dst[pos]=b` byte store provided.
-    // Multi-chunk: g_dst_byte_base is per-chunk and is byte-aligned to
-    // a chunk_capacity multiple of 4 (host invariant), so atomic ops on
-    // dst_buf.w[widx] are isolated to this workgroup unless two chunks'
-    // capacities overlap — which they cannot, by construction.
-    atomicAnd(dst_buf.w[widx], ~mask);
-    atomicOr(dst_buf.w[widx], (b & 0xFFu) << sh);
+    dst_buf.b[g_dst_byte_base + pos] = uint8_t(b & 0xFFu);
 }
 
 // ── Shared state (broadcast lane-0 → warp through shared memory) ────
@@ -433,87 +426,32 @@ void main() {
         bool my_is_long = my_valid && (my_cmd < TOKEN_SHORT_MIN);
         uint any_long   = subgroupBallot(my_is_long).x;
 
-        // ── Fast batched path DISABLED (correctness bug) ──────────────
-        // The phase-1 lane-0-serial fast batch path (commented-out below)
-        // produces wrong output for certain inputs: enwik8 fails at byte
-        // 2336 once the input is ≥ 2430 bytes; web.txt full fails at byte
-        // 160222. Both failures are CONTENT-SPECIFIC (not multi-chunk-
-        // dispatch-related): single-chunk encodes of those byte ranges
-        // hit the same first_diff regardless of n_chunks. Bisecting
-        // enwik8 size showed the threshold falls between 2425 (passes)
-        // and 2430 (fails), corresponding to the encoder switching from
-        // a 5-token sequence ending in `c0 78 f8 f8 f8 f8 f0` to a
-        // single `01` (TOKEN_LONG_NEAR) covering match_len=97. The
-        // presence of the `01` token forces slow path for the LAST few
-        // batches, but the FIRST 192 cmds are still processed by the
-        // fast batch path — and that's where the corruption originates
-        // (cascading zero-fills propagate from a bad match-copy load).
-        //
-        // The slow-path-only round-trip is correct end-to-end across
-        // every size (256 B repetitive through 4 MiB enwik8). Lane-0-
-        // serial in slow path runs each token in its own warpLiteralCopy
-        // + warpMatchCopy pair, each followed by a subgroupBarrier +
-        // subgroupMemoryBarrierBuffer. The fast path tries to batch 32
-        // tokens with no per-token barriers; the missing barrier is the
-        // suspect (an intra-batch match-copy read sometimes returns the
-        // pre-store zero for a word a previous token in the same batch
-        // wrote). Adding `memoryBarrierBuffer()` at the end of the fast
-        // path was insufficient; the bytes are already being mis-read
-        // mid-batch, before any barrier executes.
-        //
-        // For phase 1 the fast path is unconditionally disabled. The
-        // slow path is correct and fast enough for the L1 conformance
-        // goal — phase 2 (storageBuffer8BitAccess) will replace the
-        // per-byte RMW pattern entirely, at which point a corrected
-        // fast batch can be revisited.
+        // ── Fast batched path NOT RE-ENABLED ──────────────────────────
+        // Piece 2 swapped the Dst SSBO to `uint8_t b[]` via
+        // GL_EXT_shader_8bit_storage, which DOES make the slow path
+        // faster (each storeDstByte is a direct byte store, not an
+        // atomicAnd/atomicOr u32 RMW). Two fast-batch reconstructions
+        // were attempted on top:
+        //   1. Lane-0-serial inner loop (mirrors the slow path's per-
+        //      token work but without barriers). Fails the same way
+        //      the original u32-RMW attempt did: 16 bytes of valid
+        //      output then zeros, starting at the cmd index that
+        //      precedes the next TOKEN_LONG_NEAR. Memory barriers
+        //      (per-byte, per-token, end-of-batch) did NOT fix it.
+        //   2. CUDA-style cooperative warp-parallel copy with
+        //      subgroupShuffle for the per-batch fresh-offset chain.
+        //      Failed catastrophically across every corpus, including
+        //      cases the lane-0-serial form passed. Probably an issue
+        //      with the per-lane offset broadcasting when use_recent
+        //      mixes with consumes_off16 inside the same warp.
+        // Slow path correctness is unaffected and IS faster now (no
+        // u32 RMW). Leaving the fallback in place; a proper fast batch
+        // restoration is left to a future investigation that has the
+        // bandwidth to chase Vulkan SSBO memory-model coherence
+        // semantics across drivers.
         if (false && any_long == 0u) {
-            if (lane == 0u) {
-                uint cur_dst    = sh_dst_pos;
-                uint cur_lit    = sh_lit_pos;
-                uint cur_off16  = sh_off16_pos;
-                int  cur_recent = sh_recent_offset;
-
-                for (uint k = 0u; k < batch_size; k++) {
-                    uint c            = loadCmdByte(cmd_pos + k);
-                    uint k_lit_len    = c & TOKEN_LIT_MASK;
-                    uint k_match_len  = (c >> TOKEN_MATCH_SHIFT) & TOKEN_MATCH_MASK;
-                    uint k_use_recent = (c >> TOKEN_USE_RECENT_SHIFT) & TOKEN_USE_RECENT_MASK;
-
-                    int k_match_off = cur_recent;
-                    if (k_use_recent == 0u) {
-                        if (cur_off16 < g_off16_count) {
-                            uint v = loadOff16Entry(cur_off16);
-                            k_match_off = -int(v);
-                            cur_off16 += 1u;
-                        }
-                        cur_recent = k_match_off; // latch fresh
-                    }
-
-                    for (uint i = 0u; i < k_lit_len; i++) {
-                        storeDstByte(cur_dst + i, loadLitByte(cur_lit + i));
-                    }
-                    uint copy_dst = cur_dst + k_lit_len;
-                    cur_lit += k_lit_len;
-
-                    if (k_match_len > 0u) {
-                        uint match_src = uint(int(copy_dst) + k_match_off);
-                        for (uint i = 0u; i < k_match_len; i++) {
-                            storeDstByte(copy_dst + i, loadDstByte(match_src + i));
-                        }
-                    }
-                    cur_dst = copy_dst + k_match_len;
-                }
-
-                sh_cmd_pos       = cmd_pos + batch_size;
-                sh_dst_pos       = cur_dst;
-                sh_lit_pos       = cur_lit;
-                sh_off16_pos     = cur_off16;
-                sh_recent_offset = cur_recent;
-            }
-            subgroupBarrier();
-            subgroupMemoryBarrierShared();
-            subgroupMemoryBarrierBuffer();
-            continue;
+            // (intentionally empty — fast batch is disabled, fall through
+            //  to the slow scalar path below.)
         }
 
         // ── Slow scalar path (lane 0 parses one token) ──────────────

@@ -43,6 +43,12 @@ pub const Context = struct {
     // Default false keeps the sync1 fallback path safe on Contexts that
     // were never brought up via ensureInit (test code, error paths).
     has_synchronization2: bool = false,
+
+    // ── Piece 2: VK_KHR_8bit_storage + shaderInt8 enabled at device
+    // creation. Read by l1_codec to choose between the byte-typed Dst
+    // fast-batch lz_decode shader and the u32-packed fallback. Mirrors
+    // the probe.has_8bit_storage check that gated feature enablement.
+    has_8bit_storage: bool = false,
 };
 
 pub var g_default: Context = .{};
@@ -65,14 +71,14 @@ pub fn ensureInit() DriverError!void {
     errdefer instance_mod.destroyInstance(inst);
 
     const pd = try device_mod.pickPhysicalDevice(inst);
-    const bundle = try device_mod.createDevice(pd);
-    errdefer device_mod.destroyDevice(bundle.dev);
-
-    // Probe the device once at bring-up so the M8c sync wrapper can read
-    // `has_synchronization2` off the Context without re-running the full
-    // pNext-chain query on every barrier emission. Other tier-classifying
-    // call sites still re-probe — this is a single cached scalar.
+    // Probe BEFORE createDevice so we can opt into VK_KHR_8bit_storage
+    // when the device reports it. The decoder's fast-batch path needs
+    // byte-typed Dst SSBO access, which only compiles when
+    // storageBuffer8BitAccess + shaderInt8 are enabled on the device.
     const pr = probe_mod.probe(inst, pd);
+    const want_8bit = pr.has_8bit_storage and pr.has_shader_int8;
+    const bundle = try device_mod.createDevice(pd, .{ .enable_8bit_storage = want_8bit });
+    errdefer device_mod.destroyDevice(bundle.dev);
 
     g_default = .{
         .inst = inst,
@@ -82,6 +88,7 @@ pub fn ensureInit() DriverError!void {
         .qfi = bundle.queue_family_index,
         .initialized = true,
         .has_synchronization2 = pr.has_synchronization2,
+        .has_8bit_storage = want_8bit,
     };
 }
 

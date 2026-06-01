@@ -121,20 +121,13 @@ pub fn build(b: *std.Build) void {
 
     // ── Vulkan port (M6): SPIR-V shader compilation ─────────────────────
     // 17 .comp shells × 3 variants (tier1, tier1_nv, tier2) = 51 .spv blobs
-    // emitted under zig-out/shaders/. Driven by glslc from $VULKAN_SDK or PATH.
-    // Embedded later by src_vulkan/spv_blobs.zig via @embedFile; the embed
-    // resolution requires the .spv files to exist at zig compile time, so
-    // `vk-shaders` must be run first (M4 will wire the implicit dependency).
-    _ = addVulkanShaderSteps(b);
-    // src_vulkan/spv_blobs.zig is intentionally NOT wired into any compile
-    // target at M6. The 51 @embedFile sites use paths "../zig-out/shaders/
-    // <name>.<tier>.spv" which Zig 0.16's `zig test` direct invocation
-    // rejects ("outside package path"), and `--embed-dir` is not honored by
-    // `zig test` either. M4 will introduce the streamlz_vk module whose
-    // package root encompasses both src_vulkan/ and the generated .spv
-    // directory; at that point spv_blobs.zig is referenced and @embedFile
-    // resolves. For M6 the contract is: `zig build vk-shaders` must produce
-    // all 51 .spv files under zig-out/shaders/.
+    // emitted under zig-out/shaders/ AND aggregated into a WriteFiles
+    // directory exposed as `vk_shaders.embed_dir`. Driven by glslc from
+    // $VULKAN_SDK or PATH. Modules that import `src_vulkan/spv_blobs.zig`
+    // must add `vk_shaders.embed_dir` via `addEmbedPath` and depend on
+    // `vk_shaders.embed_dir_step` so the .spv files exist at zig compile
+    // time and @embedFile() resolves the bare filenames.
+    const vk_shaders = addVulkanShaderSteps(b);
 
     // ── Vulkan port (M5): pure-Zig unit tests for src_vulkan/ ───────────
     // Holds the algorithm-only modules that need no Vulkan device to
@@ -184,12 +177,19 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .link_libc = true,
     });
+    // SPV blobs are baked in at compile time via the `spv_blobs` module
+    // (rooted in the WriteFiles dir alongside the .spv files). Modules
+    // that import src_vulkan/spv_blobs.zig (transitively via slz1_codec.zig)
+    // must call addSpvBlobsImport so the @import("spv_blobs") name
+    // resolves to the colocated-in-embed_dir copy.
+    addSpvBlobsImport(vk_lib_module, vk_shaders);
 
     const streamlz_vk_static = b.addLibrary(.{
         .linkage = .static,
         .name = "streamlz_vk",
         .root_module = vk_lib_module,
     });
+    streamlz_vk_static.step.dependOn(vk_shaders.embed_dir_step);
     b.installArtifact(streamlz_vk_static);
 
     const streamlz_vk_shared = b.addLibrary(.{
@@ -197,6 +197,7 @@ pub fn build(b: *std.Build) void {
         .name = "streamlz_vk",
         .root_module = vk_lib_module,
     });
+    streamlz_vk_shared.step.dependOn(vk_shaders.embed_dir_step);
     const streamlz_vk_install = b.addInstallArtifact(streamlz_vk_shared, .{});
     const streamlz_vk_hdr = b.addInstallHeaderFile(
         b.path("include/streamlz_gpu_vk.h"),
@@ -216,7 +217,9 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .link_libc = true,
     });
+    addSpvBlobsImport(vk_smoke_module, vk_shaders);
     const vk_smoke_exe = b.addExecutable(.{ .name = "vk_smoke", .root_module = vk_smoke_module });
+    vk_smoke_exe.step.dependOn(vk_shaders.embed_dir_step);
     b.installArtifact(vk_smoke_exe);
     const run_vk_smoke = b.addRunArtifact(vk_smoke_exe);
     run_vk_smoke.step.dependOn(b.getInstallStep());
@@ -317,8 +320,14 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .link_libc = true,
     });
+    // SPV blobs are baked into streamlz_vk.exe via the embedded spv_blobs
+    // module (see addSpvBlobsImport) so the binary runs from any working
+    // directory with no zig-out/shaders dep at runtime. The
+    // embed_dir_step dependency makes Zig wait for glslc to finish before
+    // compiling spv_blobs.zig.
+    addSpvBlobsImport(cli_vk_module, vk_shaders);
     const cli_vk_exe = b.addExecutable(.{ .name = "streamlz_vk", .root_module = cli_vk_module });
-    cli_vk_exe.step.dependOn(&vk_shaders_top.step);
+    cli_vk_exe.step.dependOn(vk_shaders.embed_dir_step);
     const cli_vk_install = b.addInstallArtifact(cli_vk_exe, .{});
     b.step("streamlz_vk", "Build the Vulkan-backend CLI (streamlz_vk.exe)").dependOn(&cli_vk_install.step);
 
@@ -358,10 +367,12 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .link_libc = true,
     });
+    addSpvBlobsImport(vk_abi_test_module, vk_shaders);
     const vk_abi_test_exe = b.addExecutable(.{
         .name = "vk_abi_test",
         .root_module = vk_abi_test_module,
     });
+    vk_abi_test_exe.step.dependOn(vk_shaders.embed_dir_step);
     b.installArtifact(vk_abi_test_exe);
     const run_vk_abi_test = b.addRunArtifact(vk_abi_test_exe);
     run_vk_abi_test.step.dependOn(b.getInstallStep());
@@ -384,15 +395,41 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .link_libc = true,
     });
+    addSpvBlobsImport(vk_wire_test_module, vk_shaders);
     const vk_wire_test_exe = b.addExecutable(.{
         .name = "vk_wire_format_test",
         .root_module = vk_wire_test_module,
     });
+    vk_wire_test_exe.step.dependOn(vk_shaders.embed_dir_step);
     b.installArtifact(vk_wire_test_exe);
     const run_vk_wire_test = b.addRunArtifact(vk_wire_test_exe);
     run_vk_wire_test.step.dependOn(b.getInstallStep());
     run_vk_wire_test.step.dependOn(&vk_shaders_top.step);
     b.step("vk-wire-format-test", "Run the L1 SLZ1 wire-format wrap/unwrap test").dependOn(&run_vk_wire_test.step);
+
+    // ── Vulkan port: perf measurement bench (l1_perf_bench) ───────────
+    // Standalone runner used to capture before/after wall-clock numbers
+    // for the decoder fast-batch (piece 2) and encoder warp-parallel match
+    // extension (piece 3) restorations. Reads assets/web.txt, encode +
+    // decode through the production Vulkan modules, prints ns/byte lines.
+    const vk_perf_bench_module = b.createModule(.{
+        .root_source_file = b.path("src_vulkan/l1_perf_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .link_libc = true,
+    });
+    addSpvBlobsImport(vk_perf_bench_module, vk_shaders);
+    const vk_perf_bench_exe = b.addExecutable(.{
+        .name = "vk_l1_perf_bench",
+        .root_module = vk_perf_bench_module,
+    });
+    vk_perf_bench_exe.step.dependOn(vk_shaders.embed_dir_step);
+    b.installArtifact(vk_perf_bench_exe);
+    const run_vk_perf_bench = b.addRunArtifact(vk_perf_bench_exe);
+    run_vk_perf_bench.step.dependOn(b.getInstallStep());
+    run_vk_perf_bench.step.dependOn(&vk_shaders_top.step);
+    b.step("vk-perf-bench", "Run the Vulkan L1 encode/decode wall-clock perf bench").dependOn(&run_vk_perf_bench.step);
 
     // ── Vulkan port (M9): cross-backend conformance harness ────────────
     // 4-direction (CUDA↔CUDA, CUDA→VK, VK→CUDA, VK↔VK) × 5 levels ×
@@ -444,16 +481,32 @@ pub const VulkanShaders = struct {
     /// under zig-out/shaders/.
     step: *std.Build.Step,
     /// Directory LazyPath containing every <kernel>.<variant>.spv as a
-    /// flat list. M4 will pass this to Module.addEmbedPath (paired with an
-    /// explicit step dependency on `embed_dir_step`) so the real loader
-    /// can embed blobs without a relative-path escape.
+    /// flat list, plus a copy of `spv_blobs.zig`. Used as the root
+    /// directory for the spv_blobs Zig module — @embedFile() inside
+    /// spv_blobs.zig resolves the bare .spv names against this dir.
     embed_dir: std.Build.LazyPath,
-    /// WriteFile step that materializes the embed directory; M4 consumers
-    /// must add this as an explicit step dependency (the LazyPath alone
-    /// does not pull the step into the dep graph in Zig 0.16 for
-    /// --embed-dir).
+    /// WriteFile step that materializes the embed directory. Consumers
+    /// MUST add this as an explicit `step.dependOn` so the .spv files
+    /// exist before the compile step that reads them runs.
     embed_dir_step: *std.Build.Step,
+    /// LazyPath to the copy of spv_blobs.zig that lives inside `embed_dir`.
+    /// Use this as `root_source_file` when calling `addAnonymousImport` so
+    /// the module's package root encompasses both spv_blobs.zig and the
+    /// sibling .spv files.
+    spv_blobs_zig: std.Build.LazyPath,
 };
+
+/// Wire the embedded `spv_blobs` module into `m` so calls to
+/// `@import("spv_blobs")` resolve to the colocated-in-embed_dir copy of
+/// `src_vulkan/spv_blobs.zig`. Also wires the build-time dependency so
+/// the .spv files are produced before this module's compile step runs.
+fn addSpvBlobsImport(m: *std.Build.Module, vk_shaders: VulkanShaders) void {
+    const b = m.owner;
+    const spv_mod = b.createModule(.{
+        .root_source_file = vk_shaders.spv_blobs_zig,
+    });
+    m.addImport("spv_blobs", spv_mod);
+}
 
 // ────────────────────────────────────────────────────────────────────────
 //  Vulkan SPIR-V build rules (M6)
@@ -509,9 +562,11 @@ fn resolveGlslc(b: *std.Build) []const u8 {
 fn addVulkanShaderSteps(b: *std.Build) VulkanShaders {
     const glslc = resolveGlslc(b);
     const vk_shaders_step = b.step("vk-shaders", "Compile Vulkan compute shaders to SPIR-V (17 × 3 = 51 blobs)");
-    // Single WriteFile aggregates every .spv into one generated directory;
-    // that directory is the LazyPath consumers pass to Module.addEmbedPath
-    // so @embedFile() can find bare names like "lz_encode.tier1.spv".
+    // Single WriteFile aggregates every .spv into one generated directory.
+    // The same dir also receives a copy of src_vulkan/spv_blobs.zig so its
+    // bare-filename @embedFile() calls resolve against sibling .spv files;
+    // consumers import the colocated spv_blobs.zig as a Module rooted in
+    // this generated dir (see vk_spv_blobs_module helper below).
     const spv_wf = b.addWriteFiles();
 
     for (vk_kernels) |kernel| {
@@ -537,10 +592,14 @@ fn addVulkanShaderSteps(b: *std.Build) VulkanShaders {
             vk_shaders_step.dependOn(&install.step);
         }
     }
+    // Copy spv_blobs.zig alongside the .spv files so its @embedFile("...spv")
+    // calls find the colocated blobs at compile time.
+    const blobs_in_dir = spv_wf.addCopyFile(b.path("src_vulkan/spv_blobs.zig"), "spv_blobs.zig");
     return .{
         .step = vk_shaders_step,
         .embed_dir = spv_wf.getDirectory(),
         .embed_dir_step = &spv_wf.step,
+        .spv_blobs_zig = blobs_in_dir,
     };
 }
 

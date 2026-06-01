@@ -43,15 +43,11 @@ const l1_codec = @import("l1_codec.zig");
 const wire_format = @import("wire_format.zig");
 const descriptors = @import("descriptors.zig");
 const dispatch = @import("dispatch.zig");
-
-const MAX_SPV_BYTES: usize = 1 << 20;
-const SPV_DIR_REL: []const u8 = "zig-out/shaders";
+const spv_blobs = @import("spv_blobs");
 
 pub const Slz1Error = error{
     UnsupportedTier,
-    SpvOpenFailed,
-    SpvReadFailed,
-    SpvTooLarge,
+    NoSpvForTier,
     OutOfMemory,
     OutputTooSmall,
     BufferCreateFailed,
@@ -90,29 +86,23 @@ pub fn slz1Bound(input_size: usize) usize {
     return stream_bound + fixed + per_chunk_hdr;
 }
 
-fn tierName(t: probe_mod.Tier) ?[]const u8 {
+fn tierBlob(t: probe_mod.Tier) ?spv_blobs.Tier {
     return switch (t) {
-        .tier1 => "tier1",
-        .tier1_nv => "tier1_nv",
-        .tier2 => "tier2",
+        .tier1 => .tier1,
+        .tier1_nv => .tier1_nv,
+        .tier2 => .tier2,
         .unsupported => null,
     };
 }
 
-fn loadSpv(io: std.Io, kernel: []const u8, tier_name: []const u8, dest: []u8) Slz1Error![]u8 {
-    var path_buf: [256]u8 = undefined;
-    const filename = std.fmt.bufPrint(
-        &path_buf,
-        "{s}/{s}.{s}.spv",
-        .{ SPV_DIR_REL, kernel, tier_name },
-    ) catch return error.SpvOpenFailed;
-
-    var file = std.Io.Dir.cwd().openFile(io, filename, .{}) catch return error.SpvOpenFailed;
-    defer file.close(io);
-
-    const n = file.readPositionalAll(io, dest, 0) catch return error.SpvReadFailed;
-    if (n == dest.len) return error.SpvTooLarge;
-    return dest[0..n];
+/// Copy an @embedFile()'d SPV blob into a freshly allocated 4-byte-aligned
+/// buffer. `@embedFile` returns alignment-1 bytes; vkCreateShaderModule
+/// requires pCode to be 4-byte aligned (and codeSize a multiple of 4).
+/// Callers must free the returned slice via the same allocator.
+fn dupAlignedSpv(allocator: std.mem.Allocator, spv: []const u8) Slz1Error![]align(4) u8 {
+    const buf = try allocator.alignedAlloc(u8, .@"4", spv.len);
+    @memcpy(buf, spv);
+    return buf;
 }
 
 // ── Encode path: src → SLZ1 ──────────────────────────────────────────
@@ -268,6 +258,10 @@ fn buildStreamBundle(
 
 /// Vulkan-encode `src` into the L1 streams, wrap into SLZ1, write into `out`.
 /// Returns bytes written. Uses `driver.g_default` after ensureInit.
+///
+/// SPV blobs are baked into the binary via `spv_blobs.zig` at compile time,
+/// so the `io` parameter is unused on the SPV side. Kept for ABI stability
+/// with the prior runtime-load shape and for any future host-side IO needs.
 pub fn encodeL1ToSlz1(
     ctx: *driver.Context,
     io: std.Io,
@@ -275,6 +269,7 @@ pub fn encodeL1ToSlz1(
     src: []const u8,
     out: []u8,
 ) Slz1Error!usize {
+    _ = io;
     const tier = blk: {
         const pr = probe_mod.probe(ctx.inst, ctx.pd);
         switch (pr.tier) {
@@ -282,11 +277,10 @@ pub fn encodeL1ToSlz1(
             .unsupported => return error.UnsupportedTier,
         }
     };
-    const tier_name = tierName(tier) orelse return error.UnsupportedTier;
-
-    const enc_spv_storage = try allocator.alignedAlloc(u8, .@"4", MAX_SPV_BYTES);
-    defer allocator.free(enc_spv_storage);
-    const enc_spv = try loadSpv(io, "lz_encode", tier_name, enc_spv_storage);
+    const tier_b = tierBlob(tier) orelse return error.UnsupportedTier;
+    const enc_spv_raw = spv_blobs.find("lz_encode", tier_b) orelse return error.NoSpvForTier;
+    const enc_spv = try dupAlignedSpv(allocator, enc_spv_raw);
+    defer allocator.free(enc_spv);
 
     var enc = try l1_codec.encodeL1Multi(ctx, src, enc_spv);
     defer l1_codec.freeStreams(ctx, &enc.streams);
@@ -410,6 +404,9 @@ fn destroyMappedBuffer(ctx: *driver.Context, b: *MappedBuffer) void {
 
 /// Unwrap an SLZ1 frame, run the Vulkan L1 decoder, write decoded bytes
 /// into `out`. Returns the byte count written (== original_size).
+///
+/// SPV blobs are baked into the binary via `spv_blobs.zig` at compile time,
+/// so the `io` parameter is unused on the SPV side. Kept for ABI stability.
 pub fn decodeSlz1ToBytes(
     ctx: *driver.Context,
     io: std.Io,
@@ -417,6 +414,7 @@ pub fn decodeSlz1ToBytes(
     slz_bytes: []const u8,
     out: []u8,
 ) Slz1Error!usize {
+    _ = io;
     const tier = blk: {
         const pr = probe_mod.probe(ctx.inst, ctx.pd);
         switch (pr.tier) {
@@ -424,11 +422,10 @@ pub fn decodeSlz1ToBytes(
             .unsupported => return error.UnsupportedTier,
         }
     };
-    const tier_name = tierName(tier) orelse return error.UnsupportedTier;
-
-    const dec_spv_storage = try allocator.alignedAlloc(u8, .@"4", MAX_SPV_BYTES);
-    defer allocator.free(dec_spv_storage);
-    const dec_spv = try loadSpv(io, "lz_decode", tier_name, dec_spv_storage);
+    const tier_b = tierBlob(tier) orelse return error.UnsupportedTier;
+    const dec_spv_raw = spv_blobs.find("lz_decode", tier_b) orelse return error.NoSpvForTier;
+    const dec_spv = try dupAlignedSpv(allocator, dec_spv_raw);
+    defer allocator.free(dec_spv);
 
     var stream_view: wire_format.PerChunkStreams = undefined;
     var unwrap = try wire_format.unwrapSlz1ToL1Streams(allocator, slz_bytes, &stream_view);

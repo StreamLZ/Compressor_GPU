@@ -273,10 +273,7 @@ fn mapEncodeError(err: slz1_codec.Slz1Error) c_int {
         error.OutputTooSmall => SLZ_ERROR_BUFFER_TOO_SMALL,
         error.OutOfMemory => SLZ_ERROR_OUT_OF_MEMORY,
         error.UnsupportedTier => SLZ_ERROR_VK_FEATURE_MISSING,
-        error.SpvOpenFailed,
-        error.SpvReadFailed,
-        error.SpvTooLarge,
-        => SLZ_ERROR_VK_FEATURE_MISSING,
+        error.NoSpvForTier => SLZ_ERROR_VK_FEATURE_MISSING,
         else => SLZ_ERROR_UNSUPPORTED,
     };
 }
@@ -286,10 +283,7 @@ fn mapDecodeError(err: slz1_codec.Slz1Error) c_int {
         error.OutputTooSmall => SLZ_ERROR_BUFFER_TOO_SMALL,
         error.OutOfMemory => SLZ_ERROR_OUT_OF_MEMORY,
         error.UnsupportedTier => SLZ_ERROR_VK_FEATURE_MISSING,
-        error.SpvOpenFailed,
-        error.SpvReadFailed,
-        error.SpvTooLarge,
-        => SLZ_ERROR_VK_FEATURE_MISSING,
+        error.NoSpvForTier => SLZ_ERROR_VK_FEATURE_MISSING,
         error.BadMagic,
         error.UnsupportedVersion,
         error.BadCodec,

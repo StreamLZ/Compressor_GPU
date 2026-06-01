@@ -63,7 +63,15 @@ pub const DeviceBundle = struct {
     queue_family_index: u32,
 };
 
-pub fn createDevice(pd: vk.VkPhysicalDevice) DeviceError!DeviceBundle {
+pub const DeviceCreateOptions = struct {
+    /// Enable VK_KHR_8bit_storage + Vulkan12Features.{storageBuffer8BitAccess,
+    /// shaderInt8}. Required by the optimized lz_decode.comp fast-batch path
+    /// (which reads/writes Dst as `uint8_t bytes[]` to avoid the per-byte
+    /// RMW pattern that broke the original 32-token batch).
+    enable_8bit_storage: bool = false,
+};
+
+pub fn createDevice(pd: vk.VkPhysicalDevice, opts: DeviceCreateOptions) DeviceError!DeviceBundle {
     const get_qf = vk.vkGetPhysicalDeviceQueueFamilyProperties_fn orelse return error.LoaderNotReady;
     const create = vk.vkCreateDevice_fn orelse return error.LoaderNotReady;
     const get_queue = vk.vkGetDeviceQueue_fn orelse return error.LoaderNotReady;
@@ -100,13 +108,30 @@ pub fn createDevice(pd: vk.VkPhysicalDevice) DeviceError!DeviceBundle {
         .queueCount = queue_ci.queueCount,
         .pQueuePriorities = queue_ci.pQueuePriorities,
     };
+    // Enable VK_KHR_8bit_storage (promoted in 1.2 but the extension string
+    // is still accepted) when the codec asks for it. The shaderInt8 +
+    // storageBuffer8BitAccess feature bits chained via pNext are the
+    // actual gate; the extension name keeps drivers happy on the off
+    // chance one only honors the extension form.
+    var v12_feats: vk.VkPhysicalDeviceVulkan12Features = .{};
+    var p_next: ?*const anyopaque = null;
+    var ext_names_storage: [2][*:0]const u8 = .{ "VK_KHR_8bit_storage", "VK_KHR_storage_buffer_storage_class" };
+    var ext_count: u32 = 0;
+    if (opts.enable_8bit_storage) {
+        v12_feats.storageBuffer8BitAccess = vk.VK_TRUE;
+        v12_feats.uniformAndStorageBuffer8BitAccess = vk.VK_TRUE;
+        v12_feats.shaderInt8 = vk.VK_TRUE;
+        p_next = @ptrCast(&v12_feats);
+        ext_count = 2;
+    }
     const dev_ci: vk.VkDeviceCreateInfo = .{
+        .pNext = p_next,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = @ptrCast(&queue_ci_pub),
         .enabledLayerCount = 0,
         .ppEnabledLayerNames = null,
-        .enabledExtensionCount = 0,
-        .ppEnabledExtensionNames = null,
+        .enabledExtensionCount = ext_count,
+        .ppEnabledExtensionNames = if (ext_count > 0) @ptrCast(&ext_names_storage) else null,
         .pEnabledFeatures = null,
     };
 
