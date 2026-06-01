@@ -285,24 +285,26 @@ fn buildPipeline(
     //   - We also set REQUIRE_FULL_SUBGROUPS_BIT on the stage flags so
     //     drivers that gate the pin on full-subgroups (Intel Anv at
     //     some driver versions) still honor it.
-    // NOTE: On the dev-box Intel UHD iGPU, even with all of the above
-    // enabled correctly (verified: device feature is on, pNext chain is
-    // well-formed, vkCreateComputePipelines returns VK_SUCCESS), the
-    // driver STILL reports gl_SubgroupSize == 16 inside the compute
-    // shader. The Intel Anv driver appears to silently override the
-    // pin and pick 16 (= SIMD8 lane pairs) for compute shaders that use
-    // shared memory / barriers — a known driver-specific quirk that
-    // isn't fixable from the host side. The warp-parallel match
-    // extension (lz_encode) and 32-token fast batch (lz_decode) remain
-    // disabled in favor of the slow-path serial form because of this.
-    // On NVIDIA/AMD (subgroupSize = 32 natively), the pin succeeds and
-    // the warp-parallel forms would work — they are enabled there.
+    // HISTORICAL NOTE (kept for context — see git history): the dev-box
+    // Intel UHD iGPU was previously reporting gl_SubgroupSize == 16
+    // inside compute shaders despite the requiredSubgroupSize=32 pin.
+    // Root cause: the REQUIRE_FULL_SUBGROUPS flag below was set to 0x4
+    // instead of the spec-defined 0x2, so the flag bit Vulkan saw was
+    // a reserved zero-effect bit — Intel was therefore free to split
+    // the 32-wide workgroup into 2 × SIMD16 subgroups. Fixing the
+    // constant to 0x2 makes Intel honor the pin and report
+    // gl_SubgroupSize=32 / gl_NumSubgroups=1, which is what every
+    // subgroupBallot / subgroupShuffle in lz_encode.comp assumes.
+    //
+    // Spec reference (vulkan_core.h, post-promotion of
+    // VK_EXT_subgroup_size_control to 1.3):
+    //   VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT = 0x2
     const sgsc_info: vk.VkPipelineShaderStageRequiredSubgroupSizeCreateInfo = .{
         .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
         .pNext = null,
         .requiredSubgroupSize = 32,
     };
-    const STAGE_FLAG_REQUIRE_FULL_SUBGROUPS: u32 = 0x4;
+    const STAGE_FLAG_REQUIRE_FULL_SUBGROUPS: u32 = 0x2;
     const create_cp = vk.vkCreateComputePipelines_fn orelse return error.LoaderNotReady;
     var cp_cis: [1]vk.VkComputePipelineCreateInfo = .{.{
         .stage = .{
