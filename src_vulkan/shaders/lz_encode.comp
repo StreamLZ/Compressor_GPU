@@ -724,20 +724,50 @@ void main() {
             // Match extension across the warp.
             uint match_len  = min_match_len;
             uint max_match  = end_pos - match_pos;
-            // VULKAN_PORTABILITY: the 32-stride warp-cooperative extension
-            // returned wrong match_len under at least one driver (subgroupBallot
-            // dropped the mismatch bit even when per-lane mm was true). Phase 1
-            // takes the safe lane-0-serial form; phase 4 can revisit once
-            // the divergence-mode is isolated.
-            if (lane == 0u) {
+            // Subgroup-cooperative forward extension. Uses gl_SubgroupSize
+            // as the stride so the loop works whether the driver gave us
+            // a 32-lane subgroup (NVIDIA, AMD, Intel pinned) or a 16-lane
+            // one (Intel UHD default, see history note below).
+            //
+            // PORTABILITY NOTE: We pin requiredSubgroupSize=32 in
+            // descriptors.zig::createPipelineCached, but the Intel UHD
+            // driver silently ignores the pin for compute shaders that
+            // use shared memory + barriers — it picks subgroupSize=16
+            // (= SIMD8 lane pairs) and quietly splits the 32-wide
+            // workgroup into TWO subgroups whose subgroupBallot results
+            // are independent. The original 32-stride loop missed bytes
+            // 20..31 in that case and walked past the real match
+            // boundary. Driving the stride from gl_SubgroupSize (live
+            // value, not the WARP_SIZE constant) sidesteps the split:
+            // each subgroup independently scans its own 16-byte window
+            // per iteration, both reach the same mlen for the same
+            // (match_pos, match_ref), and the (lane == 0u) post-write
+            // picks up a consistent value regardless of which subgroup
+            // wrote first.
+            {
+                uint stride = gl_SubgroupSize;
+                bool ext_found = false;
                 uint mlen = min_match_len;
-                while (mlen < max_match) {
-                    if (loadSrcByte(match_pos + mlen) != loadSrcByte(match_ref + mlen)) break;
-                    mlen += 1u;
+                for (uint ext = min_match_len; ext < max_match; ext += stride) {
+                    uint check = ext + lane;
+                    bool mm;
+                    if (check >= max_match) {
+                        mm = true;
+                    } else {
+                        uint a = loadSrcByte(match_pos + check);
+                        uint b = loadSrcByte(match_ref + check);
+                        mm = (a != b);
+                    }
+                    uint mm_mask = subgroupBallot(mm).x;
+                    if (mm_mask != 0u) {
+                        mlen = ext + findLSB(mm_mask);
+                        ext_found = true;
+                        break;
+                    }
                 }
+                if (!ext_found) mlen = max_match;
                 match_len = mlen;
             }
-            match_len = subgroupBroadcast(match_len, 0u);
 
             // Resolve offset / off_param.
             int neg_off = -int(match_pos - match_ref);

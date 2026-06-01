@@ -113,14 +113,51 @@ pub fn createDevice(pd: vk.VkPhysicalDevice, opts: DeviceCreateOptions) DeviceEr
     // storageBuffer8BitAccess feature bits chained via pNext are the
     // actual gate; the extension name keeps drivers happy on the off
     // chance one only honors the extension form.
+    //
+    // ALSO: subgroupSizeControl is enabled unconditionally so the
+    // pipeline-creation path can pin requiredSubgroupSize=32 via
+    // VkPipelineShaderStageRequiredSubgroupSizeCreateInfo. Without this
+    // feature enabled the driver is free to pick any supported subgroup
+    // size; Intel UHD picks 16 (SIMD8 pairs) which silently breaks every
+    // shader that assumes WARP_SIZE=32 (the warp-cooperative match
+    // extension in lz_encode, the 32-token fast batch in lz_decode,
+    // etc.). The feature is core in Vulkan 1.3 and widely supported on
+    // 1.2 via VK_EXT_subgroup_size_control — failing to enable here is
+    // safe because pinning fails only when the device doesn't advertise
+    // the feature (in which case we run on whatever the driver picked,
+    // matching pre-fix behavior).
     var v12_feats: vk.VkPhysicalDeviceVulkan12Features = .{};
-    var p_next: ?*const anyopaque = null;
-    var ext_names_storage: [2][*:0]const u8 = .{ "VK_KHR_8bit_storage", "VK_KHR_storage_buffer_storage_class" };
+    // Chain BOTH the v13 omnibus AND the per-extension SubgroupSizeControl
+    // features struct. Per spec, drivers should look at either form, but
+    // some drivers only look at one — sending both is the belt-and-
+    // suspenders pattern we use elsewhere (see probe.zig).
+    var sgsc_feats: vk.VkPhysicalDeviceSubgroupSizeControlFeatures = .{};
+    sgsc_feats.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES;
+    sgsc_feats.pNext = null;
+    sgsc_feats.subgroupSizeControl = vk.VK_TRUE;
+    sgsc_feats.computeFullSubgroups = vk.VK_TRUE;
+    var v13_feats: vk.VkPhysicalDeviceVulkan13Features = .{};
+    v13_feats.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    v13_feats.pNext = @ptrCast(&sgsc_feats);
+    v13_feats.subgroupSizeControl = vk.VK_TRUE;
+    v13_feats.computeFullSubgroups = vk.VK_TRUE;
+    var p_next: ?*const anyopaque = @ptrCast(&v13_feats);
+    // VK_EXT_subgroup_size_control was promoted in 1.3 — for a 1.3
+    // device the v13 feature struct is the authoritative gate; passing
+    // the EXT name to enabledExtensionNames is unnecessary and on some
+    // 1.3 loaders triggers a "extension already promoted" rejection.
+    var ext_names_storage: [2][*:0]const u8 = .{
+        "VK_KHR_8bit_storage",
+        "VK_KHR_storage_buffer_storage_class",
+    };
     var ext_count: u32 = 0;
     if (opts.enable_8bit_storage) {
+        v12_feats.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
         v12_feats.storageBuffer8BitAccess = vk.VK_TRUE;
         v12_feats.uniformAndStorageBuffer8BitAccess = vk.VK_TRUE;
         v12_feats.shaderInt8 = vk.VK_TRUE;
+        // Chain v12 → v13.
+        v12_feats.pNext = @ptrCast(&v13_feats);
         p_next = @ptrCast(&v12_feats);
         ext_count = 2;
     }

@@ -282,10 +282,16 @@ void warpScanU32(uint v, out uint exclusive, out uint total) {
 // replace this with a word-aligned cooperative copy when dst/lit are
 // runtime-aligned.
 void warpLiteralCopy(uint dst_pos, uint lit_pos, uint lit_len) {
-    if (gl_SubgroupInvocationID == 0u) {
-        for (uint i = 0u; i < lit_len; i++) {
-            storeDstByte(dst_pos + i, loadLitByte(lit_pos + i));
-        }
+    // Cooperative byte-strided copy. With Dst as a byte-typed SSBO
+    // (uint8_t b[]) and the host's subgroupSize=32 pin (or the
+    // 16-lane fallback on Intel UHD), each lane writes a unique byte
+    // address per iteration → no write races. Uses gl_SubgroupSize as
+    // the stride so the loop works regardless of whether the driver
+    // honored the pin.
+    uint lane = gl_SubgroupInvocationID;
+    uint stride = gl_SubgroupSize;
+    for (uint i = lane; i < lit_len; i += stride) {
+        storeDstByte(dst_pos + i, loadLitByte(lit_pos + i));
     }
 }
 
@@ -299,9 +305,24 @@ void warpLiteralCopy(uint dst_pos, uint lit_pos, uint lit_len) {
 // write became visible. The serial loop preserves the RLE-fill
 // semantics for offset=1 patterns (e.g. recent_offset = -1).
 void warpMatchCopy(uint dst_pos, uint match_src, uint match_len) {
-    if (gl_SubgroupInvocationID == 0u) {
-        for (uint i = 0u; i < match_len; i++) {
+    // Non-overlapping path (match_dist >= match_len): cooperative
+    // byte-strided copy across the subgroup, identical pattern to
+    // warpLiteralCopy. Overlapping path (match_dist < match_len):
+    // strictly serial on lane 0 — lane k cannot read dst[match_src+k]
+    // before lane k-1 has written it. This preserves the RLE-fill
+    // semantics for offset=1 patterns (e.g. recent_offset = -1).
+    uint lane = gl_SubgroupInvocationID;
+    uint stride = gl_SubgroupSize;
+    uint match_dist = dst_pos - match_src; // both unsigned; dst_pos > match_src.
+    if (match_dist >= match_len) {
+        for (uint i = lane; i < match_len; i += stride) {
             storeDstByte(dst_pos + i, loadDstByte(match_src + i));
+        }
+    } else {
+        if (lane == 0u) {
+            for (uint i = 0u; i < match_len; i++) {
+                storeDstByte(dst_pos + i, loadDstByte(match_src + i));
+            }
         }
     }
 }
@@ -563,15 +584,14 @@ void main() {
 
     // ── Trailing literals ───────────────────────────────────────────
     // Port of CUDA L206-209. Any literal bytes after the last token are
-    // copied verbatim into dst[dst_pos..]. The CUDA path uses a 32-lane
-    // strided copy; we serialize on lane 0 for the same reason
-    // warpLiteralCopy does (u32-packed Dst is RMW-unsafe across lanes).
-    if (lane == 0u) {
-        uint trailing = (g_lit_size > sh_lit_pos) ? (g_lit_size - sh_lit_pos) : 0u;
-        uint dst_pos = sh_dst_pos;
-        uint lit_pos = sh_lit_pos;
-        for (uint i = 0u; i < trailing; i++) {
-            storeDstByte(dst_pos + i, loadLitByte(lit_pos + i));
-        }
+    // copied verbatim into dst[dst_pos..]. With Dst as a byte SSBO each
+    // lane writes a unique byte address per iteration, so we can do a
+    // subgroup-strided cooperative copy (same shape as warpLiteralCopy).
+    uint trailing = (g_lit_size > sh_lit_pos) ? (g_lit_size - sh_lit_pos) : 0u;
+    uint t_stride = gl_SubgroupSize;
+    uint t_dst_pos = sh_dst_pos;
+    uint t_lit_pos = sh_lit_pos;
+    for (uint i = lane; i < trailing; i += t_stride) {
+        storeDstByte(t_dst_pos + i, loadLitByte(t_lit_pos + i));
     }
 }

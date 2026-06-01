@@ -32,6 +32,11 @@ pub const ProbeResult = struct {
     subgroup_size: u32,
     subgroup_size_min: u32,
     subgroup_size_max: u32,
+    /// Bitmask of VkShaderStageFlagBits indicating which shader stages
+    /// support setting a required subgroup size via
+    /// VkPipelineShaderStageRequiredSubgroupSizeCreateInfo. We need
+    /// VK_SHADER_STAGE_COMPUTE_BIT (0x20) set to pin compute pipelines.
+    required_subgroup_size_stages: u32 = 0,
     has_subgroup_size_control: bool,
     has_buffer_device_address: bool,
     has_timeline_semaphore: bool,
@@ -65,6 +70,7 @@ pub fn probe(inst: vk.VkInstance, pd: vk.VkPhysicalDevice) ProbeResult {
         .subgroup_size = 0,
         .subgroup_size_min = 0,
         .subgroup_size_max = 0,
+        .required_subgroup_size_stages = 0,
         .has_subgroup_size_control = false,
         .has_buffer_device_address = false,
         .has_timeline_semaphore = false,
@@ -108,6 +114,7 @@ pub fn probe(inst: vk.VkInstance, pd: vk.VkPhysicalDevice) ProbeResult {
         // (they're core in 1.3) but we never read min/max without the flag.
         result.subgroup_size_min = sgsc_props.minSubgroupSize;
         result.subgroup_size_max = sgsc_props.maxSubgroupSize;
+        result.required_subgroup_size_stages = sgsc_props.requiredSubgroupSizeStages;
     }
 
     // ── Vulkan 1.2 + 1.3 Features2 chain ────────────────────────────

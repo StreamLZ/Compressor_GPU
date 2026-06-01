@@ -90,6 +90,13 @@ pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2: VkStructureType = 1000
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES: VkStructureType = 1000094000;
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES: VkStructureType = 1000225000;
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES: VkStructureType = 1000225001;
+// VkPipelineShaderStageRequiredSubgroupSizeCreateInfo — chained into a
+// VkPipelineShaderStageCreateInfo to force a specific subgroup size at
+// pipeline creation. Needed because Intel UHD silently defaults to
+// subgroupSize=16 (= SIMD8 pairs) instead of the device-reported max of
+// 32, which breaks every shader that assumes WARP_SIZE=32. Promoted in
+// Vulkan 1.3 from VK_EXT_subgroup_size_control.
+pub const VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO: VkStructureType = 1000225002;
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: VkStructureType = 49;
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: VkStructureType = 53;
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES: VkStructureType = 1000175000;
@@ -1174,6 +1181,18 @@ pub const VkPipelineShaderStageCreateInfo = extern struct {
     // PipelineKey because every committed .spv uses "main".
     pName: ?[*:0]const u8 = null,
     pSpecializationInfo: ?*const VkSpecializationInfo = null,
+};
+
+// VkPipelineShaderStageRequiredSubgroupSizeCreateInfo — chain into the
+// pNext slot of VkPipelineShaderStageCreateInfo to force a specific
+// subgroup size at pipeline creation. Required because Intel UHD picks
+// subgroupSize=16 by default (SIMD8 pairs) instead of the device's
+// max-subgroupSize, which silently turns the shader's 32-wide warp
+// assumptions into broken 16-wide behavior.
+pub const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo = extern struct {
+    sType: VkStructureType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+    pNext: ?*const anyopaque = null,
+    requiredSubgroupSize: u32 = 0,
 };
 
 pub const VkComputePipelineCreateInfo = extern struct {

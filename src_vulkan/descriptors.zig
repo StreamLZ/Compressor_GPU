@@ -262,17 +262,59 @@ fn buildPipeline(
     //    cache argument is the per-Context pipeline cache when available;
     //    otherwise we pass NULL_HANDLE and the driver builds without
     //    persistence. Either way the dispatch works.
+    //
+    // Chain VkPipelineShaderStageRequiredSubgroupSizeCreateInfo with
+    // requiredSubgroupSize=32 onto the stage's pNext. Critical because:
+    //   - Every L1 compute shader is built around WARP_SIZE=32 (the
+    //     CUDA-style 32-stride match extension, 32-wide subgroupBallot,
+    //     32-token decoder fast batch, …).
+    //   - Intel UHD's default subgroupSize is 16 (= SIMD8 lane pairs),
+    //     splitting the 32-wide workgroup into TWO subgroups whose
+    //     ballots are independent. Lanes 16..31 silently form a second
+    //     subgroup whose ballot result never reaches the first, so the
+    //     warp-parallel match extension misses bytes 20..31 and walks
+    //     past the real match boundary.
+    //   - VkPhysicalDeviceSubgroupSizeControlFeatures.subgroupSizeControl
+    //     is enabled in device.zig::createDevice. The
+    //     VK_EXT_subgroup_size_control extension is requested there too.
+    // Pin requiredSubgroupSize=32 via VkPipelineShaderStageRequired
+    // SubgroupSizeCreateInfo (promoted in Vulkan 1.3 from
+    // VK_EXT_subgroup_size_control). Belt-and-suspenders:
+    //   - The host enables `subgroupSizeControl` in BOTH the v13 omnibus
+    //     and the per-extension feature struct (device.zig).
+    //   - We also set REQUIRE_FULL_SUBGROUPS_BIT on the stage flags so
+    //     drivers that gate the pin on full-subgroups (Intel Anv at
+    //     some driver versions) still honor it.
+    // NOTE: On the dev-box Intel UHD iGPU, even with all of the above
+    // enabled correctly (verified: device feature is on, pNext chain is
+    // well-formed, vkCreateComputePipelines returns VK_SUCCESS), the
+    // driver STILL reports gl_SubgroupSize == 16 inside the compute
+    // shader. The Intel Anv driver appears to silently override the
+    // pin and pick 16 (= SIMD8 lane pairs) for compute shaders that use
+    // shared memory / barriers — a known driver-specific quirk that
+    // isn't fixable from the host side. The warp-parallel match
+    // extension (lz_encode) and 32-token fast batch (lz_decode) remain
+    // disabled in favor of the slow-path serial form because of this.
+    // On NVIDIA/AMD (subgroupSize = 32 natively), the pin succeeds and
+    // the warp-parallel forms would work — they are enabled there.
+    const sgsc_info: vk.VkPipelineShaderStageRequiredSubgroupSizeCreateInfo = .{
+        .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+        .pNext = null,
+        .requiredSubgroupSize = 32,
+    };
+    const STAGE_FLAG_REQUIRE_FULL_SUBGROUPS: u32 = 0x4;
     const create_cp = vk.vkCreateComputePipelines_fn orelse return error.LoaderNotReady;
-    const cp_ci: vk.VkComputePipelineCreateInfo = .{
+    var cp_cis: [1]vk.VkComputePipelineCreateInfo = .{.{
         .stage = .{
+            .pNext = @ptrCast(&sgsc_info),
+            .flags = STAGE_FLAG_REQUIRE_FULL_SUBGROUPS,
             .stage = vk.VK_SHADER_STAGE_COMPUTE_BIT,
             .module = shader_module,
             .pName = "main",
             .pSpecializationInfo = null,
         },
         .layout = pipeline_layout,
-    };
-    const cp_cis: [1]vk.VkComputePipelineCreateInfo = .{cp_ci};
+    }};
     var pipeline: vk.VkPipeline = null;
     if (create_cp(
         ctx.dev,
