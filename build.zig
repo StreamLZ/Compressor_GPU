@@ -171,12 +171,14 @@ pub fn build(b: *std.Build) void {
 
     // ── Vulkan port (M4): streamlz_vk static + shared C ABI ─────────────
     // Sibling of the CUDA `streamlz_gpu.dll`. Exports 16 `_vk`-suffixed
-    // symbols (5 implemented, 11 returning SLZ_ERROR_UNSUPPORTED) from
-    // src_vulkan/streamlz_gpu_vk.zig. The .dll is what game engines /
-    // ML pipelines link against; the .lib is the import library on
-    // Windows + a convenience static archive on POSIX.
+    // symbols from src_vulkan/streamlz_gpu_vk.zig. The .dll is what game
+    // engines / ML pipelines link against; the .lib is the import library
+    // on Windows + a convenience static archive on POSIX.
+    //
+    // Root at the repo top (`streamlz_vk_lib_root.zig`) so the wire-format
+    // module's `../src/format/...` imports resolve inside the package.
     const vk_lib_module = b.createModule(.{
-        .root_source_file = b.path("src_vulkan/streamlz_gpu_vk.zig"),
+        .root_source_file = b.path("streamlz_vk_lib_root.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
@@ -208,7 +210,7 @@ pub fn build(b: *std.Build) void {
     // Calls slzCreate_vk + slzDestroy_vk directly via Zig import (no DLL
     // load); prints "vk smoke OK" on success. Wired as `zig build vk-smoke`.
     const vk_smoke_module = b.createModule(.{
-        .root_source_file = b.path("src_vulkan/streamlz_gpu_vk_smoke_test.zig"),
+        .root_source_file = b.path("streamlz_vk_smoke_test_root.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
@@ -300,6 +302,71 @@ pub fn build(b: *std.Build) void {
     run_vk_l1_test.step.dependOn(b.getInstallStep());
     run_vk_l1_test.step.dependOn(&vk_shaders_top.step);
     b.step("vk-l1-test", "Run the phase-4 L1 codec round-trip test").dependOn(&run_vk_l1_test.step);
+
+    // ── Vulkan port (CLI): streamlz_vk.exe — sibling of streamlz.exe ────
+    // L1-only, level=1 CLI for end users: `streamlz_vk -c f -o f.slz`,
+    // `streamlz_vk -d f.slz -o f.out`. Linked statically against the L1
+    // codec + wire-format modules. SPV blobs are loaded at runtime from
+    // `zig-out/shaders/` (same pattern as the test exes), so the binary
+    // must be invoked with cwd set to a directory containing
+    // `zig-out/shaders/*.spv` — typically the repo root during dev.
+    const cli_vk_module = b.createModule(.{
+        .root_source_file = b.path("cli_vk_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .link_libc = true,
+    });
+    const cli_vk_exe = b.addExecutable(.{ .name = "streamlz_vk", .root_module = cli_vk_module });
+    cli_vk_exe.step.dependOn(&vk_shaders_top.step);
+    const cli_vk_install = b.addInstallArtifact(cli_vk_exe, .{});
+    b.step("streamlz_vk", "Build the Vulkan-backend CLI (streamlz_vk.exe)").dependOn(&cli_vk_install.step);
+
+    // ── Vulkan port (CLI test): self-roundtrip + cross-backend ───────────
+    // Spawns streamlz_vk.exe and streamlz.exe (the CUDA build) via
+    // std.process.Child to verify four directions of round-trip on
+    // assets/web.txt: VK→VK, CUDA→CUDA(skipped — already covered by
+    // existing CUDA tests), VK→CUDA, CUDA→VK. Reports PASS/FAIL lines.
+    const cli_vk_test_module = b.createModule(.{
+        .root_source_file = b.path("cli_vk_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .link_libc = true,
+    });
+    const cli_vk_test_exe = b.addExecutable(.{
+        .name = "vk_cli_test",
+        .root_module = cli_vk_test_module,
+    });
+    b.installArtifact(cli_vk_test_exe);
+    const run_cli_vk_test = b.addRunArtifact(cli_vk_test_exe);
+    run_cli_vk_test.step.dependOn(b.getInstallStep());
+    run_cli_vk_test.step.dependOn(&cli_vk_install.step);
+    run_cli_vk_test.step.dependOn(&vk_shaders_top.step);
+    b.step("vk-cli-test", "Run the streamlz_vk.exe CLI self + cross-backend round-trip test").dependOn(&run_cli_vk_test.step);
+
+    // ── Vulkan port (C ABI roundtrip): end-to-end through the public ABI ─
+    // Calls slzCreate_vk + slzCompressHost_vk + slzDecompressHost_vk +
+    // slzDestroy_vk on a 1 MiB prefix of `assets/web.txt` and asserts a
+    // byte-equal round trip. Same SPV-blobs-from-zig-out/shaders runtime
+    // dependency as vk-l1-test (the SPV files are loaded by slz1_codec
+    // through std.Io). Wired as `zig build vk-abi-test`.
+    const vk_abi_test_module = b.createModule(.{
+        .root_source_file = b.path("c_abi_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .link_libc = true,
+    });
+    const vk_abi_test_exe = b.addExecutable(.{
+        .name = "vk_abi_test",
+        .root_module = vk_abi_test_module,
+    });
+    b.installArtifact(vk_abi_test_exe);
+    const run_vk_abi_test = b.addRunArtifact(vk_abi_test_exe);
+    run_vk_abi_test.step.dependOn(b.getInstallStep());
+    run_vk_abi_test.step.dependOn(&vk_shaders_top.step);
+    b.step("vk-abi-test", "Run the C ABI end-to-end round-trip test").dependOn(&run_vk_abi_test.step);
 
     // ── Vulkan port (L1 wire-format): SLZ1 wrap/unwrap conformance ─────
     // Wraps the L1 codec's raw streams into a real .slz file (CPU-side)

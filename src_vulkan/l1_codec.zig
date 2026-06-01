@@ -220,7 +220,7 @@ fn resolveDeviceFn(comptime T: type, dev: vk.VkDevice, name: [*:0]const u8) ?T {
     return null;
 }
 
-fn ensureBufferFnSlots(ctx: *driver.Context) void {
+pub fn ensureBufferFnSlots(ctx: *driver.Context) void {
     if (vk.vkCreateBuffer_fn == null)
         vk.vkCreateBuffer_fn = resolveDeviceFn(vk.FnCreateBuffer, ctx.dev, "vkCreateBuffer");
     if (vk.vkDestroyBuffer_fn == null)

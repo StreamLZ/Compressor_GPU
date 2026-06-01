@@ -17,8 +17,26 @@ const std = @import("std");
 
 const driver = @import("driver.zig");
 const probe_mod = @import("probe.zig");
+const slz1_codec = @import("slz1_codec.zig");
 
 const allocator = std.heap.c_allocator;
+
+/// Process-singleton `std.Io.Threaded` instance for SPV-blob filesystem
+/// loads. Initialised lazily on the first compress / decompress call —
+/// the smoke-test path that only exercises slzCreate_vk + slzDestroy_vk
+/// avoids the threaded io chassis. Never torn down (a future
+/// `slzShutdown_vk` could do this); the OS reclaims the thread pool at
+/// process exit.
+var g_io_threaded: std.Io.Threaded = undefined;
+var g_io_inited: bool = false;
+
+fn ensureIo() std.Io {
+    if (!g_io_inited) {
+        g_io_threaded = std.Io.Threaded.init(allocator, .{});
+        g_io_inited = true;
+    }
+    return g_io_threaded.io();
+}
 
 // Version string for the Vulkan backend. Kept in sync with
 // `src/version.zig` by the CHANGELOG bump checklist; the two are not
@@ -50,19 +68,19 @@ comptime {
 }
 
 // ── ABI structs (shared layout with the CUDA path) ────────────────────
-const CompressOpts = extern struct {
+pub const CompressOpts = extern struct {
     level: c_int = 5,
     enable_profiling: c_int = 0,
     effective_level_out: c_int = 0,
     reserved: [5]c_int = @splat(0),
 };
 
-const DecompressOpts = extern struct {
+pub const DecompressOpts = extern struct {
     enable_profiling: c_int = 0,
     reserved: [7]c_int = @splat(0),
 };
 
-const KernelTimingC = extern struct {
+pub const KernelTimingC = extern struct {
     name: [*:0]const u8,
     ms: f32,
 };
@@ -160,6 +178,12 @@ pub export fn slzUnregisterBuffer_vk(
 // Returns `int` (not slzStatus_t) to match the header — the byte count
 // surface mirrors the CUDA contract once implemented.
 
+/// v1 device-pointer variant: dereferences `d_input` and `d_output`
+/// directly as host pointers — i.e. the caller is expected to pass
+/// already-mapped or unified-memory pointers. True device-to-device
+/// dispatch requires VkBufferDeviceAddress + descriptor plumbing
+/// (BDA path) and is deferred to a later wave. Behaviour is otherwise
+/// identical to `slzCompressHost_vk`.
 pub export fn slzCompress_vk(
     handle: ?*VkContext,
     d_input: ?*const anyopaque,
@@ -168,13 +192,7 @@ pub export fn slzCompress_vk(
     output_capacity: usize,
     opts: CompressOpts,
 ) c_int {
-    _ = handle;
-    _ = d_input;
-    _ = input_size;
-    _ = d_output;
-    _ = output_capacity;
-    _ = opts;
-    return SLZ_ERROR_UNSUPPORTED;
+    return slzCompressHost_vk(handle, d_input, input_size, d_output, output_capacity, opts);
 }
 
 pub export fn slzCompressHost_vk(
@@ -185,15 +203,26 @@ pub export fn slzCompressHost_vk(
     output_capacity: usize,
     opts: CompressOpts,
 ) c_int {
-    _ = handle;
-    _ = input;
-    _ = input_size;
-    _ = output;
-    _ = output_capacity;
-    _ = opts;
-    return SLZ_ERROR_UNSUPPORTED;
+    _ = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    if (input == null and input_size != 0) return SLZ_ERROR_INVALID_ARG;
+    if (output == null) return SLZ_ERROR_INVALID_ARG;
+    if (opts.level != 1) return SLZ_ERROR_UNSUPPORTED;
+
+    const src_ptr: [*]const u8 = @ptrCast(input.?);
+    const src: []const u8 = src_ptr[0..input_size];
+    const out_ptr: [*]u8 = @ptrCast(output.?);
+    const out: []u8 = out_ptr[0..output_capacity];
+
+    const io = ensureIo();
+    const written = slz1_codec.encodeL1ToSlz1(&driver.g_default, io, allocator, src, out) catch |err|
+        return mapEncodeError(err);
+    return @intCast(written);
 }
 
+/// v1 device-pointer variant: dereferences `d_input` and `d_output`
+/// directly as host pointers. True device-to-device dispatch requires
+/// BDA plumbing and is deferred to a later wave. Behaviour is otherwise
+/// identical to `slzDecompressHost_vk`.
 pub export fn slzDecompress_vk(
     handle: ?*VkContext,
     d_input: ?*const anyopaque,
@@ -202,13 +231,7 @@ pub export fn slzDecompress_vk(
     output_capacity: usize,
     opts: DecompressOpts,
 ) c_int {
-    _ = handle;
-    _ = d_input;
-    _ = input_size;
-    _ = d_output;
-    _ = output_capacity;
-    _ = opts;
-    return SLZ_ERROR_UNSUPPORTED;
+    return slzDecompressHost_vk(handle, d_input, input_size, d_output, output_capacity, opts);
 }
 
 pub export fn slzDecompressHost_vk(
@@ -219,24 +242,69 @@ pub export fn slzDecompressHost_vk(
     output_capacity: usize,
     opts: DecompressOpts,
 ) c_int {
-    _ = handle;
-    _ = input;
-    _ = input_size;
-    _ = output;
-    _ = output_capacity;
     _ = opts;
-    return SLZ_ERROR_UNSUPPORTED;
+    _ = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    if (input == null and input_size != 0) return SLZ_ERROR_INVALID_ARG;
+    if (output == null and output_capacity != 0) return SLZ_ERROR_INVALID_ARG;
+
+    const src_ptr: [*]const u8 = @ptrCast(input.?);
+    const src: []const u8 = src_ptr[0..input_size];
+    const out_ptr: [*]u8 = @ptrCast(output.?);
+    const out: []u8 = out_ptr[0..output_capacity];
+
+    const io = ensureIo();
+    const written = slz1_codec.decodeSlz1ToBytes(&driver.g_default, io, allocator, src, out) catch |err|
+        return mapDecodeError(err);
+    return @intCast(written);
 }
 
 pub export fn slzCompressBound_vk(input_size: usize) usize {
-    // Mirrors the CUDA-side `slzCompressBound` formula at high level —
-    // worst-case is bounded by `encoder.compressBound`. M4 returns a
-    // safe overestimate (input_size + 8 KiB headers + 6.25 % expansion
-    // pad). The encode wave-2 milestones replace this with the exact
-    // shared formula from `src/encode/streamlz_encoder.zig`.
-    const expansion_pad: usize = input_size / 16; // 6.25 %
-    const fixed_header_pad: usize = 8 * 1024;
-    return input_size + expansion_pad + fixed_header_pad;
+    // Loose upper bound covering the worst-case L1-encoded SLZ1 frame:
+    // ~2x stream expansion (spec §4.1) plus per-chunk headers and a
+    // global 8 KiB pad. Matches the formula in `slz1_codec.slz1Bound`;
+    // see that comment for the breakdown.
+    return slz1_codec.slz1Bound(input_size);
+}
+
+// ── Error mapping helpers ─────────────────────────────────────────────
+
+fn mapEncodeError(err: slz1_codec.Slz1Error) c_int {
+    return switch (err) {
+        error.OutputTooSmall => SLZ_ERROR_BUFFER_TOO_SMALL,
+        error.OutOfMemory => SLZ_ERROR_OUT_OF_MEMORY,
+        error.UnsupportedTier => SLZ_ERROR_VK_FEATURE_MISSING,
+        error.SpvOpenFailed,
+        error.SpvReadFailed,
+        error.SpvTooLarge,
+        => SLZ_ERROR_VK_FEATURE_MISSING,
+        else => SLZ_ERROR_UNSUPPORTED,
+    };
+}
+
+fn mapDecodeError(err: slz1_codec.Slz1Error) c_int {
+    return switch (err) {
+        error.OutputTooSmall => SLZ_ERROR_BUFFER_TOO_SMALL,
+        error.OutOfMemory => SLZ_ERROR_OUT_OF_MEMORY,
+        error.UnsupportedTier => SLZ_ERROR_VK_FEATURE_MISSING,
+        error.SpvOpenFailed,
+        error.SpvReadFailed,
+        error.SpvTooLarge,
+        => SLZ_ERROR_VK_FEATURE_MISSING,
+        error.BadMagic,
+        error.UnsupportedVersion,
+        error.BadCodec,
+        error.BadBlockSize,
+        error.BadScGroupSize,
+        error.BadInternalHeader,
+        error.BadChunkHeader,
+        error.BadSubChunkHeader,
+        error.MissingContentSize,
+        error.Truncated,
+        error.TooManyChunks,
+        error.BadFrame,
+        => SLZ_ERROR_CORRUPT_FRAME,
+        else => SLZ_ERROR_UNSUPPORTED,
+    };
 }
 
 pub export fn slzMakeDeviceOnlyHandle_vk(
