@@ -306,6 +306,35 @@ pub fn build(b: *std.Build) void {
     run_vk_l1_test.step.dependOn(&vk_shaders_top.step);
     b.step("vk-l1-test", "Run the phase-4 L1 codec round-trip test").dependOn(&run_vk_l1_test.step);
 
+    // ── Vulkan port (L1 codec, scale): large-corpus round-trip ──────────
+    // Stretches the L1 codec from ~4.5 MB (vk-l1-test's web.txt ceiling)
+    // up through enwik8 full (100 MB, ~800 chunks) and silesia_all.tar
+    // full (200 MB, ~1600 chunks). Each case: VK-encode -> VK-decode ->
+    // byte-equal, plus per-stage ns/byte timings so the perf table can be
+    // built from one run. Wired as an OPT-IN target (`zig build
+    // vk-l1-scale-test`) and explicitly NOT folded into `zig build test`
+    // because the full silesia case touches ~3 GB of host-visible Vulkan
+    // memory and takes minutes per run.
+    const vk_l1_scale_test_module = b.createModule(.{
+        .root_source_file = b.path("src_vulkan/l1_codec_scale_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .link_libc = true,
+    });
+    const vk_l1_scale_test_exe = b.addExecutable(.{
+        .name = "vk_l1_scale_test",
+        .root_module = vk_l1_scale_test_module,
+    });
+    b.installArtifact(vk_l1_scale_test_exe);
+    const run_vk_l1_scale_test = b.addRunArtifact(vk_l1_scale_test_exe);
+    run_vk_l1_scale_test.step.dependOn(b.getInstallStep());
+    run_vk_l1_scale_test.step.dependOn(&vk_shaders_top.step);
+    // Surface stdout/stderr live so the per-case PASS/FAIL lines stream
+    // out during the run rather than being buffered until exit.
+    run_vk_l1_scale_test.has_side_effects = true;
+    b.step("vk-l1-scale-test", "Run the L1 codec large-corpus scale test (16 MB -> 200 MB)").dependOn(&run_vk_l1_scale_test.step);
+
     // ── Vulkan port (CLI): streamlz_vk.exe — sibling of streamlz.exe ────
     // L1-only, level=1 CLI for end users: `streamlz_vk -c f -o f.slz`,
     // `streamlz_vk -d f.slz -o f.out`. Linked statically against the L1
@@ -406,6 +435,31 @@ pub fn build(b: *std.Build) void {
     run_vk_wire_test.step.dependOn(b.getInstallStep());
     run_vk_wire_test.step.dependOn(&vk_shaders_top.step);
     b.step("vk-wire-format-test", "Run the L1 SLZ1 wire-format wrap/unwrap test").dependOn(&run_vk_wire_test.step);
+
+    // ── Vulkan port (L1 wire-format SCALE): full-corpus cross-backend ────
+    // Companion to vk-wire-format-test at production scale: VK↔CUDA on
+    // enwik8 full (100 MB) and silesia full (200 MB). Validates the
+    // CPU-side wrap/unwrap path has no O(n²) hiding in it and that the
+    // SLZ1 wire format survives at production input sizes. Opt-in target
+    // (`zig build vk-wire-format-scale-test`) — runs minutes per pass.
+    // Same SPV / streamlz.exe runtime deps as the baseline test.
+    const vk_wire_scale_test_module = b.createModule(.{
+        .root_source_file = b.path("wire_format_scale_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .link_libc = true,
+    });
+    const vk_wire_scale_test_exe = b.addExecutable(.{
+        .name = "vk_wire_format_scale_test",
+        .root_module = vk_wire_scale_test_module,
+    });
+    b.installArtifact(vk_wire_scale_test_exe);
+    const run_vk_wire_scale_test = b.addRunArtifact(vk_wire_scale_test_exe);
+    run_vk_wire_scale_test.step.dependOn(b.getInstallStep());
+    run_vk_wire_scale_test.step.dependOn(&vk_shaders_top.step);
+    run_vk_wire_scale_test.has_side_effects = true;
+    b.step("vk-wire-format-scale-test", "Run the L1 SLZ1 wire-format wrap/unwrap test at production scale (100 MB / 200 MB)").dependOn(&run_vk_wire_scale_test.step);
 
     // ── Vulkan port: perf measurement bench (l1_perf_bench) ───────────
     // Standalone runner used to capture before/after wall-clock numbers

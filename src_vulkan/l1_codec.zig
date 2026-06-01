@@ -123,10 +123,17 @@ pub const L1Error = error{
     dispatch.DispatchError;
 
 /// Hard cap on chunks per encode. Bounds the per-chunk size sidecar
-/// arrays so we never need heap allocation in the codec module. 256
-/// chunks × 128 KiB = 32 MiB max input — comfortably above the 4.5 MiB
-/// web.txt smoke test and the 4 MiB enwik8 prefix test.
-pub const MAX_CHUNKS: u32 = 256;
+/// arrays so we never need heap allocation in the codec module. 4096
+/// chunks × 128 KiB = 512 MiB max input — covers the silesia 200 MB
+/// scale test plus headroom for ~2x growth without re-tuning. Bumped
+/// from the original 256 (= 32 MiB cap) when the L1 scale test
+/// required full-corpus runs on enwik8 (100 MB) + silesia (200 MB).
+///
+/// Per-chunk sidecar growth from this bump: L1Streams gains
+/// (4096-256) * 4 bytes * 8 arrays = ~120 KiB, total ~128 KiB struct.
+/// L1Streams is passed by value in a few host paths — the Windows
+/// 4 MiB default stack absorbs it without trouble.
+pub const MAX_CHUNKS: u32 = 4096;
 
 // ── Public types ──────────────────────────────────────────────────
 
