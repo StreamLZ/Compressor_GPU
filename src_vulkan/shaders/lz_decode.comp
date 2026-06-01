@@ -437,42 +437,143 @@ void main() {
         uint cmd_pos = sh_cmd_pos;
 
         // ── Fast-path batch detect ──────────────────────────────────
-        // Load up to 32 cmd bytes, one per lane. Lanes past batch_size
-        // load 0 (a valid standard token = "0 lit, 0 match, off16
-        // consumed") so they don't pollute the any_long ballot.
-        uint remaining  = g_cmd_size - cmd_pos;
-        uint batch_size = (remaining < WARP_SIZE) ? remaining : WARP_SIZE;
+        // Load up to gl_SubgroupSize cmd bytes, one per lane. Lanes past
+        // batch_size load TOKEN_SHORT_MIN (a valid standard token = "0
+        // lit, 0 match, no off16 consumed") so they don't pollute the
+        // any_long ballot.
+        //
+        // PORTABILITY NOTE: gl_SubgroupSize is the LIVE subgroup width.
+        // On NVIDIA / AMD / Intel-pinned this is 32. On Intel UHD iGPU
+        // the requiredSubgroupSize=32 pin is silently ignored and the
+        // 32-wide workgroup splits into TWO 16-wide subgroups. The
+        // subgroup-cooperative idioms below (subgroupBallot,
+        // subgroupExclusiveAdd, subgroupShuffle, findMSB on the
+        // inclusive-prefix mask) all span only the LANE'S OWN
+        // subgroup, so driving batch_size from gl_SubgroupSize keeps
+        // every per-lane index within [0, gl_SubgroupSize). Both
+        // subgroups then process the same batch redundantly (they read
+        // the same cmd / lit / off16 bytes and write the same dst
+        // bytes) — wasted work but byte-idempotent, matching how the
+        // slow path already coexists with multi-subgroup workgroups.
+        uint sg_size    = gl_SubgroupSize;
+        // Cap remaining at the active block's cmd boundary
+        // (sh_block_cmd_end). The block-transition prologue at the top
+        // of the outer loop only fires on `sh_cmd_pos == sh_block_cmd_end`,
+        // so a batch that strides over the boundary would silently skip
+        // the off32 cursor switch and corrupt every subsequent token.
+        // sh_block_cmd_end is always ≤ g_cmd_size (set by the prologue
+        // in main()), so it's safe to use as the tighter bound.
+        uint remaining  = sh_block_cmd_end - cmd_pos;
+        uint batch_size = (remaining < sg_size) ? remaining : sg_size;
         bool my_valid   = (lane < batch_size);
         uint my_cmd     = my_valid ? loadCmdByte(cmd_pos + lane) : TOKEN_SHORT_MIN;
         bool my_is_long = my_valid && (my_cmd < TOKEN_SHORT_MIN);
         uint any_long   = subgroupBallot(my_is_long).x;
 
-        // ── Fast batched path NOT RE-ENABLED ──────────────────────────
-        // Piece 2 swapped the Dst SSBO to `uint8_t b[]` via
-        // GL_EXT_shader_8bit_storage, which DOES make the slow path
-        // faster (each storeDstByte is a direct byte store, not an
-        // atomicAnd/atomicOr u32 RMW). Two fast-batch reconstructions
-        // were attempted on top:
-        //   1. Lane-0-serial inner loop (mirrors the slow path's per-
-        //      token work but without barriers). Fails the same way
-        //      the original u32-RMW attempt did: 16 bytes of valid
-        //      output then zeros, starting at the cmd index that
-        //      precedes the next TOKEN_LONG_NEAR. Memory barriers
-        //      (per-byte, per-token, end-of-batch) did NOT fix it.
-        //   2. CUDA-style cooperative warp-parallel copy with
-        //      subgroupShuffle for the per-batch fresh-offset chain.
-        //      Failed catastrophically across every corpus, including
-        //      cases the lane-0-serial form passed. Probably an issue
-        //      with the per-lane offset broadcasting when use_recent
-        //      mixes with consumes_off16 inside the same warp.
-        // Slow path correctness is unaffected and IS faster now (no
-        // u32 RMW). Leaving the fallback in place; a proper fast batch
-        // restoration is left to a future investigation that has the
-        // bandwidth to chase Vulkan SSBO memory-model coherence
-        // semantics across drivers.
-        if (false && any_long == 0u) {
-            // (intentionally empty — fast batch is disabled, fall through
-            //  to the slow scalar path below.)
+        // ── Fast batched path (subgroup-cooperative, sg_size tokens) ─
+        // Port of src/decode/lz_decode_raw.cuh:46-134. Every lane
+        // decodes its own token, prefix-scans into off16 / dst / lit
+        // streams, computes its match_offset (folding the use_recent
+        // → last-fresh-offset chain via an inclusive-prefix-mask
+        // findMSB), and then the per-k loop broadcasts each lane's
+        // parsed fields to drive the cooperative copies.
+        if (any_long == 0u) {
+            uint my_lit_len     = my_valid ? (my_cmd & TOKEN_LIT_MASK) : 0u;
+            uint my_match_len   = my_valid ? ((my_cmd >> TOKEN_MATCH_SHIFT) & TOKEN_MATCH_MASK) : 0u;
+            uint my_use_recent  = my_valid ? ((my_cmd >> TOKEN_USE_RECENT_SHIFT) & TOKEN_USE_RECENT_MASK) : 0u;
+            uint my_consumes_off16 = (my_valid && my_use_recent == 0u) ? 1u : 0u;
+
+            uint my_off16_local;
+            uint total_off16_used;
+            warpScanU32(my_consumes_off16, my_off16_local, total_off16_used);
+
+            int my_match_offset = sh_recent_offset;
+            if (my_consumes_off16 != 0u) {
+                uint entry_idx = sh_off16_pos + my_off16_local;
+                if (entry_idx < g_off16_count) {
+                    uint v = loadOff16Entry(entry_idx);
+                    my_match_offset = -int(v);
+                }
+            }
+
+            // Fresh-offset broadcast: every use_recent lane k inherits
+            // the most-recent fresh-offset lane strictly before it. The
+            // inclusive-prefix mask `(2u << lane) - 1u` produces bits
+            // [0, lane], one bit per lane in THIS subgroup; ANDing with
+            // fresh_mask isolates fresh-offset lanes ≤ lane. findMSB
+            // returns the highest such lane, which is the latest fresh
+            // offset visible to lane k. Subgroup-uniform call requires
+            // every lane to invoke subgroupShuffle with the same
+            // dynamic index space; src_lane is clamped to [0, sg_size).
+            uint fresh_mask = subgroupBallot(my_consumes_off16 != 0u).x;
+            uint my_prefix  = fresh_mask & ((2u << lane) - 1u);
+            int  src_lane   = (my_prefix != 0u) ? findMSB(my_prefix) : 0;
+            int  shuffled_off = subgroupShuffle(my_match_offset, uint(src_lane));
+            if (my_use_recent != 0u && my_prefix != 0u) {
+                my_match_offset = shuffled_off;
+            }
+
+            uint my_total = my_lit_len + my_match_len;
+            uint my_dst_local;
+            uint total_dst;
+            warpScanU32(my_total, my_dst_local, total_dst);
+            uint my_lit_local;
+            uint total_lit;
+            warpScanU32(my_lit_len, my_lit_local, total_lit);
+
+            uint base_dst = sh_dst_pos;
+            uint base_lit = sh_lit_pos;
+
+            // Per-token cooperative copy. Each lane broadcasts its
+            // parsed fields via subgroupShuffle; all lanes then run
+            // warpLiteralCopy / warpMatchCopy together. k indexes
+            // tokens within THIS subgroup's batch (k < sg_size); the
+            // shuffle src lane is always in [0, sg_size).
+            for (uint k = 0u; k < batch_size; k++) {
+                uint k_lit_len    = subgroupShuffle(my_lit_len,     k);
+                uint k_match_len  = subgroupShuffle(my_match_len,   k);
+                int  k_match_off  = subgroupShuffle(my_match_offset, k);
+                uint k_dst_local  = subgroupShuffle(my_dst_local,   k);
+                uint k_lit_local  = subgroupShuffle(my_lit_local,   k);
+
+                uint this_dst_pos = base_dst + k_dst_local;
+                uint this_lit_pos = base_lit + k_lit_local;
+
+                if (k_lit_len > 0u) {
+                    warpLiteralCopy(this_dst_pos, this_lit_pos, k_lit_len);
+                    subgroupBarrier();
+                    subgroupMemoryBarrierBuffer();
+                }
+                uint copy_dst = this_dst_pos + k_lit_len;
+                if (k_match_len > 0u) {
+                    uint match_src = uint(int(copy_dst) + k_match_off);
+                    warpMatchCopy(copy_dst, match_src, k_match_len);
+                    subgroupBarrier();
+                    subgroupMemoryBarrierBuffer();
+                }
+            }
+
+            // Latch the newest fresh offset across this batch into
+            // sh_recent_offset. Every lane must call subgroupShuffle
+            // uniformly with the same src index, so the shuffle runs
+            // on every lane and lane 0 alone publishes the result.
+            // (last_fresh is subgroup-uniform — fresh_mask is itself
+            // the subgroupBallot of every lane's consumes_off16, so
+            // every lane computes the same findMSB.)
+            int  last_fresh_lane = (fresh_mask != 0u) ? findMSB(fresh_mask) : 0;
+            int  batch_recent_off = subgroupShuffle(my_match_offset, uint(last_fresh_lane));
+
+            if (lane == 0u) {
+                sh_cmd_pos   = cmd_pos + batch_size;
+                sh_dst_pos   = base_dst + total_dst;
+                sh_lit_pos   = base_lit + total_lit;
+                sh_off16_pos = sh_off16_pos + total_off16_used;
+                if (fresh_mask != 0u) sh_recent_offset = batch_recent_off;
+            }
+            subgroupBarrier();
+            subgroupMemoryBarrierShared();
+            subgroupMemoryBarrierBuffer();
+            continue;
         }
 
         // ── Slow scalar path (lane 0 parses one token) ──────────────
