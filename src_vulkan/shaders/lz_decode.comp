@@ -3,9 +3,9 @@
 // plus src/decode/lz_decode_core.cuh (warpScanU32, warpLiteralCopy,
 // warpMatchCopy) and src/decode/slz_wire_format.cuh (readLength).
 //
-// Phase-1 simplifications (locked by docs/vulkan_l1_codec_spec.md):
+// Phase-1 / phase-1.5 simplifications (locked by docs/vulkan_l1_codec_spec.md):
 //   * No header wrapping — decoder reads 4 raw streams (cmd, lit, off16,
-//     length) + sizes via push constants, writes dst directly.
+//     length) + sizes via per-chunk descriptor, writes dst directly.
 //   * OFF16_SPLIT = false (interleaved u16 LE off16 entries only).
 //   * No off32 stream: tokens 2 and 3..23 (long-far + short-far) cannot
 //     appear in a phase-1 stream because the encoder rejects all
@@ -14,23 +14,41 @@
 //   * initial_copy = 0, dst_offset = 0 (encoder also skips the initial
 //     8-byte verbatim copy in phase 1; recent_offset still seeded to
 //     INITIAL_RECENT_OFFSET = -8 to match CUDA).
-//   * Single workgroup per chunk; phase 1 dispatches one chunk only.
+//   * Workgroup-per-chunk: gl_WorkGroupID.x identifies the chunk; each
+//     chunk has its own src/dst slices given by ChunkDescs.
 //
 // Buffer layout matches the encoder's u32-packed scheme (avoids the
 // shaderInt8 / storageBuffer8BitAccess feature dependency and keeps the
 // decoder symmetrical with the encoder for round-trip testing):
-//   set=0, binding=0  Cmd     readonly  - token stream
-//   set=0, binding=1  Lit     readonly  - literal stream
-//   set=0, binding=2  Off16   readonly  - u16 LE offsets (byte-addressed)
-//   set=0, binding=3  Length  readonly  - variable-length stream
-//   set=0, binding=4  Dst     buffer    - decoded output (RMW, lane 0 only)
+//   set=0, binding=0  Cmd         readonly  - token stream (all chunks concatenated)
+//   set=0, binding=1  Lit         readonly  - literal stream
+//   set=0, binding=2  Off16       readonly  - u16 LE offsets (byte-addressed)
+//   set=0, binding=3  Length      readonly  - variable-length stream
+//   set=0, binding=4  Dst         buffer    - decoded output (RMW, lane 0 only)
+//   set=0, binding=5  ChunkDescs  readonly  - per-chunk 8 u32:
+//       [0] dst_offset      (byte offset into Dst for this chunk's first byte)
+//       [1] dst_size        (bytes this chunk should produce)
+//       [2] lit_src_word_base    (u32 word base of this chunk's lit stream)
+//       [3] lit_size        (bytes)
+//       [4] cmd_src_word_base
+//       [5] cmd_size        (bytes)
+//       [6] off16_src_word_base  (entry 0 byte address = base*4)
+//       [7] off16_count     (u16 entries)
+//       (length_src_word_base derived from lit_src_word_base since each
+//        stream shares the same chunk_capacity-word stride; we still
+//        pass it explicitly via a 12-slot stride layout below.)
 //
-// Push constants (20 bytes):
-//   uint cmd_size           : bytes in cmd_buf
-//   uint lit_size           : bytes in lit_buf
-//   uint off16_count        : u16 entries in off16_buf
-//   uint length_remaining   : bytes in length_buf
-//   uint dst_size           : original input size (bound for trailing copy)
+// To keep the layout simple+aligned, ChunkDescs is 12 u32 per chunk:
+//   [0] dst_offset
+//   [1] dst_size
+//   [2] cmd_word_base, [3] cmd_size
+//   [4] lit_word_base, [5] lit_size
+//   [6] off16_word_base, [7] off16_count
+//   [8] length_word_base, [9] length_size
+//   [10..11] reserved
+//
+// Push constants (4 bytes):
+//   uint n_chunks       : number of chunks (== gl_NumWorkGroups.x)
 //
 // Subgroup size: hard-required = 32 (enforced by host pipeline creation).
 
@@ -57,14 +75,27 @@ layout(set = 0, binding = 3) readonly buffer Length { uint w[]; } length_buf;
 // and the per-byte RMW pattern relies on each store being visible to
 // the next load — including loads from other lanes after a barrier.
 layout(set = 0, binding = 4) coherent buffer Dst    { uint w[]; } dst_buf;
+layout(set = 0, binding = 5) readonly buffer ChunkDescs { uint d[]; } chunks_buf;
 
 layout(push_constant) uniform PC {
-    uint cmd_size;
-    uint lit_size;
-    uint off16_count;
-    uint length_remaining;
-    uint dst_size;
+    uint n_chunks;
 } pc;
+
+// Per-chunk push-equivalent state. Populated by main()'s prologue from
+// the workgroup's ChunkDescs entry. All `pc.<field>` references in the
+// original single-chunk shader become `g_<field>`.
+shared uint g_cmd_size;
+shared uint g_lit_size;
+shared uint g_off16_count;
+shared uint g_length_remaining;
+shared uint g_dst_size;
+
+// Per-chunk byte/word bases into the wide global streams.
+shared uint g_cmd_byte_base;
+shared uint g_lit_byte_base;
+shared uint g_off16_byte_base;
+shared uint g_length_byte_base;
+shared uint g_dst_byte_base;
 
 // ── Constants (mirror src/decode/slz_wire_format.cuh) ───────────────
 const uint WARP_SIZE                = 32u;
@@ -94,24 +125,31 @@ const int  INITIAL_RECENT_OFFSET    = -8;
 // "stream exhausted"; the decoder respects the size push constants
 // before calling these except in the readLength extended path which
 // guards against length_remaining itself).
+// Every per-stream load adds the workgroup's chunk byte base so two
+// chunks never share a u32 word. Bases are byte-aligned to 4 host-side
+// (chunk_capacity is a multiple of 4) so the (pos & 3) shift is correct.
 uint loadCmdByte(uint pos) {
-    uint w = cmd_buf.w[pos >> 2];
-    return (w >> ((pos & 3u) * 8u)) & 0xFFu;
+    uint gpos = g_cmd_byte_base + pos;
+    uint w = cmd_buf.w[gpos >> 2];
+    return (w >> ((gpos & 3u) * 8u)) & 0xFFu;
 }
 
 uint loadLitByte(uint pos) {
-    uint w = lit_buf.w[pos >> 2];
-    return (w >> ((pos & 3u) * 8u)) & 0xFFu;
+    uint gpos = g_lit_byte_base + pos;
+    uint w = lit_buf.w[gpos >> 2];
+    return (w >> ((gpos & 3u) * 8u)) & 0xFFu;
 }
 
 uint loadOff16Byte(uint pos) {
-    uint w = off16_buf.w[pos >> 2];
-    return (w >> ((pos & 3u) * 8u)) & 0xFFu;
+    uint gpos = g_off16_byte_base + pos;
+    uint w = off16_buf.w[gpos >> 2];
+    return (w >> ((gpos & 3u) * 8u)) & 0xFFu;
 }
 
 uint loadLengthByte(uint pos) {
-    uint w = length_buf.w[pos >> 2];
-    return (w >> ((pos & 3u) * 8u)) & 0xFFu;
+    uint gpos = g_length_byte_base + pos;
+    uint w = length_buf.w[gpos >> 2];
+    return (w >> ((gpos & 3u) * 8u)) & 0xFFu;
 }
 
 // readU16LE on the off16 stream (entry index → u16 value).
@@ -127,19 +165,25 @@ uint loadOff16Entry(uint entry_idx) {
 // optimization can switch to a word-aligned cooperative copy when
 // dst/lit are 4-byte aligned at runtime.
 uint loadDstByte(uint pos) {
-    uint w = dst_buf.w[pos >> 2];
-    return (w >> ((pos & 3u) * 8u)) & 0xFFu;
+    uint gpos = g_dst_byte_base + pos;
+    uint w = dst_buf.w[gpos >> 2];
+    return (w >> ((gpos & 3u) * 8u)) & 0xFFu;
 }
 
 void storeDstByte(uint pos, uint b) {
-    uint widx = pos >> 2;
-    uint sh   = (pos & 3u) * 8u;
+    uint gpos = g_dst_byte_base + pos;
+    uint widx = gpos >> 2;
+    uint sh   = (gpos & 3u) * 8u;
     uint mask = 0xFFu << sh;
     // Atomic clear-then-set to defeat any GLSL/SPV compiler reordering
     // that would otherwise let a later in-lane store cache a stale word.
     // Lane-0-only serial loop semantics still hold; atomic ops just make
     // each store individually globally observable, which is what the
     // sequential CUDA `dst[pos]=b` byte store provided.
+    // Multi-chunk: g_dst_byte_base is per-chunk and is byte-aligned to
+    // a chunk_capacity multiple of 4 (host invariant), so atomic ops on
+    // dst_buf.w[widx] are isolated to this workgroup unless two chunks'
+    // capacities overlap — which they cannot, by construction.
     atomicAnd(dst_buf.w[widx], ~mask);
     atomicOr(dst_buf.w[widx], (b & 0xFFu) << sh);
 }
@@ -168,10 +212,10 @@ shared uint sh_parse_use_recent;
 // cursor, and returns the decoded value. Out-of-stream conditions
 // return 0 and leave the cursor at its boundary (matches CUDA).
 uint readLengthFromStream() {
-    if (sh_length_offset >= pc.length_remaining) return 0u;
+    if (sh_length_offset >= g_length_remaining) return 0u;
     uint v = loadLengthByte(sh_length_offset);
     if (v > EXT_LENGTH_THRESHOLD) {
-        if (sh_length_offset + EXT_LENGTH_EXTRA_BYTES >= pc.length_remaining) {
+        if (sh_length_offset + EXT_LENGTH_EXTRA_BYTES >= g_length_remaining) {
             sh_length_offset += 1u;
             return v;
         }
@@ -188,7 +232,7 @@ uint readLengthFromStream() {
 // ── Off16 consume (lane-0 only) ─────────────────────────────────────
 // Loads the u16 entry at sh_off16_pos, advances the cursor, and
 // returns the negated int32_t match_offset. Caller must guarantee
-// sh_off16_pos < pc.off16_count.
+// sh_off16_pos < g_off16_count.
 int consumeOff16() {
     uint v = loadOff16Entry(sh_off16_pos);
     sh_off16_pos += 1u;
@@ -240,8 +284,24 @@ void warpMatchCopy(uint dst_pos, uint match_src, uint match_len) {
 // ── main ────────────────────────────────────────────────────────────
 void main() {
     uint lane = gl_SubgroupInvocationID;
+    uint chunk_id = gl_WorkGroupID.x;
 
+    // Load this workgroup's chunk descriptor (12 u32 stride per chunk).
     if (lane == 0u) {
+        uint base = chunk_id * 12u;
+        g_dst_byte_base     = chunks_buf.d[base + 0u];
+        g_dst_size          = chunks_buf.d[base + 1u];
+        // cmd / lit / off16 / length descs are u32-word bases; multiply
+        // by 4 to get the byte base.
+        g_cmd_byte_base     = chunks_buf.d[base + 2u] * 4u;
+        g_cmd_size          = chunks_buf.d[base + 3u];
+        g_lit_byte_base     = chunks_buf.d[base + 4u] * 4u;
+        g_lit_size          = chunks_buf.d[base + 5u];
+        g_off16_byte_base   = chunks_buf.d[base + 6u] * 4u;
+        g_off16_count       = chunks_buf.d[base + 7u];
+        g_length_byte_base  = chunks_buf.d[base + 8u] * 4u;
+        g_length_remaining  = chunks_buf.d[base + 9u];
+
         sh_cmd_pos       = 0u;
         sh_lit_pos       = 0u;
         sh_off16_pos     = 0u;
@@ -249,7 +309,11 @@ void main() {
         sh_recent_offset = INITIAL_RECENT_OFFSET;
         sh_length_offset = 0u;
     }
-    subgroupBarrier();
+    // Workgroup-wide barrier so the chunk-descriptor loads in lane 0 are
+    // visible to every lane before the main decode loop reads g_cmd_size /
+    // g_dst_byte_base / etc.
+    barrier();
+    memoryBarrierShared();
 
     // ── Outer decode loop ───────────────────────────────────────────
     // Runs while there are tokens to consume. Each iteration either:
@@ -261,14 +325,14 @@ void main() {
     // subgroupBroadcast calls. The fast-path batch decoding still runs
     // across all 32 lanes (cmd-byte ballot for any_long detection, per-
     // lane field decode, warpScanU32 for prefix-scans).
-    while (sh_cmd_pos < pc.cmd_size) {
+    while (sh_cmd_pos < g_cmd_size) {
         uint cmd_pos = sh_cmd_pos;
 
         // ── Fast-path batch detect ──────────────────────────────────
         // Load up to 32 cmd bytes, one per lane. Lanes past batch_size
         // load 0 (a valid standard token = "0 lit, 0 match, off16
         // consumed") so they don't pollute the any_long ballot.
-        uint remaining  = pc.cmd_size - cmd_pos;
+        uint remaining  = g_cmd_size - cmd_pos;
         uint batch_size = (remaining < WARP_SIZE) ? remaining : WARP_SIZE;
         bool my_valid   = (lane < batch_size);
         uint my_cmd     = my_valid ? loadCmdByte(cmd_pos + lane) : TOKEN_SHORT_MIN;
@@ -301,7 +365,7 @@ void main() {
 
                     int k_match_off = cur_recent;
                     if (k_use_recent == 0u) {
-                        if (cur_off16 < pc.off16_count) {
+                        if (cur_off16 < g_off16_count) {
                             uint v = loadOff16Entry(cur_off16);
                             k_match_off = -int(v);
                             cur_off16 += 1u;
@@ -361,7 +425,7 @@ void main() {
                 lit_len    = token & TOKEN_LIT_MASK;
                 match_len  = (token >> TOKEN_MATCH_SHIFT) & TOKEN_MATCH_MASK;
                 use_recent = (token >> TOKEN_USE_RECENT_SHIFT) & TOKEN_USE_RECENT_MASK;
-                if (use_recent == 0u && sh_off16_pos < pc.off16_count) {
+                if (use_recent == 0u && sh_off16_pos < g_off16_count) {
                     match_offset = consumeOff16();
                 }
             } else if (token == TOKEN_LONG_LITERAL) {
@@ -371,7 +435,7 @@ void main() {
             } else if (token == TOKEN_LONG_NEAR) {
                 // Near-offset long match (CUDA L162-173).
                 match_len = readLengthFromStream() + LONG_NEAR_BASE;
-                if (sh_off16_pos < pc.off16_count) {
+                if (sh_off16_pos < g_off16_count) {
                     match_offset = consumeOff16();
                 }
             } else if (token == TOKEN_LONG_FAR) {
@@ -441,7 +505,7 @@ void main() {
     // strided copy; we serialize on lane 0 for the same reason
     // warpLiteralCopy does (u32-packed Dst is RMW-unsafe across lanes).
     if (lane == 0u) {
-        uint trailing = (pc.lit_size > sh_lit_pos) ? (pc.lit_size - sh_lit_pos) : 0u;
+        uint trailing = (g_lit_size > sh_lit_pos) ? (g_lit_size - sh_lit_pos) : 0u;
         uint dst_pos = sh_dst_pos;
         uint lit_pos = sh_lit_pos;
         for (uint i = 0u; i < trailing; i++) {

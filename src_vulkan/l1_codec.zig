@@ -1,43 +1,50 @@
-//! Phase-1 Vulkan L1 codec module.
+//! Phase-1 / phase-1.5 Vulkan L1 codec module.
 //!
 //! Production host-side glue for the GLSL L1 encoder + decoder shaders
 //! in `src_vulkan/shaders/lz_{encode,decode}.comp`. Spec source:
 //! `docs/vulkan_l1_codec_spec.md` §9 (host-side interface).
 //!
-//! Public API (locked by the spec):
+//! Public API:
 //!
 //!   pub const L1Streams = struct {
 //!       lit_buf, cmd_buf, off16_buf, length_buf  — device-side VkBuffers
-//!       lit_size, cmd_size, off16_count, length_used — bytes/entries used
+//!       lit_size, cmd_size, off16_count, length_used — totals across all chunks
+//!       n_chunks, chunk_capacity, dst_size       — multi-chunk geometry
+//!       per_chunk_sizes_*                        — per-chunk size arrays
 //!   };
 //!
 //!   pub const EncodeResult = struct { streams: L1Streams,
 //!                                     comp_total_bytes: u32 };
 //!
 //!   pub fn encodeL1Sync(ctx, src_host) !EncodeResult
+//!     Thin wrapper over encodeL1Multi for single-chunk callers.
+//!
+//!   pub fn encodeL1Multi(ctx, src_host) !EncodeResult
+//!     Slices src into ceil(len/CHUNK_SIZE) chunks and dispatches one
+//!     workgroup per chunk in a single vkCmdDispatch.
+//!
 //!   pub fn decodeL1Sync(ctx, streams, original_size, dst_host) !void
+//!     Drives the per-chunk decoder dispatch and writes original_size
+//!     bytes into dst_host.
+//!
 //!   pub fn freeStreams(ctx, streams: *L1Streams) void
 //!
 //! Implementation notes:
 //!
-//!   * Phase 1 = single chunk dispatch (group_count = .{1,1,1}). Multi-
-//!     chunk extension is phase 2.
-//!   * Streams are over-provisioned at `2 * src_size` per the spec §4.1.
-//!     Phase 2 will tighten this once header wrapping is wired.
-//!   * All buffers are HOST_VISIBLE + HOST_COHERENT + DEVICE_LOCAL (the
-//!     "ideal" memory type that desktop NVIDIA and AMD always expose).
-//!     Falls back to HOST_VISIBLE + HOST_COHERENT only. This avoids the
-//!     staging-buffer + vkCmdCopyBuffer round-trip the spec mentions in
-//!     §9 "Internals" — for the phase-1 single-shot case the simpler
-//!     direct-map path is plenty fast and removes a chunk of host glue.
-//!   * The descriptors.Cache is owned by the codec (one per `init` call).
-//!     Pipelines are keyed on (kernel, tier); the encoder + decoder share
-//!     one cache so a single dispatch sequence pays the build cost twice
-//!     and the second sequence pays zero.
-//!   * `freeStreams` destroys every device-side handle and zeroes the
-//!     struct. Calling encodeL1Sync without a prior freeStreams leaks the
-//!     buffers from the previous result — by design, since the test
-//!     driver consumes a single EncodeResult per encode call.
+//!   * Multi-chunk dispatch mirrors the CUDA path (src/encode/lz_kernel.cu
+//!     :slzLzEncodeKernel). Each workgroup reads its `ChunkDesc` from a
+//!     dedicated SSBO, computes its slice of every output stream via
+//!     `chunk_id * chunk_capacity_words`, and writes per-chunk sizes
+//!     back into a 4-u32-per-chunk sidecar.
+//!   * Streams are over-provisioned at `2 * CHUNK_SIZE + 16` per chunk
+//!     (spec §4.1 worst case). The total stream-buffer size is
+//!     `n_chunks * chunk_capacity` — for the 35-chunk web.txt case
+//!     (~4.5 MB src) the per-stream buffer is ~9 MB, which the host
+//!     allocator handles without staging.
+//!   * All buffers are HOST_VISIBLE + HOST_COHERENT + DEVICE_LOCAL where
+//!     supported; falls back to HOST_VISIBLE only. The hash buffer is
+//!     DEVICE_LOCAL only (sized to n_chunks * HASH_SIZE_BYTES; per-chunk
+//!     slot to avoid cross-chunk reference contamination).
 
 const std = @import("std");
 
@@ -54,19 +61,29 @@ const dispatch = @import("dispatch.zig");
 pub const HASH_BITS: u32 = 17;
 pub const HASH_SIZE_BYTES: vk.VkDeviceSize = (@as(vk.VkDeviceSize, 1) << HASH_BITS) * @sizeOf(u32);
 
-/// Encoder push constants (8 bytes — see lz_encode.comp).
+/// Per-chunk input slice size. Matches `src/format/streamlz_constants.zig`
+/// sub_chunk_size = 0x20000 (128 KiB). Each shader workgroup processes
+/// one chunk; the encoder still uses the 2-block scanBlock interior
+/// (64 KiB blocks), so a 128 KiB chunk = 2 blocks per workgroup.
+pub const CHUNK_SIZE: u32 = 0x20000;
+
+/// Per-chunk reservation in each output stream. Worst-case stream size
+/// per spec §4.1 is `2 * src_size`; we add 16 bytes of slack so lane-0
+/// RMW byte stores into the tail u32 word never write past the slice.
+/// Must be a multiple of 4 (shader byte-load helpers assume word-aligned
+/// per-chunk bases — see lz_{encode,decode}.comp head-of-file comment).
+pub const CHUNK_STREAM_CAPACITY: u32 = (CHUNK_SIZE * 2) + 16;
+
+/// Encoder push constants (12 bytes — see lz_encode.comp).
 const EncodePush = extern struct {
-    src_size: u32,
+    n_chunks: u32,
     hash_bits: u32,
+    chunk_capacity: u32,
 };
 
-/// Decoder push constants (20 bytes — see lz_decode.comp).
+/// Decoder push constants (4 bytes — see lz_decode.comp).
 const DecodePush = extern struct {
-    cmd_size: u32,
-    lit_size: u32,
-    off16_count: u32,
-    length_remaining: u32,
-    dst_size: u32,
+    n_chunks: u32,
 };
 
 // ── Errors ────────────────────────────────────────────────────────
@@ -84,16 +101,23 @@ pub const L1Error = error{
     EndRecordFailed,
     SubmitFailed,
     FenceWaitFailed,
+    TooManyChunks,
 } ||
     descriptors.DescriptorError ||
     dispatch.DispatchError;
 
+/// Hard cap on chunks per encode. Bounds the per-chunk size sidecar
+/// arrays so we never need heap allocation in the codec module. 256
+/// chunks × 128 KiB = 32 MiB max input — comfortably above the 4.5 MiB
+/// web.txt smoke test and the 4 MiB enwik8 prefix test.
+pub const MAX_CHUNKS: u32 = 256;
+
 // ── Public types ──────────────────────────────────────────────────
 
 /// One device-side L1 stream bundle. All four buffers are owned —
-/// callers must `freeStreams` exactly once. `lit_size`/`cmd_size` are
-/// in bytes; `off16_count` is u16 entries (each = 2 bytes); `length_used`
-/// is in bytes.
+/// callers must `freeStreams` exactly once. The size fields sum across
+/// every chunk; per-chunk slices into the streams are reconstructed via
+/// `chunk_capacity` + the per-chunk count arrays.
 pub const L1Streams = struct {
     lit_buf: vk.VkBuffer = null,
     lit_mem: vk.VkDeviceMemory = null,
@@ -111,8 +135,24 @@ pub const L1Streams = struct {
     length_mem: vk.VkDeviceMemory = null,
     length_used: u32 = 0,
 
-    /// Total bytes worth of compressed payload (lit + cmd + 2*off16 + length).
-    /// Convenience for the round-trip test's compression-ratio report.
+    /// Multi-chunk geometry.
+    n_chunks: u32 = 0,
+    chunk_capacity: u32 = CHUNK_STREAM_CAPACITY,
+    /// Original input length in bytes. Stored on the bundle so the
+    /// decoder can rebuild per-chunk dst slices without the caller
+    /// re-asserting it.
+    dst_size: u32 = 0,
+
+    /// Per-chunk sizes (filled in by the encoder's Sizes sidecar).
+    /// Indices [0..n_chunks) are valid.
+    per_chunk_lit_size: [MAX_CHUNKS]u32 = @splat(0),
+    per_chunk_cmd_size: [MAX_CHUNKS]u32 = @splat(0),
+    per_chunk_off16_count: [MAX_CHUNKS]u32 = @splat(0),
+    per_chunk_length_used: [MAX_CHUNKS]u32 = @splat(0),
+
+    /// Total bytes worth of compressed payload (lit + cmd + 2*off16 + length)
+    /// summed across all chunks. Convenience for the round-trip test's
+    /// compression-ratio report.
     pub fn compressedTotalBytes(self: L1Streams) u32 {
         return self.lit_size + self.cmd_size + (self.off16_count * 2) + self.length_used;
     }
@@ -120,19 +160,13 @@ pub const L1Streams = struct {
 
 pub const EncodeResult = struct {
     streams: L1Streams,
-    /// Sum of the four stream sizes. Equal to `streams.compressedTotalBytes()`.
+    /// Sum of the four stream sizes across every chunk. Equal to
+    /// `streams.compressedTotalBytes()`.
     comp_total_bytes: u32,
 };
 
 // ── Internal: low-level buffer helpers ────────────────────────────
-// These mirror dispatch_test.zig's helpers but live here so the codec
-// has no test-module dependency. The longer-term plan (spec §9 and
-// the phase-2 buffers.zig refactor) lifts this into a shared module.
 
-/// Resolve every device-level fn the codec needs. Idempotent — each
-/// `orelse resolve` short-circuits once the slot is non-null. Called
-/// from `encodeL1Sync` and `decodeL1Sync` on first use; cheap to call
-/// repeatedly.
 fn resolveDeviceFn(comptime T: type, dev: vk.VkDevice, name: [*:0]const u8) ?T {
     if (vk.vkGetDeviceProcAddr_fn) |gdpa| {
         if (gdpa(dev, name)) |raw| return @ptrCast(@alignCast(raw));
@@ -173,9 +207,6 @@ fn ensureBufferFnSlots(ctx: *driver.Context) void {
     }
 }
 
-/// Find a memory type whose bit is in `type_bits_mask` AND whose
-/// propertyFlags include every bit in `required_flags`. Returns null
-/// when no matching type exists (caller can retry with weaker flags).
 fn findMemoryType(
     pd: vk.VkPhysicalDevice,
     type_bits_mask: u32,
@@ -195,11 +226,6 @@ fn findMemoryType(
     return null;
 }
 
-/// A device-side VkBuffer + its backing VkDeviceMemory + an optional
-/// host-mapped pointer for HOST_VISIBLE bindings. `size` is the
-/// caller-requested logical size; the driver's `req.size` may be
-/// padded above this for alignment, but we never expose the pad to
-/// callers.
 const Buffer = struct {
     buf: vk.VkBuffer = null,
     mem: vk.VkDeviceMemory = null,
@@ -207,9 +233,6 @@ const Buffer = struct {
     size: vk.VkDeviceSize = 0,
 };
 
-/// Create a buffer + backing memory. `host_visible = true` selects a
-/// HOST_VISIBLE + HOST_COHERENT memory type (prefers also DEVICE_LOCAL),
-/// `false` selects DEVICE_LOCAL only (the hash table — no host I/O).
 fn createBuffer(
     ctx: *driver.Context,
     size: vk.VkDeviceSize,
@@ -222,7 +245,6 @@ fn createBuffer(
     const alloc_mem = vk.vkAllocateMemory_fn orelse return error.MemoryAllocateFailed;
     const bind = vk.vkBindBufferMemory_fn orelse return error.BindBufferFailed;
 
-    // 1. Create the VkBuffer with the requested usage.
     const bci: vk.VkBufferCreateInfo = .{
         .size = size,
         .usage = usage,
@@ -233,11 +255,9 @@ fn createBuffer(
         return error.BufferCreateFailed;
     }
 
-    // 2. Query memory requirements.
     var req: vk.VkMemoryRequirements = .{};
     get_req(ctx.dev, buf, &req);
 
-    // 3. Pick a memory type.
     const mt_idx: u32 = blk: {
         if (host_visible) {
             const ideal = vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
@@ -254,7 +274,6 @@ fn createBuffer(
         return error.MemoryTypeNotFound;
     };
 
-    // 4. Allocate + bind.
     const mai: vk.VkMemoryAllocateInfo = .{
         .allocationSize = req.size,
         .memoryTypeIndex = mt_idx,
@@ -270,10 +289,6 @@ fn createBuffer(
         return error.BindBufferFailed;
     }
 
-    // 5. Map if requested. We hold the map for the buffer's lifetime —
-    //    Vulkan permits persistent mapping of HOST_VISIBLE memory, and
-    //    the phase-1 codec's short-lived host accesses don't justify
-    //    the unmap-after-each-use churn.
     var mapped: ?[*]u8 = null;
     if (host_visible) {
         const map = vk.vkMapMemory_fn orelse {
@@ -323,50 +338,50 @@ fn pickTier(ctx: *driver.Context) L1Error!probe_mod.Tier {
     };
 }
 
+/// Number of chunks for an input of `src_size` bytes. Equivalent to
+/// `ceil(src_size / CHUNK_SIZE)` with a hard minimum of 1.
+fn computeNChunks(src_size: u32) u32 {
+    if (src_size == 0) return 1;
+    return (src_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+}
+
 // ── Public API: encode ────────────────────────────────────────────
 
-/// Encode `src_host` through the Vulkan L1 encoder. Allocates one
-/// device-side stream bundle (lit/cmd/off16/length), uploads the source
-/// bytes, dispatches the encode kernel, reads the produced sizes back,
-/// and returns the bundle. Caller owns the bundle and must call
-/// `freeStreams` on it exactly once.
-///
-/// `src_host.len` must be ≤ 128 KB in phase 1 (single-chunk two-block
-/// design — see spec §1.2). Larger inputs are rejected by the GLSL
-/// shader (the parser only handles two LZ blocks).
-///
-/// `encode_spv` is the lz_encode SPIR-V bytes for the device's probed
-/// tier. The caller resolves the tier and loads the bytes (typically
-/// from `zig-out/shaders/lz_encode.<tier>.spv`) and threads them in.
-/// The codec module deliberately does NOT load SPV itself — that lets
-/// the test driver share the same load helper as dispatch_test and
-/// match_any_bench, and sidesteps spv_blobs.zig's @embedFile path
-/// resolution (see build.zig comment §M6).
+/// Thin wrapper retained for single-chunk callers. Identical to
+/// `encodeL1Multi`; the previous phase-1 single-chunk restriction is
+/// gone now that the shader respects gl_WorkGroupID.x.
 pub fn encodeL1Sync(
     ctx: *driver.Context,
     src_host: []const u8,
     encode_spv: []const u8,
 ) L1Error!EncodeResult {
-    const src_size: u32 = @intCast(src_host.len);
+    return encodeL1Multi(ctx, src_host, encode_spv);
+}
 
-    // 1. Pick the tier (used as the cache key so a future shared-cache
-    //    instance bucketizes per-device variants correctly).
+/// Encode `src_host` through the Vulkan L1 encoder, slicing into
+/// `ceil(src_host.len / CHUNK_SIZE)` independent chunks. Dispatches a
+/// single workgroup-per-chunk kernel and reads per-chunk stream sizes
+/// back via the Sizes sidecar.
+pub fn encodeL1Multi(
+    ctx: *driver.Context,
+    src_host: []const u8,
+    encode_spv: []const u8,
+) L1Error!EncodeResult {
+    const src_size: u32 = @intCast(src_host.len);
+    const n_chunks = computeNChunks(src_size);
+    if (n_chunks > MAX_CHUNKS) return error.TooManyChunks;
+
     const tier = try pickTier(ctx);
     const spv = encode_spv;
 
-    // 2. Worst-case stream sizes per spec §4.1. Each side stream caps at
-    //    `2 * src_size`. We over-allocate by a small constant (16 B) so
-    //    the encoder's lane-0 RMW byte stores into the tail u32 word
-    //    never write past the buffer end.
-    const stream_cap: vk.VkDeviceSize = @max(
-        @as(vk.VkDeviceSize, 64),
-        (@as(vk.VkDeviceSize, src_size) * 2) + 16,
-    );
+    // Per-chunk slice reservation, in bytes. Total stream buffer size =
+    // n_chunks * chunk_capacity. CHUNK_STREAM_CAPACITY is already a
+    // multiple of 4 (264208 = 0x40810), keeping per-chunk word bases
+    // u32-aligned.
+    const chunk_capacity: u32 = CHUNK_STREAM_CAPACITY;
+    const stream_cap_total: vk.VkDeviceSize = @as(vk.VkDeviceSize, n_chunks) * chunk_capacity;
 
-    // 3. Allocate the src buffer + four output streams + the hash table
-    //    + the sizes sidecar. All HOST_VISIBLE so the host can preload
-    //    src and read back sizes; hash is DEVICE_LOCAL only (no host
-    //    contact).
+    // ── Allocations ──────────────────────────────────────────────
     var src_b = try createBuffer(
         ctx,
         @max(@as(vk.VkDeviceSize, 4), @as(vk.VkDeviceSize, src_size)),
@@ -375,43 +390,68 @@ pub fn encodeL1Sync(
     );
     errdefer destroyBuffer(ctx, &src_b);
 
-    var lit_b = try createBuffer(ctx, stream_cap, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+    var lit_b = try createBuffer(ctx, stream_cap_total, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
     errdefer destroyBuffer(ctx, &lit_b);
-    var cmd_b = try createBuffer(ctx, stream_cap, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+    var cmd_b = try createBuffer(ctx, stream_cap_total, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
     errdefer destroyBuffer(ctx, &cmd_b);
-    var off16_b = try createBuffer(ctx, stream_cap, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+    var off16_b = try createBuffer(ctx, stream_cap_total, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
     errdefer destroyBuffer(ctx, &off16_b);
-    var length_b = try createBuffer(ctx, stream_cap, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+    var length_b = try createBuffer(ctx, stream_cap_total, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
     errdefer destroyBuffer(ctx, &length_b);
 
-    var hash_b = try createBuffer(ctx, HASH_SIZE_BYTES, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
-    defer destroyBuffer(ctx, &hash_b); // hash buffer is per-encode scratch
+    // Hash buffer: n_chunks × HASH_SIZE_BYTES. Device-local only — the
+    // host never reads or writes it.
+    var hash_b = try createBuffer(ctx, @as(vk.VkDeviceSize, n_chunks) * HASH_SIZE_BYTES, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+    defer destroyBuffer(ctx, &hash_b);
 
+    // Sizes sidecar: 4 u32 per chunk.
     var sizes_b = try createBuffer(
         ctx,
-        @sizeOf(u32) * 4,
+        @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * 4,
         vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         true,
     );
-    defer destroyBuffer(ctx, &sizes_b); // sizes are read back into the result struct
+    defer destroyBuffer(ctx, &sizes_b);
 
-    // 4. Upload src bytes into src_b. HOST_COHERENT means no flush.
+    // ChunkDescs: 3 u32 per chunk (src_offset, src_size, reserved).
+    var chunks_b = try createBuffer(
+        ctx,
+        @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * 3,
+        vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        true,
+    );
+    defer destroyBuffer(ctx, &chunks_b);
+
+    // ── Upload src + chunk descriptors ───────────────────────────
     if (src_size > 0) {
         const src_mapped = src_b.mapped orelse return error.MapMemoryFailed;
         @memcpy(src_mapped[0..src_size], src_host);
     }
-
-    // 5. Zero the four output streams + sizes sidecar. The encoder's
-    //    byte-packed RMW stores assume the destination word starts at
-    //    zero (lz_encode.comp:170 comment). Hash is initialized inside
-    //    the shader to HASH_EMPTY (0xFFFFFFFF), so we don't touch it.
     @memset(lit_b.mapped.?[0..@intCast(lit_b.size)], 0);
     @memset(cmd_b.mapped.?[0..@intCast(cmd_b.size)], 0);
     @memset(off16_b.mapped.?[0..@intCast(off16_b.size)], 0);
     @memset(length_b.mapped.?[0..@intCast(length_b.size)], 0);
     @memset(sizes_b.mapped.?[0..@intCast(sizes_b.size)], 0);
 
-    // 6. Build the encode pipeline + descriptor set.
+    // Fill chunk descriptors: each chunk gets [src_offset, src_size, 0].
+    {
+        const chunks_words: [*]u32 = @ptrCast(@alignCast(chunks_b.mapped.?));
+        var ci: u32 = 0;
+        while (ci < n_chunks) : (ci += 1) {
+            const off = ci * CHUNK_SIZE;
+            const this_size: u32 = if (off + CHUNK_SIZE <= src_size)
+                CHUNK_SIZE
+            else if (off < src_size)
+                src_size - off
+            else
+                0;
+            chunks_words[ci * 3 + 0] = off;
+            chunks_words[ci * 3 + 1] = this_size;
+            chunks_words[ci * 3 + 2] = 0;
+        }
+    }
+
+    // ── Build pipeline + descriptor set ──────────────────────────
     var cache: descriptors.Cache = .{};
     defer descriptors.invalidateAll(ctx, &cache);
 
@@ -421,11 +461,11 @@ pub fn encodeL1Sync(
         "lz_encode",
         tier,
         spv,
-        7, // bindings 0..6: src, lit, cmd, off16, length, hash, sizes
+        8, // bindings 0..7: src, lit, cmd, off16, length, hash, sizes, chunks
         @sizeOf(EncodePush),
     );
 
-    const enc_bindings: [7]vk.VkDescriptorBufferInfo = .{
+    const enc_bindings: [8]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = src_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = lit_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = cmd_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -433,13 +473,15 @@ pub fn encodeL1Sync(
         .{ .buffer = length_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = hash_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = sizes_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        .{ .buffer = chunks_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
     };
     const enc_set = try descriptors.allocSet(ctx, cached_enc, enc_bindings[0..]);
 
-    // 7. Submit the encode dispatch (one workgroup per chunk = 1).
+    // ── Submit encode dispatch (n_chunks workgroups) ─────────────
     const enc_push: EncodePush = .{
-        .src_size = src_size,
+        .n_chunks = n_chunks,
         .hash_bits = HASH_BITS,
+        .chunk_capacity = chunk_capacity,
     };
     var enc_push_bytes: [@sizeOf(EncodePush)]u8 = undefined;
     @memcpy(enc_push_bytes[0..], std.mem.asBytes(&enc_push));
@@ -450,49 +492,65 @@ pub fn encodeL1Sync(
         cached_enc.pipeline_layout,
         enc_set,
         enc_push_bytes[0..],
-        .{ 1, 1, 1 },
+        .{ n_chunks, 1, 1 },
     );
 
-    // 8. Read back the sizes sidecar. HOST_COHERENT + the fence-wait
-    //    inside submitOne is enough — no flush/invalidate needed.
+    // ── Read back per-chunk sizes ────────────────────────────────
     const sizes_words: [*]const u32 = @ptrCast(@alignCast(sizes_b.mapped.?));
-    const lit_size = sizes_words[0];
-    const cmd_size = sizes_words[1];
-    const off16_count = sizes_words[2];
-    const length_used = sizes_words[3];
+    var streams: L1Streams = .{
+        .n_chunks = n_chunks,
+        .chunk_capacity = chunk_capacity,
+        .dst_size = src_size,
+    };
+    var lit_total: u32 = 0;
+    var cmd_total: u32 = 0;
+    var off16_total: u32 = 0;
+    var length_total: u32 = 0;
+    {
+        var ci: u32 = 0;
+        while (ci < n_chunks) : (ci += 1) {
+            const base = ci * 4;
+            const ls = sizes_words[base + 0];
+            const cs = sizes_words[base + 1];
+            const os = sizes_words[base + 2];
+            const xs = sizes_words[base + 3];
+            streams.per_chunk_lit_size[ci] = ls;
+            streams.per_chunk_cmd_size[ci] = cs;
+            streams.per_chunk_off16_count[ci] = os;
+            streams.per_chunk_length_used[ci] = xs;
+            lit_total += ls;
+            cmd_total += cs;
+            off16_total += os;
+            length_total += xs;
+        }
+    }
 
-    // 9. We no longer need the src buffer — the encoder is done. Free it
-    //    here so the EncodeResult owns only the four output streams.
+    // Drop the src buffer — encode is done.
     destroyBuffer(ctx, &src_b);
 
-    const streams: L1Streams = .{
-        .lit_buf = lit_b.buf,
-        .lit_mem = lit_b.mem,
-        .lit_size = lit_size,
-        .cmd_buf = cmd_b.buf,
-        .cmd_mem = cmd_b.mem,
-        .cmd_size = cmd_size,
-        .off16_buf = off16_b.buf,
-        .off16_mem = off16_b.mem,
-        .off16_count = off16_count,
-        .length_buf = length_b.buf,
-        .length_mem = length_b.mem,
-        .length_used = length_used,
-    };
-    // Mapped pointers are forgotten by L1Streams (the buffer handles
-    // alone are enough for the decoder bind + the test's host readback —
-    // host accesses go through fresh vkMapMemory calls). Drop the maps
-    // here so the errdefer chain above doesn't double-unmap on success.
+    streams.lit_buf = lit_b.buf;
+    streams.lit_mem = lit_b.mem;
+    streams.lit_size = lit_total;
+    streams.cmd_buf = cmd_b.buf;
+    streams.cmd_mem = cmd_b.mem;
+    streams.cmd_size = cmd_total;
+    streams.off16_buf = off16_b.buf;
+    streams.off16_mem = off16_b.mem;
+    streams.off16_count = off16_total;
+    streams.length_buf = length_b.buf;
+    streams.length_mem = length_b.mem;
+    streams.length_used = length_total;
+
+    // Mapped pointers are forgotten by L1Streams (the buffer handles are
+    // enough for the decoder bind + host readback). Unmap and zero the
+    // local Buffer handles so the errdefer chain becomes a no-op on
+    // the success return.
     if (vk.vkUnmapMemory_fn) |u| {
         u(ctx.dev, lit_b.mem);
         u(ctx.dev, cmd_b.mem);
         u(ctx.dev, off16_b.mem);
         u(ctx.dev, length_b.mem);
     }
-    // Null out the local Buffer handles so the four `errdefer destroy
-    // Buffer` calls above become no-ops on the success path. Belt-and-
-    // suspenders: there's no `try` between here and the return, but a
-    // future edit could insert one and we don't want to double-free.
     lit_b.buf = null;
     lit_b.mem = null;
     lit_b.mapped = null;
@@ -516,9 +574,6 @@ pub fn encodeL1Sync(
 
 /// Run the Vulkan L1 decoder on `streams` and copy the decoded bytes
 /// into `dst_host`. `dst_host.len` must equal `original_size`.
-///
-/// `decode_spv` is the lz_decode SPIR-V bytes for the device's probed
-/// tier — same caller-loads-it pattern as `encodeL1Sync`.
 pub fn decodeL1Sync(
     ctx: *driver.Context,
     streams: L1Streams,
@@ -530,15 +585,16 @@ pub fn decodeL1Sync(
     ensureBufferFnSlots(ctx);
 
     const dst_size: u32 = @intCast(original_size);
+    const n_chunks = streams.n_chunks;
+    if (n_chunks == 0 or n_chunks > MAX_CHUNKS) return error.TooManyChunks;
+    const chunk_capacity = streams.chunk_capacity;
 
-    // 1. Tier (used as cache key).
     const tier = try pickTier(ctx);
     const spv = decode_spv;
 
-    // 2. Allocate the dst output buffer (HOST_VISIBLE so we can read
-    //    back; size = original_size rounded up to 4 bytes so the
-    //    decoder's u32-packed byte stores have room to RMW the tail
-    //    word without overrunning).
+    // Dst buffer: rounded up to 4 bytes for the u32-packed RMW pattern.
+    // Each chunk's slice is at byte offset `chunk_id * CHUNK_SIZE` and is
+    // sized by the per-chunk dst_size descriptor entry.
     const dst_buf_size: vk.VkDeviceSize = @max(@as(vk.VkDeviceSize, 4), (@as(vk.VkDeviceSize, dst_size) + 3) & ~@as(vk.VkDeviceSize, 3));
     var dst_b = try createBuffer(
         ctx,
@@ -549,8 +605,47 @@ pub fn decodeL1Sync(
     defer destroyBuffer(ctx, &dst_b);
     @memset(dst_b.mapped.?[0..@intCast(dst_b.size)], 0);
 
-    // 3. Build the decode pipeline + descriptor set. The four input
-    //    bindings reference the existing stream buffers (no copy).
+    // ChunkDescs: 12 u32 per chunk. See lz_decode.comp head comment for
+    // the slot layout. The host writes word bases (in u32 words); the
+    // shader multiplies by 4 to get byte bases for the per-byte load
+    // helpers.
+    var chunks_b = try createBuffer(
+        ctx,
+        @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * 12,
+        vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        true,
+    );
+    defer destroyBuffer(ctx, &chunks_b);
+    @memset(chunks_b.mapped.?[0..@intCast(chunks_b.size)], 0);
+    {
+        const chunks_words: [*]u32 = @ptrCast(@alignCast(chunks_b.mapped.?));
+        const cap_words: u32 = chunk_capacity / 4;
+        var ci: u32 = 0;
+        while (ci < n_chunks) : (ci += 1) {
+            const dst_off: u32 = ci * CHUNK_SIZE;
+            const this_dst_size: u32 = if (dst_off + CHUNK_SIZE <= dst_size)
+                CHUNK_SIZE
+            else if (dst_off < dst_size)
+                dst_size - dst_off
+            else
+                0;
+            const stream_word_base: u32 = ci * cap_words;
+            const base = ci * 12;
+            chunks_words[base + 0] = dst_off;
+            chunks_words[base + 1] = this_dst_size;
+            chunks_words[base + 2] = stream_word_base; // cmd
+            chunks_words[base + 3] = streams.per_chunk_cmd_size[ci];
+            chunks_words[base + 4] = stream_word_base; // lit
+            chunks_words[base + 5] = streams.per_chunk_lit_size[ci];
+            chunks_words[base + 6] = stream_word_base; // off16 (byte addr = base*4)
+            chunks_words[base + 7] = streams.per_chunk_off16_count[ci];
+            chunks_words[base + 8] = stream_word_base; // length
+            chunks_words[base + 9] = streams.per_chunk_length_used[ci];
+            // slots 10..11 reserved.
+        }
+    }
+
+    // ── Build decode pipeline + descriptor set ───────────────────
     var cache: descriptors.Cache = .{};
     defer descriptors.invalidateAll(ctx, &cache);
 
@@ -560,26 +655,23 @@ pub fn decodeL1Sync(
         "lz_decode",
         tier,
         spv,
-        5, // bindings 0..4: cmd, lit, off16, length, dst
+        6, // bindings 0..5: cmd, lit, off16, length, dst, chunks
         @sizeOf(DecodePush),
     );
 
-    const dec_bindings: [5]vk.VkDescriptorBufferInfo = .{
+    const dec_bindings: [6]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = streams.cmd_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = streams.lit_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = streams.off16_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = streams.length_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = dst_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        .{ .buffer = chunks_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
     };
     const dec_set = try descriptors.allocSet(ctx, cached_dec, dec_bindings[0..]);
 
-    // 4. Submit the decode dispatch.
+    // ── Submit decode dispatch (n_chunks workgroups) ─────────────
     const dec_push: DecodePush = .{
-        .cmd_size = streams.cmd_size,
-        .lit_size = streams.lit_size,
-        .off16_count = streams.off16_count,
-        .length_remaining = streams.length_used,
-        .dst_size = dst_size,
+        .n_chunks = n_chunks,
     };
     var dec_push_bytes: [@sizeOf(DecodePush)]u8 = undefined;
     @memcpy(dec_push_bytes[0..], std.mem.asBytes(&dec_push));
@@ -590,10 +682,10 @@ pub fn decodeL1Sync(
         cached_dec.pipeline_layout,
         dec_set,
         dec_push_bytes[0..],
-        .{ 1, 1, 1 },
+        .{ n_chunks, 1, 1 },
     );
 
-    // 5. Copy dst out via the host map.
+    // Copy dst out via the host map.
     if (dst_size > 0) {
         const dst_mapped = dst_b.mapped orelse return error.MapMemoryFailed;
         @memcpy(dst_host[0..dst_size], dst_mapped[0..dst_size]);
@@ -601,10 +693,9 @@ pub fn decodeL1Sync(
 }
 
 // ── Debug helper: read back stream bytes ─────────────────────────
-// Maps each stream buffer, copies up to `max_bytes` into the caller-
-// supplied buffers, and unmaps. Returned slices reflect the actual
-// (clamped) length. Returns null if mapping fails. Test-only helper —
-// not production code.
+// Single-chunk debug aid — maps each stream buffer and copies up to
+// `max_bytes` of CHUNK 0's slice into the caller-supplied buffers.
+// Useful for the per-128-byte regression cases in l1_codec_test.zig.
 pub fn debugReadStreams(
     ctx: *driver.Context,
     streams: L1Streams,
@@ -623,27 +714,34 @@ pub fn debugReadStreams(
     var off16_n: usize = 0;
     var length_n: usize = 0;
 
+    // Chunk 0's slice starts at byte 0; per-chunk_0 sizes are the totals
+    // when n_chunks == 1, which is the only case this helper is exercised.
+    const ch0_cmd = if (streams.n_chunks > 0) streams.per_chunk_cmd_size[0] else 0;
+    const ch0_lit = if (streams.n_chunks > 0) streams.per_chunk_lit_size[0] else 0;
+    const ch0_off16 = if (streams.n_chunks > 0) streams.per_chunk_off16_count[0] else 0;
+    const ch0_length = if (streams.n_chunks > 0) streams.per_chunk_length_used[0] else 0;
+
     if (map(ctx.dev, streams.cmd_mem, 0, vk.VK_WHOLE_SIZE, 0, &raw) == vk.VK_SUCCESS) {
         const p: [*]const u8 = @ptrCast(raw.?);
-        cmd_n = @min(out_cmd.len, streams.cmd_size);
+        cmd_n = @min(out_cmd.len, ch0_cmd);
         @memcpy(out_cmd[0..cmd_n], p[0..cmd_n]);
         unmap(ctx.dev, streams.cmd_mem);
     }
     if (map(ctx.dev, streams.lit_mem, 0, vk.VK_WHOLE_SIZE, 0, &raw) == vk.VK_SUCCESS) {
         const p: [*]const u8 = @ptrCast(raw.?);
-        lit_n = @min(out_lit.len, streams.lit_size);
+        lit_n = @min(out_lit.len, ch0_lit);
         @memcpy(out_lit[0..lit_n], p[0..lit_n]);
         unmap(ctx.dev, streams.lit_mem);
     }
     if (map(ctx.dev, streams.off16_mem, 0, vk.VK_WHOLE_SIZE, 0, &raw) == vk.VK_SUCCESS) {
         const p: [*]const u8 = @ptrCast(raw.?);
-        off16_n = @min(out_off16.len, streams.off16_count * 2);
+        off16_n = @min(out_off16.len, ch0_off16 * 2);
         @memcpy(out_off16[0..off16_n], p[0..off16_n]);
         unmap(ctx.dev, streams.off16_mem);
     }
     if (map(ctx.dev, streams.length_mem, 0, vk.VK_WHOLE_SIZE, 0, &raw) == vk.VK_SUCCESS) {
         const p: [*]const u8 = @ptrCast(raw.?);
-        length_n = @min(out_length.len, streams.length_used);
+        length_n = @min(out_length.len, ch0_length);
         @memcpy(out_length[0..length_n], p[0..length_n]);
         unmap(ctx.dev, streams.length_mem);
     }
@@ -677,4 +775,6 @@ pub fn freeStreams(ctx: *driver.Context, streams: *L1Streams) void {
     streams.cmd_size = 0;
     streams.off16_count = 0;
     streams.length_used = 0;
+    streams.n_chunks = 0;
+    streams.dst_size = 0;
 }

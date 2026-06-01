@@ -802,3 +802,90 @@ test "L1 round-trip on canonical inputs" {
     unaltered — every shuffle constant, every `__match_any` loop, every
     `__ffs/__clz` guard is hard-coded to 32. Probe rejects at startup;
     phase 4 may add a 16/64 path but not phase 1.
+
+---
+
+## Phase 1.5 addendum — multi-chunk dispatch
+
+The phase-1 single-chunk constraint (`group_count=(1,1,1)`) lifts to
+`group_count=(n_chunks,1,1)` with `n_chunks = ceil(src_size / CHUNK_SIZE)`
+and `CHUNK_SIZE = 0x20000` (128 KiB). `gl_WorkGroupID.x` identifies the
+chunk; each workgroup is independent (no cross-chunk hash references,
+no cross-chunk match references).
+
+### Buffer-layout changes (encoder)
+
+* Adds `set=0, binding=7` **ChunkDescs**: `n_chunks * 3 u32`
+  per-chunk struct `{ src_offset, src_size, reserved }`.
+* Existing **Sizes** sidecar grows to `n_chunks * 4 u32` (was `4 u32`):
+  per-chunk `{ lit_size, cmd_size, off16_count, length_used }`.
+* **Hash** grows to `n_chunks * (1 << hash_bits) u32` (was
+  `(1 << hash_bits) u32`); workgroup `k` uses entries
+  `[k * hash_size, (k+1) * hash_size)`. Per-chunk hash slot keeps the
+  CUDA "no cross-chunk references" invariant.
+* `lit_buf` / `cmd_buf` / `off16_buf` / `length_buf` grow to
+  `n_chunks * chunk_capacity` bytes each. Workgroup `k` writes into
+  the byte slice `[k * chunk_capacity, (k+1) * chunk_capacity)`.
+  `chunk_capacity` is the worst-case per-chunk stream size
+  (`2 * CHUNK_SIZE + 16`, multiple of 4) and is passed as a push
+  constant so the shader's per-chunk word base computation stays
+  cheap (`g_dst_word_base = chunk_id * (chunk_capacity >> 2)`).
+
+### Encoder push constants (12 B)
+
+```glsl
+layout(push_constant) uniform PC {
+    uint n_chunks;
+    uint hash_bits;
+    uint chunk_capacity;
+} pc;
+```
+
+### Buffer-layout changes (decoder)
+
+* Adds `set=0, binding=5` **ChunkDescs**: `n_chunks * 12 u32`. Slots:
+  ```
+  [0]  dst_offset           (bytes into Dst)
+  [1]  dst_size
+  [2]  cmd_word_base        (u32 words into Cmd; byte addr = base*4)
+  [3]  cmd_size
+  [4]  lit_word_base
+  [5]  lit_size
+  [6]  off16_word_base
+  [7]  off16_count
+  [8]  length_word_base
+  [9]  length_remaining
+  [10..11]  reserved
+  ```
+* Host writes `dst_offset = chunk_id * CHUNK_SIZE`,
+  `cmd/lit/off16/length_word_base = chunk_id * (chunk_capacity / 4)`,
+  and the per-chunk sizes returned by the encoder's Sizes sidecar.
+
+### Decoder push constants (4 B)
+
+```glsl
+layout(push_constant) uniform PC {
+    uint n_chunks;
+} pc;
+```
+
+(Every other push-const slot from phase 1 is now per-chunk and read
+from ChunkDescs.)
+
+### Synchronisation
+
+The chunk-descriptor load + per-chunk base computation runs only on
+lane 0; the subsequent hash-zero loop and main scan loop read those
+shared cells from every lane. A workgroup-wide `barrier()` +
+`memoryBarrierShared()` between the lane-0 init and the subsequent
+multi-lane work guarantees visibility on every driver — `subgroupBarrier`
++ `subgroupMemoryBarrierShared` is *not* sufficient on every IHV (some
+mis-converge the shared-mem visibility ordering when local size equals
+subgroup size).
+
+### Backward compatibility
+
+`encodeL1Sync` is now a thin wrapper over `encodeL1Multi`. Single-chunk
+callers dispatch with `n_chunks=1`, `g_src_byte_base=0`,
+`g_dst_word_base=0`, `g_hash_base=0` — algorithmically identical to the
+phase-1 single-chunk path.
