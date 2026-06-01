@@ -53,9 +53,43 @@ pub const Context = struct {
 
 pub var g_default: Context = .{};
 
+/// CLI-provided device selector, consulted by `ensureInit`. Default leaves
+/// the historical behavior unchanged (first compute-capable device).
+/// Callers set this BEFORE invoking `ensureInit` (the CLI does so after
+/// parsing `--device <N|substring>`); test harnesses that want to pin a
+/// device without touching CLI plumbing can also set
+/// `SLZ_VK_DEVICE_INDEX=<N>` in the environment, which `ensureInit` reads
+/// as a fallback when the in-process selector is still `.default`.
+///
+/// Lifetime note: `.by_name`'s slice MUST outlive `ensureInit`. The CLI
+/// holds argv for the whole process, so passing a slice into argv there is
+/// safe; tests building a synthetic selector should keep their own backing
+/// buffer alive for the call.
+pub var g_selector: device_mod.DeviceSelector = .default;
+
+/// Convenience setter — keeps the global private when callers don't want
+/// to import `device_mod` for the union tag names.
+pub fn setSelector(s: device_mod.DeviceSelector) void {
+    g_selector = s;
+}
+
 pub const DriverError = error{
     LoaderInitFailed,
 } || instance_mod.InstanceError || device_mod.DeviceError;
+
+/// Resolve the device selector that `ensureInit` should pass to
+/// `pickPhysicalDeviceWith`. Priority:
+///   1. Explicit `g_selector` (anything other than `.default`).
+///   2. `SLZ_VK_DEVICE_INDEX=<N>` env var when set + parseable.
+///   3. `.default` — historical "first compute-capable device" behavior.
+fn resolveSelector() device_mod.DeviceSelector {
+    if (g_selector != .default) return g_selector;
+    const raw = std.c.getenv("SLZ_VK_DEVICE_INDEX") orelse return .default;
+    const s = std.mem.span(raw);
+    if (s.len == 0) return .default;
+    const n = std.fmt.parseInt(u32, s, 10) catch return .default;
+    return .{ .by_index = n };
+}
 
 /// Bring up the full Vulkan bootstrap into `g_default`. Safe to call any
 /// number of times — subsequent calls after the first success are no-ops.
@@ -70,7 +104,8 @@ pub fn ensureInit() DriverError!void {
     const inst = try instance_mod.createInstance(true);
     errdefer instance_mod.destroyInstance(inst);
 
-    const pd = try device_mod.pickPhysicalDevice(inst);
+    const selector = resolveSelector();
+    const pd = try device_mod.pickPhysicalDeviceWith(inst, selector);
     // Probe BEFORE createDevice so we can opt into VK_KHR_8bit_storage
     // when the device reports it. The decoder's fast-batch path needs
     // byte-typed Dst SSBO access, which only compiles when

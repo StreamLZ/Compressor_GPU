@@ -17,14 +17,79 @@ pub const DeviceError = error{
     EnumerateFailed,
     CreateDeviceFailed,
     LoaderNotReady,
+    DeviceIndexOutOfRange,
+    DeviceNameNotFound,
+    DeviceNameAmbiguous,
 };
 
 const MAX_PHYSICAL_DEVICES: u32 = 16;
 const MAX_QUEUE_FAMILIES: u32 = 16;
 
+/// Selector passed to pickPhysicalDevice. The CLI/driver layer translates
+/// the user's `--device <N>` or `--device <substring>` (or
+/// SLZ_VK_DEVICE_INDEX env var) into one of these variants. Default keeps
+/// the historical behavior of returning the first compute-capable device,
+/// so callers that don't care never need to touch it.
+pub const DeviceSelector = union(enum) {
+    default,
+    by_index: u32,
+    by_name: []const u8,
+};
+
+fn hasComputeQueue(pd: vk.VkPhysicalDevice) bool {
+    const get_qf = vk.vkGetPhysicalDeviceQueueFamilyProperties_fn orelse return false;
+    var qf_count: u32 = 0;
+    get_qf(pd, &qf_count, null);
+    if (qf_count == 0) return false;
+    if (qf_count > MAX_QUEUE_FAMILIES) qf_count = MAX_QUEUE_FAMILIES;
+    var qfs: [MAX_QUEUE_FAMILIES]vk.VkQueueFamilyProperties = @splat(.{});
+    get_qf(pd, &qf_count, @ptrCast(&qfs));
+    var qi: u32 = 0;
+    while (qi < qf_count) : (qi += 1) {
+        if ((qfs[qi].queueFlags & vk.VK_QUEUE_COMPUTE_BIT) != 0 and qfs[qi].queueCount > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn deviceNameCopy(pd: vk.VkPhysicalDevice, buf: []u8) []const u8 {
+    const get_props = vk.vkGetPhysicalDeviceProperties_fn orelse return &.{};
+    var props: vk.VkPhysicalDeviceProperties = .{};
+    get_props(pd, &props);
+    var n: usize = 0;
+    while (n < props.deviceName.len and n < buf.len and props.deviceName[n] != 0) : (n += 1) {
+        buf[n] = props.deviceName[n];
+    }
+    return buf[0..n];
+}
+
+fn asciiEqIgnoreCase(a: u8, b: u8) bool {
+    const al = if (a >= 'A' and a <= 'Z') a + 32 else a;
+    const bl = if (b >= 'A' and b <= 'Z') b + 32 else b;
+    return al == bl;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (!asciiEqIgnoreCase(haystack[i + j], needle[j])) break;
+        }
+        if (j == needle.len) return true;
+    }
+    return false;
+}
+
 pub fn pickPhysicalDevice(inst: vk.VkInstance) DeviceError!vk.VkPhysicalDevice {
+    return pickPhysicalDeviceWith(inst, .default);
+}
+
+pub fn pickPhysicalDeviceWith(inst: vk.VkInstance, selector: DeviceSelector) DeviceError!vk.VkPhysicalDevice {
     const enumerate = vk.vkEnumeratePhysicalDevices_fn orelse return error.LoaderNotReady;
-    const get_qf = vk.vkGetPhysicalDeviceQueueFamilyProperties_fn orelse return error.LoaderNotReady;
 
     var count: u32 = 0;
     if (enumerate(inst, &count, null) != vk.VK_SUCCESS) return error.EnumerateFailed;
@@ -37,24 +102,43 @@ pub fn pickPhysicalDevice(inst: vk.VkInstance) DeviceError!vk.VkPhysicalDevice {
     // `count` devices, which is exactly what we want.
     if (r != vk.VK_SUCCESS and r != vk.VK_INCOMPLETE) return error.EnumerateFailed;
 
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        const pd = devices[i];
-        if (pd == null) continue;
-        var qf_count: u32 = 0;
-        get_qf(pd, &qf_count, null);
-        if (qf_count == 0) continue;
-        if (qf_count > MAX_QUEUE_FAMILIES) qf_count = MAX_QUEUE_FAMILIES;
-        var qfs: [MAX_QUEUE_FAMILIES]vk.VkQueueFamilyProperties = @splat(.{});
-        get_qf(pd, &qf_count, @ptrCast(&qfs));
-        var qi: u32 = 0;
-        while (qi < qf_count) : (qi += 1) {
-            if ((qfs[qi].queueFlags & vk.VK_QUEUE_COMPUTE_BIT) != 0 and qfs[qi].queueCount > 0) {
-                return pd;
+    switch (selector) {
+        .default => {
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                const pd = devices[i];
+                if (pd == null) continue;
+                if (hasComputeQueue(pd)) return pd;
             }
-        }
+            return error.NoComputeQueueFamily;
+        },
+        .by_index => |idx| {
+            if (idx >= count) return error.DeviceIndexOutOfRange;
+            const pd = devices[idx];
+            if (pd == null) return error.DeviceIndexOutOfRange;
+            if (!hasComputeQueue(pd)) return error.NoComputeQueueFamily;
+            return pd;
+        },
+        .by_name => |needle| {
+            var match: vk.VkPhysicalDevice = null;
+            var match_count: u32 = 0;
+            var name_buf: [vk.VK_MAX_PHYSICAL_DEVICE_NAME_SIZE]u8 = @splat(0);
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                const pd = devices[i];
+                if (pd == null) continue;
+                const name = deviceNameCopy(pd, name_buf[0..]);
+                if (containsIgnoreCase(name, needle)) {
+                    match = pd;
+                    match_count += 1;
+                }
+            }
+            if (match_count == 0) return error.DeviceNameNotFound;
+            if (match_count > 1) return error.DeviceNameAmbiguous;
+            if (!hasComputeQueue(match)) return error.NoComputeQueueFamily;
+            return match;
+        },
     }
-    return error.NoComputeQueueFamily;
 }
 
 pub const DeviceBundle = struct {

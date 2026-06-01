@@ -89,21 +89,37 @@ pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2: VkStructureType = 100005
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2: VkStructureType = 1000059001;
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES: VkStructureType = 1000094000;
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES: VkStructureType = 1000225000;
-pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES: VkStructureType = 1000225001;
+// Correct sType values per vulkan_core.h (1.3 core promotion):
+//   FEATURES        = 1000225002
+//   PROPERTIES      = 1000225000
+//   REQUIRED_CREATE = 1000225001
+// Earlier revisions had FEATURES and the create-info struct swapped, which
+// Intel's driver tolerated silently but NVIDIA's validator (correctly)
+// rejects in the VkDeviceCreateInfo pNext chain.
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES: VkStructureType = 1000225002;
 // VkPipelineShaderStageRequiredSubgroupSizeCreateInfo — chained into a
 // VkPipelineShaderStageCreateInfo to force a specific subgroup size at
 // pipeline creation. Needed because Intel UHD silently defaults to
 // subgroupSize=16 (= SIMD8 pairs) instead of the device-reported max of
 // 32, which breaks every shader that assumes WARP_SIZE=32. Promoted in
 // Vulkan 1.3 from VK_EXT_subgroup_size_control.
-pub const VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO: VkStructureType = 1000225002;
-pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: VkStructureType = 49;
+pub const VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO: VkStructureType = 1000225001;
+// Correct sType values per vulkan_core.h:
+//   VULKAN_1_1_FEATURES = 49 (intentionally not defined here — we don't
+//                             use the v1.1 omnibus feature struct)
+//   VULKAN_1_2_FEATURES = 51 (was incorrectly 49, which is _1_1_FEATURES;
+//                             Intel tolerated, NVIDIA validator rejects)
+//   VULKAN_1_3_FEATURES = 53
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: VkStructureType = 51;
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: VkStructureType = 53;
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES: VkStructureType = 1000175000;
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES: VkStructureType = 1000177000;
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES: VkStructureType = 1000257000;
 pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES: VkStructureType = 1000207000;
-pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES: VkStructureType = 1000314000;
+// Correct sType per vulkan_core.h: 1000314007 (NOT 1000314000, which is
+// the unrelated VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 head — wrong sType
+// caused NVIDIA's validator to reject the pNext chain).
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES: VkStructureType = 1000314007;
 // VkPipelineCacheCreateInfo — core in Vulkan 1.0, sType value 17.
 pub const VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO: VkStructureType = 17;
 
