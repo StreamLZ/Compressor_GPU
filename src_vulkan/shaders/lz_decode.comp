@@ -339,18 +339,40 @@ void main() {
         bool my_is_long = my_valid && (my_cmd < TOKEN_SHORT_MIN);
         uint any_long   = subgroupBallot(my_is_long).x;
 
-        if (any_long == 0u) {
-            // ── Fast batched path (lane-0-serial form) ──────────────
-            // Original CUDA decoder uses warp-cooperative subgroupShuffle
-            // to broadcast lane k's parsed fields to every lane for each
-            // copy iteration. In the GLSL port that pattern produced
-            // sparse byte drops on NVIDIA + a 32-batch token stream — most
-            // likely a dynamic-shuffle / per-byte-RMW interaction. Phase 1
-            // accepts a lane-0-serial fallback: parse + copy every token
-            // on lane 0 only, broadcast the post-batch shared cursors,
-            // and continue. Throughput parity with CUDA returns once the
-            // dst buffer goes byte-typed (storageBuffer8BitAccess) in
-            // phase 2, which obviates the per-byte RMW path entirely.
+        // ── Fast batched path DISABLED (correctness bug) ──────────────
+        // The phase-1 lane-0-serial fast batch path (commented-out below)
+        // produces wrong output for certain inputs: enwik8 fails at byte
+        // 2336 once the input is ≥ 2430 bytes; web.txt full fails at byte
+        // 160222. Both failures are CONTENT-SPECIFIC (not multi-chunk-
+        // dispatch-related): single-chunk encodes of those byte ranges
+        // hit the same first_diff regardless of n_chunks. Bisecting
+        // enwik8 size showed the threshold falls between 2425 (passes)
+        // and 2430 (fails), corresponding to the encoder switching from
+        // a 5-token sequence ending in `c0 78 f8 f8 f8 f8 f0` to a
+        // single `01` (TOKEN_LONG_NEAR) covering match_len=97. The
+        // presence of the `01` token forces slow path for the LAST few
+        // batches, but the FIRST 192 cmds are still processed by the
+        // fast batch path — and that's where the corruption originates
+        // (cascading zero-fills propagate from a bad match-copy load).
+        //
+        // The slow-path-only round-trip is correct end-to-end across
+        // every size (256 B repetitive through 4 MiB enwik8). Lane-0-
+        // serial in slow path runs each token in its own warpLiteralCopy
+        // + warpMatchCopy pair, each followed by a subgroupBarrier +
+        // subgroupMemoryBarrierBuffer. The fast path tries to batch 32
+        // tokens with no per-token barriers; the missing barrier is the
+        // suspect (an intra-batch match-copy read sometimes returns the
+        // pre-store zero for a word a previous token in the same batch
+        // wrote). Adding `memoryBarrierBuffer()` at the end of the fast
+        // path was insufficient; the bytes are already being mis-read
+        // mid-batch, before any barrier executes.
+        //
+        // For phase 1 the fast path is unconditionally disabled. The
+        // slow path is correct and fast enough for the L1 conformance
+        // goal — phase 2 (storageBuffer8BitAccess) will replace the
+        // per-byte RMW pattern entirely, at which point a corrected
+        // fast batch can be revisited.
+        if (false && any_long == 0u) {
             if (lane == 0u) {
                 uint cur_dst    = sh_dst_pos;
                 uint cur_lit    = sh_lit_pos;

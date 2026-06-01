@@ -463,6 +463,44 @@ pub fn main(process_init: std.process.Init) !void {
         try w.flush();
     }
 
+    // ── Enwik8 prefix sweep — regression coverage for the 2336 bug ──
+    // These prefixes pinned down the root cause: enwik8_2425 PASSES under
+    // the old fast-batched decoder path (the encoder produced no `01`
+    // long-near token), but enwik8_2430 FAILS at byte 2336 (encoder hit
+    // the `01` threshold). Both now pass under the slow-path-only
+    // decoder. Keep the sweep so the regression is locked in.
+    inline for ([_]usize{ 2420, 2425, 2430, 2433, 2440 }) |sz| {
+        var s: [sz]u8 = undefined;
+        var d: [sz]u8 = undefined;
+        const ok_open = blk: {
+            var file = std.Io.Dir.cwd().openFile(io, "assets/enwik8.txt", .{}) catch break :blk false;
+            defer file.close(io);
+            const n = file.readPositionalAll(io, s[0..], 0) catch 0;
+            break :blk (n == sz);
+        };
+        if (!ok_open) {
+            try w.print("L1_ROUNDTRIP SKIP enwik8_{d}\n", .{sz});
+            try w.flush();
+        } else {
+            const r = try roundTrip(ctx, enc_spv, dec_spv, s[0..], d[0..]);
+            var label_buf: [32]u8 = undefined;
+            const label = try std.fmt.bufPrint(&label_buf, "enwik8_{d}", .{sz});
+            try printResult(w, label, sz, r);
+            try w.flush();
+            if (!r.pass) {
+                const d_off = r.first_diff;
+                const start = if (d_off >= 16) d_off - 16 else 0;
+                const end = @min(d_off + 16, sz);
+                try w.print("DEBUG enwik8_{d} src[{d}..{d}] = ", .{ sz, start, end });
+                for (s[start..end]) |b| try w.print("{x:0>2} ", .{b});
+                try w.print("\nDEBUG enwik8_{d} dst[{d}..{d}] = ", .{ sz, start, end });
+                for (d[start..end]) |b| try w.print("{x:0>2} ", .{b});
+                try w.print("\n", .{});
+                try w.flush();
+            }
+        }
+    }
+
     // ── Phase 1.5: multi-chunk cases ─────────────────────────────
     // The shaders now dispatch one workgroup per 128 KiB chunk. Past this
     // point every input larger than CHUNK_SIZE exercises the multi-chunk
@@ -564,13 +602,91 @@ pub fn main(process_init: std.process.Init) !void {
         }
     }
 
-    // Diagnostic note: chunk1_standalone (web.txt[131072..262144] as a
-    // single-chunk encode) and the equivalent multi-chunk chunk-1 slice
-    // BOTH fail at chunk-local offset 29150 — proving the multi-chunk
-    // dispatch is correct and identical to the standalone single-chunk
-    // path. The latent failure is a content-specific encoder/decoder
-    // bug that pre-dates this task; it just wasn't exercised because
-    // the prior test set capped at 64 KiB of corpus input.
+    // Root-cause note: the chunk-1 / 2336 failures observed before the
+    // fix were NOT multi-chunk dispatch bugs. The shared first_diff
+    // across multi-chunk and single-chunk runs (web.txt[131072..262144]
+    // = chunk 1; enwik8[0..2440] = chunk 0) traced to the decoder's
+    // 32-token FAST BATCH path producing wrong dst bytes when the cmd
+    // stream contained a TOKEN_LONG_NEAR (`01`) anywhere. Disabling the
+    // fast path (slow-path only) fixed both. Phase 2 will resurrect the
+    // batched path once dst goes byte-typed via storageBuffer8BitAccess.
+
+    // Diagnostic D1: enwik8 first 32 KiB as a single chunk.
+    // If this PASSES, BUG B (the "2336 bug" at chunk 0 offset 2336 of
+    // enwik8 in multi-chunk runs) is chunk-count-dependent. If it FAILS,
+    // BUG B is enwik8-data-specific (an encoder edge case that only
+    // shows up with this corpus, exposed because prior tests used web.txt).
+    {
+        const enwik_path = "assets/enwik8.txt";
+        var file = std.Io.Dir.cwd().openFile(io, enwik_path, .{}) catch {
+            try w.print("L1_ROUNDTRIP SKIP enwik8_first_32k_singlechunk (open fail)\n", .{});
+            try w.flush();
+            return;
+        };
+        defer file.close(io);
+        const sz: usize = 32 * 1024;
+        var s: [32 * 1024]u8 = undefined;
+        var d: [32 * 1024]u8 = undefined;
+        const n = file.readPositionalAll(io, s[0..], 0) catch 0;
+        if (n != sz) {
+            try w.print("L1_ROUNDTRIP SKIP enwik8_first_32k_singlechunk (short read = {d})\n", .{n});
+            try w.flush();
+        } else {
+            const r = try roundTrip(ctx, enc_spv, dec_spv, s[0..], d[0..]);
+            try printResult(w, "enwik8_first_32k_singlechunk", sz, r);
+            try w.flush();
+            if (!r.pass) {
+                const d_off = r.first_diff;
+                const start = if (d_off >= 16) d_off - 16 else 0;
+                const end = @min(d_off + 16, sz);
+                try w.print("DEBUG enwik32k src[{d}..{d}] = ", .{ start, end });
+                for (s[start..end]) |b| try w.print("{x:0>2} ", .{b});
+                try w.print("\nDEBUG enwik32k dst[{d}..{d}] = ", .{ start, end });
+                for (d[start..end]) |b| try w.print("{x:0>2} ", .{b});
+                try w.print("\n", .{});
+                try w.flush();
+            }
+        }
+    }
+
+    // Diagnostic D2: enwik8 first 128 KiB as a single chunk (= n_chunks=1).
+    // If D1 passes but D2 fails → some encoder edge case in enwik8
+    // between 32k and 128k. If D2 passes → the 2336 bug is genuinely
+    // multi-chunk-dispatch-specific.
+    {
+        const enwik_path = "assets/enwik8.txt";
+        var file = std.Io.Dir.cwd().openFile(io, enwik_path, .{}) catch {
+            try w.print("L1_ROUNDTRIP SKIP enwik8_first_128k_singlechunk (open fail)\n", .{});
+            try w.flush();
+            return;
+        };
+        defer file.close(io);
+        const sz: usize = 128 * 1024;
+        const src = try allocator.alloc(u8, sz);
+        defer allocator.free(src);
+        const dst = try allocator.alloc(u8, sz);
+        defer allocator.free(dst);
+        const n = file.readPositionalAll(io, src, 0) catch 0;
+        if (n != sz) {
+            try w.print("L1_ROUNDTRIP SKIP enwik8_first_128k_singlechunk (short read = {d})\n", .{n});
+            try w.flush();
+        } else {
+            const r = try roundTrip(ctx, enc_spv, dec_spv, src, dst);
+            try printResult(w, "enwik8_first_128k_singlechunk", sz, r);
+            try w.flush();
+            if (!r.pass) {
+                const d_off = r.first_diff;
+                const start = if (d_off >= 16) d_off - 16 else 0;
+                const end = @min(d_off + 16, sz);
+                try w.print("DEBUG enwik128k src[{d}..{d}] = ", .{ start, end });
+                for (src[start..end]) |b| try w.print("{x:0>2} ", .{b});
+                try w.print("\nDEBUG enwik128k dst[{d}..{d}] = ", .{ start, end });
+                for (dst[start..end]) |b| try w.print("{x:0>2} ", .{b});
+                try w.print("\n", .{});
+                try w.flush();
+            }
+        }
+    }
 
     // Case M5: first 1 MiB of enwik8 (8 chunks).
     {
