@@ -65,8 +65,17 @@ layout(set = 0, binding = 6) writeonly buffer Sizes { uint s[]; } sizes_buf;
 // ChunkDesc layout (3 u32 per chunk, packed):
 //   [0] src_offset    (bytes into Src for this chunk's first byte)
 //   [1] src_size      (bytes in this chunk; ≤ chunk_capacity)
-//   [2] reserved      (kept for 16-byte alignment / future header_offset)
+//   [2] is_first      (0 or 1; when 1 the encoder emits an
+//                      INITIAL_LITERAL_COPY_BYTES verbatim prefix at the
+//                      head of lit_buf and seeds anchor at 8)
 layout(set = 0, binding = 7) readonly buffer ChunkDescs { uint d[]; } chunks_buf;
+
+// Off32 stream — 3-byte LE entries (OFF32_ENTRY_BYTES = 3) for matches
+// with resolved_off > NEAR_OFFSET_MAX. Two virtual blocks per chunk (the
+// 64 KiB scanBlock interior split): block-0 entries go first, then
+// block-1 entries; per-block counts are written into the Sizes sidecar
+// (slots 4 and 5).
+layout(set = 0, binding = 8)          buffer Off32 { uint w[]; } off32_buf;
 
 layout(push_constant) uniform PC {
     uint n_chunks;
@@ -108,8 +117,20 @@ const uint NEAR_CONT_MATCH_MAX         = 90u;
 const uint LENGTH_INLINE_MAX           = 251u;
 const uint LENGTH_EXT_TAG_BIAS         = 4u;
 const uint LZ_BLOCK_SIZE               = 0x10000u;
+const uint INITIAL_LITERAL_COPY_BYTES  = 8u;
 const int  INITIAL_RECENT_OFFSET       = -8;
 const uint enable_match_rehash         = 0u; // L1 hard-zero (§11.5)
+
+// Off32 / far-offset constants (mirror src/encode/lz_token_emit.cuh +
+// src/common/gpu_wire_format.cuh).
+const uint OFF32_ENTRY_BYTES           = 3u;
+const uint OFF32_MATCH_LEN_BIAS        = 5u;   // small-far token = match_len - 5 (token in [9, 23] after FAR_OFFSET_MIN_MATCH guard)
+const uint OFF32_INLINE_DELTA_MAX      = 23u;  // max match_len encodable inline = OFF32_MATCH_LEN_BIAS + 23 = 28
+const uint OFF32_FAR_LEN_BIAS          = 29u;  // long-far (token 2) length value = match_len - 29
+const uint OFF32_NEAR_LEN_BIAS         = 91u;  // long-near (token 1) length value = match_len - 91 (NEAR_CONT_MATCH_MAX + 1)
+const uint TOKEN_LONG_LITERAL          = 0u;
+const uint TOKEN_LONG_NEAR             = 1u;
+const uint TOKEN_LONG_FAR              = 2u;
 
 // ── Hash multiplier ─────────────────────────────────────────────────
 // FIB_HASH_MUL_K6 = 0x79B97F4A7C150000ULL (= 0x9E3779B97F4A7C15ULL << 16).
@@ -237,6 +258,25 @@ void storeOff16LE(uint pos, uint v) {
     storeOff16Byte(pos + 1u, (v >> 8) & 0xFFu);
 }
 
+void storeOff32Byte(uint pos, uint b) {
+    uint gpos = (g_dst_word_base << 2) + pos;
+    uint widx = gpos >> 2;
+    uint sh = (gpos & 3u) * 8u;
+    uint mask = 0xFFu << sh;
+    off32_buf.w[widx] = (off32_buf.w[widx] & ~mask) | ((b & 0xFFu) << sh);
+}
+
+// 24-bit LE store at byte `pos` (3 bytes). 128 KiB chunks mean
+// `effective_offset + block2_start - match_pos` never exceeds 0x40000
+// at L1, comfortably under LARGE_OFFSET_THRESHOLD (0xC00000), so the
+// CUDA writeOffset32 large-tag branch is dead and we emit the simple
+// 3-byte form only.
+void storeOff32LE24(uint pos, uint v) {
+    storeOff32Byte(pos,      v & 0xFFu);
+    storeOff32Byte(pos + 1u, (v >> 8) & 0xFFu);
+    storeOff32Byte(pos + 2u, (v >> 16) & 0xFFu);
+}
+
 // ── Shared OutputStreams cursor ─────────────────────────────────────
 // All emit logic is lane-0 only, so the cursors live in shared memory
 // and only lane 0 touches them.
@@ -244,6 +284,13 @@ shared uint lit_count;
 shared uint token_count;
 shared uint off16_count;
 shared uint length_count;
+shared uint off32_byte_pos;     // running byte cursor across block 0 + block 1
+shared uint off32_count_total;  // running entry count across both blocks
+shared uint off32_count_block1; // snapshot of off32_count_total at block-0 end
+shared uint cmd_stream2_offset; // token_count snapshot at block-0/1 boundary
+                                // (0 if g_src_size <= LZ_BLOCK_SIZE: no boundary)
+shared uint sh_block2_start;    // 0 during block 0, LZ_BLOCK_SIZE during block 1
+                                // (= CUDA's `block2_start` argument to emitCmd)
 
 // ── State broadcast across the warp ─────────────────────────────────
 shared uint  sh_anchor;
@@ -287,13 +334,17 @@ void writeLengthValue(uint value) {
 }
 
 // ── emitCmd (lane-0 only) ───────────────────────────────────────────
-// Port of src/encode/lz_token_emit.cuh:103 — with phase-1 constraint
-// that any far-offset emit returns failure (caller must filter first).
-// Phase-1 guarantee: caller only invokes emitCmd when resolved_off <=
-// NEAR_OFFSET_MAX (far matches are rejected at the parser). Therefore
-// the Step-4 far-offset branch is dead at L1; we keep its structure
-// for parity but it can never fire.
-void emitCmd(uint lit_len, uint match_len, uint offset, int recent_offset) {
+// Port of src/encode/lz_token_emit.cuh:103. Caller is responsible for
+// enforcing FAR_OFFSET_MIN_MATCH (14) before invoking with a far offset
+// (resolved_off > NEAR_OFFSET_MAX) — the parser advances `pos = match_pos
+// + 1` and retries when a far match comes up too short, exactly like
+// CUDA's lz_greedy_parser.cuh.
+//
+// `match_pos` is the source position where the match starts (used by
+// the far branch to compute the off32 entry value `effective_offset +
+// block2_start - match_pos`). `block2_start` is 0 inside block 0 and
+// LZ_BLOCK_SIZE inside block 1.
+void emitCmd(uint lit_len, uint match_len, uint offset, int recent_offset, uint match_pos, uint block2_start) {
     uint remaining_lit = lit_len;
 
     // Step 1: Fast path.
@@ -324,8 +375,7 @@ void emitCmd(uint lit_len, uint match_len, uint offset, int recent_offset) {
         if (match_len == 0u) return;
     }
 
-    // Step 3: Near-offset continuation. (Phase 1 guarantees offset is
-    // either 0 or <= NEAR_OFFSET_MAX, so the Step-4 far path is dead.)
+    // Step 3: Near-offset continuation.
     if (offset <= NEAR_OFFSET_MAX && match_len <= NEAR_CONT_MATCH_MAX) {
         uint current = (match_len < MAX_INLINE_MATCH) ? match_len : MAX_INLINE_MATCH;
         uint token = (remaining_lit + TOKEN_MATCH_SHIFT_MUL * current) & 0xFFu;
@@ -348,8 +398,6 @@ void emitCmd(uint lit_len, uint match_len, uint offset, int recent_offset) {
     }
 
     // Step 4: long near-offset / far-offset path.
-    // Phase 1 only reaches here when offset <= NEAR_OFFSET_MAX (or 0)
-    // AND match_len > NEAR_CONT_MATCH_MAX — i.e. token-type 1 "long near".
     if (remaining_lit != 0u) {
         storeCmdByte(token_count, (TOKEN_RECENT_FLAG + remaining_lit) & 0xFFu);
         token_count += 1u;
@@ -360,17 +408,43 @@ void emitCmd(uint lit_len, uint match_len, uint offset, int recent_offset) {
         effective_offset = uint(-recent_offset);
     }
 
-    // Phase-1 guard: parser must never call emitCmd with a far offset.
-    // If it slipped through somehow, drop the match silently rather than
-    // producing an undecodable off32-referencing token.
     if (effective_offset > NEAR_OFFSET_MAX) {
+        // Far-offset path. Match CUDA's lz_token_emit.cuh::emitCmd far
+        // branch: a short far match (match_len in [5, 28]) emits a
+        // single offset-class token equal to (match_len - 5); a long
+        // far match (match_len >= 29) emits TOKEN_LONG_FAR (=2) plus a
+        // length-stream byte for (match_len - 29). The off32 entry
+        // itself is the same in both cases: 3-byte LE value of
+        // `effective_offset + block2_start - match_pos`.
+        uint offset_class_token;
+        bool write_length;
+        uint length_value_u;
+        if (match_len >= OFF32_MATCH_LEN_BIAS && (match_len - OFF32_MATCH_LEN_BIAS) <= OFF32_INLINE_DELTA_MAX) {
+            offset_class_token = match_len - OFF32_MATCH_LEN_BIAS;
+            write_length = false;
+            length_value_u = 0u;
+        } else {
+            offset_class_token = TOKEN_LONG_FAR;
+            write_length = true;
+            length_value_u = (match_len > OFF32_FAR_LEN_BIAS) ? (match_len - OFF32_FAR_LEN_BIAS) : 0u;
+        }
+        storeCmdByte(token_count, offset_class_token & 0xFFu);
+        token_count += 1u;
+        if (write_length) writeLengthValue(length_value_u);
+
+        // off32 entry value (3 bytes LE). `effective_offset + block2_start
+        // - match_pos` — uint arithmetic is wrapping mod 2^32, matching
+        // CUDA's uint32_t semantics.
+        uint adjusted = effective_offset + block2_start - match_pos;
+        storeOff32LE24(off32_byte_pos, adjusted & 0xFFFFFFu);
+        off32_byte_pos += OFF32_ENTRY_BYTES;
+        off32_count_total += 1u;
         return;
     }
 
-    // Token-type 1: long-near-match. Emit the type-1 tag byte + length +
-    // off16 entry.
-    int length_value = int(match_len) - 91; // = NEAR_CONT_MATCH_MAX + 1
-    storeCmdByte(token_count, 1u);
+    // Token-type 1: long-near-match.
+    int length_value = int(match_len) - int(OFF32_NEAR_LEN_BIAS);
+    storeCmdByte(token_count, TOKEN_LONG_NEAR & 0xFFu);
     token_count += 1u;
     uint lv = (length_value > 0) ? uint(length_value) : 0u;
     writeLengthValue(lv);
@@ -396,16 +470,38 @@ void main() {
         uint base = chunk_id * 3u;
         g_src_byte_base   = chunks_buf.d[base + 0u];
         g_src_size        = chunks_buf.d[base + 1u];
-        // chunks_buf.d[base + 2u] reserved for future use.
+        // chunks_buf.d[base + 2u] is `is_first` (0 or 1); see l1_codec.zig.
         g_dst_word_base   = chunk_id * (pc.chunk_capacity >> 2);
         g_hash_base       = chunk_id * hash_size;
-        g_sizes_word_base = chunk_id * 4u;
+        g_sizes_word_base = chunk_id * 8u; // 8 u32 per chunk — see end-of-main
 
-        lit_count = 0u;
+        // For the first chunk in the frame (is_first != 0), match CUDA's
+        // anchor=8 design: the first 8 source bytes are written to the
+        // lit stream as a direct initial copy AND skipped in the token
+        // parser. The wire-format wrapper picks them off the front of
+        // lit_buf to populate the sub-chunk's INITIAL_LITERAL_COPY_BYTES
+        // prefix. The Vulkan decoder mirrors this: for chunk 0 it copies
+        // the first 8 bytes of lit_buf directly to dst[0..8] before the
+        // token-driven loop runs.
+        uint is_first = chunks_buf.d[base + 2u];
+        if (is_first != 0u && g_src_size >= INITIAL_LITERAL_COPY_BYTES) {
+            for (uint i = 0u; i < INITIAL_LITERAL_COPY_BYTES; i++) {
+                storeLitByte(i, loadSrcByte(i));
+            }
+            lit_count = INITIAL_LITERAL_COPY_BYTES;
+            sh_anchor = INITIAL_LITERAL_COPY_BYTES;
+        } else {
+            lit_count = 0u;
+            sh_anchor = 0u;
+        }
         token_count = 0u;
         off16_count = 0u;
         length_count = 0u;
-        sh_anchor = 0u;                       // phase-1: no initial copy
+        off32_byte_pos = 0u;
+        off32_count_total = 0u;
+        off32_count_block1 = 0u;
+        cmd_stream2_offset = 0u;
+        sh_block2_start = 0u;
         sh_recent_offset = INITIAL_RECENT_OFFSET;
     }
     // Workgroup-wide barrier with implicit shared-memory visibility:
@@ -434,10 +530,30 @@ void main() {
         if (block == 0u) {
             start_pos = sh_anchor;
             end_pos   = block1_end;
+            if (lane == 0u) sh_block2_start = 0u;
         } else {
-            if (g_src_size <= LZ_BLOCK_SIZE) break;
+            if (g_src_size <= LZ_BLOCK_SIZE) {
+                // Single-block chunk: snapshot block-0 off32 count and
+                // stop. Mirrors CUDA: block1 always runs; block2 only
+                // runs when src_size > LZ_BLOCK_SIZE, otherwise count2 = 0.
+                if (lane == 0u) {
+                    off32_count_block1 = off32_count_total;
+                    off32_count_total = 0u;
+                }
+                break;
+            }
             start_pos = (sh_anchor > LZ_BLOCK_SIZE) ? sh_anchor : LZ_BLOCK_SIZE;
             end_pos   = g_src_size;
+            // Block boundary: snapshot block-0 off32 count + token count
+            // and reset the running counts. The byte cursor keeps
+            // growing — block-1 entries follow block-0 entries
+            // contiguously in off32_buf.
+            if (lane == 0u) {
+                off32_count_block1 = off32_count_total;
+                off32_count_total = 0u;
+                cmd_stream2_offset = token_count;
+                sh_block2_start = LZ_BLOCK_SIZE;
+            }
         }
         if (lane == 0u) sh_pos = start_pos;
         subgroupBarrier();
@@ -628,16 +744,11 @@ void main() {
             uint off_param = (neg_off == recent_offset) ? 0u : uint(-neg_off);
             uint resolved_off = (off_param == 0u) ? uint(-recent_offset) : off_param;
 
-            // Phase-1: reject all far-offset matches (no off32 stream).
-            // CUDA's FAR_OFFSET_MIN_MATCH rule (resolved_off > 0xFFFF AND
-            // match_len < 14) is extended to ALL match lengths.
-            if (resolved_off > NEAR_OFFSET_MAX) {
-                if (lane == 0u) sh_pos = match_pos + 1u;
-                subgroupBarrier();
-                continue;
-            }
-            // Also keep the original FAR_OFFSET_MIN_MATCH guard for parity
-            // (dead under the above gate but harmless).
+            // CUDA's FAR_OFFSET_MIN_MATCH rule: far-offset matches
+            // (resolved_off > 0xFFFF) shorter than 14 bytes are
+            // rejected — the parser advances `pos = match_pos + 1` and
+            // retries. Longer far matches feed the off32 stream via
+            // emitCmd's Step-4 branch.
             if (resolved_off > NEAR_OFFSET_MAX && match_len < FAR_OFFSET_MIN_MATCH) {
                 if (lane == 0u) sh_pos = match_pos + 1u;
                 subgroupBarrier();
@@ -690,7 +801,7 @@ void main() {
                         off16_count += 1u;
                     }
                 } else {
-                    emitCmd(lit_len, match_len, off_param, recent_offset);
+                    emitCmd(lit_len, match_len, off_param, recent_offset, match_pos, sh_block2_start);
                 }
 
                 sh_recent_offset = neg_off;
@@ -720,8 +831,33 @@ void main() {
             subgroupBarrier();
         } // end while inner
 
+        // Per-block trailing literals. CUDA's scanBlock (lz_greedy_parser.cuh)
+        // flushes literals from anchor to end_pos before returning, so the
+        // cmd-stream boundary lines up exactly with the dst-stream
+        // boundary block_dst_start = block1_end. The decoder relies on
+        // this to compute correct match_offset values for block-2 off32
+        // entries.
+        //
+        // For block 0 we emit up to block1_end (= the first 64 KiB
+        // boundary). For block 1 the per-block trailing happens here
+        // again (so the trailing-literal step at end-of-main becomes a
+        // no-op). Either way, lane-0 only.
+        if (lane == 0u) {
+            uint cur_anchor = sh_anchor;
+            uint trailing = (cur_anchor < end_pos) ? (end_pos - cur_anchor) : 0u;
+            if (trailing > 0u) {
+                uint lit_base = lit_count;
+                for (uint i = 0u; i < trailing; i++) {
+                    storeLitByte(lit_base + i, loadSrcByte(cur_anchor + i));
+                }
+                lit_count = lit_base + trailing;
+                emitCmd(trailing, 0u, 0u, sh_recent_offset, cur_anchor, sh_block2_start);
+                sh_anchor = end_pos;
+            }
+        }
         // Inter-pass safety barrier (block-2 reads sh_anchor written by block-1).
         subgroupBarrier();
+        subgroupMemoryBarrierShared();
     } // end for block
 
     // 3. Trailing literals.
@@ -735,7 +871,10 @@ void main() {
                     storeLitByte(lit_base + i, loadSrcByte(anchor + i));
                 }
                 lit_count = lit_base + trailing;
-                emitCmd(trailing, 0u, 0u, sh_recent_offset);
+                // Trailing literals: no match, so match_pos and
+                // block2_start are unused inside emitCmd's near branches.
+                // Pass anchor + 0 to keep the call shape consistent.
+                emitCmd(trailing, 0u, 0u, sh_recent_offset, anchor, sh_block2_start);
                 sh_anchor = g_src_size;
             }
         }
@@ -744,11 +883,23 @@ void main() {
     subgroupBarrier();
     subgroupMemoryBarrierBuffer();
 
-    // 4. Write back per-chunk sizes (4 u32 at offset chunk_id * 4).
+    // 4. Write back per-chunk sizes (8 u32 at offset chunk_id * 8).
+    //   [0] lit_count
+    //   [1] token_count
+    //   [2] off16_count
+    //   [3] length_count
+    //   [4] off32_count_block1  (entry count for the first 64 KiB block)
+    //   [5] off32_count_block2  (entry count for the rest of the chunk)
+    //   [6] cmd_stream2_offset  (token-stream split between blocks; 0 = no split)
+    //   [7] reserved
     if (lane == 0u) {
         sizes_buf.s[g_sizes_word_base + 0u] = lit_count;
         sizes_buf.s[g_sizes_word_base + 1u] = token_count;
         sizes_buf.s[g_sizes_word_base + 2u] = off16_count;
         sizes_buf.s[g_sizes_word_base + 3u] = length_count;
+        sizes_buf.s[g_sizes_word_base + 4u] = off32_count_block1;
+        sizes_buf.s[g_sizes_word_base + 5u] = off32_count_total; // block-2 count (or block-0 if g_src_size <= LZ_BLOCK_SIZE)
+        sizes_buf.s[g_sizes_word_base + 6u] = cmd_stream2_offset;
+        sizes_buf.s[g_sizes_word_base + 7u] = 0u;
     }
 }

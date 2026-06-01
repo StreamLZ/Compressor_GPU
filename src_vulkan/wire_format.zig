@@ -159,6 +159,15 @@ const SUBCHUNK_HDR_BYTES: u32 = 3;
 ///   2-byte internal block header + 4-byte chunk header.
 const CHUNK_INTERNAL_HDR_BYTES: u32 = 6;
 
+/// Off32 wire-format constants (mirror src/common/gpu_wire_format.cuh).
+/// 12-bit per-block packed-count field; counts >= 4095 spill into a
+/// trailing u16 extension before the off32 byte entries.
+const OFF32_ENTRY_BYTES: u32 = 3;
+const OFF32_COUNT_FIELD_BITS: u5 = 12;
+const OFF32_COUNT_PACK_MAX: u32 = (1 << OFF32_COUNT_FIELD_BITS) - 1; // 4095
+const OFF32_COUNT1_SHIFT: u5 = OFF32_COUNT_FIELD_BITS; // = 12
+const OFF32_COUNT2_MASK: u32 = OFF32_COUNT_PACK_MAX;   // low 12 bits
+
 /// SC tail prefix bytes per (non-first) chunk.
 const SC_TAIL_PER_CHUNK_BYTES: u32 = 8;
 
@@ -175,18 +184,48 @@ pub const VK_CHUNK_SIZE: u32 = l1_codec.CHUNK_SIZE;
 
 pub const PerChunkStreams = struct {
     /// One entry per chunk; lit_bytes[i] is the chunk-local literal
-    /// byte run (`per_chunk_lit_size[i]` bytes).
+    /// byte run (`per_chunk_lit_size[i]` bytes). When
+    /// `per_chunk_initial_copy[i] != 0`, the first
+    /// INITIAL_LITERAL_COPY_BYTES bytes of lit_bytes[i] are the
+    /// verbatim prefix the wrap path emits as the sub-chunk header's
+    /// initial copy (and the unwrap path strips off before exposing
+    /// lit_bytes to the Vulkan decoder via lit_views).
     lit_bytes: [][]const u8,
     cmd_bytes: [][]const u8,
     /// off16_bytes[i] is the raw interleaved u16-LE byte slice
     /// (`per_chunk_off16_count[i] * 2` bytes).
     off16_bytes: [][]const u8,
     length_bytes: [][]const u8,
-    /// Original source bytes — needed for the per-chunk init prefix
-    /// (chunk 0's first 8 verbatim bytes) and the SC tail prefix
+    /// off32_bytes[i] is the chunk's concatenated off32 stream:
+    /// `off32_count_block1[i] * OFF32_ENTRY_BYTES` bytes for block 0
+    /// followed immediately by `off32_count_block2[i] * OFF32_ENTRY_BYTES`
+    /// bytes for block 1. Empty slice when the chunk emitted no
+    /// far-offset matches.
+    off32_bytes: ?[][]const u8 = null,
+    /// Per-chunk off32 entry counts (block 0 / block 1). When `null`,
+    /// the wrap path assumes zero off32 entries per chunk (legacy).
+    per_chunk_off32_count1: ?[]const u32 = null,
+    per_chunk_off32_count2: ?[]const u32 = null,
+    /// Per-chunk cmd_stream2_offset — token-index boundary between LZ
+    /// blocks 0 and 1. Set non-zero when the chunk spans both blocks
+    /// AND emitted off32 entries (else the wrap path collapses it to
+    /// the legacy `cmd_size` filler so the decoder treats the whole
+    /// stream as block 0). The Vulkan decoder reads this from chunk
+    /// descriptor slot 14 (see lz_decode.comp head comment).
+    per_chunk_cmd_stream2_offset: ?[]const u32 = null,
+    /// Original source bytes — needed for the SC tail prefix
     /// (8 bytes per non-first chunk from the source).  Wrap path only;
     /// the unwrap path leaves this null.
     src_bytes: ?[]const u8,
+    /// Per-chunk initial-copy byte count (0 or INITIAL_LITERAL_COPY_BYTES).
+    /// Mirrors `l1_codec.L1Streams.per_chunk_initial_copy`.  When non-zero
+    /// for chunk i, lit_bytes[i][0..n] is the verbatim sub-chunk prefix.
+    /// Allocator-owned by the unwrap path (set to a non-null slice of
+    /// `n_chunks` entries); wrap callers either pass an existing slice
+    /// (the encoder's `per_chunk_initial_copy`) or leave it null to mean
+    /// "chunk 0 has 8 prefix bytes, all others 0" (legacy single-source
+    /// default).
+    per_chunk_initial_copy: ?[]const u32 = null,
     /// Chunk geometry.
     n_chunks: u32,
     chunk_size: u32 = VK_CHUNK_SIZE,
@@ -257,29 +296,39 @@ pub fn wrapBound(streams: PerChunkStreams) usize {
     var total: usize = frame.max_header_size + 8; // frame + block header
     var ci: usize = 0;
     while (ci < streams.n_chunks) : (ci += 1) {
-        if (ci == 0) {
-            // Chunk 0 is emitted uncompressed (see header comment) —
-            // 2-byte internal block header + chunk_size raw bytes,
-            // capped to the original input length for inputs smaller
-            // than one chunk.
-            total += 2;
-            total += streams.chunk_size;
-            continue;
-        }
+        const init_copy: usize = chunkInitialCopy(streams, @intCast(ci));
         total += CHUNK_INTERNAL_HDR_BYTES; // 2-byte internal + 4-byte chunk
         total += SUBCHUNK_HDR_BYTES;        // 3-byte sub-chunk header
-        total += 3 + streams.lit_bytes[ci].len;           // type-0 lit
-        total += 3 + streams.cmd_bytes[ci].len;           // type-0 cmd
-        total += 2;                                        // cmd_stream2_offset
-        total += 2 + streams.off16_bytes[ci].len;          // raw off16
-        total += 3;                                        // off32 packed = 0
-        total += streams.length_bytes[ci].len;             // length stream
+        total += init_copy;                 // 8 verbatim source bytes (chunk 0 only)
+        const advertised_lit_len: usize = streams.lit_bytes[ci].len - init_copy;
+        total += 3 + advertised_lit_len;                   // type-0 lit
+        total += 3 + streams.cmd_bytes[ci].len;            // type-0 cmd
+        total += 2;                                         // cmd_stream2_offset
+        total += 2 + streams.off16_bytes[ci].len;           // raw off16
+        total += 3 + 4;                                     // off32 packed counts + 2× u16 ext (worst case)
+        const off32_bytes: usize = if (streams.off32_bytes) |arr| arr[ci].len else 0;
+        total += off32_bytes;
+        total += streams.length_bytes[ci].len;              // length stream
     }
     if (streams.n_chunks > 1) {
         total += @as(usize, streams.n_chunks - 1) * SC_TAIL_PER_CHUNK_BYTES;
     }
     total += 4; // end mark
     return total;
+}
+
+/// Per-chunk initial-copy byte count. Honors the caller-supplied
+/// `per_chunk_initial_copy` slice when present; otherwise applies the
+/// legacy default (chunk 0 carries 8 bytes when the chunk is large
+/// enough, every other chunk carries none).
+fn chunkInitialCopy(streams: PerChunkStreams, ci: u32) usize {
+    if (streams.per_chunk_initial_copy) |pci| {
+        if (ci < pci.len) return pci[ci];
+    }
+    if (ci == 0 and streams.lit_bytes[0].len >= INITIAL_LITERAL_COPY_BYTES) {
+        return INITIAL_LITERAL_COPY_BYTES;
+    }
+    return 0;
 }
 
 /// Walk the per-chunk streams and emit a complete SLZ1 frame into
@@ -294,7 +343,11 @@ pub fn wrapL1ToSlz1(
     if (streams.n_chunks == 0 or streams.n_chunks > l1_codec.MAX_CHUNKS) {
         return error.TooManyChunks;
     }
-    const src = streams.src_bytes orelse return error.BadHeader;
+    // src_bytes only consumed for the (n_chunks > 1) SC tail prefix; for
+    // single-chunk encodes we can wrap without a source slice because the
+    // 8-byte initial copy comes from lit_buf, not from src directly.
+    const src_opt = streams.src_bytes;
+    if (streams.n_chunks > 1 and src_opt == null) return error.BadHeader;
     if (out.len < wrapBound(streams)) return error.OutputTooSmall;
 
     var pos: usize = 0;
@@ -327,40 +380,41 @@ pub fn wrapL1ToSlz1(
             break :blk @intCast(remaining);
         };
 
+        const init_copy: u32 = @intCast(chunkInitialCopy(streams, ci));
+
         // 3a. 2-byte internal block header.
         //   byte 0 = magic(0x05) | self_contained(0x10) | restart_decoder(0x40)
-        //          | (uncompressed(0x80) iff chunk 0)
         //   byte 1 = decoder_type = Fast (1).
-        const uncomp_flag: u8 = if (ci == 0) 0x80 else 0;
-        const internal_hdr0: u8 = 0x05 | 0x10 | 0x40 | uncomp_flag;
+        // Every chunk is LZ-compressed — the encoder produces native
+        // sub-chunks with the 8-byte initial copy baked into chunk 0.
+        const internal_hdr0: u8 = 0x05 | 0x10 | 0x40;
         const internal_hdr1: u8 = @intFromEnum(block_header.CodecType.fast);
         out[pos + 0] = internal_hdr0;
         out[pos + 1] = internal_hdr1;
         pos += 2;
 
-        if (ci == 0) {
-            // 3b/c/d (uncompressed). Per `streamlz_decoder.zig::
-            // buildChunkDescriptors`, an uncompressed chunk has NO
-            // 4-byte chunk header — its payload sits immediately after
-            // the 2-byte internal header, sized by the outer
-            // `eff_chunk_size` (= our `chunk_size`) capped to the
-            // remaining source bytes.
-            std.debug.assert(src.len >= chunk_dst_off + chunk_decomp_size);
-            @memcpy(out[pos..][0..chunk_decomp_size],
-                src[@intCast(chunk_dst_off)..][0..chunk_decomp_size]);
-            pos += chunk_decomp_size;
-            continue;
-        }
-
         // 3b. 4-byte LE chunk header (compressed_size - 1 in low 18 bits).
         //   compressed_size = 3-byte sub-chunk header + sub-chunk payload bytes.
+        const advertised_lit_len: usize = streams.lit_bytes[ci].len - init_copy;
+        const off32_count1_ci: u32 = if (streams.per_chunk_off32_count1) |a| a[ci] else 0;
+        const off32_count2_ci: u32 = if (streams.per_chunk_off32_count2) |a| a[ci] else 0;
+        const off32_bytes_ci: usize = if (streams.off32_bytes) |a| a[ci].len else 0;
+        // CUDA's packed-count header has a 12-bit field per block;
+        // counts ≥ 4095 spill into a u16 extension after the 3-byte
+        // packed word (one extension per block that overflows).
+        const off32_ext_bytes: usize =
+            (@as(usize, if (off32_count1_ci >= OFF32_COUNT_PACK_MAX) 2 else 0)) +
+            (@as(usize, if (off32_count2_ci >= OFF32_COUNT_PACK_MAX) 2 else 0));
         const sub_payload_size: u32 = subChunkPayloadSize(
             ci,
             chunk_decomp_size,
-            streams.lit_bytes[ci].len,
+            advertised_lit_len,
             streams.cmd_bytes[ci].len,
             streams.off16_bytes[ci].len,
             streams.length_bytes[ci].len,
+            init_copy,
+            off32_bytes_ci,
+            off32_ext_bytes,
         );
         const chunk_compressed_size: u32 = SUBCHUNK_HDR_BYTES + sub_payload_size;
         std.mem.writeInt(u32, out[pos..][0..4], chunk_compressed_size - 1, .little);
@@ -373,15 +427,22 @@ pub fn wrapL1ToSlz1(
         writeBE24(out[pos..][0..3], sc_hdr_word);
         pos += 3;
 
-        // 3d. Sub-chunk payload (NO initial 8-byte verbatim copy for
-        //     chunk index > 0 — `base_offset > 0` on the decoder side
-        //     skips that prefix).
+        // 3d.0 Initial verbatim copy (chunk 0 only — INITIAL_LITERAL_COPY_BYTES
+        //      source bytes that the CUDA decoder writes straight to
+        //      dst[0..8] via the `base_offset == 0` branch). Encoder put
+        //      these as the first 8 bytes of lit_buf; wrap pulls them
+        //      off the front so the lit-stream header advertises only
+        //      the tokens-driven literals.
+        if (init_copy != 0) {
+            @memcpy(out[pos..][0..init_copy], streams.lit_bytes[ci][0..init_copy]);
+            pos += init_copy;
+        }
 
-        // 3d.i Literal stream (type-0 raw).
-        writeBE24(out[pos..][0..3], @intCast(streams.lit_bytes[ci].len));
+        // 3d.i Literal stream (type-0 raw) — excludes the initial copy.
+        writeBE24(out[pos..][0..3], @intCast(advertised_lit_len));
         pos += 3;
-        @memcpy(out[pos..][0..streams.lit_bytes[ci].len], streams.lit_bytes[ci]);
-        pos += streams.lit_bytes[ci].len;
+        @memcpy(out[pos..][0..advertised_lit_len], streams.lit_bytes[ci][init_copy..]);
+        pos += advertised_lit_len;
 
         // 3d.ii Command/token stream (type-0 raw).
         writeBE24(out[pos..][0..3], @intCast(streams.cmd_bytes[ci].len));
@@ -390,13 +451,21 @@ pub fn wrapL1ToSlz1(
         pos += streams.cmd_bytes[ci].len;
 
         // 3d.iii cmd_stream2_offset (2 bytes LE) — present because
-        //         sub_decomp_size > LZ_BLOCK_SIZE.  Set to cmd_size so
-        //         every token goes through the CUDA decoder's block-0
-        //         loop iteration; block-1 finds zero tokens and the
-        //         block-trailing routine quickly observes
-        //         dst_pos >= block_end with no fill needed.
+        //         sub_decomp_size > LZ_BLOCK_SIZE. Use the encoder's
+        //         actual block-0/1 token boundary so the CUDA decoder
+        //         routes off32 entries to the correct block. When the
+        //         encoder didn't split (single-block chunk encoded as
+        //         128 KiB anyway, e.g. last chunk smaller than 64 KiB
+        //         wouldn't even reach this branch), fall back to
+        //         cmd_size — "everything is block 0" — which CUDA
+        //         tolerates because the block-1 trailing path then sees
+        //         dst_pos >= block_end and emits nothing.
         if (chunk_decomp_size > LZ_BLOCK_SIZE) {
-            const cs2o: u16 = @intCast(streams.cmd_bytes[ci].len);
+            const cs2o_raw: u32 = if (streams.per_chunk_cmd_stream2_offset) |arr| arr[ci] else 0;
+            const cs2o: u16 = if (cs2o_raw != 0 and cs2o_raw < streams.cmd_bytes[ci].len)
+                @intCast(cs2o_raw)
+            else
+                @intCast(streams.cmd_bytes[ci].len);
             std.mem.writeInt(u16, out[pos..][0..2], cs2o, .little);
             pos += 2;
         }
@@ -408,11 +477,26 @@ pub fn wrapL1ToSlz1(
         @memcpy(out[pos..][0..streams.off16_bytes[ci].len], streams.off16_bytes[ci]);
         pos += streams.off16_bytes[ci].len;
 
-        // 3d.v off32 packed counts header — all zero (L1 emits no off32).
-        out[pos + 0] = 0;
-        out[pos + 1] = 0;
-        out[pos + 2] = 0;
+        // 3d.v off32 packed counts header (3 bytes LE) — `(count1 << 12)
+        //      | count2`, clamped to OFF32_COUNT_PACK_MAX with the
+        //      overflow spilling into a trailing u16 LE per block.
+        const c1_clamped: u32 = if (off32_count1_ci < OFF32_COUNT_PACK_MAX) off32_count1_ci else OFF32_COUNT_PACK_MAX;
+        const c2_clamped: u32 = if (off32_count2_ci < OFF32_COUNT_PACK_MAX) off32_count2_ci else OFF32_COUNT_PACK_MAX;
+        const packed_counts: u32 = (c1_clamped << OFF32_COUNT1_SHIFT) | c2_clamped;
+        writeLE24(out[pos..][0..3], packed_counts);
         pos += 3;
+        if (off32_count1_ci >= OFF32_COUNT_PACK_MAX) {
+            std.mem.writeInt(u16, out[pos..][0..2], @intCast(off32_count1_ci), .little);
+            pos += 2;
+        }
+        if (off32_count2_ci >= OFF32_COUNT_PACK_MAX) {
+            std.mem.writeInt(u16, out[pos..][0..2], @intCast(off32_count2_ci), .little);
+            pos += 2;
+        }
+        if (streams.off32_bytes) |off32_arr| {
+            @memcpy(out[pos..][0..off32_arr[ci].len], off32_arr[ci]);
+            pos += off32_arr[ci].len;
+        }
 
         // 3d.vi length stream (raw).
         @memcpy(out[pos..][0..streams.length_bytes[ci].len], streams.length_bytes[ci]);
@@ -423,6 +507,7 @@ pub fn wrapL1ToSlz1(
     //       Each entry restores the 8 verbatim source bytes the decoder
     //       skips at the head of every non-first chunk.
     if (streams.n_chunks > 1) {
+        const src = src_opt.?;
         var prefix_idx: u32 = 0;
         while (prefix_idx < streams.n_chunks - 1) : (prefix_idx += 1) {
             const src_off: u64 = @as(u64, prefix_idx + 1) * streams.chunk_size;
@@ -465,14 +550,18 @@ fn subChunkPayloadSize(
     cmd_size: usize,
     off16_bytes: usize,
     length_size: usize,
+    init_copy: u32,
+    off32_bytes: usize,
+    off32_ext_bytes: usize,
 ) u32 {
     _ = chunk_idx;
-    var n: u32 = 0;
+    var n: u32 = init_copy; // INITIAL_LITERAL_COPY_BYTES verbatim prefix (chunk 0)
     n += 3 + @as(u32, @intCast(lit_size)); // type-0 lit
     n += 3 + @as(u32, @intCast(cmd_size)); // type-0 cmd
     if (chunk_decomp_size > LZ_BLOCK_SIZE) n += 2; // cmd_stream2_offset
     n += 2 + @as(u32, @intCast(off16_bytes)); // off16 count + bytes
-    n += 3; // off32 packed = 0
+    n += 3 + @as(u32, @intCast(off32_ext_bytes)); // off32 packed counts + optional u16 ext per block
+    n += @as(u32, @intCast(off32_bytes));         // off32 entry bytes
     n += @as(u32, @intCast(length_size));
     return n;
 }
@@ -486,10 +575,19 @@ pub const UnwrapStorage = struct {
     cmd_arena: []u8,
     off16_arena: []u8,
     length_arena: []u8,
+    off32_arena: []u8,
     lit_views: [][]const u8,
     cmd_views: [][]const u8,
     off16_views: [][]const u8,
     length_views: [][]const u8,
+    off32_views: [][]const u8,
+    /// Per-chunk initial-copy byte count. The Vulkan decoder consumes
+    /// this via the chunk descriptor (slot 10) to pre-write dst[0..n]
+    /// from the head of lit_views[i] before any tokens execute.
+    initial_copy: []u32,
+    off32_count1: []u32,
+    off32_count2: []u32,
+    cmd_stream2_offset: []u32,
 };
 
 pub fn freeUnwrapStorage(allocator: std.mem.Allocator, s: *UnwrapStorage) void {
@@ -497,10 +595,16 @@ pub fn freeUnwrapStorage(allocator: std.mem.Allocator, s: *UnwrapStorage) void {
     allocator.free(s.cmd_arena);
     allocator.free(s.off16_arena);
     allocator.free(s.length_arena);
+    allocator.free(s.off32_arena);
     allocator.free(s.lit_views);
     allocator.free(s.cmd_views);
     allocator.free(s.off16_views);
     allocator.free(s.length_views);
+    allocator.free(s.off32_views);
+    allocator.free(s.initial_copy);
+    allocator.free(s.off32_count1);
+    allocator.free(s.off32_count2);
+    allocator.free(s.cmd_stream2_offset);
 }
 
 /// Parse an SLZ1 frame produced by either the CUDA encoder or the
@@ -579,17 +683,28 @@ pub fn unwrapSlz1ToL1Streams(
         .cmd_arena = try allocator.alloc(u8, original_size + 1024),
         .off16_arena = try allocator.alloc(u8, original_size + 1024),
         .length_arena = try allocator.alloc(u8, original_size + 1024),
+        .off32_arena = try allocator.alloc(u8, original_size + 1024),
         .lit_views = try allocator.alloc([]const u8, n_chunks),
         .cmd_views = try allocator.alloc([]const u8, n_chunks),
         .off16_views = try allocator.alloc([]const u8, n_chunks),
         .length_views = try allocator.alloc([]const u8, n_chunks),
+        .off32_views = try allocator.alloc([]const u8, n_chunks),
+        .initial_copy = try allocator.alloc(u32, n_chunks),
+        .off32_count1 = try allocator.alloc(u32, n_chunks),
+        .off32_count2 = try allocator.alloc(u32, n_chunks),
+        .cmd_stream2_offset = try allocator.alloc(u32, n_chunks),
     };
     errdefer freeUnwrapStorage(allocator, &storage);
+    @memset(storage.initial_copy, 0);
+    @memset(storage.off32_count1, 0);
+    @memset(storage.off32_count2, 0);
+    @memset(storage.cmd_stream2_offset, 0);
 
     var lit_arena_pos: usize = 0;
     var cmd_arena_pos: usize = 0;
     var off16_arena_pos: usize = 0;
     var length_arena_pos: usize = 0;
+    var off32_arena_pos: usize = 0;
 
     var result: UnwrapResult = .{
         .n_chunks = n_chunks,
@@ -640,13 +755,15 @@ pub fn unwrapSlz1ToL1Streams(
             lit_arena_pos += chunk_decomp_size_top;
             pos += chunk_decomp_size_top;
 
-            // Empty cmd stream — the Vulkan decoder's trailing-literal
-            // routine flushes the remaining lit bytes when cmd has no
-            // tokens to process.
+            // Empty cmd / off16 / off32 / length streams — the Vulkan
+            // decoder's trailing-literal routine flushes the remaining
+            // lit bytes when cmd has no tokens to process.
             const empty_cmd = storage.cmd_arena[cmd_arena_pos..][0..0];
             storage.cmd_views[ci] = empty_cmd;
             const empty_off16 = storage.off16_arena[off16_arena_pos..][0..0];
             storage.off16_views[ci] = empty_off16;
+            const empty_off32 = storage.off32_arena[off32_arena_pos..][0..0];
+            storage.off32_views[ci] = empty_off32;
             const empty_len = storage.length_arena[length_arena_pos..][0..0];
             storage.length_views[ci] = empty_len;
             continue;
@@ -679,31 +796,26 @@ pub fn unwrapSlz1ToL1Streams(
         // branch — reused here without recomputing.
         const chunk_decomp_size = chunk_decomp_size_top;
 
-        // 4b. Capture the 8 initial bytes on the first sub-chunk so we
-        //     can splice them into the lit stream for the Vulkan
-        //     decoder.  The CUDA encoder seeds its anchor at 8 for
-        //     chunk 0 — the lit stream covers positions 8..src_size —
-        //     and the decoder restores dst[0..8] via the sub-chunk
-        //     prefix.  The Vulkan decoder has no equivalent prefix
-        //     copy (anchor starts at 0 in the encoder per the spec),
-        //     so we prepend the 8 prefix bytes + two short-form tokens
-        //     that emit them as a literal run before any encoder
-        //     tokens execute.  The synthetic tokens carry the
-        //     "use_recent" flag (so they don't perturb the
-        //     decoder-side `recent_offset` from its INITIAL_RECENT_OFFSET
-        //     = -8 seed value) and have `match_len = 0` so no match
-        //     copy fires.
+        // 4b. Capture the 8 initial bytes on the first sub-chunk and
+        //     splice them onto the front of lit_view so the Vulkan
+        //     decoder can reproduce them at dst[0..8] via its slot-10
+        //     initial-copy descriptor field. (Earlier ports synthesised
+        //     two `0x8X` literal-only tokens at the head of cmd_view to
+        //     consume the prefix; that workaround is gone now that the
+        //     decoder shader handles initial_copy natively.)
         var first_chunk_prefix: [INITIAL_LITERAL_COPY_BYTES]u8 = undefined;
         const has_initial_prefix = (ci == 0);
         if (has_initial_prefix) {
             if (pos + INITIAL_LITERAL_COPY_BYTES > sc_end) return error.Truncated;
             @memcpy(first_chunk_prefix[0..], slz_bytes[pos..][0..INITIAL_LITERAL_COPY_BYTES]);
             pos += INITIAL_LITERAL_COPY_BYTES;
+            storage.initial_copy[ci] = INITIAL_LITERAL_COPY_BYTES;
         }
 
         // 4c. Literal stream (type-0 raw, 3-byte BE size header).
         //     For chunk 0 we prepend the 8 prefix bytes captured in 4b
-        //     so the Vulkan decoder reproduces them at dst[0..8].
+        //     so the decoder's initial-copy step reads them from the
+        //     head of lit_view.
         if (pos + 3 > sc_end) return error.Truncated;
         // Validate chunk type = 0 (the high nibble of byte 0 carries it).
         if ((slz_bytes[pos] & 0x80) != 0) return error.BadSubChunkHeader;
@@ -725,37 +837,24 @@ pub fn unwrapSlz1ToL1Streams(
         pos += lit_size;
 
         // 4d. Command stream (type-0 raw, 3-byte BE size header).
-        //     For chunk 0 we prepend two short-form tokens that consume
-        //     the 8 prefix literal bytes above (`0x87` emits 7 lits
-        //     with recent_flag set + match_len 0; `0x81` emits 1 lit
-        //     with the same flags).  These don't perturb the encoder-
-        //     side `recent_offset = INITIAL_RECENT_OFFSET = -8` seed
-        //     because the use_recent path leaves recent_offset
-        //     unchanged, and `match_len = 0` means no off16 read.
         if (pos + 3 > sc_end) return error.Truncated;
         if ((slz_bytes[pos] & 0x80) != 0) return error.BadSubChunkHeader;
         if (((slz_bytes[pos] >> 4) & 0x07) != 0) return error.BadSubChunkHeader;
         const cmd_size: u32 = readBE24(slz_bytes[pos..][0..3]);
         pos += 3;
         if (pos + cmd_size > sc_end) return error.Truncated;
-        const cmd_prefix_bytes: u32 = if (has_initial_prefix) 2 else 0;
-        const total_cmd: u32 = cmd_size + cmd_prefix_bytes;
-        const cmd_view = storage.cmd_arena[cmd_arena_pos..][0..total_cmd];
-        if (has_initial_prefix) {
-            cmd_view[0] = 0x87; // lit=7, match=0, use_recent=1
-            cmd_view[1] = 0x81; // lit=1, match=0, use_recent=1
-            @memcpy(cmd_view[2..], slz_bytes[pos..][0..cmd_size]);
-        } else {
-            @memcpy(cmd_view, slz_bytes[pos..][0..cmd_size]);
-        }
+        const cmd_view = storage.cmd_arena[cmd_arena_pos..][0..cmd_size];
+        @memcpy(cmd_view, slz_bytes[pos..][0..cmd_size]);
         storage.cmd_views[ci] = cmd_view;
-        cmd_arena_pos += total_cmd;
+        cmd_arena_pos += cmd_size;
         pos += cmd_size;
 
         // 4e. cmd_stream2_offset (2 bytes LE) if sub-chunk > 64 KiB.
         if (chunk_decomp_size > LZ_BLOCK_SIZE) {
             if (pos + 2 > sc_end) return error.Truncated;
-            pos += 2; // value not retained — the Vulkan decoder doesn't need it.
+            const cs2o: u32 = std.mem.readInt(u16, slz_bytes[pos..][0..2], .little);
+            storage.cmd_stream2_offset[ci] = cs2o;
+            pos += 2;
         }
 
         // 4f. off16 stream.
@@ -775,17 +874,36 @@ pub fn unwrapSlz1ToL1Streams(
         off16_arena_pos += off16_bytes;
         pos += off16_bytes;
 
-        // 4g. off32 packed counts header.
+        // 4g. off32 packed counts header (3 bytes LE). Bits [23:12] =
+        //     count1, bits [11:0] = count2 (each clamped to 0xFFF in
+        //     the header; ≥ 0xFFF values spill into a trailing u16 LE
+        //     extension per block).
         if (pos + 3 > sc_end) return error.Truncated;
         const off32_packed: u32 = @as(u32, slz_bytes[pos + 0]) |
             (@as(u32, slz_bytes[pos + 1]) << 8) |
             (@as(u32, slz_bytes[pos + 2]) << 16);
         pos += 3;
-        if (off32_packed != 0) {
-            // L1 never emits off32 entries; reject so the Vulkan decoder
-            // doesn't silently lose data.
-            return error.BadSubChunkHeader;
+        var off32_count1: u32 = off32_packed >> OFF32_COUNT1_SHIFT;
+        var off32_count2: u32 = off32_packed & OFF32_COUNT2_MASK;
+        if (off32_count1 == OFF32_COUNT_PACK_MAX) {
+            if (pos + 2 > sc_end) return error.Truncated;
+            off32_count1 = std.mem.readInt(u16, slz_bytes[pos..][0..2], .little);
+            pos += 2;
         }
+        if (off32_count2 == OFF32_COUNT_PACK_MAX) {
+            if (pos + 2 > sc_end) return error.Truncated;
+            off32_count2 = std.mem.readInt(u16, slz_bytes[pos..][0..2], .little);
+            pos += 2;
+        }
+        const off32_total_bytes: u32 = (off32_count1 + off32_count2) * OFF32_ENTRY_BYTES;
+        if (pos + off32_total_bytes > sc_end) return error.Truncated;
+        const off32_view = storage.off32_arena[off32_arena_pos..][0..off32_total_bytes];
+        @memcpy(off32_view, slz_bytes[pos..][0..off32_total_bytes]);
+        storage.off32_views[ci] = off32_view;
+        storage.off32_count1[ci] = off32_count1;
+        storage.off32_count2[ci] = off32_count2;
+        off32_arena_pos += off32_total_bytes;
+        pos += off32_total_bytes;
 
         // 4h. Length stream — everything left in the sub-chunk.
         const length_size: u32 = @intCast(sc_end - pos);
@@ -812,7 +930,12 @@ pub fn unwrapSlz1ToL1Streams(
         .cmd_bytes = storage.cmd_views,
         .off16_bytes = storage.off16_views,
         .length_bytes = storage.length_views,
+        .off32_bytes = storage.off32_views,
+        .per_chunk_off32_count1 = storage.off32_count1,
+        .per_chunk_off32_count2 = storage.off32_count2,
+        .per_chunk_cmd_stream2_offset = storage.cmd_stream2_offset,
         .src_bytes = null,
+        .per_chunk_initial_copy = storage.initial_copy,
         .n_chunks = n_chunks,
         .chunk_size = eff_chunk_size,
         .original_size = original_size,

@@ -67,12 +67,28 @@ pub const HASH_SIZE_BYTES: vk.VkDeviceSize = (@as(vk.VkDeviceSize, 1) << HASH_BI
 /// (64 KiB blocks), so a 128 KiB chunk = 2 blocks per workgroup.
 pub const CHUNK_SIZE: u32 = 0x20000;
 
+/// Number of source bytes written verbatim to the head of chunk 0's
+/// lit_buf and skipped in its token stream. Mirrors CUDA's
+/// `INITIAL_LITERAL_COPY_BYTES` from `src/common/gpu_wire_format.cuh`
+/// (matches the "anchor = 8 when is_first" rule in lz_kernel.cu and the
+/// `base_offset == 0` prefix copy in lz_dispatch.cuh).
+pub const INITIAL_LITERAL_COPY_BYTES: u32 = 8;
+
 /// Per-chunk reservation in each output stream. Worst-case stream size
 /// per spec §4.1 is `2 * src_size`; we add 16 bytes of slack so lane-0
 /// RMW byte stores into the tail u32 word never write past the slice.
 /// Must be a multiple of 4 (shader byte-load helpers assume word-aligned
 /// per-chunk bases — see lz_{encode,decode}.comp head-of-file comment).
 pub const CHUNK_STREAM_CAPACITY: u32 = (CHUNK_SIZE * 2) + 16;
+
+/// Per-chunk reservation for the off32 stream. Bounded by
+/// `2 * src_size` (every byte slot in a chunk could in the worst case
+/// drive a 3-byte off32 entry; the *2 keeps the headroom symmetric with
+/// the other streams), and we pad to a multiple of 4. With CHUNK_SIZE =
+/// 128 KiB this works out to ~512 KiB per chunk — generous, but the
+/// decoder/encoder allocate on demand only when a chunk actually emits
+/// far-offset matches.
+pub const CHUNK_OFF32_CAPACITY: u32 = (CHUNK_SIZE * 2) + 16;
 
 /// Encoder push constants (12 bytes — see lz_encode.comp).
 const EncodePush = extern struct {
@@ -135,9 +151,17 @@ pub const L1Streams = struct {
     length_mem: vk.VkDeviceMemory = null,
     length_used: u32 = 0,
 
+    off32_buf: vk.VkBuffer = null,
+    off32_mem: vk.VkDeviceMemory = null,
+    /// Sum across all chunks of (off32_count_block1 + off32_count_block2)
+    /// — used for the round-trip ratio report and for size accounting
+    /// on the host side. Each entry is `OFF32_ENTRY_BYTES = 3` bytes.
+    off32_total: u32 = 0,
+
     /// Multi-chunk geometry.
     n_chunks: u32 = 0,
     chunk_capacity: u32 = CHUNK_STREAM_CAPACITY,
+    off32_capacity: u32 = CHUNK_OFF32_CAPACITY,
     /// Original input length in bytes. Stored on the bundle so the
     /// decoder can rebuild per-chunk dst slices without the caller
     /// re-asserting it.
@@ -149,12 +173,30 @@ pub const L1Streams = struct {
     per_chunk_cmd_size: [MAX_CHUNKS]u32 = @splat(0),
     per_chunk_off16_count: [MAX_CHUNKS]u32 = @splat(0),
     per_chunk_length_used: [MAX_CHUNKS]u32 = @splat(0),
+    /// `INITIAL_LITERAL_COPY_BYTES` (8) for chunk 0, 0 otherwise. Matches
+    /// the CUDA `CompressChunkDesc::is_first` flag — when non-zero, the
+    /// encoder skipped the first 8 source bytes in its token output and
+    /// wrote them as the first 8 literals of this chunk's lit_buf; the
+    /// decoder reproduces them directly to dst[0..8].
+    per_chunk_initial_copy: [MAX_CHUNKS]u32 = @splat(0),
 
-    /// Total bytes worth of compressed payload (lit + cmd + 2*off16 + length)
-    /// summed across all chunks. Convenience for the round-trip test's
-    /// compression-ratio report.
+    /// Per-chunk off32 entry counts (block-0 + block-1). The sub-chunk
+    /// payload's off32 block carries `count1` entries followed by
+    /// `count2` entries, each `OFF32_ENTRY_BYTES = 3` bytes.
+    per_chunk_off32_count1: [MAX_CHUNKS]u32 = @splat(0),
+    per_chunk_off32_count2: [MAX_CHUNKS]u32 = @splat(0),
+    /// Per-chunk cmd_stream2_offset — token-index boundary between
+    /// blocks 0 and 1 in the cmd stream. 0 means "no split" (chunk
+    /// fits in one LZ block). Used by the decoder to switch the active
+    /// off32 cursor at the right token boundary.
+    per_chunk_cmd_stream2_offset: [MAX_CHUNKS]u32 = @splat(0),
+
+    /// Total bytes worth of compressed payload (lit + cmd + 2*off16 +
+    /// 3*off32 + length) summed across all chunks. Convenience for the
+    /// round-trip test's compression-ratio report.
     pub fn compressedTotalBytes(self: L1Streams) u32 {
-        return self.lit_size + self.cmd_size + (self.off16_count * 2) + self.length_used;
+        return self.lit_size + self.cmd_size + (self.off16_count * 2) +
+            (self.off32_total * 3) + self.length_used;
     }
 };
 
@@ -398,16 +440,23 @@ pub fn encodeL1Multi(
     errdefer destroyBuffer(ctx, &off16_b);
     var length_b = try createBuffer(ctx, stream_cap_total, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
     errdefer destroyBuffer(ctx, &length_b);
+    const off32_cap_total: vk.VkDeviceSize = @as(vk.VkDeviceSize, n_chunks) * CHUNK_OFF32_CAPACITY;
+    var off32_b = try createBuffer(ctx, off32_cap_total, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+    errdefer destroyBuffer(ctx, &off32_b);
 
     // Hash buffer: n_chunks × HASH_SIZE_BYTES. Device-local only — the
     // host never reads or writes it.
     var hash_b = try createBuffer(ctx, @as(vk.VkDeviceSize, n_chunks) * HASH_SIZE_BYTES, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
     defer destroyBuffer(ctx, &hash_b);
 
-    // Sizes sidecar: 4 u32 per chunk.
+    // Sizes sidecar: 8 u32 per chunk:
+    //   [0] lit_count   [1] cmd_count
+    //   [2] off16_count [3] length_count
+    //   [4] off32_count_block1   [5] off32_count_block2
+    //   [6] cmd_stream2_offset   [7] reserved
     var sizes_b = try createBuffer(
         ctx,
-        @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * 4,
+        @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * 8,
         vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         true,
     );
@@ -431,9 +480,14 @@ pub fn encodeL1Multi(
     @memset(cmd_b.mapped.?[0..@intCast(cmd_b.size)], 0);
     @memset(off16_b.mapped.?[0..@intCast(off16_b.size)], 0);
     @memset(length_b.mapped.?[0..@intCast(length_b.size)], 0);
+    @memset(off32_b.mapped.?[0..@intCast(off32_b.size)], 0);
     @memset(sizes_b.mapped.?[0..@intCast(sizes_b.size)], 0);
 
-    // Fill chunk descriptors: each chunk gets [src_offset, src_size, 0].
+    // Fill chunk descriptors: each chunk gets [src_offset, src_size, is_first].
+    // is_first=1 for chunk 0 makes the encoder treat the first 8 source
+    // bytes as a direct lit_buf copy and skip them in the token parser
+    // (matches CUDA's INITIAL_LITERAL_COPY_BYTES handling). Subsequent
+    // chunks always have is_first=0 (no per-chunk initial prefix).
     {
         const chunks_words: [*]u32 = @ptrCast(@alignCast(chunks_b.mapped.?));
         var ci: u32 = 0;
@@ -445,9 +499,10 @@ pub fn encodeL1Multi(
                 src_size - off
             else
                 0;
+            const is_first: u32 = if (ci == 0 and this_size >= INITIAL_LITERAL_COPY_BYTES) 1 else 0;
             chunks_words[ci * 3 + 0] = off;
             chunks_words[ci * 3 + 1] = this_size;
-            chunks_words[ci * 3 + 2] = 0;
+            chunks_words[ci * 3 + 2] = is_first;
         }
     }
 
@@ -461,11 +516,11 @@ pub fn encodeL1Multi(
         "lz_encode",
         tier,
         spv,
-        8, // bindings 0..7: src, lit, cmd, off16, length, hash, sizes, chunks
+        9, // bindings 0..8: src, lit, cmd, off16, length, hash, sizes, chunks, off32
         @sizeOf(EncodePush),
     );
 
-    const enc_bindings: [8]vk.VkDescriptorBufferInfo = .{
+    const enc_bindings: [9]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = src_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = lit_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = cmd_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -474,6 +529,7 @@ pub fn encodeL1Multi(
         .{ .buffer = hash_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = sizes_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = chunks_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        .{ .buffer = off32_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
     };
     const enc_set = try descriptors.allocSet(ctx, cached_enc, enc_bindings[0..]);
 
@@ -506,22 +562,39 @@ pub fn encodeL1Multi(
     var cmd_total: u32 = 0;
     var off16_total: u32 = 0;
     var length_total: u32 = 0;
+    var off32_total_count: u32 = 0;
     {
         var ci: u32 = 0;
         while (ci < n_chunks) : (ci += 1) {
-            const base = ci * 4;
+            const base = ci * 8;
             const ls = sizes_words[base + 0];
             const cs = sizes_words[base + 1];
             const os = sizes_words[base + 2];
             const xs = sizes_words[base + 3];
+            const o32c1 = sizes_words[base + 4];
+            const o32c2 = sizes_words[base + 5];
+            const cs2o = sizes_words[base + 6];
             streams.per_chunk_lit_size[ci] = ls;
             streams.per_chunk_cmd_size[ci] = cs;
             streams.per_chunk_off16_count[ci] = os;
             streams.per_chunk_length_used[ci] = xs;
+            streams.per_chunk_off32_count1[ci] = o32c1;
+            streams.per_chunk_off32_count2[ci] = o32c2;
+            streams.per_chunk_cmd_stream2_offset[ci] = cs2o;
+            // is_first reflects exactly the chunk-descriptor value we
+            // wrote pre-dispatch. Carrying it on the streams bundle lets
+            // the wire-format wrapper and the decoder agree on which
+            // chunks start with an 8-byte verbatim prefix in lit_buf.
+            const init_copy: u32 = if (ci == 0 and ls >= INITIAL_LITERAL_COPY_BYTES)
+                INITIAL_LITERAL_COPY_BYTES
+            else
+                0;
+            streams.per_chunk_initial_copy[ci] = init_copy;
             lit_total += ls;
             cmd_total += cs;
             off16_total += os;
             length_total += xs;
+            off32_total_count += o32c1 + o32c2;
         }
     }
 
@@ -540,6 +613,10 @@ pub fn encodeL1Multi(
     streams.length_buf = length_b.buf;
     streams.length_mem = length_b.mem;
     streams.length_used = length_total;
+    streams.off32_buf = off32_b.buf;
+    streams.off32_mem = off32_b.mem;
+    streams.off32_total = off32_total_count;
+    streams.off32_capacity = CHUNK_OFF32_CAPACITY;
 
     // Mapped pointers are forgotten by L1Streams (the buffer handles are
     // enough for the decoder bind + host readback). Unmap and zero the
@@ -550,6 +627,7 @@ pub fn encodeL1Multi(
         u(ctx.dev, cmd_b.mem);
         u(ctx.dev, off16_b.mem);
         u(ctx.dev, length_b.mem);
+        u(ctx.dev, off32_b.mem);
     }
     lit_b.buf = null;
     lit_b.mem = null;
@@ -563,6 +641,9 @@ pub fn encodeL1Multi(
     length_b.buf = null;
     length_b.mem = null;
     length_b.mapped = null;
+    off32_b.buf = null;
+    off32_b.mem = null;
+    off32_b.mapped = null;
 
     return .{
         .streams = streams,
@@ -605,13 +686,13 @@ pub fn decodeL1Sync(
     defer destroyBuffer(ctx, &dst_b);
     @memset(dst_b.mapped.?[0..@intCast(dst_b.size)], 0);
 
-    // ChunkDescs: 12 u32 per chunk. See lz_decode.comp head comment for
-    // the slot layout. The host writes word bases (in u32 words); the
-    // shader multiplies by 4 to get byte bases for the per-byte load
-    // helpers.
+    // ChunkDescs: 16 u32 per chunk. See lz_decode.comp head comment for
+    // the slot layout (slots 12..14 plumb off32 counts + the cmd-stream
+    // boundary; slot 15 is reserved for future alignment).
+    const off32_cap_total: vk.VkDeviceSize = @as(vk.VkDeviceSize, n_chunks) * streams.off32_capacity;
     var chunks_b = try createBuffer(
         ctx,
-        @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * 12,
+        @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * 16,
         vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         true,
     );
@@ -620,6 +701,7 @@ pub fn decodeL1Sync(
     {
         const chunks_words: [*]u32 = @ptrCast(@alignCast(chunks_b.mapped.?));
         const cap_words: u32 = chunk_capacity / 4;
+        const off32_cap_words: u32 = streams.off32_capacity / 4;
         var ci: u32 = 0;
         while (ci < n_chunks) : (ci += 1) {
             const dst_off: u32 = ci * CHUNK_SIZE;
@@ -630,7 +712,18 @@ pub fn decodeL1Sync(
             else
                 0;
             const stream_word_base: u32 = ci * cap_words;
-            const base = ci * 12;
+            // For the Vulkan encoder's own decode path the cmd-stream
+            // block-2 boundary is at `cmd_size` for sub-chunks larger
+            // than LZ_BLOCK_SIZE — every token gets attributed to block-1
+            // (CUDA writes the boundary at the actual encoder-side token
+            // count for block 1; we don't track that yet, so the
+            // boundary collapses to "the rest is block 1"). Multi-chunk
+            // round-trip with default chunks still works because
+            // `cmd_stream2_offset = 0` means "no block-2 boundary",
+            // i.e. everything is block-0 — and the encoder's
+            // off32_count_block1/2 split matches that view.
+            //
+            const base = ci * 16;
             chunks_words[base + 0] = dst_off;
             chunks_words[base + 1] = this_dst_size;
             chunks_words[base + 2] = stream_word_base; // cmd
@@ -641,9 +734,21 @@ pub fn decodeL1Sync(
             chunks_words[base + 7] = streams.per_chunk_off16_count[ci];
             chunks_words[base + 8] = stream_word_base; // length
             chunks_words[base + 9] = streams.per_chunk_length_used[ci];
-            // slots 10..11 reserved.
+            // Slot 10 = initial_copy bytes (0 or 8). Mirrors the
+            // sub-chunk prefix the CUDA decoder writes from
+            // SUBCHUNK_PAYLOAD[0..8] to dst[0..8] for chunk 0.
+            chunks_words[base + 10] = streams.per_chunk_initial_copy[ci];
+            // Slot 11 = u32-word base of the per-chunk off32 slice.
+            chunks_words[base + 11] = ci * off32_cap_words;
+            // Slots 12..14 = off32_count_block1 / off32_count_block2 /
+            // cmd_stream2_offset.
+            chunks_words[base + 12] = streams.per_chunk_off32_count1[ci];
+            chunks_words[base + 13] = streams.per_chunk_off32_count2[ci];
+            chunks_words[base + 14] = streams.per_chunk_cmd_stream2_offset[ci];
+            // slot 15 reserved.
         }
     }
+    _ = off32_cap_total;
 
     // ── Build decode pipeline + descriptor set ───────────────────
     var cache: descriptors.Cache = .{};
@@ -655,17 +760,18 @@ pub fn decodeL1Sync(
         "lz_decode",
         tier,
         spv,
-        6, // bindings 0..5: cmd, lit, off16, length, dst, chunks
+        7, // bindings 0..6: cmd, lit, off16, length, dst, chunks, off32
         @sizeOf(DecodePush),
     );
 
-    const dec_bindings: [6]vk.VkDescriptorBufferInfo = .{
+    const dec_bindings: [7]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = streams.cmd_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = streams.lit_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = streams.off16_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = streams.length_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = dst_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = chunks_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        .{ .buffer = streams.off32_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
     };
     const dec_set = try descriptors.allocSet(ctx, cached_dec, dec_bindings[0..]);
 
@@ -761,6 +867,7 @@ pub fn freeStreams(ctx: *driver.Context, streams: *L1Streams) void {
         .{ &streams.cmd_buf, &streams.cmd_mem },
         .{ &streams.off16_buf, &streams.off16_mem },
         .{ &streams.length_buf, &streams.length_mem },
+        .{ &streams.off32_buf, &streams.off32_mem },
     }) |pair| {
         if (pair[0].* != null) {
             if (vk.vkDestroyBuffer_fn) |d| d(ctx.dev, pair[0].*, null);
@@ -775,6 +882,7 @@ pub fn freeStreams(ctx: *driver.Context, streams: *L1Streams) void {
     streams.cmd_size = 0;
     streams.off16_count = 0;
     streams.length_used = 0;
+    streams.off32_total = 0;
     streams.n_chunks = 0;
     streams.dst_size = 0;
 }

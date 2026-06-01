@@ -61,20 +61,24 @@ const StreamBundle = struct {
     cmd_views: [][]const u8,
     off16_views: [][]const u8,
     length_views: [][]const u8,
+    off32_views: [][]const u8,
     lit_arena: []u8,
     cmd_arena: []u8,
     off16_arena: []u8,
     length_arena: []u8,
+    off32_arena: []u8,
 
     pub fn deinit(self: *StreamBundle, allocator: std.mem.Allocator) void {
         allocator.free(self.lit_arena);
         allocator.free(self.cmd_arena);
         allocator.free(self.off16_arena);
         allocator.free(self.length_arena);
+        allocator.free(self.off32_arena);
         allocator.free(self.lit_views);
         allocator.free(self.cmd_views);
         allocator.free(self.off16_views);
         allocator.free(self.length_views);
+        allocator.free(self.off32_views);
     }
 };
 
@@ -117,6 +121,7 @@ fn buildStreamBundle(
     var total_cmd: usize = 0;
     var total_off16_bytes: usize = 0;
     var total_length: usize = 0;
+    var total_off32_bytes: usize = 0;
     {
         var ci: u32 = 0;
         while (ci < streams.n_chunks) : (ci += 1) {
@@ -124,6 +129,7 @@ fn buildStreamBundle(
             total_cmd += streams.per_chunk_cmd_size[ci];
             total_off16_bytes += @as(usize, streams.per_chunk_off16_count[ci]) * 2;
             total_length += streams.per_chunk_length_used[ci];
+            total_off32_bytes += @as(usize, streams.per_chunk_off32_count1[ci] + streams.per_chunk_off32_count2[ci]) * 3;
         }
     }
 
@@ -132,10 +138,12 @@ fn buildStreamBundle(
         .cmd_arena = try allocator.alloc(u8, total_cmd + 16),
         .off16_arena = try allocator.alloc(u8, total_off16_bytes + 16),
         .length_arena = try allocator.alloc(u8, total_length + 16),
+        .off32_arena = try allocator.alloc(u8, total_off32_bytes + 16),
         .lit_views = try allocator.alloc([]const u8, streams.n_chunks),
         .cmd_views = try allocator.alloc([]const u8, streams.n_chunks),
         .off16_views = try allocator.alloc([]const u8, streams.n_chunks),
         .length_views = try allocator.alloc([]const u8, streams.n_chunks),
+        .off32_views = try allocator.alloc([]const u8, streams.n_chunks),
     };
     errdefer bundle.deinit(allocator);
 
@@ -147,28 +155,56 @@ fn buildStreamBundle(
         streams.n_chunks, &streams.per_chunk_off16_count, true);
     try copyOneStream(ctx, streams.length_mem, bundle.length_arena, streams.chunk_capacity,
         streams.n_chunks, &streams.per_chunk_length_used, false);
+    try copyOff32Stream(ctx, streams, bundle.off32_arena);
 
     var lit_pos: usize = 0;
     var cmd_pos: usize = 0;
     var off16_pos: usize = 0;
     var length_pos: usize = 0;
+    var off32_pos: usize = 0;
     var ci: u32 = 0;
     while (ci < streams.n_chunks) : (ci += 1) {
         const ls = streams.per_chunk_lit_size[ci];
         const cs = streams.per_chunk_cmd_size[ci];
         const os = @as(usize, streams.per_chunk_off16_count[ci]) * 2;
         const xs = streams.per_chunk_length_used[ci];
+        const o32 = @as(usize, streams.per_chunk_off32_count1[ci] + streams.per_chunk_off32_count2[ci]) * 3;
         bundle.lit_views[ci] = bundle.lit_arena[lit_pos..][0..ls];
         bundle.cmd_views[ci] = bundle.cmd_arena[cmd_pos..][0..cs];
         bundle.off16_views[ci] = bundle.off16_arena[off16_pos..][0..os];
         bundle.length_views[ci] = bundle.length_arena[length_pos..][0..xs];
+        bundle.off32_views[ci] = bundle.off32_arena[off32_pos..][0..o32];
         lit_pos += ls;
         cmd_pos += cs;
         off16_pos += os;
         length_pos += xs;
+        off32_pos += o32;
     }
 
     return bundle;
+}
+
+fn copyOff32Stream(
+    ctx: *driver.Context,
+    streams: l1_codec.L1Streams,
+    out: []u8,
+) !void {
+    const map = vk.vkMapMemory_fn orelse return error.MapMemoryFailed;
+    const unmap = vk.vkUnmapMemory_fn orelse return error.MapMemoryFailed;
+    var raw: ?*anyopaque = null;
+    if (map(ctx.dev, streams.off32_mem, 0, vk.VK_WHOLE_SIZE, 0, &raw) != vk.VK_SUCCESS)
+        return error.MapMemoryFailed;
+    defer unmap(ctx.dev, streams.off32_mem);
+    const p: [*]const u8 = @ptrCast(raw.?);
+
+    var pos: usize = 0;
+    var ci: u32 = 0;
+    while (ci < streams.n_chunks) : (ci += 1) {
+        const chunk_byte_base: usize = @as(usize, ci) * streams.off32_capacity;
+        const slice_bytes: usize = @as(usize, streams.per_chunk_off32_count1[ci] + streams.per_chunk_off32_count2[ci]) * 3;
+        @memcpy(out[pos..][0..slice_bytes], p[chunk_byte_base..][0..slice_bytes]);
+        pos += slice_bytes;
+    }
 }
 
 // ── Shell-out helper for streamlz.exe ─────────────────────────────────
@@ -270,7 +306,12 @@ fn testVkEncodeCudaDecode(
         .cmd_bytes = bundle.cmd_views,
         .off16_bytes = bundle.off16_views,
         .length_bytes = bundle.length_views,
+        .off32_bytes = bundle.off32_views,
+        .per_chunk_off32_count1 = enc.streams.per_chunk_off32_count1[0..enc.streams.n_chunks],
+        .per_chunk_off32_count2 = enc.streams.per_chunk_off32_count2[0..enc.streams.n_chunks],
+        .per_chunk_cmd_stream2_offset = enc.streams.per_chunk_cmd_stream2_offset[0..enc.streams.n_chunks],
         .src_bytes = src,
+        .per_chunk_initial_copy = enc.streams.per_chunk_initial_copy[0..enc.streams.n_chunks],
         .n_chunks = enc.streams.n_chunks,
         .chunk_size = enc.streams.chunk_capacity, // unused for sizing — wrap uses VK_CHUNK_SIZE
         .original_size = @intCast(src.len),
@@ -354,16 +395,12 @@ fn testCudaEncodeVkDecode(
     src: []const u8,
     tmp_slz: []const u8,
 ) !void {
-    // 1. Shell out to streamlz.exe -c -l 1 --sc 0.25.
-    //    The `--sc 0.25` override pins the CUDA encoder to 64 KiB
-    //    sub-chunks, which avoids the off32 stream entirely:  the
-    //    encoder's near-offset cap (NEAR_OFFSET_MAX = 0xFFFF) is
-    //    larger than one 64 KiB sub-chunk, so every match offset
-    //    fits in off16 — exactly the Vulkan L1 codec's contract.
-    //    With 0.5 (the default for inputs above the saturation
-    //    threshold) the CUDA encoder emits off32 entries that the
-    //    Vulkan L1 decoder can't consume.
-    const exit = runStreamlz(io, allocator, &.{ "-c", "-l", "1", "--sc", "0.25", src_path, "-o", tmp_slz }) catch |err| {
+    // 1. Shell out to streamlz.exe -c -l 1 (default sc = 0.5).
+    //    The Vulkan L1 decoder now consumes off32 entries natively,
+    //    so the previous `--sc 0.25` workaround (which pinned the
+    //    CUDA encoder to 64 KiB sub-chunks to avoid off32) is no
+    //    longer required.
+    const exit = runStreamlz(io, allocator, &.{ "-c", "-l", "1", src_path, "-o", tmp_slz }) catch |err| {
         try w.print("CUDA_TO_VK FAIL {s} stage=streamlz err={s}\n", .{ label, @errorName(err) });
         return;
     };
@@ -474,11 +511,16 @@ fn decodeUnwrappedVkOnly(
     defer destroyMappedBuffer(ctx, &off16_b);
     var length_b = try createMappedBuffer(ctx, stream_cap_total);
     defer destroyMappedBuffer(ctx, &length_b);
+    const off32_capacity = l1_codec.CHUNK_OFF32_CAPACITY;
+    const off32_cap_total: vk.VkDeviceSize = @as(vk.VkDeviceSize, n_chunks) * off32_capacity;
+    var off32_b = try createMappedBuffer(ctx, off32_cap_total);
+    defer destroyMappedBuffer(ctx, &off32_b);
 
     @memset(lit_b.mapped[0..@intCast(lit_b.size)], 0);
     @memset(cmd_b.mapped[0..@intCast(cmd_b.size)], 0);
     @memset(off16_b.mapped[0..@intCast(off16_b.size)], 0);
     @memset(length_b.mapped[0..@intCast(length_b.size)], 0);
+    @memset(off32_b.mapped[0..@intCast(off32_b.size)], 0);
 
     // ── Upload per-chunk stream bytes into the per-chunk slots ──
     // Slot offset for chunk i = i * chunk_capacity (in bytes).
@@ -486,6 +528,7 @@ fn decodeUnwrappedVkOnly(
         var ci: u32 = 0;
         while (ci < n_chunks) : (ci += 1) {
             const base: usize = @as(usize, ci) * chunk_capacity;
+            const off32_base: usize = @as(usize, ci) * off32_capacity;
             const ls = stream_view.lit_bytes[ci].len;
             const cs = stream_view.cmd_bytes[ci].len;
             const ob = stream_view.off16_bytes[ci].len;
@@ -494,6 +537,10 @@ fn decodeUnwrappedVkOnly(
             if (cs != 0) @memcpy(cmd_b.mapped[base..][0..cs], stream_view.cmd_bytes[ci]);
             if (ob != 0) @memcpy(off16_b.mapped[base..][0..ob], stream_view.off16_bytes[ci]);
             if (xs != 0) @memcpy(length_b.mapped[base..][0..xs], stream_view.length_bytes[ci]);
+            if (stream_view.off32_bytes) |arr| {
+                const ob32 = arr[ci].len;
+                if (ob32 != 0) @memcpy(off32_b.mapped[off32_base..][0..ob32], arr[ci]);
+            }
         }
     }
 
@@ -508,14 +555,15 @@ fn decodeUnwrappedVkOnly(
     defer destroyMappedBuffer(ctx, &dst_b);
     @memset(dst_b.mapped[0..@intCast(dst_b.size)], 0);
 
-    // Chunks SSBO: 12 u32 per chunk (see `lz_decode.comp` head
+    // Chunks SSBO: 16 u32 per chunk (see `lz_decode.comp` head
     // comment for the slot layout).
-    var chunks_b = try createMappedBuffer(ctx, @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * 12);
+    var chunks_b = try createMappedBuffer(ctx, @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * 16);
     defer destroyMappedBuffer(ctx, &chunks_b);
     @memset(chunks_b.mapped[0..@intCast(chunks_b.size)], 0);
     {
         const words: [*]u32 = @ptrCast(@alignCast(chunks_b.mapped));
         const cap_words: u32 = chunk_capacity / 4;
+        const off32_cap_words: u32 = off32_capacity / 4;
         var ci: u32 = 0;
         while (ci < n_chunks) : (ci += 1) {
             // Per-chunk dst_off / dst_size derived from the unwrap
@@ -527,7 +575,7 @@ fn decodeUnwrappedVkOnly(
             const dst_off: u32 = ci * unwrap.result.chunk_size;
             const dst_size: u32 = unwrap.result.per_chunk_decomp_size[ci];
             const word_base: u32 = ci * cap_words;
-            const base = ci * 12;
+            const base = ci * 16;
             words[base + 0] = dst_off;
             words[base + 1] = dst_size;
             words[base + 2] = word_base;
@@ -538,6 +586,19 @@ fn decodeUnwrappedVkOnly(
             words[base + 7] = @intCast(stream_view.off16_bytes[ci].len / 2);
             words[base + 8] = word_base;
             words[base + 9] = @intCast(stream_view.length_bytes[ci].len);
+            // Slot 10 = initial_copy bytes (chunk 0 only); pulled from
+            // the unwrap bundle which knows whether the sub-chunk
+            // carried an INITIAL_LITERAL_COPY_BYTES verbatim prefix.
+            if (stream_view.per_chunk_initial_copy) |pci| {
+                if (ci < pci.len) words[base + 10] = pci[ci];
+            }
+            // Slot 11 = u32-word base of this chunk's off32 slice.
+            // Slots 12..14 = off32_count_block1 / off32_count_block2 /
+            // cmd_stream2_offset, plumbed from the unwrap result.
+            words[base + 11] = ci * off32_cap_words;
+            if (stream_view.per_chunk_off32_count1) |a| if (ci < a.len) { words[base + 12] = a[ci]; };
+            if (stream_view.per_chunk_off32_count2) |a| if (ci < a.len) { words[base + 13] = a[ci]; };
+            if (stream_view.per_chunk_cmd_stream2_offset) |a| if (ci < a.len) { words[base + 14] = a[ci]; };
         }
     }
 
@@ -551,17 +612,18 @@ fn decodeUnwrappedVkOnly(
         "lz_decode",
         tier,
         dec_spv,
-        6,
+        7,
         @sizeOf(DecodePush),
     );
 
-    const dec_bindings: [6]vk.VkDescriptorBufferInfo = .{
+    const dec_bindings: [7]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = cmd_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = lit_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = off16_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = length_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = dst_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = chunks_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        .{ .buffer = off32_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
     };
     const dec_set = try descriptors.allocSet(ctx, cached_dec, dec_bindings[0..]);
 
