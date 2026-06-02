@@ -19,6 +19,7 @@ const driver = @import("driver.zig");
 const probe_mod = @import("probe.zig");
 const slz1_codec = @import("slz1_codec.zig");
 const l1_codec = @import("l1_codec.zig");
+const vk = @import("vk_api.zig");
 
 const allocator = std.heap.c_allocator;
 
@@ -119,7 +120,40 @@ pub const VkContext = struct {
     /// every case our async callers care about.
     async_enc: AsyncSlot = .{},
     async_dec: AsyncSlot = .{},
+
+    /// D2D buffer registry. Phase 2 (TODO A2) — `slzRegisterBuffer_vk`
+    /// adds (device-address u64, VkBuffer, size) tuples here so the
+    /// codec can look up the caller's VkBuffer when given the address
+    /// as the `d_input` / `d_output` argument to `slzCompress_vk` or
+    /// `slzDecompress_vk`. A flat slot array (no hash map) is fine —
+    /// any realistic D2D caller registers a handful of buffers per
+    /// handle (input + output + maybe a frame staging buffer); a
+    /// linear scan is faster than a map at that size.
+    registry: [MAX_REGISTERED]RegisteredBuffer = @splat(.{}),
+    registry_count: u32 = 0,
 };
+
+/// Cap on registered D2D buffers per handle. Bumped if real-world
+/// callers register more than this; 16 covers every test/bench shape
+/// we have today.
+pub const MAX_REGISTERED: usize = 16;
+
+pub const RegisteredBuffer = struct {
+    address: u64 = 0,
+    buffer: vk.VkBuffer = null,
+    size: usize = 0,
+};
+
+/// Look up a registered buffer by address. Returns null if the address
+/// is zero, has never been registered, or has since been unregistered.
+fn lookupRegistered(h: *VkContext, addr: u64) ?RegisteredBuffer {
+    if (addr == 0) return null;
+    var i: u32 = 0;
+    while (i < h.registry_count) : (i += 1) {
+        if (h.registry[i].address == addr) return h.registry[i];
+    }
+    return null;
+}
 
 /// Per-direction async slot. Owns the in-flight worker thread (if any)
 /// and the most recent result. The slot is "busy" while `thread` is
@@ -263,33 +297,125 @@ pub export fn slzDestroy_vk(handle: ?*VkContext) void {
     // `slzShutdown_vk`). Multiple handles share one VkDevice in M4.
 }
 
-// ── Buffer registration ───────────────────────────────────────────────
-// Tier-1 (BDA): both calls are no-ops returning SLZ_SUCCESS. Tier-2
-// (M6+) will record the (VkBuffer, VkDeviceAddress, size) mapping so
-// dispatchers can resolve a caller-supplied device address into a
-// descriptor-set binding without re-querying the loader. The signature
-// is stable now so portable callers can wire register/unregister calls
-// even before Tier-2 is live.
+// ── Buffer registration (Phase 2 / TODO A2 — true D2D via BDA) ────────
+// Caller supplies a VkBuffer (cast to `void*`) plus optional pre-
+// queried device address. The function records (address, VkBuffer,
+// size) on the handle's registry so the codec can resolve a
+// caller-supplied device address into the corresponding VkBuffer
+// when invoked via `slzCompress_vk` / `slzDecompress_vk`.
+//
+// `d_base_address` semantics:
+//   * non-null  — caller already queried `vkGetBufferDeviceAddress`
+//                 and is asserting the address. We trust them.
+//   * null      — we call vkGetBufferDeviceAddress on the supplied
+//                 VkBuffer ourselves. The caller can read the result
+//                 back via the companion `slzBufferGetDeviceAddress_vk`
+//                 helper below; without that, the registry mapping
+//                 is opaque and the caller has nothing to pass back.
+//                 This branch is mainly here for symmetry with the
+//                 CUDA-side `slzRegisterBuffer` (where the address
+//                 is the caller's CUDA-side allocation pointer and
+//                 always known).
+//
+// The VkBuffer MUST be created with
+// `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` (Phase 2 enables
+// `bufferDeviceAddress` at device-create time in `device.zig`).
 pub export fn slzRegisterBuffer_vk(
     handle: ?*VkContext,
     vk_buffer_handle: ?*anyopaque,
     d_base_address: ?*const anyopaque,
     buffer_size: usize,
 ) c_int {
-    _ = vk_buffer_handle;
-    _ = d_base_address;
-    _ = buffer_size;
-    _ = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    const vk_buf_raw = vk_buffer_handle orelse return SLZ_ERROR_INVALID_ARG;
+    if (buffer_size == 0) return SLZ_ERROR_INVALID_ARG;
+    if (h.registry_count >= MAX_REGISTERED) return SLZ_ERROR_OUT_OF_MEMORY;
+
+    const vk_buf: vk.VkBuffer = @ptrCast(vk_buf_raw);
+
+    // Resolve address: either trust the caller (CUDA-symmetry path)
+    // or query via vkGetBufferDeviceAddress.
+    const addr: u64 = if (d_base_address) |p|
+        @intFromPtr(p)
+    else blk: {
+        const a = queryBufferAddress(vk_buf) catch return SLZ_ERROR_VK_FEATURE_MISSING;
+        if (a == 0) return SLZ_ERROR_VK_FEATURE_MISSING;
+        break :blk a;
+    };
+
+    h.registry[h.registry_count] = .{
+        .address = addr,
+        .buffer = vk_buf,
+        .size = buffer_size,
+    };
+    h.registry_count += 1;
     return SLZ_SUCCESS;
 }
 
+/// Removes an address from the registry. Idempotent — unregistering
+/// an address that is not registered returns SLZ_SUCCESS.
 pub export fn slzUnregisterBuffer_vk(
     handle: ?*VkContext,
     d_base_address: ?*const anyopaque,
 ) c_int {
-    _ = d_base_address;
-    _ = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    const addr_raw = d_base_address orelse return SLZ_SUCCESS;
+    const addr = @intFromPtr(addr_raw);
+    var i: u32 = 0;
+    while (i < h.registry_count) : (i += 1) {
+        if (h.registry[i].address == addr) {
+            // Swap-with-last so the registry stays compact. Order is
+            // not exposed to callers so this is safe.
+            const last = h.registry_count - 1;
+            if (i != last) h.registry[i] = h.registry[last];
+            h.registry[last] = .{};
+            h.registry_count = last;
+            return SLZ_SUCCESS;
+        }
+    }
     return SLZ_SUCCESS;
+}
+
+/// Query the device address of a VkBuffer. Internal helper used by
+/// `slzRegisterBuffer_vk` when the caller didn't pre-query, AND
+/// exposed publicly (below) so test code can call it without
+/// importing all of vk_api.
+fn queryBufferAddress(buf: vk.VkBuffer) !u64 {
+    // Lazy resolve.
+    if (vk.vkGetBufferDeviceAddress_fn == null) {
+        if (vk.vkGetDeviceProcAddr_fn) |gdpa| {
+            if (gdpa(driver.g_default.dev, "vkGetBufferDeviceAddress")) |raw| {
+                vk.vkGetBufferDeviceAddress_fn = @ptrCast(@alignCast(raw));
+            }
+        }
+        // Some drivers only expose the KHR-suffixed name on Vulkan
+        // 1.1 hosts; the Tier floor here is 1.2 so the core name is
+        // always present, but try the KHR alias as a belt.
+        if (vk.vkGetBufferDeviceAddress_fn == null) {
+            if (vk.vkGetDeviceProcAddr_fn) |gdpa| {
+                if (gdpa(driver.g_default.dev, "vkGetBufferDeviceAddressKHR")) |raw| {
+                    vk.vkGetBufferDeviceAddress_fn = @ptrCast(@alignCast(raw));
+                }
+            }
+        }
+    }
+    const get = vk.vkGetBufferDeviceAddress_fn orelse return error.NoBdaFn;
+    const info: vk.VkBufferDeviceAddressInfo = .{ .buffer = buf };
+    return get(driver.g_default.dev, &info);
+}
+
+/// Public helper: query the device address of an already-created
+/// VkBuffer. Caller passes the VkBuffer handle cast to `void*`;
+/// returns the BDA u64 or 0 on failure. Surfaced through the C ABI
+/// so test code can build BDA-typed D2D round-trips without pulling
+/// in vk_api directly.
+pub export fn slzBufferGetDeviceAddress_vk(
+    handle: ?*VkContext,
+    vk_buffer_handle: ?*anyopaque,
+) u64 {
+    _ = handle orelse return 0;
+    const buf: vk.VkBuffer = @ptrCast(vk_buffer_handle orelse return 0);
+    return queryBufferAddress(buf) catch 0;
 }
 
 // ── Sync compress / decompress (STUBBED) ──────────────────────────────
@@ -298,14 +424,23 @@ pub export fn slzUnregisterBuffer_vk(
 // Returns `int` (not slzStatus_t) to match the header — the byte count
 // surface mirrors the CUDA contract once implemented.
 
-/// v1 device-pointer variant: dereferences `d_input` and `d_output`
-/// directly as host pointers — i.e. the caller is expected to pass
-/// already-mapped or unified-memory pointers. True device-to-device
-/// dispatch via `slzMakeDeviceOnlyHandle_vk` sentinels is Phase 2
-/// (A2 — BDA wiring); today a sentinel pointer is rejected with
-/// SLZ_ERROR_UNSUPPORTED so the caller learns the codec hasn't been
-/// taught the device-address path yet. Behaviour is otherwise
-/// identical to `slzCompressHost_vk`.
+/// Device-pointer variant. Phase 2 (TODO A2) wires the BDA path: if
+/// `d_input` is the device address of a previously-registered
+/// VkBuffer (via `slzRegisterBuffer_vk`), the encoder binds that
+/// buffer directly into the descriptor set and skips its internal
+/// HOST_VISIBLE staging + memcpy. Otherwise the call falls through
+/// to `slzCompressHost_vk` (treats the pointer as a host pointer).
+///
+/// `d_output` is always host-side for compress today — the L1
+/// encoder's output goes through the CPU wire-format wrap before
+/// landing in `d_output`. Registering `d_output` as a device buffer
+/// is accepted (we copy the wrapped frame into it via staging) for
+/// API symmetry but is NOT a perf win at this phase.
+///
+/// The "device-only sentinel" from `slzMakeDeviceOnlyHandle_vk` is
+/// rejected here: it carries no registered buffer to bind, so the
+/// codec has no actual buffer to operate on. Use
+/// `slzRegisterBuffer_vk` + pass the BDA address instead.
 pub export fn slzCompress_vk(
     handle: ?*VkContext,
     d_input: ?*const anyopaque,
@@ -314,13 +449,133 @@ pub export fn slzCompress_vk(
     output_capacity: usize,
     opts: CompressOpts,
 ) c_int {
-    // Phase 1: reject device-only sentinel pointers — the codec
-    // doesn't have a BDA path yet, so dereferencing the sentinel as
-    // a host pointer would fault. Phase 2 lifts this guard and
-    // routes the call through the BDA codec.
     if (isDeviceOnlySentinel(d_input) or isDeviceOnlySentinel(d_output))
         return SLZ_ERROR_UNSUPPORTED;
-    return slzCompressHost_vk(handle, d_input, input_size, d_output, output_capacity, opts);
+
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    if (d_input == null and input_size != 0) return SLZ_ERROR_INVALID_ARG;
+    if (d_output == null) return SLZ_ERROR_INVALID_ARG;
+    if (opts.level != 1) return SLZ_ERROR_UNSUPPORTED;
+
+    // Look up the input address in the registry. If found, branch
+    // through the D2D path; otherwise treat as a host pointer and
+    // delegate to the host-pointer entry point.
+    const in_addr: u64 = @intFromPtr(d_input);
+    const out_addr: u64 = @intFromPtr(d_output);
+    const in_reg = lookupRegistered(h, in_addr);
+    const out_reg = lookupRegistered(h, out_addr);
+    if (in_reg == null and out_reg == null) {
+        return slzCompressHost_vk(handle, d_input, input_size, d_output, output_capacity, opts);
+    }
+
+    // D2D path. The host-side wire-format wrap still runs in CPU,
+    // so we always need a host buffer for the compressed frame. If
+    // d_output is a registered device buffer, we encode into a host
+    // scratch buffer then stage the result into the device buffer.
+    return d2dCompress(
+        h,
+        in_reg,
+        d_input,
+        input_size,
+        out_reg,
+        d_output,
+        output_capacity,
+        opts,
+    );
+}
+
+/// D2D-aware compress backend. Builds the codec options from the
+/// registered-buffer lookup and either bounces the output through a
+/// host scratch (when d_output is device-resident) or writes
+/// straight to the caller's host pointer.
+fn d2dCompress(
+    h: *VkContext,
+    in_reg: ?RegisteredBuffer,
+    d_input_host: ?*const anyopaque,
+    input_size: usize,
+    out_reg: ?RegisteredBuffer,
+    d_output_host: ?*anyopaque,
+    output_capacity: usize,
+    opts: CompressOpts,
+) c_int {
+    _ = opts;
+    // Phase-2 perf win lives in the src side: skip the HOST_VISIBLE
+    // staging + memcpy when the caller's source is already on
+    // device. The encoder kernel then reads the caller's VkBuffer
+    // directly via descriptor binding. BUT the CPU wire-format
+    // wrap downstream of the encoder also needs the source bytes
+    // (the SC tail prefix copies 8 verbatim bytes per non-first
+    // chunk from the source into the output frame). For Phase 2
+    // we satisfy that by reading the bytes back from the device
+    // buffer into a host scratch before encode. Net effect: we
+    // trade one H2D for one D2H — perf-neutral for now but the
+    // path lets the encoder kernel skip the descriptor's H2D wait
+    // and Phase 3 (GPU frame assembly) drops the D2H entirely.
+    const src_buffer_override: ?vk.VkBuffer = if (in_reg) |r| r.buffer else null;
+    var src_view: []const u8 = undefined;
+    var d2h_scratch: ?[]u8 = null;
+    defer if (d2h_scratch) |b| allocator.free(b);
+    if (in_reg) |reg| {
+        if (input_size > reg.size) return SLZ_ERROR_INVALID_ARG;
+        const scratch = allocator.alloc(u8, input_size) catch return SLZ_ERROR_OUT_OF_MEMORY;
+        d2h_scratch = scratch;
+        if (!stageBytesFromDeviceBuffer(reg.buffer, scratch))
+            return SLZ_ERROR_VK_FEATURE_MISSING;
+        src_view = scratch;
+    } else {
+        if (d_input_host == null and input_size != 0) return SLZ_ERROR_INVALID_ARG;
+        const ptr: [*]const u8 = @ptrCast(d_input_host.?);
+        src_view = ptr[0..input_size];
+    }
+
+    // Output side: if the caller's output is a registered device
+    // buffer, encode into a host scratch and stage the result over
+    // to the device buffer via vkCmdCopyBuffer. The bound size
+    // (caller's registered_size) caps capacity.
+    if (out_reg) |reg| {
+        if (output_capacity == 0) return SLZ_ERROR_INVALID_ARG;
+        const cap = @min(output_capacity, reg.size);
+        const scratch = allocator.alloc(u8, cap) catch return SLZ_ERROR_OUT_OF_MEMORY;
+        defer allocator.free(scratch);
+
+        const io = ensureIo();
+        l1_codec.last_encode_dispatch_ns = 0;
+        const written_or_err = slz1_codec.encodeL1ToSlz1Ex(
+            &driver.g_default,
+            io,
+            allocator,
+            src_view,
+            scratch,
+            .{ .src_buffer_override = src_buffer_override },
+        );
+        const written: usize = written_or_err catch |err| return mapEncodeError(err);
+        h.last_encode_dispatch_ns = l1_codec.last_encode_dispatch_ns;
+
+        // Stage scratch → caller's device buffer. Cheap CPU-side
+        // copy through a host-visible staging buffer then a
+        // GPU-side copy into the registered buffer.
+        const ok = stageBytesToDeviceBuffer(reg.buffer, scratch[0..written]);
+        if (!ok) return SLZ_ERROR_OUT_OF_MEMORY;
+        return @intCast(written);
+    }
+
+    // Output is a host pointer; encode directly into it.
+    if (d_output_host == null) return SLZ_ERROR_INVALID_ARG;
+    const out_ptr: [*]u8 = @ptrCast(d_output_host.?);
+    const out: []u8 = out_ptr[0..output_capacity];
+
+    const io = ensureIo();
+    l1_codec.last_encode_dispatch_ns = 0;
+    const written = slz1_codec.encodeL1ToSlz1Ex(
+        &driver.g_default,
+        io,
+        allocator,
+        src_view,
+        out,
+        .{ .src_buffer_override = src_buffer_override },
+    ) catch |err| return mapEncodeError(err);
+    h.last_encode_dispatch_ns = l1_codec.last_encode_dispatch_ns;
+    return @intCast(written);
 }
 
 pub export fn slzCompressHost_vk(
@@ -355,10 +610,15 @@ pub export fn slzCompressHost_vk(
     return @intCast(written);
 }
 
-/// v1 device-pointer variant: dereferences `d_input` and `d_output`
-/// directly as host pointers. Device-only sentinels from
-/// `slzMakeDeviceOnlyHandle_vk` are rejected with SLZ_ERROR_UNSUPPORTED
-/// until Phase 2 wires the BDA path.
+/// Device-pointer variant. Phase 2 (TODO A2) wires the BDA path. If
+/// `d_output` is a registered VkBuffer's device address, the decoder
+/// writes decoded bytes directly into the caller's VkBuffer without
+/// the internal HOST_VISIBLE staging copy + host @memcpy chain. If
+/// `d_input` is registered, the CPU wire-format unwrap still runs
+/// (the CPU path needs the bytes); we read them back from the device
+/// buffer via a staging copy. This is correctness-preserving but not
+/// a perf win for input D2D at this phase — Phase 4 (GPU decode
+/// pipeline) is the path to real D2D for input.
 pub export fn slzDecompress_vk(
     handle: ?*VkContext,
     d_input: ?*const anyopaque,
@@ -369,7 +629,240 @@ pub export fn slzDecompress_vk(
 ) c_int {
     if (isDeviceOnlySentinel(d_input) or isDeviceOnlySentinel(d_output))
         return SLZ_ERROR_UNSUPPORTED;
-    return slzDecompressHost_vk(handle, d_input, input_size, d_output, output_capacity, opts);
+
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    if (d_input == null and input_size != 0) return SLZ_ERROR_INVALID_ARG;
+    if (d_output == null and output_capacity != 0) return SLZ_ERROR_INVALID_ARG;
+
+    const in_addr: u64 = @intFromPtr(d_input);
+    const out_addr: u64 = @intFromPtr(d_output);
+    const in_reg = lookupRegistered(h, in_addr);
+    const out_reg = lookupRegistered(h, out_addr);
+    if (in_reg == null and out_reg == null) {
+        return slzDecompressHost_vk(handle, d_input, input_size, d_output, output_capacity, opts);
+    }
+    return d2dDecompress(h, in_reg, d_input, input_size, out_reg, d_output, output_capacity, opts);
+}
+
+fn d2dDecompress(
+    h: *VkContext,
+    in_reg: ?RegisteredBuffer,
+    d_input_host: ?*const anyopaque,
+    input_size: usize,
+    out_reg: ?RegisteredBuffer,
+    d_output_host: ?*anyopaque,
+    output_capacity: usize,
+    opts: DecompressOpts,
+) c_int {
+    _ = opts;
+    // Input: if registered, pull bytes off the device into a host
+    // scratch (the CPU wire-format unwrap needs them). For host
+    // input, alias the caller's slice.
+    var input_slice: []const u8 = undefined;
+    var input_owned_scratch: ?[]u8 = null;
+    defer if (input_owned_scratch) |b| allocator.free(b);
+    if (in_reg) |reg| {
+        if (input_size > reg.size) return SLZ_ERROR_INVALID_ARG;
+        const scratch = allocator.alloc(u8, input_size) catch return SLZ_ERROR_OUT_OF_MEMORY;
+        input_owned_scratch = scratch;
+        if (!stageBytesFromDeviceBuffer(reg.buffer, scratch)) return SLZ_ERROR_VK_FEATURE_MISSING;
+        input_slice = scratch;
+    } else {
+        if (d_input_host == null) return SLZ_ERROR_INVALID_ARG;
+        const ptr: [*]const u8 = @ptrCast(d_input_host.?);
+        input_slice = ptr[0..input_size];
+    }
+
+    // Output: if registered, the decoder writes straight into the
+    // caller's buffer via dst_buffer_override. For host output,
+    // alias the caller's slice as before.
+    const dst_buffer_override: ?vk.VkBuffer = if (out_reg) |r| r.buffer else null;
+    var dst_view: []u8 = undefined;
+    if (out_reg != null) {
+        // The codec only writes to the device buffer; pass a zero-
+        // length host slice so the unused @memcpy path is skipped.
+        dst_view = &.{};
+    } else {
+        if (d_output_host == null) return SLZ_ERROR_INVALID_ARG;
+        const ptr: [*]u8 = @ptrCast(d_output_host.?);
+        dst_view = ptr[0..output_capacity];
+    }
+
+    const io = ensureIo();
+    l1_codec.last_decode_dispatch_ns = 0;
+    const written = slz1_codec.decodeSlz1ToBytesEx(
+        &driver.g_default,
+        io,
+        allocator,
+        input_slice,
+        dst_view,
+        .{ .dst_buffer_override = dst_buffer_override },
+    ) catch |err| return mapDecodeError(err);
+    h.last_decode_dispatch_ns = l1_codec.last_decode_dispatch_ns;
+    return @intCast(written);
+}
+
+/// Stage `bytes` into a caller-owned device VkBuffer via an
+/// internal HOST_VISIBLE staging buffer and a vkCmdCopyBuffer.
+/// Returns true on success.
+fn stageBytesToDeviceBuffer(dst: vk.VkBuffer, bytes: []const u8) bool {
+    // `to_device` direction only reads `host_bytes` — the @memcpy
+    // inside `stageDeviceBufferCopy` clones the source bytes into
+    // the staging buffer's mapped memory before submit. A
+    // `@constCast` is fine here because the helper never writes
+    // to the slice in this direction.
+    const writable: []u8 = @constCast(bytes);
+    return stageDeviceBufferCopy(dst, writable, .to_device);
+}
+
+/// Read bytes from a caller-owned device VkBuffer into a host
+/// scratch (size = `out.len`). Returns true on success.
+fn stageBytesFromDeviceBuffer(src: vk.VkBuffer, out: []u8) bool {
+    return stageDeviceBufferCopy(src, out, .from_device);
+}
+
+const StageDir = enum { to_device, from_device };
+
+/// Helper shared by stageBytesTo/FromDeviceBuffer. Allocates a
+/// HOST_VISIBLE staging buffer the same size as `bytes` and submits
+/// a single vkCmdCopyBuffer in either direction. Reuses the
+/// existing dispatch chassis on `driver.g_default` so the fence
+/// chassis doesn't get duplicated.
+fn stageDeviceBufferCopy(dev_buf: vk.VkBuffer, host_bytes: []u8, dir: StageDir) bool {
+    if (host_bytes.len == 0) return true;
+    const ctx = &driver.g_default;
+    l1_codec.ensureBufferFnSlots(ctx);
+
+    // Create the staging buffer.
+    const create_buf = vk.vkCreateBuffer_fn orelse return false;
+    const get_req = vk.vkGetBufferMemoryRequirements_fn orelse return false;
+    const alloc_mem = vk.vkAllocateMemory_fn orelse return false;
+    const free_mem = vk.vkFreeMemory_fn orelse return false;
+    const bind = vk.vkBindBufferMemory_fn orelse return false;
+    const destroy_buf = vk.vkDestroyBuffer_fn orelse return false;
+    const map = vk.vkMapMemory_fn orelse return false;
+    const unmap = vk.vkUnmapMemory_fn orelse return false;
+    const get_mem_props = vk.vkGetPhysicalDeviceMemoryProperties_fn orelse return false;
+
+    const usage: vk.VkBufferUsageFlags = switch (dir) {
+        .to_device => vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .from_device => vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    };
+    const bci: vk.VkBufferCreateInfo = .{
+        .size = host_bytes.len,
+        .usage = usage,
+        .sharingMode = vk.VK_SHARING_MODE_EXCLUSIVE,
+    };
+    var stage_buf: vk.VkBuffer = null;
+    if (create_buf(ctx.dev, &bci, null, &stage_buf) != vk.VK_SUCCESS) return false;
+    defer destroy_buf(ctx.dev, stage_buf, null);
+
+    var req: vk.VkMemoryRequirements = .{};
+    get_req(ctx.dev, stage_buf, &req);
+
+    var mem_props: vk.VkPhysicalDeviceMemoryProperties = .{};
+    get_mem_props(ctx.pd, &mem_props);
+    const want = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    var mt_idx: u32 = std.math.maxInt(u32);
+    {
+        var i: u32 = 0;
+        while (i < mem_props.memoryTypeCount) : (i += 1) {
+            const ok = (req.memoryTypeBits & (@as(u32, 1) << @intCast(i))) != 0;
+            if (ok and (mem_props.memoryTypes[i].propertyFlags & want) == want) {
+                mt_idx = i;
+                break;
+            }
+        }
+    }
+    if (mt_idx == std.math.maxInt(u32)) return false;
+
+    const mai: vk.VkMemoryAllocateInfo = .{
+        .allocationSize = req.size,
+        .memoryTypeIndex = mt_idx,
+    };
+    var stage_mem: vk.VkDeviceMemory = null;
+    if (alloc_mem(ctx.dev, &mai, null, &stage_mem) != vk.VK_SUCCESS) return false;
+    defer free_mem(ctx.dev, stage_mem, null);
+    if (bind(ctx.dev, stage_buf, stage_mem, 0) != vk.VK_SUCCESS) return false;
+
+    var raw: ?*anyopaque = null;
+    if (map(ctx.dev, stage_mem, 0, vk.VK_WHOLE_SIZE, 0, &raw) != vk.VK_SUCCESS) return false;
+    defer unmap(ctx.dev, stage_mem);
+    const mapped: [*]u8 = @ptrCast(@alignCast(raw.?));
+
+    // For to_device, fill the staging buffer; for from_device, read
+    // it after the GPU copy completes (post-submit).
+    if (dir == .to_device) {
+        @memcpy(mapped[0..host_bytes.len], host_bytes);
+    }
+
+    // Submit a one-shot vkCmdCopyBuffer using the driver chassis.
+    if (!recordAndSubmitCopy(ctx, stage_buf, dev_buf, host_bytes.len, dir)) return false;
+
+    if (dir == .from_device) {
+        @memcpy(host_bytes, mapped[0..host_bytes.len]);
+    }
+    return true;
+}
+
+/// Inline cmdbuf record + submit + wait for a single
+/// vkCmdCopyBuffer. Reuses the dispatch chassis primary command
+/// buffer + fence on `ctx`.
+fn recordAndSubmitCopy(
+    ctx: *driver.Context,
+    stage_buf: vk.VkBuffer,
+    dev_buf: vk.VkBuffer,
+    size: usize,
+    dir: StageDir,
+) bool {
+    // Ensure the chassis (cmd_pool, cmd_buf, fence, query_pool) is up.
+    // dispatch.submitOne does this lazily on first dispatch; the D2D
+    // stage-copy path may run before any codec dispatch, so prep it
+    // explicitly here.
+    const dispatch_mod = @import("dispatch.zig");
+    dispatch_mod.ensureChassisPub(ctx) catch return false;
+
+    const reset_cb = vk.vkResetCommandBuffer_fn orelse return false;
+    const begin_cb = vk.vkBeginCommandBuffer_fn orelse return false;
+    const end_cb = vk.vkEndCommandBuffer_fn orelse return false;
+    const cmd_copy = vk.vkCmdCopyBuffer_fn orelse return false;
+    const reset_fence = vk.vkResetFences_fn orelse return false;
+    const submit = vk.vkQueueSubmit_fn orelse return false;
+    const wait_fence = vk.vkWaitForFences_fn orelse return false;
+
+    // The chassis is set up by `dispatch.submitOne` on first call —
+    // we expect at least one codec dispatch has run by this point
+    // (the encoder/decoder runs before we get here), so cmd_buf +
+    // fence are already populated. If not, bail.
+    if (ctx.cmd_buf == null or ctx.fence == null) return false;
+
+    if (reset_cb(ctx.cmd_buf, 0) != vk.VK_SUCCESS) return false;
+    const begin_info: vk.VkCommandBufferBeginInfo = .{
+        .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (begin_cb(ctx.cmd_buf, &begin_info) != vk.VK_SUCCESS) return false;
+    const region: vk.VkBufferCopy = .{
+        .srcOffset = 0,
+        .dstOffset = 0,
+        .size = @intCast(size),
+    };
+    const regions: [1]vk.VkBufferCopy = .{region};
+    switch (dir) {
+        .to_device => cmd_copy(ctx.cmd_buf, stage_buf, dev_buf, 1, @ptrCast(&regions)),
+        .from_device => cmd_copy(ctx.cmd_buf, dev_buf, stage_buf, 1, @ptrCast(&regions)),
+    }
+    if (end_cb(ctx.cmd_buf) != vk.VK_SUCCESS) return false;
+
+    const fences: [1]vk.VkFence = .{ctx.fence};
+    if (reset_fence(ctx.dev, 1, @ptrCast(&fences)) != vk.VK_SUCCESS) return false;
+    const cmd_bufs: [1]vk.VkCommandBuffer = .{ctx.cmd_buf};
+    const submit_info: vk.VkSubmitInfo = .{
+        .commandBufferCount = 1,
+        .pCommandBuffers = @ptrCast(&cmd_bufs),
+    };
+    const submits: [1]vk.VkSubmitInfo = .{submit_info};
+    if (submit(ctx.queue, 1, @ptrCast(&submits), ctx.fence) != vk.VK_SUCCESS) return false;
+    return wait_fence(ctx.dev, 1, @ptrCast(&fences), vk.VK_TRUE, vk.VK_M8A_FENCE_WAIT_NS) == vk.VK_SUCCESS;
 }
 
 pub export fn slzDecompressHost_vk(

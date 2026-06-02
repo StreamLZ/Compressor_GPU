@@ -1620,6 +1620,36 @@ pub const FnCmdFillBuffer = *const fn (
     data: u32,
 ) callconv(.c) void;
 
+// ── Phase 2 (L1 finish — TODO A2): BDA query ──────────────────────
+// VkBufferDeviceAddressInfo + vkGetBufferDeviceAddress (Vulkan 1.2 core,
+// also from VK_KHR_buffer_device_address). The Vulkan 1.2 device opts
+// into BDA via VkPhysicalDeviceVulkan12Features.bufferDeviceAddress
+// (already enabled at device-create time per `device.zig`); we use the
+// returned u64 as the "device address" handle returned to C ABI
+// callers via `slzRegisterBuffer_vk`.
+pub const VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO: VkStructureType = 1000244001;
+pub const VkBufferDeviceAddressInfo = extern struct {
+    sType: VkStructureType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+    pNext: ?*const anyopaque = null,
+    buffer: VkBuffer = null,
+};
+pub const FnGetBufferDeviceAddress = *const fn (
+    device: VkDevice,
+    pInfo: *const VkBufferDeviceAddressInfo,
+) callconv(.c) u64;
+// Also needed when creating a BDA-capable VkBuffer (caller-side
+// VkBuffer creation; tests use this to make buffers whose device
+// address the codec then reads via vkGetBufferDeviceAddress).
+pub const VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT: VkBufferUsageFlags = 0x00020000;
+pub const VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT: u32 = 0x00000002;
+pub const VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO: VkStructureType = 1000060000;
+pub const VkMemoryAllocateFlagsInfo = extern struct {
+    sType: VkStructureType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+    pNext: ?*const anyopaque = null,
+    flags: u32 = 0,
+    deviceMask: u32 = 0,
+};
+
 // ── M8c function-pointer slots ───────────────────────────────────
 // Same lazy-on-first-use pattern as M8a/M8b. sync.zig + timing.zig
 // populate these inside their ensure helpers.
@@ -1636,6 +1666,7 @@ pub var vkGetBufferMemoryRequirements_fn: ?FnGetBufferMemoryRequirements = null;
 pub var vkGetPhysicalDeviceMemoryProperties_fn: ?FnGetPhysicalDeviceMemoryProperties = null;
 pub var vkCmdCopyBuffer_fn: ?FnCmdCopyBuffer = null;
 pub var vkCmdFillBuffer_fn: ?FnCmdFillBuffer = null;
+pub var vkGetBufferDeviceAddress_fn: ?FnGetBufferDeviceAddress = null;
 
 // ── Loader helpers ───────────────────────────────────────────────
 

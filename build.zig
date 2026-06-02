@@ -443,6 +443,33 @@ pub fn build(b: *std.Build) void {
     run_vk_abi_async_test.step.dependOn(&vk_shaders_top.step);
     b.step("vk-abi-async-test", "Run the Phase-1 (A1) async + timings + sentinel C ABI test").dependOn(&run_vk_abi_async_test.step);
 
+    // ── Vulkan port (Phase 2 / TODO A2): D2D via BDA test ──────────
+    // Exercises the device-to-device codec paths added in Phase 2:
+    //   * slzRegisterBuffer_vk records (VkBuffer, BDA, size).
+    //   * slzBufferGetDeviceAddress_vk queries vkGetBufferDeviceAddress.
+    //   * slzCompress_vk / slzDecompress_vk recognize the registered
+    //     BDA addresses and skip the corresponding H2D/D2H copies.
+    // Wired as `zig build vk-l1-d2d-test`. Same decoupling pattern
+    // as vk-abi-test: no CUDA-side install dependency.
+    const vk_d2d_test_module = b.createModule(.{
+        .root_source_file = b.path("c_abi_d2d_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .link_libc = true,
+    });
+    addSpvBlobsImport(vk_d2d_test_module, vk_shaders);
+    const vk_d2d_test_exe = b.addExecutable(.{
+        .name = "vk_l1_d2d_test",
+        .root_module = vk_d2d_test_module,
+    });
+    vk_d2d_test_exe.step.dependOn(vk_shaders.embed_dir_step);
+    const vk_d2d_test_install = b.addInstallArtifact(vk_d2d_test_exe, .{});
+    const run_vk_d2d_test = b.addRunArtifact(vk_d2d_test_exe);
+    run_vk_d2d_test.step.dependOn(&vk_d2d_test_install.step);
+    run_vk_d2d_test.step.dependOn(&vk_shaders_top.step);
+    b.step("vk-l1-d2d-test", "Run the Phase-2 (A2) D2D BDA round-trip test").dependOn(&run_vk_d2d_test.step);
+
     // ── Vulkan port (L1 wire-format): SLZ1 wrap/unwrap conformance ─────
     // Wraps the L1 codec's raw streams into a real .slz file (CPU-side)
     // and round-trips both directions against the CUDA encoder/decoder

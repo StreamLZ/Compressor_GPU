@@ -211,6 +211,17 @@ pub fn createDevice(pd: vk.VkPhysicalDevice, opts: DeviceCreateOptions) DeviceEr
     // the feature (in which case we run on whatever the driver picked,
     // matching pre-fix behavior).
     var v12_feats: vk.VkPhysicalDeviceVulkan12Features = .{};
+    v12_feats.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    // Phase 2 (L1 finish — TODO A2): enable VK_KHR_buffer_device_address.
+    // Caller-side D2D buffers register via `slzRegisterBuffer_vk` and
+    // hand the BDA u64 back to the codec as the value passed to
+    // `slzCompress_vk(d_input)` / `slzDecompress_vk(d_output)`. The
+    // codec uses the address as a registry key to find the caller's
+    // VkBuffer and binds it directly into the descriptor set, skipping
+    // the internal HOST_VISIBLE staging copy. Buffers must also be
+    // created with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT for the
+    // BDA query to succeed.
+    v12_feats.bufferDeviceAddress = vk.VK_TRUE;
     // Chain BOTH the v13 omnibus AND the per-extension SubgroupSizeControl
     // features struct. Per spec, drivers should look at either form, but
     // some drivers only look at one — sending both is the belt-and-
@@ -225,7 +236,11 @@ pub fn createDevice(pd: vk.VkPhysicalDevice, opts: DeviceCreateOptions) DeviceEr
     v13_feats.pNext = @ptrCast(&sgsc_feats);
     v13_feats.subgroupSizeControl = vk.VK_TRUE;
     v13_feats.computeFullSubgroups = vk.VK_TRUE;
-    var p_next: ?*const anyopaque = @ptrCast(&v13_feats);
+    // The v12 omnibus is always chained now (was only chained when 8bit
+    // storage was requested) so `bufferDeviceAddress` is on for every
+    // device — the BDA path is the new default for D2D callers.
+    v12_feats.pNext = @ptrCast(&v13_feats);
+    const p_next: ?*const anyopaque = @ptrCast(&v12_feats);
     // VK_EXT_subgroup_size_control was promoted in 1.3 — for a 1.3
     // device the v13 feature struct is the authoritative gate; passing
     // the EXT name to enabledExtensionNames is unnecessary and on some
@@ -236,13 +251,9 @@ pub fn createDevice(pd: vk.VkPhysicalDevice, opts: DeviceCreateOptions) DeviceEr
     };
     var ext_count: u32 = 0;
     if (opts.enable_8bit_storage) {
-        v12_feats.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
         v12_feats.storageBuffer8BitAccess = vk.VK_TRUE;
         v12_feats.uniformAndStorageBuffer8BitAccess = vk.VK_TRUE;
         v12_feats.shaderInt8 = vk.VK_TRUE;
-        // Chain v12 → v13.
-        v12_feats.pNext = @ptrCast(&v13_feats);
-        p_next = @ptrCast(&v12_feats);
         ext_count = 2;
     }
     const dev_ci: vk.VkDeviceCreateInfo = .{

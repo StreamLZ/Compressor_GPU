@@ -530,6 +530,17 @@ pub fn encodeL1Sync(
     return encodeL1Multi(ctx, src_host, encode_spv);
 }
 
+/// Optional knobs for `encodeL1MultiEx`. Phase 2 (TODO A2) adds the
+/// `src_buffer_override` slot — when non-null, the encoder skips its
+/// own HOST_VISIBLE src allocation + @memcpy and binds the caller's
+/// VkBuffer directly into the descriptor set's src slot. The caller
+/// is responsible for the buffer's contents being valid for the
+/// duration of the dispatch (typically: the caller filled it via
+/// staging copy or mapped memory before invoking the codec).
+pub const EncodeOptions = struct {
+    src_buffer_override: ?vk.VkBuffer = null,
+};
+
 /// Encode `src_host` through the Vulkan L1 encoder, slicing into
 /// `ceil(src_host.len / CHUNK_SIZE)` independent chunks. Dispatches a
 /// single workgroup-per-chunk kernel and reads per-chunk stream sizes
@@ -538,6 +549,15 @@ pub fn encodeL1Multi(
     ctx: *driver.Context,
     src_host: []const u8,
     encode_spv: []const u8,
+) L1Error!EncodeResult {
+    return encodeL1MultiEx(ctx, src_host, encode_spv, .{});
+}
+
+pub fn encodeL1MultiEx(
+    ctx: *driver.Context,
+    src_host: []const u8,
+    encode_spv: []const u8,
+    opts: EncodeOptions,
 ) L1Error!EncodeResult {
     const src_size: u32 = @intCast(src_host.len);
     const n_chunks = computeNChunks(src_size);
@@ -554,13 +574,23 @@ pub fn encodeL1Multi(
     const stream_cap_total: vk.VkDeviceSize = @as(vk.VkDeviceSize, n_chunks) * chunk_capacity;
 
     // ── Allocations ──────────────────────────────────────────────
-    var src_b = try createBuffer(
-        ctx,
-        @max(@as(vk.VkDeviceSize, 4), @as(vk.VkDeviceSize, src_size)),
-        vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        true,
-    );
-    errdefer destroyBuffer(ctx, &src_b);
+    // Phase 2 (TODO A2): when the caller registered a D2D source
+    // buffer via `slzRegisterBuffer_vk`, the encoder reuses it
+    // directly via `opts.src_buffer_override`. Skip the H2D copy
+    // (the bytes are already where the GPU needs them) and skip
+    // our own allocation. `src_b` stays zero-initialized so the
+    // teardown path is a no-op.
+    var src_b: Buffer = .{};
+    const use_src_override = opts.src_buffer_override != null;
+    if (!use_src_override) {
+        src_b = try createBuffer(
+            ctx,
+            @max(@as(vk.VkDeviceSize, 4), @as(vk.VkDeviceSize, src_size)),
+            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            true,
+        );
+    }
+    errdefer if (!use_src_override) destroyBuffer(ctx, &src_b);
 
     var lit_b = try createBuffer(ctx, stream_cap_total, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
     errdefer destroyBuffer(ctx, &lit_b);
@@ -602,7 +632,11 @@ pub fn encodeL1Multi(
     defer destroyBuffer(ctx, &chunks_b);
 
     // ── Upload src + chunk descriptors ───────────────────────────
-    if (src_size > 0) {
+    // Skip the H2D when the caller's src_buffer_override is in use —
+    // the bytes are already on device. `src_host.len` is still the
+    // logical input size (the codec uses it to compute chunk
+    // descriptors etc.).
+    if (src_size > 0 and !use_src_override) {
         const src_mapped = src_b.mapped orelse return error.MapMemoryFailed;
         @memcpy(src_mapped[0..src_size], src_host);
     }
@@ -650,8 +684,9 @@ pub fn encodeL1Multi(
         @sizeOf(EncodePush),
     );
 
+    const src_binding_buf: vk.VkBuffer = if (opts.src_buffer_override) |b| b else src_b.buf;
     const enc_bindings: [9]vk.VkDescriptorBufferInfo = .{
-        .{ .buffer = src_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        .{ .buffer = src_binding_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = lit_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = cmd_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = off16_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -729,7 +764,9 @@ pub fn encodeL1Multi(
         }
     }
 
-    // Drop the src buffer — encode is done.
+    // Drop the src buffer — encode is done. When src_buffer_override
+    // was in use, `src_b` is a zero-init Buffer and destroyBuffer is
+    // a no-op; the caller owns the override's lifetime.
     destroyBuffer(ctx, &src_b);
 
     streams.lit_buf = lit_b.buf;

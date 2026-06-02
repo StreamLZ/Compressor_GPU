@@ -256,6 +256,25 @@ fn buildStreamBundle(
     return bundle;
 }
 
+/// Optional knobs for the D2D paths added in Phase 2 (TODO A2).
+/// Both fields default to null — the L1 codec falls through to the
+/// existing HOST_VISIBLE allocate + memcpy path. When either is
+/// populated the codec uses the caller's VkBuffer for that endpoint
+/// directly (no internal allocation, no host bounce for THAT
+/// endpoint). The other endpoint still rides the host path.
+pub const Slz1Options = struct {
+    /// Encode-side: caller's VkBuffer holding `src` already on
+    /// device. The encoder binds this as the src SSBO instead of
+    /// staging the host bytes through its own buffer.
+    src_buffer_override: ?vk.VkBuffer = null,
+    /// Decode-side: caller's VkBuffer to receive decoded bytes
+    /// directly. The decoder uses this as the dst SSBO, skipping
+    /// the host-mapped staging buffer. When set, the `out` slice
+    /// passed to `decodeSlz1ToBytes` may be empty — the codec
+    /// only writes to the device buffer.
+    dst_buffer_override: ?vk.VkBuffer = null,
+};
+
 /// Vulkan-encode `src` into the L1 streams, wrap into SLZ1, write into `out`.
 /// Returns bytes written. Uses `driver.g_default` after ensureInit.
 ///
@@ -268,6 +287,17 @@ pub fn encodeL1ToSlz1(
     allocator: std.mem.Allocator,
     src: []const u8,
     out: []u8,
+) Slz1Error!usize {
+    return encodeL1ToSlz1Ex(ctx, io, allocator, src, out, .{});
+}
+
+pub fn encodeL1ToSlz1Ex(
+    ctx: *driver.Context,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    out: []u8,
+    opts: Slz1Options,
 ) Slz1Error!usize {
     _ = io;
     const tier = blk: {
@@ -282,7 +312,9 @@ pub fn encodeL1ToSlz1(
     const enc_spv = try dupAlignedSpv(allocator, enc_spv_raw);
     defer allocator.free(enc_spv);
 
-    var enc = try l1_codec.encodeL1Multi(ctx, src, enc_spv);
+    var enc = try l1_codec.encodeL1MultiEx(ctx, src, enc_spv, .{
+        .src_buffer_override = opts.src_buffer_override,
+    });
     defer l1_codec.freeStreams(ctx, &enc.streams);
 
     var bundle = try buildStreamBundle(allocator, ctx, enc.streams);
@@ -414,6 +446,17 @@ pub fn decodeSlz1ToBytes(
     slz_bytes: []const u8,
     out: []u8,
 ) Slz1Error!usize {
+    return decodeSlz1ToBytesEx(ctx, io, allocator, slz_bytes, out, .{});
+}
+
+pub fn decodeSlz1ToBytesEx(
+    ctx: *driver.Context,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    slz_bytes: []const u8,
+    out: []u8,
+    opts: Slz1Options,
+) Slz1Error!usize {
     _ = io;
     const tier = blk: {
         const pr = probe_mod.probe(ctx.inst, ctx.pd);
@@ -432,7 +475,11 @@ pub fn decodeSlz1ToBytes(
     defer wire_format.freeUnwrapStorage(allocator, &unwrap.storage);
 
     const dst_total: u32 = @intCast(unwrap.result.original_size);
-    if (out.len < dst_total) return error.OutputTooSmall;
+    // When dst_buffer_override is set, the `out` host slice may be
+    // empty — the codec writes only to the device buffer. The
+    // OutputTooSmall guard still fires for host-output paths.
+    const use_dst_override = opts.dst_buffer_override != null;
+    if (!use_dst_override and out.len < dst_total) return error.OutputTooSmall;
 
     const chunk_capacity = l1_codec.CHUNK_STREAM_CAPACITY;
     const n_chunks = unwrap.result.n_chunks;
@@ -481,9 +528,17 @@ pub fn decodeSlz1ToBytes(
         @as(vk.VkDeviceSize, 4),
         (@as(vk.VkDeviceSize, dst_total) + 3) & ~@as(vk.VkDeviceSize, 3),
     );
-    var dst_b = try createMappedBuffer(ctx, dst_buf_size);
-    defer destroyMappedBuffer(ctx, &dst_b);
-    @memset(dst_b.mapped[0..@intCast(dst_b.size)], 0);
+    // When dst_buffer_override is in use, the decoder writes
+    // directly into the caller's VkBuffer. Skip the internal
+    // allocation; `dst_b` stays zero-init and destroyMappedBuffer
+    // is a no-op on a null handle. The bound dst binding below
+    // is the override.
+    var dst_b: MappedBuffer = .{ .buf = null, .mem = null, .mapped = undefined, .size = 0 };
+    if (!use_dst_override) {
+        dst_b = try createMappedBuffer(ctx, dst_buf_size);
+        @memset(dst_b.mapped[0..@intCast(dst_b.size)], 0);
+    }
+    defer if (!use_dst_override) destroyMappedBuffer(ctx, &dst_b);
 
     var chunks_b = try createMappedBuffer(ctx, @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * 16);
     defer destroyMappedBuffer(ctx, &chunks_b);
@@ -531,12 +586,13 @@ pub fn decodeSlz1ToBytes(
         @sizeOf(DecodePush),
     );
 
+    const dst_bind_buf: vk.VkBuffer = if (opts.dst_buffer_override) |b| b else dst_b.buf;
     const dec_bindings: [7]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = cmd_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = lit_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = off16_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = length_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-        .{ .buffer = dst_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        .{ .buffer = dst_bind_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = chunks_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = off32_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
     };
@@ -555,6 +611,11 @@ pub fn decodeSlz1ToBytes(
         .{ n_chunks, 1, 1 },
     );
 
-    @memcpy(out[0..dst_total], dst_b.mapped[0..dst_total]);
+    // Host readback only when the host buffer was actually the
+    // dst — D2D callers skip it entirely (the bytes are already
+    // in their device buffer).
+    if (!use_dst_override) {
+        @memcpy(out[0..dst_total], dst_b.mapped[0..dst_total]);
+    }
     return dst_total;
 }

@@ -148,6 +148,15 @@ fn ensureFnSlots(dev: vk.VkDevice) DispatchError!void {
 /// Lazy-create the chassis state on `ctx` if not already present. Safe
 /// to call repeatedly — second+ calls short-circuit on the already-
 /// populated cmd_pool field.
+///
+/// `ensureChassisPub` exposes this to peer modules (the streamlz_gpu_vk
+/// D2D staging path uses it to prep the cmd_buf + fence + queue
+/// pointers before recording its own one-shot copies, without needing
+/// to bounce through a full submitOne dispatch).
+pub fn ensureChassisPub(ctx: *driver_mod.Context) DispatchError!void {
+    return ensureChassis(ctx);
+}
+
 fn ensureChassis(ctx: *driver_mod.Context) DispatchError!void {
     if (ctx.cmd_pool != null) return;
     try ensureFnSlots(ctx.dev);
