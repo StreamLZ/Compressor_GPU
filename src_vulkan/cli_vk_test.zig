@@ -118,6 +118,18 @@ fn runOne(
     return true;
 }
 
+/// Probe whether the CUDA-side streamlz.exe binary is present on disk
+/// AND runnable. The interop pair (VK_TO_CUDA + CUDA_TO_VK) is the
+/// load-bearing half of this test — VK_SELF (VK encode → VK decode)
+/// can pass with symmetric corruption because both halves share the
+/// same buggy state — so we need to know up-front whether the CUDA
+/// binary is available, and refuse to pass the test if it isn't.
+fn cudaInteropAvailable(io: std.Io) bool {
+    var file = std.Io.Dir.cwd().openFile(io, STREAMLZ_EXE, .{}) catch return false;
+    file.close(io);
+    return true;
+}
+
 pub fn main(process_init: std.process.Init) !void {
     const io = process_init.io;
     const allocator = std.heap.c_allocator;
@@ -136,6 +148,22 @@ pub fn main(process_init: std.process.Init) !void {
     try w.print("CLI smoke — corpus={s} bytes={d}\n", .{ CORPUS_PATH, src.len });
     try w.flush();
 
+    // Cluster F (F040): VK_SELF (VK encode → VK decode) can pass with
+    // symmetric corruption — if both halves of the codec are broken the
+    // same way, the byte-equal round-trip still holds. The interop pair
+    // (VK_TO_CUDA + CUDA_TO_VK) is the only load-bearing direction in
+    // this test. We refuse to declare PASS if the pair didn't run.
+    const interop_up = cudaInteropAvailable(io);
+    if (interop_up) {
+        try w.print("CLI cuda_interop=available exe={s}\n", .{STREAMLZ_EXE});
+    } else {
+        try w.print(
+            "CLI cuda_interop=UNAVAILABLE exe={s} (VK_SELF alone is INSUFFICIENT)\n",
+            .{STREAMLZ_EXE},
+        );
+    }
+    try w.flush();
+
     // Paths.
     const vk_self_slz = TMP_DIR ++ "/vk_self.slz";
     const vk_self_out = TMP_DIR ++ "/vk_self.out";
@@ -145,36 +173,68 @@ pub fn main(process_init: std.process.Init) !void {
     const cuda_to_vk_out = TMP_DIR ++ "/cuda_to_vk.out";
 
     var any_fail = false;
+    var vk_self_ok = false;
+    var vk_to_cuda_ok = false;
+    var cuda_to_vk_ok = false;
 
     // ── 1. VK_SELF: vk_encode + vk_decode. ───────────────────────────
     {
         const enc_argv = [_][]const u8{ STREAMLZ_VK_EXE, "-c", CORPUS_PATH, "-o", vk_self_slz };
         const dec_argv = [_][]const u8{ STREAMLZ_VK_EXE, "-d", vk_self_slz, "-o", vk_self_out };
-        const ok = try runOne(w, io, allocator, "CLI_VK_SELF", src, &enc_argv, &dec_argv, vk_self_out);
-        if (!ok) any_fail = true;
+        vk_self_ok = try runOne(w, io, allocator, "CLI_VK_SELF", src, &enc_argv, &dec_argv, vk_self_out);
+        if (!vk_self_ok) any_fail = true;
         try w.flush();
     }
 
     // ── 2. VK_TO_CUDA: vk_encode + cuda_decode. ──────────────────────
-    {
+    if (interop_up) {
         const enc_argv = [_][]const u8{ STREAMLZ_VK_EXE, "-c", CORPUS_PATH, "-o", vk_to_cuda_slz };
         const dec_argv = [_][]const u8{ STREAMLZ_EXE, "-d", vk_to_cuda_slz, "-o", vk_to_cuda_out };
-        const ok = try runOne(w, io, allocator, "CLI_VK_TO_CUDA", src, &enc_argv, &dec_argv, vk_to_cuda_out);
-        if (!ok) any_fail = true;
-        try w.flush();
+        vk_to_cuda_ok = try runOne(w, io, allocator, "CLI_VK_TO_CUDA", src, &enc_argv, &dec_argv, vk_to_cuda_out);
+        if (!vk_to_cuda_ok) any_fail = true;
+    } else {
+        try w.writeAll("CLI_VK_TO_CUDA SKIP cuda_interop_unavailable\n");
     }
+    try w.flush();
 
     // ── 3. CUDA_TO_VK: cuda_encode -l 1 + vk_decode. ────────────────
-    {
+    if (interop_up) {
         const enc_argv = [_][]const u8{ STREAMLZ_EXE, "-c", "-l", "1", CORPUS_PATH, "-o", cuda_to_vk_slz };
         const dec_argv = [_][]const u8{ STREAMLZ_VK_EXE, "-d", cuda_to_vk_slz, "-o", cuda_to_vk_out };
-        const ok = try runOne(w, io, allocator, "CLI_CUDA_TO_VK", src, &enc_argv, &dec_argv, cuda_to_vk_out);
-        if (!ok) any_fail = true;
-        try w.flush();
+        cuda_to_vk_ok = try runOne(w, io, allocator, "CLI_CUDA_TO_VK", src, &enc_argv, &dec_argv, cuda_to_vk_out);
+        if (!cuda_to_vk_ok) any_fail = true;
+    } else {
+        try w.writeAll("CLI_CUDA_TO_VK SKIP cuda_interop_unavailable\n");
+    }
+    try w.flush();
+
+    // Verdict logic (F040 — VK_SELF cannot be the sole gate):
+    //   * interop_up + any_fail  -> FAIL (a real regression).
+    //   * interop_up + all pass  -> PASS.
+    //   * !interop_up + VK_SELF pass -> INSUFFICIENT (exits non-zero
+    //     so a CI run on a CUDA-less box doesn't ship a green light
+    //     for a VK codec that might be symmetrically broken).
+    //   * !interop_up + VK_SELF fail -> FAIL (still a real regression).
+    if (!interop_up) {
+        if (!vk_self_ok) {
+            try w.writeAll("CLI_OVERALL FAIL (VK_SELF mismatch on CUDA-less box)\n");
+            return error.OneOrMoreFailed;
+        }
+        try w.writeAll(
+            "CLI_OVERALL INSUFFICIENT — VK_SELF passed but interop pair (VK_TO_CUDA + CUDA_TO_VK) did not run; pass requires CUDA-side streamlz.exe present\n",
+        );
+        return error.InteropPairUnavailable;
     }
 
     if (any_fail) {
         try w.writeAll("CLI_OVERALL FAIL\n");
+        return error.OneOrMoreFailed;
+    }
+    // Belt: even with interop_up + any_fail clean, refuse to declare
+    // PASS unless the interop pair both ran AND passed. This is the
+    // F040 invariant — VK_SELF is never the sole gate.
+    if (!(vk_to_cuda_ok and cuda_to_vk_ok)) {
+        try w.writeAll("CLI_OVERALL FAIL — interop pair did not pass\n");
         return error.OneOrMoreFailed;
     }
     try w.writeAll("CLI_OVERALL PASS\n");
