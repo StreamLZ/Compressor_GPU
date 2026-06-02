@@ -115,6 +115,54 @@ pub const CHUNK_STREAM_CAPACITY: u32 = (CHUNK_SIZE * 2) + 16;
 /// far-offset matches.
 pub const CHUNK_OFF32_CAPACITY: u32 = (CHUNK_SIZE * 2) + 16;
 
+comptime {
+    // TODO N2 caveat #1: `storeOff32Byte` in `shaders/lz_encode.comp`
+    // computes its global byte offset as
+    //   gpos = (g_dst_word_base << 2) + pos
+    // where `g_dst_word_base` is set to `chunk_id * (chunk_capacity >> 2)`
+    // — i.e. it uses CHUNK_STREAM_CAPACITY (the cmd/lit/length stride)
+    // as the off32 stride too. That's correct today because the two
+    // capacities are identical, but the shader has no other guard
+    // against them diverging. Pin them equal here so any future bump
+    // of one without the other fails to compile.
+    if (CHUNK_OFF32_CAPACITY != CHUNK_STREAM_CAPACITY) @compileError(
+        "CHUNK_OFF32_CAPACITY must equal CHUNK_STREAM_CAPACITY — see " ++
+            "storeOff32Byte in shaders/lz_encode.comp (g_dst_word_base " ++
+            "is derived from chunk_capacity and shared between off32 + " ++
+            "the other streams). Update the shader if you bump only one.",
+    );
+}
+
+/// Internal: matches the GLSL constants in `shaders/lz_encode.comp`.
+/// Used by the caveat-#2 assertion below.
+const LZ_BLOCK_SIZE_HOST: u32 = 0x10000; // 64 KiB — see lz_encode.comp
+const LARGE_OFFSET_THRESHOLD: u32 = 0xC00000; // ditto
+
+comptime {
+    // TODO N2 caveat #2: the encoder's off32 emission path in
+    // `shaders/lz_encode.comp::emitMatchLong` emits the simple
+    // 3-byte (`storeOff32LE24`) form unconditionally. CUDA's
+    // reference `writeOffset32` has a large-tag branch for
+    // `adjusted >= LARGE_OFFSET_THRESHOLD (0xC00000)` — we omit it
+    // because at default chunk sizes the worst-case
+    //   adjusted = effective_offset + block2_start - match_pos
+    // is bounded by `CHUNK_SIZE + LZ_BLOCK_SIZE` (max-near match
+    // plus block-1 start, with match_pos = 0). Today that ceiling
+    // is `0x10000 + 0x10000 = 0x20000`, dwarfed by the threshold.
+    //
+    // Pin the relationship: if either side ever crosses the
+    // threshold the encoder needs the large-tag branch back and a
+    // matching decoder change. The assertion below fails loudly so
+    // the bump doesn't silently corrupt the wire format.
+    if (CHUNK_SIZE + LZ_BLOCK_SIZE_HOST >= LARGE_OFFSET_THRESHOLD) @compileError(
+        "CHUNK_SIZE + LZ_BLOCK_SIZE has grown into LARGE_OFFSET_THRESHOLD " ++
+            "(0xC00000). shaders/lz_encode.comp's `emitMatchLong` emits the " ++
+            "simple 3-byte off32 form unconditionally — restore CUDA's large- " ++
+            "tag branch (writeOffset32 in src/encode/lz_kernel.cu) before " ++
+            "this assertion fires or the wire format will corrupt silently.",
+    );
+}
+
 /// Encoder push constants (12 bytes — see lz_encode.comp).
 const EncodePush = extern struct {
     n_chunks: u32,

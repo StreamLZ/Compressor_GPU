@@ -266,11 +266,17 @@ void storeOff32Byte(uint pos, uint b) {
     off32_buf.w[widx] = (off32_buf.w[widx] & ~mask) | ((b & 0xFFu) << sh);
 }
 
-// 24-bit LE store at byte `pos` (3 bytes). 128 KiB chunks mean
-// `effective_offset + block2_start - match_pos` never exceeds 0x40000
-// at L1, comfortably under LARGE_OFFSET_THRESHOLD (0xC00000), so the
-// CUDA writeOffset32 large-tag branch is dead and we emit the simple
-// 3-byte form only.
+// 24-bit LE store at byte `pos` (3 bytes). The CUDA reference
+// `writeOffset32` has a large-tag branch for `adjusted >=
+// LARGE_OFFSET_THRESHOLD (0xC00000)`; we omit it because at default
+// L1 chunk sizes the worst-case
+//   adjusted = effective_offset + block2_start - match_pos
+// is bounded by CHUNK_SIZE + LZ_BLOCK_SIZE ≤ 0x20000 — comfortably
+// under the threshold. Host-side comptime assertion in
+// `src_vulkan/l1_codec.zig` (TODO N2 caveat #2) pins the
+// relationship; bumping CHUNK_SIZE or LZ_BLOCK_SIZE will trip that
+// assertion and force the large-tag branch back here before the
+// wire format silently corrupts.
 void storeOff32LE24(uint pos, uint v) {
     storeOff32Byte(pos,      v & 0xFFu);
     storeOff32Byte(pos + 1u, (v >> 8) & 0xFFu);

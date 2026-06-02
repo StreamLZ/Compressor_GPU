@@ -500,6 +500,20 @@ fn decodeUnwrappedVkOnly(
     };
     const chunk_capacity = l1_codec.CHUNK_STREAM_CAPACITY;
     const n_chunks = unwrap.result.n_chunks;
+    // TODO N2 caveat #3: this helper sizes per-chunk stream slots
+    // using `l1_codec.CHUNK_STREAM_CAPACITY` (= `(VK CHUNK_SIZE *
+    // 2) + 16`), which is the worst-case stream length for the
+    // Vulkan codec's native chunk size. If the unwrapped frame
+    // carries a chunk_size LARGER than the Vulkan codec's CHUNK_SIZE
+    // (e.g. a future CUDA encoder bumping its sub-chunk default),
+    // the per-chunk slot will be too small and the chunk-0 stream
+    // bytes will spill into chunk-1's slot. Today every CUDA
+    // encoder we test against produces chunk_size ≤ Vulkan's
+    // CHUNK_SIZE (64 KiB at sc_group_size = 0.25), so the slot
+    // sizing is conservative. Pin the relationship here so a future
+    // CUDA encoder bump fails loudly rather than silently
+    // corrupting the test's decode bytes.
+    std.debug.assert(unwrap.result.chunk_size <= l1_codec.CHUNK_SIZE);
     const stream_cap_total: vk.VkDeviceSize = @as(vk.VkDeviceSize, n_chunks) * chunk_capacity;
 
     // Create host-visible stream buffers and fill the per-chunk slots.
