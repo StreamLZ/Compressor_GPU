@@ -920,19 +920,16 @@ fn mapDecodeError(err: slz1_codec.Slz1Error) c_int {
         error.OutOfMemory => SLZ_ERROR_OUT_OF_MEMORY,
         error.UnsupportedTier => SLZ_ERROR_VK_FEATURE_MISSING,
         error.NoSpvForTier => SLZ_ERROR_VK_FEATURE_MISSING,
-        error.BadMagic,
-        error.UnsupportedVersion,
-        error.BadCodec,
-        error.BadBlockSize,
-        error.BadScGroupSize,
-        error.BadInternalHeader,
-        error.BadChunkHeader,
-        error.BadSubChunkHeader,
-        error.MissingContentSize,
-        error.Truncated,
-        error.TooManyChunks,
-        error.BadFrame,
-        => SLZ_ERROR_CORRUPT_FRAME,
+        // Cluster B (F004) collapsed the decoder's CPU-unwrap error
+        // set into the two device-side failures the GPU pipeline can
+        // surface: a frame the GPU couldn't parse (`BadFrame`) and
+        // chunk-count overflow (`TooManyChunks`). The fine-grained
+        // BadMagic / UnsupportedVersion / BadCodec / etc. used to come
+        // from `wire_format.UnwrapError`, which is no longer reachable
+        // from the production decode path (the CPU unwrap was deleted
+        // in commit `146c5a6`; the toggle that fell back to it was
+        // deleted in Cluster B's F004 commit).
+        error.BadFrame, error.TooManyChunks => SLZ_ERROR_CORRUPT_FRAME,
         else => SLZ_ERROR_UNSUPPORTED,
     };
 }
