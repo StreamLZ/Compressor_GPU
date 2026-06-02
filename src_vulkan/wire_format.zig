@@ -297,18 +297,30 @@ pub fn wrapBound(streams: PerChunkStreams) usize {
     var ci: usize = 0;
     while (ci < streams.n_chunks) : (ci += 1) {
         const init_copy: usize = chunkInitialCopy(streams, @intCast(ci));
-        total += CHUNK_INTERNAL_HDR_BYTES; // 2-byte internal + 4-byte chunk
-        total += SUBCHUNK_HDR_BYTES;        // 3-byte sub-chunk header
-        total += init_copy;                 // 8 verbatim source bytes (chunk 0 only)
+        // Each chunk takes the larger of the LZ-compressed bound and
+        // the uncompressed-fallback bound (used when the LZ payload would
+        // exceed the chunk's decompressed size — see wrapL1ToSlz1).
+        // LZ bound (matches the LZ-path emission below).
+        var lz: usize = CHUNK_INTERNAL_HDR_BYTES; // 2-byte internal + 4-byte chunk
+        lz += SUBCHUNK_HDR_BYTES;
+        lz += init_copy;
         const advertised_lit_len: usize = streams.lit_bytes[ci].len - init_copy;
-        total += 3 + advertised_lit_len;                   // type-0 lit
-        total += 3 + streams.cmd_bytes[ci].len;            // type-0 cmd
-        total += 2;                                         // cmd_stream2_offset
-        total += 2 + streams.off16_bytes[ci].len;           // raw off16
-        total += 3 + 4;                                     // off32 packed counts + 2× u16 ext (worst case)
+        lz += 3 + advertised_lit_len;                   // type-0 lit
+        lz += 3 + streams.cmd_bytes[ci].len;            // type-0 cmd
+        lz += 2;                                         // cmd_stream2_offset
+        lz += 2 + streams.off16_bytes[ci].len;           // raw off16
+        lz += 3 + 4;                                     // off32 packed counts + 2× u16 ext (worst case)
         const off32_bytes: usize = if (streams.off32_bytes) |arr| arr[ci].len else 0;
-        total += off32_bytes;
-        total += streams.length_bytes[ci].len;              // length stream
+        lz += off32_bytes;
+        lz += streams.length_bytes[ci].len;              // length stream
+        // Uncompressed-fallback bound: 2-byte internal hdr + chunk_size raw bytes.
+        const chunk_dst_off: u64 = @as(u64, ci) * streams.chunk_size;
+        const decomp: usize = if (streams.original_size > chunk_dst_off)
+            @min(@as(usize, @intCast(streams.original_size - chunk_dst_off)), streams.chunk_size)
+        else
+            0;
+        const uncomp: usize = 2 + decomp;
+        total += if (lz > uncomp) lz else uncomp;
     }
     if (streams.n_chunks > 1) {
         total += @as(usize, streams.n_chunks - 1) * SC_TAIL_PER_CHUNK_BYTES;
@@ -382,19 +394,8 @@ pub fn wrapL1ToSlz1(
 
         const init_copy: u32 = @intCast(chunkInitialCopy(streams, ci));
 
-        // 3a. 2-byte internal block header.
-        //   byte 0 = magic(0x05) | self_contained(0x10) | restart_decoder(0x40)
-        //   byte 1 = decoder_type = Fast (1).
-        // Every chunk is LZ-compressed — the encoder produces native
-        // sub-chunks with the 8-byte initial copy baked into chunk 0.
-        const internal_hdr0: u8 = 0x05 | 0x10 | 0x40;
-        const internal_hdr1: u8 = @intFromEnum(block_header.CodecType.fast);
-        out[pos + 0] = internal_hdr0;
-        out[pos + 1] = internal_hdr1;
-        pos += 2;
-
-        // 3b. 4-byte LE chunk header (compressed_size - 1 in low 18 bits).
-        //   compressed_size = 3-byte sub-chunk header + sub-chunk payload bytes.
+        // Pre-compute the LZ sub-chunk payload size so we can decide
+        // between LZ-compressed and raw emission for this chunk.
         const advertised_lit_len: usize = streams.lit_bytes[ci].len - init_copy;
         const off32_count1_ci: u32 = if (streams.per_chunk_off32_count1) |a| a[ci] else 0;
         const off32_count2_ci: u32 = if (streams.per_chunk_off32_count2) |a| a[ci] else 0;
@@ -416,7 +417,55 @@ pub fn wrapL1ToSlz1(
             off32_bytes_ci,
             off32_ext_bytes,
         );
-        const chunk_compressed_size: u32 = SUBCHUNK_HDR_BYTES + sub_payload_size;
+
+        // ── Emit-as-uncompressed path ───────────────────────────────
+        // CUDA's per-warp decoder picks the raw-copy fast path whenever
+        // the sub-chunk's compressed size is >= the decompressed size
+        // (`if (sc_comp_size < sc_size)` → LZ; else raw, in
+        // lz_decode_kernels.cuh::slzLzDecodeRawKernel). If the encoder
+        // produced an LZ payload that doesn't actually compress (which
+        // happens on high-entropy chunks — silesia x-ray data is the
+        // canonical case), the LZ-path bytes get reinterpreted as raw
+        // source bytes and the decoded chunk is garbage. The fix mirrors
+        // what the CUDA encoder does for the same chunk: emit it as a
+        // whole-chunk uncompressed block. The internal block header has
+        // bit 7 (uncompressed) set, no 4-byte chunk header follows, and
+        // the 2-byte hdr is immediately followed by `chunk_decomp_size`
+        // raw source bytes. The chunk's per-stream buffers (lit / cmd /
+        // ...) are dropped — they're now unused.
+        const lz_payload_size: u32 = SUBCHUNK_HDR_BYTES + sub_payload_size;
+        const emit_uncompressed = sub_payload_size >= chunk_decomp_size and
+            src_opt != null and
+            chunk_dst_off + chunk_decomp_size <= src_opt.?.len;
+        if (emit_uncompressed) {
+            // 2-byte internal block header with uncompressed flag set.
+            const u_hdr0: u8 = 0x05 | 0x10 | 0x40 | 0x80;
+            const u_hdr1: u8 = @intFromEnum(block_header.CodecType.fast);
+            out[pos + 0] = u_hdr0;
+            out[pos + 1] = u_hdr1;
+            pos += 2;
+            // Raw chunk_decomp_size source bytes.
+            const src = src_opt.?;
+            @memcpy(
+                out[pos..][0..chunk_decomp_size],
+                src[@intCast(chunk_dst_off)..][0..chunk_decomp_size],
+            );
+            pos += chunk_decomp_size;
+            continue;
+        }
+
+        // 3a. 2-byte internal block header.
+        //   byte 0 = magic(0x05) | self_contained(0x10) | restart_decoder(0x40)
+        //   byte 1 = decoder_type = Fast (1).
+        const internal_hdr0: u8 = 0x05 | 0x10 | 0x40;
+        const internal_hdr1: u8 = @intFromEnum(block_header.CodecType.fast);
+        out[pos + 0] = internal_hdr0;
+        out[pos + 1] = internal_hdr1;
+        pos += 2;
+
+        // 3b. 4-byte LE chunk header (compressed_size - 1 in low 18 bits).
+        //   compressed_size = 3-byte sub-chunk header + sub-chunk payload bytes.
+        const chunk_compressed_size: u32 = lz_payload_size;
         std.mem.writeInt(u32, out[pos..][0..4], chunk_compressed_size - 1, .little);
         pos += 4;
 
