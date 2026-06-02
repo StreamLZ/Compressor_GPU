@@ -31,6 +31,29 @@ const vk = @import("vk_api.zig");
 const driver_mod = @import("driver.zig");
 const probe_mod = @import("probe.zig");
 
+// QueryPerformanceCounter bracketing for `submit_wait_wall_ns`. Used by
+// the readback-cost diagnostic to attribute the host-wall time around
+// vkQueueSubmit + vkWaitForFences vs. host-side recording / fence read.
+const win32 = struct {
+    extern "kernel32" fn QueryPerformanceCounter(count: *i64) callconv(.c) c_int;
+    extern "kernel32" fn QueryPerformanceFrequency(freq: *i64) callconv(.c) c_int;
+};
+
+inline fn qpcNow() i64 {
+    var c: i64 = 0;
+    _ = win32.QueryPerformanceCounter(&c);
+    return c;
+}
+
+inline fn qpcDeltaNs(from: i64, to: i64) u64 {
+    var freq: i64 = 0;
+    _ = win32.QueryPerformanceFrequency(&freq);
+    if (freq <= 0) freq = 1;
+    const delta = if (to > from) to - from else 0;
+    const ns = @divTrunc(@as(i128, delta) * 1_000_000_000, @as(i128, freq));
+    return @intCast(ns);
+}
+
 pub const DispatchError = error{
     LoaderNotReady,
     CommandPoolCreateFailed,
@@ -56,14 +79,33 @@ pub const DispatchResult = struct {
     /// the pair anyway so the cmdbuf shape stays uniform, but the delta
     /// will be garbage; M8c surfaces a hard error via the probe instead).
     ns: u64,
+    /// GPU-side duration of the in-cmdbuf vkCmdCopyBuffer (set only by
+    /// `submitOneWithCopy`; zero for plain `submitOne`). Measured with
+    /// a second TOP_OF_PIPE/BOTTOM_OF_PIPE timestamp pair written either
+    /// side of cmd_copy. Used by the readback-cost diagnostic in
+    /// slz1_codec to separate the GPU dst_b → dst_stage transfer from
+    /// the host @memcpy(out, dst_stage.mapped).
+    copy_ns: u64 = 0,
+    /// Host-wall duration measured around `vkQueueSubmit` ... `vkWaitForFences`.
+    /// Includes the GPU's actual work (kernel + barrier + copy on
+    /// submitOneWithCopy) plus any host scheduling / fence-poll cost.
+    /// On a single-queue path with a wait-fence right after submit this
+    /// is dominated by GPU work time. Diagnostic-only — not used for
+    /// any control flow.
+    submit_wait_wall_ns: u64 = 0,
 };
 
-/// Slot indices within the 2-slot timestamp pool. Encoded as constants so
-/// the M8c bump to 68 slots is a single-file change here — production
-/// indexing (per arch §15) becomes `2 * kernel_idx + slot + 34 * buffer`.
+/// Slot indices within the 4-slot timestamp pool. Two slots (BEGIN/END)
+/// bracket the dispatch; two more (COPY_BEGIN/COPY_END) bracket the
+/// vkCmdCopyBuffer in `submitOneWithCopy`. Plain `submitOne` writes only
+/// the first pair; `submitOneWithCopy` writes all four. M8c will bump
+/// this further (68 slots per arch §15) so the per-kernel-fixture
+/// indexing constants live in one place here.
 const TS_SLOT_BEGIN: u32 = 0;
 const TS_SLOT_END: u32 = 1;
-const TS_SLOT_COUNT: u32 = 2;
+const TS_SLOT_COPY_BEGIN: u32 = 2;
+const TS_SLOT_COPY_END: u32 = 3;
+const TS_SLOT_COUNT: u32 = 4;
 
 /// Resolve a device-level entry point; prefer vkGetDeviceProcAddr (one
 /// fewer dispatch hop) but fall back to the instance-level thunk via
@@ -402,6 +444,7 @@ pub fn submitOne(
         .pCommandBuffers = @ptrCast(&cmd_bufs),
     };
     const submits: [1]vk.VkSubmitInfo = .{submit_info};
+    const t_submit_begin = qpcNow();
     if (submit(ctx.queue, 1, @ptrCast(&submits), ctx.fence) != vk.VK_SUCCESS) {
         return error.SubmitFailed;
     }
@@ -412,19 +455,21 @@ pub fn submitOne(
     // 60 s still surfaces a typed timeout fast enough that a genuinely
     // hung GPU does not deadlock the test process.
     const wait_result = wait_fence(ctx.dev, 1, @ptrCast(&fences), vk.VK_TRUE, vk.VK_M8A_FENCE_WAIT_NS);
+    const submit_wait_ns = qpcDeltaNs(t_submit_begin, qpcNow());
     if (wait_result == vk.VK_TIMEOUT) return error.FenceWaitTimeout;
     if (wait_result != vk.VK_SUCCESS) return error.FenceWaitFailed;
 
-    // Pull both timestamps in one call. 64-bit slots, WAIT_BIT for
-    // belt-and-suspenders (the fence guarantee already makes results
-    // available; WAIT_BIT just means the driver won't return VK_NOT_READY
-    // if it ever did otherwise).
-    var ts: [TS_SLOT_COUNT]u64 = .{ 0, 0 };
+    // Pull only the BEGIN/END timestamps; plain `submitOne` doesn't
+    // write the COPY_BEGIN/COPY_END pair so reading them back with
+    // VK_QUERY_RESULT_WAIT_BIT would hang (waits for availability of
+    // queries that were never recorded). The wider read happens only
+    // in `submitOneWithCopy`, which writes all four slots.
+    var ts: [2]u64 = .{ 0, 0 };
     const result = get_results(
         ctx.dev,
         ctx.query_pool,
         0,
-        TS_SLOT_COUNT,
+        2,
         @sizeOf(@TypeOf(ts)),
         @ptrCast(&ts),
         @sizeOf(u64),
@@ -445,7 +490,7 @@ pub fn submitOne(
     const ns_f: f64 = @as(f64, @floatFromInt(delta_ticks)) * @as(f64, period);
     const ns: u64 = if (ns_f <= 0.0) 0 else @intFromFloat(ns_f);
 
-    return .{ .ns = ns };
+    return .{ .ns = ns, .copy_ns = 0, .submit_wait_wall_ns = submit_wait_ns };
 }
 
 /// One follow-on buffer copy queued after the dispatch in the SAME
@@ -545,8 +590,9 @@ pub fn submitOneWithCopy(
     cmd_dispatch(ctx.cmd_buf, group_count[0], group_count[1], group_count[2]);
 
     // BOTTOM_OF_PIPE timestamp captures pure kernel time — the copy
-    // below stays OUTSIDE the timing window. Kernel ns + copy wall ns
-    // are reported as two distinct numbers in the bench.
+    // below is bracketed by its own COPY_BEGIN/COPY_END timestamp pair
+    // so the host can attribute kernel ns vs vkCmdCopyBuffer GPU ns
+    // independently.
     cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, TS_SLOT_END);
 
     // Buffer barrier: SHADER_WRITE in the compute stage must complete
@@ -577,6 +623,14 @@ pub fn submitOneWithCopy(
         null,
     );
 
+    // TOP_OF_PIPE timestamp pre-copy (after the barrier so the timer
+    // starts at the moment the transfer stage actually picks the work
+    // up). The copy is a single vkCmdCopyBuffer of `copy.size` bytes
+    // from a DEVICE_LOCAL buffer to a HOST_VISIBLE (host_visible_sysmem
+    // mode in l1_codec.createBufferEx) buffer; on a discrete GPU this
+    // is GPU-PCIe-WRITE bandwidth-bound (~10 GB/s on a 4060 Ti slot).
+    cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, TS_SLOT_COPY_BEGIN);
+
     const region: vk.VkBufferCopy = .{
         .srcOffset = copy.src_offset,
         .dstOffset = copy.dst_offset,
@@ -584,6 +638,8 @@ pub fn submitOneWithCopy(
     };
     const regions: [1]vk.VkBufferCopy = .{region};
     cmd_copy(ctx.cmd_buf, copy.src, copy.dst, 1, @ptrCast(&regions));
+
+    cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, TS_SLOT_COPY_END);
 
     if (end_cb(ctx.cmd_buf) != vk.VK_SUCCESS) return error.EndCommandBufferFailed;
 
@@ -598,15 +654,17 @@ pub fn submitOneWithCopy(
         .pCommandBuffers = @ptrCast(&cmd_bufs),
     };
     const submits: [1]vk.VkSubmitInfo = .{submit_info};
+    const t_submit_begin = qpcNow();
     if (submit(ctx.queue, 1, @ptrCast(&submits), ctx.fence) != vk.VK_SUCCESS) {
         return error.SubmitFailed;
     }
 
     const wait_result = wait_fence(ctx.dev, 1, @ptrCast(&fences), vk.VK_TRUE, vk.VK_M8A_FENCE_WAIT_NS);
+    const submit_wait_ns = qpcDeltaNs(t_submit_begin, qpcNow());
     if (wait_result == vk.VK_TIMEOUT) return error.FenceWaitTimeout;
     if (wait_result != vk.VK_SUCCESS) return error.FenceWaitFailed;
 
-    var ts: [TS_SLOT_COUNT]u64 = .{ 0, 0 };
+    var ts: [TS_SLOT_COUNT]u64 = .{ 0, 0, 0, 0 };
     const result = get_results(
         ctx.dev,
         ctx.query_pool,
@@ -627,5 +685,12 @@ pub fn submitOneWithCopy(
     const ns_f: f64 = @as(f64, @floatFromInt(delta_ticks)) * @as(f64, period);
     const ns: u64 = if (ns_f <= 0.0) 0 else @intFromFloat(ns_f);
 
-    return .{ .ns = ns };
+    const copy_ticks: u64 = if (ts[TS_SLOT_COPY_END] >= ts[TS_SLOT_COPY_BEGIN])
+        ts[TS_SLOT_COPY_END] - ts[TS_SLOT_COPY_BEGIN]
+    else
+        0;
+    const copy_ns_f: f64 = @as(f64, @floatFromInt(copy_ticks)) * @as(f64, period);
+    const copy_ns: u64 = if (copy_ns_f <= 0.0) 0 else @intFromFloat(copy_ns_f);
+
+    return .{ .ns = ns, .copy_ns = copy_ns, .submit_wait_wall_ns = submit_wait_ns };
 }

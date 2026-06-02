@@ -220,6 +220,55 @@ pub var last_decode_slz_descset_ns: u64 = 0;
 pub var last_decode_slz_dispatch_ns: u64 = 0;
 pub var last_decode_slz_readback_ns: u64 = 0;
 
+// Sub-phase breakdown for the dispatch_ns and readback_ns globals
+// above. Populated from `dispatch.DispatchResult` (kernel + GPU copy
+// GPU-side timestamps, host-wall around submit+fence-wait) on every
+// decode invocation; all in nanoseconds. cli_vk.zig prints them when
+// SLZ_VK_PROFILE_DECODE=1.
+//
+//   gpu_kernel_ns       = TS_SLOT_END - TS_SLOT_BEGIN (lz_decode kernel)
+//   gpu_copy_ns         = TS_SLOT_COPY_END - TS_SLOT_COPY_BEGIN
+//                         (the vkCmdCopyBuffer dst_b → dst_stage)
+//   submit_wait_wall_ns = QPC host-wall around vkQueueSubmit through
+//                         vkWaitForFences (kernel + GPU copy + driver
+//                         scheduling overhead from the host's POV)
+//
+// readback_ns above is purely the host @memcpy(out, dst_stage.mapped)
+// because submitOneWithCopy waits on the fence INSIDE before returning,
+// so all GPU-side work is done before the t_readback_begin QPC sample.
+pub var last_decode_slz_gpu_kernel_ns: u64 = 0;
+pub var last_decode_slz_gpu_copy_ns: u64 = 0;
+pub var last_decode_slz_submit_wait_wall_ns: u64 = 0;
+
+// One-shot diagnostic outputs filled by `runReadbackDiagnostics`. The
+// helper runs once per process the first time decodeSlz1ToBytesEx is
+// called with SLZ_VK_PROFILE_DECODE=1, then sets `_ran` to disable
+// further runs. Used by the readback-cost investigation.
+//
+//   dst_stage_mt_index   = the VkMemoryType index findHostVisibleNonDeviceLocal
+//                          actually resolved on this device for the
+//                          dst_stage buffer (95 MB shape, TRANSFER_DST).
+//   dst_stage_mt_flags   = the propertyFlags bitmask of that memory type
+//                          (DEVICE_LOCAL=0x1, HOST_VISIBLE=0x2,
+//                           HOST_COHERENT=0x4, HOST_CACHED=0x8).
+//   sysmem_memcpy_GBps_x100 = standalone sysmem→sysmem @memcpy throughput
+//                          (× 100, integer GB/s) on a 95 MB buffer pair.
+//                          Theoretical ceiling for the dst_stage → out
+//                          memcpy step in the readback path.
+//   bar_like_memcpy_GBps_x100 = same shape, but src is a freshly mapped
+//                          dst_stage-style HOST_VISIBLE Vulkan buffer.
+//                          If this is similar to the sysmem rate the
+//                          backing memory really is sysmem-cached; if
+//                          it's an order of magnitude slower it's
+//                          BAR-mapped.
+pub var diag_ran: bool = false;
+pub var diag_dst_stage_mt_index: i32 = -1;
+pub var diag_dst_stage_mt_flags: u32 = 0;
+pub var diag_sysmem_memcpy_GBps_x100: u32 = 0;
+pub var diag_bar_like_memcpy_GBps_x100: u32 = 0;
+pub var diag_n_memory_types: u32 = 0;
+pub var diag_memory_type_flags: [vk.VK_MAX_MEMORY_TYPES]u32 = @splat(0);
+
 const win32 = struct {
     extern "kernel32" fn QueryPerformanceCounter(count: *i64) callconv(.c) c_int;
     extern "kernel32" fn QueryPerformanceFrequency(freq: *i64) callconv(.c) c_int;
@@ -245,6 +294,149 @@ inline fn qpcNs(from: i64, to: i64) u64 {
 const UnwrapPush = extern struct {
     frame_size: u32,
 };
+
+/// One-shot diagnostic for the readback path. Runs the first time
+/// `decodeSlz1ToBytesEx` is called with SLZ_VK_PROFILE_DECODE=1. Writes
+/// findings into the `diag_*` globals; cli_vk.zig prints them.
+///
+/// Three measurements:
+///   1. Enumerate all VkMemoryType slots on the physical device and
+///      record their propertyFlags. Cross-references whatever
+///      findHostVisibleNonDeviceLocal happens to pick on this device.
+///   2. Allocate a real dst_stage-shaped (TRANSFER_DST, 95 MB) buffer
+///      using the same .host_visible_sysmem mode as the production
+///      decode path, read back its resolved memoryTypeIndex via the
+///      same heuristic, and record its propertyFlags. Confirms whether
+///      "host_visible_sysmem" actually got a sysmem-only HOST_VISIBLE
+///      type or whether the helper fell through to a DEVICE_LOCAL +
+///      HOST_VISIBLE rebar slot.
+///   3. Run a 95 MB host @memcpy from one sysmem (Zig allocator) buffer
+///      to another to measure the theoretical ceiling for the final
+///      `@memcpy(out, dst_stage.mapped)` step in the readback path.
+///   4. Run a 95 MB host @memcpy from the freshly mapped dst_stage
+///      buffer's `.mapped` pointer into the sysmem dst buffer. This is
+///      the actual operation the readback path performs. If (4) << (3)
+///      the backing memory is BAR-mapped, not sysmem.
+fn runReadbackDiagnostics(
+    ctx: *driver.Context,
+    allocator: std.mem.Allocator,
+    sample_size: usize,
+) void {
+    if (diag_ran) return;
+    diag_ran = true;
+
+    // 1. Enumerate memory types so we can print them.
+    if (vk.vkGetPhysicalDeviceMemoryProperties_fn) |get_mem_props| {
+        var mem_props: vk.VkPhysicalDeviceMemoryProperties = .{};
+        get_mem_props(ctx.pd, &mem_props);
+        diag_n_memory_types = mem_props.memoryTypeCount;
+        var i: u32 = 0;
+        while (i < mem_props.memoryTypeCount and i < vk.VK_MAX_MEMORY_TYPES) : (i += 1) {
+            diag_memory_type_flags[i] = mem_props.memoryTypes[i].propertyFlags;
+        }
+    }
+
+    // 2. Build a dst_stage-shaped buffer (same size, same usage, same
+    //    MemMode) and inspect what memory type it actually got. We
+    //    can't directly read `mem_type_index` from the l1_codec.Buffer
+    //    struct (it isn't stored), so we replay the lookup with the
+    //    real buffer's memory requirements.
+    const dst_buf_size: vk.VkDeviceSize = @max(
+        @as(vk.VkDeviceSize, 4),
+        (@as(vk.VkDeviceSize, sample_size) + 3) & ~@as(vk.VkDeviceSize, 3),
+    );
+    var probe_buf = l1_codec.createBufferEx(
+        ctx,
+        dst_buf_size,
+        vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .host_visible_sysmem,
+    ) catch return;
+    defer l1_codec.destroyBuffer(ctx, &probe_buf);
+
+    if (vk.vkGetBufferMemoryRequirements_fn) |get_req| {
+        if (vk.vkGetPhysicalDeviceMemoryProperties_fn) |get_mem_props| {
+            var req: vk.VkMemoryRequirements = .{};
+            get_req(ctx.dev, probe_buf.buf, &req);
+            var mem_props: vk.VkPhysicalDeviceMemoryProperties = .{};
+            get_mem_props(ctx.pd, &mem_props);
+            // Re-run the same selection logic as findHostVisibleNonDeviceLocal
+            // so the diag matches what createBufferEx actually picked.
+            const want = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            var i: u32 = 0;
+            while (i < mem_props.memoryTypeCount) : (i += 1) {
+                const supported = (req.memoryTypeBits & (@as(u32, 1) << @intCast(i))) != 0;
+                if (!supported) continue;
+                const flags = mem_props.memoryTypes[i].propertyFlags;
+                const has_want = (flags & want) == want;
+                const is_device_local = (flags & vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+                if (has_want and !is_device_local) {
+                    diag_dst_stage_mt_index = @intCast(i);
+                    diag_dst_stage_mt_flags = flags;
+                    break;
+                }
+            }
+            // Helper returned null — record the fallback that createBufferEx
+            // would have picked (plain HOST_VISIBLE+HOST_COHERENT, including
+            // a DEVICE_LOCAL type if that's the only option).
+            if (diag_dst_stage_mt_index < 0) {
+                i = 0;
+                while (i < mem_props.memoryTypeCount) : (i += 1) {
+                    const supported = (req.memoryTypeBits & (@as(u32, 1) << @intCast(i))) != 0;
+                    if (!supported) continue;
+                    const flags = mem_props.memoryTypes[i].propertyFlags;
+                    const has_want = (flags & want) == want;
+                    if (has_want) {
+                        diag_dst_stage_mt_index = @intCast(i);
+                        diag_dst_stage_mt_flags = flags;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Sysmem→sysmem @memcpy throughput on this host.
+    const sysmem_src = allocator.alloc(u8, sample_size) catch return;
+    defer allocator.free(sysmem_src);
+    const sysmem_dst = allocator.alloc(u8, sample_size) catch return;
+    defer allocator.free(sysmem_dst);
+    // Touch every page on the dst to fault them in (avoid first-touch
+    // page-fault overhead inflating the @memcpy time).
+    @memset(sysmem_src, 0xAA);
+    @memset(sysmem_dst, 0x55);
+    {
+        const t0 = qpcNow();
+        @memcpy(sysmem_dst, sysmem_src);
+        const ns = qpcNs(t0, qpcNow());
+        const gbps = (@as(f64, @floatFromInt(sample_size)) / 1_073_741_824.0) /
+            (@as(f64, @floatFromInt(ns)) / 1_000_000_000.0);
+        diag_sysmem_memcpy_GBps_x100 = @intFromFloat(gbps * 100.0);
+    }
+
+    // 4. dst_stage.mapped → sysmem @memcpy. This is the exact operation
+    //    the production readback performs (out is allocator-backed
+    //    sysmem, dst_stage.mapped is the Vulkan-mapped buffer).
+    if (probe_buf.mapped) |stage_mapped| {
+        // Touch the mapped region by writing zeroes through it. If it
+        // really is sysmem this is a sysmem write (~10 GB/s); if it's
+        // BAR-mapped this is a PCIe write (~3 GB/s typical).
+        @memset(stage_mapped[0..sample_size], 0);
+        // Run the read twice and keep the fastest — the first iteration
+        // can be polluted by cache cold-start.
+        var best_ns: u64 = std.math.maxInt(u64);
+        var r: usize = 0;
+        while (r < 2) : (r += 1) {
+            const t0 = qpcNow();
+            @memcpy(sysmem_dst, stage_mapped[0..sample_size]);
+            const ns = qpcNs(t0, qpcNow());
+            if (ns < best_ns) best_ns = ns;
+        }
+        const gbps = (@as(f64, @floatFromInt(sample_size)) / 1_073_741_824.0) /
+            (@as(f64, @floatFromInt(best_ns)) / 1_000_000_000.0);
+        diag_bar_like_memcpy_GBps_x100 = @intFromFloat(gbps * 100.0);
+    }
+}
 
 pub fn decodeSlz1ToBytesEx(
     ctx: *driver.Context,
@@ -364,6 +556,19 @@ pub fn decodeSlz1ToBytesEx(
     defer if (!use_dst_override) l1_codec.destroyBuffer(ctx, &dst_b);
     defer if (!use_dst_override) l1_codec.destroyBuffer(ctx, &dst_stage);
 
+    // One-shot readback-cost diagnostic (controlled by SLZ_VK_PROFILE_DECODE=1).
+    // Runs before any per-decode timing is captured so the diag work
+    // does not pollute the dispatch/readback ns globals. Internally
+    // gated by `diag_ran` so subsequent decode calls are no-ops.
+    if (!use_dst_override and dst_total > 0) {
+        const want_profile: bool = blk2: {
+            const raw = std.c.getenv("SLZ_VK_PROFILE_DECODE") orelse break :blk2 false;
+            const s = std.mem.span(raw);
+            break :blk2 s.len > 0 and s[0] != '0';
+        };
+        if (want_profile) runReadbackDiagnostics(ctx, allocator, dst_total);
+    }
+
     // ── Descriptor sets ────────────────────────────────────────────
     const t_descset_begin = qpcNow();
     var cache: descriptors.Cache = .{};
@@ -478,6 +683,13 @@ pub fn decodeSlz1ToBytesEx(
     // codec); this path is the one the SLZ1 wire-format unwrap
     // takes, so wiring it here closes the missing path.
     l1_codec.last_decode_dispatch_ns = dec_dispatch_result.ns;
+    // Readback-cost diagnostic globals: kernel GPU ns, GPU-side
+    // vkCmdCopyBuffer ns, host-wall around submit+fence-wait. All
+    // sourced from the per-submitOneWithCopy `DispatchResult` that
+    // dispatch.zig fills via the 4-slot timestamp pool + QPC.
+    last_decode_slz_gpu_kernel_ns = dec_dispatch_result.ns;
+    last_decode_slz_gpu_copy_ns = dec_dispatch_result.copy_ns;
+    last_decode_slz_submit_wait_wall_ns = dec_dispatch_result.submit_wait_wall_ns;
 
     // Host readback only when the host buffer was actually the
     // dst — D2D callers skip it entirely (the bytes are already

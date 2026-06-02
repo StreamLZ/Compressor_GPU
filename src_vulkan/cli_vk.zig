@@ -565,7 +565,48 @@ fn runBench(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: A
                     @as(f64, @floatFromInt(slz1_codec.last_decode_slz_readback_ns)) / 1_000_000.0,
                 },
             );
+            // dispatch sub-phase breakdown: GPU kernel ns + GPU copy ns
+            // (vkCmdCopyBuffer) + host-wall around vkQueueSubmit/wait.
+            // readback_ns above is purely the host @memcpy because
+            // submitOneWithCopy already waited on the fence inside.
+            try w.print(
+                "      sub: gpu_kernel={d:.2}ms gpu_copy={d:.2}ms submit_wait_wall={d:.2}ms\n",
+                .{
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_gpu_kernel_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_gpu_copy_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_submit_wait_wall_ns)) / 1_000_000.0,
+                },
+            );
         }
+    }
+
+    // Print the one-shot readback diagnostic after all runs (it ran
+    // once internally on the first decode call when the profile env
+    // knob was on). Lets the reviewer correlate the per-run readback
+    // ns with the underlying memory-type choice + host @memcpy ceiling.
+    if (slz1_codec.diag_ran) {
+        try w.print("readback-diag: memory_types[{d}]:\n", .{slz1_codec.diag_n_memory_types});
+        var i: u32 = 0;
+        while (i < slz1_codec.diag_n_memory_types and i < 32) : (i += 1) {
+            const f = slz1_codec.diag_memory_type_flags[i];
+            try w.print("    type[{d:2}] flags=0x{x:0>3} (", .{ i, f });
+            if (f & 0x1 != 0) try w.writeAll("DEVICE_LOCAL ");
+            if (f & 0x2 != 0) try w.writeAll("HOST_VISIBLE ");
+            if (f & 0x4 != 0) try w.writeAll("HOST_COHERENT ");
+            if (f & 0x8 != 0) try w.writeAll("HOST_CACHED ");
+            if (f & 0x10 != 0) try w.writeAll("LAZILY_ALLOCATED ");
+            try w.writeAll(")\n");
+        }
+        try w.print(
+            "  dst_stage resolved: memoryTypeIndex={d} flags=0x{x:0>3}\n",
+            .{ slz1_codec.diag_dst_stage_mt_index, slz1_codec.diag_dst_stage_mt_flags },
+        );
+        const sysmem_gbps = @as(f64, @floatFromInt(slz1_codec.diag_sysmem_memcpy_GBps_x100)) / 100.0;
+        const stage_gbps = @as(f64, @floatFromInt(slz1_codec.diag_bar_like_memcpy_GBps_x100)) / 100.0;
+        try w.print(
+            "  sysmem→sysmem @memcpy: {d:.2} GB/s    dst_stage.mapped→sysmem @memcpy: {d:.2} GB/s\n",
+            .{ sysmem_gbps, stage_gbps },
+        );
     }
 
     // Median across the runs. Slice the e2e and d2d arrays
