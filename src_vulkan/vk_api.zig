@@ -1387,8 +1387,18 @@ pub const VK_ACCESS_2_MEMORY_WRITE_BIT: VkAccessFlags2 = 0x10000;
 // VkDependencyFlags — empty by default; spec bits unused at M8c.
 pub const VkDependencyFlags = u32;
 
-// VkMemoryBarrier (sync1) is left unmodeled — the M8c wrapper does NOT
-// emit global memory barriers; everything is per-buffer. Add when needed.
+// VkMemoryBarrier (sync1) — a single global memory barrier carries
+// SHADER_WRITE→SHADER_READ over every buffer touched by the prior
+// dispatch. Cheaper than 6+ per-buffer barriers for the decode-pipeline
+// chain (`decode_pipeline_gpu.zig`) where each kernel writes a disjoint
+// region of the same set of buffers.
+pub const VK_STRUCTURE_TYPE_MEMORY_BARRIER: VkStructureType = 46;
+pub const VkMemoryBarrier = extern struct {
+    sType: VkStructureType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+    pNext: ?*const anyopaque = null,
+    srcAccessMask: VkAccessFlags = 0,
+    dstAccessMask: VkAccessFlags = 0,
+};
 
 // ── sync1: VkBufferMemoryBarrier (24-byte header + buffer/offset/size) ─
 pub const VkBufferMemoryBarrier = extern struct {

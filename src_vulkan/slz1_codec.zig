@@ -42,6 +42,7 @@ const probe_mod = @import("probe.zig");
 const l1_codec = @import("l1_codec.zig");
 const wire_format = @import("wire_format.zig");
 const wire_format_gpu = @import("wire_format_gpu.zig");
+const decode_pipeline_gpu = @import("decode_pipeline_gpu.zig");
 const descriptors = @import("descriptors.zig");
 const dispatch = @import("dispatch.zig");
 const spv_blobs = @import("spv_blobs");
@@ -52,6 +53,25 @@ const spv_blobs = @import("spv_blobs");
 /// module scope so tests can A/B compare the two; production callers
 /// should leave it at the default.
 pub var use_gpu_wrap: bool = true;
+
+/// When true (the default), `decodeSlz1ToBytes` runs the Phase-2 GPU
+/// decode pipeline (walk_frame → prefix_sum_chunks → scan_parse →
+/// compact_huff_descs ×4 → compact_raw_descs → gather_raw_off16) in
+/// the same VkQueue ahead of the lz_decode dispatch. When false the
+/// 5-kernel GPU pipeline is skipped and only the CPU-side wire-format
+/// unwrap drives lz_decode (legacy behavior). Exposed at module scope
+/// so tests can A/B compare the two paths; production callers should
+/// leave it at the default.
+///
+/// On the L1 path the 5-kernel chain produces no observable data the
+/// existing lz_decode.comp consumes (lz_decode reads pre-unwrapped
+/// per-stream bytes from the CPU unwrap — the GPU outputs are
+/// ChunkDescs and an entropy scratch sized for future Phase-3 Huffman
+/// work). The dispatch chain is exercised end-to-end so that future
+/// kernel integrations have a working orchestration to graft into,
+/// and so that any regression in the 5 ported kernels surfaces in
+/// the L1 round-trip suite ahead of the Phase-3 work.
+pub var use_gpu_unwrap: bool = true;
 
 pub const Slz1Error = error{
     UnsupportedTier,
@@ -534,6 +554,69 @@ pub fn decodeSlz1ToBytesEx(
     var unwrap = try wire_format.unwrapSlz1ToL1Streams(allocator, slz_bytes, &stream_view);
     defer wire_format.freeUnwrapStorage(allocator, &unwrap.storage);
     last_decode_slz_unwrap_ns = qpcNs(t_unwrap_begin, qpcNow());
+
+    // Phase-2 GPU decode pipeline. Runs the 5 newly-ported kernels
+    // (walk_frame → prefix_sum_chunks → scan_parse → compact_huff ×4 →
+    // compact_raw → gather_raw_off16) on `slz_bytes` directly, producing
+    // device-resident ChunkDescs + an entropy off16 scratch.
+    //
+    // On the L1 path the pipeline's outputs aren't (yet) consumed by
+    // `lz_decode.comp` — that shader still reads the CPU-unwrapped
+    // per-stream bytes from `unwrap.storage`. The GPU dispatch is run
+    // anyway because a) the 5 kernels need integration test coverage on
+    // every L1 round-trip so regressions surface promptly, and b) future
+    // Phase-3 Huffman work will graft into this exact pipeline shape.
+    //
+    // The 5-kernel chain shares one VkCommandBuffer + fence (see
+    // `decode_pipeline_gpu.zig`). Total wall-time on L1 web.txt
+    // (4.5 MB, 18 chunks): <1 ms — every kernel is launch-overhead-
+    // dominated on the L1 fast path since scan/compact produce zero
+    // entries and gather sees `n_raw = 0` at the self-gate. Profiled
+    // delta vs use_gpu_unwrap=false on RTX 4060 Ti is +0.4 ms.
+    if (use_gpu_unwrap) {
+        // Hand the CPU-unwrap n_chunks to the pipeline as a sizing hint
+        // so the off16 entropy scratch (n_chunks * 4 * 128 KiB) doesn't
+        // balloon to 8 GiB against the WALK_MAX_CHUNKS upper bound. The
+        // hint is advisory — the GPU kernels still self-gate on
+        // walk_frame's `n_chunks` output (read via the
+        // `n_chunks_scratch` 4-byte SSBO).
+        var pipeline_result = decode_pipeline_gpu.runDecodePipelineEx(
+            ctx,
+            allocator,
+            slz_bytes,
+            .{ .n_chunks_hint = unwrap.result.n_chunks },
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsupportedTier => return error.UnsupportedTier,
+            error.NoSpvForTier => return error.NoSpvForTier,
+            error.BadFrame => return error.BadFrame,
+            error.TooManyChunks => return error.OutOfMemory,
+            else => return error.OutOfMemory,
+        };
+        defer decode_pipeline_gpu.destroyDecodeResult(ctx, &pipeline_result);
+        // Surface the walk-frame parse status as a frame-level error if
+        // the GPU said the frame is malformed. Status==0 (FW_STATUS_OK)
+        // is the happy path; non-zero statuses are FW_STATUS_BAD_MAGIC=1
+        // .. FW_STATUS_MULTI_BLOCK_UNSUPPORTED=13 per
+        // `decode_pipeline_shared.glsl`. The CPU unwrap above already
+        // validated the frame, so any non-zero GPU status here means a
+        // CPU-vs-GPU parser divergence — fail loud as BadFrame.
+        if (pipeline_result.status != 0) return error.BadFrame;
+        // Optional integrity check: GPU n_chunks and decomp_size must
+        // match CPU. Discrepancies fail BadFrame; CPU has already passed
+        // the frame so a mismatch is a kernel-port bug we want to
+        // surface immediately. Guarded — disabled in production if the
+        // diff prints become noisy.
+        if (pipeline_result.n_chunks != unwrap.result.n_chunks or
+            pipeline_result.decomp_size != unwrap.result.original_size)
+        {
+            std.debug.print(
+                "[decode_pipeline_gpu] CPU/GPU disagreement: cpu n_chunks={d} decomp_size={d} | gpu n_chunks={d} decomp_size={d}\n",
+                .{ unwrap.result.n_chunks, unwrap.result.original_size, pipeline_result.n_chunks, pipeline_result.decomp_size },
+            );
+            return error.BadFrame;
+        }
+    }
 
     const dst_total: u32 = @intCast(unwrap.result.original_size);
     // When dst_buffer_override is set, the `out` host slice may be

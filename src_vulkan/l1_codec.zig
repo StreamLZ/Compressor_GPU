@@ -338,6 +338,13 @@ pub fn ensureBufferFnSlots(ctx: *driver.Context) void {
         vk.vkUnmapMemory_fn = resolveDeviceFn(vk.FnUnmapMemory, ctx.dev, "vkUnmapMemory");
     if (vk.vkGetBufferMemoryRequirements_fn == null)
         vk.vkGetBufferMemoryRequirements_fn = resolveDeviceFn(vk.FnGetBufferMemoryRequirements, ctx.dev, "vkGetBufferMemoryRequirements");
+    // vkCmdFillBuffer is core Vulkan 1.0 — used by the decode-pipeline
+    // orchestration (`decode_pipeline_gpu.zig`) to zero the chunks
+    // buffer before walk_frame writes its (n_chunks) prefix. Resolves
+    // lazily here so the decode-only entry path doesn't have to wire
+    // its own resolver.
+    if (vk.vkCmdFillBuffer_fn == null)
+        vk.vkCmdFillBuffer_fn = resolveDeviceFn(vk.FnCmdFillBuffer, ctx.dev, "vkCmdFillBuffer");
 
     // vkGetPhysicalDeviceMemoryProperties is instance-level — resolve via
     // vkGetInstanceProcAddr only.

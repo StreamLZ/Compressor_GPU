@@ -1,8 +1,414 @@
-// SHELL: walk_frame. Replace body when porting CUDA kernel.
+// ── StreamLZ Vulkan frame-walk kernel ───────────────────────────────
+// Port of src/decode/walk_frame_kernel.cuh::slzWalkFrameKernel.
+//
+// Single-threaded GPU walk over a compressed SLZ1 frame: validates the
+// frame header, walks the single block payload, and emits a device-
+// resident `ChunkDesc[]` array (6 u32 slots per chunk) plus a 6-u32
+// meta buffer (n_chunks, decomp_size, sub_chunk_cap, block_start,
+// block_size, status). Mirrors the CUDA reference exactly — status
+// codes match decode/driver.zig::FrameWalkStatus and decode_pipeline_
+// shared.glsl::FW_STATUS_*.
+//
+// Why single-threaded: the frame walk is inherently serial (per-block
+// then per-chunk header parsing with bounded truncation handling) and
+// frame_size is capped at ~256 MiB / 16k chunks, so a parallel walk has
+// no upside and would massively complicate the truncation guards. The
+// kernel runs in microseconds wall-time on practical frames; the SIMD
+// fan-out waste (Intel SIMD8 → 7 lanes idle; SIMD32 → 31 idle) is
+// accepted per the Phase-1 plan.
+//
+// Bindings (mirror Phase-1 plan):
+//   set=0, binding=0  Frame   readonly  - compressed SLZ1 frame bytes,
+//                                         u32-packed (byte-loaded via
+//                                         (w[p>>2] >> ((p&3)*8)) & 0xFF)
+//   set=0, binding=1  Chunks  writeonly - WALK_MAX_CHUNKS * 6 u32 slots
+//                                         (only first n_chunks slots are
+//                                         touched; downstream consumers
+//                                         read d_walk_meta[N_CHUNKS_SLOT]
+//                                         for the cutoff)
+//   set=0, binding=2  Meta    writeonly - 6 u32: n_chunks, decomp_size,
+//                                         sub_chunk_cap, block_start,
+//                                         block_size, status
+//   push constants:    frame_size, max_chunks
+//
+// Workgroup: 1x1x1; grid 1x1x1. The kernel self-gates so only invocation
+// (0,0,0) runs — matches `SLZ_GUARD_SINGLE_THREAD()` on the CUDA side.
+
 #version 460
-#extension GL_KHR_shader_subgroup_basic : require
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
-layout(set = 0, binding = 0) writeonly buffer Out { uint data[]; } out_buf;
+
+#include "decode_pipeline_shared.glsl"
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer Frame  { uint w[]; } frame_buf;
+layout(set = 0, binding = 1) writeonly buffer Chunks { uint d[]; } chunks_buf;
+layout(set = 0, binding = 2) writeonly buffer Meta   { uint d[]; } meta_buf;
+
+layout(push_constant) uniform PC {
+    uint frame_size;
+    uint max_chunks;
+} pc;
+
+// ── Frame byte loads ───────────────────────────────────────────────
+// Mirrors loadByteU32 idiom in lz_decode.comp:148 — the compressed
+// frame is a u32-typed SSBO (no VK_KHR_8bit_storage dependency for this
+// orchestration kernel) so each byte read is a u32 fetch + shift + mask.
+// All callers must verify `p < pc.frame_size` (or its block-end analog)
+// before calling, exactly as the CUDA reference does.
+uint loadFrameByte(uint p) {
+    uint w = frame_buf.w[p >> 2];
+    return (w >> ((p & 3u) * 8u)) & 0xFFu;
+}
+
+uint loadFrameU16LE(uint p) {
+    return loadFrameByte(p) | (loadFrameByte(p + 1u) << 8);
+}
+
+uint loadFrameU32LE(uint p) {
+    return loadFrameByte(p)
+         | (loadFrameByte(p + 1u) << 8)
+         | (loadFrameByte(p + 2u) << 16)
+         | (loadFrameByte(p + 3u) << 24);
+}
+
+// ── Meta writers ───────────────────────────────────────────────────
+// The CUDA kernel zeros all 6 meta slots up front, then writes the final
+// values on success at the bottom (n_chunks, decomp_size, sub_chunk_cap
+// at the end; block_start / block_size as soon as they're known; status
+// non-zero on the error returns). We mirror that order exactly so any
+// downstream code that reads partial state on error gets the same bytes.
+void initMeta() {
+    meta_buf.d[WALK_META_N_CHUNKS_SLOT]      = 0u;
+    meta_buf.d[WALK_META_DECOMP_SIZE_SLOT]   = 0u;
+    meta_buf.d[WALK_META_SUB_CHUNK_CAP_SLOT] = 0u;
+    meta_buf.d[WALK_META_BLOCK_START_SLOT]   = 0u;
+    meta_buf.d[WALK_META_BLOCK_SIZE_SLOT]    = 0u;
+    meta_buf.d[WALK_META_STATUS_SLOT]        = 0u;
+}
+
+void setStatus(uint code) {
+    meta_buf.d[WALK_META_STATUS_SLOT] = code;
+}
+
+// ── Chunk-desc writer ──────────────────────────────────────────────
+// Each chunk occupies CHUNK_DESC_U32_COUNT (6) u32 slots. memset_fill
+// lives in the low byte of slot 5; the upper 24 bits are reserved pad
+// and MUST be written as zero for host-side bitwise comparisons to
+// stay deterministic (Phase-1 plan note (3)).
+void writeChunkDesc(uint idx,
+                    uint src_offset,
+                    uint comp_size,
+                    uint decomp_size,
+                    uint dst_offset,
+                    uint flags,
+                    uint memset_fill) {
+    uint base = idx * CHUNK_DESC_U32_COUNT;
+    chunks_buf.d[base + CHUNK_SRC_OFFSET_SLOT]   = src_offset;
+    chunks_buf.d[base + CHUNK_COMP_SIZE_SLOT]    = comp_size;
+    chunks_buf.d[base + CHUNK_DECOMP_SIZE_SLOT]  = decomp_size;
+    chunks_buf.d[base + CHUNK_DST_OFFSET_SLOT]   = dst_offset;
+    chunks_buf.d[base + CHUNK_FLAGS_SLOT]        = flags;
+    // slot 5: low byte = memset_fill, upper 24 bits = pad (must be 0).
+    chunks_buf.d[base + CHUNK_MEMSET_FILL_SLOT]  = memset_fill & 0xFFu;
+}
+
 void main() {
-    if (gl_GlobalInvocationID.x == 0u) out_buf.data[0] = 0xDEADBEEFu;
+    // SLZ_GUARD_SINGLE_THREAD() equivalent. The dispatch is 1x1x1 in
+    // workgroups AND 1x1x1 in local size, but we still gate to be safe.
+    if (gl_GlobalInvocationID.x != 0u
+     || gl_GlobalInvocationID.y != 0u
+     || gl_GlobalInvocationID.z != 0u) {
+        return;
+    }
+
+    initMeta();
+
+    uint frame_size = pc.frame_size;
+    uint max_chunks = pc.max_chunks;
+
+    if (frame_size < SLZ_FRAME_MIN_HDR_SIZE) {
+        setStatus(FW_STATUS_FRAME_TRUNCATED);
+        return;
+    }
+
+    if (loadFrameU32LE(0u) != SLZ_FRAME_MAGIC) {
+        setStatus(FW_STATUS_BAD_MAGIC);
+        return;
+    }
+    uint version = loadFrameByte(4u);
+    if (version != SLZ_FRAME_VERSION) {
+        setStatus(FW_STATUS_UNSUPPORTED_VERSION);
+        return;
+    }
+    uint flags = loadFrameByte(5u);
+    uint codec = loadFrameByte(6u);
+    if (codec != SLZ_CODEC_FAST_LZ) {
+        setStatus(FW_STATUS_UNSUPPORTED_CODEC);
+        return;
+    }
+    // d_frame[7] = level (unused) / d_frame[8] = block_size_log2 (unused —
+    // we walk by block header).
+
+    // walkReadF32LE: CUDA does `memcpy(&v, &raw, sizeof(v))` to bit-cast
+    // u32 → float. GLSL uintBitsToFloat is the matching operation.
+    uint sc_group_raw = loadFrameU32LE(9u);
+    float sc_group_size = uintBitsToFloat(sc_group_raw);
+
+    uint pos = SLZ_FRAME_MIN_HDR_SIZE;
+    bool content_size_present = (flags & SLZ_FRAME_FLAG_CONTENT_SIZE_PRESENT) != 0u;
+    bool dict_id_present      = (flags & SLZ_FRAME_FLAG_DICT_ID_PRESENT) != 0u;
+    if (dict_id_present) {
+        setStatus(FW_STATUS_DICT_PRESENT);
+        return;
+    }
+    if (content_size_present) {
+        pos += 8u;
+    }
+    // No PDM / checksums on the slzCompress path; the loop below
+    // rejects them if encountered (status 5).
+
+    // eff_chunk_size mirrors decompressOneFrame/gpuBatchDecode: the CHUNK
+    // boundary at which the 2-byte internal block header repeats.
+    uint eff_chunk_size = uint(sc_group_size * float(SLZ_CHUNK_SIZE_BYTES));
+    if (eff_chunk_size > SLZ_CHUNK_SIZE_BYTES) {
+        eff_chunk_size = SLZ_CHUNK_SIZE_BYTES;
+    }
+    if (eff_chunk_size == 0u) {
+        eff_chunk_size = DEFAULT_SUB_CHUNK_CAP;
+    }
+    // sub_chunk_cap is the slot stride used by the scan kernel; mirrors
+    // the CPU's `eff_sc_cap = constants.sub_chunk_size` (= 128KB).
+    uint sub_chunk_cap = ENTROPY_SCRATCH_SLOT_BYTES;
+
+    uint dst_off = 0u;
+    uint n_chunks = 0u;
+    uint blocks_seen = 0u;
+
+    // ── Outer block loop ──────────────────────────────────────────
+    while (pos + 4u <= frame_size) {
+        uint w0 = loadFrameU32LE(pos);
+        if (w0 == SLZ_FRAME_END_MARK) {
+            break;
+        }
+        if (pos + 8u > frame_size) {
+            setStatus(FW_STATUS_BLOCK_HEADER_TRUNCATED);
+            return;
+        }
+        uint decomp_size = loadFrameU32LE(pos + 4u);
+        bool uncompressed_block = (w0 & SLZ_BLOCK_UNCOMP_FLAG) != 0u;
+        bool pdm_block          = (w0 & SLZ_BLOCK_PDM_FLAG) != 0u;
+        uint comp_size = w0 & ~(SLZ_BLOCK_UNCOMP_FLAG | SLZ_BLOCK_PDM_FLAG);
+        pos += 8u;
+        blocks_seen += 1u;
+        if (blocks_seen > 1u) {
+            setStatus(FW_STATUS_MULTI_BLOCK_UNSUPPORTED);
+            return;
+        }
+        if (pdm_block) {
+            setStatus(FW_STATUS_PDM_OR_CHECKSUM);
+            return;
+        }
+
+        uint block_payload_start = pos;
+        meta_buf.d[WALK_META_BLOCK_START_SLOT] = block_payload_start;
+        meta_buf.d[WALK_META_BLOCK_SIZE_SLOT]  = comp_size;
+
+        if (uncompressed_block) {
+            if (pos + decomp_size > frame_size) {
+                setStatus(FW_STATUS_FRAME_TRUNCATED);
+                return;
+            }
+            if (n_chunks >= max_chunks) {
+                setStatus(FW_STATUS_CHUNK_BUFFER_OVERFLOW);
+                return;
+            }
+            // src_offset is BLOCK-PAYLOAD-RELATIVE (matches the CPU walk
+            // in gpuBatchDecode). decompressFramedFromDevice passes
+            // `d_compressed_src = d_frame + block_start` so the decode
+            // kernels' `compressed + src_offset` reads land on the right
+            // bytes.
+            writeChunkDesc(n_chunks,
+                           /*src_offset*/  0u,
+                           /*comp_size*/   decomp_size,
+                           /*decomp_size*/ decomp_size,
+                           /*dst_offset*/  dst_off,
+                           /*flags*/       CHUNK_FLAG_UNCOMPRESSED,
+                           /*memset_fill*/ 0u);
+            n_chunks += 1u;
+            dst_off += decomp_size;
+            pos += comp_size;
+            continue;
+        }
+
+        if (pos + 2u > frame_size) {
+            setStatus(FW_STATUS_FRAME_TRUNCATED);
+            return;
+        }
+        uint bh0 = loadFrameByte(pos);
+        uint bh1 = loadFrameByte(pos + 1u);
+        if ((bh0 & SLZ_BLOCK_HDR_MAGIC_MASK) != SLZ_INT_BLOCK_MAGIC) {
+            setStatus(FW_STATUS_BAD_INTERNAL_BLOCK_MAGIC);
+            return;
+        }
+        uint decoder = bh1 & SLZ_BLOCK_HDR_DECODER_MASK;
+        if (decoder != SLZ_DECODER_FAST && decoder != SLZ_DECODER_TURBO) {
+            setStatus(FW_STATUS_BAD_DECODER_TYPE);
+            return;
+        }
+        bool use_checksums = (bh1 & SLZ_BLOCK_HDR_CHECKSUM_FLAG) != 0u;
+        if (use_checksums) {
+            setStatus(FW_STATUS_PDM_OR_CHECKSUM);
+            return;
+        }
+        uint block_end = pos + comp_size;
+
+        // PHASE-2 INTEGRATION PATCH (decode_pipeline_gpu): record the
+        // uncompressed-chunk bit (bit 7 of internal_hdr0) up front so
+        // the inner loop's first iteration can emit a CHUNK_FLAG_
+        // UNCOMPRESSED descriptor without a separate `need_internal_hdr`
+        // re-read. The CPU `unwrap` path (`wire_format.zig` line 794)
+        // does the same — `ihdr.uncompressed` is propagated to the
+        // first chunk. Without this fix, the inner loop reads 4 bytes
+        // past the 2-byte uncompressed header AS A CHUNK HEADER and
+        // gets a garbage chunk_type → FW_STATUS_BAD_CHUNK_TYPE. Hit on
+        // silesia full-corpus (3248 chunks, several incompressible
+        // chunks fall into the encoder's uncompressed-fallback path).
+        bool first_chunk_uncompressed = (bh0 & 0x80u) != 0u;
+
+        uint dst_remaining = decomp_size;
+        bool need_internal_hdr = false;
+        bool pending_uncompressed = first_chunk_uncompressed;
+        pos += 2u;
+
+        // ── Inner chunk loop ─────────────────────────────────────
+        while (dst_remaining > 0u && pos < block_end) {
+            if (need_internal_hdr) {
+                if (pos + 2u > block_end) {
+                    setStatus(FW_STATUS_BAD_INTERNAL_BLOCK_MAGIC);
+                    return;
+                }
+                uint b0 = loadFrameByte(pos);
+                uint b1 = loadFrameByte(pos + 1u);
+                if ((b0 & SLZ_BLOCK_HDR_MAGIC_MASK) != SLZ_INT_BLOCK_MAGIC) {
+                    setStatus(FW_STATUS_BAD_INTERNAL_BLOCK_MAGIC);
+                    return;
+                }
+                uint dec2 = b1 & SLZ_BLOCK_HDR_DECODER_MASK;
+                if (dec2 != SLZ_DECODER_FAST && dec2 != SLZ_DECODER_TURBO) {
+                    setStatus(FW_STATUS_BAD_DECODER_TYPE);
+                    return;
+                }
+                if ((b1 & SLZ_BLOCK_HDR_CHECKSUM_FLAG) != 0u) {
+                    setStatus(FW_STATUS_PDM_OR_CHECKSUM);
+                    return;
+                }
+                // PHASE-2 INTEGRATION PATCH: latch bit 7 of internal_hdr0
+                // (the uncompressed-chunk marker, mirror of CPU unwrap's
+                // `ihdr.uncompressed`). When set, the chunk has NO 4-byte
+                // chunk header — payload = chunk_decomp_size raw bytes
+                // directly after this 2-byte internal header.
+                pending_uncompressed = (b0 & 0x80u) != 0u;
+                pos += 2u;
+            }
+
+            uint dst_this = (dst_remaining < eff_chunk_size)
+                          ? dst_remaining
+                          : eff_chunk_size;
+
+            // PHASE-2 INTEGRATION PATCH: uncompressed-chunk fast path.
+            // Emit a CHUNK_FLAG_UNCOMPRESSED descriptor (src_offset =
+            // block-payload-relative position of the raw bytes,
+            // comp_size = decomp_size = dst_this) and advance pos past
+            // the raw payload — no 4-byte chunk header.
+            if (pending_uncompressed) {
+                if (pos + dst_this > block_end) {
+                    setStatus(FW_STATUS_FRAME_TRUNCATED);
+                    return;
+                }
+                if (n_chunks >= max_chunks) {
+                    setStatus(FW_STATUS_CHUNK_BUFFER_OVERFLOW);
+                    return;
+                }
+                writeChunkDesc(n_chunks,
+                               /*src_offset*/  pos - block_payload_start,
+                               /*comp_size*/   dst_this,
+                               /*decomp_size*/ dst_this,
+                               /*dst_offset*/  dst_off,
+                               /*flags*/       CHUNK_FLAG_UNCOMPRESSED,
+                               /*memset_fill*/ 0u);
+                n_chunks += 1u;
+                pos += dst_this;
+                dst_off += dst_this;
+                dst_remaining -= dst_this;
+                need_internal_hdr = true;
+                pending_uncompressed = false;
+                continue;
+            }
+
+            if (pos + 4u > block_end) {
+                setStatus(FW_STATUS_CHUNK_HEADER_TRUNCATED);
+                return;
+            }
+            uint v = loadFrameU32LE(pos);
+            uint size_field = v & SLZ_CHUNK_SIZE_MASK;
+            uint chunk_type = (v >> SLZ_CHUNK_TYPE_SHIFT) & 3u;
+
+            if (chunk_type == 0u) {
+                uint comp = size_field + 1u;
+                pos += 4u;
+                if (pos + comp > block_end) {
+                    setStatus(FW_STATUS_FRAME_TRUNCATED);
+                    return;
+                }
+                if (n_chunks >= max_chunks) {
+                    setStatus(FW_STATUS_CHUNK_BUFFER_OVERFLOW);
+                    return;
+                }
+                uint flg = (comp == dst_this) ? CHUNK_FLAG_UNCOMPRESSED : 0u;
+                // src_offset is BLOCK-PAYLOAD-RELATIVE (matches CPU walk).
+                writeChunkDesc(n_chunks,
+                               /*src_offset*/  pos - block_payload_start,
+                               /*comp_size*/   comp,
+                               /*decomp_size*/ dst_this,
+                               /*dst_offset*/  dst_off,
+                               /*flags*/       flg,
+                               /*memset_fill*/ 0u);
+                n_chunks += 1u;
+                pos += comp;
+            } else if (chunk_type == 1u) {
+                if (pos + 5u > block_end) {
+                    setStatus(FW_STATUS_CHUNK_HEADER_TRUNCATED);
+                    return;
+                }
+                uint fill = loadFrameByte(pos + 4u);
+                pos += 5u;
+                if (n_chunks >= max_chunks) {
+                    setStatus(FW_STATUS_CHUNK_BUFFER_OVERFLOW);
+                    return;
+                }
+                writeChunkDesc(n_chunks,
+                               /*src_offset*/  0u,
+                               /*comp_size*/   0u,
+                               /*decomp_size*/ dst_this,
+                               /*dst_offset*/  dst_off,
+                               /*flags*/       CHUNK_FLAG_MEMSET,
+                               /*memset_fill*/ fill);
+                n_chunks += 1u;
+            } else {
+                setStatus(FW_STATUS_BAD_CHUNK_TYPE);
+                return;
+            }
+
+            dst_off += dst_this;
+            dst_remaining -= dst_this;
+            need_internal_hdr = true;
+        }
+
+        pos = block_end;
+    }
+
+    meta_buf.d[WALK_META_N_CHUNKS_SLOT]      = n_chunks;
+    meta_buf.d[WALK_META_DECOMP_SIZE_SLOT]   = dst_off;
+    meta_buf.d[WALK_META_SUB_CHUNK_CAP_SLOT] = sub_chunk_cap;
+    // status stays 0 (set by initMeta) — FW_STATUS_OK.
 }

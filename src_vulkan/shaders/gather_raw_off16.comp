@@ -1,8 +1,137 @@
-// SHELL: gather_raw_off16. Replace body when porting CUDA kernel.
+// SuRC StreamLZ Vulkan gather_raw_off16 ──────────────────────────────
+// Port of src/decode/gather_raw_off16_kernel.cuh.
+//
+// Purpose: single-launch scatter of raw (type-0) off16 sub-streams from
+// the compressed blob into the off16 entropy scratch — replacing the
+// ~1500 host-issued device-to-device copies of the pre-fused path.
+//
+// Algorithm (CUDA reference, ~38 LOC):
+//   i = blockIdx.x
+//   if (i >= *d_count) return;                       // self-gate
+//   d = descs[i]                                     // {src_offset, size, gpu_offset}
+//   if (d.size == 0 ||
+//       d.src_offset > comp_len ||
+//       d.size > comp_len - d.src_offset) return;    // defensive bounds
+//   const uint8_t* s = comp_base + d.src_offset;
+//   uint8_t*       t = scratch_base + d.gpu_offset;
+//   for (j = threadIdx.x; j < d.size; j += blockDim.x)
+//       t[j] = s[j];                                 // strided byte copy
+//
+// GLSL port mapping:
+//   * blockIdx.x        → gl_WorkGroupID.x
+//   * threadIdx.x       → gl_LocalInvocationID.x
+//   * blockDim.x        → gl_WorkGroupSize.x  (compile-time = 256)
+//   * comp_base         → Comp SSBO, u32-packed, byte-load via shift+mask
+//   * scratch_base      → Scratch SSBO, typed as uint8_t[] via
+//                          GL_EXT_shader_8bit_storage (same idiom as
+//                          lz_decode.comp's Dst buffer). The host-side
+//                          binding stays a raw storage buffer; only the
+//                          GLSL type view changes. This removes the
+//                          per-byte atomicAnd/atomicOr RMW that a
+//                          u32-typed Scratch would force.
+//   * descs[i]          → 3 u32 slots per RawOff16Desc, see slot macros.
+//   * *d_count          → NDescs.v[0] — device-resident self-gate count.
+//
+// Workgroup size: 256 — matches CUDA's blockDim.x = 256 explicitly.
+// On NVIDIA this is 8 warps per block (high occupancy). On Intel SIMD8
+// this is 32 SIMD8 subgroups per workgroup; throughput is bandwidth-
+// bound (L3) not occupancy-bound, so the workgroup size doesn't gate
+// achievable throughput. The CUDA kernel deliberately does NOT carry
+// __launch_bounds__ for the same reason.
+//
+// Self-gating: the dispatch is over-launched at worst-case
+// `total_subchunks * 2` workgroups (matches CUDA's launch contract);
+// each workgroup tests `gl_WorkGroupID.x >= NDescs.v[0]` and bails. This
+// avoids a CPU round-trip to size the dispatch.
+//
+// Bounds-check parity: the three CUDA defensive checks are reproduced
+// verbatim — empty size, src_offset overflow, and (size > comp_len -
+// src_offset) using unsigned subtraction in the same evaluation order
+// as the CUDA shortcircuit. Identical semantics on uint32_t.
+
 #version 460
-#extension GL_KHR_shader_subgroup_basic : require
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
-layout(set = 0, binding = 0) writeonly buffer Out { uint data[]; } out_buf;
+#extension GL_KHR_shader_subgroup_basic                : require
+// Lets Scratch be a byte-typed SSBO so the strided per-lane stores are
+// individually-granular at the SSBO level — same trick lz_decode.comp's
+// Dst buffer uses. Host-side the buffer is still a raw storage buffer;
+// GLSL just gives it a uint8_t[] view here.
+#extension GL_EXT_shader_8bit_storage                  : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "decode_pipeline_shared.glsl"
+
+// 256 lanes per workgroup. Matches CUDA `blockDim.x = 256`. Each
+// workgroup handles ONE RawOff16Desc; the 256 lanes stride-copy its
+// `size` bytes from Comp at src_offset to Scratch at gpu_offset.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// ── Bindings ────────────────────────────────────────────────────────
+// binding=0  Comp     readonly u32[]   — compressed block bytes
+// binding=1  Scratch  coherent uint8[] — off16 entropy scratch (byte-typed
+//                                         GLSL view; raw storage buffer
+//                                         on the host side)
+// binding=2  Descs    readonly u32[]   — compacted RawOff16Desc array
+//                                         (3 u32 / 12 B per slot)
+// binding=3  NDescs   readonly u32[]   — 1 u32 self-gate count
+layout(set = 0, binding = 0) readonly buffer Comp    { uint w[]; } comp_buf;
+// `coherent` is conservative: this kernel only writes Scratch (it never
+// reads it back), but downstream kernels read it after the
+// pipeline-barrier flush. Matching lz_decode.comp's Dst pattern keeps
+// the byte-granularity semantics explicit.
+layout(std430, set = 0, binding = 1) coherent buffer Scratch { uint8_t b[]; } scratch_buf;
+layout(set = 0, binding = 2) readonly buffer Descs   { uint d[]; } descs_buf;
+layout(set = 0, binding = 3) readonly buffer NDescs  { uint v[]; } ndescs_buf;
+
+layout(push_constant) uniform PC {
+    uint comp_len;
+} pc;
+
+// ── Comp byte loader (mirror of lz_decode.comp's loadCmdByte etc.) ──
+// Loads byte at absolute address `p` from the u32-packed compressed
+// buffer. No bounds check — callers verify in-bounds before calling.
+uint loadCompByte(uint p) {
+    uint w = comp_buf.w[p >> 2];
+    return (w >> ((p & 3u) * 8u)) & 0xFFu;
+}
+
 void main() {
-    if (gl_GlobalInvocationID.x == 0u) out_buf.data[0] = 0xDEADBEEFu;
+    // i = blockIdx.x.
+    uint i = gl_WorkGroupID.x;
+
+    // Self-gate: `if (i >= *d_count) return;`. ndescs_buf.v[0] is the
+    // device-resident compacted count produced by compact_raw_descs.
+    uint count = ndescs_buf.v[0];
+    if (i >= count) return;
+
+    // Load the 3-slot descriptor. Mirrors `const SlzRawOff16Desc d = descs[i];`.
+    uint base = i * RAWDESC_U32_COUNT;
+    uint d_src_offset = descs_buf.d[base + RAWDESC_SRC_OFFSET_SLOT];
+    uint d_size       = descs_buf.d[base + RAWDESC_SIZE_SLOT];
+    uint d_gpu_offset = descs_buf.d[base + RAWDESC_GPU_OFFSET_SLOT];
+
+    // Defensive bounds: matches the three CUDA checks verbatim and in
+    // the same short-circuit order. With unsigned arithmetic the
+    // `d_size > pc.comp_len - d_src_offset` test is only reached when
+    // the prior `d_src_offset > pc.comp_len` is false, so the
+    // subtraction is non-wrapping (matches CUDA semantics on uint32_t).
+    if (d_size == 0u) return;
+    if (d_src_offset > pc.comp_len) return;
+    if (d_size > pc.comp_len - d_src_offset) return;
+
+    // Strided byte copy. Lane stride = gl_WorkGroupSize.x (256).
+    //   for (j = lane; j < d.size; j += stride) scratch[gpu+j] = comp[src+j];
+    // Each lane writes a unique byte address per iteration — the
+    // uint8_t[] SSBO view makes the store granular so there's no need
+    // for u32 RMW or atomics, and no inter-lane store races within a
+    // descriptor. Cross-descriptor races are impossible because the
+    // compact step assigns each descriptor a disjoint [gpu_offset,
+    // gpu_offset + size) slice of Scratch (gpu_offset and size are both
+    // 4-byte aligned by construction; the slices are dense and
+    // non-overlapping per the off16-hi/lo split layout).
+    uint lane = gl_LocalInvocationID.x;
+    uint stride = gl_WorkGroupSize.x;
+    for (uint j = lane; j < d_size; j += stride) {
+        uint b = loadCompByte(d_src_offset + j);
+        scratch_buf.b[d_gpu_offset + j] = uint8_t(b);
+    }
 }
