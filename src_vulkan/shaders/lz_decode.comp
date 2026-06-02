@@ -25,27 +25,36 @@
 //   set=0, binding=2  Off16       readonly  - u16 LE offsets (byte-addressed)
 //   set=0, binding=3  Length      readonly  - variable-length stream
 //   set=0, binding=4  Dst         buffer    - decoded output (RMW, lane 0 only)
-//   set=0, binding=5  ChunkDescs  readonly  - per-chunk 8 u32:
-//       [0] dst_offset      (byte offset into Dst for this chunk's first byte)
-//       [1] dst_size        (bytes this chunk should produce)
-//       [2] lit_src_word_base    (u32 word base of this chunk's lit stream)
-//       [3] lit_size        (bytes)
-//       [4] cmd_src_word_base
-//       [5] cmd_size        (bytes)
-//       [6] off16_src_word_base  (entry 0 byte address = base*4)
-//       [7] off16_count     (u16 entries)
-//       (length_src_word_base derived from lit_src_word_base since each
-//        stream shares the same chunk_capacity-word stride; we still
-//        pass it explicitly via a 12-slot stride layout below.)
+//   set=0, binding=5  ChunkDescs  readonly  - per-chunk 16 u32:
+//       [0] dst_offset      (UNUSED — see binding 7 walk_chunks_buf)
+//       [1] dst_size        (UNUSED — see binding 7)
+//       [2] cmd_byte_base    (byte offset into Cmd  buffer)
+//       [3] cmd_size         (bytes)
+//       [4] lit_byte_base    (byte offset into Lit  buffer)
+//       [5] lit_size         (bytes — includes the chunk-0 8-byte
+//                              initial prefix bytes if present, since
+//                              lit_byte_base on chunk 0 points at the
+//                              prefix and `initial_copy` declares the
+//                              prefix length to skip)
+//       [6] off16_byte_base  (byte offset into Off16 buffer)
+//       [7] off16_count      (u16 entries)
+//       [8] length_byte_base (byte offset into Length buffer)
+//       [9] length_size      (bytes)
+//       [10] initial_copy    (0 or INITIAL_LITERAL_COPY_BYTES = 8)
+//       [11] off32_byte_base (byte offset into Off32 buffer)
+//       [12] off32_count1    (entries in LZ block 0)
+//       [13] off32_count2    (entries in LZ block 1)
+//       [14] cmd_stream2_offset
+//       [15] reserved
 //
-// To keep the layout simple+aligned, ChunkDescs is 12 u32 per chunk:
-//   [0] dst_offset
-//   [1] dst_size
-//   [2] cmd_word_base, [3] cmd_size
-//   [4] lit_word_base, [5] lit_size
-//   [6] off16_word_base, [7] off16_count
-//   [8] length_word_base, [9] length_size
-//   [10..11] reserved
+// The byte_base fields are byte offsets into whichever buffer the
+// kernel was bound to; on the SLZ1-unwrap path the same compressed
+// frame is bound to all four of cmd/lit/off16/length (and off32), and
+// each stream's byte_base is its offset within that frame. On the
+// encode-roundtrip direct path each stream has its own SSBO at a
+// chunk_capacity stride and byte_base = ci * chunk_capacity. The byte
+// loader (g_<stream>_byte_base + pos) handles unaligned bases via
+// (pos & 3u) shift, so the bases need NOT be 4-aligned.
 //
 // Push constants (4 bytes):
 //   uint n_chunks       : number of chunks (== gl_NumWorkGroups.x)
@@ -157,6 +166,13 @@ shared uint g_off16_byte_base;
 shared uint g_length_byte_base;
 shared uint g_dst_byte_base;
 shared uint g_off32_byte_base;     // base byte address into off32_buf for this chunk
+shared uint g_init_byte_base;      // base byte address into lit_buf for the
+                                   // initial-copy prefix (chunk 0 only — when
+                                   // initial_copy != 0 the decoder reads
+                                   // `initial_copy` bytes from this position
+                                   // before any token processing; for all
+                                   // other chunks `initial_copy == 0` so the
+                                   // value is unread).
 
 // ── Constants (mirror src/decode/slz_wire_format.cuh) ───────────────
 // LZ_BLOCK_SIZE, INITIAL_RECENT_OFFSET, OFF16_ENTRY_BYTES, OFF32_ENTRY_
@@ -201,6 +217,22 @@ uint loadCmdByte(uint pos) {
 
 uint loadLitByte(uint pos) {
     uint gpos = g_lit_byte_base + pos;
+    uint w = lit_buf.w[gpos >> 2];
+    return (w >> ((gpos & 3u) * 8u)) & 0xFFu;
+}
+
+// loadInitByte: reads from lit_buf using a SEPARATE per-chunk byte base
+// for the initial-copy prefix bytes. On the SLZ1-unwrap path the init
+// prefix sits inside the compressed frame buffer at a position that
+// is NOT contiguous with the chunk's main literal bytes (a 3-byte
+// type-0 stream header sits between them), so a separate base is
+// required. On the encode-roundtrip path the encoder placed both the
+// prefix and the lit bytes inside the same per-chunk lit slice with
+// the prefix at the head, so `init_byte_base == lit_byte_base -
+// initial_copy` and the two readers land on the right bytes either
+// way. Only called when `g_initial_copy != 0` (chunk 0 only).
+uint loadInitByte(uint pos) {
+    uint gpos = g_init_byte_base + pos;
     uint w = lit_buf.w[gpos >> 2];
     return (w >> ((gpos & 3u) * 8u)) & 0xFFu;
 }
@@ -459,15 +491,18 @@ void main() {
         uint wbase = chunk_id * CHUNK_DESC_U32_COUNT;
         g_dst_byte_base     = walk_chunks_buf.d[wbase + CHUNK_DST_OFFSET_SLOT];
         g_dst_size          = walk_chunks_buf.d[wbase + CHUNK_DECOMP_SIZE_SLOT];
-        // cmd / lit / off16 / length descs are u32-word bases; multiply
-        // by 4 to get the byte base.
-        g_cmd_byte_base     = chunks_buf.d[base + 2u] * 4u;
+        // cmd / lit / off16 / length descs are BYTE bases. (Pre-port
+        // these were u32-word bases × 4 to byte address; the new GPU
+        // L1-unwrap kernel writes byte offsets into the compressed
+        // frame directly so the *4 was dropped on both encode-roundtrip
+        // and SLZ1-unwrap paths.)
+        g_cmd_byte_base     = chunks_buf.d[base + 2u];
         g_cmd_size          = chunks_buf.d[base + 3u];
-        g_lit_byte_base     = chunks_buf.d[base + 4u] * 4u;
+        g_lit_byte_base     = chunks_buf.d[base + 4u];
         g_lit_size          = chunks_buf.d[base + 5u];
-        g_off16_byte_base   = chunks_buf.d[base + 6u] * 4u;
+        g_off16_byte_base   = chunks_buf.d[base + 6u];
         g_off16_count       = chunks_buf.d[base + 7u];
-        g_length_byte_base  = chunks_buf.d[base + 8u] * 4u;
+        g_length_byte_base  = chunks_buf.d[base + 8u];
         g_length_remaining  = chunks_buf.d[base + 9u];
         // Slot 10 = initial_copy bytes (0 or 8). For chunk 0 (is_first)
         // the encoder skips the first 8 source bytes in its token stream
@@ -475,8 +510,10 @@ void main() {
         // decoder reproduces those 8 bytes directly to dst[0..8] before
         // the token loop runs.
         g_initial_copy      = chunks_buf.d[base + 10u];
-        // Slot 11 = u32-word base of this chunk's off32 stream slice.
-        g_off32_byte_base   = chunks_buf.d[base + 11u] * 4u;
+        // Slot 11 = BYTE base of this chunk's off32 stream slice. (See
+        // the note above on slots 2/4/6/8 — units flipped from u32-word
+        // to byte; both decode paths write byte bases now.)
+        g_off32_byte_base   = chunks_buf.d[base + 11u];
 
         // Per-chunk off32 layout (read from a separate 4-u32-per-chunk
         // sidecar: see l1_codec.decodeL1Sync). Encoded as a single u32
@@ -488,6 +525,14 @@ void main() {
         g_off32_count1       = chunks_buf.d[base + 12u];
         g_off32_count2       = chunks_buf.d[base + 13u];
         g_cmd_stream2_offset = chunks_buf.d[base + 14u];
+        // Slot 15 = init_byte_base. Separate byte base for the initial-
+        // copy prefix bytes (chunk 0 only). On the encode-roundtrip
+        // path the host writes this == lit_byte_base (prefix sits at
+        // the head of the per-chunk lit slice). On the SLZ1-unwrap
+        // path the GPU L1-unwrap kernel writes the in-frame byte
+        // offset of the prefix, which is NOT contiguous with the
+        // chunk's lit bytes.
+        g_init_byte_base     = chunks_buf.d[base + 15u];
     }
     // Workgroup-wide barrier so the chunk-descriptor loads in lane 0 are
     // visible to every lane before the main decode loop reads g_cmd_size /
@@ -498,12 +543,15 @@ void main() {
     // ── Initial verbatim copy (chunk-0 only when g_initial_copy != 0) ──
     // Mirrors CUDA's parseAndDecodeSubChunkRaw initial-prefix step: the
     // sub-chunk payload's first 8 bytes go straight to dst[0..8] before
-    // any token-driven processing. For the Vulkan codec the bytes live
-    // at the head of lit_buf (encoder put them there); we copy them
-    // through the standard storeDstByte RMW path on lane 0.
+    // any token-driven processing. Reads through `loadInitByte` so the
+    // SLZ1-unwrap path can place the prefix bytes at a position inside
+    // the compressed frame that is NOT contiguous with the chunk's
+    // lit-bytes slice. On the encode-roundtrip path the host sets
+    // `init_byte_base == lit_byte_base`, so this resolves to the same
+    // bytes the legacy `loadLitByte(i)` reader did.
     if (lane == 0u && g_initial_copy != 0u) {
         for (uint i = 0u; i < g_initial_copy; i++) {
-            storeDstByte(i, loadLitByte(i));
+            storeDstByte(i, loadInitByte(i));
         }
     }
     barrier();
@@ -515,8 +563,18 @@ void main() {
     // computes the per-iter advances via warpScanU32 / subgroupBallot,
     // which are subgroup-uniform, so every lane updates its copy with
     // identical values — matching CUDA's pattern in lz_decode_raw.cuh.
+    //
+    // lit_pos starts at 0 because `lit_byte_base` ALREADY points at the
+    // first byte the main token loop should read (after any initial
+    // prefix). On the encode-roundtrip path the host sets
+    // `lit_byte_base = chunk_byte_base + initial_copy` and trims
+    // `lit_size` by initial_copy so the trailing-literal sentinel is
+    // also consistent. On the SLZ1-unwrap path the GPU L1-unwrap kernel
+    // sets `lit_byte_base` directly to the byte-after-header position
+    // and `lit_size` to just the chunk's actual lit-byte count (no
+    // prefix included).
     uint cmd_pos       = 0u;
-    uint lit_pos       = g_initial_copy;
+    uint lit_pos       = 0u;
     uint off16_pos     = 0u;
     uint dst_pos       = g_initial_copy;
     int  recent_offset = INITIAL_RECENT_OFFSET;

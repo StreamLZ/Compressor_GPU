@@ -978,23 +978,6 @@ pub fn decodeL1Sync(
     {
         const w: [*]u32 = @ptrCast(@alignCast(walk_chunks_b.mapped.?));
         var ci: u32 = 0;
-        // ── LOAD-BEARING PROOF (temporary) ────────────────────────────
-        // Toggle to true to exercise the load-bearing proof: clobbers
-        // walk_chunks_b's dst_off / decomp_size with zeros, which MUST
-        // cause the multi-chunk L1 round-trip tests to fail. This was
-        // used during Cluster A commit to verify lz_decode actually
-        // consumes walk_chunks_b for the FRAME-level fields rather
-        // than the (now-zero) slots 0/1 in chunks_b. Left in place so
-        // any future regression in the binding-7 wiring can be
-        // re-verified locally; default is false in production.
-        //
-        // Confirmed 2026-06-02: with `proof_clobber = true`,
-        //   L1_ROUNDTRIP FAIL multi_chunk_1x128k bytes=131072
-        //     first_diff=0 total_diffs=61309
-        // (vk-l1-test --device 0). Single-chunk corpora still pass
-        // because chunk-0's dst_off is 0 (the zero-clobbered value),
-        // so the single-chunk geometry happens to match by accident.
-        const proof_clobber: bool = false;
         while (ci < n_chunks) : (ci += 1) {
             const dst_off: u32 = ci * CHUNK_SIZE;
             const this_dst_size: u32 = if (dst_off + CHUNK_SIZE <= dst_size)
@@ -1012,9 +995,9 @@ pub fn decodeL1Sync(
             //   slot 4: flags        (zero — direct path has no GPU walk)
             //   slot 5: memset_fill  (zero)
             w[wbase + 0] = 0; // src_offset
-            w[wbase + 1] = if (proof_clobber) 0 else this_dst_size; // comp_size
-            w[wbase + 2] = if (proof_clobber) 0 else this_dst_size; // CHUNK_DECOMP_SIZE_SLOT
-            w[wbase + 3] = if (proof_clobber) 0 else dst_off;       // CHUNK_DST_OFFSET_SLOT
+            w[wbase + 1] = this_dst_size; // comp_size
+            w[wbase + 2] = this_dst_size; // CHUNK_DECOMP_SIZE_SLOT
+            w[wbase + 3] = dst_off;       // CHUNK_DST_OFFSET_SLOT
             w[wbase + 4] = 0; // flags
             w[wbase + 5] = 0; // memset_fill (+ pad)
         }
@@ -1022,11 +1005,17 @@ pub fn decodeL1Sync(
     @memset(chunks_b.mapped.?[0..@intCast(chunks_b.size)], 0);
     {
         const chunks_words: [*]u32 = @ptrCast(@alignCast(chunks_b.mapped.?));
-        const cap_words: u32 = chunk_capacity / 4;
-        const off32_cap_words: u32 = streams.off32_capacity / 4;
+        // lz_decode.comp's slots 2/4/6/8/11 are BYTE-base offsets into
+        // their respective stream SSBOs (post-l1_unwrap port). On the
+        // direct encode-roundtrip path each stream has its own
+        // chunk_capacity-strided SSBO, so the byte base is
+        // `ci * chunk_capacity` (already 4-aligned because
+        // chunk_capacity is a multiple of 4 — comptime-checked in
+        // wire_constants.zig).
         var ci: u32 = 0;
         while (ci < n_chunks) : (ci += 1) {
-            const stream_word_base: u32 = ci * cap_words;
+            const stream_byte_base: u32 = ci * chunk_capacity;
+            const off32_byte_base: u32 = ci * streams.off32_capacity;
             // Cluster C (F018): cmd-stream block-0/1 boundary IS tracked
             // correctly by the encoder. lz_encode.comp writes
             // `cmd_stream2_offset = token_count` at the block-0/1
@@ -1054,26 +1043,38 @@ pub fn decodeL1Sync(
             // immediate output corruption.
             chunks_words[base + 0] = 0;
             chunks_words[base + 1] = 0;
-            chunks_words[base + 2] = stream_word_base; // cmd
+            chunks_words[base + 2] = stream_byte_base; // cmd  byte base
             chunks_words[base + 3] = streams.per_chunk_cmd_size[ci];
-            chunks_words[base + 4] = stream_word_base; // lit
-            chunks_words[base + 5] = streams.per_chunk_lit_size[ci];
-            chunks_words[base + 6] = stream_word_base; // off16 (byte addr = base*4)
+            // lit_byte_base / lit_size semantics (post-l1_unwrap port):
+            //   lit_byte_base points at the FIRST byte the token loop
+            //   reads (after any init prefix). lit_size is just the
+            //   chunk's token-driven lit-byte count.
+            // The encoder placed the 8-byte init prefix at the head of
+            // the per-chunk lit slice — so we bump lit_byte_base by
+            // initial_copy and trim lit_size accordingly. The init
+            // prefix itself is reachable via init_byte_base (slot 15).
+            const ic: u32 = streams.per_chunk_initial_copy[ci];
+            chunks_words[base + 4] = stream_byte_base + ic; // lit byte base (after prefix)
+            chunks_words[base + 5] = streams.per_chunk_lit_size[ci] - ic;
+            chunks_words[base + 6] = stream_byte_base; // off16 byte base
             chunks_words[base + 7] = streams.per_chunk_off16_count[ci];
-            chunks_words[base + 8] = stream_word_base; // length
+            chunks_words[base + 8] = stream_byte_base; // length byte base
             chunks_words[base + 9] = streams.per_chunk_length_used[ci];
             // Slot 10 = initial_copy bytes (0 or 8). Mirrors the
             // sub-chunk prefix the CUDA decoder writes from
             // SUBCHUNK_PAYLOAD[0..8] to dst[0..8] for chunk 0.
-            chunks_words[base + 10] = streams.per_chunk_initial_copy[ci];
-            // Slot 11 = u32-word base of the per-chunk off32 slice.
-            chunks_words[base + 11] = ci * off32_cap_words;
+            chunks_words[base + 10] = ic;
+            // Slot 11 = byte base of the per-chunk off32 slice.
+            chunks_words[base + 11] = off32_byte_base;
             // Slots 12..14 = off32_count_block1 / off32_count_block2 /
             // cmd_stream2_offset.
             chunks_words[base + 12] = streams.per_chunk_off32_count1[ci];
             chunks_words[base + 13] = streams.per_chunk_off32_count2[ci];
             chunks_words[base + 14] = streams.per_chunk_cmd_stream2_offset[ci];
-            // slot 15 reserved.
+            // Slot 15 = init_byte_base: where the init prefix sits.
+            // Encoder places it at the head of the per-chunk lit slice,
+            // so this equals the unbumped stream_byte_base.
+            chunks_words[base + 15] = stream_byte_base;
         }
     }
     _ = off32_cap_total;

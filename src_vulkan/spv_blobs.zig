@@ -1,6 +1,6 @@
 // SPIR-V blob registry.
 //
-// 17 kernel shells × 3 variants (tier1, tier1_nv, tier2) = 51 embedded blobs.
+// 18 kernel shells × 3 variants (tier1, tier1_nv, tier2) = 54 embedded blobs.
 // `zig build vk-shaders` produces a WriteFiles directory containing every
 // <kernel>.<variant>.spv as a flat name; consumers add that directory as an
 // embed path via `Module.addEmbedPath`, after which @embedFile() resolves
@@ -86,6 +86,10 @@ pub const blobs = [_]Blob{
     .{ .name = "lz_decode_raw", .tier = .tier1, .bytes = @embedFile("lz_decode_raw.tier1.spv") },
     .{ .name = "lz_decode_raw", .tier = .tier1_nv, .bytes = @embedFile("lz_decode_raw.tier1_nv.spv") },
     .{ .name = "lz_decode_raw", .tier = .tier2, .bytes = @embedFile("lz_decode_raw.tier2.spv") },
+
+    .{ .name = "l1_unwrap", .tier = .tier1, .bytes = @embedFile("l1_unwrap.tier1.spv") },
+    .{ .name = "l1_unwrap", .tier = .tier1_nv, .bytes = @embedFile("l1_unwrap.tier1_nv.spv") },
+    .{ .name = "l1_unwrap", .tier = .tier2, .bytes = @embedFile("l1_unwrap.tier2.spv") },
 };
 
 pub fn find(name: []const u8, tier: Tier) ?[]const u8 {
@@ -95,8 +99,8 @@ pub fn find(name: []const u8, tier: Tier) ?[]const u8 {
     return null;
 }
 
-test "blob count is 17 kernels x 3 variants = 51" {
-    try std.testing.expectEqual(@as(usize, 51), blobs.len);
+test "blob count is 18 kernels x 3 variants = 54" {
+    try std.testing.expectEqual(@as(usize, 54), blobs.len);
 }
 
 test "every blob is non-empty and SPIR-V (magic 0x07230203)" {

@@ -577,8 +577,6 @@ fn decodeUnwrappedVkOnly(
     @memset(chunks_b.mapped[0..@intCast(chunks_b.size)], 0);
     {
         const words: [*]u32 = @ptrCast(@alignCast(chunks_b.mapped));
-        const cap_words: u32 = chunk_capacity / 4;
-        const off32_cap_words: u32 = off32_capacity / 4;
         var ci: u32 = 0;
         while (ci < n_chunks) : (ci += 1) {
             // Per-chunk dst_off / dst_size derived from the unwrap
@@ -589,31 +587,41 @@ fn decodeUnwrappedVkOnly(
             // descriptor advertises.
             const dst_off: u32 = ci * unwrap.result.chunk_size;
             const dst_size: u32 = unwrap.result.per_chunk_decomp_size[ci];
-            const word_base: u32 = ci * cap_words;
+            // BYTE base (post-l1_unwrap port — slots 2/4/6/8/11 in the
+            // 16-u32 descriptor are byte offsets into the corresponding
+            // stream SSBO; lz_decode no longer multiplies them by 4).
+            const stream_byte_base: u32 = ci * chunk_capacity;
+            const off32_byte_base: u32 = ci * off32_capacity;
             const base = ci * 16;
+            const ic: u32 = if (stream_view.per_chunk_initial_copy) |pci|
+                (if (ci < pci.len) pci[ci] else 0)
+            else
+                0;
             words[base + 0] = dst_off;
             words[base + 1] = dst_size;
-            words[base + 2] = word_base;
+            words[base + 2] = stream_byte_base;
             words[base + 3] = @intCast(stream_view.cmd_bytes[ci].len);
-            words[base + 4] = word_base;
-            words[base + 5] = @intCast(stream_view.lit_bytes[ci].len);
-            words[base + 6] = word_base;
+            // CPU unwrap already spliced the init prefix at the head of
+            // lit_bytes[ci]. lit_byte_base / lit_size point at the
+            // TOKEN-LOOP slice (after the prefix); init_byte_base
+            // (slot 15) points at the prefix.
+            words[base + 4] = stream_byte_base + ic;
+            words[base + 5] = @intCast(stream_view.lit_bytes[ci].len - ic);
+            words[base + 6] = stream_byte_base;
             words[base + 7] = @intCast(stream_view.off16_bytes[ci].len / 2);
-            words[base + 8] = word_base;
+            words[base + 8] = stream_byte_base;
             words[base + 9] = @intCast(stream_view.length_bytes[ci].len);
-            // Slot 10 = initial_copy bytes (chunk 0 only); pulled from
-            // the unwrap bundle which knows whether the sub-chunk
-            // carried an INITIAL_LITERAL_COPY_BYTES verbatim prefix.
-            if (stream_view.per_chunk_initial_copy) |pci| {
-                if (ci < pci.len) words[base + 10] = pci[ci];
-            }
-            // Slot 11 = u32-word base of this chunk's off32 slice.
+            words[base + 10] = ic;
+            // Slot 11 = BYTE base of this chunk's off32 slice.
             // Slots 12..14 = off32_count_block1 / off32_count_block2 /
             // cmd_stream2_offset, plumbed from the unwrap result.
-            words[base + 11] = ci * off32_cap_words;
+            words[base + 11] = off32_byte_base;
             if (stream_view.per_chunk_off32_count1) |a| if (ci < a.len) { words[base + 12] = a[ci]; };
             if (stream_view.per_chunk_off32_count2) |a| if (ci < a.len) { words[base + 13] = a[ci]; };
             if (stream_view.per_chunk_cmd_stream2_offset) |a| if (ci < a.len) { words[base + 14] = a[ci]; };
+            // Slot 15 = init_byte_base. Prefix sits at the head of the
+            // per-chunk lit slice.
+            words[base + 15] = stream_byte_base;
         }
     }
 
