@@ -41,9 +41,17 @@ const driver = @import("driver.zig");
 const probe_mod = @import("probe.zig");
 const l1_codec = @import("l1_codec.zig");
 const wire_format = @import("wire_format.zig");
+const wire_format_gpu = @import("wire_format_gpu.zig");
 const descriptors = @import("descriptors.zig");
 const dispatch = @import("dispatch.zig");
 const spv_blobs = @import("spv_blobs");
+
+/// When true (the default), `encodeL1ToSlz1` uses the GPU-side
+/// frame-assembly path (`wire_format_gpu.wrapL1ToSlz1Gpu`); when false
+/// it falls back to the CPU `wire_format.wrapL1ToSlz1`. Exposed at
+/// module scope so tests can A/B compare the two; production callers
+/// should leave it at the default.
+pub var use_gpu_wrap: bool = true;
 
 pub const Slz1Error = error{
     UnsupportedTier,
@@ -316,6 +324,22 @@ pub fn encodeL1ToSlz1Ex(
         .src_buffer_override = opts.src_buffer_override,
     });
     defer l1_codec.freeStreams(ctx, &enc.streams);
+
+    // GPU wrap path (Phase 3). Default — pipelines the wire-format
+    // wrap behind the same VkQueue the encoder already drives, so the
+    // host never sees the per-chunk LZ streams. Falls back to the CPU
+    // path when `use_gpu_wrap` is toggled off (testing / debugging).
+    if (use_gpu_wrap) {
+        return wire_format_gpu.wrapL1ToSlz1Gpu(ctx, allocator, enc.streams, src, out) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.OutputTooSmall => return error.OutputTooSmall,
+            error.BadHeader => return error.BadHeader,
+            error.UnsupportedTier => return error.UnsupportedTier,
+            error.NoSpvForTier => return error.NoSpvForTier,
+            error.TooManyChunks => return error.OutOfMemory,
+            else => return error.OutOfMemory,
+        };
+    }
 
     var bundle = try buildStreamBundle(allocator, ctx, enc.streams);
     defer bundle.deinit(allocator);

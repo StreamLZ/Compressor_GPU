@@ -1,8 +1,206 @@
-// SHELL: frame_assemble. Replace body when porting CUDA kernel.
+// ── StreamLZ Vulkan L1 frame-assembly: pass 3 (frame splice) ────────
+// L1-specialized port of slzFrameAssembleKernel from
+// src/encode/assemble_kernel.cu. Splices the device-resident assembled
+// sub-chunk payloads (from assemble_write.comp) plus host-precomputed
+// per-chunk dst offsets into a complete SLZ1 frame in `frame_out`.
+//
+// Per-chunk layout (compressed):
+//   [2B internal_hdr]                    (byte 0 = internal_hdr0,
+//                                          byte 1 = internal_hdr1)
+//   [4B LE chunk_hdr]                    = (compressed_size - 1) where
+//                                          compressed_size = 3 (sub-chunk
+//                                          header) + payload size.
+//   [3B BE sub-chunk header]             = sub_payload_size
+//                                          | (1 << SUBCHUNK_MODE_SHIFT)
+//                                          | SUBCHUNK_LZ_FLAG_BIT
+//   [sub-chunk payload]                  (copied from asm_out_buf at
+//                                          per_chunk_asm_off[i])
+//
+// Per-chunk layout (uncompressed — flagged by per_chunk_asm_off[i] ==
+// UNCOMPRESSED_CHUNK_MARKER):
+//   [2B internal_hdr w/ bit 7 set]
+//   [chunk_decomp_size raw source bytes copied from src_buf]
+//
+// Per-chunk descriptor (FrameChunkDesc) — 4 u32 per chunk:
+//   [0] dst_off              (byte offset into frame_out where this
+//                              chunk's 2B internal_hdr starts)
+//   [1] asm_or_marker        (UNCOMPRESSED_CHUNK_MARKER (0xFFFFFFFF) for
+//                              an uncompressed-fallback chunk, else the
+//                              byte offset into asm_out_buf where this
+//                              chunk's sub-chunk payload starts)
+//   [2] payload_size         (asm payload bytes when compressed, OR raw
+//                              decomp_size bytes when uncompressed)
+//   [3] sub_hdr_word         (precomputed 3B BE sub-chunk header word —
+//                              equals `payload_size | mode_bit | lz_flag`
+//                              for compressed chunks; ignored for
+//                              uncompressed chunks)
+//
+// Grid layout (mirrors CUDA): n_chunks + 1 workgroups.
+//   id < n_chunks  → write chunk's bytes.
+//   id == n_chunks → write prefix bytes (frame_hdr + block_hdr placeholder
+//                    + block_hdr backfill), SC tail prefix, end mark.
+//
+// Bindings:
+//   set=0, binding=0  ChunkDescs       readonly buffer { uint d[]; }
+//   set=0, binding=1  AsmOut           readonly buffer { uint8_t b[]; }
+//   set=0, binding=2  Src              readonly buffer { uint w[]; }
+//   set=0, binding=3  PrefixBytes      readonly buffer { uint8_t b[]; }
+//                        (pre-formed frame_hdr + block_hdr — host fills
+//                         in the block_hdr's compressed_size last because
+//                         it depends on the post-prefix-sum total.)
+//   set=0, binding=4  FrameOut         coherent  buffer { uint8_t b[]; }
+//
+// Push constants (32 bytes — must stay ≤ 128 for tier safety):
+//   uint  n_chunks
+//   uint  eff_chunk_size           (source chunking stride, == sub-chunk size)
+//   uint  src_len                  (total source byte count, for SC tail
+//                                    last-entry clamp)
+//   uint  prefix_size              (length of PrefixBytes)
+//   uint  sc_tail_off              (dst offset of SC tail table)
+//   uint  end_mark_off             (dst offset of 4-byte end mark)
+//   uint  packed_hdrs              = internal_hdr0 | (internal_hdr1 << 8)
+
 #version 460
 #extension GL_KHR_shader_subgroup_basic : require
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
-layout(set = 0, binding = 0) writeonly buffer Out { uint data[]; } out_buf;
+#extension GL_EXT_shader_8bit_storage   : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer ChunkDescs  { uint d[]; }     descs_buf;
+layout(std430, set = 0, binding = 1) readonly buffer AsmOut       { uint8_t b[]; } asm_out_buf;
+layout(set = 0, binding = 2) readonly buffer Src         { uint w[]; }     src_buf;
+layout(std430, set = 0, binding = 3) readonly buffer PrefixBytes  { uint8_t b[]; } prefix_buf;
+layout(std430, set = 0, binding = 4) coherent buffer FrameOut     { uint8_t b[]; } frame_out_buf;
+
+layout(push_constant) uniform PC {
+    uint n_chunks;
+    uint eff_chunk_size;
+    uint src_len;
+    uint prefix_size;
+    uint sc_tail_off;
+    uint end_mark_off;
+    uint packed_hdrs;
+} pc;
+
+const uint UNCOMPRESSED_CHUNK_MARKER = 0xFFFFFFFFu;
+const uint INTERNAL_BLOCK_UNCOMPRESSED_FLAG = 0x80u;
+const uint SC_TAIL_PER_CHUNK_BYTES = 8u;
+
+uint loadSrcByte(uint pos) {
+    uint w = src_buf.w[pos >> 2];
+    return (w >> ((pos & 3u) * 8u)) & 0xFFu;
+}
+
+void storeFrameByte(uint pos, uint v) {
+    frame_out_buf.b[pos] = uint8_t(v & 0xFFu);
+}
+
+void writeBE24(uint pos, uint v) {
+    storeFrameByte(pos + 0u, (v >> 16) & 0xFFu);
+    storeFrameByte(pos + 1u, (v >>  8) & 0xFFu);
+    storeFrameByte(pos + 2u,  v        & 0xFFu);
+}
+
+void writeLE32(uint pos, uint v) {
+    storeFrameByte(pos + 0u,  v        & 0xFFu);
+    storeFrameByte(pos + 1u, (v >>  8) & 0xFFu);
+    storeFrameByte(pos + 2u, (v >> 16) & 0xFFu);
+    storeFrameByte(pos + 3u, (v >> 24) & 0xFFu);
+}
+
 void main() {
-    if (gl_GlobalInvocationID.x == 0u) out_buf.data[0] = 0xDEADBEEFu;
+    uint block_id = gl_WorkGroupID.x;
+    uint tid      = gl_LocalInvocationID.x;
+    uint bdim     = gl_WorkGroupSize.x;
+
+    uint internal_hdr0 = (pc.packed_hdrs >> 0) & 0xFFu;
+    uint internal_hdr1 = (pc.packed_hdrs >> 8) & 0xFFu;
+
+    if (block_id < pc.n_chunks) {
+        uint base = block_id * 4u;
+        uint dst_off       = descs_buf.d[base + 0u];
+        uint asm_or_marker = descs_buf.d[base + 1u];
+        uint payload_size  = descs_buf.d[base + 2u];
+        uint sub_hdr_word  = descs_buf.d[base + 3u];
+
+        bool is_uncompressed = (asm_or_marker == UNCOMPRESSED_CHUNK_MARKER);
+
+        // 1. 2-byte internal block header.
+        if (tid == 0u) {
+            uint h0 = is_uncompressed
+                ? (internal_hdr0 | INTERNAL_BLOCK_UNCOMPRESSED_FLAG)
+                : internal_hdr0;
+            storeFrameByte(dst_off + 0u, h0);
+            storeFrameByte(dst_off + 1u, internal_hdr1);
+        }
+
+        // 2. Compressed chunks pay a 4-byte LE chunk_hdr + 3-byte BE
+        //    sub-chunk header before the payload. Uncompressed chunks
+        //    skip both.
+        uint payload_dst;
+        if (is_uncompressed) {
+            payload_dst = dst_off + 2u;
+        } else {
+            if (tid == 0u) {
+                // chunk_hdr_u32 = compressed_size - 1, where
+                // compressed_size = 3 (sub-chunk header) + payload_size.
+                uint compressed_size = payload_size + 3u;
+                writeLE32(dst_off + 2u, compressed_size - 1u);
+                // 3-byte BE sub-chunk header (host pre-computed).
+                writeBE24(dst_off + 6u, sub_hdr_word);
+            }
+            payload_dst = dst_off + 9u; // 2 + 4 + 3
+        }
+
+        // Publish lane-0 header bytes before the cooperative payload
+        // copy starts (they live in earlier bytes of the same
+        // workgroup's output range; technically a later byte in the
+        // same SSBO word might be involved on the boundary, so add a
+        // buffer memory barrier for correctness).
+        barrier();
+        memoryBarrierBuffer();
+
+        // 3. Payload copy. Each invocation writes a unique byte address
+        //    per iteration so the cooperative loop is race-free.
+        if (is_uncompressed) {
+            uint src_off = block_id * pc.eff_chunk_size;
+            for (uint i = tid; i < payload_size; i += bdim) {
+                storeFrameByte(payload_dst + i, loadSrcByte(src_off + i));
+            }
+        } else {
+            for (uint i = tid; i < payload_size; i += bdim) {
+                storeFrameByte(payload_dst + i, uint(asm_out_buf.b[asm_or_marker + i]));
+            }
+        }
+        return;
+    }
+
+    // block_id == n_chunks: prefix bytes (frame + block hdr) + SC tail
+    // prefix + end mark. The host pre-formed the frame and block headers
+    // and pre-baked the final block_hdr.compressed_size; we just copy
+    // the bytes verbatim into the front of frame_out.
+    if (block_id == pc.n_chunks) {
+        for (uint i = tid; i < pc.prefix_size; i += bdim) {
+            storeFrameByte(i, uint(prefix_buf.b[i]));
+        }
+
+        // SC tail: (n_chunks - 1) entries × 8 bytes; each entry is the
+        // first 8 source bytes of (entry_idx + 1). Pad with zero past EOF.
+        if (pc.n_chunks > 1u) {
+            uint total_tail_bytes = (pc.n_chunks - 1u) * SC_TAIL_PER_CHUNK_BYTES;
+            for (uint i = tid; i < total_tail_bytes; i += bdim) {
+                uint entry_idx     = i / SC_TAIL_PER_CHUNK_BYTES;
+                uint byte_in_entry = i - entry_idx * SC_TAIL_PER_CHUNK_BYTES;
+                uint chunk_idx     = entry_idx + 1u;
+                uint src_off       = chunk_idx * pc.eff_chunk_size + byte_in_entry;
+                uint v = (src_off < pc.src_len) ? loadSrcByte(src_off) : 0u;
+                storeFrameByte(pc.sc_tail_off + i, v);
+            }
+        }
+
+        // End mark: 4 zero bytes.
+        if (tid == 0u) writeLE32(pc.end_mark_off, 0u);
+        return;
+    }
 }
