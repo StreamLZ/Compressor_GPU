@@ -598,19 +598,26 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .link_libc = true,
     });
+    // Cluster F (F010): conformance harness now drives the VK production
+    // codec via slz1_codec.{encodeL1ToSlz1, decodeSlz1ToBytes}, which
+    // transitively imports `spv_blobs`. Wire the embed module + the
+    // shader-build dependency so the SPV blobs exist at compile time
+    // and @embedFile() inside spv_blobs.zig resolves the bare names.
+    addSpvBlobsImport(conformance_module, vk_shaders);
 
     const conformance_test = b.addTest(.{
         .root_module = conformance_module,
         .test_runner = .{ .path = b.path("src/test_runner_parallel.zig"), .mode = .simple },
     });
     conformance_test.step.dependOn(ptx_freshness);
+    conformance_test.step.dependOn(vk_shaders.embed_dir_step);
     const run_conformance = b.addRunArtifact(conformance_test);
     // Surface stdout/stderr live so the "conformance: X pass / Y fail / Z
     // skipped" summary is visible during the run, not buried in a log.
     run_conformance.has_side_effects = true;
     b.step(
         "test-conformance",
-        "Run the M9 cross-backend conformance matrix (CUDA↔CUDA real, VK cells stubbed)",
+        "Run the M9 cross-backend conformance matrix (all 4 directions through the production codec)",
     ).dependOn(&run_conformance.step);
     // Also fold into the main `zig build test` step so the dashboard runs
     // on every dev iteration — additive (does not replace the parallel

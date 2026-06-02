@@ -2,22 +2,28 @@
 //!
 //! Architecture: `docs/vulkan_port_architecture.md` §17 + port map §9.2 (3).
 //!
-//! The matrix is intentionally over-sized for the day-one substrate: only
-//! direction D1 (CUDA-encode → CUDA-decode roundtrip) runs real codec; D2
-//! (CUDA-encode → VK-decode), D3 (VK-encode → CUDA-decode) and D4
-//! (VK-encode → VK-decode) all return `.skipped_unimplemented` until the
-//! corresponding Vulkan production kernels land in waves 1 and 2.
+//! Today's matrix:
+//!   * D1 = CUDA-encode → CUDA-decode (production code path, runs when CUDA is up).
+//!   * D2 = CUDA-encode → VK-decode (production path; CUDA encoder + VK
+//!     `slz1_codec.decodeSlz1ToBytes`).
+//!   * D3 = VK-encode → CUDA-decode (production path; VK
+//!     `slz1_codec.encodeL1ToSlz1` + CUDA decoder).
+//!   * D4 = VK-encode → VK-decode (production path; both halves Vulkan).
 //!
-//! Existence of the harness is the M9 deliverable — every later Vulkan
-//! kernel milestone flips one or more cells from `skipped_unimplemented`
-//! to `pass` (or `fail`, which then blocks the milestone). The
-//! pass/fail/skipped tally line at the bottom of the run is the visible
-//! progress meter described in §3 of the milestone plan.
+//! Cluster F fix (F010): the matrix used to hard-code D2/D3/D4 to
+//! `skipped_unimplemented` even though the Vulkan production codec has
+//! been live for several milestones. This file now drives every cell
+//! through the same production entry points the CLI binaries call,
+//! producing real PASS/FAIL signal on the cross-backend matrix.
+//!
+//! All Vulkan cells are L1-only (the VK codec is L1-level only today),
+//! so for D2/D3/D4 only `level == 1` runs real codec; other levels
+//! report `.skipped_unimplemented` until the higher-level Vulkan path
+//! lands. D1 still runs all 5 levels.
 //!
 //! The harness owns its three corpora at `assets/{web.txt, enwik8.txt,
-//! silesia_all.tar}` and asserts byte-identical roundtrip per cell. The
-//! `cellDiff` helper bracket-prints the first divergence with ±32-byte
-//! context so a regression is debuggable from the test output alone.
+//! silesia_all.tar}` and asserts byte-identical roundtrip per cell.
+//! `cellDiff` brackets the first divergence with ±32 bytes of context.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -25,20 +31,24 @@ const testing = std.testing;
 
 // Relative imports work because the enclosing test module is rooted at
 // `tests_root.zig` (repo root), widening the package boundary to cover
-// both `src/` and `tests/`. See `tests_root.zig` for the rationale.
+// `src/`, `src_vulkan/`, and `tests/`. See `tests_root.zig`.
 const encoder = @import("../src/encode/streamlz_encoder.zig");
 const decoder = @import("../src/decode/streamlz_decoder.zig");
 const gpu_encoder = @import("../src/encode/driver.zig");
 const gpu_driver = @import("../src/decode/driver.zig");
 
+const vk_driver = @import("../src_vulkan/driver.zig");
+const vk_probe = @import("../src_vulkan/probe.zig");
+const vk_slz1 = @import("../src_vulkan/slz1_codec.zig");
+
 const Direction = enum {
-    /// CUDA encode → CUDA decode (real, ships today).
+    /// CUDA encode → CUDA decode.
     d1_cuda_cuda,
-    /// CUDA encode → Vulkan decode (gated on Wave-1 / M10..M20).
+    /// CUDA encode → Vulkan decode.
     d2_cuda_vk,
-    /// Vulkan encode → CUDA decode (gated on Wave-2 / M22..M26).
+    /// Vulkan encode → CUDA decode.
     d3_vk_cuda,
-    /// Vulkan encode → Vulkan decode (gated on Wave-2 completion).
+    /// Vulkan encode → Vulkan decode.
     d4_vk_vk,
 };
 
@@ -52,8 +62,9 @@ const Cell = struct {
 const CellResult = enum {
     pass,
     fail,
-    /// Backend not implemented yet (D2/D3/D4 today). Counts toward the
-    /// skipped tally and the milestone-progress reporter; not a failure.
+    /// Backend pair not implemented yet at this level. The Vulkan
+    /// codec is L1-only today, so D2/D3/D4 at level > 1 still hit
+    /// this terminal state. D1 never reports it.
     skipped_unimplemented,
     /// The dev machine lacks the device for this direction (no Vulkan
     /// loader, no NVIDIA GPU, etc.). Counts toward the skipped tally.
@@ -78,40 +89,78 @@ const directions = [_]Direction{
 
 // ── Corpus cache ──────────────────────────────────────────────────────
 // Each corpus is read at most once per test run. The cache is consulted
-// before every D1 cell so the 5 levels × 3 corpora = 15 real roundtrips
-// avoid 15 separate file reads of the 200+ MiB silesia tarball.
+// before every cell so the 5 levels × 3 corpora × 4 directions = 60
+// real roundtrips avoid 60 separate file reads of the 200+ MiB silesia
+// tarball.
 
 const CorpusEntry = struct {
     bytes: ?[]u8 = null,
-    /// `true` once the file was attempted (whether successful or not).
-    /// Subsequent attempts use the cached `bytes` (which may be `null` if
-    /// the file is missing — then the cell skips as device_mismatch).
+    /// Set once we've attempted the corpus; further attempts re-use the
+    /// cached `bytes` (which can be `null` when `missing == true`).
     tried: bool = false,
+    /// `true` if the file is legitimately absent (open returned
+    /// FileNotFound). The cell maps this to `.skipped_device_mismatch`.
+    missing: bool = false,
 };
 
 var corpus_cache: [corpora.len]CorpusEntry = @splat(.{});
 
-fn loadCorpus(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ?[]const u8 {
+/// Outcome of a corpus load:
+///   * `.ok(bytes)` — bytes ready (cached for the rest of the run).
+///   * `.missing` — file legitimately absent (FileNotFound), skip cell.
+///   * `.io_error` — some other IO failure (permission, corruption,
+///     short read); the caller MUST fail loudly because this is a real
+///     bug, not "the dev box doesn't have the corpus".
+const CorpusLoad = union(enum) {
+    ok: []const u8,
+    missing,
+    io_error: anyerror,
+};
+
+fn loadCorpus(allocator: std.mem.Allocator, io: std.Io, path: []const u8) CorpusLoad {
     const idx = for (corpora, 0..) |c, i| {
         if (std.mem.eql(u8, c, path)) break i;
-    } else return null;
+    } else return .{ .io_error = error.UnknownCorpus };
 
     const entry = &corpus_cache[idx];
-    if (entry.tried) return entry.bytes;
+    if (entry.tried) {
+        if (entry.missing) return .missing;
+        if (entry.bytes) |b| return .{ .ok = b };
+        // Tried but neither cached nor flagged missing — treat as IO
+        // error reproducer (a prior call hit this path and burned the
+        // entry; surfacing the failure is the point).
+        return .{ .io_error = error.CorpusLoadFailed };
+    }
     entry.tried = true;
 
-    // Hard cap on per-corpus size — `silesia_all.tar` is ~213 MiB, so 1 GiB
-    // gives generous headroom while still bounding a hostile / mis-named
-    // file. The cap is a sanity check, not a feature gate.
+    // Hard cap on per-corpus size — `silesia_all.tar` is ~213 MiB, so
+    // 1 GiB gives generous headroom while still bounding a hostile /
+    // mis-named file. The cap is a sanity check, not a feature gate.
     const max_corpus_bytes: usize = 1 << 30;
     const buf = std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
         allocator,
         @enumFromInt(max_corpus_bytes),
-    ) catch return null;
+    ) catch |err| switch (err) {
+        // Cluster F fix (F050): distinguish "the dev box doesn't have
+        // this corpus" (FileNotFound → skip cell, dashboard-friendly)
+        // from real IO errors (permission denied, corrupt file, short
+        // read, etc.) which used to be silently collapsed into a skip
+        // and let real failures go undetected.
+        // FileNotFound is the only "legitimately absent" branch we
+        // can take here; the other variants in the upstream error set
+        // (PermissionDenied, InputOutput, IsDir, NameTooLong, etc.)
+        // all indicate either a hostile filesystem or a misconfigured
+        // dev box, and the F050 fix demands we surface them loudly.
+        error.FileNotFound => {
+            entry.missing = true;
+            return .missing;
+        },
+        else => return .{ .io_error = err },
+    };
     entry.bytes = buf;
-    return buf;
+    return .{ .ok = buf };
 }
 
 fn freeCorpusCache(allocator: std.mem.Allocator) void {
@@ -152,78 +201,271 @@ fn cellDiff(expected: []const u8, actual: []const u8) void {
     std.debug.print("\n", .{});
 }
 
-// ── CUDA → CUDA real cell (D1) ────────────────────────────────────────
-// Single-pass roundtrip on the supplied corpus + level using the same
-// gpu_encoder / gpu_driver singletons the production CLI exercises.
-// Failures report the first-byte divergence via cellDiff and return
-// `.fail`; missing corpus returns `.skipped_device_mismatch`.
-fn runD1(allocator: std.mem.Allocator, io: std.Io, corpus_path: []const u8, level: u8) CellResult {
-    const src = loadCorpus(allocator, io, corpus_path) orelse return .skipped_device_mismatch;
+// ── CUDA helpers ──────────────────────────────────────────────────────
 
+fn cudaEncode(
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    level: u8,
+) ![]u8 {
     const bound = encoder.compressBound(src.len);
-    const compressed = allocator.alloc(u8, bound) catch return .fail;
-    defer allocator.free(compressed);
-
-    const n = encoder.compressFramed(
+    const compressed = try allocator.alloc(u8, bound);
+    errdefer allocator.free(compressed);
+    const n = try encoder.compressFramed(
         allocator,
         src,
         compressed,
         .{ .level = level },
         &gpu_encoder.g_default,
-    ) catch |err| {
+    );
+    return allocator.realloc(compressed, n) catch compressed[0..n];
+}
+
+fn cudaDecode(
+    allocator: std.mem.Allocator,
+    compressed: []const u8,
+    expected_size: usize,
+) ![]u8 {
+    const dst = try allocator.alloc(u8, expected_size + decoder.safe_space);
+    errdefer allocator.free(dst);
+    const written = try decoder.decompressFramed(compressed, dst, &gpu_driver.g_default);
+    if (written != expected_size) return error.SizeMismatch;
+    return allocator.realloc(dst, written) catch dst[0..written];
+}
+
+// ── Vulkan helpers ────────────────────────────────────────────────────
+
+fn vkEncode(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    src: []const u8,
+) ![]u8 {
+    const bound = vk_slz1.slz1Bound(src.len);
+    const compressed = try allocator.alloc(u8, bound);
+    errdefer allocator.free(compressed);
+    const n = try vk_slz1.encodeL1ToSlz1(
+        &vk_driver.g_default,
+        io,
+        allocator,
+        src,
+        compressed,
+    );
+    return allocator.realloc(compressed, n) catch compressed[0..n];
+}
+
+fn vkDecode(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    compressed: []const u8,
+    expected_size: usize,
+) ![]u8 {
+    const dst = try allocator.alloc(u8, expected_size);
+    errdefer allocator.free(dst);
+    const written = try vk_slz1.decodeSlz1ToBytes(
+        &vk_driver.g_default,
+        io,
+        allocator,
+        compressed,
+        dst,
+    );
+    if (written != expected_size) return error.SizeMismatch;
+    return dst[0..written];
+}
+
+// ── Direction implementations ─────────────────────────────────────────
+//
+// All four run the production code paths. D1 reuses the original CUDA
+// pipeline; D2/D3/D4 route through `slz1_codec.encodeL1ToSlz1` /
+// `decodeSlz1ToBytes` — the same entry points `streamlz_vk.exe` and
+// `slzCompressHost_vk` / `slzDecompressHost_vk` call. No test-only
+// fixtures; no shim decode helpers. If a redirected cell fails it's a
+// real production bug, not a test plumbing issue.
+
+fn runD1(allocator: std.mem.Allocator, src: []const u8, corpus_path: []const u8, level: u8) CellResult {
+    const compressed = cudaEncode(allocator, src, level) catch |err| {
         std.debug.print(
             "  D1 compress failed: corpus={s} level={d} err={s}\n",
             .{ corpus_path, level, @errorName(err) },
         );
         return .fail;
     };
+    defer allocator.free(compressed);
 
-    const dst = allocator.alloc(u8, src.len + decoder.safe_space) catch return .fail;
-    defer allocator.free(dst);
-
-    const written = decoder.decompressFramed(compressed[0..n], dst, &gpu_driver.g_default) catch |err| {
+    const dst = cudaDecode(allocator, compressed, src.len) catch |err| {
         std.debug.print(
             "  D1 decompress failed: corpus={s} level={d} err={s}\n",
             .{ corpus_path, level, @errorName(err) },
         );
         return .fail;
     };
-    if (written != src.len) {
-        std.debug.print(
-            "  D1 size mismatch: corpus={s} level={d} expected={d} got={d}\n",
-            .{ corpus_path, level, src.len, written },
-        );
+    defer allocator.free(dst);
+
+    if (!std.mem.eql(u8, src, dst)) {
+        std.debug.print("  D1 byte mismatch: corpus={s} level={d}\n", .{ corpus_path, level });
+        cellDiff(src, dst);
         return .fail;
     }
-    if (!std.mem.eql(u8, src, dst[0..written])) {
-        std.debug.print("  D1 byte mismatch: corpus={s} level={d}\n", .{ corpus_path, level });
-        cellDiff(src, dst[0..written]);
+    return .pass;
+}
+
+fn runD2(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    src: []const u8,
+    corpus_path: []const u8,
+    level: u8,
+) CellResult {
+    // CUDA-encode → VK-decode. Only level == 1 runs real codec; the VK
+    // decoder is L1-only.
+    const compressed = cudaEncode(allocator, src, level) catch |err| {
+        std.debug.print(
+            "  D2 CUDA-encode failed: corpus={s} level={d} err={s}\n",
+            .{ corpus_path, level, @errorName(err) },
+        );
+        return .fail;
+    };
+    defer allocator.free(compressed);
+
+    const dst = vkDecode(allocator, io, compressed, src.len) catch |err| {
+        std.debug.print(
+            "  D2 VK-decode failed: corpus={s} level={d} err={s}\n",
+            .{ corpus_path, level, @errorName(err) },
+        );
+        return .fail;
+    };
+    defer allocator.free(dst);
+
+    if (!std.mem.eql(u8, src, dst)) {
+        std.debug.print("  D2 byte mismatch: corpus={s} level={d}\n", .{ corpus_path, level });
+        cellDiff(src, dst);
+        return .fail;
+    }
+    return .pass;
+}
+
+fn runD3(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    src: []const u8,
+    corpus_path: []const u8,
+    level: u8,
+) CellResult {
+    // VK-encode → CUDA-decode. Level fixed at 1 (VK encoder is L1-only).
+    _ = level;
+    const compressed = vkEncode(allocator, io, src) catch |err| {
+        std.debug.print(
+            "  D3 VK-encode failed: corpus={s} err={s}\n",
+            .{ corpus_path, @errorName(err) },
+        );
+        return .fail;
+    };
+    defer allocator.free(compressed);
+
+    const dst = cudaDecode(allocator, compressed, src.len) catch |err| {
+        std.debug.print(
+            "  D3 CUDA-decode failed: corpus={s} err={s}\n",
+            .{ corpus_path, @errorName(err) },
+        );
+        return .fail;
+    };
+    defer allocator.free(dst);
+
+    if (!std.mem.eql(u8, src, dst)) {
+        std.debug.print("  D3 byte mismatch: corpus={s}\n", .{corpus_path});
+        cellDiff(src, dst);
+        return .fail;
+    }
+    return .pass;
+}
+
+fn runD4(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    src: []const u8,
+    corpus_path: []const u8,
+    level: u8,
+) CellResult {
+    _ = level;
+    const compressed = vkEncode(allocator, io, src) catch |err| {
+        std.debug.print(
+            "  D4 VK-encode failed: corpus={s} err={s}\n",
+            .{ corpus_path, @errorName(err) },
+        );
+        return .fail;
+    };
+    defer allocator.free(compressed);
+
+    const dst = vkDecode(allocator, io, compressed, src.len) catch |err| {
+        std.debug.print(
+            "  D4 VK-decode failed: corpus={s} err={s}\n",
+            .{ corpus_path, @errorName(err) },
+        );
+        return .fail;
+    };
+    defer allocator.free(dst);
+
+    if (!std.mem.eql(u8, src, dst)) {
+        std.debug.print("  D4 byte mismatch: corpus={s}\n", .{corpus_path});
+        cellDiff(src, dst);
         return .fail;
     }
     return .pass;
 }
 
 // ── Cell dispatch ─────────────────────────────────────────────────────
-// D1 runs real; D2/D3/D4 return `skipped_unimplemented` until the
-// matching Vulkan kernels land. The Vulkan-tagged cells will fan out to
-// their own runD2/runD3/runD4 once src_vulkan exposes a compress /
-// decompress entry point (currently every `_vk` ABI symbol returns
-// SLZ_ERROR_UNSUPPORTED per M2).
-fn runCell(allocator: std.mem.Allocator, io: std.Io, cell: Cell) CellResult {
+
+const Backends = struct {
+    cuda_up: bool,
+    vk_up: bool,
+};
+
+fn runCell(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cell: Cell,
+    backends: Backends,
+    src: []const u8,
+) CellResult {
     return switch (cell.direction) {
-        .d1_cuda_cuda => runD1(allocator, io, cell.corpus, cell.level),
-        .d2_cuda_vk => .skipped_unimplemented,
-        .d3_vk_cuda => .skipped_unimplemented,
-        .d4_vk_vk => .skipped_unimplemented,
+        .d1_cuda_cuda => if (!backends.cuda_up)
+            .skipped_device_mismatch
+        else
+            runD1(allocator, src, cell.corpus, cell.level),
+        .d2_cuda_vk => blk: {
+            if (!backends.cuda_up or !backends.vk_up) break :blk .skipped_device_mismatch;
+            // VK decoder is L1-only; higher levels stay parked.
+            if (cell.level != 1) break :blk .skipped_unimplemented;
+            break :blk runD2(allocator, io, src, cell.corpus, cell.level);
+        },
+        .d3_vk_cuda => blk: {
+            if (!backends.cuda_up or !backends.vk_up) break :blk .skipped_device_mismatch;
+            if (cell.level != 1) break :blk .skipped_unimplemented;
+            break :blk runD3(allocator, io, src, cell.corpus, cell.level);
+        },
+        .d4_vk_vk => blk: {
+            if (!backends.vk_up) break :blk .skipped_device_mismatch;
+            if (cell.level != 1) break :blk .skipped_unimplemented;
+            break :blk runD4(allocator, io, src, cell.corpus, cell.level);
+        },
     };
 }
 
 // ── Tier probe ────────────────────────────────────────────────────────
-// Placeholder until src_vulkan/probe.zig is wired through; the matrix is
-// stamped with this value so post-M21 dashboards can group results by
-// tier without rerunning. M9 only runs D1 cells so the choice is cosmetic.
+// Cluster F fix (F010): used to hard-code `"tier1"`. Now drives a real
+// `src_vulkan/probe.zig::probe()` call and maps the returned tier into
+// the dashboard's tier string. Falls back to "unsupported" when the
+// Vulkan loader is absent or the device probes below our tier-2 floor.
 fn probeTier() []const u8 {
-    return "tier1"; // M4 will replace with a real loader+probe call.
+    if (vk_driver.ensureInit()) |_| {} else |_| {
+        return "unsupported";
+    }
+    const r = vk_probe.probe(vk_driver.g_default.inst, vk_driver.g_default.pd);
+    return switch (r.tier) {
+        .tier1 => "tier1",
+        .tier1_nv => "tier1_nv",
+        .tier2 => "tier2",
+        .unsupported => "unsupported",
+    };
 }
 
 // ── The conformance test ──────────────────────────────────────────────
@@ -240,19 +482,44 @@ test "cross-backend conformance matrix" {
     const io = io_inst.io();
 
     // D1 needs the CUDA backend up. If absent, every D1 cell drops to
-    // .skipped_device_mismatch; the test still runs the matrix (it's a
-    // dashboard, not a gate) and asserts only that no cell hit .fail.
+    // `.skipped_device_mismatch`. D2/D3 also need CUDA; D4 just needs VK.
     const cuda_up = gpu_encoder.isAvailable() and
         gpu_driver.isAvailable() and
         gpu_driver.bindContextToCallingThread();
 
+    // Drive ensureInit through probeTier (it's the one place that
+    // gates everything else on Vulkan bring-up). If the loader is
+    // missing, every D2/D3/D4 cell drops to `.skipped_device_mismatch`.
     const tier = probeTier();
+    const vk_up = !std.mem.eql(u8, tier, "unsupported");
+
+    const backends: Backends = .{ .cuda_up = cuda_up, .vk_up = vk_up };
 
     var pass: u32 = 0;
     var fail: u32 = 0;
     var skipped: u32 = 0;
 
     for (corpora) |corpus| {
+        // Resolve the corpus once per outer loop and let every direction
+        // share the bytes. The cache makes this O(1) after the first hit;
+        // pulling it up here also lets us turn a real IO error into a
+        // visible test failure instead of a swallowed skip.
+        const corpus_bytes: ?[]const u8 = switch (loadCorpus(allocator, io, corpus)) {
+            .ok => |b| b,
+            .missing => null,
+            .io_error => |err| {
+                std.debug.print(
+                    "  corpus IO error: path={s} err={s}\n",
+                    .{ corpus, @errorName(err) },
+                );
+                // Cluster F fix (F050): an IO error that is NOT
+                // FileNotFound is a real bug, not "corpus not present
+                // on dev box". Make it loud.
+                try testing.expect(false);
+                return;
+            },
+        };
+
         for (levels) |lvl| {
             for (directions) |dir| {
                 const cell: Cell = .{
@@ -261,10 +528,10 @@ test "cross-backend conformance matrix" {
                     .direction = dir,
                     .tier = tier,
                 };
-                const r = if (!cuda_up and dir == .d1_cuda_cuda)
+                const r = if (corpus_bytes == null)
                     CellResult.skipped_device_mismatch
                 else
-                    runCell(allocator, io, cell);
+                    runCell(allocator, io, cell, backends, corpus_bytes.?);
                 switch (r) {
                     .pass => pass += 1,
                     .fail => fail += 1,
@@ -275,8 +542,8 @@ test "cross-backend conformance matrix" {
     }
 
     std.debug.print(
-        "conformance: {d} pass / {d} fail / {d} skipped\n",
-        .{ pass, fail, skipped },
+        "conformance: tier={s} {d} pass / {d} fail / {d} skipped\n",
+        .{ tier, pass, fail, skipped },
     );
     try testing.expectEqual(@as(u32, 0), fail);
 }
