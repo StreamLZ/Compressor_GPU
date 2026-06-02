@@ -473,6 +473,41 @@ pub fn decodeSlz1ToBytes(
     return decodeSlz1ToBytesEx(ctx, io, allocator, slz_bytes, out, .{});
 }
 
+// Per-process per-phase profile globals (ns) for decodeSlz1ToBytes.
+// Always populated; cli_vk.zig prints them when SLZ_VK_PROFILE_DECODE=1.
+// Mirror the same shape as l1_codec.last_decode_dst_*_ns so the bench
+// harness can pull per-phase numbers for the SLZ1 unwrap path.
+// Used by the P4 diagnosis (commit message) to confirm that the
+// dst readback through BAR was the dominant cost (~88 ms of a 122 ms
+// decode wall-time on web.txt 4.5 MB on NVIDIA RTX 4060 Ti).
+pub var last_decode_slz_unwrap_ns: u64 = 0;
+pub var last_decode_slz_alloc_ns: u64 = 0;
+pub var last_decode_slz_memset_ns: u64 = 0;
+pub var last_decode_slz_fill_ns: u64 = 0;
+pub var last_decode_slz_descset_ns: u64 = 0;
+pub var last_decode_slz_dispatch_ns: u64 = 0;
+pub var last_decode_slz_readback_ns: u64 = 0;
+
+const win32 = struct {
+    extern "kernel32" fn QueryPerformanceCounter(count: *i64) callconv(.c) c_int;
+    extern "kernel32" fn QueryPerformanceFrequency(freq: *i64) callconv(.c) c_int;
+};
+
+inline fn qpcNow() i64 {
+    var c: i64 = 0;
+    _ = win32.QueryPerformanceCounter(&c);
+    return c;
+}
+
+inline fn qpcNs(from: i64, to: i64) u64 {
+    var freq: i64 = 0;
+    _ = win32.QueryPerformanceFrequency(&freq);
+    if (freq <= 0) freq = 1;
+    const delta = if (to > from) to - from else 0;
+    const ns = @divTrunc(@as(i128, delta) * 1_000_000_000, @as(i128, freq));
+    return @intCast(ns);
+}
+
 pub fn decodeSlz1ToBytesEx(
     ctx: *driver.Context,
     io: std.Io,
@@ -494,9 +529,11 @@ pub fn decodeSlz1ToBytesEx(
     const dec_spv = try dupAlignedSpv(allocator, dec_spv_raw);
     defer allocator.free(dec_spv);
 
+    const t_unwrap_begin = qpcNow();
     var stream_view: wire_format.PerChunkStreams = undefined;
     var unwrap = try wire_format.unwrapSlz1ToL1Streams(allocator, slz_bytes, &stream_view);
     defer wire_format.freeUnwrapStorage(allocator, &unwrap.storage);
+    last_decode_slz_unwrap_ns = qpcNs(t_unwrap_begin, qpcNow());
 
     const dst_total: u32 = @intCast(unwrap.result.original_size);
     // When dst_buffer_override is set, the `out` host slice may be
@@ -511,6 +548,7 @@ pub fn decodeSlz1ToBytesEx(
     const off32_capacity = l1_codec.CHUNK_OFF32_CAPACITY;
     const off32_cap_total: vk.VkDeviceSize = @as(vk.VkDeviceSize, n_chunks) * off32_capacity;
 
+    const t_alloc_begin = qpcNow();
     var lit_b = try createMappedBuffer(ctx, stream_cap_total);
     defer destroyMappedBuffer(ctx, &lit_b);
     var cmd_b = try createMappedBuffer(ctx, stream_cap_total);
@@ -521,13 +559,21 @@ pub fn decodeSlz1ToBytesEx(
     defer destroyMappedBuffer(ctx, &length_b);
     var off32_b = try createMappedBuffer(ctx, off32_cap_total);
     defer destroyMappedBuffer(ctx, &off32_b);
+    last_decode_slz_alloc_ns = qpcNs(t_alloc_begin, qpcNow());
 
-    @memset(lit_b.mapped[0..@intCast(lit_b.size)], 0);
-    @memset(cmd_b.mapped[0..@intCast(cmd_b.size)], 0);
-    @memset(off16_b.mapped[0..@intCast(off16_b.size)], 0);
-    @memset(length_b.mapped[0..@intCast(length_b.size)], 0);
-    @memset(off32_b.mapped[0..@intCast(off32_b.size)], 0);
+    // No @memset on the stream buffers. The lz_decode shader reads
+    // each stream by byte offset bounded by per-chunk descriptor
+    // sizes (g_<stream>_size), so out-of-range bytes are never
+    // consumed. Pre-fix, this memset cleared 5 × stream_cap_total of
+    // BAR-mapped memory on NVIDIA at write-combine speed (~12 ms on
+    // 4.5 MB web.txt) for no functional benefit. Word loads at the
+    // tail of a stream may read up to 3 bytes past the last
+    // initialized byte, but the byte-shift+mask in loadCmdByte and
+    // friends discards them. Verified by the round-trip check below
+    // and the full vk-l1-test suite.
+    last_decode_slz_memset_ns = 0;
 
+    const t_fill_begin = qpcNow();
     {
         var ci: u32 = 0;
         while (ci < n_chunks) : (ci += 1) {
@@ -547,22 +593,49 @@ pub fn decodeSlz1ToBytesEx(
             }
         }
     }
+    last_decode_slz_fill_ns = qpcNs(t_fill_begin, qpcNow());
 
     const dst_buf_size: vk.VkDeviceSize = @max(
         @as(vk.VkDeviceSize, 4),
         (@as(vk.VkDeviceSize, dst_total) + 3) & ~@as(vk.VkDeviceSize, 3),
     );
-    // When dst_buffer_override is in use, the decoder writes
-    // directly into the caller's VkBuffer. Skip the internal
-    // allocation; `dst_b` stays zero-init and destroyMappedBuffer
-    // is a no-op on a null handle. The bound dst binding below
-    // is the override.
-    var dst_b: MappedBuffer = .{ .buf = null, .mem = null, .mapped = undefined, .size = 0 };
+    // Discrete-GPU readback pattern (mirrors the P1 fix in
+    // l1_codec.decodeL1Sync — commits 45613bd + 0fa1afb). The SLZ1
+    // decode path was missing this pattern: the previous
+    // createMappedBuffer call was placing dst in NVIDIA's resizable
+    // BAR region (DEVICE_LOCAL+HOST_VISIBLE), and the trailing
+    // @memcpy(out, dst_b.mapped) read at uncached PCIe BAR speed
+    // (~20-60 MB/s) — measured 88 ms of a 122 ms decode wall-time
+    // on web.txt 4.5 MB. We allocate:
+    //   dst_b     = DEVICE_LOCAL-only (no host mapping) so the kernel
+    //               writes at full VRAM bandwidth, and
+    //   dst_stage = HOST_VISIBLE+HOST_COHERENT explicitly NOT
+    //               DEVICE_LOCAL — driver-cached sysmem, so the host
+    //               @memcpy reads at full cached-memory bandwidth.
+    // A vkCmdCopyBuffer in the same cmdbuf as the dispatch (via
+    // dispatch.submitOneWithCopy) stages dst_b → dst_stage.
+    // On Intel iGPU every host-visible heap is also device-local; the
+    // .host_visible_sysmem mode then falls back to the rebar-style
+    // ideal and the extra copy is a tiny iGPU-bandwidth penalty
+    // (microseconds, dwarfed by the rest of the path).
+    var dst_b: l1_codec.Buffer = .{};
+    var dst_stage: l1_codec.Buffer = .{};
     if (!use_dst_override) {
-        dst_b = try createMappedBuffer(ctx, dst_buf_size);
-        @memset(dst_b.mapped[0..@intCast(dst_b.size)], 0);
+        dst_b = try l1_codec.createBufferEx(
+            ctx,
+            dst_buf_size,
+            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            .device_local_only,
+        );
+        dst_stage = try l1_codec.createBufferEx(
+            ctx,
+            dst_buf_size,
+            vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .host_visible_sysmem,
+        );
     }
-    defer if (!use_dst_override) destroyMappedBuffer(ctx, &dst_b);
+    defer if (!use_dst_override) l1_codec.destroyBuffer(ctx, &dst_b);
+    defer if (!use_dst_override) l1_codec.destroyBuffer(ctx, &dst_stage);
 
     var chunks_b = try createMappedBuffer(ctx, @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * 16);
     defer destroyMappedBuffer(ctx, &chunks_b);
@@ -597,6 +670,7 @@ pub fn decodeSlz1ToBytesEx(
         }
     }
 
+    const t_descset_begin = qpcNow();
     var cache: descriptors.Cache = .{};
     defer descriptors.invalidateAll(ctx, &cache);
 
@@ -626,14 +700,41 @@ pub fn decodeSlz1ToBytesEx(
     var dec_push_bytes: [@sizeOf(DecodePush)]u8 = undefined;
     @memcpy(dec_push_bytes[0..], std.mem.asBytes(&dec_push));
 
-    const dec_dispatch_result = try dispatch.submitOne(
-        ctx,
-        cached_dec.pipeline,
-        cached_dec.pipeline_layout,
-        dec_set,
-        dec_push_bytes[0..],
-        .{ n_chunks, 1, 1 },
-    );
+    last_decode_slz_descset_ns = qpcNs(t_descset_begin, qpcNow());
+
+    const t_dispatch_begin = qpcNow();
+    // Submit decode dispatch. When the caller did NOT supply a D2D
+    // dst override, queue a vkCmdCopyBuffer(dst_b → dst_stage) in
+    // the same cmdbuf so the host readback below reads from sysmem
+    // (cached) instead of BAR-mapped VRAM (uncached). The D2D path
+    // skips the copy because the caller's VkBuffer is its own dst
+    // — they don't go through the staging buffer at all.
+    const dec_dispatch_result = blk: {
+        if (use_dst_override or dst_total == 0) {
+            break :blk try dispatch.submitOne(
+                ctx,
+                cached_dec.pipeline,
+                cached_dec.pipeline_layout,
+                dec_set,
+                dec_push_bytes[0..],
+                .{ n_chunks, 1, 1 },
+            );
+        }
+        break :blk try dispatch.submitOneWithCopy(
+            ctx,
+            cached_dec.pipeline,
+            cached_dec.pipeline_layout,
+            dec_set,
+            dec_push_bytes[0..],
+            .{ n_chunks, 1, 1 },
+            .{
+                .src = dst_b.buf,
+                .dst = dst_stage.buf,
+                .size = @as(vk.VkDeviceSize, dst_total),
+            },
+        );
+    };
+    last_decode_slz_dispatch_ns = qpcNs(t_dispatch_begin, qpcNow());
     // Phase 4: surface the GPU-side dispatch ns so the CLI bench
     // and `slzGetLastTimings_vk` callers can report `d2d` numbers
     // for the SLZ1 decode path. `decodeL1Sync` writes the same
@@ -644,9 +745,13 @@ pub fn decodeSlz1ToBytesEx(
 
     // Host readback only when the host buffer was actually the
     // dst — D2D callers skip it entirely (the bytes are already
-    // in their device buffer).
-    if (!use_dst_override) {
-        @memcpy(out[0..dst_total], dst_b.mapped[0..dst_total]);
+    // in their device buffer). Reads from dst_stage (sysmem,
+    // driver-cached) instead of dst_b (DEVICE_LOCAL VRAM).
+    const t_readback_begin = qpcNow();
+    if (!use_dst_override and dst_total > 0) {
+        const stage_mapped = dst_stage.mapped orelse return error.MapMemoryFailed;
+        @memcpy(out[0..dst_total], stage_mapped[0..dst_total]);
     }
+    last_decode_slz_readback_ns = qpcNs(t_readback_begin, qpcNow());
     return dst_total;
 }

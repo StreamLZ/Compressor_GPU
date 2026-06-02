@@ -399,7 +399,7 @@ fn findHostVisibleNonDeviceLocal(
     return null;
 }
 
-const Buffer = struct {
+pub const Buffer = struct {
     buf: vk.VkBuffer = null,
     mem: vk.VkDeviceMemory = null,
     mapped: ?[*]u8 = null,
@@ -438,7 +438,7 @@ fn createBuffer(
     return createBufferEx(ctx, size, usage, mode);
 }
 
-fn createBufferEx(
+pub fn createBufferEx(
     ctx: *driver.Context,
     size: vk.VkDeviceSize,
     usage: vk.VkBufferUsageFlags,
@@ -532,7 +532,7 @@ fn createBufferEx(
     return .{ .buf = buf, .mem = mem, .mapped = mapped, .size = size };
 }
 
-fn destroyBuffer(ctx: *driver.Context, b: *Buffer) void {
+pub fn destroyBuffer(ctx: *driver.Context, b: *Buffer) void {
     if (ctx.dev == null) return;
     if (b.mapped != null) {
         if (vk.vkUnmapMemory_fn) |u| u(ctx.dev, b.mem);

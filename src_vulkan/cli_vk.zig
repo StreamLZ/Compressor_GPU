@@ -546,6 +546,26 @@ fn runBench(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: A
                 .{ r + 1, e2e_ms, mb * 1000.0 / e2e_ms },
             );
         }
+        // Optional profile breakdown — enable with SLZ_VK_PROFILE_DECODE=1.
+        const want_profile: bool = blk: {
+            const raw = std.c.getenv("SLZ_VK_PROFILE_DECODE") orelse break :blk false;
+            const s = std.mem.span(raw);
+            break :blk s.len > 0 and s[0] != '0';
+        };
+        if (want_profile) {
+            try w.print(
+                "    profile: unwrap={d:.2}ms alloc={d:.2}ms memset={d:.2}ms fill={d:.2}ms descset={d:.2}ms dispatch={d:.2}ms readback={d:.2}ms\n",
+                .{
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_unwrap_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_alloc_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_memset_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_fill_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_descset_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_dispatch_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_readback_ns)) / 1_000_000.0,
+                },
+            );
+        }
     }
 
     // Median across the runs. Slice the e2e and d2d arrays
