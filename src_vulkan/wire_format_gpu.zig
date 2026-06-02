@@ -1,37 +1,30 @@
 //! GPU-side SLZ1 wire-format wrap.
 //!
-//! Phase 3 of the Vulkan port (see `src_vulkan/TODO.md`): mirror the
-//! CUDA encoder's device-resident frame-assembly path. The CPU
-//! reference is `wire_format.wrapL1ToSlz1` (in `wire_format.zig`) —
-//! this module produces byte-identical output without staging the
-//! per-chunk LZ streams through host memory.
+//! Mirrors the CUDA encoder's device-resident frame-assembly path.
+//! The CPU reference is `wire_format.wrapL1ToSlz1` (in `wire_format.zig`) —
+//! this module produces byte-identical output without staging the per-chunk
+//! LZ streams or any frame/block header bytes through host memory.
 //!
 //! Pipeline (mirrors `src/encode/encode_assemble.zig`):
 //!
 //!   1. Build `AssembleMeasureDesc` (8 u32/chunk) from per-chunk
 //!      stream sizes + chunk geometry, upload, dispatch
 //!      `assemble_measure.comp` → per-chunk sub-chunk payload size.
-//!   2. Host: prefix-sum the per-chunk sizes; decide compressed vs.
-//!      uncompressed (sub_payload_size >= chunk_decomp_size triggers
-//!      the raw-block fallback per `wire_format.zig` §3 head comment);
-//!      build the per-chunk `AssembleWriteDesc` (16 u32/chunk) with
-//!      asm_out offsets baked in.
-//!   3. Upload AssembleWriteDesc, allocate the device-side asm_out
-//!      buffer, dispatch `assemble_write.comp` → assembled sub-chunk
-//!      payloads laid out back-to-back in `asm_out_buf`.
-//!   4. Pre-form frame_hdr + block_hdr bytes on host (per
-//!      `wire_format.zig`); compute the per-chunk dst offsets within
-//!      the final frame; build the 4-u32/chunk FrameChunkDesc;
-//!      upload prefix bytes + desc table; dispatch
-//!      `frame_assemble.comp` (n_chunks + 1 workgroups) → complete
-//!      frame in `frame_out_buf`.
-//!   5. Stage `frame_out_buf` → host `out` slice.
+//!   2. Dispatch `frame_layout.comp` (single-threaded GPU prefix-sum):
+//!      reads measure output, writes `AssembleWriteDesc` slot-0 +
+//!      `FrameChunkDesc` (all 4 slots) + `FrameMeta` (total_frame_size,
+//!      sc_tail_off, end_mark_off, asm_total, block_payload_size).
+//!   3. Dispatch `assemble_write.comp` → assembled sub-chunk payloads
+//!      laid out back-to-back in `asm_out_buf`.
+//!   4. Dispatch `frame_assemble.comp` (n_chunks + 1 workgroups) → splice
+//!      sub-chunk payloads into per-chunk slots AND synthesize the frame
+//!      header + block header + SC tail prefix + end mark directly into
+//!      `frame_out_buf` (no host prefix upload).
+//!   5. Read back `frame_meta_buf[0]` (total_frame_size) and memcpy
+//!      `frame_out_buf[0..total_frame_size]` → `out_host`.
 //!
-//! The CPU path remains callable as `wire_format.wrapL1ToSlz1`; the
-//! `gpu_wrap_supported` predicate below documents the cases this
-//! module handles (currently: every L1 corpus the CPU wrap handles,
-//! since the L1 codec doesn't run a Huffman pass and the assembler
-//! shaders emit only chunk-type-0 entropy chunks).
+//! No host-side computation of per-chunk offsets, no host header bytes
+//! uploaded, no host fallback toggle — the GPU pipeline IS the path.
 
 const std = @import("std");
 
@@ -41,14 +34,17 @@ const probe_mod = @import("probe.zig");
 const l1_codec = @import("l1_codec.zig");
 const descriptors = @import("descriptors.zig");
 const dispatch = @import("dispatch.zig");
-const wire_format = @import("wire_format.zig");
 const wire_constants = @import("wire_constants.zig");
 const spv_blobs = @import("spv_blobs");
 
-// CPU wire-format helpers (frame_hdr + block_hdr writers). Same import
-// pattern `wire_format.zig` uses — resolves via the per-target root
+// Frame-format constants (codec / level / block_size / sc_group_size /
+// flags / block_size_log2 base) — imported via the per-target root
 // (e.g. `wire_format_test_root.zig`) that widens the package boundary.
-const frame = @import("../src/format/frame_format.zig");
+// The frame header is now SYNTHESIZED on the GPU; the only thing we
+// pull out of the CPU module is the codec / level / block-size /
+// sc-group-size constants the host bakes into push constants for the
+// frame_assemble kernel.
+const frame_format = @import("../src/format/frame_format.zig");
 const block_header = @import("../src/format/block_header.zig");
 const constants = @import("../src/format/streamlz_constants.zig");
 
@@ -56,14 +52,11 @@ const constants = @import("../src/format/streamlz_constants.zig");
 
 const LZ_BLOCK_SIZE: u32 = wire_constants.LZ_BLOCK_SIZE;
 const INITIAL_LITERAL_COPY_BYTES: u32 = wire_constants.INITIAL_LITERAL_COPY_BYTES;
-const SUBCHUNK_LZ_FLAG_BIT: u32 = wire_constants.SUBCHUNK_LZ_FLAG_BIT;
-const SUBCHUNK_MODE_SHIFT: u5 = wire_constants.SUBCHUNK_MODE_SHIFT;
 const SUBCHUNK_HDR_BYTES: u32 = wire_constants.SUBCHUNK_HDR_BYTES;
 const CHUNK_INTERNAL_HDR_BYTES: u32 = wire_constants.CHUNK_INTERNAL_HDR_BYTES;
 const UNCOMPRESSED_CHUNK_HDR_BYTES: u32 = wire_constants.UNCOMPRESSED_CHUNK_HDR_BYTES;
 const OFF32_COUNT_PACK_MAX: u32 = wire_constants.OFF32_COUNT_PACK_MAX;
 const SC_TAIL_PER_CHUNK_BYTES: u32 = wire_constants.SC_TAIL_PER_CHUNK_BYTES;
-const UNCOMPRESSED_CHUNK_MARKER: u32 = wire_constants.UNCOMPRESSED_CHUNK_MARKER;
 
 // ── Errors ────────────────────────────────────────────────────────────
 
@@ -90,6 +83,13 @@ const MeasurePush = extern struct {
     n_chunks: u32,
 };
 
+const LayoutPush = extern struct {
+    n_chunks: u32,
+    eff_chunk_size: u32,
+    src_len: u32,
+    prefix_size: u32,
+};
+
 const WritePush = extern struct {
     n_chunks: u32,
 };
@@ -99,9 +99,12 @@ const FramePush = extern struct {
     eff_chunk_size: u32,
     src_len: u32,
     prefix_size: u32,
-    sc_tail_off: u32,
-    end_mark_off: u32,
     packed_hdrs: u32,
+    codec_byte: u32,
+    level_byte: u32,
+    block_size_log2_offset: u32,
+    sc_group_size_bits: u32,
+    flags_byte: u32,
 };
 
 // ── Buffer helper (host-visible, mirror l1_codec's pattern) ──────────
@@ -222,42 +225,74 @@ fn dupAlignedSpv(allocator: std.mem.Allocator, spv: []const u8) GpuWrapError![]a
     return buf;
 }
 
+// ── Frame-header constants (mirror writeHeader's encoder-side config) ─
+//
+// The GPU `frame_assemble.comp` kernel synthesizes the SLZ1 frame +
+// block header bytes directly into `frame_out_buf`. The encoder's
+// option set is fixed at compile time — codec=fast, level=1,
+// block_size=256 KiB, sc_group_size=0.25, content_size_present=true,
+// no dictionary, no content_checksum — so the corresponding header
+// fields are precomputed once here and passed to the kernel via push
+// constants. Mirrors `writeHeader` in `src/format/frame_format.zig`.
+
+const FRAME_CODEC_BYTE: u32 = @intFromEnum(frame_format.Codec.fast);
+const FRAME_LEVEL_BYTE: u32 = 1;
+const FRAME_BLOCK_SIZE_LOG2_OFFSET: u32 = blk: {
+    const min_log2 = std.math.log2_int(usize, frame_format.min_block_size);
+    const this_log2 = std.math.log2_int(usize, constants.chunk_size);
+    break :blk this_log2 - min_log2;
+};
+const FRAME_FLAGS_BYTE: u32 = blk: {
+    const f: frame_format.FrameFlags = .{ .content_size_present = true };
+    break :blk @as(u32, @intCast(@as(u8, @bitCast(f))));
+};
+
+/// Fixed prefix size (frame header + 8-byte block header) for the
+/// encoder's frozen option set. magic(4) + version(1) + flags(1) +
+/// codec(1) + level(1) + block_size_log2(1) + sc_group_size_f32(4) +
+/// reserved(1) + content_size_i64(8) + block_compressed_raw(4) +
+/// block_decomp(4) = 30 bytes. Asserted at compile time below.
+const PREFIX_SIZE: u32 = 14 + 8 + 8;
+
+comptime {
+    // Sanity-check against the CPU writer's bookkeeping — if anyone
+    // ever flips a flag bit or adds an optional field, the SPV kernel's
+    // inline header writer needs the matching change.
+    std.debug.assert(PREFIX_SIZE == 30);
+    std.debug.assert(FRAME_CODEC_BYTE == @intFromEnum(block_header.CodecType.fast));
+}
+
+// ── Frame-out / asm-out conservative upper bounds ───────────────────
+//
+// The host no longer participates in the per-chunk layout pass — the
+// GPU is the source of truth for per-chunk offsets, asm_total, and
+// total_frame_size. To size the buffers up-front (Vulkan needs the
+// allocation size at vkCreateBuffer time) we compute conservative
+// upper bounds the GPU kernel can never exceed.
+//
+// Per-chunk encoded ceiling:
+//   uncompressed: UNCOMPRESSED_CHUNK_HDR_BYTES + chunk_size
+//   compressed:   CHUNK_INTERNAL_HDR_BYTES + SUBCHUNK_HDR_BYTES + sps_max
+//                  where sps_max == subChunkPayloadSize at every chunk
+//                  capacity bound; using 2*chunk_size + 64 covers it
+//                  with margin (2*chunk_size comes from the L1 codec's
+//                  worst-case lit+cmd+off16+length budget; +64 covers
+//                  every per-chunk header byte the wire format adds).
+//
+// asm_out per-chunk ceiling: the chunk's sub-chunk payload only (no
+// per-chunk frame header overhead), bounded by sps_max above.
+
+fn perChunkFrameBound(chunk_size: u32) u32 {
+    const compressed_max: u32 = CHUNK_INTERNAL_HDR_BYTES + SUBCHUNK_HDR_BYTES + (2 * chunk_size) + 64;
+    const uncompressed_max: u32 = UNCOMPRESSED_CHUNK_HDR_BYTES + chunk_size;
+    return @max(compressed_max, uncompressed_max);
+}
+
+fn perChunkAsmBound(chunk_size: u32) u32 {
+    return (2 * chunk_size) + 64;
+}
+
 // ── Public API ────────────────────────────────────────────────────────
-
-/// Per-chunk sub-chunk payload size — same formula as
-/// `wire_format.subChunkPayloadSize` but evaluated on host using
-/// the per-chunk descriptor values the L1 codec publishes. Used by the
-/// pre-dispatch sizing pass for the asm_out buffer.
-fn subChunkPayloadSize(
-    streams: l1_codec.L1Streams,
-    ci: u32,
-    chunk_decomp_size: u32,
-    init_copy: u32,
-) u32 {
-    const lit = streams.per_chunk_lit_size[ci] - init_copy;
-    const cmd = streams.per_chunk_cmd_size[ci];
-    const off16_bytes = streams.per_chunk_off16_count[ci] * 2;
-    const length = streams.per_chunk_length_used[ci];
-    const c1 = streams.per_chunk_off32_count1[ci];
-    const c2 = streams.per_chunk_off32_count2[ci];
-    const off32_bytes = (c1 + c2) * 3;
-    var off32_ext: u32 = 0;
-    if (c1 >= OFF32_COUNT_PACK_MAX) off32_ext += 2;
-    if (c2 >= OFF32_COUNT_PACK_MAX) off32_ext += 2;
-
-    var n: u32 = init_copy;
-    n += 3 + lit;
-    n += 3 + cmd;
-    if (chunk_decomp_size > LZ_BLOCK_SIZE) n += 2;
-    n += 2 + off16_bytes;
-    n += 3 + off32_ext + off32_bytes;
-    n += length;
-    return n;
-}
-
-fn chunkInitialCopy(streams: l1_codec.L1Streams, ci: u32) u32 {
-    return streams.per_chunk_initial_copy[ci];
-}
 
 /// Wrap `streams` (already device-resident from `l1_codec.encodeL1Multi`)
 /// into a complete SLZ1 frame; write into `out_host`. The source bytes
@@ -265,7 +300,7 @@ fn chunkInitialCopy(streams: l1_codec.L1Streams, ci: u32) u32 {
 /// prefix — pass them via `src_host`. Returns the byte count written.
 ///
 /// Byte-identical to `wire_format.wrapL1ToSlz1` on every L1 corpus
-/// (verified by `wire_format_test`; see TODO.md Phase 3).
+/// (verified by `wire_format_test`).
 pub fn wrapL1ToSlz1Gpu(
     ctx: *driver.Context,
     allocator: std.mem.Allocator,
@@ -285,12 +320,8 @@ pub fn wrapL1ToSlz1Gpu(
     };
     const tier_b = tierBlob(tier) orelse return error.UnsupportedTier;
 
-    // ── 1. Pre-form frame_hdr + placeholder block_hdr on host ────────
     const original_size: u32 = @intCast(streams.dst_size);
-    const eff_chunk_size: u32 = streams.dst_size / n_chunks; // checked below
-    // Actual chunk size is l1_codec.CHUNK_SIZE — geometry from the L1 codec.
     const chunk_size: u32 = l1_codec.CHUNK_SIZE;
-    _ = eff_chunk_size;
     if (n_chunks > 1) {
         // Sanity: chunk_size * (n_chunks - 1) must be < original_size.
         if (@as(u64, chunk_size) * @as(u64, n_chunks - 1) >= original_size) {
@@ -298,139 +329,71 @@ pub fn wrapL1ToSlz1Gpu(
         }
     }
 
-    var prefix_buf: [frame.max_header_size + 8]u8 = undefined;
-    const hdr_n = frame.writeHeader(prefix_buf[0..], .{
-        .codec = .fast,
-        .level = 1,
-        .block_size = constants.chunk_size, // 256 KiB outer block bound
-        .sc_group_size = wire_constants.SC_GROUP_SIZE,
-        .content_size = original_size,
-        .dictionary_id = null,
-        .content_checksum = false,
-    }) catch return error.BadHeader;
-    // Block-header writer is filled later, after we know payload size.
-    const prefix_size: u32 = @intCast(hdr_n + 8);
+    // ── 1. Compute conservative upper bounds for the device buffers ─
+    // The GPU layout kernel writes the actual sizes into frame_meta_buf;
+    // the host reads them back after frame_assemble completes.
+    const sc_tail_bytes: u32 = if (n_chunks > 1) (n_chunks - 1) * SC_TAIL_PER_CHUNK_BYTES else 0;
+    const per_chunk_bound = perChunkFrameBound(chunk_size);
+    const per_chunk_asm_bound = perChunkAsmBound(chunk_size);
+    const total_frame_bound: u32 =
+        PREFIX_SIZE + (n_chunks * per_chunk_bound) + sc_tail_bytes + 4;
+    const asm_out_bound: u32 = n_chunks * per_chunk_asm_bound;
 
-    // Internal block header bytes (per-chunk repeated).
-    const internal_hdr0: u8 = 0x05 | 0x10 | 0x40; // magic | self_contained | restart_decoder
-    const internal_hdr1: u8 = @intFromEnum(block_header.CodecType.fast);
+    if (out_host.len < PREFIX_SIZE) return error.OutputTooSmall;
 
-    // ── 2. Host-side measurement (replicate measure-kernel arithmetic) ─
-    // Per-chunk payload sizes + uncompressed-fallback decision. The
-    // measure shader publishes the same values on the GPU — we run the
-    // same arithmetic here so we can pre-decide chunk dst offsets, pre-
-    // size the asm_out buffer, and skip a roundtrip dispatch+readback.
-    // Phase 4 may move the prefix-sum + decision to the GPU.
-    var sub_payload_sizes = allocator.alloc(u32, n_chunks) catch return error.OutOfMemory;
-    defer allocator.free(sub_payload_sizes);
-    var asm_offsets = allocator.alloc(u32, n_chunks) catch return error.OutOfMemory;
-    defer allocator.free(asm_offsets);
-    var per_chunk_asm_size = allocator.alloc(u32, n_chunks) catch return error.OutOfMemory;
-    defer allocator.free(per_chunk_asm_size);
-    var per_chunk_dst_off = allocator.alloc(u32, n_chunks) catch return error.OutOfMemory;
-    defer allocator.free(per_chunk_dst_off);
-    var per_chunk_decomp_size = allocator.alloc(u32, n_chunks) catch return error.OutOfMemory;
-    defer allocator.free(per_chunk_decomp_size);
+    // ── 2. Allocate device buffers ───────────────────────────────────
+    var measure_descs_b = try createHostVisibleBuffer(ctx, @as(vk.VkDeviceSize, n_chunks) * 8 * 4);
+    defer destroyBuffer(ctx, &measure_descs_b);
+    var measure_out_b = try createHostVisibleBuffer(ctx, @as(vk.VkDeviceSize, n_chunks) * 4);
+    defer destroyBuffer(ctx, &measure_out_b);
 
-    var asm_total: u32 = 0;
-    var pos: u32 = prefix_size;
+    var write_descs_b = try createHostVisibleBuffer(ctx, @as(vk.VkDeviceSize, n_chunks) * 16 * 4);
+    defer destroyBuffer(ctx, &write_descs_b);
+    var asm_out_b = try createHostVisibleBuffer(ctx, @max(@as(vk.VkDeviceSize, asm_out_bound), 4));
+    defer destroyBuffer(ctx, &asm_out_b);
+
+    var frame_descs_b = try createHostVisibleBuffer(ctx, @as(vk.VkDeviceSize, n_chunks) * 4 * 4);
+    defer destroyBuffer(ctx, &frame_descs_b);
+
+    // 5 u32: total_frame_size, sc_tail_off, end_mark_off, asm_total,
+    // block_payload_size — written by frame_layout, read by host (slot 0)
+    // and by frame_assemble (slots 1, 2, 4).
+    var frame_meta_b = try createHostVisibleBuffer(ctx, 5 * 4);
+    defer destroyBuffer(ctx, &frame_meta_b);
+
+    // Source buffer for the GPU side — uncompressed-fallback chunks
+    // copy `chunk_decomp_size` raw source bytes via frame_assemble;
+    // SC tail entries copy the first 8 source bytes of each non-first
+    // chunk via the same kernel.
+    const src_buf_size: vk.VkDeviceSize = @max(@as(vk.VkDeviceSize, src_host.len), 4);
+    var src_b = try createHostVisibleBuffer(ctx, src_buf_size);
+    defer destroyBuffer(ctx, &src_b);
+
+    var frame_out_b = try createHostVisibleBuffer(ctx, @max(@as(vk.VkDeviceSize, total_frame_bound), 4));
+    defer destroyBuffer(ctx, &frame_out_b);
+
+    // ── 3. Upload src + initialise device buffers ────────────────────
+    if (src_host.len > 0) {
+        @memcpy(src_b.mapped.?[0..src_host.len], src_host);
+    }
+    @memset(measure_out_b.mapped.?[0..@intCast(measure_out_b.size)], 0);
+    @memset(frame_meta_b.mapped.?[0..@intCast(frame_meta_b.size)], 0);
+    @memset(asm_out_b.mapped.?[0..@intCast(asm_out_b.size)], 0);
+    @memset(frame_out_b.mapped.?[0..@intCast(frame_out_b.size)], 0);
+
+    // ── 4. Populate AssembleMeasureDesc (8 u32/chunk) ────────────────
     {
+        const d: [*]u32 = @ptrCast(@alignCast(measure_descs_b.mapped.?));
         var ci: u32 = 0;
         while (ci < n_chunks) : (ci += 1) {
+            const base = ci * 8;
+            const init_copy = streams.per_chunk_initial_copy[ci];
             const chunk_dst_off: u64 = @as(u64, ci) * chunk_size;
             const decomp: u32 = blk: {
                 const remaining = original_size - chunk_dst_off;
                 if (remaining >= chunk_size) break :blk chunk_size;
                 break :blk @intCast(remaining);
             };
-            per_chunk_decomp_size[ci] = decomp;
-            const init_copy = chunkInitialCopy(streams, ci);
-            const sps = subChunkPayloadSize(streams, ci, decomp, init_copy);
-            sub_payload_sizes[ci] = sps;
-
-            const emit_uncompressed = sps >= decomp and
-                chunk_dst_off + decomp <= src_host.len;
-            per_chunk_dst_off[ci] = pos;
-            if (emit_uncompressed) {
-                asm_offsets[ci] = UNCOMPRESSED_CHUNK_MARKER;
-                per_chunk_asm_size[ci] = decomp;
-                pos += UNCOMPRESSED_CHUNK_HDR_BYTES + decomp;
-            } else {
-                asm_offsets[ci] = asm_total;
-                per_chunk_asm_size[ci] = sps;
-                asm_total += sps;
-                // Per-chunk overhead = 2B internal hdr + 4B chunk hdr +
-                // 3B sub-chunk hdr (CHUNK_INTERNAL_HDR_BYTES = 6 covers
-                // only the first two; the sub-chunk header is the third).
-                // The frame_assemble kernel writes payload at
-                // `dst_off + 9` for compressed chunks (see
-                // frame_assemble.comp), so the host has to advance `pos`
-                // by the same 9-byte overhead.
-                pos += CHUNK_INTERNAL_HDR_BYTES + SUBCHUNK_HDR_BYTES + sps;
-            }
-        }
-    }
-    const sc_tail_off: u32 = pos;
-    const sc_tail_bytes: u32 = if (n_chunks > 1)
-        (n_chunks - 1) * SC_TAIL_PER_CHUNK_BYTES
-    else
-        0;
-    pos += sc_tail_bytes;
-    const end_mark_off: u32 = pos;
-    pos += 4;
-    const total_frame_size: u32 = pos;
-
-    if (out_host.len < total_frame_size) return error.OutputTooSmall;
-
-    // Backfill the block header now that we know payload size.
-    const block_payload_size: u32 = total_frame_size - prefix_size - 4;
-    frame.writeBlockHeader(prefix_buf[hdr_n..][0..8], .{
-        .compressed_size = block_payload_size,
-        .decompressed_size = original_size,
-        .uncompressed = false,
-        .parallel_decode_metadata = false,
-    });
-
-    // ── 3. Allocate device buffers ───────────────────────────────────
-    var measure_descs_b = try createHostVisibleBuffer(ctx, @as(vk.VkDeviceSize, n_chunks) * 8 * 4);
-    defer destroyBuffer(ctx, &measure_descs_b);
-    var measure_out_b = try createHostVisibleBuffer(ctx, @as(vk.VkDeviceSize, n_chunks) * 4);
-    defer destroyBuffer(ctx, &measure_out_b);
-    var write_descs_b = try createHostVisibleBuffer(ctx, @as(vk.VkDeviceSize, n_chunks) * 16 * 4);
-    defer destroyBuffer(ctx, &write_descs_b);
-    var asm_out_b = try createHostVisibleBuffer(ctx, @max(@as(vk.VkDeviceSize, asm_total), 4));
-    defer destroyBuffer(ctx, &asm_out_b);
-
-    // Per-chunk frame_assemble descriptor: 4 u32 per chunk.
-    var frame_descs_b = try createHostVisibleBuffer(ctx, @as(vk.VkDeviceSize, n_chunks) * 4 * 4);
-    defer destroyBuffer(ctx, &frame_descs_b);
-    var prefix_b = try createHostVisibleBuffer(ctx, prefix_size);
-    defer destroyBuffer(ctx, &prefix_b);
-    // Source buffer — for SC tail prefix copies + uncompressed-chunk
-    // payload copies on the GPU side.
-    const src_buf_size: vk.VkDeviceSize = @max(@as(vk.VkDeviceSize, src_host.len), 4);
-    var src_b = try createHostVisibleBuffer(ctx, src_buf_size);
-    defer destroyBuffer(ctx, &src_b);
-    // Final frame buffer.
-    var frame_out_b = try createHostVisibleBuffer(ctx, @max(@as(vk.VkDeviceSize, total_frame_size), 4));
-    defer destroyBuffer(ctx, &frame_out_b);
-
-    // Populate src buffer + prefix buffer.
-    if (src_host.len > 0) {
-        @memcpy(src_b.mapped.?[0..src_host.len], src_host);
-    }
-    @memcpy(prefix_b.mapped.?[0..prefix_size], prefix_buf[0..prefix_size]);
-    @memset(asm_out_b.mapped.?[0..@intCast(asm_out_b.size)], 0);
-    @memset(frame_out_b.mapped.?[0..@intCast(frame_out_b.size)], 0);
-
-    // ── 4. Build measure descriptor + dispatch ───────────────────────
-    {
-        const d: [*]u32 = @ptrCast(@alignCast(measure_descs_b.mapped.?));
-        var ci: u32 = 0;
-        while (ci < n_chunks) : (ci += 1) {
-            const base = ci * 8;
-            const init_copy = chunkInitialCopy(streams, ci);
-            const decomp = per_chunk_decomp_size[ci];
             const c1 = streams.per_chunk_off32_count1[ci];
             const c2 = streams.per_chunk_off32_count2[ci];
             const lit_size = streams.per_chunk_lit_size[ci] - init_copy;
@@ -445,12 +408,53 @@ pub fn wrapL1ToSlz1Gpu(
             d[base + 7] = init_copy | (sub_decomp_gt_lzb << 16);
         }
     }
-    @memset(measure_out_b.mapped.?[0..@intCast(measure_out_b.size)], 0);
+
+    // ── 5. Pre-fill AssembleWriteDesc slots 1..15 (slot 0 = layout's) ─
+    {
+        const d: [*]u32 = @ptrCast(@alignCast(write_descs_b.mapped.?));
+        const cap_words: u32 = streams.chunk_capacity / 4;
+        const off32_cap_words: u32 = streams.off32_capacity / 4;
+        var ci: u32 = 0;
+        while (ci < n_chunks) : (ci += 1) {
+            const base = ci * 16;
+            const init_copy = streams.per_chunk_initial_copy[ci];
+            const chunk_dst_off: u64 = @as(u64, ci) * chunk_size;
+            const decomp: u32 = blk: {
+                const remaining = original_size - chunk_dst_off;
+                if (remaining >= chunk_size) break :blk chunk_size;
+                break :blk @intCast(remaining);
+            };
+            const c1 = streams.per_chunk_off32_count1[ci];
+            const c2 = streams.per_chunk_off32_count2[ci];
+
+            // Slot 0 = asm_out_offset (or UNCOMPRESSED_CHUNK_MARKER).
+            // Written by frame_layout.comp; pre-init to a poison value
+            // (max u32 - 1) so a missed layout dispatch surfaces as a
+            // visible OOB rather than silently appearing valid.
+            d[base + 0]  = 0xFFFF_FFFE;
+            d[base + 1]  = ci * cap_words;
+            d[base + 2]  = streams.per_chunk_lit_size[ci];
+            d[base + 3]  = ci * cap_words;
+            d[base + 4]  = streams.per_chunk_cmd_size[ci];
+            d[base + 5]  = ci * cap_words;
+            d[base + 6]  = streams.per_chunk_off16_count[ci];
+            d[base + 7]  = ci * cap_words;
+            d[base + 8]  = streams.per_chunk_length_used[ci];
+            d[base + 9]  = ci * off32_cap_words;
+            d[base + 10] = (c1 + c2) * 3;
+            d[base + 11] = c1;
+            d[base + 12] = c2;
+            d[base + 13] = 0; // src_byte_base — unused for L1 (init bytes come from lit_buf)
+            const sub_decomp_gt_lzb: u32 = if (decomp > LZ_BLOCK_SIZE) 1 else 0;
+            d[base + 14] = init_copy | (sub_decomp_gt_lzb << 16);
+            d[base + 15] = 0;
+        }
+    }
 
     var cache: descriptors.Cache = .{};
     defer descriptors.invalidateAll(ctx, &cache);
 
-    // Measure pass.
+    // ── 6. Measure dispatch ──────────────────────────────────────────
     {
         const spv_raw = spv_blobs.find("assemble_measure", tier_b) orelse return error.NoSpvForTier;
         const spv = try dupAlignedSpv(allocator, spv_raw);
@@ -472,60 +476,40 @@ pub fn wrapL1ToSlz1Gpu(
         );
     }
 
-    // NOTE: the measure-kernel output is functionally redundant — the
-    // host has already replicated the same per-chunk size arithmetic
-    // in `sub_payload_sizes` above (needed for the asm_out buffer-size
-    // and uncompressed-fallback predicate, both of which the host has
-    // to know synchronously). Keeping the measure dispatch in the
-    // pipeline anyway because:
-    //   1. It matches the CUDA assembler's three-pass topology,
-    //      simplifying parallel-implementation comparisons.
-    //   2. Phase 4 (`prefix_sum_chunks.comp` + GPU scan) wants to
-    //      consume measure-kernel output directly without the host
-    //      readback we currently take. Wiring it in now lets that
-    //      future change touch only the scan kernel.
-    // No runtime_safety assertion against the measure output — a
-    // mismatch can only mean a kernel/host arithmetic divergence,
-    // which the per-corpus round-trip suites already catch.
-
-    // ── 5. Build write descriptor + dispatch ─────────────────────────
+    // ── 7. Layout dispatch (GPU prefix-sum) ──────────────────────────
+    // Consumes measure output, writes AssembleWriteDesc slot 0,
+    // FrameChunkDesc (4 u32/chunk), FrameMeta (5 u32). After this
+    // dispatch fences, frame_meta_b is the source of truth for
+    // total_frame_size / sc_tail_off / end_mark_off / block_payload_size.
     {
-        const d: [*]u32 = @ptrCast(@alignCast(write_descs_b.mapped.?));
-        const cap_words: u32 = streams.chunk_capacity / 4;
-        const off32_cap_words: u32 = streams.off32_capacity / 4;
-        var ci: u32 = 0;
-        while (ci < n_chunks) : (ci += 1) {
-            const base = ci * 16;
-            const init_copy = chunkInitialCopy(streams, ci);
-            const decomp = per_chunk_decomp_size[ci];
-            const c1 = streams.per_chunk_off32_count1[ci];
-            const c2 = streams.per_chunk_off32_count2[ci];
-
-            // asm_out_offset — UNCOMPRESSED_CHUNK_MARKER means "skip the
-            // write kernel for this chunk" (frame_assemble will splice
-            // raw bytes from src instead). The shader checks slot 0 for
-            // the marker and bails before any descriptor reads.
-            const skip_write = (asm_offsets[ci] == UNCOMPRESSED_CHUNK_MARKER);
-            d[base + 0]  = if (skip_write) UNCOMPRESSED_CHUNK_MARKER else asm_offsets[ci];
-            d[base + 1]  = ci * cap_words;
-            d[base + 2]  = streams.per_chunk_lit_size[ci];
-            d[base + 3]  = ci * cap_words;
-            d[base + 4]  = streams.per_chunk_cmd_size[ci];
-            d[base + 5]  = ci * cap_words;
-            d[base + 6]  = streams.per_chunk_off16_count[ci];
-            d[base + 7]  = ci * cap_words;
-            d[base + 8]  = streams.per_chunk_length_used[ci];
-            d[base + 9]  = ci * off32_cap_words;
-            d[base + 10] = (c1 + c2) * 3;
-            d[base + 11] = c1;
-            d[base + 12] = c2;
-            d[base + 13] = 0; // src_byte_base — unused for L1 (init bytes come from lit_buf)
-            const sub_decomp_gt_lzb: u32 = if (decomp > LZ_BLOCK_SIZE) 1 else 0;
-            d[base + 14] = init_copy | (sub_decomp_gt_lzb << 16);
-            d[base + 15] = 0;
-        }
+        const spv_raw = spv_blobs.find("frame_layout", tier_b) orelse return error.NoSpvForTier;
+        const spv = try dupAlignedSpv(allocator, spv_raw);
+        defer allocator.free(spv);
+        const cached = try descriptors.getOrCreate(
+            ctx, &cache, "frame_layout", tier, spv, 4, @sizeOf(LayoutPush),
+        );
+        const bindings: [4]vk.VkDescriptorBufferInfo = .{
+            .{ .buffer = measure_out_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = write_descs_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = frame_descs_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = frame_meta_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        };
+        const set = try descriptors.allocSet(ctx, cached, bindings[0..]);
+        const push: LayoutPush = .{
+            .n_chunks = n_chunks,
+            .eff_chunk_size = chunk_size,
+            .src_len = @intCast(src_host.len),
+            .prefix_size = PREFIX_SIZE,
+        };
+        var push_bytes: [@sizeOf(LayoutPush)]u8 = undefined;
+        @memcpy(push_bytes[0..], std.mem.asBytes(&push));
+        _ = try dispatch.submitOne(
+            ctx, cached.pipeline, cached.pipeline_layout, set, push_bytes[0..],
+            .{ 1, 1, 1 },
+        );
     }
 
+    // ── 8. Write dispatch ────────────────────────────────────────────
     {
         const spv_raw = spv_blobs.find("assemble_write", tier_b) orelse return error.NoSpvForTier;
         const spv = try dupAlignedSpv(allocator, spv_raw);
@@ -553,23 +537,14 @@ pub fn wrapL1ToSlz1Gpu(
         );
     }
 
-    // ── 6. Build frame_assemble descriptor + dispatch ────────────────
-    {
-        const d: [*]u32 = @ptrCast(@alignCast(frame_descs_b.mapped.?));
-        var ci: u32 = 0;
-        while (ci < n_chunks) : (ci += 1) {
-            const base = ci * 4;
-            const is_uncompressed = (asm_offsets[ci] == UNCOMPRESSED_CHUNK_MARKER);
-            d[base + 0] = per_chunk_dst_off[ci];
-            d[base + 1] = asm_offsets[ci]; // already UNCOMPRESSED_CHUNK_MARKER for raw chunks
-            d[base + 2] = per_chunk_asm_size[ci];
-            d[base + 3] = if (is_uncompressed) 0 else
-                (sub_payload_sizes[ci] |
-                    (@as(u32, 1) << SUBCHUNK_MODE_SHIFT) |
-                    SUBCHUNK_LZ_FLAG_BIT);
-        }
-    }
-
+    // ── 9. Frame-assemble dispatch ───────────────────────────────────
+    // Splices per-chunk payloads into frame_out AND synthesizes the
+    // frame + block headers + SC tail prefix + end mark. The host no
+    // longer uploads any prefix bytes — every byte in frame_out_buf is
+    // written by this kernel.
+    const internal_hdr0: u32 = 0x05 | 0x10 | 0x40; // magic | self_contained | restart_decoder
+    const internal_hdr1: u32 = @intFromEnum(block_header.CodecType.fast);
+    const sc_group_size_bits: u32 = @bitCast(wire_constants.SC_GROUP_SIZE);
     {
         const spv_raw = spv_blobs.find("frame_assemble", tier_b) orelse return error.NoSpvForTier;
         const spv = try dupAlignedSpv(allocator, spv_raw);
@@ -581,19 +556,22 @@ pub fn wrapL1ToSlz1Gpu(
             .{ .buffer = frame_descs_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
             .{ .buffer = asm_out_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
             .{ .buffer = src_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-            .{ .buffer = prefix_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+            .{ .buffer = frame_meta_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
             .{ .buffer = frame_out_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         };
         const set = try descriptors.allocSet(ctx, cached, bindings[0..]);
-        const packed_hdrs: u32 = @as(u32, internal_hdr0) | (@as(u32, internal_hdr1) << 8);
+        const packed_hdrs: u32 = internal_hdr0 | (internal_hdr1 << 8);
         const push: FramePush = .{
             .n_chunks = n_chunks,
             .eff_chunk_size = chunk_size,
             .src_len = @intCast(src_host.len),
-            .prefix_size = prefix_size,
-            .sc_tail_off = sc_tail_off,
-            .end_mark_off = end_mark_off,
+            .prefix_size = PREFIX_SIZE,
             .packed_hdrs = packed_hdrs,
+            .codec_byte = FRAME_CODEC_BYTE,
+            .level_byte = FRAME_LEVEL_BYTE,
+            .block_size_log2_offset = FRAME_BLOCK_SIZE_LOG2_OFFSET,
+            .sc_group_size_bits = sc_group_size_bits,
+            .flags_byte = FRAME_FLAGS_BYTE,
         };
         var push_bytes: [@sizeOf(FramePush)]u8 = undefined;
         @memcpy(push_bytes[0..], std.mem.asBytes(&push));
@@ -603,7 +581,16 @@ pub fn wrapL1ToSlz1Gpu(
         );
     }
 
-    // ── 7. Stage frame_out → host ────────────────────────────────────
+    // ── 10. Read total_frame_size, stage frame_out → host ────────────
+    const meta_ptr: [*]u32 = @ptrCast(@alignCast(frame_meta_b.mapped.?));
+    const total_frame_size: u32 = meta_ptr[0];
+    if (total_frame_size == 0 or total_frame_size > total_frame_bound) {
+        // The GPU layout kernel never published a sane size — either
+        // the dispatch never ran or a constant divergence corrupted the
+        // running sum. Either way the frame bytes are unsafe to publish.
+        return error.BadHeader;
+    }
+    if (out_host.len < total_frame_size) return error.OutputTooSmall;
     @memcpy(out_host[0..total_frame_size], frame_out_b.mapped.?[0..total_frame_size]);
     return total_frame_size;
 }

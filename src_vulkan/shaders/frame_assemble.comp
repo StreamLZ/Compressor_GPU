@@ -1,8 +1,8 @@
 // ── StreamLZ Vulkan L1 frame-assembly: pass 3 (frame splice) ────────
 // L1-specialized port of slzFrameAssembleKernel from
 // src/encode/assemble_kernel.cu. Splices the device-resident assembled
-// sub-chunk payloads (from assemble_write.comp) plus host-precomputed
-// per-chunk dst offsets into a complete SLZ1 frame in `frame_out`.
+// sub-chunk payloads (from assemble_write.comp) plus GPU-synthesized
+// frame + block headers into a complete SLZ1 frame in `frame_out`.
 //
 // Per-chunk layout (compressed):
 //   [2B internal_hdr]                    (byte 0 = internal_hdr0,
@@ -21,7 +21,8 @@
 //   [2B internal_hdr w/ bit 7 set]
 //   [chunk_decomp_size raw source bytes copied from src_buf]
 //
-// Per-chunk descriptor (FrameChunkDesc) — 4 u32 per chunk:
+// Per-chunk descriptor (FrameChunkDesc) — 4 u32 per chunk (now written by
+// frame_layout.comp, not the host):
 //   [0] dst_off              (byte offset into frame_out where this
 //                              chunk's 2B internal_hdr starts)
 //   [1] asm_or_marker        (UNCOMPRESSED_CHUNK_MARKER (0xFFFFFFFF) for
@@ -35,30 +36,44 @@
 //                              for compressed chunks; ignored for
 //                              uncompressed chunks)
 //
+// Per-frame metadata (FrameMeta — written by frame_layout.comp, 5 u32):
+//   [0] total_frame_size     (host reads to drive the outbound memcpy)
+//   [1] sc_tail_off          (dst offset of SC tail table)
+//   [2] end_mark_off         (dst offset of 4-byte end mark)
+//   [3] asm_total            (telemetry — not consumed here)
+//   [4] block_payload_size   (= total_frame_size - prefix_size - 4)
+//
 // Grid layout (mirrors CUDA): n_chunks + 1 workgroups.
 //   id < n_chunks  → write chunk's bytes.
-//   id == n_chunks → write prefix bytes (frame_hdr + block_hdr placeholder
-//                    + block_hdr backfill), SC tail prefix, end mark.
+//   id == n_chunks → SYNTHESIZE the frame + block headers (no CPU
+//                    prefix-buffer upload), then write SC tail prefix +
+//                    end mark.
 //
 // Bindings:
 //   set=0, binding=0  ChunkDescs       readonly buffer { uint d[]; }
 //   set=0, binding=1  AsmOut           readonly buffer { uint8_t b[]; }
 //   set=0, binding=2  Src              readonly buffer { uint w[]; }
-//   set=0, binding=3  PrefixBytes      readonly buffer { uint8_t b[]; }
-//                        (pre-formed frame_hdr + block_hdr — host fills
-//                         in the block_hdr's compressed_size last because
-//                         it depends on the post-prefix-sum total.)
+//   set=0, binding=3  FrameMeta        readonly buffer { uint v[]; }
 //   set=0, binding=4  FrameOut         coherent  buffer { uint8_t b[]; }
 //
 // Push constants (32 bytes — must stay ≤ 128 for tier safety):
 //   uint  n_chunks
 //   uint  eff_chunk_size           (source chunking stride, == sub-chunk size)
 //   uint  src_len                  (total source byte count, for SC tail
-//                                    last-entry clamp)
-//   uint  prefix_size              (length of PrefixBytes)
-//   uint  sc_tail_off              (dst offset of SC tail table)
-//   uint  end_mark_off             (dst offset of 4-byte end mark)
+//                                    last-entry clamp + content_size field
+//                                    in the frame header)
+//   uint  prefix_size              (frame_hdr + block_hdr byte count;
+//                                    must match the host's slz1Bound
+//                                    calculation and the layout kernel's
+//                                    PC.prefix_size)
 //   uint  packed_hdrs              = internal_hdr0 | (internal_hdr1 << 8)
+//   uint  codec_byte               (frame header codec field — 0/1/2)
+//   uint  level_byte               (frame header level field — 1-9)
+//   uint  block_size_log2_offset   (frame header block_size_log2 - 16)
+//   uint  sc_group_size_bits       (f32 sc_group_size reinterpreted as u32)
+//   uint  flags_byte               (frame header flags byte —
+//                                    content_size_present bit and any other
+//                                    flag bits the host configured)
 
 #version 460
 #extension GL_KHR_shader_subgroup_basic : require
@@ -70,7 +85,7 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0) readonly buffer ChunkDescs  { uint d[]; }     descs_buf;
 layout(std430, set = 0, binding = 1) readonly buffer AsmOut       { uint8_t b[]; } asm_out_buf;
 layout(set = 0, binding = 2) readonly buffer Src         { uint w[]; }     src_buf;
-layout(std430, set = 0, binding = 3) readonly buffer PrefixBytes  { uint8_t b[]; } prefix_buf;
+layout(set = 0, binding = 3) readonly buffer FrameMeta   { uint v[]; }     frame_meta_buf;
 layout(std430, set = 0, binding = 4) coherent buffer FrameOut     { uint8_t b[]; } frame_out_buf;
 
 layout(push_constant) uniform PC {
@@ -78,14 +93,32 @@ layout(push_constant) uniform PC {
     uint eff_chunk_size;
     uint src_len;
     uint prefix_size;
-    uint sc_tail_off;
-    uint end_mark_off;
     uint packed_hdrs;
+    uint codec_byte;
+    uint level_byte;
+    uint block_size_log2_offset;
+    uint sc_group_size_bits;
+    uint flags_byte;
 } pc;
 
 const uint UNCOMPRESSED_CHUNK_MARKER = 0xFFFFFFFFu;
 const uint INTERNAL_BLOCK_UNCOMPRESSED_FLAG = 0x80u;
 const uint SC_TAIL_PER_CHUNK_BYTES = 8u;
+// SLZ1 magic: 0x534C5A31 (stored little-endian on disk → bytes 31 5A 4C 53).
+const uint SLZ1_FRAME_MAGIC = 0x534C5A31u;
+const uint SLZ1_FRAME_VERSION = 2u;
+const uint FRAME_FLAGS_CONTENT_SIZE_PRESENT = 0x1u;
+// Frame-header fixed-portion byte offsets (mirrors writeHeader() in
+// src/format/frame_format.zig).
+const uint FRAME_HDR_FIXED_BYTES = 14u; // magic(4) + ver(1) + flags(1)
+                                        // + codec(1) + level(1)
+                                        // + block_size_log2(1)
+                                        // + sc_group_size_f32(4)
+                                        // + reserved(1)
+const uint FRAME_HDR_CONTENT_SIZE_BYTES = 8u;
+// Block-header layout (writeBlockHeader): 4B LE raw (compressed_size)
+// + 4B LE decompressed_size.
+const uint BLOCK_HDR_BYTES = 8u;
 
 uint loadSrcByte(uint pos) {
     uint w = src_buf.w[pos >> 2];
@@ -107,6 +140,56 @@ void writeLE32(uint pos, uint v) {
     storeFrameByte(pos + 1u, (v >>  8) & 0xFFu);
     storeFrameByte(pos + 2u, (v >> 16) & 0xFFu);
     storeFrameByte(pos + 3u, (v >> 24) & 0xFFu);
+}
+
+// Synthesize the SLZ1 frame header + block header into frame_out at
+// offset 0. Mirrors src/format/frame_format.zig::writeHeader +
+// writeBlockHeader, for the L1 encoder's fixed option set:
+//
+//   * flags.content_size_present is the only flag bit set today
+//     (the host computes the byte and passes it via PC.flags_byte —
+//     keeps the shader oblivious to future flag bits the encoder might
+//     enable, e.g. content_checksum).
+//   * dictionary_id is never present, so the optional 4-byte tail is
+//     omitted unconditionally.
+//   * Layout: magic(4) + version(1) + flags(1) + codec(1) + level(1) +
+//     block_size_log2(1) + sc_group_size_f32(4) + reserved(1) +
+//     content_size_i64(8) + block_compressed_raw(4) + block_decomp(4)
+//     = 30 bytes total = pc.prefix_size.
+void writeFrameAndBlockHeader() {
+    // Frame magic — 4 bytes LE.
+    writeLE32(0u, SLZ1_FRAME_MAGIC);
+    storeFrameByte(4u, SLZ1_FRAME_VERSION);
+    storeFrameByte(5u, pc.flags_byte & 0xFFu);
+    storeFrameByte(6u, pc.codec_byte & 0xFFu);
+    storeFrameByte(7u, pc.level_byte & 0xFFu);
+    storeFrameByte(8u, pc.block_size_log2_offset & 0xFFu);
+    writeLE32(9u, pc.sc_group_size_bits);
+    storeFrameByte(13u, 0u); // reserved
+
+    uint pos = FRAME_HDR_FIXED_BYTES;
+
+    if ((pc.flags_byte & FRAME_FLAGS_CONTENT_SIZE_PRESENT) != 0u) {
+        // content_size as LE i64 — host already enforces src_len fits
+        // in i32 / u32, so the upper 4 bytes are zero today. Write the
+        // low 32 bits explicitly and zero the high 32.
+        writeLE32(pos + 0u, pc.src_len);
+        writeLE32(pos + 4u, 0u);
+        pos += FRAME_HDR_CONTENT_SIZE_BYTES;
+    }
+
+    // Block header: 4B raw (compressed_size, no flags set for L1) +
+    // 4B decompressed_size. uncompressed and parallel_decode_metadata
+    // flag bits are NEVER set by the GPU L1 encoder (those are CPU-
+    // codec bits — see src/format/frame_format.zig head comment).
+    uint block_payload_size = frame_meta_buf.v[4];
+    writeLE32(pos + 0u, block_payload_size);
+    writeLE32(pos + 4u, pc.src_len);
+    pos += BLOCK_HDR_BYTES;
+
+    // pos must now equal pc.prefix_size — if it doesn't, the host's
+    // sizing math is out of sync with this writer. No runtime assert
+    // (this is a shader); the round-trip tests catch any divergence.
 }
 
 void main() {
@@ -147,7 +230,7 @@ void main() {
                 // compressed_size = 3 (sub-chunk header) + payload_size.
                 uint compressed_size = payload_size + 3u;
                 writeLE32(dst_off + 2u, compressed_size - 1u);
-                // 3-byte BE sub-chunk header (host pre-computed).
+                // 3-byte BE sub-chunk header (layout kernel pre-computed).
                 writeBE24(dst_off + 6u, sub_hdr_word);
             }
             payload_dst = dst_off + 9u; // 2 + 4 + 3
@@ -176,17 +259,22 @@ void main() {
         return;
     }
 
-    // block_id == n_chunks: prefix bytes (frame + block hdr) + SC tail
-    // prefix + end mark. The host pre-formed the frame and block headers
-    // and pre-baked the final block_hdr.compressed_size; we just copy
-    // the bytes verbatim into the front of frame_out.
+    // block_id == n_chunks: synthesize the frame + block headers in
+    // place (no CPU prefix upload), then write the SC tail prefix + the
+    // end mark.
     if (block_id == pc.n_chunks) {
-        for (uint i = tid; i < pc.prefix_size; i += bdim) {
-            storeFrameByte(i, uint(prefix_buf.b[i]));
+        // Frame + block headers — single-thread (lane 0) write. The
+        // writers do at most 30 byte stores (FRAME_HDR_FIXED_BYTES +
+        // optional content_size + block_hdr = 14 + 8 + 8 = 30), so
+        // parallelizing across the workgroup buys nothing.
+        if (tid == 0u) {
+            writeFrameAndBlockHeader();
         }
 
         // SC tail: (n_chunks - 1) entries × 8 bytes; each entry is the
         // first 8 source bytes of (entry_idx + 1). Pad with zero past EOF.
+        uint sc_tail_off  = frame_meta_buf.v[1];
+        uint end_mark_off = frame_meta_buf.v[2];
         if (pc.n_chunks > 1u) {
             uint total_tail_bytes = (pc.n_chunks - 1u) * SC_TAIL_PER_CHUNK_BYTES;
             for (uint i = tid; i < total_tail_bytes; i += bdim) {
@@ -195,12 +283,12 @@ void main() {
                 uint chunk_idx     = entry_idx + 1u;
                 uint src_off       = chunk_idx * pc.eff_chunk_size + byte_in_entry;
                 uint v = (src_off < pc.src_len) ? loadSrcByte(src_off) : 0u;
-                storeFrameByte(pc.sc_tail_off + i, v);
+                storeFrameByte(sc_tail_off + i, v);
             }
         }
 
         // End mark: 4 zero bytes.
-        if (tid == 0u) writeLE32(pc.end_mark_off, 0u);
+        if (tid == 0u) writeLE32(end_mark_off, 0u);
         return;
     }
 }

@@ -691,6 +691,7 @@ const vk_kernels = [_][]const u8{
     "huff_encode_4stream",
     "assemble_measure",
     "assemble_write",
+    "frame_layout",
     "frame_assemble",
     // decode (12)
     "walk_frame",
@@ -734,7 +735,7 @@ fn resolveGlslc(b: *std.Build) []const u8 {
 
 fn addVulkanShaderSteps(b: *std.Build) VulkanShaders {
     const glslc = resolveGlslc(b);
-    const vk_shaders_step = b.step("vk-shaders", "Compile Vulkan compute shaders to SPIR-V (18 × 3 = 54 blobs)");
+    const vk_shaders_step = b.step("vk-shaders", "Compile Vulkan compute shaders to SPIR-V (19 × 3 = 57 blobs)");
     // Single WriteFile aggregates every .spv into one generated directory.
     // The same dir also receives a copy of src_vulkan/spv_blobs.zig so its
     // bare-filename @embedFile() calls resolve against sibling .spv files;

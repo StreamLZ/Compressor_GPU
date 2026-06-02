@@ -1,0 +1,166 @@
+// ── StreamLZ Vulkan L1 frame-assembly: GPU layout / prefix-sum ──────
+// Consumes `assemble_measure.comp`'s per-chunk sub-chunk payload sizes
+// and produces every per-chunk descriptor + per-frame offset the
+// downstream `assemble_write` + `frame_assemble` kernels need.
+//
+// This kernel replaces the host-side loop that used to live in
+// `wire_format_gpu.zig` immediately after the measure dispatch — the
+// host was running the same arithmetic in lockstep with the GPU and
+// throwing the GPU's output away. After this kernel lands, the host's
+// only job is to allocate worst-case-sized buffers and read back the
+// final frame size for the outbound memcpy.
+//
+// Per-chunk decision logic (mirror of wire_format_gpu.zig:337-372):
+//
+//   sps           = measure_out[ci]                            (from assemble_measure)
+//   decomp        = min(chunk_size, src_len - ci * chunk_size)
+//   uncompressed  = sps >= decomp && ci*chunk_size + decomp <= src_len
+//   per_chunk_asm_size[ci] = uncompressed ? decomp : sps
+//   asm_offset[ci]         = uncompressed ? UNCOMPRESSED_CHUNK_MARKER
+//                                          : running asm_total
+//   dst_off[ci]            = running pos (starts at prefix_size)
+//   pos += uncompressed ? UNCOMPRESSED_CHUNK_HDR_BYTES + decomp
+//                       : CHUNK_INTERNAL_HDR_BYTES + SUBCHUNK_HDR_BYTES + sps
+//
+// After the per-chunk loop:
+//   sc_tail_off       = pos
+//   end_mark_off      = sc_tail_off + (n_chunks - 1) * SC_TAIL_PER_CHUNK_BYTES
+//   total_frame_size  = end_mark_off + 4
+//   asm_total         = running asm_total
+//
+// Per-chunk descriptor outputs:
+//
+//   write_descs[ci][0]    = uncompressed ? UNCOMPRESSED_CHUNK_MARKER
+//                                        : running asm_total
+//     (host pre-fills slots 1..15 — they're per-chunk L1 stream
+//      base/size fields the assemble_write kernel reads as input)
+//
+//   frame_descs[ci][0..3] = { dst_off, asm_or_marker, payload_size,
+//                             sub_hdr_word }
+//     (full 4-u32 descriptor — frame_assemble consumes all four)
+//
+// Frame metadata output (5 u32):
+//
+//   frame_meta[0] = total_frame_size
+//   frame_meta[1] = sc_tail_off
+//   frame_meta[2] = end_mark_off
+//   frame_meta[3] = asm_total           (host telemetry / debugging;
+//                                         not consumed by downstream
+//                                         kernels)
+//   frame_meta[4] = block_payload_size  (= total_frame_size - prefix_size - 4;
+//                                         frame_assemble.comp reads this
+//                                         to backfill the block header it
+//                                         now synthesizes inline)
+//
+// Bindings:
+//   set=0, binding=0  MeasureOut    readonly  { uint sps[]; }     (from assemble_measure)
+//   set=0, binding=1  WriteDescs    coherent  { uint d[]; }       (16 u32/chunk — slot 0 written here)
+//   set=0, binding=2  FrameDescs    writeonly { uint d[]; }       (4 u32/chunk — all 4 slots written)
+//   set=0, binding=3  FrameMeta     writeonly { uint v[]; }       (5 u32)
+//
+// Push constants:
+//   uint n_chunks
+//   uint eff_chunk_size
+//   uint src_len
+//   uint prefix_size
+//
+// Dispatch: grid=(1,1,1), local=(1,1,1). Single-threaded prefix-sum;
+// n_chunks ≤ 4096 (MAX_CHUNKS) so well under 100 µs at any chunk count.
+// Matches the topology of `prefix_sum_chunks.comp` on the decode side
+// (same justification — n bounded, dispatch overhead dwarfs the loop).
+
+#version 460
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer MeasureOut  { uint sps[]; } measure_out_buf;
+layout(std430, set = 0, binding = 1) coherent  buffer WriteDescs  { uint d[]; }   write_descs_buf;
+layout(std430, set = 0, binding = 2) writeonly buffer FrameDescs  { uint d[]; }   frame_descs_buf;
+layout(std430, set = 0, binding = 3) writeonly buffer FrameMeta   { uint v[]; }   frame_meta_buf;
+
+layout(push_constant) uniform PC {
+    uint n_chunks;
+    uint eff_chunk_size;
+    uint src_len;
+    uint prefix_size;
+} pc;
+
+// Mirror wire_constants.zig — keep in sync.
+const uint UNCOMPRESSED_CHUNK_MARKER  = 0xFFFFFFFFu;
+const uint UNCOMPRESSED_CHUNK_HDR_BYTES = 2u;
+const uint CHUNK_INTERNAL_HDR_BYTES   = 6u;   // 2 (internal) + 4 (chunk_hdr)
+const uint SUBCHUNK_HDR_BYTES         = 3u;
+const uint SC_TAIL_PER_CHUNK_BYTES    = 8u;
+const uint SUBCHUNK_LZ_FLAG_BIT       = 0x800000u;
+const uint SUBCHUNK_MODE_SHIFT        = 19u;
+
+void main() {
+    // Single-thread guard. Host launches a 1×1×1 grid; defend against
+    // misconfiguration the same way prefix_sum_chunks.comp does.
+    if (gl_GlobalInvocationID.x != 0u
+        || gl_GlobalInvocationID.y != 0u
+        || gl_GlobalInvocationID.z != 0u) {
+        return;
+    }
+
+    uint n_chunks = pc.n_chunks;
+    uint chunk_size = pc.eff_chunk_size;
+    uint src_len = pc.src_len;
+    uint pos = pc.prefix_size;
+    uint asm_total = 0u;
+
+    for (uint ci = 0u; ci < n_chunks; ci++) {
+        uint chunk_dst_src_off = ci * chunk_size;
+        uint remaining = src_len - chunk_dst_src_off;
+        uint decomp = (remaining >= chunk_size) ? chunk_size : remaining;
+
+        uint sps = measure_out_buf.sps[ci];
+
+        bool emit_uncompressed = (sps >= decomp)
+            && (chunk_dst_src_off + decomp <= src_len);
+
+        uint dst_off = pos;
+        uint asm_or_marker;
+        uint payload_size;
+        uint sub_hdr_word;
+
+        if (emit_uncompressed) {
+            asm_or_marker = UNCOMPRESSED_CHUNK_MARKER;
+            payload_size  = decomp;
+            sub_hdr_word  = 0u;
+            pos += UNCOMPRESSED_CHUNK_HDR_BYTES + decomp;
+        } else {
+            asm_or_marker = asm_total;
+            payload_size  = sps;
+            sub_hdr_word  = sps
+                | (1u << SUBCHUNK_MODE_SHIFT)
+                | SUBCHUNK_LZ_FLAG_BIT;
+            asm_total += sps;
+            pos += CHUNK_INTERNAL_HDR_BYTES + SUBCHUNK_HDR_BYTES + sps;
+        }
+
+        // assemble_write slot 0 — UNCOMPRESSED_CHUNK_MARKER signals
+        // "skip this chunk; frame_assemble splices src bytes directly".
+        write_descs_buf.d[ci * 16u + 0u] = asm_or_marker;
+
+        // frame_assemble per-chunk descriptor (4 u32).
+        frame_descs_buf.d[ci * 4u + 0u] = dst_off;
+        frame_descs_buf.d[ci * 4u + 1u] = asm_or_marker;
+        frame_descs_buf.d[ci * 4u + 2u] = payload_size;
+        frame_descs_buf.d[ci * 4u + 3u] = sub_hdr_word;
+    }
+
+    uint sc_tail_off = pos;
+    uint sc_tail_bytes = (n_chunks > 1u)
+        ? (n_chunks - 1u) * SC_TAIL_PER_CHUNK_BYTES
+        : 0u;
+    uint end_mark_off = sc_tail_off + sc_tail_bytes;
+    uint total_frame_size = end_mark_off + 4u;
+    uint block_payload_size = total_frame_size - pc.prefix_size - 4u;
+
+    frame_meta_buf.v[0] = total_frame_size;
+    frame_meta_buf.v[1] = sc_tail_off;
+    frame_meta_buf.v[2] = end_mark_off;
+    frame_meta_buf.v[3] = asm_total;
+    frame_meta_buf.v[4] = block_payload_size;
+}

@@ -1,6 +1,6 @@
 // SPIR-V blob registry.
 //
-// 18 kernel shells × 3 variants (tier1, tier1_nv, tier2) = 54 embedded blobs.
+// 19 kernel shells × 3 variants (tier1, tier1_nv, tier2) = 57 embedded blobs.
 // `zig build vk-shaders` produces a WriteFiles directory containing every
 // <kernel>.<variant>.spv as a flat name; consumers add that directory as an
 // embed path via `Module.addEmbedPath`, after which @embedFile() resolves
@@ -37,6 +37,10 @@ pub const blobs = [_]Blob{
     .{ .name = "assemble_write", .tier = .tier1, .bytes = @embedFile("assemble_write.tier1.spv") },
     .{ .name = "assemble_write", .tier = .tier1_nv, .bytes = @embedFile("assemble_write.tier1_nv.spv") },
     .{ .name = "assemble_write", .tier = .tier2, .bytes = @embedFile("assemble_write.tier2.spv") },
+
+    .{ .name = "frame_layout", .tier = .tier1, .bytes = @embedFile("frame_layout.tier1.spv") },
+    .{ .name = "frame_layout", .tier = .tier1_nv, .bytes = @embedFile("frame_layout.tier1_nv.spv") },
+    .{ .name = "frame_layout", .tier = .tier2, .bytes = @embedFile("frame_layout.tier2.spv") },
 
     .{ .name = "frame_assemble", .tier = .tier1, .bytes = @embedFile("frame_assemble.tier1.spv") },
     .{ .name = "frame_assemble", .tier = .tier1_nv, .bytes = @embedFile("frame_assemble.tier1_nv.spv") },
@@ -99,8 +103,8 @@ pub fn find(name: []const u8, tier: Tier) ?[]const u8 {
     return null;
 }
 
-test "blob count is 18 kernels x 3 variants = 54" {
-    try std.testing.expectEqual(@as(usize, 54), blobs.len);
+test "blob count is 19 kernels x 3 variants = 57" {
+    try std.testing.expectEqual(@as(usize, 57), blobs.len);
 }
 
 test "every blob is non-empty and SPIR-V (magic 0x07230203)" {
