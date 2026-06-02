@@ -23,6 +23,7 @@ const driver = @import("driver.zig");
 const probe_mod = @import("probe.zig");
 const l1_codec = @import("l1_codec.zig");
 const wire_format = @import("wire_format.zig");
+const wire_constants = @import("wire_constants.zig");
 const descriptors = @import("descriptors.zig");
 const dispatch = @import("dispatch.zig");
 
@@ -524,14 +525,33 @@ fn decodeUnwrappedVkOnly(
         }
     }
 
+    // Cluster A wiring: walk-format chunks buffer for lz_decode binding 7.
+    var walk_chunks_b = try createMappedBuffer(
+        ctx,
+        @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * wire_constants.CHUNK_DESC_U32_COUNT,
+    );
+    defer destroyMappedBuffer(ctx, &walk_chunks_b);
+    @memset(walk_chunks_b.mapped[0..@intCast(walk_chunks_b.size)], 0);
+    {
+        const wcw: [*]u32 = @ptrCast(@alignCast(walk_chunks_b.mapped));
+        var ci: u32 = 0;
+        while (ci < n_chunks) : (ci += 1) {
+            const dst_off: u32 = ci * unwrap.result.chunk_size;
+            const dst_size: u32 = unwrap.result.per_chunk_decomp_size[ci];
+            const wbase = ci * wire_constants.CHUNK_DESC_U32_COUNT;
+            wcw[wbase + wire_constants.CHUNK_DECOMP_SIZE_SLOT] = dst_size;
+            wcw[wbase + wire_constants.CHUNK_DST_OFFSET_SLOT] = dst_off;
+        }
+    }
+
     var cache: descriptors.Cache = .{};
     defer descriptors.invalidateAll(ctx, &cache);
 
     const cached_dec = try descriptors.getOrCreate(
-        ctx, &cache, "lz_decode", tier, dec_spv, 7, @sizeOf(DecodePush),
+        ctx, &cache, "lz_decode", tier, dec_spv, 8, @sizeOf(DecodePush),
     );
 
-    const dec_bindings: [7]vk.VkDescriptorBufferInfo = .{
+    const dec_bindings: [8]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = cmd_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = lit_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = off16_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -539,6 +559,7 @@ fn decodeUnwrappedVkOnly(
         .{ .buffer = dst_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = chunks_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = off32_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        .{ .buffer = walk_chunks_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
     };
     const dec_set = try descriptors.allocSet(ctx, cached_dec, dec_bindings[0..]);
 

@@ -943,12 +943,41 @@ pub fn decodeL1Sync(
         true,
     );
     defer destroyBuffer(ctx, &chunks_b);
-    @memset(chunks_b.mapped.?[0..@intCast(chunks_b.size)], 0);
+
+    // Cluster A (F001): walk-format chunks descriptor (6 u32 per chunk,
+    // mirror of `decode_pipeline_shared.glsl::SlzChunkDesc`). For the
+    // direct codec path there's no walk_frame kernel — the encoder owns
+    // the per-chunk geometry — so we mirror walk_frame's output shape
+    // CPU-side and bind THIS buffer (not the 16-u32 chunks_b) as the
+    // source of truth for dst_offset + decomp_size in lz_decode.comp.
+    var walk_chunks_b = try createBuffer(
+        ctx,
+        @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * wire_constants.CHUNK_DESC_U32_COUNT,
+        vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        true,
+    );
+    defer destroyBuffer(ctx, &walk_chunks_b);
+    @memset(walk_chunks_b.mapped.?[0..@intCast(walk_chunks_b.size)], 0);
     {
-        const chunks_words: [*]u32 = @ptrCast(@alignCast(chunks_b.mapped.?));
-        const cap_words: u32 = chunk_capacity / 4;
-        const off32_cap_words: u32 = streams.off32_capacity / 4;
+        const w: [*]u32 = @ptrCast(@alignCast(walk_chunks_b.mapped.?));
         var ci: u32 = 0;
+        // ── LOAD-BEARING PROOF (temporary) ────────────────────────────
+        // Toggle to true to exercise the load-bearing proof: clobbers
+        // walk_chunks_b's dst_off / decomp_size with zeros, which MUST
+        // cause the multi-chunk L1 round-trip tests to fail. This was
+        // used during Cluster A commit to verify lz_decode actually
+        // consumes walk_chunks_b for the FRAME-level fields rather
+        // than the (now-zero) slots 0/1 in chunks_b. Left in place so
+        // any future regression in the binding-7 wiring can be
+        // re-verified locally; default is false in production.
+        //
+        // Confirmed 2026-06-02: with `proof_clobber = true`,
+        //   L1_ROUNDTRIP FAIL multi_chunk_1x128k bytes=131072
+        //     first_diff=0 total_diffs=61309
+        // (vk-l1-test --device 0). Single-chunk corpora still pass
+        // because chunk-0's dst_off is 0 (the zero-clobbered value),
+        // so the single-chunk geometry happens to match by accident.
+        const proof_clobber: bool = false;
         while (ci < n_chunks) : (ci += 1) {
             const dst_off: u32 = ci * CHUNK_SIZE;
             const this_dst_size: u32 = if (dst_off + CHUNK_SIZE <= dst_size)
@@ -957,6 +986,29 @@ pub fn decodeL1Sync(
                 dst_size - dst_off
             else
                 0;
+            const wbase = ci * wire_constants.CHUNK_DESC_U32_COUNT;
+            // SlzChunkDesc layout (see decode_pipeline_shared.glsl):
+            //   slot 0: src_offset (unused on this path — encoder owns it)
+            //   slot 1: comp_size  (unused on this path)
+            //   slot 2: decomp_size  ← consumed by lz_decode
+            //   slot 3: dst_offset   ← consumed by lz_decode
+            //   slot 4: flags        (zero — direct path has no GPU walk)
+            //   slot 5: memset_fill  (zero)
+            w[wbase + 0] = 0; // src_offset
+            w[wbase + 1] = if (proof_clobber) 0 else this_dst_size; // comp_size
+            w[wbase + 2] = if (proof_clobber) 0 else this_dst_size; // CHUNK_DECOMP_SIZE_SLOT
+            w[wbase + 3] = if (proof_clobber) 0 else dst_off;       // CHUNK_DST_OFFSET_SLOT
+            w[wbase + 4] = 0; // flags
+            w[wbase + 5] = 0; // memset_fill (+ pad)
+        }
+    }
+    @memset(chunks_b.mapped.?[0..@intCast(chunks_b.size)], 0);
+    {
+        const chunks_words: [*]u32 = @ptrCast(@alignCast(chunks_b.mapped.?));
+        const cap_words: u32 = chunk_capacity / 4;
+        const off32_cap_words: u32 = streams.off32_capacity / 4;
+        var ci: u32 = 0;
+        while (ci < n_chunks) : (ci += 1) {
             const stream_word_base: u32 = ci * cap_words;
             // For the Vulkan encoder's own decode path the cmd-stream
             // block-2 boundary is at `cmd_size` for sub-chunks larger
@@ -970,8 +1022,14 @@ pub fn decodeL1Sync(
             // off32_count_block1/2 split matches that view.
             //
             const base = ci * 16;
-            chunks_words[base + 0] = dst_off;
-            chunks_words[base + 1] = this_dst_size;
+            // Cluster A (F002): slots 0/1 (dst_offset, dst_size) are
+            // no longer consumed by lz_decode.comp — those fields come
+            // from the walk-format chunks buffer at binding 7
+            // (`walk_chunks_b` built just above). Zero the slots so a
+            // future regression that re-reads them surfaces as
+            // immediate output corruption.
+            chunks_words[base + 0] = 0;
+            chunks_words[base + 1] = 0;
             chunks_words[base + 2] = stream_word_base; // cmd
             chunks_words[base + 3] = streams.per_chunk_cmd_size[ci];
             chunks_words[base + 4] = stream_word_base; // lit
@@ -1007,11 +1065,11 @@ pub fn decodeL1Sync(
         "lz_decode",
         tier,
         spv,
-        7, // bindings 0..6: cmd, lit, off16, length, dst, chunks, off32
+        8, // bindings 0..7: cmd, lit, off16, length, dst, chunks, off32, walk_chunks
         @sizeOf(DecodePush),
     );
 
-    const dec_bindings: [7]vk.VkDescriptorBufferInfo = .{
+    const dec_bindings: [8]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = streams.cmd_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = streams.lit_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = streams.off16_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -1019,6 +1077,9 @@ pub fn decodeL1Sync(
         .{ .buffer = dst_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = chunks_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = streams.off32_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        // Cluster A (F001): walk-format chunks descriptor — source of
+        // truth for dst_offset + decomp_size that lz_decode.comp reads.
+        .{ .buffer = walk_chunks_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
     };
     const dec_set = try descriptors.allocSet(ctx, cached_dec, dec_bindings[0..]);
     const t_desc1 = qpcNow();

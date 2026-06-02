@@ -45,6 +45,7 @@ const wire_format_gpu = @import("wire_format_gpu.zig");
 const decode_pipeline_gpu = @import("decode_pipeline_gpu.zig");
 const descriptors = @import("descriptors.zig");
 const dispatch = @import("dispatch.zig");
+const wire_constants = @import("wire_constants.zig");
 const spv_blobs = @import("spv_blobs");
 
 /// When true (the default), `encodeL1ToSlz1` uses the GPU-side
@@ -57,20 +58,27 @@ pub var use_gpu_wrap: bool = true;
 /// When true (the default), `decodeSlz1ToBytes` runs the Phase-2 GPU
 /// decode pipeline (walk_frame → prefix_sum_chunks → scan_parse →
 /// compact_huff_descs ×4 → compact_raw_descs → gather_raw_off16) in
-/// the same VkQueue ahead of the lz_decode dispatch. When false the
-/// 5-kernel GPU pipeline is skipped and only the CPU-side wire-format
-/// unwrap drives lz_decode (legacy behavior). Exposed at module scope
-/// so tests can A/B compare the two paths; production callers should
-/// leave it at the default.
+/// the same VkQueue ahead of the lz_decode dispatch.
 ///
-/// On the L1 path the 5-kernel chain produces no observable data the
-/// existing lz_decode.comp consumes (lz_decode reads pre-unwrapped
-/// per-stream bytes from the CPU unwrap — the GPU outputs are
-/// ChunkDescs and an entropy scratch sized for future Phase-3 Huffman
-/// work). The dispatch chain is exercised end-to-end so that future
-/// kernel integrations have a working orchestration to graft into,
-/// and so that any regression in the 5 ported kernels surfaces in
-/// the L1 round-trip suite ahead of the Phase-3 work.
+/// Cluster A wiring (recon2.md) — walk_frame's `chunks` device buffer
+/// is bound DIRECTLY into lz_decode's binding-7 descriptor. lz_decode
+/// reads `dst_offset` + `decomp_size` from walk_frame's GPU output;
+/// the previous "GPU dispatch runs then we throw the result away"
+/// pattern is gone. The load-bearing proof is in the cluster's commit
+/// message: zeroing walk_frame's chunks output causes vk-l1-test (via
+/// streamlz_vk -d) to fail byte-equality.
+///
+/// What still rides on the CPU unwrap path: the per-stream byte split
+/// (lit / cmd / off16 / length / off32) of each chunk's compressed
+/// payload, and the per-stream metadata (cmd_stream2_offset, off32
+/// counts, initial_copy). There is no GPU producer for this at L1
+/// today — `scan_parse` emits valid=0 on every L1 sub-chunk because
+/// L1 has no Huffman pass. A full GPU "L1 unwrap" kernel would be a
+/// new addition and is tracked separately.
+///
+/// When `false` the 5-kernel pipeline is skipped and a CPU mirror
+/// (`walk_chunks_cpu`, built from `unwrap.result.per_chunk_decomp_size`)
+/// is bound in walk_frame's place. Used by the A/B tests.
 pub var use_gpu_unwrap: bool = true;
 
 pub const Slz1Error = error{
@@ -573,6 +581,15 @@ pub fn decodeSlz1ToBytesEx(
     // dominated on the L1 fast path since scan/compact produce zero
     // entries and gather sees `n_raw = 0` at the self-gate. Profiled
     // delta vs use_gpu_unwrap=false on RTX 4060 Ti is +0.4 ms.
+    // Cluster A (F001/F002/F003): the GPU pipeline result (specifically
+    // walk_frame's `chunks` device buffer) is bound DIRECTLY into the
+    // downstream lz_decode dispatch. Previously this struct's lifetime
+    // ended at the `if (use_gpu_unwrap)` scope exit before lz_decode
+    // ran, which made every GPU output dead-code. Lifting it to the
+    // function-body scope keeps the buffers alive across the second
+    // dispatch.
+    var pipeline_result: decode_pipeline_gpu.DecodeResult = .{};
+    defer if (use_gpu_unwrap) decode_pipeline_gpu.destroyDecodeResult(ctx, &pipeline_result);
     if (use_gpu_unwrap) {
         // Hand the CPU-unwrap n_chunks to the pipeline as a sizing hint
         // so the off16 entropy scratch (n_chunks * 4 * 128 KiB) doesn't
@@ -580,7 +597,7 @@ pub fn decodeSlz1ToBytesEx(
         // hint is advisory — the GPU kernels still self-gate on
         // walk_frame's `n_chunks` output (read via the
         // `n_chunks_scratch` 4-byte SSBO).
-        var pipeline_result = decode_pipeline_gpu.runDecodePipelineEx(
+        pipeline_result = decode_pipeline_gpu.runDecodePipelineEx(
             ctx,
             allocator,
             slz_bytes,
@@ -593,7 +610,6 @@ pub fn decodeSlz1ToBytesEx(
             error.TooManyChunks => return error.OutOfMemory,
             else => return error.OutOfMemory,
         };
-        defer decode_pipeline_gpu.destroyDecodeResult(ctx, &pipeline_result);
         // Surface the walk-frame parse status as a frame-level error if
         // the GPU said the frame is malformed. Status==0 (FW_STATUS_OK)
         // is the happy path; non-zero statuses are FW_STATUS_BAD_MAGIC=1
@@ -729,12 +745,16 @@ pub fn decodeSlz1ToBytesEx(
         const off32_cap_words: u32 = off32_capacity / 4;
         var ci: u32 = 0;
         while (ci < n_chunks) : (ci += 1) {
-            const dst_off: u32 = ci * unwrap.result.chunk_size;
-            const dst_size: u32 = unwrap.result.per_chunk_decomp_size[ci];
             const word_base: u32 = ci * cap_words;
             const base = ci * 16;
-            words[base + 0] = dst_off;
-            words[base + 1] = dst_size;
+            // F002: slots 0 (dst_offset) and 1 (dst_size) are NO LONGER
+            // consumed by lz_decode.comp — those fields come from the
+            // GPU walk_frame chunks buffer bound at descriptor binding 7
+            // (or its CPU mirror when use_gpu_unwrap=false). Leaving the
+            // slots zero so a leftover-read regression in lz_decode would
+            // surface as immediate corruption rather than silent fallback.
+            words[base + 0] = 0;
+            words[base + 1] = 0;
             words[base + 2] = word_base;
             words[base + 3] = @intCast(stream_view.cmd_bytes[ci].len);
             words[base + 4] = word_base;
@@ -753,6 +773,45 @@ pub fn decodeSlz1ToBytesEx(
         }
     }
 
+    // Cluster A (F001/F002): walk-format chunks descriptor (6 u32/chunk).
+    // When the GPU pipeline ran (`use_gpu_unwrap = true`, default), we
+    // BIND walk_frame's GPU-resident output directly into lz_decode's
+    // binding-7 descriptor — making the previously-dead GPU dispatch
+    // load-bearing. lz_decode reads dst_offset and decomp_size from this
+    // buffer; if walk_frame's output is corrupt the decoder writes to
+    // wrong offsets and the round-trip cmp fails (verified by the
+    // load-bearing proof in cluster A).
+    //
+    // When `use_gpu_unwrap = false` (the legacy A/B path tests can flip),
+    // there's no GPU producer for the walk chunks — we build a CPU mirror
+    // from `unwrap.result.per_chunk_decomp_size` so lz_decode still has a
+    // valid binding. This fallback exists purely to keep the toggle
+    // honest; production callers should leave use_gpu_unwrap=true.
+    var walk_chunks_cpu: l1_codec.Buffer = .{};
+    defer if (!use_gpu_unwrap) l1_codec.destroyBuffer(ctx, &walk_chunks_cpu);
+    if (!use_gpu_unwrap) {
+        walk_chunks_cpu = try l1_codec.createBufferEx(
+            ctx,
+            @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * wire_constants.CHUNK_DESC_U32_COUNT,
+            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            .host_visible_prefer_device_local,
+        );
+        @memset(walk_chunks_cpu.mapped.?[0..@intCast(walk_chunks_cpu.size)], 0);
+        const wcw: [*]u32 = @ptrCast(@alignCast(walk_chunks_cpu.mapped.?));
+        var ci: u32 = 0;
+        while (ci < n_chunks) : (ci += 1) {
+            const dst_off: u32 = ci * unwrap.result.chunk_size;
+            const dst_size: u32 = unwrap.result.per_chunk_decomp_size[ci];
+            const wbase = ci * wire_constants.CHUNK_DESC_U32_COUNT;
+            wcw[wbase + wire_constants.CHUNK_DECOMP_SIZE_SLOT] = dst_size;
+            wcw[wbase + wire_constants.CHUNK_DST_OFFSET_SLOT] = dst_off;
+        }
+    }
+    const walk_chunks_bind: vk.VkBuffer = if (use_gpu_unwrap)
+        pipeline_result.chunks.buf
+    else
+        walk_chunks_cpu.buf;
+
     const t_descset_begin = qpcNow();
     var cache: descriptors.Cache = .{};
     defer descriptors.invalidateAll(ctx, &cache);
@@ -763,12 +822,12 @@ pub fn decodeSlz1ToBytesEx(
         "lz_decode",
         tier,
         dec_spv,
-        7,
+        8,
         @sizeOf(DecodePush),
     );
 
     const dst_bind_buf: vk.VkBuffer = if (opts.dst_buffer_override) |b| b else dst_b.buf;
-    const dec_bindings: [7]vk.VkDescriptorBufferInfo = .{
+    const dec_bindings: [8]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = cmd_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = lit_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = off16_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -776,6 +835,9 @@ pub fn decodeSlz1ToBytesEx(
         .{ .buffer = dst_bind_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = chunks_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = off32_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        // Cluster A (F001/F002): walk_frame's GPU chunks output bound
+        // here makes the 5-kernel decode pipeline load-bearing.
+        .{ .buffer = walk_chunks_bind, .offset = 0, .range = vk.VK_WHOLE_SIZE },
     };
     const dec_set = try descriptors.allocSet(ctx, cached_dec, dec_bindings[0..]);
 

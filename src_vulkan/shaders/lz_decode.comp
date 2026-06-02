@@ -88,6 +88,11 @@
 #extension GL_EXT_shader_8bit_storage                : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
+// Pull in the shared decode-pipeline header for the 6-u32 SlzChunkDesc
+// slot constants (CHUNK_DST_OFFSET_SLOT, CHUNK_DECOMP_SIZE_SLOT,
+// CHUNK_DESC_U32_COUNT, etc.) — the binding-7 walk_chunks layout.
+#include "decode_pipeline_shared.glsl"
+
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 // Cmd / Lit / Off16 / Length stay u32-packed (the encoder writes those
@@ -107,6 +112,24 @@ layout(set = 0, binding = 3) readonly buffer Length { uint w[]; } length_buf;
 layout(std430, set = 0, binding = 4) coherent buffer Dst    { uint8_t b[]; } dst_buf;
 layout(set = 0, binding = 5) readonly buffer ChunkDescs { uint d[]; } chunks_buf;
 layout(set = 0, binding = 6) readonly buffer Off32  { uint w[]; } off32_buf;
+// Binding 7 — Cluster A (F001): walk_frame's GPU-emitted 6-u32-per-chunk
+// SlzChunkDesc array. This is the source of truth for FRAME-level fields:
+//   * `dst_offset` (slot CHUNK_DST_OFFSET_SLOT = 3) — where the chunk's
+//     output bytes go in the global dst buffer.
+//   * `decomp_size` (slot CHUNK_DECOMP_SIZE_SLOT = 2) — how many bytes
+//     this chunk should produce.
+//   * `flags` (slot CHUNK_FLAGS_SLOT = 4) and `memset_fill`
+//     (slot CHUNK_MEMSET_FILL_SLOT = 5, low byte) for the future
+//     uncompressed/memset fast paths (Cluster C / F011).
+// The PER-STREAM fields (cmd_size, lit_size, off16_count, length_used,
+// off32 counts, cmd_stream2_offset, initial_copy) are still sourced from
+// the legacy 16-u32 ChunkDescs at binding 5 — the GPU pipeline doesn't
+// yet have an L1-unwrap kernel that splits a chunk payload into the
+// 5 stream views. Each path that fills the 16-u32 descriptors also
+// builds a parallel 6-u32 walk-format descriptor buffer (either
+// host-side mirror for the direct `decodeL1Sync` path, or directly from
+// walk_frame's GPU output for the SLZ1 frame path).
+layout(set = 0, binding = 7) readonly buffer WalkChunks { uint d[]; } walk_chunks_buf;
 
 layout(push_constant) uniform PC {
     uint n_chunks;
@@ -136,9 +159,15 @@ shared uint g_dst_byte_base;
 shared uint g_off32_byte_base;     // base byte address into off32_buf for this chunk
 
 // ── Constants (mirror src/decode/slz_wire_format.cuh) ───────────────
+// LZ_BLOCK_SIZE, INITIAL_RECENT_OFFSET, OFF16_ENTRY_BYTES, OFF32_ENTRY_
+// BYTES come from decode_pipeline_shared.glsl (Cluster H consolidation).
 const uint WARP_SIZE                = 32u;
 const uint FULL_WARP_MASK           = 0xFFFFFFFFu;
 const uint TOKEN_SHORT_MIN          = 24u;
+// Long-token IDs in the cmd stream (mirror src/decode/slz_wire_format.cuh).
+// Kept local because lz_encode.comp also defines these and the two have
+// historically drifted independently — folding into the shared header
+// will follow when lz_encode.comp also includes the header.
 const uint TOKEN_LONG_LITERAL       = 0u;
 const uint TOKEN_LONG_NEAR          = 1u;
 const uint TOKEN_LONG_FAR           = 2u;
@@ -154,10 +183,6 @@ const uint TOKEN_USE_RECENT_MASK    = 1u;
 const uint EXT_LENGTH_THRESHOLD     = 251u;
 const uint EXT_LENGTH_EXTRA_BYTES   = 2u;
 const uint EXT_LENGTH_SCALE         = 4u;
-const uint OFF16_ENTRY_BYTES        = 2u;
-const uint OFF32_ENTRY_BYTES        = 3u;
-const uint LZ_BLOCK_SIZE            = 0x10000u;
-const int  INITIAL_RECENT_OFFSET    = -8;
 
 // ── Byte-level loads from u32-packed input streams ──────────────────
 // Mirror the encoder's loadSrcByte / loadSrcU32LE pattern. Out-of-bounds
@@ -327,8 +352,16 @@ void main() {
     // Load this workgroup's chunk descriptor (16 u32 stride per chunk).
     if (lane == 0u) {
         uint base = chunk_id * 16u;
-        g_dst_byte_base     = chunks_buf.d[base + 0u];
-        g_dst_size          = chunks_buf.d[base + 1u];
+        // Cluster A (F001): FRAME-level fields (dst_offset, decomp_size)
+        // come from walk_frame's 6-u32 SlzChunkDesc layout (binding 7).
+        // The legacy slots 0/1 in chunks_buf are no longer read — they
+        // were redundant copies of the same values the host computed
+        // CPU-side. The walk_chunks_buf is the GPU-resident source of
+        // truth populated either by walk_frame.comp (SLZ1 frame path)
+        // or by a host-mirrored writer (l1_codec.decodeL1Sync path).
+        uint wbase = chunk_id * CHUNK_DESC_U32_COUNT;
+        g_dst_byte_base     = walk_chunks_buf.d[wbase + CHUNK_DST_OFFSET_SLOT];
+        g_dst_size          = walk_chunks_buf.d[wbase + CHUNK_DECOMP_SIZE_SLOT];
         // cmd / lit / off16 / length descs are u32-word bases; multiply
         // by 4 to get the byte base.
         g_cmd_byte_base     = chunks_buf.d[base + 2u] * 4u;

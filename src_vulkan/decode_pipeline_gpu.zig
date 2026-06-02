@@ -459,8 +459,13 @@ fn loadAllPipelines(
 // stage on both sides. A global memory barrier is cheaper than 6
 // per-buffer barriers and sufficient because the kernels write
 // disjoint regions.
-fn recordComputeBarrier(cmd_buf: vk.VkCommandBuffer) void {
-    const cmd_barrier = vk.vkCmdPipelineBarrier_fn orelse return;
+//
+// F067: returns an error rather than silently no-oping when
+// `vkCmdPipelineBarrier_fn` is unresolved. A missing barrier in a
+// kernel chain corrupts results undetectably; better to fail loud than
+// to ship incorrect output.
+fn recordComputeBarrier(cmd_buf: vk.VkCommandBuffer) PipelineError!void {
+    const cmd_barrier = vk.vkCmdPipelineBarrier_fn orelse return error.LoaderNotReady;
     const mb: vk.VkMemoryBarrier = .{
         .srcAccessMask = vk.VK_ACCESS_SHADER_WRITE_BIT,
         .dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT | vk.VK_ACCESS_SHADER_WRITE_BIT,
@@ -871,7 +876,7 @@ pub fn runDecodePipelineEx(
     }
 
     // BARRIER A — walk_frame writes → prefix_sum_chunks reads.
-    recordComputeBarrier(ctx.cmd_buf);
+    try recordComputeBarrier(ctx.cmd_buf);
 
     // 2. prefix_sum_chunks. Push uses worst-case n_chunks = WALK_MAX_CHUNKS
     //    minus a loop early-exit: the kernel iterates `i < n_chunks` but
@@ -957,7 +962,7 @@ pub fn runDecodePipelineEx(
     }
 
     // BARRIER B — prefix_sum writes → scan_parse reads.
-    recordComputeBarrier(ctx.cmd_buf);
+    try recordComputeBarrier(ctx.cmd_buf);
 
     // Copy meta[N_CHUNKS_SLOT] into n_chunks_scratch so scan_parse sees
     // the actual walk-frame-determined n_chunks (its self-gate compares
@@ -1035,7 +1040,7 @@ pub fn runDecodePipelineEx(
     }
 
     // BARRIER C — scan_parse writes → compact_* read.
-    recordComputeBarrier(ctx.cmd_buf);
+    try recordComputeBarrier(ctx.cmd_buf);
 
     // 4a–4d. compact_huff_descs (lit, tok, hi, lo). All four launches
     //    can ride the same barrier (BARRIER C) because they write
@@ -1077,7 +1082,7 @@ pub fn runDecodePipelineEx(
     }
 
     // BARRIER D — compact_* writes → gather_raw_off16 reads.
-    recordComputeBarrier(ctx.cmd_buf);
+    try recordComputeBarrier(ctx.cmd_buf);
 
     // 5. gather_raw_off16 — total_subchunks*2 workgroups × 256 threads.
     //    The kernel self-gates on compact_counts[4] (n_raw), so an
@@ -1125,7 +1130,7 @@ pub fn runDecodePipelineEx(
     // downstream kernel is in a separate cmdbuf today (Phase 3+ kernel
     // bodies aren't on the L1 path), but we end with the barrier so
     // future single-cmdbuf merges can see a consistent shape.
-    recordComputeBarrier(ctx.cmd_buf);
+    try recordComputeBarrier(ctx.cmd_buf);
 
     if (end_cb(ctx.cmd_buf) != vk.VK_SUCCESS) return error.EndCommandBufferFailed;
 

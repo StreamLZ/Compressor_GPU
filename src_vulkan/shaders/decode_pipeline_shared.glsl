@@ -73,6 +73,8 @@ const uint SUBCHUNK_MODE_MASK         = 0xFu;
 const uint SUBCHUNK_COMP_SIZE_MASK    = 0x7FFFFu;
 
 // ── Off16 / Off32 stream markers ────────────────────────────────────
+const uint OFF16_ENTRY_BYTES          = 2u;
+const uint OFF32_ENTRY_BYTES          = 3u;
 const uint OFF16_ENTROPY_MARKER       = 0xFFFFu;
 const uint OFF32_COUNT_FIELD_BITS     = 12u;
 const uint OFF32_COUNT_PACK_MAX       = 0xFFFu;

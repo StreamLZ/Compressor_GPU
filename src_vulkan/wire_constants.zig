@@ -123,6 +123,33 @@ pub const LARGE_OFFSET_THRESHOLD: u32 = 0xC00000;
 pub const FIB_MUL_LO: u32 = 0x7C150000;
 pub const FIB_MUL_HI: u32 = 0x79B97F4A;
 
+// ── SlzChunkDesc slot layout (mirror decode_pipeline_shared.glsl) ────
+//
+// 6 u32 per ChunkDesc emitted by walk_frame.comp; the slot indices
+// are byte-identical to `decode_pipeline_shared.glsl::CHUNK_*_SLOT`.
+//
+//   slot 0  src_offset           (block-payload-relative byte offset)
+//   slot 1  comp_size            (bytes in the compressed stream)
+//   slot 2  decomp_size          (bytes the chunk will produce)
+//   slot 3  dst_offset           (byte offset into the output buffer)
+//   slot 4  flags                (CHUNK_FLAG_UNCOMPRESSED | _MEMSET)
+//   slot 5  memset_fill (low 8b) + pad (upper 24b must be zero)
+//
+// Consumers: walk_frame.comp (writer), lz_decode.comp (binding 7
+// reader — Cluster A wiring).
+
+pub const CHUNK_DESC_U32_COUNT: u32 = 6;
+pub const CHUNK_SRC_OFFSET_SLOT: u32 = 0;
+pub const CHUNK_COMP_SIZE_SLOT: u32 = 1;
+pub const CHUNK_DECOMP_SIZE_SLOT: u32 = 2;
+pub const CHUNK_DST_OFFSET_SLOT: u32 = 3;
+pub const CHUNK_FLAGS_SLOT: u32 = 4;
+pub const CHUNK_MEMSET_FILL_SLOT: u32 = 5;
+
+// SlzChunkDesc::flags bits (mirror decode_pipeline_shared.glsl).
+pub const CHUNK_FLAG_UNCOMPRESSED: u32 = 0x1;
+pub const CHUNK_FLAG_MEMSET: u32 = 0x2;
+
 // ── Per-context capacity bounds (mirror decode_pipeline_shared.glsl) ─
 //
 // WALK_MAX_CHUNKS           — max chunks the walk-frame kernel emits
