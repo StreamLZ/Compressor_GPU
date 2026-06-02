@@ -19,9 +19,13 @@ const driver = @import("driver.zig");
 const probe_mod = @import("probe.zig");
 const l1_codec = @import("l1_codec.zig");
 const wire_format = @import("wire_format.zig");
-const wire_constants = @import("wire_constants.zig");
-const descriptors = @import("descriptors.zig");
-const dispatch = @import("dispatch.zig");
+// Cluster F (F036): the CUDA_TO_VK direction now goes through the
+// production decoder so the test exercises the same code path the CLI
+// and the C ABI take. The `wire_constants` / `descriptors` / `dispatch`
+// imports went away with the deleted `decodeUnwrappedVkOnly` fixture —
+// they were only ever used to build descriptor sets + push constants
+// for the test-only lz_decode dispatch that the fixture drove.
+const slz1_codec = @import("slz1_codec.zig");
 
 const MAX_SPV_BYTES: usize = 1 << 20;
 const SPV_DIR_REL: []const u8 = "zig-out/shaders";
@@ -396,6 +400,16 @@ fn testCudaEncodeVkDecode(
     src: []const u8,
     tmp_slz: []const u8,
 ) !void {
+    _ = dec_spv;
+    // Cluster F (F036): this test used to drive a test-only
+    // `decodeUnwrappedVkOnly` fixture that bypassed the GPU pipeline
+    // (no walk_frame, no l1_unwrap, no DEVICE_LOCAL+sysmem staging
+    // readback). That meant the CUDA_TO_VK direction NEVER exercised
+    // the production decoder — the one the CLI and the C ABI call —
+    // so a real regression there would have gone undetected. We now
+    // drive `slz1_codec.decodeSlz1ToBytes`, the same entry point
+    // `slzDecompressHost_vk` uses.
+
     // 1. Shell out to streamlz.exe -c -l 1 (default sc = 0.5).
     //    The Vulkan L1 decoder now consumes off32 entries natively,
     //    so the previous `--sc 0.25` workaround (which pinned the
@@ -410,366 +424,67 @@ fn testCudaEncodeVkDecode(
         return;
     }
 
-    // 2. Read the .slz bytes.
+    // 2. Read the CUDA-produced .slz bytes.
     const slz_bytes = readFile(io, allocator, tmp_slz) catch |err| {
         try w.print("CUDA_TO_VK FAIL {s} stage=read_slz err={s}\n", .{ label, @errorName(err) });
         return;
     };
     defer allocator.free(slz_bytes);
 
-    // 3. Unwrap to per-chunk streams.
-    var stream_view: wire_format.PerChunkStreams = undefined;
-    var unwrap = wire_format.unwrapSlz1ToL1Streams(allocator, slz_bytes, &stream_view) catch |err| {
-        try w.print("CUDA_TO_VK FAIL {s} stage=unwrap err={s}\n", .{ label, @errorName(err) });
+    // 3. Drive the production VK decoder. Output buffer is sized to
+    //    src.len exactly — `decodeSlz1ToBytes` returns the original
+    //    size from the frame header, which must equal src.len for a
+    //    correct round-trip.
+    const dst = allocator.alloc(u8, src.len) catch |err| {
+        try w.print("CUDA_TO_VK FAIL {s} stage=alloc_dst err={s}\n", .{ label, @errorName(err) });
         return;
     };
-    defer wire_format.freeUnwrapStorage(allocator, &unwrap.storage);
+    defer allocator.free(dst);
 
-    // 4. Re-encode through Vulkan to obtain a populated L1Streams bundle
-    //    we can hand to decodeL1Sync.  The cleaner path would be a host-
-    //    upload variant of `encodeL1Multi` that takes raw stream bytes,
-    //    but that's a bigger surface change than this task warrants —
-    //    we Vulkan-encode src to get the bundle shape and then OVERWRITE
-    //    the device-side stream buffers with the CUDA-produced bytes.
-    //
-    //    For now we go the simpler route: Vulkan-decode using a freshly-
-    //    built L1Streams that we construct from the unwrapped per-chunk
-    //    byte slices by uploading them to fresh device buffers.
-    if (try decodeUnwrappedVkOnly(allocator, ctx, dec_spv, &unwrap, &stream_view)) |result| {
-        defer allocator.free(result.bytes);
-        const diff = compareBytes(src, result.bytes);
-        if (diff.total_diffs == 0 and src.len == result.bytes.len) {
-            try w.print(
-                "CUDA_TO_VK PASS {s} bytes={d} slz_bytes={d}\n",
-                .{ label, src.len, slz_bytes.len },
-            );
-        } else {
-            try w.print(
-                "CUDA_TO_VK FAIL {s} bytes={d} decoded_bytes={d} first_diff={d} total_diffs={d}\n",
-                .{ label, src.len, result.bytes.len, diff.first_diff, diff.total_diffs },
-            );
-            const d = diff.first_diff;
-            const start = if (d >= 16) d - 16 else 0;
-            const end = @min(d + 16, @min(src.len, result.bytes.len));
-            try w.print("DEBUG src[{d}..{d}] = ", .{ start, end });
-            for (src[start..end]) |b| try w.print("{x:0>2} ", .{b});
-            try w.print("\nDEBUG dec[{d}..{d}] = ", .{ start, end });
-            for (result.bytes[start..end]) |b| try w.print("{x:0>2} ", .{b});
-            try w.print("\n", .{});
-        }
-    }
-}
-
-const DecodeResult = struct {
-    bytes: []u8,
-};
-
-/// Build a fresh L1Streams from CPU-side per-chunk byte slices and
-/// invoke `decodeL1Sync`.  Uploads each stream to a fresh device buffer,
-/// reproducing the layout `encodeL1Multi` would have left behind:
-///   * Per-chunk byte slot is at byte_base = chunk_id * chunk_capacity
-///     in each stream buffer.
-///   * `per_chunk_*_size` arrays carry the bytes-used count.
-/// Custom decode-path tailored to the unwrap output: drives the
-/// Vulkan lz_decode shader directly so each chunk's dst_size comes
-/// from the unwrap result rather than the hard-coded `CHUNK_SIZE`
-/// in `l1_codec.decodeL1Sync`.  Required because the CUDA encoder
-/// emits 64 KiB sub-chunks under `sc_group_size = 0.25` — the only
-/// setting that avoids the off32 stream the Vulkan L1 decoder
-/// cannot consume.
-/// Vulkan decode-shader push constants (mirrors the layout in
-/// `lz_decode.comp`: `layout(push_constant) uniform PC { uint
-/// n_chunks; }`).  Kept here rather than imported from `l1_codec.zig`
-/// because that field is private to the codec module.
-const DecodePush = extern struct {
-    n_chunks: u32,
-};
-
-fn decodeUnwrappedVkOnly(
-    allocator: std.mem.Allocator,
-    ctx: *driver.Context,
-    dec_spv: []const u8,
-    unwrap: *const wire_format.UnwrapBundle,
-    stream_view: *const wire_format.PerChunkStreams,
-) !?DecodeResult {
-    const tier = blk: {
-        const pr = probe_mod.probe(ctx.inst, ctx.pd);
-        switch (pr.tier) {
-            .tier1, .tier1_nv, .tier2 => break :blk pr.tier,
-            .unsupported => return error.UnsupportedTier,
-        }
-    };
-    const chunk_capacity = l1_codec.CHUNK_STREAM_CAPACITY;
-    const n_chunks = unwrap.result.n_chunks;
-    // TODO N2 caveat #3: this helper sizes per-chunk stream slots
-    // using `l1_codec.CHUNK_STREAM_CAPACITY` (= `(VK CHUNK_SIZE *
-    // 2) + 16`), which is the worst-case stream length for the
-    // Vulkan codec's native chunk size. If the unwrapped frame
-    // carries a chunk_size LARGER than the Vulkan codec's CHUNK_SIZE
-    // (e.g. a future CUDA encoder bumping its sub-chunk default),
-    // the per-chunk slot will be too small and the chunk-0 stream
-    // bytes will spill into chunk-1's slot. Today every CUDA
-    // encoder we test against produces chunk_size ≤ Vulkan's
-    // CHUNK_SIZE (64 KiB at sc_group_size = 0.25), so the slot
-    // sizing is conservative. Pin the relationship here so a future
-    // CUDA encoder bump fails loudly rather than silently
-    // corrupting the test's decode bytes.
-    std.debug.assert(unwrap.result.chunk_size <= l1_codec.CHUNK_SIZE);
-    const stream_cap_total: vk.VkDeviceSize = @as(vk.VkDeviceSize, n_chunks) * chunk_capacity;
-
-    // Create host-visible stream buffers and fill the per-chunk slots.
-    var lit_b = try createMappedBuffer(ctx, stream_cap_total);
-    defer destroyMappedBuffer(ctx, &lit_b);
-    var cmd_b = try createMappedBuffer(ctx, stream_cap_total);
-    defer destroyMappedBuffer(ctx, &cmd_b);
-    var off16_b = try createMappedBuffer(ctx, stream_cap_total);
-    defer destroyMappedBuffer(ctx, &off16_b);
-    var length_b = try createMappedBuffer(ctx, stream_cap_total);
-    defer destroyMappedBuffer(ctx, &length_b);
-    const off32_capacity = l1_codec.CHUNK_OFF32_CAPACITY;
-    const off32_cap_total: vk.VkDeviceSize = @as(vk.VkDeviceSize, n_chunks) * off32_capacity;
-    var off32_b = try createMappedBuffer(ctx, off32_cap_total);
-    defer destroyMappedBuffer(ctx, &off32_b);
-
-    @memset(lit_b.mapped[0..@intCast(lit_b.size)], 0);
-    @memset(cmd_b.mapped[0..@intCast(cmd_b.size)], 0);
-    @memset(off16_b.mapped[0..@intCast(off16_b.size)], 0);
-    @memset(length_b.mapped[0..@intCast(length_b.size)], 0);
-    @memset(off32_b.mapped[0..@intCast(off32_b.size)], 0);
-
-    // ── Upload per-chunk stream bytes into the per-chunk slots ──
-    // Slot offset for chunk i = i * chunk_capacity (in bytes).
-    {
-        var ci: u32 = 0;
-        while (ci < n_chunks) : (ci += 1) {
-            const base: usize = @as(usize, ci) * chunk_capacity;
-            const off32_base: usize = @as(usize, ci) * off32_capacity;
-            const ls = stream_view.lit_bytes[ci].len;
-            const cs = stream_view.cmd_bytes[ci].len;
-            const ob = stream_view.off16_bytes[ci].len;
-            const xs = stream_view.length_bytes[ci].len;
-            if (ls != 0) @memcpy(lit_b.mapped[base..][0..ls], stream_view.lit_bytes[ci]);
-            if (cs != 0) @memcpy(cmd_b.mapped[base..][0..cs], stream_view.cmd_bytes[ci]);
-            if (ob != 0) @memcpy(off16_b.mapped[base..][0..ob], stream_view.off16_bytes[ci]);
-            if (xs != 0) @memcpy(length_b.mapped[base..][0..xs], stream_view.length_bytes[ci]);
-            if (stream_view.off32_bytes) |arr| {
-                const ob32 = arr[ci].len;
-                if (ob32 != 0) @memcpy(off32_b.mapped[off32_base..][0..ob32], arr[ci]);
-            }
-        }
-    }
-
-    // Dst buffer: rounded to a u32 multiple for the decoder's word-
-    // aligned RMW stores.
-    const dst_total: u32 = @intCast(unwrap.result.original_size);
-    const dst_buf_size: vk.VkDeviceSize = @max(
-        @as(vk.VkDeviceSize, 4),
-        (@as(vk.VkDeviceSize, dst_total) + 3) & ~@as(vk.VkDeviceSize, 3),
-    );
-    var dst_b = try createMappedBuffer(ctx, dst_buf_size);
-    defer destroyMappedBuffer(ctx, &dst_b);
-    @memset(dst_b.mapped[0..@intCast(dst_b.size)], 0);
-
-    // Chunks SSBO: 16 u32 per chunk (see `lz_decode.comp` head
-    // comment for the slot layout).
-    var chunks_b = try createMappedBuffer(ctx, @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * 16);
-    defer destroyMappedBuffer(ctx, &chunks_b);
-    @memset(chunks_b.mapped[0..@intCast(chunks_b.size)], 0);
-    {
-        const words: [*]u32 = @ptrCast(@alignCast(chunks_b.mapped));
-        var ci: u32 = 0;
-        while (ci < n_chunks) : (ci += 1) {
-            // Per-chunk dst_off / dst_size derived from the unwrap
-            // result — the CUDA-encoded frame may use a smaller
-            // sub-chunk size (64 KiB at sc_group_size = 0.25) than the
-            // Vulkan L1 codec's native 128 KiB CHUNK_SIZE, and the
-            // Vulkan decoder respects whatever dst_size the host
-            // descriptor advertises.
-            const dst_off: u32 = ci * unwrap.result.chunk_size;
-            const dst_size: u32 = unwrap.result.per_chunk_decomp_size[ci];
-            // BYTE base (post-l1_unwrap port — slots 2/4/6/8/11 in the
-            // 16-u32 descriptor are byte offsets into the corresponding
-            // stream SSBO; lz_decode no longer multiplies them by 4).
-            const stream_byte_base: u32 = ci * chunk_capacity;
-            const off32_byte_base: u32 = ci * off32_capacity;
-            const base = ci * 16;
-            const ic: u32 = if (stream_view.per_chunk_initial_copy) |pci|
-                (if (ci < pci.len) pci[ci] else 0)
-            else
-                0;
-            words[base + 0] = dst_off;
-            words[base + 1] = dst_size;
-            words[base + 2] = stream_byte_base;
-            words[base + 3] = @intCast(stream_view.cmd_bytes[ci].len);
-            // CPU unwrap already spliced the init prefix at the head of
-            // lit_bytes[ci]. lit_byte_base / lit_size point at the
-            // TOKEN-LOOP slice (after the prefix); init_byte_base
-            // (slot 15) points at the prefix.
-            words[base + 4] = stream_byte_base + ic;
-            words[base + 5] = @intCast(stream_view.lit_bytes[ci].len - ic);
-            words[base + 6] = stream_byte_base;
-            words[base + 7] = @intCast(stream_view.off16_bytes[ci].len / 2);
-            words[base + 8] = stream_byte_base;
-            words[base + 9] = @intCast(stream_view.length_bytes[ci].len);
-            words[base + 10] = ic;
-            // Slot 11 = BYTE base of this chunk's off32 slice.
-            // Slots 12..14 = off32_count_block1 / off32_count_block2 /
-            // cmd_stream2_offset, plumbed from the unwrap result.
-            words[base + 11] = off32_byte_base;
-            if (stream_view.per_chunk_off32_count1) |a| if (ci < a.len) { words[base + 12] = a[ci]; };
-            if (stream_view.per_chunk_off32_count2) |a| if (ci < a.len) { words[base + 13] = a[ci]; };
-            if (stream_view.per_chunk_cmd_stream2_offset) |a| if (ci < a.len) { words[base + 14] = a[ci]; };
-            // Slot 15 = init_byte_base. Prefix sits at the head of the
-            // per-chunk lit slice.
-            words[base + 15] = stream_byte_base;
-        }
-    }
-
-    // Cluster A wiring: build a walk-format chunks buffer (6 u32/chunk)
-    // mirroring walk_frame.comp's SlzChunkDesc output. lz_decode.comp
-    // now reads dst_offset + decomp_size from this buffer (binding 7).
-    var walk_chunks_b = try createMappedBuffer(
+    const written = slz1_codec.decodeSlz1ToBytes(
         ctx,
-        @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * wire_constants.CHUNK_DESC_U32_COUNT,
-    );
-    defer destroyMappedBuffer(ctx, &walk_chunks_b);
-    @memset(walk_chunks_b.mapped[0..@intCast(walk_chunks_b.size)], 0);
-    {
-        const wcw: [*]u32 = @ptrCast(@alignCast(walk_chunks_b.mapped));
-        var ci: u32 = 0;
-        while (ci < n_chunks) : (ci += 1) {
-            const dst_off: u32 = ci * unwrap.result.chunk_size;
-            const dst_size: u32 = unwrap.result.per_chunk_decomp_size[ci];
-            const wbase = ci * wire_constants.CHUNK_DESC_U32_COUNT;
-            wcw[wbase + wire_constants.CHUNK_DECOMP_SIZE_SLOT] = dst_size;
-            wcw[wbase + wire_constants.CHUNK_DST_OFFSET_SLOT] = dst_off;
-        }
-    }
-
-    // Build decode pipeline and submit dispatch.
-    var cache: descriptors.Cache = .{};
-    defer descriptors.invalidateAll(ctx, &cache);
-
-    const cached_dec = try descriptors.getOrCreate(
-        ctx,
-        &cache,
-        "lz_decode",
-        tier,
-        dec_spv,
-        8,
-        @sizeOf(DecodePush),
-    );
-
-    const dec_bindings: [8]vk.VkDescriptorBufferInfo = .{
-        .{ .buffer = cmd_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-        .{ .buffer = lit_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-        .{ .buffer = off16_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-        .{ .buffer = length_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-        .{ .buffer = dst_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-        .{ .buffer = chunks_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-        .{ .buffer = off32_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
-        .{ .buffer = walk_chunks_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        io,
+        allocator,
+        slz_bytes,
+        dst,
+    ) catch |err| {
+        try w.print("CUDA_TO_VK FAIL {s} stage=vk_decode err={s}\n", .{ label, @errorName(err) });
+        return;
     };
-    const dec_set = try descriptors.allocSet(ctx, cached_dec, dec_bindings[0..]);
 
-    const dec_push: DecodePush = .{ .n_chunks = n_chunks };
-    var dec_push_bytes: [@sizeOf(DecodePush)]u8 = undefined;
-    @memcpy(dec_push_bytes[0..], std.mem.asBytes(&dec_push));
-
-    _ = try dispatch.submitOne(
-        ctx,
-        cached_dec.pipeline,
-        cached_dec.pipeline_layout,
-        dec_set,
-        dec_push_bytes[0..],
-        .{ n_chunks, 1, 1 },
-    );
-
-    const dst_bytes = try allocator.alloc(u8, dst_total);
-    errdefer allocator.free(dst_bytes);
-    @memcpy(dst_bytes, dst_b.mapped[0..dst_total]);
-    return DecodeResult{ .bytes = dst_bytes };
+    // 4. Compare.
+    const diff = compareBytes(src, dst[0..written]);
+    if (diff.total_diffs == 0 and src.len == written) {
+        try w.print(
+            "CUDA_TO_VK PASS {s} bytes={d} slz_bytes={d}\n",
+            .{ label, src.len, slz_bytes.len },
+        );
+    } else {
+        try w.print(
+            "CUDA_TO_VK FAIL {s} bytes={d} decoded_bytes={d} first_diff={d} total_diffs={d}\n",
+            .{ label, src.len, written, diff.first_diff, diff.total_diffs },
+        );
+        const d = diff.first_diff;
+        const start = if (d >= 16) d - 16 else 0;
+        const end = @min(d + 16, @min(src.len, written));
+        try w.print("DEBUG src[{d}..{d}] = ", .{ start, end });
+        for (src[start..end]) |b| try w.print("{x:0>2} ", .{b});
+        try w.print("\nDEBUG dec[{d}..{d}] = ", .{ start, end });
+        for (dst[start..end]) |b| try w.print("{x:0>2} ", .{b});
+        try w.print("\n", .{});
+    }
 }
 
-const MappedBuffer = struct {
-    buf: vk.VkBuffer,
-    mem: vk.VkDeviceMemory,
-    mapped: [*]u8,
-    size: vk.VkDeviceSize,
-};
-
-fn createMappedBuffer(ctx: *driver.Context, size: vk.VkDeviceSize) !MappedBuffer {
-    const create_buf = vk.vkCreateBuffer_fn orelse return error.BufferCreateFailed;
-    const get_req = vk.vkGetBufferMemoryRequirements_fn orelse return error.BufferCreateFailed;
-    const alloc_mem = vk.vkAllocateMemory_fn orelse return error.MemoryAllocateFailed;
-    const bind = vk.vkBindBufferMemory_fn orelse return error.BindBufferFailed;
-    const map = vk.vkMapMemory_fn orelse return error.MapMemoryFailed;
-    const get_mem_props = vk.vkGetPhysicalDeviceMemoryProperties_fn orelse return error.MemoryTypeNotFound;
-
-    const bci: vk.VkBufferCreateInfo = .{
-        .size = size,
-        .usage = vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        .sharingMode = vk.VK_SHARING_MODE_EXCLUSIVE,
-    };
-    var buf: vk.VkBuffer = null;
-    if (create_buf(ctx.dev, &bci, null, &buf) != vk.VK_SUCCESS) return error.BufferCreateFailed;
-
-    var req: vk.VkMemoryRequirements = .{};
-    get_req(ctx.dev, buf, &req);
-
-    var mem_props: vk.VkPhysicalDeviceMemoryProperties = .{};
-    get_mem_props(ctx.pd, &mem_props);
-
-    var mt_idx: u32 = std.math.maxInt(u32);
-    const want_flags = vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-        vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-        vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    const fallback_flags = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-        vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    var i: u32 = 0;
-    while (i < mem_props.memoryTypeCount) : (i += 1) {
-        const supported = (req.memoryTypeBits & (@as(u32, 1) << @intCast(i))) != 0;
-        const flags = mem_props.memoryTypes[i].propertyFlags;
-        if (supported and (flags & want_flags) == want_flags) {
-            mt_idx = i;
-            break;
-        }
-    }
-    if (mt_idx == std.math.maxInt(u32)) {
-        var j: u32 = 0;
-        while (j < mem_props.memoryTypeCount) : (j += 1) {
-            const supported = (req.memoryTypeBits & (@as(u32, 1) << @intCast(j))) != 0;
-            const flags = mem_props.memoryTypes[j].propertyFlags;
-            if (supported and (flags & fallback_flags) == fallback_flags) {
-                mt_idx = j;
-                break;
-            }
-        }
-    }
-    if (mt_idx == std.math.maxInt(u32)) return error.MemoryTypeNotFound;
-
-    const mai: vk.VkMemoryAllocateInfo = .{
-        .allocationSize = req.size,
-        .memoryTypeIndex = mt_idx,
-    };
-    var mem: vk.VkDeviceMemory = null;
-    if (alloc_mem(ctx.dev, &mai, null, &mem) != vk.VK_SUCCESS) return error.MemoryAllocateFailed;
-    if (bind(ctx.dev, buf, mem, 0) != vk.VK_SUCCESS) return error.BindBufferFailed;
-
-    var raw: ?*anyopaque = null;
-    if (map(ctx.dev, mem, 0, vk.VK_WHOLE_SIZE, 0, &raw) != vk.VK_SUCCESS)
-        return error.MapMemoryFailed;
-    const mapped: [*]u8 = @ptrCast(@alignCast(raw.?));
-
-    return .{ .buf = buf, .mem = mem, .mapped = mapped, .size = size };
-}
-
-fn destroyMappedBuffer(ctx: *driver.Context, b: *MappedBuffer) void {
-    if (vk.vkDestroyBuffer_fn) |d| d(ctx.dev, b.buf, null);
-    if (vk.vkFreeMemory_fn) |f| f(ctx.dev, b.mem, null);
-    b.buf = null;
-    b.mem = null;
-}
+// Cluster F (F036): the `decodeUnwrappedVkOnly` fixture that used to
+// live here drove the lz_decode shader directly from host-uploaded
+// per-chunk stream slices, bypassing the production GPU walk_frame /
+// l1_unwrap / DEVICE_LOCAL+sysmem-staging chain. It has been deleted —
+// `testCudaEncodeVkDecode` above now calls `slz1_codec.decodeSlz1ToBytes`,
+// the same entry point the CLI and the C ABI take. The chunk-descriptor
+// + bind helpers that supported the fixture (createMappedBuffer,
+// destroyMappedBuffer, DecodePush, DecodeResult, MappedBuffer) were
+// deleted with it; their absence is enforced by the unused-decl warnings
+// in the test compile.
 
 // ── main ──────────────────────────────────────────────────────────────
 
@@ -808,7 +523,7 @@ pub fn main(process_init: std.process.Init) !void {
         .{ .name = "enwik8_4mb", .path = "assets/enwik8.txt", .size = 4 * 1024 * 1024 },
     };
 
-    // ── Direction 1: vk_encode → cuda_decode ─────────────────────────
+    // ── Direction 1: vk_encode â†’ cuda_decode ─────────────────────────
     for (corpora) |c| {
         var file = std.Io.Dir.cwd().openFile(io, c.path, .{}) catch {
             try w.print("VK_TO_CUDA SKIP {s} (open fail {s})\n", .{ c.name, c.path });
@@ -849,7 +564,7 @@ pub fn main(process_init: std.process.Init) !void {
         try w.flush();
     }
 
-    // ── Direction 2: cuda_encode → vk_decode ─────────────────────────
+    // ── Direction 2: cuda_encode â†’ vk_decode ─────────────────────────
     for (corpora) |c| {
         var file = std.Io.Dir.cwd().openFile(io, c.path, .{}) catch {
             try w.print("CUDA_TO_VK SKIP {s} (open fail {s})\n", .{ c.name, c.path });

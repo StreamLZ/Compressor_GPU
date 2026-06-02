@@ -512,10 +512,15 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .link_libc = true,
     });
+    // Cluster F (F036): the scale test now drives the production VK
+    // decoder via slz1_codec.decodeSlz1ToBytes, which transitively
+    // pulls in `spv_blobs` for the @embedFile()'d .spv blobs.
+    addSpvBlobsImport(vk_wire_scale_test_module, vk_shaders);
     const vk_wire_scale_test_exe = b.addExecutable(.{
         .name = "vk_wire_format_scale_test",
         .root_module = vk_wire_scale_test_module,
     });
+    vk_wire_scale_test_exe.step.dependOn(vk_shaders.embed_dir_step);
     b.installArtifact(vk_wire_scale_test_exe);
     const run_vk_wire_scale_test = b.addRunArtifact(vk_wire_scale_test_exe);
     run_vk_wire_scale_test.step.dependOn(b.getInstallStep());
