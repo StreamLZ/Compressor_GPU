@@ -405,11 +405,43 @@ pub fn build(b: *std.Build) void {
         .root_module = vk_abi_test_module,
     });
     vk_abi_test_exe.step.dependOn(vk_shaders.embed_dir_step);
-    b.installArtifact(vk_abi_test_exe);
+    const vk_abi_test_install = b.addInstallArtifact(vk_abi_test_exe, .{});
     const run_vk_abi_test = b.addRunArtifact(vk_abi_test_exe);
-    run_vk_abi_test.step.dependOn(b.getInstallStep());
+    // Detach from b.getInstallStep() (and the CUDA-side ptx-freshness
+    // gate it pulls in) — same pattern as vk-l1-test. Vulkan-only test
+    // runs shouldn't require a working CUDA tool-chain on the dev box.
+    run_vk_abi_test.step.dependOn(&vk_abi_test_install.step);
     run_vk_abi_test.step.dependOn(&vk_shaders_top.step);
     b.step("vk-abi-test", "Run the C ABI end-to-end round-trip test").dependOn(&run_vk_abi_test.step);
+
+    // ── Vulkan port (Phase 1 / TODO A1): async + timings + sentinel ─
+    // Exercises the six C ABI symbols that were stubbed to
+    // SLZ_ERROR_UNSUPPORTED before this phase:
+    //   * slzMakeDeviceOnlyHandle_vk
+    //   * slzCompressAsync_vk + slzCompressAsyncPoll_vk
+    //   * slzDecompressAsync_vk + slzDecompressAsyncPoll_vk
+    //   * slzGetLastTimings_vk
+    // Wired as `zig build vk-abi-async-test`. Detached from
+    // b.getInstallStep() (same pattern as vk-abi-test) so the test
+    // runs without a CUDA tool-chain.
+    const vk_abi_async_test_module = b.createModule(.{
+        .root_source_file = b.path("c_abi_async_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .link_libc = true,
+    });
+    addSpvBlobsImport(vk_abi_async_test_module, vk_shaders);
+    const vk_abi_async_test_exe = b.addExecutable(.{
+        .name = "vk_abi_async_test",
+        .root_module = vk_abi_async_test_module,
+    });
+    vk_abi_async_test_exe.step.dependOn(vk_shaders.embed_dir_step);
+    const vk_abi_async_test_install = b.addInstallArtifact(vk_abi_async_test_exe, .{});
+    const run_vk_abi_async_test = b.addRunArtifact(vk_abi_async_test_exe);
+    run_vk_abi_async_test.step.dependOn(&vk_abi_async_test_install.step);
+    run_vk_abi_async_test.step.dependOn(&vk_shaders_top.step);
+    b.step("vk-abi-async-test", "Run the Phase-1 (A1) async + timings + sentinel C ABI test").dependOn(&run_vk_abi_async_test.step);
 
     // ── Vulkan port (L1 wire-format): SLZ1 wrap/unwrap conformance ─────
     // Wraps the L1 codec's raw streams into a real .slz file (CPU-side)
