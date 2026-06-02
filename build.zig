@@ -17,7 +17,19 @@ pub fn build(b: *std.Build) void {
         .cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 },
     } else .{};
     const target = b.standardTargetOptions(.{ .default_target = default_query });
-    const optimize = b.standardOptimizeOption(.{});
+    // Default to ReleaseFast so bare `zig build` matches the header comment
+    // above. The stock `standardOptimizeOption` defaults to `.Debug` even
+    // when `preferred_optimize_mode` is set (it only consults `--release`
+    // on the CLI), which means every bench/release artifact that forgot
+    // `-Doptimize=ReleaseFast` silently shipped runtime safety checks.
+    // We still honour an explicit `-Doptimize=...` so existing scripts
+    // (`tools/bench_d2d.bat`, `tools/build_gpu.bat`, README examples,
+    // `.claude/settings.json` permissions) keep working unchanged.
+    const optimize: std.builtin.OptimizeMode = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size (default: ReleaseFast)",
+    ) orelse .ReleaseFast;
 
     // `-Dstrip=false` keeps debug info even in ReleaseFast so profilers
     // (VTune, samply, etc.) can attribute samples to source lines.
