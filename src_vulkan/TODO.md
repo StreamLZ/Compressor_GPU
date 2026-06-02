@@ -28,15 +28,18 @@ What works end-to-end **today**:
   tests all pass on `device 0` (Intel iGPU) at HEAD.
 
 Headline perf on `assets/web.txt` (4.5 MB), `zig build vk-perf-bench`,
-at the new sc=0.25 default:
+at the new sc=0.25 default (NVIDIA decode is post-`0fa1afb`):
 
 | device | encode ns/B | decode ns/B |
 |---|---:|---:|
-| Intel(R) Graphics (iGPU) | **11.14** | **4.26** |
-| NVIDIA GeForce RTX 4060 Ti | **6.60** | 20.21 |
+| Intel(R) Graphics (iGPU) | **11.14** | **4.19** |
+| NVIDIA GeForce RTX 4060 Ti | **6.60** | **4.82** |
 
 (Both encoders 30-45% faster after the sc=0.5→0.25 switch; Intel
-decode also 17% faster; NVIDIA decode within noise.)
+decode also 17% faster; NVIDIA decode 4× faster after the discrete-GPU
+readback-staging fix landed — was 20.21 ns/B pre-fix. At 100 MB+
+inputs the NVIDIA decoder is now ~3.5 ns/B, slightly faster than
+Intel.)
 
 ---
 
@@ -96,36 +99,28 @@ unblock D2D for the codec.
 
 ## PERF (correctness done; throughput further-tunable)
 
-### P1. NVIDIA decode ~5× slower than Intel (anomaly worth investigating)
+### P1. NVIDIA decode ~5× slower than Intel — **FIXED** (commits `45613bd` + `0fa1afb`)
 
-At sc=0.25 (current default after `8cd8155`):
+| field | value |
+|---|---|
+| symptom (before fix) | NVIDIA RTX 4060 Ti decode wall-time on `assets/web.txt` was 20.21 ns/B vs Intel iGPU's 4.26 ns/B (+374%). Got dramatically worse with size — silesia_full was 55.7 ns/B (~12 s for 213 MB). |
+| diagnosis | VkQueryPool timestamp capture + per-phase QPC instrumentation in `vk_l1_perf_bench` showed GPU-side decode was actually 0.04-0.41 ns/B on NVIDIA (2x FASTER than Intel). All 5x wall-time gap was the final `@memcpy(dst_host, dst_b.mapped)` reading from the dst buffer's mapped memory — which the createBuffer helper had placed in NVIDIA's resizable BAR region (`DEVICE_LOCAL+HOST_VISIBLE`). CPU reads from BAR are uncached PCIe burst reads at 20-60 MB/s; on silesia the single 212 MB readback took 10.1 s. The kernel itself was 9.6 ms. |
+| fix | Standard discrete-GPU pattern. Decoder now allocates `dst_b` `DEVICE_LOCAL`-only (no host mapping; full VRAM bandwidth for the kernel) and a sibling `dst_stage` buffer explicitly pinned to `HOST_VISIBLE+HOST_COHERENT` AND NOT `DEVICE_LOCAL` via the new `findHostVisibleNonDeviceLocal` memory-type helper. The decode cmdbuf gets a `vkCmdCopyBuffer(dst_b → dst_stage)` queued after the dispatch (in the same cmdbuf, via new `dispatch.submitOneWithCopy`, with a `SHADER_WRITE → TRANSFER_READ` buffer barrier). Host @memcpy now reads from sysmem-backed staging at cached-memory bandwidth. |
+| verification | `vk_l1_perf_bench` after fix: NVIDIA decode is web.txt 4.82, enwik8 3.56, silesia 3.53 ns/B (Intel: 4.19 / 3.67 / 3.65). NVIDIA now matches or beats Intel at every size. VK→VK + VK→CUDA + CUDA→VK round-trips all byte-equal on web.txt + enwik8 + silesia on both devices. All 30+ `vk-l1-test` + 14 `vk-l1-scale-test` cases pass on both Intel and NVIDIA. |
 
-| op | Intel iGPU | NVIDIA RTX 4060 Ti |
-|---|---:|---:|
-| encode ns/B (web.txt) | 11.14 | **6.60** (−41%, expected) |
-| decode ns/B (web.txt) | **4.26** | **20.21** (+374%, surprising) |
+Closes the last L1 perf item. Original candidates (1, 2, 3) breakdown:
+candidate (1) was the right answer but in a non-obvious way — the BAR
+readback was the entire story, NOT per-call PCIe overhead (which is
+constant per call; if it had been (1), ns/B would have *shrunk* as
+size grew, not *grown*). Candidate (2) (`8bit_storage`) was a false
+lead — the GPU-side numbers prove `uint8_t` SSBO writes are actually
+faster on NVIDIA than Intel. Candidate (3) (fast-batch driver path)
+likewise not the bottleneck.
 
-Encoder is correctly faster on NVIDIA (more EUs, fixed-32 subgroup).
-Decoder is much slower. Same shader, same wire format, same algorithm.
-The sc=0.5→0.25 switch did not change the decode picture meaningfully.
-Candidates:
-
-1. **PCIe upload/download dominates at small sizes.** Discrete-GPU has
-   to copy `compressed.slz` + receive `decompressed.bin` over PCIe; Intel
-   iGPU shares memory with the CPU. For 4.5 MB inputs the per-call
-   PCIe round-trip could be a significant fraction of wall-clock.
-2. **NVIDIA's `8bit_storage` path is slower than Intel's.** The decoder
-   uses `uint8_t` SSBO writes (commit `ab659e4`) which is implemented
-   via SPIR-V's `StorageBuffer8BitAccess` capability. Different
-   vendors may emit different ISA for it.
-3. **Fast-batch loop hits a different driver compile path.** The
-   32-token batch (commit `d625c8b`) relies on `subgroupShuffle` +
-   `subgroupBallot` patterns that NVIDIA may optimize differently.
-
-Diagnostic plan: per-kernel timing breakdown on each device via
-`SLZ_VK_E2E_TIMER` env var (when implemented). Without that, a
-GPU-side `VkQueryPool` capture at each `vkCmdDispatch` boundary
-would localize where the time goes.
+The decoder-phase instrumentation (`SLZ_VK_E2E_TIMER`-spirit via
+`l1_codec.last_decode_*_ns` globals + `vk_l1_perf_bench` breakdown
+output) was added in commit `45613bd` and stays — useful for future
+perf work on the encoder host-overhead split.
 
 ### P2. GPU-side frame assembly (not yet ported)
 
