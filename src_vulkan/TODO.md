@@ -42,61 +42,19 @@ decode also 17% faster; NVIDIA decode within noise.)
 
 # L1 — remaining work
 
-## CORRECTNESS BLOCKERS (1 known bug)
+## CORRECTNESS BLOCKERS — none.
 
-### B1. `VK→CUDA silesia_full` deterministic residual
+### B1. `VK→CUDA silesia_full` deterministic residual — **FIXED** (commit `12cad9e`)
 
-| field | value (recheck needed at sc=0.25) |
+| field | value |
 |---|---|
-| symptom | `vk-wire-format-scale-test VK_TO_CUDA_SCALE silesia_full` fails |
-| first_diff (measured at sc=0.5) | byte **202,768,392** (chunk ≈ 1547 of 1624) |
-| first_diff (sc=0.25) | unknown — last reported as "still fails" but exact offset not re-measured after `8cd8155` |
-| total_diffs (at sc=0.5) | **1,627,664** |
-| affected | only `VK encode → CUDA decode` |
-| not affected | VK→VK silesia_full PASS; CUDA→VK silesia_full PASS; CUDA→CUDA PASS |
-| device-specific? | **NO** — byte-identical wrong output on both Intel and NVIDIA at sc=0.5 |
-| reproducible? | YES — deterministic, both vendors, every run |
+| symptom (before fix) | `vk-wire-format-scale-test VK_TO_CUDA_SCALE silesia_full` failed at byte **198,967,304** (chunk 3036 of 3248 at sc=0.25, 60,704 diffs in the carved 2-chunk repro) |
+| root cause | **wire-format wrap** — not encoder. The wrap unconditionally marked every chunk as LZ-compressed. CUDA's `slzLzDecodeRawKernel` picks the raw-copy fast path whenever `sc_comp_size >= sc_size` (see `lz_decode_kernels.cuh:113`), so a chunk whose LZ payload exceeded `chunk_decomp_size` (high-entropy data like the silesia x-ray slice) was silently reinterpreted as raw bytes. |
+| fix | When `sub_payload_size >= chunk_decomp_size`, emit the chunk as a true uncompressed block: internal_hdr0 bit 7 set, no 4-byte chunk hdr, just 2-byte hdr + `chunk_decomp_size` raw source bytes. Mirrors what CUDA's encoder does. The unwrap path already tolerated this layout, so VK→VK and CUDA→VK are unaffected. |
+| verification | VK→CUDA silesia_full is byte-identical to source. Resulting VK SLZ output is byte-identical to CUDA's SLZ output (101,782,020 bytes). enwik8_full + web.txt unaffected. |
 
-**NOTE after commit `8cd8155`:** the sc=0.25 switch made our 1 MB and
-16 MB tests byte-identical to CUDA. The bug exists somewhere AFTER the
-first 16 MiB. silesia is 200 MB. The chunk count doubled (1624→3248 at
-sc=0.25), so chunk numbering shifted. **Re-running diagnostic at sc=0.25
-should be the first step** — the bug may have shifted location or been
-masked by the chunk-boundary change.
-
-**Implications of "identical on both vendors":** the bug is in
-*our* code — shader or wire-format wrap — not in any driver quirk.
-This is the strongest possible signal that the fix will land
-once we instrument the right code path.
-
-**Diagnostic methodology** (proven on chunk-77 + chunk-78 + the
-SubgroupSize bug):
-
-1. Re-run `vk-wire-format-scale-test` at sc=0.25 (current default).
-   Record first_diff offset.
-2. Identify which chunk holds that offset; carve a minimal reproducer.
-3. Add a debug SSBO to `lz_encode.comp` capturing
-   `[pos, token_emitted, lit_len, match_len, use_recent, match_offset, off16_pos, off32_pos, length_offset]`
-   around the failing position.
-4. Identify the first mis-emitted token; patch.
-
-**Likely candidates** (rank by hand-trace plausibility):
-
-- (a) end-of-file boundary in the encoder — bug specifically at very
-  late chunks, not early or middle. Could be an end-of-chunk emission
-  edge case that only manifests when the chunk has specific content
-  past some threshold.
-- (b) wire-format wrap path overflow at large chunk counts —
-  `MAX_CHUNKS=4096`; silesia at sc=0.25 = 3248 chunks (~80% of cap).
-  Higher pressure than 1624 chunks at sc=0.5 — worth re-checking.
-- (c) off32 emission edge case at very-late-file positions.
-- (d) length stream emission edge case for a `TOKEN_LONG_*` near
-  end-of-chunk.
-- (e) sc=0.25-specific issue that we hadn't tested before — chunk-78
-  failures we fixed earlier were all at sc=0.5; at sc=0.25 we may have
-  newly-introduced or newly-exposed bugs.
-
-Estimated work: 1 single agent, 6-10 iterations, similar to the chunk-78 hunt.
+Closes the last L1 correctness bug. The L1 codec now matches CUDA's
+L1 wire format byte-for-byte on every corpus tested.
 
 ## API COMPLETENESS (sync API works; async stubbed)
 
