@@ -376,6 +376,45 @@ fn findHostVisibleNonDeviceLocal(
     return null;
 }
 
+/// Find a memory type that is HOST_VISIBLE+HOST_COHERENT+HOST_CACHED.
+/// On NVIDIA discrete with resizable BAR, the BAR window is exposed as
+/// two separate memory types: an uncached one (HOST_VISIBLE+HOST_COHERENT,
+/// 0x006) and a driver-cached one (HOST_VISIBLE+HOST_COHERENT+HOST_CACHED,
+/// 0x00e). CPU reads from the uncached type issue per-cache-line PCIe
+/// reads (~0.28 GB/s on RTX 4060 Ti). The cached variant lets the CPU
+/// hit its own L1/L2/L3 on subsequent reads and runs at full DRAM
+/// bandwidth (~6–14 GB/s). On Intel integrated GPUs, all heaps are
+/// DEVICE_LOCAL but type 0x00f (DEVICE_LOCAL+HOST_VISIBLE+HOST_COHERENT+
+/// HOST_CACHED) exists alongside an uncached 0x007 — same speedup applies.
+///
+/// HOST_COHERENT is required: a HOST_CACHED-only memory type would force
+/// callers to add vkInvalidateMappedMemoryRanges before every CPU read.
+/// On every device we've seen the cached variant also carries
+/// HOST_COHERENT, so the conjunction is the right thing to ask for; on
+/// devices where it doesn't, the caller falls through to the next
+/// helper rather than picking up new invalidate plumbing.
+fn findHostCachedHostVisible(
+    pd: vk.VkPhysicalDevice,
+    type_bits_mask: u32,
+) ?u32 {
+    const get_mem_props = vk.vkGetPhysicalDeviceMemoryProperties_fn orelse return null;
+    var mem_props: vk.VkPhysicalDeviceMemoryProperties = .{};
+    get_mem_props(pd, &mem_props);
+
+    const want = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+        vk.VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    var i: u32 = 0;
+    while (i < mem_props.memoryTypeCount) : (i += 1) {
+        const supported = (type_bits_mask & (@as(u32, 1) << @intCast(i))) != 0;
+        if (!supported) continue;
+        const flags = mem_props.memoryTypes[i].propertyFlags;
+        const has_want = (flags & want) == want;
+        if (has_want) return i;
+    }
+    return null;
+}
+
 pub const Buffer = struct {
     buf: vk.VkBuffer = null,
     mem: vk.VkDeviceMemory = null,
@@ -455,11 +494,26 @@ pub fn createBufferEx(
                 if (findMemoryType(ctx.pd, req.memoryTypeBits, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) |i| break :blk i;
             },
             .host_visible_sysmem => {
-                // Walk memory types and pick the first HOST_VISIBLE+
-                // HOST_COHERENT type that is NOT also DEVICE_LOCAL.
-                // On discrete GPUs that's the sysmem heap; on an iGPU
-                // every host-visible heap is also device-local, so we
-                // fall back to the rebar-style ideal.
+                // Priority order — the CPU is going to @memcpy this
+                // buffer out after the GPU writes it, so what we want
+                // is whichever memory type lets CPU reads hit the
+                // cache hierarchy instead of issuing per-line PCIe
+                // round trips:
+                //
+                //   1. HOST_VISIBLE+HOST_COHERENT+HOST_CACHED — driver-
+                //      cached BAR on NVIDIA discrete (type 0x00e) or
+                //      cached host-visible on Intel iGPU (type 0x00f).
+                //      CPU reads hit L1/L2/L3 on subsequent passes;
+                //      sustained ~6–14 GB/s vs 0.28 GB/s for uncached.
+                //   2. HOST_VISIBLE+HOST_COHERENT and NOT DEVICE_LOCAL —
+                //      the existing "plain sysmem on iGPU/AMD" path. Only
+                //      reached when the device offers no HOST_CACHED
+                //      host-visible heap at all.
+                //   3. HOST_VISIBLE+HOST_COHERENT fallback — uncached BAR;
+                //      what we used to pick on NVIDIA. Kept as the last
+                //      resort because the alternative is failing the
+                //      allocation.
+                if (findHostCachedHostVisible(ctx.pd, req.memoryTypeBits)) |i| break :blk i;
                 if (findHostVisibleNonDeviceLocal(ctx.pd, req.memoryTypeBits)) |i| break :blk i;
                 const fallback = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                     vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;

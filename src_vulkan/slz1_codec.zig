@@ -359,34 +359,52 @@ fn runReadbackDiagnostics(
             get_req(ctx.dev, probe_buf.buf, &req);
             var mem_props: vk.VkPhysicalDeviceMemoryProperties = .{};
             get_mem_props(ctx.pd, &mem_props);
-            // Re-run the same selection logic as findHostVisibleNonDeviceLocal
-            // so the diag matches what createBufferEx actually picked.
-            const want = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            // Mirror createBufferEx(.host_visible_sysmem)'s priority
+            // order so the diag prints the type the buffer actually
+            // got — not the helper-by-helper internals:
+            //   1. HOST_VISIBLE+HOST_COHERENT+HOST_CACHED
+            //   2. HOST_VISIBLE+HOST_COHERENT and NOT DEVICE_LOCAL
+            //   3. HOST_VISIBLE+HOST_COHERENT (any)
+            const hv_co = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            const hv_co_cached = hv_co | vk.VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+            // Priority 1: HOST_CACHED.
             var i: u32 = 0;
             while (i < mem_props.memoryTypeCount) : (i += 1) {
                 const supported = (req.memoryTypeBits & (@as(u32, 1) << @intCast(i))) != 0;
                 if (!supported) continue;
                 const flags = mem_props.memoryTypes[i].propertyFlags;
-                const has_want = (flags & want) == want;
-                const is_device_local = (flags & vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
-                if (has_want and !is_device_local) {
+                if ((flags & hv_co_cached) == hv_co_cached) {
                     diag_dst_stage_mt_index = @intCast(i);
                     diag_dst_stage_mt_flags = flags;
                     break;
                 }
             }
-            // Helper returned null — record the fallback that createBufferEx
-            // would have picked (plain HOST_VISIBLE+HOST_COHERENT, including
-            // a DEVICE_LOCAL type if that's the only option).
+            // Priority 2: non-DEVICE_LOCAL HOST_VISIBLE+HOST_COHERENT.
             if (diag_dst_stage_mt_index < 0) {
                 i = 0;
                 while (i < mem_props.memoryTypeCount) : (i += 1) {
                     const supported = (req.memoryTypeBits & (@as(u32, 1) << @intCast(i))) != 0;
                     if (!supported) continue;
                     const flags = mem_props.memoryTypes[i].propertyFlags;
-                    const has_want = (flags & want) == want;
-                    if (has_want) {
+                    const has_want = (flags & hv_co) == hv_co;
+                    const is_device_local = (flags & vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+                    if (has_want and !is_device_local) {
+                        diag_dst_stage_mt_index = @intCast(i);
+                        diag_dst_stage_mt_flags = flags;
+                        break;
+                    }
+                }
+            }
+            // Priority 3: any HOST_VISIBLE+HOST_COHERENT.
+            if (diag_dst_stage_mt_index < 0) {
+                i = 0;
+                while (i < mem_props.memoryTypeCount) : (i += 1) {
+                    const supported = (req.memoryTypeBits & (@as(u32, 1) << @intCast(i))) != 0;
+                    if (!supported) continue;
+                    const flags = mem_props.memoryTypes[i].propertyFlags;
+                    if ((flags & hv_co) == hv_co) {
                         diag_dst_stage_mt_index = @intCast(i);
                         diag_dst_stage_mt_flags = flags;
                         break;
