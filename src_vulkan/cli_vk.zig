@@ -14,6 +14,7 @@
 //! Built as `zig build streamlz_vk`; installed to `zig-out/bin/streamlz_vk.exe`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const driver = @import("driver.zig");
 const slz1_codec = @import("slz1_codec.zig");
@@ -23,16 +24,20 @@ const vk = @import("vk_api.zig");
 const instance_mod = @import("instance.zig");
 const probe_mod = @import("probe.zig");
 const device_mod = @import("device.zig");
+const l1_codec = @import("l1_codec.zig");
 
 const VK_SAFE_SPACE: usize = 64;
 
-const Mode = enum { compress, decompress, version, help, probe };
+const Mode = enum { compress, decompress, version, help, probe, bench };
 
 const Args = struct {
     mode: Mode = .compress,
     level: u8 = 1,
     input: ?[]const u8 = null,
     output: ?[]const u8 = null,
+    /// Bench-mode run count (`-r N`). Defaults to 3 to match the CUDA
+    /// `streamlz -b` default. Only consulted in `.bench` mode.
+    runs: u32 = 3,
     /// Raw `--device <arg>` payload (lifetime: argv). Parsed at run-time:
     /// pure-digit strings become `.by_index`; anything else becomes
     /// `.by_name` (case-insensitive substring match against deviceName).
@@ -40,6 +45,35 @@ const Args = struct {
     /// var, else falls back to first compute-capable device.
     device_spec: ?[]const u8 = null,
 };
+
+// ── Bench-mode QPC helpers ────────────────────────────────────────────
+// Windows has the highest-resolution clock the CUDA-side bench uses
+// for its `e2e` timings; mirror it here so the two backends report
+// directly comparable numbers. On non-Windows the fallback resolution
+// is whatever std.time.nanoTimestamp gives — typically still
+// sub-microsecond and good enough for the ms-scale bench output.
+const win32_qpc = struct {
+    extern "kernel32" fn QueryPerformanceCounter(count: *i64) callconv(.c) c_int;
+    extern "kernel32" fn QueryPerformanceFrequency(freq: *i64) callconv(.c) c_int;
+};
+fn qpcNow() i64 {
+    if (builtin.os.tag != .windows) return @intCast(std.time.nanoTimestamp());
+    var c: i64 = 0;
+    _ = win32_qpc.QueryPerformanceCounter(&c);
+    return c;
+}
+fn qpcNs(from: i64, to: i64) u64 {
+    if (builtin.os.tag != .windows) {
+        const d = to - from;
+        return if (d > 0) @intCast(d) else 0;
+    }
+    var freq: i64 = 0;
+    _ = win32_qpc.QueryPerformanceFrequency(&freq);
+    if (freq <= 0) freq = 1;
+    const delta = if (to > from) to - from else 0;
+    const ns = @divTrunc(@as(i128, delta) * 1_000_000_000, @as(i128, freq));
+    return @intCast(ns);
+}
 
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
@@ -58,11 +92,15 @@ fn printUsage(w: *std.Io.Writer) !void {
         \\Modes:
         \\  -c                  Compress (default)
         \\  -d                  Decompress
+        \\  -b                  Benchmark — compress + N decompress runs, report
+        \\                      e2e (wall) and d2d (kernel) timings in the
+        \\                      same format as the CUDA-backend `streamlz -b`
         \\  -p, --probe         List all Vulkan physical devices and exit
         \\
         \\Options:
         \\  -l N                Compression level (only 1 supported in v1)
-        \\  -o PATH             Output path
+        \\  -r N                Bench: number of decompress runs (default 3)
+        \\  -o PATH             Output path (compress / decompress modes)
         \\  --device <N|name>   Select Vulkan device by zero-based index
         \\                      (matches --probe order) or by case-insensitive
         \\                      substring of the device name. Env var
@@ -98,6 +136,18 @@ fn parseArgs(raw: []const []const u8, w: *std.Io.Writer) Args {
         }
         if (eql(arg, "-d")) {
             result.mode = .decompress;
+            continue;
+        }
+        if (eql(arg, "-b")) {
+            result.mode = .bench;
+            continue;
+        }
+        if (eql(arg, "-r")) {
+            i += 1;
+            if (i >= raw.len) die(w, "error: -r requires a value\n", .{});
+            result.runs = std.fmt.parseInt(u32, raw[i], 10) catch
+                die(w, "error: invalid -r value '{s}'\n", .{raw[i]});
+            if (result.runs == 0) die(w, "error: -r must be >= 1\n", .{});
             continue;
         }
         if (eql(arg, "-p") or eql(arg, "--probe")) {
@@ -384,6 +434,162 @@ fn yn(b: bool) []const u8 {
     return if (b) "y" else "n";
 }
 
+/// Return the median of `xs` (mutates the slice; sorts in place).
+/// Empty slice returns 0.
+fn medianU64(xs: []u64) u64 {
+    if (xs.len == 0) return 0;
+    std.mem.sort(u64, xs, {}, std.sort.asc(u64));
+    return xs[xs.len / 2];
+}
+
+/// `streamlz_vk -b <file>` — mirrors the CUDA `streamlz -b` output
+/// format so cross-backend benchmarks read line-for-line
+/// comparably. Format:
+///
+///   Input: <path> (<bytes> bytes, <MiB> MB)
+///     Compress: <ms>ms (<MB/s> MB/s)
+///   Level 1: <bytes> -> <bytes> (<%>)
+///
+///     Decompress run 1: e2e <ms>ms (<MB/s>)  d2d <ms>ms (<MB/s>)
+///     ...
+///     Decompress median: e2e <ms>ms (<MB/s>)  d2d <ms>ms (<MB/s>)
+///
+///   Round-trip: PASS|FAIL
+///
+/// `e2e` = QPC wall-clock around the synchronous decompress call
+/// (host setup + dispatch + GPU exec + readback). `d2d` = pure
+/// GPU dispatch time, pulled from slzGetLastTimings_vk after each
+/// run.
+fn runBench(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: Args) !void {
+    if (args.level != 1) {
+        try w.print("error: bench requires -l 1 (got -l {d})\n", .{args.level});
+        return error.UnsupportedLevel;
+    }
+    const in_path = args.input orelse {
+        try w.writeAll("error: -b requires an input file\n");
+        return error.NoInput;
+    };
+    const runs: u32 = args.runs;
+
+    const src = readFileAll(allocator, io, in_path) catch |err| {
+        try w.print("error: cannot read '{s}': {s}\n", .{ in_path, @errorName(err) });
+        return err;
+    };
+    defer allocator.free(src);
+    if (src.len == 0) {
+        try w.writeAll("error: input file is empty\n");
+        return error.EmptyInput;
+    }
+
+    try ensureInitWithSelector(w, args);
+    defer driver.deinit();
+
+    const mb: f64 = @as(f64, @floatFromInt(src.len)) / (1024.0 * 1024.0);
+    try w.print("Input: {s} ({d} bytes, {d:.2} MB)\n", .{ in_path, src.len, mb });
+
+    // ── Compress (one timed pass, after a warm-up of equal shape). ──
+    const bound = slz1_codec.slz1Bound(src.len);
+    const compressed = try allocator.alloc(u8, bound);
+    defer allocator.free(compressed);
+
+    // Warm-up encode to populate the pipeline cache; the timed run
+    // mirrors the second call so the cache effect doesn't skew the
+    // headline number.
+    _ = try slz1_codec.encodeL1ToSlz1(&driver.g_default, io, allocator, src, compressed);
+
+    var comp_size: usize = 0;
+    {
+        const t0 = qpcNow();
+        comp_size = try slz1_codec.encodeL1ToSlz1(&driver.g_default, io, allocator, src, compressed);
+        const t1 = qpcNow();
+        const ns = qpcNs(t0, t1);
+        const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+        try w.print("  Compress: {d:.0}ms ({d:.1} MB/s)\n", .{ ms, mb * 1000.0 / ms });
+    }
+    try w.print("Level 1: {d} -> {d} bytes ({d:.1}%)\n\n", .{
+        src.len, comp_size, @as(f64, @floatFromInt(comp_size)) / @as(f64, @floatFromInt(src.len)) * 100.0,
+    });
+
+    // ── Decompress runs ──────────────────────────────────────────
+    const dec_buf = try allocator.alloc(u8, src.len + VK_SAFE_SPACE);
+    defer allocator.free(dec_buf);
+
+    // Warm-up decompress (same rationale as the encode warm-up).
+    _ = try slz1_codec.decodeSlz1ToBytes(&driver.g_default, io, allocator, compressed[0..comp_size], dec_buf);
+
+    const dec_e2e_ns = try allocator.alloc(u64, runs);
+    defer allocator.free(dec_e2e_ns);
+    const dec_d2d_ns = try allocator.alloc(u64, runs);
+    defer allocator.free(dec_d2d_ns);
+
+    var r: u32 = 0;
+    while (r < runs) : (r += 1) {
+        // Reset the per-process dispatch-timing global to 0 so we
+        // know the per-run d2d came from THIS call (the codec
+        // resets it on entry but this is belt-and-suspenders).
+        l1_codec.last_decode_dispatch_ns = 0;
+        const t0 = qpcNow();
+        _ = try slz1_codec.decodeSlz1ToBytes(&driver.g_default, io, allocator, compressed[0..comp_size], dec_buf);
+        const t1 = qpcNow();
+        dec_e2e_ns[r] = qpcNs(t0, t1);
+        dec_d2d_ns[r] = l1_codec.last_decode_dispatch_ns;
+        const e2e_ms = @as(f64, @floatFromInt(dec_e2e_ns[r])) / 1_000_000.0;
+        const d2d_ms = @as(f64, @floatFromInt(dec_d2d_ns[r])) / 1_000_000.0;
+        if (dec_d2d_ns[r] > 0) {
+            try w.print(
+                "  Decompress run {d}: e2e {d:.0}ms ({d:.1} MB/s)  d2d {d:.2}ms ({d:.1} MB/s)\n",
+                .{ r + 1, e2e_ms, mb * 1000.0 / e2e_ms, d2d_ms, mb * 1000.0 / d2d_ms },
+            );
+        } else {
+            try w.print(
+                "  Decompress run {d}: {d:.0}ms ({d:.1} MB/s)\n",
+                .{ r + 1, e2e_ms, mb * 1000.0 / e2e_ms },
+            );
+        }
+    }
+
+    // Median across the runs. Slice the e2e and d2d arrays
+    // separately — independent medians give the same shape as the
+    // CUDA bench's output.
+    const e2e_med = medianU64(dec_e2e_ns);
+    const e2e_med_ms = @as(f64, @floatFromInt(e2e_med)) / 1_000_000.0;
+    // For d2d, drop any zero entries (could happen on a device that
+    // reports timestampValidBits == 0; unlikely on supported tiers).
+    var nz_d2d: std.ArrayList(u64) = .empty;
+    defer nz_d2d.deinit(allocator);
+    for (dec_d2d_ns) |x| {
+        if (x > 0) try nz_d2d.append(allocator, x);
+    }
+    if (nz_d2d.items.len > 0) {
+        const d2d_med = medianU64(nz_d2d.items);
+        const d2d_med_ms = @as(f64, @floatFromInt(d2d_med)) / 1_000_000.0;
+        try w.print(
+            "  Decompress median: e2e {d:.0}ms ({d:.1} MB/s)  d2d {d:.2}ms ({d:.1} MB/s)\n\n",
+            .{ e2e_med_ms, mb * 1000.0 / e2e_med_ms, d2d_med_ms, mb * 1000.0 / d2d_med_ms },
+        );
+    } else {
+        try w.print(
+            "  Decompress median: {d:.0}ms ({d:.1} MB/s)\n\n",
+            .{ e2e_med_ms, mb * 1000.0 / e2e_med_ms },
+        );
+    }
+
+    // ── Round-trip verify. ──────────────────────────────────────
+    if (std.mem.eql(u8, src, dec_buf[0..src.len])) {
+        try w.writeAll("Round-trip: PASS\n");
+    } else {
+        var first_fail: usize = 0;
+        var fail_count: usize = 0;
+        for (0..src.len) |bi| if (src[bi] != dec_buf[bi]) {
+            if (fail_count == 0) first_fail = bi;
+            fail_count += 1;
+        };
+        try w.print("Round-trip: FAIL  first_diff={d} total_diffs={d}\n", .{ first_fail, fail_count });
+        try w.flush();
+        std.process.exit(1);
+    }
+}
+
 pub fn main(process_init: std.process.Init) !void {
     const allocator = process_init.gpa;
     const io = process_init.io;
@@ -411,6 +617,7 @@ pub fn main(process_init: std.process.Init) !void {
         .help => try printUsage(w),
         .compress => try runCompress(allocator, io, w, args),
         .decompress => try runDecompress(allocator, io, w, args),
+        .bench => try runBench(allocator, io, w, args),
         .probe => try runProbe(w),
     }
 }

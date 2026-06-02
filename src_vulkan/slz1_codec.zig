@@ -602,7 +602,7 @@ pub fn decodeSlz1ToBytesEx(
     var dec_push_bytes: [@sizeOf(DecodePush)]u8 = undefined;
     @memcpy(dec_push_bytes[0..], std.mem.asBytes(&dec_push));
 
-    _ = try dispatch.submitOne(
+    const dec_dispatch_result = try dispatch.submitOne(
         ctx,
         cached_dec.pipeline,
         cached_dec.pipeline_layout,
@@ -610,6 +610,13 @@ pub fn decodeSlz1ToBytesEx(
         dec_push_bytes[0..],
         .{ n_chunks, 1, 1 },
     );
+    // Phase 4: surface the GPU-side dispatch ns so the CLI bench
+    // and `slzGetLastTimings_vk` callers can report `d2d` numbers
+    // for the SLZ1 decode path. `decodeL1Sync` writes the same
+    // global from its own dispatch site (the lower-level direct
+    // codec); this path is the one the SLZ1 wire-format unwrap
+    // takes, so wiring it here closes the missing path.
+    l1_codec.last_decode_dispatch_ns = dec_dispatch_result.ns;
 
     // Host readback only when the host buffer was actually the
     // dst — D2D callers skip it entirely (the bytes are already

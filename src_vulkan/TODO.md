@@ -59,43 +59,51 @@ Intel.)
 Closes the last L1 correctness bug. The L1 codec now matches CUDA's
 L1 wire format byte-for-byte on every corpus tested.
 
-## API COMPLETENESS (sync API works; async stubbed)
+## API COMPLETENESS — DONE (Phase 1 + Phase 2 of the L1 finishing work)
 
-### A1. Six stubbed C ABI symbols in `streamlz_gpu_vk.zig`
+### A1. Six stubbed C ABI symbols — **DONE** (commit `7336eb3`)
 
-All return `SLZ_ERROR_UNSUPPORTED` (= 5):
+All six entry points implemented and exercised by
+`vk-abi-async-test` (6/6 pass on both Intel iGPU and NVIDIA RTX
+4060 Ti):
 
-| Symbol | Purpose | Blocking? |
-|---|---|---|
-| `slzMakeDeviceOnlyHandle_vk` | sentinel for "input is already on device" | only D2D callers |
-| `slzCompressAsync_vk` | non-blocking encode submission | async-pattern callers |
-| `slzCompressAsyncPoll_vk` | poll async encode for completion | async-pattern callers |
-| `slzDecompressAsync_vk` | non-blocking decode submission | async-pattern callers |
-| `slzDecompressAsyncPoll_vk` | poll async decode | async-pattern callers |
-| `slzGetLastTimings_vk` | retrieve per-kernel timings | profiling callers |
+| Symbol | Implementation |
+|---|---|
+| `slzMakeDeviceOnlyHandle_vk` | returns the `0x10` device-only sentinel (matches CUDA's `device_only_host_stub_addr` pattern). |
+| `slzCompressAsync_vk` | spawns a per-handle 32 MiB-stack worker thread that runs the sync codec. |
+| `slzCompressAsyncPoll_vk` | acquire-loads the worker's `done` flag; non-blocking poll returns `SLZ_ERROR_UNSUPPORTED` as the "not ready" sentinel; blocking poll joins + drains. |
+| `slzDecompressAsync_vk` | symmetric with the encode async pair. |
+| `slzDecompressAsyncPoll_vk` | symmetric with the encode poll. |
+| `slzGetLastTimings_vk` | drains the per-handle `last_{encode,decode}_dispatch_ns` snapshot into a `KernelTimingC[]` array; names are static `"lz_encode"` / `"lz_decode"`. |
 
-CLI + sync (`slzCompressHost_vk` / `slzDecompressHost_vk`) cover the
-common case. These six matter for embedded-in-app integrations that
-want non-blocking submission or per-kernel timings.
+### A2. True D2D for `slzCompress_vk` / `slzDecompress_vk` — **DONE** (commit `710db2d`)
 
-### A2. True D2D for `slzCompress_vk` / `slzDecompress_vk`
+- `device.zig` now enables `bufferDeviceAddress` at device-create
+  time on every device (was only chained when 8-bit storage was
+  requested).
+- `slzRegisterBuffer_vk` records a `(VkBuffer, VkDeviceAddress, size)`
+  tuple on a per-handle 16-slot registry. `d_base_address == NULL`
+  triggers an internal `vkGetBufferDeviceAddress` query.
+- A new public helper `slzBufferGetDeviceAddress_vk` lets tests
+  read addresses without importing `vk_api.zig`.
+- `slzCompress_vk` / `slzDecompress_vk` peek `d_input` / `d_output`
+  for registered addresses and route through D2D-aware codec paths
+  that:
+  * skip the HOST_VISIBLE staging buffer + memcpy when the source
+    is device-resident (encode input D2D);
+  * write straight into the caller's VkBuffer when the destination
+    is device-resident (decode output D2D);
+  * use a small staging-copy shim for the two correctness-preserving
+    directions (encode output, decode input — the CPU wire format
+    wrap/unwrap still needs host bytes, so this phase trades one
+    transfer direction for another rather than removing it).
+- New `vk-l1-d2d-test` exercises all three directions byte-equal to
+  the host-pointer reference (3/3 pass on Intel + NVIDIA).
 
-Currently the device-pointer-typed entry points (`slzCompress_vk` and
-`slzDecompress_vk`) treat their `void*` args as **host pointers**
-(documented in the function-header comments — no implicit copy). A
-caller who has GPU-resident input/output buffers cannot use them
-without first copying back to host.
-
-Real D2D requires `VK_KHR_buffer_device_address` integration:
-- Use `vkGetBufferDeviceAddress` to convert a `VkBuffer` to a
-  device-address u64.
-- Treat that u64 as the value passed to `slzCompress_vk(d_input)`.
-- In the shader, dereference via the existing BDA path
-  (`GL_EXT_buffer_reference` is already enabled).
-
-`slzRegisterBuffer_vk` is the spec'd entry point for callers to hand
-over a `VkBuffer` + its address; today it's a no-op. Wiring it would
-unblock D2D for the codec.
+`slzMakeDeviceOnlyHandle_vk`'s sentinel is still rejected by the
+codec — the registry path provides the actual D2D buffer; the
+sentinel exists only for ABI symmetry with the CUDA `slzCompress`
+device-only-buffer pattern. Real D2D callers use the registry.
 
 ## PERF (correctness done; throughput further-tunable)
 
@@ -166,16 +174,16 @@ honors on Intel and `gl_SubgroupSize` is always 32. The defensive
 code is correct but dead-load-bearing. Could simplify back to
 compile-time constants; keep as safety belt for now.
 
-### N2. Three small defensive caveats flagged in earlier commits
+### N2. Three small defensive caveats — **DONE** (commit `08497f0`)
 
-| caveat | location | severity |
-|---|---|---|
-| `storeOff32Byte` assumes `CHUNK_OFF32_CAPACITY == CHUNK_STREAM_CAPACITY` | `lz_encode.comp` | latent — true today but fragile |
-| `LARGE_OFFSET_THRESHOLD (0xC00000)` guard missing in encoder | `lz_encode.comp` off32 emission | defensive — true for 128 KiB chunks |
-| `decodeUnwrappedVkOnly` single-chunk-size assumption | `wire_format_test.zig` | test-only, not production code |
+All three flagged invariants now have a comptime / runtime assertion
+that fires loudly if a future change crosses the boundary:
 
-None block any current test. Bundle into a small cleanup commit when
-convenient.
+| caveat | guard |
+|---|---|
+| `storeOff32Byte` assumes `CHUNK_OFF32_CAPACITY == CHUNK_STREAM_CAPACITY` | comptime block in `l1_codec.zig` pins them equal |
+| `LARGE_OFFSET_THRESHOLD (0xC00000)` guard missing in encoder | comptime assertion `CHUNK_SIZE + LZ_BLOCK_SIZE < 0xC00000` in `l1_codec.zig`; comment in `lz_encode.comp::storeOff32LE24` rewritten to point at it |
+| `decodeUnwrappedVkOnly` single-chunk-size assumption | runtime `std.debug.assert(unwrap.result.chunk_size <= l1_codec.CHUNK_SIZE)` in `wire_format_test.zig` |
 
 ---
 

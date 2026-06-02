@@ -258,4 +258,28 @@ pub fn main(process_init: std.process.Init) !void {
             @as(f64, @floatFromInt(phase_read_min)) / len_f,
         },
     );
+    // CUDA-symmetric headline: same shape as the streamlz -b output
+    // so cross-backend benchmarks read line-for-line. e2e = wall ns
+    // (host + dispatch + GPU + readback); d2d = pure GPU dispatch ns.
+    // Encode side prints the same pair from its own min trial so
+    // the encoder column matches.
+    const mb: f64 = @as(f64, @floatFromInt(src.len)) / (1024.0 * 1024.0);
+    const enc_e2e_ms: f64 = @as(f64, @floatFromInt(encode_ns_min)) / 1_000_000.0;
+    const enc_d2d_ms: f64 = @as(f64, @floatFromInt(encode_gpu_ns_min)) / 1_000_000.0;
+    const dec_e2e_ms: f64 = @as(f64, @floatFromInt(decode_ns_min)) / 1_000_000.0;
+    const dec_d2d_ms: f64 = @as(f64, @floatFromInt(decode_gpu_ns_min)) / 1_000_000.0;
+    try w.print(
+        "  Compress min: e2e {d:.0}ms ({d:.1} MB/s)  d2d {d:.2}ms ({d:.1} MB/s)\n",
+        .{
+            enc_e2e_ms, mb * 1000.0 / enc_e2e_ms,
+            enc_d2d_ms, mb * 1000.0 / enc_d2d_ms,
+        },
+    );
+    try w.print(
+        "  Decompress min: e2e {d:.0}ms ({d:.1} MB/s)  d2d {d:.2}ms ({d:.1} MB/s)\n",
+        .{
+            dec_e2e_ms, mb * 1000.0 / dec_e2e_ms,
+            dec_d2d_ms, mb * 1000.0 / dec_d2d_ms,
+        },
+    );
 }
