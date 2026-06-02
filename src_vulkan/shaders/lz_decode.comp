@@ -51,6 +51,29 @@
 //   uint n_chunks       : number of chunks (== gl_NumWorkGroups.x)
 //
 // Subgroup size: hard-required = 32 (enforced by host pipeline creation).
+//
+// PHASE-4 PERF OPT (Intel iGPU silesia_all.tar): per-iteration decode
+// state (cmd_pos / lit_pos / dst_pos / off16_pos / recent_offset /
+// length_offset / off32 cursors / block boundaries) was previously
+// stashed in `shared` cells, written by lane 0 and re-read by every
+// other lane on each outer-loop iteration. On Intel iGPU each such
+// shared-store + barrier + shared-load round-trip pays SLM-write +
+// subgroupMemoryBarrierShared overhead — ≈ 25-40 ns per iter, and a
+// ~16 KiB chunk emits 6-10 k batched iters, so the shared-state path
+// burned ~60 ms on a 200 MB corpus. CUDA's equivalent kernel keeps
+// this state in per-lane registers and uses __shfl_sync(.., 0) to
+// broadcast the slow-path parse results — every lane redundantly
+// updates its own register on the fast batched path, which matches
+// across lanes because the batch totals (total_dst / total_lit /
+// total_off16_used / batch_size / batch_recent_off) are computed via
+// warpScan/subgroupBallot and are subgroup-uniform.
+//
+// This rewrite mirrors the CUDA register-keep pattern: every per-iter
+// state cell becomes a per-lane uint/int local. The slow-path lane-0
+// parse broadcasts via subgroupBroadcast(.., 0u). Block-boundary
+// updates are recomputed uniformly on every lane (the block-2
+// boundary is a subgroup-uniform predicate). Net effect: 5 shared
+// writes + 5 barriers + 5 shared loads PER ITER eliminated.
 
 #version 460
 #extension GL_KHR_shader_subgroup_basic              : require
@@ -89,9 +112,9 @@ layout(push_constant) uniform PC {
     uint n_chunks;
 } pc;
 
-// Per-chunk push-equivalent state. Populated by main()'s prologue from
-// the workgroup's ChunkDescs entry. All `pc.<field>` references in the
-// original single-chunk shader become `g_<field>`.
+// Per-chunk constants (loaded once by lane 0 at chunk entry, broadcast
+// via a workgroup barrier). These never change during the decode loop,
+// so the SLM cost is paid exactly once per chunk.
 shared uint g_cmd_size;
 shared uint g_lit_size;
 shared uint g_off16_count;
@@ -208,60 +231,29 @@ void storeDstByte(uint pos, uint b) {
     dst_buf.b[g_dst_byte_base + pos] = uint8_t(b & 0xFFu);
 }
 
-// ── Shared state (broadcast lane-0 → warp through shared memory) ────
-// All decode state lives on lane 0 because the cooperative copies are
-// serialized there too (see Dst section). The shared cells let the
-// outer-loop control flow (any_long ballot, batch_size) stay
-// warp-uniform without per-iteration subgroupBroadcast calls.
-shared uint sh_cmd_pos;
-shared uint sh_lit_pos;
-shared uint sh_off16_pos;
-shared uint sh_dst_pos;
-shared int  sh_recent_offset;
-shared uint sh_length_offset;
-shared uint sh_off32_pos;          // entry cursor within the active off32 block
-shared uint sh_off32_block_count;  // size of the active off32 block (= count1 or count2)
-shared uint sh_off32_base_entry;   // entry offset of the active block's first entry within off32_buf
-shared uint sh_block_dst_start;    // dst position at the start of the active block (for off32 entry → match_offset math)
-shared uint sh_block_cmd_end;      // cmd-index boundary for the active block
-
-// Slow-path parse-result broadcast cells (lane 0 → warp).
-shared uint sh_parse_lit_len;
-shared uint sh_parse_match_len;
-shared int  sh_parse_match_offset;
-shared uint sh_parse_use_recent;
-
-// ── readLength (lane-0 only) ────────────────────────────────────────
+// ── readLength (per-lane, lane-0 drives) ────────────────────────────
 // Port of src/decode/slz_wire_format.cuh:161 readLength().
-// Reads the length-stream entry at sh_length_offset, advances the
-// cursor, and returns the decoded value. Out-of-stream conditions
-// return 0 and leave the cursor at its boundary (matches CUDA).
-uint readLengthFromStream() {
-    if (sh_length_offset >= g_length_remaining) return 0u;
-    uint v = loadLengthByte(sh_length_offset);
+// Lane 0 reads + advances; the returned value is consumed only by the
+// lane-0 parser. `length_offset` is a per-lane variable; we pass it by
+// reference (inout) so lane 0's advance is recorded in its own copy.
+// All other lanes never call this; their copy of length_offset is
+// re-broadcast via subgroupBroadcast at the end of the slow path.
+uint readLengthFromStream(inout uint length_offset, uint length_remaining) {
+    if (length_offset >= length_remaining) return 0u;
+    uint v = loadLengthByte(length_offset);
     if (v > EXT_LENGTH_THRESHOLD) {
-        if (sh_length_offset + EXT_LENGTH_EXTRA_BYTES >= g_length_remaining) {
-            sh_length_offset += 1u;
+        if (length_offset + EXT_LENGTH_EXTRA_BYTES >= length_remaining) {
+            length_offset += 1u;
             return v;
         }
-        uint extra_lo = loadLengthByte(sh_length_offset + 1u);
-        uint extra_hi = loadLengthByte(sh_length_offset + 2u);
+        uint extra_lo = loadLengthByte(length_offset + 1u);
+        uint extra_hi = loadLengthByte(length_offset + 2u);
         uint extra = extra_lo | (extra_hi << 8);
         v += extra * EXT_LENGTH_SCALE;
-        sh_length_offset += EXT_LENGTH_EXTRA_BYTES;
+        length_offset += EXT_LENGTH_EXTRA_BYTES;
     }
-    sh_length_offset += 1u;
+    length_offset += 1u;
     return v;
-}
-
-// ── Off16 consume (lane-0 only) ─────────────────────────────────────
-// Loads the u16 entry at sh_off16_pos, advances the cursor, and
-// returns the negated int32_t match_offset. Caller must guarantee
-// sh_off16_pos < g_off16_count.
-int consumeOff16() {
-    uint v = loadOff16Entry(sh_off16_pos);
-    sh_off16_pos += 1u;
-    return -int(v);
 }
 
 // ── warpScanU32 emulation ───────────────────────────────────────────
@@ -366,25 +358,6 @@ void main() {
         g_off32_count1       = chunks_buf.d[base + 12u];
         g_off32_count2       = chunks_buf.d[base + 13u];
         g_cmd_stream2_offset = chunks_buf.d[base + 14u];
-
-        sh_cmd_pos       = 0u;
-        sh_lit_pos       = g_initial_copy;
-        sh_off16_pos     = 0u;
-        sh_dst_pos       = g_initial_copy;
-        sh_recent_offset = INITIAL_RECENT_OFFSET;
-        sh_length_offset = 0u;
-
-        // Active off32 block starts as block-0.
-        sh_off32_pos         = 0u;
-        sh_off32_block_count = g_off32_count1;
-        sh_off32_base_entry  = 0u;
-        sh_block_dst_start   = g_initial_copy;
-        // Block boundary in the cmd stream: if g_cmd_stream2_offset != 0
-        // it splits the cmd stream between block-0 and block-1 (matching
-        // CUDA's `block_cmd_end` in lz_decode_general.cuh:127). Else
-        // there is no boundary, all tokens belong to block-0.
-        sh_block_cmd_end = (g_cmd_stream2_offset != 0u && g_cmd_stream2_offset < g_cmd_size)
-            ? g_cmd_stream2_offset : g_cmd_size;
     }
     // Workgroup-wide barrier so the chunk-descriptor loads in lane 0 are
     // visible to every lane before the main decode loop reads g_cmd_size /
@@ -407,34 +380,56 @@ void main() {
     memoryBarrierShared();
     memoryBarrierBuffer();
 
+    // ── Per-lane decode state (was: shared sh_* in the prior revision) ──
+    // Every lane keeps an identical register copy. The fast-batched path
+    // computes the per-iter advances via warpScanU32 / subgroupBallot,
+    // which are subgroup-uniform, so every lane updates its copy with
+    // identical values — matching CUDA's pattern in lz_decode_raw.cuh.
+    uint cmd_pos       = 0u;
+    uint lit_pos       = g_initial_copy;
+    uint off16_pos     = 0u;
+    uint dst_pos       = g_initial_copy;
+    int  recent_offset = INITIAL_RECENT_OFFSET;
+    uint length_offset = 0u;
+
+    // Active off32 block starts as block-0.
+    uint off32_pos         = 0u;
+    uint off32_block_count = g_off32_count1;
+    uint off32_base_entry  = 0u;
+    uint block_dst_start   = g_initial_copy;
+    // Block boundary in the cmd stream: if g_cmd_stream2_offset != 0
+    // it splits the cmd stream between block-0 and block-1 (matching
+    // CUDA's `block_cmd_end` in lz_decode_general.cuh:127). Else
+    // there is no boundary, all tokens belong to block-0.
+    uint block_cmd_end = (g_cmd_stream2_offset != 0u && g_cmd_stream2_offset < g_cmd_size)
+        ? g_cmd_stream2_offset : g_cmd_size;
+
     // ── Outer decode loop ───────────────────────────────────────────
     // Runs while there are tokens to consume. Each iteration either:
     //   * Fast path: 32-token batch with no long tokens.
     //   * Slow path: lane-0 parses one token (long or standard).
     //
-    // Following the CUDA design, all state is held in shared memory so
-    // the warp-uniform control flow does not need per-iteration
-    // subgroupBroadcast calls. The fast-path batch decoding still runs
-    // across all 32 lanes (cmd-byte ballot for any_long detection, per-
-    // lane field decode, warpScanU32 for prefix-scans).
-    while (sh_cmd_pos < g_cmd_size) {
+    // All per-iteration state is now per-lane (register-resident). Fast
+    // path: every lane redundantly applies the subgroup-uniform advances
+    // (cmd_pos+=batch_size, dst_pos+=total_dst, lit_pos+=total_lit,
+    // off16_pos+=total_off16_used, recent_offset=batch_recent_off if
+    // fresh_mask!=0). Slow path: lane 0 parses, then subgroupBroadcast
+    // (val, 0u) publishes the four parsed fields to every lane.
+    while (cmd_pos < g_cmd_size) {
         // Block-boundary transition: once we finish all block-0 tokens,
         // switch the off32 cursor to the block-1 slice and bump the
         // active cmd_end to g_cmd_size. Matches CUDA's "advance to
-        // block 2" footer in lz_decode_general.cuh:283-289.
-        if (sh_cmd_pos == sh_block_cmd_end && sh_block_cmd_end < g_cmd_size) {
-            if (lane == 0u) {
-                sh_off32_base_entry  = g_off32_count1;
-                sh_off32_block_count = g_off32_count2;
-                sh_off32_pos         = 0u;
-                sh_block_dst_start   = sh_dst_pos;
-                sh_block_cmd_end     = g_cmd_size;
-            }
-            subgroupBarrier();
-            subgroupMemoryBarrierShared();
+        // block 2" footer in lz_decode_general.cuh:283-289. The
+        // predicate is subgroup-uniform (cmd_pos and block_cmd_end are
+        // identical across lanes), so every lane updates its own
+        // register copy identically — no barrier needed.
+        if (cmd_pos == block_cmd_end && block_cmd_end < g_cmd_size) {
+            off32_base_entry  = g_off32_count1;
+            off32_block_count = g_off32_count2;
+            off32_pos         = 0u;
+            block_dst_start   = dst_pos;
+            block_cmd_end     = g_cmd_size;
         }
-
-        uint cmd_pos = sh_cmd_pos;
 
         // ── Fast-path batch detect ──────────────────────────────────
         // Load up to gl_SubgroupSize cmd bytes, one per lane. Lanes past
@@ -444,26 +439,23 @@ void main() {
         //
         // PORTABILITY NOTE: gl_SubgroupSize is the LIVE subgroup width.
         // On NVIDIA / AMD / Intel-pinned this is 32. On Intel UHD iGPU
-        // the requiredSubgroupSize=32 pin is silently ignored and the
-        // 32-wide workgroup splits into TWO 16-wide subgroups. The
-        // subgroup-cooperative idioms below (subgroupBallot,
-        // subgroupExclusiveAdd, subgroupShuffle, findMSB on the
-        // inclusive-prefix mask) all span only the LANE'S OWN
-        // subgroup, so driving batch_size from gl_SubgroupSize keeps
-        // every per-lane index within [0, gl_SubgroupSize). Both
-        // subgroups then process the same batch redundantly (they read
-        // the same cmd / lit / off16 bytes and write the same dst
-        // bytes) — wasted work but byte-idempotent, matching how the
-        // slow path already coexists with multi-subgroup workgroups.
+        // (when the requiredSubgroupSize=32 + REQUIRE_FULL_SUBGROUPS
+        // pins are silently ignored) the 32-wide workgroup splits into
+        // TWO 16-wide subgroups. The subgroup-cooperative idioms below
+        // span only the LANE'S OWN subgroup, so driving batch_size
+        // from gl_SubgroupSize keeps every per-lane index within
+        // [0, gl_SubgroupSize). Both subgroups then process the same
+        // batch redundantly (they read the same cmd / lit / off16 bytes
+        // and write the same dst bytes) — wasted work but byte-idempotent,
+        // matching how the slow path already coexists with multi-subgroup
+        // workgroups.
         uint sg_size    = gl_SubgroupSize;
         // Cap remaining at the active block's cmd boundary
-        // (sh_block_cmd_end). The block-transition prologue at the top
-        // of the outer loop only fires on `sh_cmd_pos == sh_block_cmd_end`,
-        // so a batch that strides over the boundary would silently skip
-        // the off32 cursor switch and corrupt every subsequent token.
-        // sh_block_cmd_end is always ≤ g_cmd_size (set by the prologue
-        // in main()), so it's safe to use as the tighter bound.
-        uint remaining  = sh_block_cmd_end - cmd_pos;
+        // (block_cmd_end). The block-transition prologue at the top of
+        // the outer loop only fires on `cmd_pos == block_cmd_end`, so a
+        // batch that strides over the boundary would silently skip the
+        // off32 cursor switch and corrupt every subsequent token.
+        uint remaining  = block_cmd_end - cmd_pos;
         uint batch_size = (remaining < sg_size) ? remaining : sg_size;
         bool my_valid   = (lane < batch_size);
         uint my_cmd     = my_valid ? loadCmdByte(cmd_pos + lane) : TOKEN_SHORT_MIN;
@@ -471,12 +463,6 @@ void main() {
         uint any_long   = subgroupBallot(my_is_long).x;
 
         // ── Fast batched path (subgroup-cooperative, sg_size tokens) ─
-        // Port of src/decode/lz_decode_raw.cuh:46-134. Every lane
-        // decodes its own token, prefix-scans into off16 / dst / lit
-        // streams, computes its match_offset (folding the use_recent
-        // → last-fresh-offset chain via an inclusive-prefix-mask
-        // findMSB), and then the per-k loop broadcasts each lane's
-        // parsed fields to drive the cooperative copies.
         if (any_long == 0u) {
             uint my_lit_len     = my_valid ? (my_cmd & TOKEN_LIT_MASK) : 0u;
             uint my_match_len   = my_valid ? ((my_cmd >> TOKEN_MATCH_SHIFT) & TOKEN_MATCH_MASK) : 0u;
@@ -487,9 +473,9 @@ void main() {
             uint total_off16_used;
             warpScanU32(my_consumes_off16, my_off16_local, total_off16_used);
 
-            int my_match_offset = sh_recent_offset;
+            int my_match_offset = recent_offset;
             if (my_consumes_off16 != 0u) {
-                uint entry_idx = sh_off16_pos + my_off16_local;
+                uint entry_idx = off16_pos + my_off16_local;
                 if (entry_idx < g_off16_count) {
                     uint v = loadOff16Entry(entry_idx);
                     my_match_offset = -int(v);
@@ -521,8 +507,8 @@ void main() {
             uint total_lit;
             warpScanU32(my_lit_len, my_lit_local, total_lit);
 
-            uint base_dst = sh_dst_pos;
-            uint base_lit = sh_lit_pos;
+            uint base_dst = dst_pos;
+            uint base_lit = lit_pos;
 
             // Per-token cooperative copy. Each lane broadcasts its
             // parsed fields via subgroupShuffle; all lanes then run
@@ -554,33 +540,33 @@ void main() {
             }
 
             // Latch the newest fresh offset across this batch into
-            // sh_recent_offset. Every lane must call subgroupShuffle
+            // recent_offset. Every lane must call subgroupShuffle
             // uniformly with the same src index, so the shuffle runs
-            // on every lane and lane 0 alone publishes the result.
-            // (last_fresh is subgroup-uniform — fresh_mask is itself
-            // the subgroupBallot of every lane's consumes_off16, so
-            // every lane computes the same findMSB.)
+            // on every lane. (last_fresh is subgroup-uniform — fresh_mask
+            // is itself the subgroupBallot of every lane's consumes_off16,
+            // so every lane computes the same findMSB.)
             int  last_fresh_lane = (fresh_mask != 0u) ? findMSB(fresh_mask) : 0;
             int  batch_recent_off = subgroupShuffle(my_match_offset, uint(last_fresh_lane));
 
-            if (lane == 0u) {
-                sh_cmd_pos   = cmd_pos + batch_size;
-                sh_dst_pos   = base_dst + total_dst;
-                sh_lit_pos   = base_lit + total_lit;
-                sh_off16_pos = sh_off16_pos + total_off16_used;
-                if (fresh_mask != 0u) sh_recent_offset = batch_recent_off;
-            }
-            subgroupBarrier();
-            subgroupMemoryBarrierShared();
-            subgroupMemoryBarrierBuffer();
+            // All lanes advance identically. batch_size, total_dst,
+            // total_lit, total_off16_used are all subgroup-uniform
+            // (computed via subgroupAdd / subgroupBallot.bitCount), so
+            // every lane lands on the same new cmd_pos/dst_pos/lit_pos/
+            // off16_pos value. No shared-mem write + barrier needed.
+            cmd_pos   += batch_size;
+            dst_pos   = base_dst + total_dst;
+            lit_pos   = base_lit + total_lit;
+            off16_pos += total_off16_used;
+            if (fresh_mask != 0u) recent_offset = batch_recent_off;
             continue;
         }
 
         // ── Slow scalar path (lane 0 parses one token) ──────────────
         // Port of src/decode/lz_decode_raw.cuh:137-204. Lane 0 reads the
-        // token at sh_cmd_pos, decodes its fields (consuming length
-        // and/or off16 entries as needed), and writes the four output
-        // values into shared memory. All lanes then cooperatively copy.
+        // token at cmd_pos, decodes its fields (consuming length and/or
+        // off16 entries as needed). The four output values are broadcast
+        // to every lane via subgroupBroadcast(.., 0u), matching CUDA's
+        // __shfl_sync(.., 0) pattern.
         //
         // Phase-1 note: TOKEN_LONG_FAR (2) and tokens 3..23 (short far)
         // are not produced by the phase-1 encoder. We still handle them
@@ -589,84 +575,90 @@ void main() {
         // wedge the loop. Round-trip correctness is unaffected because
         // the encoder never emits these tokens.
 
-        if (lane == 0u) {
-            uint token = loadCmdByte(sh_cmd_pos);
-            uint lit_len = 0u;
-            uint match_len = 0u;
-            int  match_offset = sh_recent_offset;
-            uint use_recent = 0u;
+        uint p_lit_len = 0u;
+        uint p_match_len = 0u;
+        int  p_match_offset = recent_offset;
+        uint p_use_recent = 0u;
+        // Lane 0 also tracks how much it advanced length_offset / off16_pos
+        // / off32_pos so we can broadcast the new values back to every
+        // lane.
+        uint new_length_offset = length_offset;
+        uint new_off16_pos     = off16_pos;
+        uint new_off32_pos     = off32_pos;
 
+        if (lane == 0u) {
+            uint token = loadCmdByte(cmd_pos);
             if (token >= TOKEN_SHORT_MIN) {
                 // Standard token (CUDA L143-157).
-                lit_len    = token & TOKEN_LIT_MASK;
-                match_len  = (token >> TOKEN_MATCH_SHIFT) & TOKEN_MATCH_MASK;
-                use_recent = (token >> TOKEN_USE_RECENT_SHIFT) & TOKEN_USE_RECENT_MASK;
-                if (use_recent == 0u && sh_off16_pos < g_off16_count) {
-                    match_offset = consumeOff16();
+                p_lit_len    = token & TOKEN_LIT_MASK;
+                p_match_len  = (token >> TOKEN_MATCH_SHIFT) & TOKEN_MATCH_MASK;
+                p_use_recent = (token >> TOKEN_USE_RECENT_SHIFT) & TOKEN_USE_RECENT_MASK;
+                if (p_use_recent == 0u && new_off16_pos < g_off16_count) {
+                    uint v = loadOff16Entry(new_off16_pos);
+                    p_match_offset = -int(v);
+                    new_off16_pos += 1u;
                 }
             } else if (token == TOKEN_LONG_LITERAL) {
                 // Literal-only command (CUDA L158-161).
-                use_recent = 1u;
-                lit_len    = readLengthFromStream() + LONG_LITERAL_BASE;
+                p_use_recent = 1u;
+                p_lit_len    = readLengthFromStream(new_length_offset, g_length_remaining)
+                             + LONG_LITERAL_BASE;
             } else if (token == TOKEN_LONG_NEAR) {
                 // Near-offset long match (CUDA L162-173).
-                match_len = readLengthFromStream() + LONG_NEAR_BASE;
-                if (sh_off16_pos < g_off16_count) {
-                    match_offset = consumeOff16();
+                p_match_len = readLengthFromStream(new_length_offset, g_length_remaining)
+                            + LONG_NEAR_BASE;
+                if (new_off16_pos < g_off16_count) {
+                    uint v = loadOff16Entry(new_off16_pos);
+                    p_match_offset = -int(v);
+                    new_off16_pos += 1u;
                 }
             } else if (token == TOKEN_LONG_FAR) {
                 // Far-offset long match (CUDA L180-191).
-                match_len = readLengthFromStream() + LONG_FAR_BASE;
-                if (sh_off32_pos < sh_off32_block_count) {
+                p_match_len = readLengthFromStream(new_length_offset, g_length_remaining)
+                            + LONG_FAR_BASE;
+                if (new_off32_pos < off32_block_count) {
                     // off32 entries are 3 bytes each (encoder writes byte
                     // triples). match_offset = block_dst_start - v -
                     // dst_pos, where v is the 24-bit LE value.
-                    uint entry_idx = sh_off32_base_entry + sh_off32_pos;
+                    uint entry_idx = off32_base_entry + new_off32_pos;
                     uint v = loadOff32Entry24(entry_idx);
-                    match_offset = int(sh_block_dst_start) - int(v) - int(sh_dst_pos);
-                    sh_off32_pos += 1u;
+                    p_match_offset = int(block_dst_start) - int(v) - int(dst_pos);
+                    new_off32_pos += 1u;
                 }
-                use_recent = 0u;
+                p_use_recent = 0u;
             } else {
                 // Short-far match (token in [3, 23]) — CUDA L192-203.
-                match_len = token + SHORT_FAR_BASE;
-                if (sh_off32_pos < sh_off32_block_count) {
-                    uint entry_idx = sh_off32_base_entry + sh_off32_pos;
+                p_match_len = token + SHORT_FAR_BASE;
+                if (new_off32_pos < off32_block_count) {
+                    uint entry_idx = off32_base_entry + new_off32_pos;
                     uint v = loadOff32Entry24(entry_idx);
-                    match_offset = int(sh_block_dst_start) - int(v) - int(sh_dst_pos);
-                    sh_off32_pos += 1u;
+                    p_match_offset = int(block_dst_start) - int(v) - int(dst_pos);
+                    new_off32_pos += 1u;
                 }
-                use_recent = 0u;
+                p_use_recent = 0u;
             }
-            sh_cmd_pos += 1u;
-
-            // Stash parsed values into shared memory for the warp-wide
-            // cooperative copy. The CUDA path broadcasts via shfl(.., 0);
-            // we route through shared memory because every other lane
-            // reads them in the copy loop below.
-            sh_parse_lit_len      = lit_len;
-            sh_parse_match_len    = match_len;
-            sh_parse_match_offset = match_offset;
-            sh_parse_use_recent   = use_recent;
         }
-        subgroupBarrier();
-        subgroupMemoryBarrierShared();
+
+        // Broadcast lane-0's parse results to every lane. Each
+        // subgroupBroadcast is the GLSL analogue of CUDA's
+        // __shfl_sync(FULL_WARP_MASK, val, 0). The slow-path scalar
+        // parse is subgroup-uniform after broadcast — no shared-memory
+        // round-trip needed.
+        uint slow_lit_len    = subgroupBroadcast(p_lit_len,     0u);
+        uint slow_match_len  = subgroupBroadcast(p_match_len,   0u);
+        int  slow_match_off  = subgroupBroadcast(p_match_offset, 0u);
+        uint slow_use_recent = subgroupBroadcast(p_use_recent,  0u);
+        length_offset        = subgroupBroadcast(new_length_offset, 0u);
+        off16_pos            = subgroupBroadcast(new_off16_pos,     0u);
+        off32_pos            = subgroupBroadcast(new_off32_pos,     0u);
 
         // Cooperative literal + match copy (CUDA L186-199).
-        uint slow_lit_len    = sh_parse_lit_len;
-        uint slow_match_len  = sh_parse_match_len;
-        int  slow_match_off  = sh_parse_match_offset;
-        uint slow_use_recent = sh_parse_use_recent;
-
-        uint slow_dst_pos = sh_dst_pos;
-        uint slow_lit_pos = sh_lit_pos;
-
         if (slow_lit_len > 0u) {
-            warpLiteralCopy(slow_dst_pos, slow_lit_pos, slow_lit_len);
+            warpLiteralCopy(dst_pos, lit_pos, slow_lit_len);
             subgroupBarrier();
             subgroupMemoryBarrierBuffer();
         }
-        uint slow_copy_dst = slow_dst_pos + slow_lit_len;
+        uint slow_copy_dst = dst_pos + slow_lit_len;
         if (slow_match_len > 0u) {
             uint match_src = uint(int(slow_copy_dst) + slow_match_off);
             warpMatchCopy(slow_copy_dst, match_src, slow_match_len);
@@ -674,13 +666,11 @@ void main() {
             subgroupMemoryBarrierBuffer();
         }
 
-        if (lane == 0u) {
-            sh_dst_pos += slow_lit_len + slow_match_len;
-            sh_lit_pos += slow_lit_len;
-            if (slow_use_recent == 0u) sh_recent_offset = slow_match_off;
-        }
-        subgroupBarrier();
-        subgroupMemoryBarrierShared();
+        // All lanes advance identically (subgroup-uniform).
+        cmd_pos += 1u;
+        dst_pos += slow_lit_len + slow_match_len;
+        lit_pos += slow_lit_len;
+        if (slow_use_recent == 0u) recent_offset = slow_match_off;
     }
 
     // ── Trailing literals ───────────────────────────────────────────
@@ -688,10 +678,10 @@ void main() {
     // copied verbatim into dst[dst_pos..]. With Dst as a byte SSBO each
     // lane writes a unique byte address per iteration, so we can do a
     // subgroup-strided cooperative copy (same shape as warpLiteralCopy).
-    uint trailing = (g_lit_size > sh_lit_pos) ? (g_lit_size - sh_lit_pos) : 0u;
+    uint trailing = (g_lit_size > lit_pos) ? (g_lit_size - lit_pos) : 0u;
     uint t_stride = gl_SubgroupSize;
-    uint t_dst_pos = sh_dst_pos;
-    uint t_lit_pos = sh_lit_pos;
+    uint t_dst_pos = dst_pos;
+    uint t_lit_pos = lit_pos;
     for (uint i = lane; i < trailing; i += t_stride) {
         storeDstByte(t_dst_pos + i, loadLitByte(t_lit_pos + i));
     }
