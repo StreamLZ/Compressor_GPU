@@ -130,22 +130,78 @@ The decoder-phase instrumentation (`SLZ_VK_E2E_TIMER`-spirit via
 output) was added in commit `45613bd` and stays — useful for future
 perf work on the encoder host-overhead split.
 
-### P2. GPU-side frame assembly (not yet ported)
+### P2. GPU-side frame assembly — **DONE encode-side** (commit `f9af0a6`)
 
-Wire-format wrap/unwrap runs on CPU today. CUDA does it on GPU via
-`src/encode/assemble_kernel.cu`. Current CPU wrap timings on
-`silesia_full`:
+Encode-side wire-format wrap moved to GPU via the L1-specialized port
+of `src/encode/assemble_kernel.cu`. Three new GLSL kernels +
+`src_vulkan/wire_format_gpu.zig` host glue replace the CPU
+`wire_format.wrapL1ToSlz1` path inside `slz1_codec.encodeL1ToSlz1`.
+The CPU path stays as a fallback (toggle `slz1_codec.use_gpu_wrap`).
 
-| stage | wall-clock |
-|---|---:|
-| vk_encode_ns | 1,353,485,800 (~1.4 s on Intel) |
-| bundle_ns (host glue) | (subsumed above) |
-| wrap_ns | 21,977,000 (~22 ms — not dominant yet) |
-| cuda_dec_ns | 252,736,000 |
+| Shader | Purpose |
+|---|---|
+| `assemble_measure.comp` | per-chunk sub-chunk payload sizing |
+| `assemble_write.comp` | per-chunk sub-chunk payload write into `asm_out` |
+| `frame_assemble.comp` | frame splice (per-chunk internal+chunk+sub-chunk headers, uncompressed-fallback raw copies, SC tail prefix, end mark) |
 
-At current corpora sizes the CPU wrap is ≤2% of total. For multi-GB
-inputs it could matter. Required for true CUDA-throughput parity at
-very large inputs.
+L1-specialization: the CUDA kernel handles both raw (type-0) and
+Huffman (type-4) entropy chunks; the Vulkan L1 encoder only emits raw
+streams today, so the assembler kernels statically pick the type-0
+branch for every stream. Phase 2A (Huffman) generalizes the
+descriptor + write kernel to choose huff-vs-raw per stream.
+
+Verification (commit `f9af0a6` HEAD):
+  * VK output byte-identical to CUDA output on web.txt (4.5 MB),
+    enwik8 (100 MB), silesia_all.tar (200 MB) — `cmp` round-trip.
+  * `vk-l1-test` PASS on Intel iGPU + NVIDIA RTX 4060 Ti.
+  * `vk-l1-scale-test` PASS on both devices (14 cases, silesia_full
+    3248 chunks).
+  * `vk-l1-d2d-test` 3/3 PASS on both devices.
+  * `vk-abi-test`, `vk-abi-async-test` 6/6 PASS.
+  * `vk-wire-format-test` 6/6 PASS (CPU wrap path used by that
+    suite — kept passing as the A/B reference).
+
+Perf measurement (`streamlz_vk -b -r 3`, post-warmup compress wall
+ms; bench reports a single compress wall-time per run, not split):
+
+| corpus | device | CPU-wrap (baseline) | GPU-wrap (Phase 3) | delta |
+|---|---|---:|---:|---:|
+| web.txt 4.5 MB | Intel iGPU | 60-61 ms | 61 ms | ~0% |
+| silesia 200 MB | Intel iGPU | 3035 ms | 3045 ms | +0.3% |
+| web.txt 4.5 MB | NVIDIA 4060 Ti | 85 ms | 85 ms | ~0% |
+| silesia 200 MB | NVIDIA 4060 Ti | 4159 ms | 4276 ms | +2.8% |
+
+The expected e2e improvement did NOT materialize at this layer: the
+extra per-dispatch buffer-alloc + cmdbuf submit + fence wait
+overhead (3 extra dispatches in series) plus the source-bytes upload
+into a GPU buffer cancels out the savings from skipping the CPU
+wrap (~22 ms on silesia per the pre-Phase-3 measurement, a small
+fraction of the encode wall). The wrap also still ends with a
+device→host @memcpy of the final frame bytes, which dominates the
+discrete-GPU case the same way it dominated the decoder pre-P1-fix.
+
+The architectural prerequisite stays useful regardless:
+  * Phase 2A's Huffman pass produces device-resident bodies; the
+    assembler kernel is the natural splice point.
+  * Phase 4 (decode-side GPU unwrap + multi-kernel decode pipeline)
+    needs the same three-pass topology on the decode side.
+  * A future bundle-level optimization (per-handle pool of
+    reusable measure/write/frame buffers, pipeline cache for the
+    three SPVs, eliminating the host-side prefix-sum via the
+    already-stubbed `prefix_sum_chunks.comp`) is the right place
+    to reclaim the 2-3% NVIDIA regression — out of Phase 3 scope.
+
+Open follow-ups:
+  * Reuse a per-handle scratch pool across `encodeL1ToSlz1` calls so
+    the 6-buffer alloc-and-destroy hot path collapses to size checks.
+  * Move the host-side prefix-sum to GPU via `prefix_sum_chunks.comp`
+    once Phase 4 wires that kernel — measure pass would then publish
+    its sizes directly into a device-resident offset table without
+    the readback round-trip.
+  * `wire_format_gpu` still allocates `asm_out` on the host-visible
+    heap (uses the rebar/BAR path on NVIDIA discrete). Phase 5 should
+    move it to `device_local_only` and add a stage-back copy for the
+    final frame bytes, mirroring the decoder P1 fix.
 
 ## POLISH (none of these block anything)
 
@@ -289,22 +345,16 @@ Test extensions: `vk-l5-test` + cross-backend extension.
 
 LOC estimate: ~800 GLSL + ~500 Zig. Effort: 2-3 single agents.
 
-### Phase 3 — GPU-side frame assembly (CPU wrap → GPU wrap)
+### Phase 3 — GPU-side frame assembly (encode wrap) — **DONE** (commit `f9af0a6`)
 
-Goal: drop CPU wire-format wrap/unwrap; move to GPU compute. Required
-for matching CUDA throughput at very large inputs (>500 MB).
+Encode-side wrap moved to GPU. Three new GLSL kernels
+(`assemble_measure.comp`, `assemble_write.comp`,
+`frame_assemble.comp`) + ~600 LOC of `wire_format_gpu.zig` host glue
+replace the CPU wrap inside `slz1_codec.encodeL1ToSlz1`. CPU path
+stays as the runtime-toggleable fallback. See the P2 section above
+for the verification table + perf measurement.
 
-Kernels to port:
-1. `assemble_measure.comp` — pass-1 sizing.
-2. `assemble_write.comp` — pass-2 write.
-3. `frame_assemble.comp` — outer frame composition.
-
-Host glue:
-- Replace `wire_format.zig`'s `wrapL1ToSlz1` CPU path with a GPU
-  dispatch sequence. Keep the CPU path as a fallback or for ABI
-  compatibility.
-
-LOC estimate: ~900 GLSL + ~400 Zig. Effort: 2-3 single agents.
+Decode-side unwrap is still CPU — Phase 4 handles that.
 
 ### Phase 4 — Full GPU decode pipeline
 
