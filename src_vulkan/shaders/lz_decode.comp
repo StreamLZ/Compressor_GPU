@@ -527,15 +527,21 @@ void main() {
 
                 if (k_lit_len > 0u) {
                     warpLiteralCopy(this_dst_pos, this_lit_pos, k_lit_len);
+                    // subgroupBarrier() alone provides both execution sync
+                    // AND coherent-memory ordering within the subgroup
+                    // (KHR_shader_subgroup §7.1: "reads and writes to
+                    // coherent memory issued by ... invocations within the
+                    // subgroup are visible to a subgroup invocation after
+                    // ... the call to subgroupBarrier()"). Dst is qualified
+                    // `coherent`, so the trailing subgroupMemoryBarrierBuffer
+                    // was redundant — removed for perf on Intel iGPU.
                     subgroupBarrier();
-                    subgroupMemoryBarrierBuffer();
                 }
                 uint copy_dst = this_dst_pos + k_lit_len;
                 if (k_match_len > 0u) {
                     uint match_src = uint(int(copy_dst) + k_match_off);
                     warpMatchCopy(copy_dst, match_src, k_match_len);
                     subgroupBarrier();
-                    subgroupMemoryBarrierBuffer();
                 }
             }
 
@@ -653,17 +659,18 @@ void main() {
         off32_pos            = subgroupBroadcast(new_off32_pos,     0u);
 
         // Cooperative literal + match copy (CUDA L186-199).
+        // subgroupBarrier() alone is sufficient for coherent-memory ordering;
+        // the trailing subgroupMemoryBarrierBuffer was redundant. See the
+        // fast-path identical pattern above for the spec quote.
         if (slow_lit_len > 0u) {
             warpLiteralCopy(dst_pos, lit_pos, slow_lit_len);
             subgroupBarrier();
-            subgroupMemoryBarrierBuffer();
         }
         uint slow_copy_dst = dst_pos + slow_lit_len;
         if (slow_match_len > 0u) {
             uint match_src = uint(int(slow_copy_dst) + slow_match_off);
             warpMatchCopy(slow_copy_dst, match_src, slow_match_len);
             subgroupBarrier();
-            subgroupMemoryBarrierBuffer();
         }
 
         // All lanes advance identically (subgroup-uniform).
