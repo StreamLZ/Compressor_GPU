@@ -415,6 +415,65 @@ fn findHostCachedHostVisible(
     return null;
 }
 
+/// Returns true iff the physical device exposes a memory type that is
+/// simultaneously DEVICE_LOCAL+HOST_VISIBLE+HOST_COHERENT+HOST_CACHED
+/// — i.e. a memory pool the GPU treats as local VRAM (full bandwidth
+/// for kernel stores) AND the CPU reads through its own cache (no per-
+/// line PCIe round-trips).
+///
+/// When true (NVIDIA discrete with rebar enabled, AMD, some Apple Silicon
+/// IGPs), the SLZ1 decoder can let lz_decode write straight into the
+/// readback buffer and skip the dst→stage vkCmdCopyBuffer entirely.
+///
+/// When false (Intel iGPU's HOST_CACHED type[3] is NOT DEVICE_LOCAL — the
+/// GPU writes into uncached sysmem there, ~100× slower than its
+/// DEVICE_LOCAL type[1]), the decoder must keep the two-buffer pattern:
+/// kernel writes to a DEVICE_LOCAL-only dst, then a vkCmdCopyBuffer
+/// stages it into the HOST_CACHED readback buffer.
+///
+/// Probed against the SLZ1 decoder's intended buffer usage so the result
+/// reflects the actual type that allocation would land on.
+pub fn deviceHasDeviceLocalHostCached(ctx: *driver.Context) bool {
+    ensureBufferFnSlots(ctx);
+    if (vk.vkGetPhysicalDeviceMemoryProperties_fn == null) return false;
+    if (vk.vkGetBufferMemoryRequirements_fn == null) return false;
+    if (vk.vkCreateBuffer_fn == null) return false;
+    if (vk.vkDestroyBuffer_fn == null) return false;
+
+    // A 4-byte probe buffer is the cheapest way to read the device's
+    // memoryTypeBits mask for the intended STORAGE_BUFFER+TRANSFER_SRC
+    // usage. Some drivers restrict the type mask based on usage flags,
+    // so probing with the actual flags gives the correct answer.
+    const bci: vk.VkBufferCreateInfo = .{
+        .size = 4,
+        .usage = vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = vk.VK_SHARING_MODE_EXCLUSIVE,
+    };
+    var probe_buf: vk.VkBuffer = null;
+    if (vk.vkCreateBuffer_fn.?(ctx.dev, &bci, null, &probe_buf) != vk.VK_SUCCESS) return false;
+    defer vk.vkDestroyBuffer_fn.?(ctx.dev, probe_buf, null);
+
+    var req: vk.VkMemoryRequirements = .{};
+    vk.vkGetBufferMemoryRequirements_fn.?(ctx.dev, probe_buf, &req);
+
+    var mem_props: vk.VkPhysicalDeviceMemoryProperties = .{};
+    vk.vkGetPhysicalDeviceMemoryProperties_fn.?(ctx.pd, &mem_props);
+
+    const want = vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+        vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+        vk.VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    var i: u32 = 0;
+    while (i < mem_props.memoryTypeCount) : (i += 1) {
+        const supported = (req.memoryTypeBits & (@as(u32, 1) << @intCast(i))) != 0;
+        if (!supported) continue;
+        const flags = mem_props.memoryTypes[i].propertyFlags;
+        if ((flags & want) == want) return true;
+    }
+    return false;
+}
+
 pub const Buffer = struct {
     buf: vk.VkBuffer = null,
     mem: vk.VkDeviceMemory = null,

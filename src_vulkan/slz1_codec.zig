@@ -561,33 +561,66 @@ pub fn decodeSlz1ToBytesEx(
     last_decode_slz_memset_ns = 0;
     last_decode_slz_fill_ns = 0;
 
-    // ── dst buffers (unchanged readback pattern) ───────────────────
-    // Discrete-GPU readback pattern (mirrors the P1 fix in
-    // l1_codec.decodeL1Sync). dst_b is DEVICE_LOCAL-only so the kernel
-    // writes at full VRAM bandwidth; dst_stage is HOST_VISIBLE-sysmem
-    // so the host @memcpy reads cached. A vkCmdCopyBuffer in the
-    // dispatch cmdbuf stages dst_b → dst_stage.
+    // ── dst buffer(s) ──────────────────────────────────────────────
+    //
+    // Two shapes are supported, picked by device capability:
+    //
+    //   single-buffer (NVIDIA discrete with rebar, AMD, Apple Silicon
+    //   IGP — `deviceHasDeviceLocalHostCached(ctx) == true`):
+    //     One buffer in DEVICE_LOCAL+HOST_VISIBLE+HOST_COHERENT+
+    //     HOST_CACHED memory (NVIDIA type[2] = 0x00f). The kernel
+    //     writes directly into this buffer at VRAM bandwidth and the
+    //     host @memcpy reads the same memory through the CPU cache.
+    //     No vkCmdCopyBuffer is needed — the dst→stage transfer the
+    //     old two-buffer path emitted was pure overhead.
+    //
+    //   two-buffer (Intel iGPU — DEVICE_LOCAL+HOST_CACHED is not a
+    //   single memory type there; type[3] = HOST_CACHED is sysmem and
+    //   GPU writes to it are ~100× slower than to type[1] = DEVICE_LOCAL):
+    //     `dst_b`     in DEVICE_LOCAL-only memory (fast kernel writes)
+    //     `dst_stage` in HOST_VISIBLE+HOST_CACHED memory (cached CPU
+    //                 reads, ~14 GB/s on every device measured)
+    //     A vkCmdCopyBuffer(dst_b → dst_stage) inside the dispatch
+    //     cmdbuf stages the result for readback.
+    //
+    // The shape decision lives here (per-call, cheap probe) so the
+    // submit pattern downstream stays uniform: it's always one merged
+    // submitTwoWithCopy, with copy.size==0 (no copy emitted) for the
+    // single-buffer shape and copy.size==dst_total (full GPU staging
+    // copy with the compute→transfer barrier) for the two-buffer shape.
     const dst_buf_size: vk.VkDeviceSize = @max(
         @as(vk.VkDeviceSize, 4),
         (@as(vk.VkDeviceSize, dst_total) + 3) & ~@as(vk.VkDeviceSize, 3),
     );
+    const direct_write: bool = !use_dst_override and
+        l1_codec.deviceHasDeviceLocalHostCached(ctx);
     var dst_b: l1_codec.Buffer = .{};
     var dst_stage: l1_codec.Buffer = .{};
     if (!use_dst_override) {
-        dst_b = try l1_codec.createBufferEx(
-            ctx,
-            dst_buf_size,
-            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            .device_local_only,
-        );
-        dst_stage = try l1_codec.createBufferEx(
-            ctx,
-            dst_buf_size,
-            vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            .host_visible_sysmem,
-        );
+        if (direct_write) {
+            // Single-buffer: dst_stage IS the kernel write target.
+            dst_stage = try l1_codec.createBufferEx(
+                ctx,
+                dst_buf_size,
+                vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                .host_visible_sysmem,
+            );
+        } else {
+            dst_b = try l1_codec.createBufferEx(
+                ctx,
+                dst_buf_size,
+                vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                .device_local_only,
+            );
+            dst_stage = try l1_codec.createBufferEx(
+                ctx,
+                dst_buf_size,
+                vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .host_visible_sysmem,
+            );
+        }
     }
-    defer if (!use_dst_override) l1_codec.destroyBuffer(ctx, &dst_b);
+    defer if (!use_dst_override and !direct_write) l1_codec.destroyBuffer(ctx, &dst_b);
     defer if (!use_dst_override) l1_codec.destroyBuffer(ctx, &dst_stage);
 
     // One-shot readback-cost diagnostic (controlled by SLZ_VK_PROFILE_DECODE=1).
@@ -641,7 +674,17 @@ pub fn decodeSlz1ToBytesEx(
     // l1_unwrap.comp encodes byte offsets INTO that single compressed
     // buffer for every stream. No per-stream materialized buffers
     // anywhere on this path.
-    const dst_bind_buf: vk.VkBuffer = if (opts.dst_buffer_override) |b| b else dst_b.buf;
+    const dst_bind_buf: vk.VkBuffer = if (opts.dst_buffer_override) |b|
+        b
+    else if (direct_write)
+        // Single-buffer: kernel writes directly into the host-cached
+        // staging buffer (no GPU copy needed).
+        dst_stage.buf
+    else
+        // Two-buffer: kernel writes into dst_b (DEVICE_LOCAL VRAM);
+        // a vkCmdCopyBuffer below stages it into dst_stage for
+        // host readback.
+        dst_b.buf;
     const dec_bindings: [8]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = pipeline_result.frame.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = pipeline_result.frame.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -675,10 +718,19 @@ pub fn decodeSlz1ToBytesEx(
     var unwrap_push_bytes: [@sizeOf(UnwrapPush)]u8 = undefined;
     @memcpy(unwrap_push_bytes[0..], std.mem.asBytes(&unwrap_push));
 
-    const copy_size: vk.VkDeviceSize = if (use_dst_override or dst_total == 0)
+    // copy_size==0 → single-buffer path: kernel wrote straight into
+    // dst_stage (HOST_CACHED), no GPU staging copy needed; the COPY
+    // timestamp pair gets written but the resulting copy_ns is 0.
+    // copy_size==dst_total → two-buffer path: stage dst_b → dst_stage
+    // with the compute→transfer barrier.
+    // copy_size==0 when use_dst_override → D2D-style: caller's buffer
+    // is the kernel target, no copy needed.
+    const copy_size: vk.VkDeviceSize = if (use_dst_override or dst_total == 0 or direct_write)
         0
     else
         @as(vk.VkDeviceSize, dst_total);
+    const copy_src: vk.VkBuffer = if (copy_size == 0) null else dst_b.buf;
+    const copy_dst: vk.VkBuffer = if (copy_size == 0) null else dst_stage.buf;
 
     const dec_dispatch_result = try dispatch.submitTwoWithCopy(
         ctx,
@@ -706,8 +758,8 @@ pub fn decodeSlz1ToBytesEx(
         chunks_b.buf,
         vk.VK_WHOLE_SIZE,
         .{
-            .src = dst_b.buf,
-            .dst = dst_stage.buf,
+            .src = copy_src,
+            .dst = copy_dst,
             .size = copy_size,
         },
     );
