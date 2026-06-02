@@ -47,12 +47,36 @@
 //!     slot to avoid cross-chunk reference contamination).
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const vk = @import("vk_api.zig");
 const driver = @import("driver.zig");
 const probe_mod = @import("probe.zig");
 const descriptors = @import("descriptors.zig");
 const dispatch = @import("dispatch.zig");
+
+// ── QPC helpers (Windows-only; degrade to monotonic on other OSes) ──
+// Used by the diagnostic decode-phase timing to attribute host-overhead
+// ns to specific decode steps for TODO-P1 diagnosis.
+const win32_qpc = struct {
+    extern "kernel32" fn QueryPerformanceCounter(count: *i64) callconv(.c) c_int;
+    extern "kernel32" fn QueryPerformanceFrequency(freq: *i64) callconv(.c) c_int;
+};
+fn qpcNow() i64 {
+    if (builtin.os.tag != .windows) return std.time.nanoTimestamp();
+    var c: i64 = 0;
+    _ = win32_qpc.QueryPerformanceCounter(&c);
+    return c;
+}
+fn qpcNs(from: i64, to: i64) u64 {
+    if (builtin.os.tag != .windows) return @intCast(@max(0, to - from));
+    var freq: i64 = 0;
+    _ = win32_qpc.QueryPerformanceFrequency(&freq);
+    if (freq <= 0) freq = 1;
+    const delta = if (to > from) to - from else 0;
+    const ns = @divTrunc(@as(i128, delta) * 1_000_000_000, @as(i128, freq));
+    return @intCast(ns);
+}
 
 // ── Constants ─────────────────────────────────────────────────────
 
@@ -122,6 +146,27 @@ pub const L1Error = error{
 } ||
     descriptors.DescriptorError ||
     dispatch.DispatchError;
+
+/// Per-process stash for the most recent encode / decode GPU-side
+/// dispatch nanoseconds (as returned by `dispatch.submitOne` from the
+/// VkQueryPool TIMESTAMP pair). Updated by encodeL1Multi / decodeL1Sync
+/// right after their submitOne calls. Diagnostic-only — production
+/// callers should plumb a proper out-param when needed (TODO P1's
+/// `slzGetLastTimings_vk` is the spec'd path for that). Lives at module
+/// scope so the perf bench can read it without changing the public API.
+pub var last_encode_dispatch_ns: u64 = 0;
+pub var last_decode_dispatch_ns: u64 = 0;
+
+/// Per-process fine-grained decode-phase wall ns (QPC). Populated by
+/// decodeL1Sync to split where the host overhead actually goes — at
+/// minimum: buffer create+map+zero, descriptor build, dispatch (subsumes
+/// GPU + fence wait), final readback @memcpy. Diagnostic-only; used by
+/// l1_perf_bench to render the breakdown table for TODO P1.
+pub var last_decode_dst_alloc_ns: u64 = 0;
+pub var last_decode_dst_memset_ns: u64 = 0;
+pub var last_decode_descriptors_ns: u64 = 0;
+pub var last_decode_dispatch_wall_ns: u64 = 0;
+pub var last_decode_readback_ns: u64 = 0;
 
 /// Hard cap on chunks per encode. Bounds the per-chunk size sidecar
 /// arrays so we never need heap allocation in the codec module. 4096
@@ -550,7 +595,7 @@ pub fn encodeL1Multi(
     var enc_push_bytes: [@sizeOf(EncodePush)]u8 = undefined;
     @memcpy(enc_push_bytes[0..], std.mem.asBytes(&enc_push));
 
-    _ = try dispatch.submitOne(
+    const enc_dispatch_result = try dispatch.submitOne(
         ctx,
         cached_enc.pipeline,
         cached_enc.pipeline_layout,
@@ -558,6 +603,7 @@ pub fn encodeL1Multi(
         enc_push_bytes[0..],
         .{ n_chunks, 1, 1 },
     );
+    last_encode_dispatch_ns = enc_dispatch_result.ns;
 
     // ── Read back per-chunk sizes ────────────────────────────────
     const sizes_words: [*]const u32 = @ptrCast(@alignCast(sizes_b.mapped.?));
@@ -685,6 +731,7 @@ pub fn decodeL1Sync(
     // Each chunk's slice is at byte offset `chunk_id * CHUNK_SIZE` and is
     // sized by the per-chunk dst_size descriptor entry.
     const dst_buf_size: vk.VkDeviceSize = @max(@as(vk.VkDeviceSize, 4), (@as(vk.VkDeviceSize, dst_size) + 3) & ~@as(vk.VkDeviceSize, 3));
+    const t_alloc0 = qpcNow();
     var dst_b = try createBuffer(
         ctx,
         dst_buf_size,
@@ -692,7 +739,12 @@ pub fn decodeL1Sync(
         true,
     );
     defer destroyBuffer(ctx, &dst_b);
+    const t_alloc1 = qpcNow();
+    last_decode_dst_alloc_ns = qpcNs(t_alloc0, t_alloc1);
+    const t_memset0 = qpcNow();
     @memset(dst_b.mapped.?[0..@intCast(dst_b.size)], 0);
+    const t_memset1 = qpcNow();
+    last_decode_dst_memset_ns = qpcNs(t_memset0, t_memset1);
 
     // ChunkDescs: 16 u32 per chunk. See lz_decode.comp head comment for
     // the slot layout (slots 12..14 plumb off32 counts + the cmd-stream
@@ -759,6 +811,7 @@ pub fn decodeL1Sync(
     _ = off32_cap_total;
 
     // ── Build decode pipeline + descriptor set ───────────────────
+    const t_desc0 = qpcNow();
     var cache: descriptors.Cache = .{};
     defer descriptors.invalidateAll(ctx, &cache);
 
@@ -782,6 +835,8 @@ pub fn decodeL1Sync(
         .{ .buffer = streams.off32_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
     };
     const dec_set = try descriptors.allocSet(ctx, cached_dec, dec_bindings[0..]);
+    const t_desc1 = qpcNow();
+    last_decode_descriptors_ns = qpcNs(t_desc0, t_desc1);
 
     // ── Submit decode dispatch (n_chunks workgroups) ─────────────
     const dec_push: DecodePush = .{
@@ -790,7 +845,8 @@ pub fn decodeL1Sync(
     var dec_push_bytes: [@sizeOf(DecodePush)]u8 = undefined;
     @memcpy(dec_push_bytes[0..], std.mem.asBytes(&dec_push));
 
-    _ = try dispatch.submitOne(
+    const t_disp0 = qpcNow();
+    const dec_dispatch_result = try dispatch.submitOne(
         ctx,
         cached_dec.pipeline,
         cached_dec.pipeline_layout,
@@ -798,12 +854,18 @@ pub fn decodeL1Sync(
         dec_push_bytes[0..],
         .{ n_chunks, 1, 1 },
     );
+    const t_disp1 = qpcNow();
+    last_decode_dispatch_ns = dec_dispatch_result.ns;
+    last_decode_dispatch_wall_ns = qpcNs(t_disp0, t_disp1);
 
     // Copy dst out via the host map.
+    const t_read0 = qpcNow();
     if (dst_size > 0) {
         const dst_mapped = dst_b.mapped orelse return error.MapMemoryFailed;
         @memcpy(dst_host[0..dst_size], dst_mapped[0..dst_size]);
     }
+    const t_read1 = qpcNow();
+    last_decode_readback_ns = qpcNs(t_read0, t_read1);
 }
 
 // ── Debug helper: read back stream bytes ─────────────────────────

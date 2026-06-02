@@ -504,9 +504,12 @@ pub fn build(b: *std.Build) void {
         .root_module = vk_perf_bench_module,
     });
     vk_perf_bench_exe.step.dependOn(vk_shaders.embed_dir_step);
-    b.installArtifact(vk_perf_bench_exe);
+    const vk_perf_bench_install = b.addInstallArtifact(vk_perf_bench_exe, .{});
     const run_vk_perf_bench = b.addRunArtifact(vk_perf_bench_exe);
-    run_vk_perf_bench.step.dependOn(b.getInstallStep());
+    // Depend only on this bench's install + shader compile — not on
+    // `b.getInstallStep()`, which would also build streamlz (CUDA) and
+    // trip the PTX-freshness check during Vulkan-only perf work.
+    run_vk_perf_bench.step.dependOn(&vk_perf_bench_install.step);
     run_vk_perf_bench.step.dependOn(&vk_shaders_top.step);
     b.step("vk-perf-bench", "Run the Vulkan L1 encode/decode wall-clock perf bench").dependOn(&run_vk_perf_bench.step);
 
