@@ -577,6 +577,25 @@ fn runBench(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: A
                     @as(f64, @floatFromInt(slz1_codec.last_decode_slz_submit_wait_wall_ns)) / 1_000_000.0,
                 },
             );
+            try w.print(
+                "      unwrap: wall={d:.2}ms rec={d:.2}ms sub={d:.2}ms wait={d:.2}ms qry={d:.2}ms\n",
+                .{
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_unwrap_submit_wait_wall_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_unwrap_record_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_unwrap_submit_call_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_unwrap_wait_call_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_unwrap_query_read_ns)) / 1_000_000.0,
+                },
+            );
+            try w.print(
+                "      decode: rec={d:.2}ms sub={d:.2}ms wait={d:.2}ms qry={d:.2}ms\n",
+                .{
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_dec_record_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_dec_submit_call_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_dec_wait_call_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_slz_dec_query_read_ns)) / 1_000_000.0,
+                },
+            );
         }
     }
 

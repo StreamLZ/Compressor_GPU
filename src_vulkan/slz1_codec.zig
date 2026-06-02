@@ -240,6 +240,22 @@ pub var last_decode_slz_gpu_kernel_ns: u64 = 0;
 pub var last_decode_slz_gpu_copy_ns: u64 = 0;
 pub var last_decode_slz_submit_wait_wall_ns: u64 = 0;
 
+// Finer-grained host-side attribution for the decode dispatch phase.
+// Populated when SLZ_VK_PROFILE_DECODE=1. All in nanoseconds. The
+// l1_unwrap submit is the small `dispatch.submitOne` call before the
+// lz_decode `dispatch.submitOneWithCopy`. Together with the
+// gpu_kernel/gpu_copy/submit_wait_wall fields above this gives a
+// per-call breakdown of where `last_decode_slz_dispatch_ns` is spent.
+pub var last_decode_slz_unwrap_submit_wait_wall_ns: u64 = 0;
+pub var last_decode_slz_unwrap_record_ns: u64 = 0;
+pub var last_decode_slz_unwrap_submit_call_ns: u64 = 0;
+pub var last_decode_slz_unwrap_wait_call_ns: u64 = 0;
+pub var last_decode_slz_unwrap_query_read_ns: u64 = 0;
+pub var last_decode_slz_dec_record_ns: u64 = 0;
+pub var last_decode_slz_dec_submit_call_ns: u64 = 0;
+pub var last_decode_slz_dec_wait_call_ns: u64 = 0;
+pub var last_decode_slz_dec_query_read_ns: u64 = 0;
+
 // One-shot diagnostic outputs filled by `runReadbackDiagnostics`. The
 // helper runs once per process the first time decodeSlz1ToBytesEx is
 // called with SLZ_VK_PROFILE_DECODE=1, then sets `_ran` to disable
@@ -646,54 +662,68 @@ pub fn decodeSlz1ToBytesEx(
 
     last_decode_slz_descset_ns = qpcNs(t_descset_begin, qpcNow());
 
-    // ── Dispatch #1: l1_unwrap (n_chunks workgroups, 1 thread each) ─
+    // ── Merged dispatch: l1_unwrap + lz_decode + dst→stage copy in
+    // one cmdbuf + one submit + one fence wait. Saves one
+    // vkQueueSubmit/vkWaitForFences round-trip per decode call vs the
+    // previous two-submit pattern (measured ~0.4 ms / call on NVIDIA
+    // RTX 4060 Ti, ~4 ms / call on Intel iGPU at the time of the
+    // merge). When the caller supplied a D2D dst override the copy
+    // step collapses to size=0 (no barrier, no vkCmdCopyBuffer) and
+    // the kernel's writes land directly in the caller's VkBuffer. ─
     const t_dispatch_begin = qpcNow();
     const unwrap_push: UnwrapPush = .{ .frame_size = @intCast(slz_bytes.len) };
     var unwrap_push_bytes: [@sizeOf(UnwrapPush)]u8 = undefined;
     @memcpy(unwrap_push_bytes[0..], std.mem.asBytes(&unwrap_push));
 
-    _ = try dispatch.submitOne(
-        ctx,
-        cached_unwrap.pipeline,
-        cached_unwrap.pipeline_layout,
-        unwrap_set,
-        unwrap_push_bytes[0..],
-        .{ n_chunks, 1, 1 },
-    );
+    const copy_size: vk.VkDeviceSize = if (use_dst_override or dst_total == 0)
+        0
+    else
+        @as(vk.VkDeviceSize, dst_total);
 
-    // ── Dispatch #2: lz_decode reading from compressed frame ────────
-    // Submit lz_decode. When the caller did NOT supply a D2D dst
-    // override, queue a vkCmdCopyBuffer(dst_b → dst_stage) in the
-    // same cmdbuf so the host readback below reads from sysmem
-    // (cached) instead of BAR-mapped VRAM (uncached). The D2D path
-    // skips the copy because the caller's VkBuffer is its own dst
-    // — they don't go through the staging buffer at all.
-    const dec_dispatch_result = blk: {
-        if (use_dst_override or dst_total == 0) {
-            break :blk try dispatch.submitOne(
-                ctx,
-                cached_dec.pipeline,
-                cached_dec.pipeline_layout,
-                dec_set,
-                dec_push_bytes[0..],
-                .{ n_chunks, 1, 1 },
-            );
-        }
-        break :blk try dispatch.submitOneWithCopy(
-            ctx,
-            cached_dec.pipeline,
-            cached_dec.pipeline_layout,
-            dec_set,
-            dec_push_bytes[0..],
-            .{ n_chunks, 1, 1 },
-            .{
-                .src = dst_b.buf,
-                .dst = dst_stage.buf,
-                .size = @as(vk.VkDeviceSize, dst_total),
-            },
-        );
-    };
+    const dec_dispatch_result = try dispatch.submitTwoWithCopy(
+        ctx,
+        .{
+            .pipeline = cached_unwrap.pipeline,
+            .pipeline_layout = cached_unwrap.pipeline_layout,
+            .descriptor_set = unwrap_set,
+            .push_constants_bytes = unwrap_push_bytes[0..],
+            .group_count = .{ n_chunks, 1, 1 },
+        },
+        .{
+            .pipeline = cached_dec.pipeline,
+            .pipeline_layout = cached_dec.pipeline_layout,
+            .descriptor_set = dec_set,
+            .push_constants_bytes = dec_push_bytes[0..],
+            .group_count = .{ n_chunks, 1, 1 },
+        },
+        // Inter-dispatch barrier on the chunks buffer that l1_unwrap
+        // writes (binding 3 in its set) and lz_decode reads (binding 5
+        // in its set). All other lz_decode inputs are either already
+        // visible from `vkQueueSubmit`'s implicit host→queue domain
+        // transition (the compressed frame uploaded before submit) or
+        // produced by the GPU decode pipeline that ran with its own
+        // fence wait inside `runDecodePipelineEx`.
+        chunks_b.buf,
+        vk.VK_WHOLE_SIZE,
+        .{
+            .src = dst_b.buf,
+            .dst = dst_stage.buf,
+            .size = copy_size,
+        },
+    );
     last_decode_slz_dispatch_ns = qpcNs(t_dispatch_begin, qpcNow());
+
+    // The merged submit collapses the previous unwrap-submit's
+    // per-call wall (record/submit/wait/query) into the single
+    // submitTwoWithCopy call below. There is no separate l1_unwrap
+    // submit any more, so the unwrap_* globals stay at zero — kept
+    // around so the SLZ_VK_PROFILE_DECODE=1 printer doesn't need an
+    // out-of-band conditional.
+    last_decode_slz_unwrap_submit_wait_wall_ns = 0;
+    last_decode_slz_unwrap_record_ns = 0;
+    last_decode_slz_unwrap_submit_call_ns = 0;
+    last_decode_slz_unwrap_wait_call_ns = 0;
+    last_decode_slz_unwrap_query_read_ns = 0;
     // Phase 4: surface the GPU-side dispatch ns so the CLI bench
     // and `slzGetLastTimings_vk` callers can report `d2d` numbers
     // for the SLZ1 decode path. `decodeL1Sync` writes the same
@@ -708,6 +738,10 @@ pub fn decodeSlz1ToBytesEx(
     last_decode_slz_gpu_kernel_ns = dec_dispatch_result.ns;
     last_decode_slz_gpu_copy_ns = dec_dispatch_result.copy_ns;
     last_decode_slz_submit_wait_wall_ns = dec_dispatch_result.submit_wait_wall_ns;
+    last_decode_slz_dec_record_ns = dec_dispatch_result.record_wall_ns;
+    last_decode_slz_dec_submit_call_ns = dec_dispatch_result.submit_call_ns;
+    last_decode_slz_dec_wait_call_ns = dec_dispatch_result.wait_call_ns;
+    last_decode_slz_dec_query_read_ns = dec_dispatch_result.query_read_ns;
 
     // Host readback only when the host buffer was actually the
     // dst — D2D callers skip it entirely (the bytes are already

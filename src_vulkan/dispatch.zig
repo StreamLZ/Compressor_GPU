@@ -93,6 +93,20 @@ pub const DispatchResult = struct {
     /// is dominated by GPU work time. Diagnostic-only — not used for
     /// any control flow.
     submit_wait_wall_ns: u64 = 0,
+    /// Host-wall around the cmdbuf recording phase (reset → begin →
+    /// record dispatch / barriers / copy → end). Diagnostic-only.
+    record_wall_ns: u64 = 0,
+    /// Host-wall around the `vkQueueSubmit` call alone (no wait).
+    submit_call_ns: u64 = 0,
+    /// Host-wall around the `vkWaitForFences` call alone (this is the
+    /// "GPU work + driver scheduling" cost from the host's POV).
+    wait_call_ns: u64 = 0,
+    /// Host-wall around the `vkGetQueryPoolResults` call (timestamp
+    /// readback). With VK_QUERY_RESULT_WAIT_BIT this can include extra
+    /// availability-wait time, though all queries should already be
+    /// resolved by the time we get here (the fence wait above blocked
+    /// until the GPU finished, which makes all timestamps available).
+    query_read_ns: u64 = 0,
 };
 
 /// Slot indices within the 4-slot timestamp pool. Two slots (BEGIN/END)
@@ -368,6 +382,7 @@ pub fn submitOne(
 
     // Reset the command buffer in place (RESET_COMMAND_BUFFER_BIT on the
     // pool authorizes this).
+    const t_record_begin = qpcNow();
     if (reset_cb(ctx.cmd_buf, 0) != vk.VK_SUCCESS) return error.ResetCommandBufferFailed;
 
     const begin_info: vk.VkCommandBufferBeginInfo = .{
@@ -429,6 +444,7 @@ pub fn submitOne(
     cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, TS_SLOT_END);
 
     if (end_cb(ctx.cmd_buf) != vk.VK_SUCCESS) return error.EndCommandBufferFailed;
+    const record_ns = qpcDeltaNs(t_record_begin, qpcNow());
 
     // Reset the fence to unsignaled before submit. submitOne starts from
     // a signaled fence on the second+ call (vkWaitForFences leaves it
@@ -448,6 +464,8 @@ pub fn submitOne(
     if (submit(ctx.queue, 1, @ptrCast(&submits), ctx.fence) != vk.VK_SUCCESS) {
         return error.SubmitFailed;
     }
+    const t_submit_end = qpcNow();
+    const submit_call_ns = qpcDeltaNs(t_submit_begin, t_submit_end);
 
     // Wait with the budget in VK_M8A_FENCE_WAIT_NS (60 s). The original
     // 2 s value was sized for M8a microbenches; production-scale L1
@@ -455,7 +473,9 @@ pub fn submitOne(
     // 60 s still surfaces a typed timeout fast enough that a genuinely
     // hung GPU does not deadlock the test process.
     const wait_result = wait_fence(ctx.dev, 1, @ptrCast(&fences), vk.VK_TRUE, vk.VK_M8A_FENCE_WAIT_NS);
-    const submit_wait_ns = qpcDeltaNs(t_submit_begin, qpcNow());
+    const t_wait_end = qpcNow();
+    const wait_call_ns = qpcDeltaNs(t_submit_end, t_wait_end);
+    const submit_wait_ns = qpcDeltaNs(t_submit_begin, t_wait_end);
     if (wait_result == vk.VK_TIMEOUT) return error.FenceWaitTimeout;
     if (wait_result != vk.VK_SUCCESS) return error.FenceWaitFailed;
 
@@ -465,6 +485,7 @@ pub fn submitOne(
     // queries that were never recorded). The wider read happens only
     // in `submitOneWithCopy`, which writes all four slots.
     var ts: [2]u64 = .{ 0, 0 };
+    const t_query_begin = qpcNow();
     const result = get_results(
         ctx.dev,
         ctx.query_pool,
@@ -475,6 +496,7 @@ pub fn submitOne(
         @sizeOf(u64),
         vk.VK_QUERY_RESULT_64_BIT | vk.VK_QUERY_RESULT_WAIT_BIT,
     );
+    const query_read_ns = qpcDeltaNs(t_query_begin, qpcNow());
     if (result != vk.VK_SUCCESS) return error.QueryReadFailed;
 
     // Delta scaled by timestampPeriod (ns/tick). Saturating sub guards
@@ -490,7 +512,15 @@ pub fn submitOne(
     const ns_f: f64 = @as(f64, @floatFromInt(delta_ticks)) * @as(f64, period);
     const ns: u64 = if (ns_f <= 0.0) 0 else @intFromFloat(ns_f);
 
-    return .{ .ns = ns, .copy_ns = 0, .submit_wait_wall_ns = submit_wait_ns };
+    return .{
+        .ns = ns,
+        .copy_ns = 0,
+        .submit_wait_wall_ns = submit_wait_ns,
+        .record_wall_ns = record_ns,
+        .submit_call_ns = submit_call_ns,
+        .wait_call_ns = wait_call_ns,
+        .query_read_ns = query_read_ns,
+    };
 }
 
 /// One follow-on buffer copy queued after the dispatch in the SAME
@@ -545,6 +575,7 @@ pub fn submitOneWithCopy(
     const wait_fence = vk.vkWaitForFences_fn orelse return error.LoaderNotReady;
     const get_results = vk.vkGetQueryPoolResults_fn orelse return error.LoaderNotReady;
 
+    const t_record_begin = qpcNow();
     if (reset_cb(ctx.cmd_buf, 0) != vk.VK_SUCCESS) return error.ResetCommandBufferFailed;
 
     const begin_info: vk.VkCommandBufferBeginInfo = .{
@@ -642,6 +673,7 @@ pub fn submitOneWithCopy(
     cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, TS_SLOT_COPY_END);
 
     if (end_cb(ctx.cmd_buf) != vk.VK_SUCCESS) return error.EndCommandBufferFailed;
+    const record_ns = qpcDeltaNs(t_record_begin, qpcNow());
 
     const fences: [1]vk.VkFence = .{ctx.fence};
     if (reset_fence(ctx.dev, 1, @ptrCast(&fences)) != vk.VK_SUCCESS) {
@@ -658,13 +690,18 @@ pub fn submitOneWithCopy(
     if (submit(ctx.queue, 1, @ptrCast(&submits), ctx.fence) != vk.VK_SUCCESS) {
         return error.SubmitFailed;
     }
+    const t_submit_end = qpcNow();
+    const submit_call_ns = qpcDeltaNs(t_submit_begin, t_submit_end);
 
     const wait_result = wait_fence(ctx.dev, 1, @ptrCast(&fences), vk.VK_TRUE, vk.VK_M8A_FENCE_WAIT_NS);
-    const submit_wait_ns = qpcDeltaNs(t_submit_begin, qpcNow());
+    const t_wait_end = qpcNow();
+    const wait_call_ns = qpcDeltaNs(t_submit_end, t_wait_end);
+    const submit_wait_ns = qpcDeltaNs(t_submit_begin, t_wait_end);
     if (wait_result == vk.VK_TIMEOUT) return error.FenceWaitTimeout;
     if (wait_result != vk.VK_SUCCESS) return error.FenceWaitFailed;
 
     var ts: [TS_SLOT_COUNT]u64 = .{ 0, 0, 0, 0 };
+    const t_query_begin = qpcNow();
     const result = get_results(
         ctx.dev,
         ctx.query_pool,
@@ -675,6 +712,7 @@ pub fn submitOneWithCopy(
         @sizeOf(u64),
         vk.VK_QUERY_RESULT_64_BIT | vk.VK_QUERY_RESULT_WAIT_BIT,
     );
+    const query_read_ns = qpcDeltaNs(t_query_begin, qpcNow());
     if (result != vk.VK_SUCCESS) return error.QueryReadFailed;
 
     const delta_ticks: u64 = if (ts[TS_SLOT_END] >= ts[TS_SLOT_BEGIN])
@@ -692,5 +730,298 @@ pub fn submitOneWithCopy(
     const copy_ns_f: f64 = @as(f64, @floatFromInt(copy_ticks)) * @as(f64, period);
     const copy_ns: u64 = if (copy_ns_f <= 0.0) 0 else @intFromFloat(copy_ns_f);
 
-    return .{ .ns = ns, .copy_ns = copy_ns, .submit_wait_wall_ns = submit_wait_ns };
+    return .{
+        .ns = ns,
+        .copy_ns = copy_ns,
+        .submit_wait_wall_ns = submit_wait_ns,
+        .record_wall_ns = record_ns,
+        .submit_call_ns = submit_call_ns,
+        .wait_call_ns = wait_call_ns,
+        .query_read_ns = query_read_ns,
+    };
+}
+
+/// Description of one compute dispatch within a multi-dispatch command
+/// buffer. `descriptor_set == null` skips the bind; `push_constants_bytes
+/// .len == 0` skips the push.
+pub const DispatchSpec = struct {
+    pipeline: vk.VkPipeline,
+    pipeline_layout: vk.VkPipelineLayout,
+    descriptor_set: vk.VkDescriptorSet,
+    push_constants_bytes: []const u8,
+    group_count: [3]u32,
+};
+
+/// Two-dispatch + buffer-copy in a single command buffer + single submit.
+///
+/// Replaces the pair `submitOne(unwrap)` + `submitOneWithCopy(decode,copy)`
+/// the decoder used pre-merge. Eliminates one vkQueueSubmit and one
+/// vkWaitForFences round-trip per decode call.
+///
+/// Recorded shape:
+///   reset query pool
+///   first dispatch (bind pipe → bind ds → push consts → dispatch)
+///   buffer-memory barrier on `inter_barrier_buf` (SHADER_WRITE →
+///     SHADER_READ, compute → compute) so the second dispatch sees the
+///     first dispatch's writes
+///   TS_SLOT_BEGIN write (TOP_OF_PIPE) — brackets ONLY the second dispatch
+///   second dispatch (bind pipe → bind ds → push consts → dispatch)
+///   TS_SLOT_END write (BOTTOM_OF_PIPE)
+///   buffer-memory barrier on `copy.src` (SHADER_WRITE → TRANSFER_READ,
+///     compute → transfer) so the copy sees the second dispatch's writes
+///   TS_SLOT_COPY_BEGIN write
+///   vkCmdCopyBuffer
+///   TS_SLOT_COPY_END write
+///
+/// `ns` in the returned DispatchResult is the GPU-side duration of the
+/// SECOND dispatch only (matching `submitOneWithCopy`'s semantics so the
+/// caller's `gpu_kernel_ns` reporting stays comparable across the
+/// pre/post-merge code).
+///
+/// `inter_barrier_buf` is the buffer the first dispatch writes that the
+/// second dispatch reads (in the L1 decoder, this is the per-stream
+/// chunks descriptor that l1_unwrap.comp writes and lz_decode.comp reads).
+/// If `inter_barrier_buf == null` no intermediate barrier is emitted —
+/// the caller is responsible for the chain producing/consuming on
+/// distinct buffers or no aliasing.
+pub fn submitTwoWithCopy(
+    ctx: *driver_mod.Context,
+    first: DispatchSpec,
+    second: DispatchSpec,
+    inter_barrier_buf: vk.VkBuffer,
+    inter_barrier_size: vk.VkDeviceSize,
+    copy: CopyOp,
+) DispatchError!DispatchResult {
+    if (!ctx.initialized or ctx.dev == null or ctx.queue == null) {
+        return error.LoaderNotReady;
+    }
+    try ensureChassis(ctx);
+
+    const reset_cb = vk.vkResetCommandBuffer_fn orelse return error.LoaderNotReady;
+    const begin_cb = vk.vkBeginCommandBuffer_fn orelse return error.LoaderNotReady;
+    const end_cb = vk.vkEndCommandBuffer_fn orelse return error.LoaderNotReady;
+    const cmd_reset_qp = vk.vkCmdResetQueryPool_fn orelse return error.LoaderNotReady;
+    const cmd_write_ts = vk.vkCmdWriteTimestamp_fn orelse return error.LoaderNotReady;
+    const cmd_bind_pl = vk.vkCmdBindPipeline_fn orelse return error.LoaderNotReady;
+    const cmd_dispatch = vk.vkCmdDispatch_fn orelse return error.LoaderNotReady;
+    const cmd_copy = vk.vkCmdCopyBuffer_fn orelse return error.LoaderNotReady;
+    const cmd_barrier = vk.vkCmdPipelineBarrier_fn orelse return error.LoaderNotReady;
+    const cmd_bind_ds = vk.vkCmdBindDescriptorSets_fn orelse return error.LoaderNotReady;
+    const reset_fence = vk.vkResetFences_fn orelse return error.LoaderNotReady;
+    const submit = vk.vkQueueSubmit_fn orelse return error.LoaderNotReady;
+    const wait_fence = vk.vkWaitForFences_fn orelse return error.LoaderNotReady;
+    const get_results = vk.vkGetQueryPoolResults_fn orelse return error.LoaderNotReady;
+
+    const t_record_begin = qpcNow();
+    if (reset_cb(ctx.cmd_buf, 0) != vk.VK_SUCCESS) return error.ResetCommandBufferFailed;
+
+    const begin_info: vk.VkCommandBufferBeginInfo = .{
+        .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (begin_cb(ctx.cmd_buf, &begin_info) != vk.VK_SUCCESS) {
+        return error.BeginCommandBufferFailed;
+    }
+
+    cmd_reset_qp(ctx.cmd_buf, ctx.query_pool, 0, TS_SLOT_COUNT);
+
+    // ── First dispatch (no timestamps — fast/trivial in the L1 path) ──
+    cmd_bind_pl(ctx.cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, first.pipeline);
+    if (first.descriptor_set != null and first.pipeline_layout != null) {
+        const sets: [1]vk.VkDescriptorSet = .{first.descriptor_set};
+        cmd_bind_ds(
+            ctx.cmd_buf,
+            vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            first.pipeline_layout,
+            0,
+            1,
+            @ptrCast(&sets),
+            0,
+            null,
+        );
+    }
+    if (first.push_constants_bytes.len > 0) {
+        const cmd_push = vk.vkCmdPushConstants_fn orelse return error.LoaderNotReady;
+        if (first.pipeline_layout == null) return error.LoaderNotReady;
+        cmd_push(
+            ctx.cmd_buf,
+            first.pipeline_layout,
+            vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            0,
+            @intCast(first.push_constants_bytes.len),
+            @ptrCast(first.push_constants_bytes.ptr),
+        );
+    }
+    cmd_dispatch(ctx.cmd_buf, first.group_count[0], first.group_count[1], first.group_count[2]);
+
+    // ── Inter-dispatch barrier (compute write → compute read) ──
+    // The first dispatch writes `inter_barrier_buf`; the second reads
+    // it. A buffer-memory barrier with SHADER_WRITE → SHADER_READ on
+    // COMPUTE_SHADER → COMPUTE_SHADER is the minimal correct sync.
+    if (inter_barrier_buf != null) {
+        const bbarrier: vk.VkBufferMemoryBarrier = .{
+            .srcAccessMask = vk.VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT,
+            .srcQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
+            .buffer = inter_barrier_buf,
+            .offset = 0,
+            .size = inter_barrier_size,
+        };
+        const bbarriers: [1]vk.VkBufferMemoryBarrier = .{bbarrier};
+        cmd_barrier(
+            ctx.cmd_buf,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            0,
+            null,
+            1,
+            @ptrCast(&bbarriers),
+            0,
+            null,
+        );
+    }
+
+    // ── Second dispatch (timestamp-bracketed) ──
+    cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, TS_SLOT_BEGIN);
+    cmd_bind_pl(ctx.cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, second.pipeline);
+    if (second.descriptor_set != null and second.pipeline_layout != null) {
+        const sets: [1]vk.VkDescriptorSet = .{second.descriptor_set};
+        cmd_bind_ds(
+            ctx.cmd_buf,
+            vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            second.pipeline_layout,
+            0,
+            1,
+            @ptrCast(&sets),
+            0,
+            null,
+        );
+    }
+    if (second.push_constants_bytes.len > 0) {
+        const cmd_push = vk.vkCmdPushConstants_fn orelse return error.LoaderNotReady;
+        if (second.pipeline_layout == null) return error.LoaderNotReady;
+        cmd_push(
+            ctx.cmd_buf,
+            second.pipeline_layout,
+            vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            0,
+            @intCast(second.push_constants_bytes.len),
+            @ptrCast(second.push_constants_bytes.ptr),
+        );
+    }
+    cmd_dispatch(ctx.cmd_buf, second.group_count[0], second.group_count[1], second.group_count[2]);
+    cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, TS_SLOT_END);
+
+    // ── Compute → Transfer barrier + vkCmdCopyBuffer (skipped when
+    // copy.size == 0 — used by the D2D override path that writes the
+    // decoded bytes straight into the caller's VkBuffer). The COPY_BEGIN
+    // / COPY_END timestamps are still written so the get_results call
+    // below has a defined value to read; they collapse to a zero copy_ns
+    // when nothing was recorded between them. ──
+    const has_copy = copy.size != 0;
+    if (has_copy) {
+        const cbarrier: vk.VkBufferMemoryBarrier = .{
+            .srcAccessMask = vk.VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = vk.VK_ACCESS_TRANSFER_READ_BIT,
+            .srcQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
+            .buffer = copy.src,
+            .offset = copy.src_offset,
+            .size = copy.size,
+        };
+        const cbarriers: [1]vk.VkBufferMemoryBarrier = .{cbarrier};
+        cmd_barrier(
+            ctx.cmd_buf,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0,
+            0,
+            null,
+            1,
+            @ptrCast(&cbarriers),
+            0,
+            null,
+        );
+    }
+
+    cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, TS_SLOT_COPY_BEGIN);
+    if (has_copy) {
+        const region: vk.VkBufferCopy = .{
+            .srcOffset = copy.src_offset,
+            .dstOffset = copy.dst_offset,
+            .size = copy.size,
+        };
+        const regions: [1]vk.VkBufferCopy = .{region};
+        cmd_copy(ctx.cmd_buf, copy.src, copy.dst, 1, @ptrCast(&regions));
+    }
+    cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, TS_SLOT_COPY_END);
+
+    if (end_cb(ctx.cmd_buf) != vk.VK_SUCCESS) return error.EndCommandBufferFailed;
+    const record_ns = qpcDeltaNs(t_record_begin, qpcNow());
+
+    const fences: [1]vk.VkFence = .{ctx.fence};
+    if (reset_fence(ctx.dev, 1, @ptrCast(&fences)) != vk.VK_SUCCESS) {
+        return error.ResetFenceFailed;
+    }
+
+    const cmd_bufs: [1]vk.VkCommandBuffer = .{ctx.cmd_buf};
+    const submit_info: vk.VkSubmitInfo = .{
+        .commandBufferCount = 1,
+        .pCommandBuffers = @ptrCast(&cmd_bufs),
+    };
+    const submits: [1]vk.VkSubmitInfo = .{submit_info};
+    const t_submit_begin = qpcNow();
+    if (submit(ctx.queue, 1, @ptrCast(&submits), ctx.fence) != vk.VK_SUCCESS) {
+        return error.SubmitFailed;
+    }
+    const t_submit_end = qpcNow();
+    const submit_call_ns = qpcDeltaNs(t_submit_begin, t_submit_end);
+
+    const wait_result = wait_fence(ctx.dev, 1, @ptrCast(&fences), vk.VK_TRUE, vk.VK_M8A_FENCE_WAIT_NS);
+    const t_wait_end = qpcNow();
+    const wait_call_ns = qpcDeltaNs(t_submit_end, t_wait_end);
+    const submit_wait_ns = qpcDeltaNs(t_submit_begin, t_wait_end);
+    if (wait_result == vk.VK_TIMEOUT) return error.FenceWaitTimeout;
+    if (wait_result != vk.VK_SUCCESS) return error.FenceWaitFailed;
+
+    var ts: [TS_SLOT_COUNT]u64 = .{ 0, 0, 0, 0 };
+    const t_query_begin = qpcNow();
+    const result = get_results(
+        ctx.dev,
+        ctx.query_pool,
+        0,
+        TS_SLOT_COUNT,
+        @sizeOf(@TypeOf(ts)),
+        @ptrCast(&ts),
+        @sizeOf(u64),
+        vk.VK_QUERY_RESULT_64_BIT | vk.VK_QUERY_RESULT_WAIT_BIT,
+    );
+    const query_read_ns = qpcDeltaNs(t_query_begin, qpcNow());
+    if (result != vk.VK_SUCCESS) return error.QueryReadFailed;
+
+    const delta_ticks: u64 = if (ts[TS_SLOT_END] >= ts[TS_SLOT_BEGIN])
+        ts[TS_SLOT_END] - ts[TS_SLOT_BEGIN]
+    else
+        0;
+    const period = if (ctx.timestamp_period_ns > 0.0) ctx.timestamp_period_ns else 1.0;
+    const ns_f: f64 = @as(f64, @floatFromInt(delta_ticks)) * @as(f64, period);
+    const ns: u64 = if (ns_f <= 0.0) 0 else @intFromFloat(ns_f);
+
+    const copy_ticks: u64 = if (ts[TS_SLOT_COPY_END] >= ts[TS_SLOT_COPY_BEGIN])
+        ts[TS_SLOT_COPY_END] - ts[TS_SLOT_COPY_BEGIN]
+    else
+        0;
+    const copy_ns_f: f64 = @as(f64, @floatFromInt(copy_ticks)) * @as(f64, period);
+    const copy_ns: u64 = if (copy_ns_f <= 0.0) 0 else @intFromFloat(copy_ns_f);
+
+    return .{
+        .ns = ns,
+        .copy_ns = copy_ns,
+        .submit_wait_wall_ns = submit_wait_ns,
+        .record_wall_ns = record_ns,
+        .submit_call_ns = submit_call_ns,
+        .wait_call_ns = wait_call_ns,
+        .query_read_ns = query_read_ns,
+    };
 }
