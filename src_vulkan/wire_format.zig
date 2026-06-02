@@ -171,8 +171,8 @@ const OFF32_COUNT2_MASK: u32 = OFF32_COUNT_PACK_MAX;   // low 12 bits
 /// SC tail prefix bytes per (non-first) chunk.
 const SC_TAIL_PER_CHUNK_BYTES: u32 = 8;
 
-/// L1 codec chunk size — 128 KiB.  Maps 1:1 to the wire-format
-/// sub_chunk_size at sc_group_size = 0.5.
+/// L1 codec chunk size — 64 KiB.  Maps 1:1 to the wire-format
+/// sub_chunk_size at sc_group_size = 0.25 (matches CUDA defaults).
 pub const VK_CHUNK_SIZE: u32 = l1_codec.CHUNK_SIZE;
 
 // ── PerChunkStreams: host-visible per-chunk view of the L1 streams ─
@@ -357,7 +357,7 @@ pub fn wrapL1ToSlz1(
         .codec = .fast,
         .level = 1,
         .block_size = constants.chunk_size, // 256 KiB
-        .sc_group_size = 0.5,
+        .sc_group_size = 0.25,
         .content_size = streams.original_size,
         .dictionary_id = null,
         .content_checksum = false,

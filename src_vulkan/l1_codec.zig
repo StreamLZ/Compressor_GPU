@@ -62,10 +62,11 @@ pub const HASH_BITS: u32 = 17;
 pub const HASH_SIZE_BYTES: vk.VkDeviceSize = (@as(vk.VkDeviceSize, 1) << HASH_BITS) * @sizeOf(u32);
 
 /// Per-chunk input slice size. Matches `src/format/streamlz_constants.zig`
-/// sub_chunk_size = 0x20000 (128 KiB). Each shader workgroup processes
-/// one chunk; the encoder still uses the 2-block scanBlock interior
-/// (64 KiB blocks), so a 128 KiB chunk = 2 blocks per workgroup.
-pub const CHUNK_SIZE: u32 = 0x20000;
+/// sub_chunk_size = 0x10000 (64 KiB) at sc_group_size = 0.25 — the same
+/// sub-chunk size the CUDA encoder defaults to. Each shader workgroup
+/// processes one chunk; the encoder uses the 2-block scanBlock interior
+/// (64 KiB blocks), so a 64 KiB chunk = 1 block per workgroup.
+pub const CHUNK_SIZE: u32 = 0x10000;
 
 /// Number of source bytes written verbatim to the head of chunk 0's
 /// lit_buf and skipped in its token stream. Mirrors CUDA's
