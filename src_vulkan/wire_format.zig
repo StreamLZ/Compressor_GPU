@@ -121,6 +121,7 @@
 const std = @import("std");
 
 const l1_codec = @import("l1_codec.zig");
+const wire_constants = @import("wire_constants.zig");
 
 // ── Imports of the CPU codec's wire-format helpers ────────────────
 // Imported via relative path.  This module compiles only as part of
@@ -131,45 +132,22 @@ const frame = @import("../src/format/frame_format.zig");
 const block_header = @import("../src/format/block_header.zig");
 const constants = @import("../src/format/streamlz_constants.zig");
 
-// ── Wire-format constants mirrored from common/gpu_wire_format.cuh ─
-// Kept here as private constants so we don't need to pull the .cuh
-// header into the Zig build graph.  The static_assert in the .cuh
-// validates these against the encoder side at CUDA build time; this
-// file's tests validate them against the decoder side at runtime.
+// ── Wire-format constants ─────────────────────────────────────────
+// Sourced from `wire_constants.zig` (Cluster H consolidation). Kept as
+// local re-bindings so the existing code reads unchanged.
 
-/// LZ block boundary inside a sub-chunk (64 KiB).  Sub-chunks larger
-/// than this trigger the cmd_stream2_offset prefix.
-const LZ_BLOCK_SIZE: u32 = 0x10000;
-
-/// First sub-chunk in a frame carries this many verbatim source bytes
-/// before the lit-stream header (matches reencodeGpuWithEntropy's
-/// `initial_bytes` and lz_kernel.cu's `is_first` branch).
-const INITIAL_LITERAL_COPY_BYTES: u32 = 8;
-
-/// 3-byte BE sub-chunk header: bit 23 set = LZ-coded sub-chunk.
-const SUBCHUNK_LZ_FLAG_BIT: u32 = 0x800000;
-/// 3-byte BE sub-chunk header: bits 19-22 = decode mode nibble.  The
-/// assembler writes mode = 1 (LZ-with-entropy); the decoder treats
-/// 0 and 1 identically because the per-stream type byte already says
-/// raw-vs-Huffman.
-const SUBCHUNK_MODE_SHIFT: u5 = 19;
-const SUBCHUNK_HDR_BYTES: u32 = 3;
-
-/// Per-chunk header overhead (mirrors encode_context.zig):
-///   2-byte internal block header + 4-byte chunk header.
-const CHUNK_INTERNAL_HDR_BYTES: u32 = 6;
-
-/// Off32 wire-format constants (mirror src/common/gpu_wire_format.cuh).
-/// 12-bit per-block packed-count field; counts >= 4095 spill into a
-/// trailing u16 extension before the off32 byte entries.
-const OFF32_ENTRY_BYTES: u32 = 3;
-const OFF32_COUNT_FIELD_BITS: u5 = 12;
-const OFF32_COUNT_PACK_MAX: u32 = (1 << OFF32_COUNT_FIELD_BITS) - 1; // 4095
+const LZ_BLOCK_SIZE: u32 = wire_constants.LZ_BLOCK_SIZE;
+const INITIAL_LITERAL_COPY_BYTES: u32 = wire_constants.INITIAL_LITERAL_COPY_BYTES;
+const SUBCHUNK_LZ_FLAG_BIT: u32 = wire_constants.SUBCHUNK_LZ_FLAG_BIT;
+const SUBCHUNK_MODE_SHIFT: u5 = wire_constants.SUBCHUNK_MODE_SHIFT;
+const SUBCHUNK_HDR_BYTES: u32 = wire_constants.SUBCHUNK_HDR_BYTES;
+const CHUNK_INTERNAL_HDR_BYTES: u32 = wire_constants.CHUNK_INTERNAL_HDR_BYTES;
+const OFF32_ENTRY_BYTES: u32 = wire_constants.OFF32_ENTRY_BYTES;
+const OFF32_COUNT_FIELD_BITS: u5 = wire_constants.OFF32_COUNT_FIELD_BITS;
+const OFF32_COUNT_PACK_MAX: u32 = wire_constants.OFF32_COUNT_PACK_MAX;
 const OFF32_COUNT1_SHIFT: u5 = OFF32_COUNT_FIELD_BITS; // = 12
 const OFF32_COUNT2_MASK: u32 = OFF32_COUNT_PACK_MAX;   // low 12 bits
-
-/// SC tail prefix bytes per (non-first) chunk.
-const SC_TAIL_PER_CHUNK_BYTES: u32 = 8;
+const SC_TAIL_PER_CHUNK_BYTES: u32 = wire_constants.SC_TAIL_PER_CHUNK_BYTES;
 
 /// L1 codec chunk size — 64 KiB.  Maps 1:1 to the wire-format
 /// sub_chunk_size at sc_group_size = 0.25 (matches CUDA defaults).
@@ -369,7 +347,7 @@ pub fn wrapL1ToSlz1(
         .codec = .fast,
         .level = 1,
         .block_size = constants.chunk_size, // 256 KiB
-        .sc_group_size = 0.25,
+        .sc_group_size = wire_constants.SC_GROUP_SIZE,
         .content_size = streams.original_size,
         .dictionary_id = null,
         .content_checksum = false,

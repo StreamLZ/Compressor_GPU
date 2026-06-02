@@ -42,6 +42,7 @@ const l1_codec = @import("l1_codec.zig");
 const descriptors = @import("descriptors.zig");
 const dispatch = @import("dispatch.zig");
 const wire_format = @import("wire_format.zig");
+const wire_constants = @import("wire_constants.zig");
 const spv_blobs = @import("spv_blobs");
 
 // CPU wire-format helpers (frame_hdr + block_hdr writers). Same import
@@ -51,18 +52,18 @@ const frame = @import("../src/format/frame_format.zig");
 const block_header = @import("../src/format/block_header.zig");
 const constants = @import("../src/format/streamlz_constants.zig");
 
-// ── Wire-format constants (mirror wire_format.zig) ───────────────────
+// ── Wire-format constants (sourced from wire_constants.zig) ──────────
 
-const LZ_BLOCK_SIZE: u32 = 0x10000;
-const INITIAL_LITERAL_COPY_BYTES: u32 = 8;
-const SUBCHUNK_LZ_FLAG_BIT: u32 = 0x800000;
-const SUBCHUNK_MODE_SHIFT: u5 = 19;
-const SUBCHUNK_HDR_BYTES: u32 = 3;
-const CHUNK_INTERNAL_HDR_BYTES: u32 = 6;
-const UNCOMPRESSED_CHUNK_HDR_BYTES: u32 = 2;
-const OFF32_COUNT_PACK_MAX: u32 = (1 << 12) - 1; // 4095
-const SC_TAIL_PER_CHUNK_BYTES: u32 = 8;
-const UNCOMPRESSED_CHUNK_MARKER: u32 = 0xFFFFFFFF;
+const LZ_BLOCK_SIZE: u32 = wire_constants.LZ_BLOCK_SIZE;
+const INITIAL_LITERAL_COPY_BYTES: u32 = wire_constants.INITIAL_LITERAL_COPY_BYTES;
+const SUBCHUNK_LZ_FLAG_BIT: u32 = wire_constants.SUBCHUNK_LZ_FLAG_BIT;
+const SUBCHUNK_MODE_SHIFT: u5 = wire_constants.SUBCHUNK_MODE_SHIFT;
+const SUBCHUNK_HDR_BYTES: u32 = wire_constants.SUBCHUNK_HDR_BYTES;
+const CHUNK_INTERNAL_HDR_BYTES: u32 = wire_constants.CHUNK_INTERNAL_HDR_BYTES;
+const UNCOMPRESSED_CHUNK_HDR_BYTES: u32 = wire_constants.UNCOMPRESSED_CHUNK_HDR_BYTES;
+const OFF32_COUNT_PACK_MAX: u32 = wire_constants.OFF32_COUNT_PACK_MAX;
+const SC_TAIL_PER_CHUNK_BYTES: u32 = wire_constants.SC_TAIL_PER_CHUNK_BYTES;
+const UNCOMPRESSED_CHUNK_MARKER: u32 = wire_constants.UNCOMPRESSED_CHUNK_MARKER;
 
 // ── Errors ────────────────────────────────────────────────────────────
 
@@ -302,7 +303,7 @@ pub fn wrapL1ToSlz1Gpu(
         .codec = .fast,
         .level = 1,
         .block_size = constants.chunk_size, // 256 KiB outer block bound
-        .sc_group_size = 0.25,
+        .sc_group_size = wire_constants.SC_GROUP_SIZE,
         .content_size = original_size,
         .dictionary_id = null,
         .content_checksum = false,

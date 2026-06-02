@@ -54,6 +54,7 @@ const driver = @import("driver.zig");
 const probe_mod = @import("probe.zig");
 const descriptors = @import("descriptors.zig");
 const dispatch = @import("dispatch.zig");
+const wire_constants = @import("wire_constants.zig");
 
 // ── QPC helpers (Windows-only; degrade to monotonic on other OSes) ──
 // Used by the diagnostic decode-phase timing to attribute host-overhead
@@ -79,32 +80,39 @@ fn qpcNs(from: i64, to: i64) u64 {
 }
 
 // ── Constants ─────────────────────────────────────────────────────
+//
+// Re-exports of the cross-cutting wire-format constants that live in
+// `wire_constants.zig`. Cluster H (Phase 4 / `recon2.md`) consolidated
+// these here so the L1 codec, wire-format wrap/unwrap, decode-pipeline
+// orchestrator, and GLSL kernels all agree at compile time. The comptime
+// invariants are in `wire_constants.zig`; this file just exposes the
+// names with the doc-strings that the rest of the codec module uses.
 
 /// Per-chunk hash-table size for L1 (hash_bits = 17 → 1<<17 entries × u32
 /// = 512 KB). Spec §1.1.
-pub const HASH_BITS: u32 = 17;
-pub const HASH_SIZE_BYTES: vk.VkDeviceSize = (@as(vk.VkDeviceSize, 1) << HASH_BITS) * @sizeOf(u32);
+pub const HASH_BITS: u32 = wire_constants.HASH_BITS;
+pub const HASH_SIZE_BYTES: vk.VkDeviceSize = wire_constants.HASH_SIZE_BYTES;
 
 /// Per-chunk input slice size. Matches `src/format/streamlz_constants.zig`
 /// sub_chunk_size = 0x10000 (64 KiB) at sc_group_size = 0.25 — the same
 /// sub-chunk size the CUDA encoder defaults to. Each shader workgroup
 /// processes one chunk; the encoder uses the 2-block scanBlock interior
 /// (64 KiB blocks), so a 64 KiB chunk = 1 block per workgroup.
-pub const CHUNK_SIZE: u32 = 0x10000;
+pub const CHUNK_SIZE: u32 = wire_constants.CHUNK_SIZE;
 
 /// Number of source bytes written verbatim to the head of chunk 0's
 /// lit_buf and skipped in its token stream. Mirrors CUDA's
 /// `INITIAL_LITERAL_COPY_BYTES` from `src/common/gpu_wire_format.cuh`
 /// (matches the "anchor = 8 when is_first" rule in lz_kernel.cu and the
 /// `base_offset == 0` prefix copy in lz_dispatch.cuh).
-pub const INITIAL_LITERAL_COPY_BYTES: u32 = 8;
+pub const INITIAL_LITERAL_COPY_BYTES: u32 = wire_constants.INITIAL_LITERAL_COPY_BYTES;
 
 /// Per-chunk reservation in each output stream. Worst-case stream size
 /// per spec §4.1 is `2 * src_size`; we add 16 bytes of slack so lane-0
 /// RMW byte stores into the tail u32 word never write past the slice.
 /// Must be a multiple of 4 (shader byte-load helpers assume word-aligned
 /// per-chunk bases — see lz_{encode,decode}.comp head-of-file comment).
-pub const CHUNK_STREAM_CAPACITY: u32 = (CHUNK_SIZE * 2) + 16;
+pub const CHUNK_STREAM_CAPACITY: u32 = wire_constants.CHUNK_STREAM_CAPACITY;
 
 /// Per-chunk reservation for the off32 stream. Bounded by
 /// `2 * src_size` (every byte slot in a chunk could in the worst case
@@ -113,55 +121,7 @@ pub const CHUNK_STREAM_CAPACITY: u32 = (CHUNK_SIZE * 2) + 16;
 /// 128 KiB this works out to ~512 KiB per chunk — generous, but the
 /// decoder/encoder allocate on demand only when a chunk actually emits
 /// far-offset matches.
-pub const CHUNK_OFF32_CAPACITY: u32 = (CHUNK_SIZE * 2) + 16;
-
-comptime {
-    // TODO N2 caveat #1: `storeOff32Byte` in `shaders/lz_encode.comp`
-    // computes its global byte offset as
-    //   gpos = (g_dst_word_base << 2) + pos
-    // where `g_dst_word_base` is set to `chunk_id * (chunk_capacity >> 2)`
-    // — i.e. it uses CHUNK_STREAM_CAPACITY (the cmd/lit/length stride)
-    // as the off32 stride too. That's correct today because the two
-    // capacities are identical, but the shader has no other guard
-    // against them diverging. Pin them equal here so any future bump
-    // of one without the other fails to compile.
-    if (CHUNK_OFF32_CAPACITY != CHUNK_STREAM_CAPACITY) @compileError(
-        "CHUNK_OFF32_CAPACITY must equal CHUNK_STREAM_CAPACITY — see " ++
-            "storeOff32Byte in shaders/lz_encode.comp (g_dst_word_base " ++
-            "is derived from chunk_capacity and shared between off32 + " ++
-            "the other streams). Update the shader if you bump only one.",
-    );
-}
-
-/// Internal: matches the GLSL constants in `shaders/lz_encode.comp`.
-/// Used by the caveat-#2 assertion below.
-const LZ_BLOCK_SIZE_HOST: u32 = 0x10000; // 64 KiB — see lz_encode.comp
-const LARGE_OFFSET_THRESHOLD: u32 = 0xC00000; // ditto
-
-comptime {
-    // TODO N2 caveat #2: the encoder's off32 emission path in
-    // `shaders/lz_encode.comp::emitMatchLong` emits the simple
-    // 3-byte (`storeOff32LE24`) form unconditionally. CUDA's
-    // reference `writeOffset32` has a large-tag branch for
-    // `adjusted >= LARGE_OFFSET_THRESHOLD (0xC00000)` — we omit it
-    // because at default chunk sizes the worst-case
-    //   adjusted = effective_offset + block2_start - match_pos
-    // is bounded by `CHUNK_SIZE + LZ_BLOCK_SIZE` (max-near match
-    // plus block-1 start, with match_pos = 0). Today that ceiling
-    // is `0x10000 + 0x10000 = 0x20000`, dwarfed by the threshold.
-    //
-    // Pin the relationship: if either side ever crosses the
-    // threshold the encoder needs the large-tag branch back and a
-    // matching decoder change. The assertion below fails loudly so
-    // the bump doesn't silently corrupt the wire format.
-    if (CHUNK_SIZE + LZ_BLOCK_SIZE_HOST >= LARGE_OFFSET_THRESHOLD) @compileError(
-        "CHUNK_SIZE + LZ_BLOCK_SIZE has grown into LARGE_OFFSET_THRESHOLD " ++
-            "(0xC00000). shaders/lz_encode.comp's `emitMatchLong` emits the " ++
-            "simple 3-byte off32 form unconditionally — restore CUDA's large- " ++
-            "tag branch (writeOffset32 in src/encode/lz_kernel.cu) before " ++
-            "this assertion fires or the wire format will corrupt silently.",
-    );
-}
+pub const CHUNK_OFF32_CAPACITY: u32 = wire_constants.CHUNK_OFF32_CAPACITY;
 
 /// Encoder push constants (12 bytes — see lz_encode.comp).
 const EncodePush = extern struct {
@@ -216,18 +176,16 @@ pub var last_decode_descriptors_ns: u64 = 0;
 pub var last_decode_dispatch_wall_ns: u64 = 0;
 pub var last_decode_readback_ns: u64 = 0;
 
-/// Hard cap on chunks per encode. Bounds the per-chunk size sidecar
-/// arrays so we never need heap allocation in the codec module. 4096
-/// chunks × 128 KiB = 512 MiB max input — covers the silesia 200 MB
-/// scale test plus headroom for ~2x growth without re-tuning. Bumped
-/// from the original 256 (= 32 MiB cap) when the L1 scale test
-/// required full-corpus runs on enwik8 (100 MB) + silesia (200 MB).
+/// Hard cap on chunks per encode. Now (post-F052) just a runtime guard:
+/// L1Streams holds allocator-owned slices for per-chunk sidecars so the
+/// cap doesn't bound stack-static array sizes. 4096 × 64 KiB = 256 MiB
+/// max input — covers the silesia 200 MB scale test plus headroom.
 ///
-/// Per-chunk sidecar growth from this bump: L1Streams gains
-/// (4096-256) * 4 bytes * 8 arrays = ~120 KiB, total ~128 KiB struct.
-/// L1Streams is passed by value in a few host paths — the Windows
-/// 4 MiB default stack absorbs it without trouble.
-pub const MAX_CHUNKS: u32 = 4096;
+/// Sourced from `wire_constants.MAX_CHUNKS` so the orchestrator
+/// (`decode_pipeline_gpu.zig::WALK_MAX_CHUNKS`) and the codec agree on a
+/// single number. Re-exported here for callers (tests, wire_format.zig)
+/// that historically named it `l1_codec.MAX_CHUNKS`.
+pub const MAX_CHUNKS: u32 = wire_constants.MAX_CHUNKS;
 
 // ── Public types ──────────────────────────────────────────────────
 
@@ -235,6 +193,18 @@ pub const MAX_CHUNKS: u32 = 4096;
 /// callers must `freeStreams` exactly once. The size fields sum across
 /// every chunk; per-chunk slices into the streams are reconstructed via
 /// `chunk_capacity` + the per-chunk count arrays.
+///
+/// `MAX_CHUNKS` (= `wire_constants.MAX_CHUNKS`) IS load-bearing here:
+/// the per-chunk arrays below are inline `[MAX_CHUNKS]u32`. Total
+/// struct size = 5 + 3 inline arrays × `MAX_CHUNKS * 4 B`, currently
+/// 8 × 4096 × 4 = 128 KiB. The struct is occasionally passed by value
+/// across boundaries (the unit-test helpers and `slz1_codec` decode
+/// path); the Windows 4 MiB default stack absorbs it but any bump of
+/// `MAX_CHUNKS` beyond ~8192 will start to crowd typical 64 KiB stack
+/// budgets in alternative configurations. The runtime cap check in
+/// `encodeL1Multi` (`if (n_chunks > MAX_CHUNKS)`) provides the user-
+/// visible error if input exceeds capacity (256 MiB at the current
+/// `CHUNK_SIZE = 64 KiB`).
 pub const L1Streams = struct {
     lit_buf: vk.VkBuffer = null,
     lit_mem: vk.VkDeviceMemory = null,
@@ -661,7 +631,20 @@ pub fn encodeL1MultiEx(
 
     // Hash buffer: n_chunks × HASH_SIZE_BYTES. Device-local only — the
     // host never reads or writes it.
-    var hash_b = try createBuffer(ctx, @as(vk.VkDeviceSize, n_chunks) * HASH_SIZE_BYTES, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+    //
+    // F058 guard: per-chunk hash is 512 KiB, so n_chunks=4096 demands
+    // 2 GiB of VRAM purely for hash slots. On a 6 GB iGPU or a 4060 Ti
+    // (8 GB total) running the L1 scale test alongside other allocations
+    // (lit/cmd/off16/length/off32 streams at ~512 KiB per chunk = ~10 GiB
+    // total worst case) this is the buffer that puts us over the cliff.
+    // Fail loud with `MemoryAllocateFailed` if the requested hash VRAM
+    // exceeds the configured ceiling so callers see a real error rather
+    // than an opaque VK_ERROR_OUT_OF_DEVICE_MEMORY from the driver.
+    const hash_bytes_total: vk.VkDeviceSize = @as(vk.VkDeviceSize, n_chunks) * HASH_SIZE_BYTES;
+    if (hash_bytes_total > wire_constants.HASH_VRAM_MAX_BYTES) {
+        return error.MemoryAllocateFailed;
+    }
+    var hash_b = try createBuffer(ctx, hash_bytes_total, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
     defer destroyBuffer(ctx, &hash_b);
 
     // Sizes sidecar: 8 u32 per chunk:

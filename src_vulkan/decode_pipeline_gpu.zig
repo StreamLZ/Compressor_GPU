@@ -71,21 +71,30 @@ const probe_mod = @import("probe.zig");
 const l1_codec = @import("l1_codec.zig");
 const descriptors = @import("descriptors.zig");
 const dispatch = @import("dispatch.zig");
+const wire_constants = @import("wire_constants.zig");
 const spv_blobs = @import("spv_blobs");
 
 // ── Constants that mirror the shared GLSL header ─────────────────────
+//
+// Sourced from `wire_constants.zig` (Cluster H consolidation). The GLSL
+// header `decode_pipeline_shared.glsl` carries identical values; the
+// comptime checks in `wire_constants` enforce host/GLSL coherence.
 
 /// Max chunks the walk-frame kernel is sized to accept (matches the
 /// `WALK_MAX_CHUNKS` constant in `decode_pipeline_shared.glsl`).
-pub const WALK_MAX_CHUNKS: u32 = 16384;
+pub const WALK_MAX_CHUNKS: u32 = wire_constants.WALK_MAX_CHUNKS;
 
 /// Worst-case sub-chunks per chunk. Matches `MAX_SUB_CHUNKS_PER_CHUNK`
 /// in the shared GLSL header.
-pub const MAX_SUB_CHUNKS_PER_CHUNK: u32 = 4;
+pub const MAX_SUB_CHUNKS_PER_CHUNK: u32 = wire_constants.MAX_SUB_CHUNKS_PER_CHUNK;
 
 /// Per-sub-chunk entropy-scratch slot stride. Matches
 /// `ENTROPY_SCRATCH_SLOT_BYTES` (128 KiB).
-pub const ENTROPY_SCRATCH_SLOT_BYTES: u32 = 131072;
+pub const ENTROPY_SCRATCH_SLOT_BYTES: u32 = wire_constants.ENTROPY_SCRATCH_SLOT_BYTES;
+
+/// Outer-block boundary in bytes (256 KiB) for an SLZ1 frame. Mirrors
+/// `SLZ_CHUNK_SIZE_BYTES` in the shared GLSL header.
+pub const SLZ_CHUNK_SIZE_BYTES: u32 = wire_constants.SLZ_CHUNK_SIZE_BYTES;
 
 /// Slot widths (u32 counts) of the descriptor structs the 5 kernels
 /// exchange. Must stay byte-identical to the shared GLSL header.
@@ -537,7 +546,7 @@ pub fn runDecodePipelineEx(
     // `(decomp_size / SLZ_CHUNK_SIZE_BYTES) + 2`. We use `slz_bytes.len`
     // as a proxy upper bound for decomp_size (compressed is always
     // ≤ decompressed) plus a safety pad.
-    const slz_chunk_size_bytes: u32 = 0x40000; // 256 KiB
+    const slz_chunk_size_bytes: u32 = SLZ_CHUNK_SIZE_BYTES; // 256 KiB (wire-format outer block bound)
     const n_chunks_max: u32 = if (hints.n_chunks_hint != 0)
         @max(hints.n_chunks_hint, 1)
     else
