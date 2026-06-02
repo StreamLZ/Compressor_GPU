@@ -327,6 +327,146 @@ pub fn main(process_init: std.process.Init) !void {
         }
     }
 
+    // ── Case 4: Scribble proof — verify the codec reads CURRENT device-
+    // buffer contents, NOT the host bytes the caller passed at registration.
+    //
+    // Cluster F (F034) — cases 1 and 3 above byte-compare against a
+    // reference whose source is the SAME bytes the test wrote into the
+    // device buffer via the host map. If the codec silently dropped the
+    // src_buffer_override and re-uploaded host bytes from `d_input` (the
+    // BDA cast back to a pointer), the test would either crash on a bad
+    // host dereference OR — worse — accidentally pass because the bytes
+    // happened to be the same. The scribble proof closes that gap:
+    //
+    //   1. Fill the device buffer with bytes A (the corpus prefix),
+    //      register it, compress → assert equals ref_compress(A).
+    //   2. Overwrite the device buffer (host map is HOST_COHERENT so the
+    //      next compress sees the new bytes immediately) with a
+    //      RECOGNIZABLE pattern B (alternating 0xAA / 0x55), compress
+    //      AGAIN → assert equals ref_compress(B).
+    //   3. The same registered VkBuffer is used for both compresses. The
+    //      codec MUST observe the buffer's CURRENT contents both times.
+    //      A codec that secretly cached the address-A bytes from
+    //      registration time, or that aliased the host pointer that
+    //      `src` was originally backed by, would fail step 2.
+    //
+    // Asserts BOTH compresses match their respective host-path references
+    // AND that the two D2D outputs differ — pattern B is wildly more
+    // compressible than the natural-text corpus prefix, so equal outputs
+    // would be a flagrant red flag for either the codec or the test.
+    {
+        var src_buf = try createTestBuf(ctx, src.len);
+        defer destroyTestBuf(ctx, &src_buf);
+
+        // Step 1: corpus-prefix bytes → device buffer; register; compress.
+        @memcpy(src_buf.mapped.?[0..src.len], src);
+        const reg_rc = vk_abi.slzRegisterBuffer_vk(handle, @ptrCast(src_buf.buf), null, src.len);
+        if (reg_rc != 0) {
+            try results.append(allocator, .{
+                .name = "encode_input_d2d_scribble",
+                .passed = false,
+                .detail = "register failed",
+            });
+        } else {
+            const dev_addr = vk_abi.slzBufferGetDeviceAddress_vk(handle, @ptrCast(src_buf.buf));
+            if (dev_addr == 0) {
+                try results.append(allocator, .{
+                    .name = "encode_input_d2d_scribble",
+                    .passed = false,
+                    .detail = "BDA returned 0",
+                });
+            } else {
+                const dev_ptr: *const anyopaque = @ptrFromInt(dev_addr);
+
+                // ── Compress A: corpus bytes already loaded ──────────────
+                const d2d_a = try allocator.alloc(u8, bound);
+                defer allocator.free(d2d_a);
+                const rc_a = vk_abi.slzCompress_vk(
+                    handle,
+                    dev_ptr,
+                    src.len,
+                    d2d_a.ptr,
+                    d2d_a.len,
+                    .{ .level = 1 },
+                );
+
+                // ── Scribble: overwrite the device buffer with the
+                //    AA/55 pattern via the HOST_COHERENT mapping. The next
+                //    compress through the SAME registered buffer should
+                //    see the new bytes — `ref_slz`'s host bytes are gone.
+                {
+                    var i: usize = 0;
+                    while (i < src.len) : (i += 1) {
+                        src_buf.mapped.?[i] = if ((i & 1) == 0) 0xAA else 0x55;
+                    }
+                }
+                // Build a host scratch carrying the SAME scribble pattern
+                // so the reference path produces ref_compress(B).
+                const scribble = try allocator.alloc(u8, src.len);
+                defer allocator.free(scribble);
+                {
+                    var i: usize = 0;
+                    while (i < src.len) : (i += 1) {
+                        scribble[i] = if ((i & 1) == 0) 0xAA else 0x55;
+                    }
+                }
+                const ref_b = try allocator.alloc(u8, bound);
+                defer allocator.free(ref_b);
+                const ref_b_rc = vk_abi.slzCompressHost_vk(
+                    handle,
+                    scribble.ptr,
+                    scribble.len,
+                    ref_b.ptr,
+                    ref_b.len,
+                    .{ .level = 1 },
+                );
+
+                // ── Compress B: device buffer now holds AA/55 ────────────
+                const d2d_b = try allocator.alloc(u8, bound);
+                defer allocator.free(d2d_b);
+                const rc_b = vk_abi.slzCompress_vk(
+                    handle,
+                    dev_ptr,
+                    src.len,
+                    d2d_b.ptr,
+                    d2d_b.len,
+                    .{ .level = 1 },
+                );
+
+                const ok_each_compress = (rc_a >= 0) and (rc_b >= 0) and (ref_b_rc >= 0);
+                const a_matches_ref = ok_each_compress and
+                    @as(usize, @intCast(rc_a)) == ref_cz_bytes and
+                    std.mem.eql(u8, ref_slz[0..ref_cz_bytes], d2d_a[0..@intCast(rc_a)]);
+                const b_matches_ref = ok_each_compress and
+                    @as(usize, @intCast(rc_b)) == @as(usize, @intCast(ref_b_rc)) and
+                    std.mem.eql(u8, ref_b[0..@intCast(ref_b_rc)], d2d_b[0..@intCast(rc_b)]);
+                // A != B is a sanity check on the scribble pattern itself
+                // — alternating AA/55 must compress to something other
+                // than the natural-text corpus prefix. If the two outputs
+                // matched, the codec is broken (or the test's scribble
+                // somehow coincided with the source, which is impossible
+                // because the corpus is real bytes).
+                const distinct = ok_each_compress and
+                    @as(usize, @intCast(rc_a)) != @as(usize, @intCast(rc_b));
+
+                const ok = a_matches_ref and b_matches_ref and distinct;
+                try results.append(allocator, .{
+                    .name = "encode_input_d2d_scribble",
+                    .passed = ok,
+                    .detail = if (ok)
+                        "device-buffer contents drove output for both A (corpus) and B (AA/55 scribble)"
+                    else if (!a_matches_ref)
+                        "compress(A) on D2D buffer != ref_compress(corpus)"
+                    else if (!b_matches_ref)
+                        "compress(B) on scribbled D2D buffer != ref_compress(AA/55)"
+                    else
+                        "scribbled D2D output identical to corpus output (codec ignored scribble?)",
+                });
+            }
+            _ = vk_abi.slzUnregisterBuffer_vk(handle, @ptrFromInt(dev_addr));
+        }
+    }
+
     // ── Report ──────────────────────────────────────────────────────
     var pass_count: u32 = 0;
     var fail_count: u32 = 0;
