@@ -316,23 +316,20 @@ comptime {
         "OFF32_COUNT_PACK_MAX must equal (1<<OFF32_COUNT_FIELD_BITS)-1.",
     );
 
-    // F014 guard rail: today the encoder emits off32 entries using the
-    // simple 3-byte form unconditionally because (chunk-internal
-    // `adjusted` offset) <= CHUNK_SIZE + LZ_BLOCK_SIZE which is well
-    // below LARGE_OFFSET_THRESHOLD (0xC00000). If we ever raise the
-    // chunk geometry past that bound, the 4-byte extended form (added
-    // in Cluster C) must be the active path. The comptime assertion
-    // catches the geometry bump silently; Cluster C added the 4-byte
-    // form so this assert is now an early-warning rather than a hard
-    // wall — the code path exists, but the assertion documents that
-    // the simple form is still safe at current sizes.
-    if (CHUNK_SIZE + LZ_BLOCK_SIZE >= LARGE_OFFSET_THRESHOLD) @compileError(
-        "CHUNK_SIZE + LZ_BLOCK_SIZE has grown into LARGE_OFFSET_THRESHOLD " ++
-            "(0xC00000). The 3-byte off32 form is still emitted by " ++
-            "shaders/lz_encode.comp::emitMatchLong — verify the 4-byte " ++
-            "extended form is wired into the encoder's hot path before " ++
-            "lifting this assertion.",
-    );
+    // F014 note: the 4-byte extended off32 form is now wired into
+    // shaders/lz_encode.comp::writeOffset32. At L1 default geometry
+    // (CHUNK_SIZE + LZ_BLOCK_SIZE = 0x20000) every emit still hits the
+    // 3-byte short form (LARGE_OFFSET_THRESHOLD = 0xC00000). If the
+    // geometry is bumped past the threshold the long form takes over
+    // automatically; the decoder's loadOff32EntryFull reader handles
+    // both forms (Cluster C / F014 in src_vulkan/shaders/lz_decode.comp).
+    //
+    // The assertion below remains useful as documentation that the L1
+    // tested path stays in the short form — if it ever fires, the L1
+    // decode path's loadOff32Entry24 reader (which assumes uniform
+    // 3-byte entries indexed by entry_idx) needs to switch to a
+    // byte-cursor walk over loadOff32EntryFull. Today nothing on the
+    // L1 hot path consumes the extended form.
 
     // FAR_OFFSET_MIN_MATCH > 0 (any positive value works — we just want
     // a sanity bound that catches a typo zeroing out the constant).

@@ -230,14 +230,52 @@ uint loadOff32Byte(uint pos) {
 }
 
 // readU24LE on the off32 stream (entry index → 24-bit value).
-// We assume no large-tag entries at L1 (`adjusted < LARGE_OFFSET_THRESHOLD`
-// for 128 KiB chunks); the upper byte of CUDA's 4-byte "large" form is
-// not consumed here.
+// At L1 default geometry every emit hits the 3-byte short form, so this
+// reader is sufficient. The 4-byte extended form (Cluster C / F014) is
+// handled by `loadOff32EntryFull` below — currently unused on the L1
+// hot path but exposed for future bumps to CHUNK_SIZE / LZ_BLOCK_SIZE
+// that would push offsets past LARGE_OFFSET_THRESHOLD.
+//
+// IMPORTANT: this function takes an ENTRY INDEX, not a byte offset.
+// L1 entries are uniformly 3 bytes, so the byte offset = entry_idx *
+// OFF32_ENTRY_BYTES. If you mix in 4-byte extended entries, the caller
+// must use loadOff32EntryFull with a running byte cursor instead.
 uint loadOff32Entry24(uint entry_idx) {
     uint base = entry_idx * OFF32_ENTRY_BYTES;
     return loadOff32Byte(base)
          | (loadOff32Byte(base + 1u) << 8)
          | (loadOff32Byte(base + 2u) << 16);
+}
+
+// Cluster C (F014): byte-cursor variant of off32 read that handles
+// both the 3-byte short form (offset < LARGE_OFFSET_THRESHOLD) and the
+// 4-byte extended form (high-tag bits == OFF32_LONG_ENTRY_TAG).
+// Returns a (value, bytes_consumed) pair packed into a uvec2.
+//
+// CUDA reference: src/decode/lz_decode_general.cuh::readOffset32 (the
+// general-decoder reader). At L1 today this function is unused; the
+// 3-byte fast path in the existing token loop calls loadOff32Entry24
+// directly. Provided here so a future host can iterate the off32
+// stream by byte cursor and decode extended-form entries correctly.
+uvec2 loadOff32EntryFull(uint byte_pos) {
+    uint b0 = loadOff32Byte(byte_pos);
+    uint b1 = loadOff32Byte(byte_pos + 1u);
+    uint b2 = loadOff32Byte(byte_pos + 2u);
+    uint short_val = b0 | (b1 << 8) | (b2 << 16);
+    // High-tag detection: top byte of the 24-bit value matches
+    // OFF32_LONG_ENTRY_TAG (0xC0). That means low-22 bits hold the
+    // truncated offset and a 4th byte follows with the high bits.
+    if ((short_val & 0xC00000u) == 0xC00000u) {
+        uint high = loadOff32Byte(byte_pos + 3u);
+        // Reconstruct: offset = (low22) | (high << 22). The encoder
+        // wrote `(offset - truncated) >> 22` into the high byte where
+        // `truncated = low22 | OFF32_LARGE_TAG`, so reversing:
+        //   offset = (short_val & OFF32_LOW22_MASK) | (high << 22)
+        // + OFF32_LARGE_TAG bits restored.
+        uint low22 = short_val & 0x3FFFFFu;
+        return uvec2(low22 | (high << 22), 4u);
+    }
+    return uvec2(short_val, 3u);
 }
 
 // ── Dst byte ops (direct uint8_t SSBO access, GL_EXT_shader_8bit_storage) ──
@@ -310,6 +348,65 @@ void warpLiteralCopy(uint dst_pos, uint lit_pos, uint lit_len) {
     for (uint i = lane; i < lit_len; i += stride) {
         storeDstByte(dst_pos + i, loadLitByte(lit_pos + i));
     }
+}
+
+// ── Bounded warp-cooperative copy variants (Cluster C / F013) ───────
+// Port of src/decode/lz_decode_core.cuh:65-89 warpLiteralCopyBounded +
+// warpMatchCopyBounded. Each store is guarded by
+//   dst_pos + i < dst_end_abs
+// so the last batched store can't write past the legal dst end (the
+// encoder may emit a token group whose nominal copy reaches a few
+// bytes past the chunk's true decomp_size on the final iteration; the
+// CUDA general decoder uses bounded variants on that final iteration).
+// Literal copies additionally guard against running past lit_size.
+//
+// Note (L1 specifics): the unbounded variants above are still used in
+// the fast batched path because the encoder pre-pads stream capacities
+// to chunk_capacity_bytes (much larger than any real chunk). The
+// bounded variants exist for defensive use on the very last batch (or
+// future paths that don't pre-pad), matching the CUDA general-decoder
+// design.
+void warpLiteralCopyBounded(uint dst_pos, uint lit_pos, uint lit_len,
+                            uint dst_end_abs, uint lit_size) {
+    uint lane = gl_SubgroupInvocationID;
+    uint stride = gl_SubgroupSize;
+    for (uint i = lane; i < lit_len; i += stride) {
+        if (dst_pos + i < dst_end_abs && lit_pos + i < lit_size) {
+            storeDstByte(dst_pos + i, loadLitByte(lit_pos + i));
+        }
+    }
+}
+
+void warpMatchCopyBounded(uint dst_pos, uint match_src, uint match_len,
+                          uint match_dist, uint dst_end_abs) {
+    uint lane = gl_SubgroupInvocationID;
+    uint stride = gl_SubgroupSize;
+    if (match_dist >= match_len) {
+        // Non-overlapping: cooperative
+        for (uint i = lane; i < match_len; i += stride) {
+            if (dst_pos + i < dst_end_abs) {
+                storeDstByte(dst_pos + i, loadDstByte(match_src + i));
+            }
+        }
+    } else if (lane == 0u) {
+        // Overlapping: serial RLE-fill
+        for (uint i = 0u; i < match_len; i++) {
+            if (dst_pos + i < dst_end_abs) {
+                storeDstByte(dst_pos + i, loadDstByte(match_src + i));
+            }
+        }
+    }
+}
+
+// Bounded variant for the delta-literal fast path used by future
+// sub-chunk decoders (mirrors deltaLiteralCopyBounded). Equivalent to
+// warpLiteralCopyBounded but with a separate name for documentation
+// (delta = literals reconstructed from a recent-offset stride). Kept
+// in sync with the unbounded copy so future delta-literal callers can
+// switch over without a port lag.
+void deltaLiteralCopyBounded(uint dst_pos, uint lit_pos, uint lit_len,
+                             uint dst_end_abs, uint lit_size) {
+    warpLiteralCopyBounded(dst_pos, lit_pos, lit_len, dst_end_abs, lit_size);
 }
 
 // Port of src/decode/lz_decode_core.cuh:45 warpMatchCopy().

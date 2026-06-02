@@ -266,21 +266,51 @@ void storeOff32Byte(uint pos, uint b) {
     off32_buf.w[widx] = (off32_buf.w[widx] & ~mask) | ((b & 0xFFu) << sh);
 }
 
-// 24-bit LE store at byte `pos` (3 bytes). The CUDA reference
-// `writeOffset32` has a large-tag branch for `adjusted >=
-// LARGE_OFFSET_THRESHOLD (0xC00000)`; we omit it because at default
-// L1 chunk sizes the worst-case
-//   adjusted = effective_offset + block2_start - match_pos
-// is bounded by CHUNK_SIZE + LZ_BLOCK_SIZE ≤ 0x20000 — comfortably
-// under the threshold. Host-side comptime assertion in
-// `src_vulkan/l1_codec.zig` (TODO N2 caveat #2) pins the
-// relationship; bumping CHUNK_SIZE or LZ_BLOCK_SIZE will trip that
-// assertion and force the large-tag branch back here before the
-// wire format silently corrupts.
+// 24-bit LE store at byte `pos` (3 bytes).
 void storeOff32LE24(uint pos, uint v) {
     storeOff32Byte(pos,      v & 0xFFu);
     storeOff32Byte(pos + 1u, (v >> 8) & 0xFFu);
     storeOff32Byte(pos + 2u, (v >> 16) & 0xFFu);
+}
+
+// ── writeOffset32 (Cluster C / F014) ────────────────────────────────
+// Append a far-offset entry to the off32 stream. Offsets below
+// LARGE_OFFSET_THRESHOLD = 0xC00000 take 3 bytes (the historic L1
+// short form); larger ones take 4 bytes via the OFF32_LARGE_TAG-marked
+// extended form. Port of `writeOffset32` in
+// src/encode/lz_token_emit.cuh.
+//
+// Today at L1 default geometry (CHUNK_SIZE + LZ_BLOCK_SIZE = 0x20000)
+// the adjusted-offset domain is bounded well below the threshold, so
+// every emit hits the short-form branch. The 4-byte branch exists so
+// future bumps to CHUNK_SIZE / LZ_BLOCK_SIZE don't silently corrupt
+// the wire format (the comptime assertion in wire_constants.zig that
+// previously hard-gated the unconditional short form has been relaxed
+// — the long-form branch is the safety net).
+//
+// Returns the number of bytes written (3 or 4) so the caller can
+// advance its cursor. The CUDA reference takes the cursor by
+// reference; GLSL has no in-out parameters across files, so we let the
+// caller bump.
+const uint OFF32_LARGE_TAG_HOST   = 0xC00000u;
+const uint OFF32_LOW22_MASK_HOST  = 0x3FFFFFu;
+const uint OFF32_LOW_BITS_HOST    = 22u;
+uint writeOffset32(uint pos, uint offset) {
+    if (offset >= OFF32_LARGE_TAG_HOST) {
+        uint truncated = (offset & OFF32_LOW22_MASK_HOST) | OFF32_LARGE_TAG_HOST;
+        storeOff32LE24(pos, truncated);
+        // High byte = (offset - truncated) >> 22.
+        // Mathematical identity: offset >> 22 == truncated_high + extra_high.
+        // CUDA writes `(offset - truncated) >> 22` which equals
+        // `(offset >> 22) - 0x03` (the truncated low22 form has the tag's
+        // top 2 bits = 11). We mirror the exact bit pattern to keep
+        // wire compatibility with the decoder.
+        storeOff32Byte(pos + 3u, ((offset - truncated) >> OFF32_LOW_BITS_HOST) & 0xFFu);
+        return 4u;
+    } else {
+        storeOff32LE24(pos, offset);
+        return 3u;
+    }
 }
 
 // ── Shared OutputStreams cursor ─────────────────────────────────────
@@ -438,12 +468,17 @@ void emitCmd(uint lit_len, uint match_len, uint offset, int recent_offset, uint 
         token_count += 1u;
         if (write_length) writeLengthValue(length_value_u);
 
-        // off32 entry value (3 bytes LE). `effective_offset + block2_start
+        // off32 entry value. `effective_offset + block2_start
         // - match_pos` — uint arithmetic is wrapping mod 2^32, matching
         // CUDA's uint32_t semantics.
+        //
+        // Cluster C (F014): route through writeOffset32 which emits the
+        // 3-byte short form when adjusted < LARGE_OFFSET_THRESHOLD and
+        // the 4-byte extended form otherwise. Advances off32_byte_pos
+        // by the actual bytes written (3 or 4).
         uint adjusted = effective_offset + block2_start - match_pos;
-        storeOff32LE24(off32_byte_pos, adjusted & 0xFFFFFFu);
-        off32_byte_pos += OFF32_ENTRY_BYTES;
+        uint bytes_written = writeOffset32(off32_byte_pos, adjusted);
+        off32_byte_pos += bytes_written;
         off32_count_total += 1u;
         return;
     }

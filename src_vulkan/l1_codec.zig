@@ -1010,16 +1010,23 @@ pub fn decodeL1Sync(
         var ci: u32 = 0;
         while (ci < n_chunks) : (ci += 1) {
             const stream_word_base: u32 = ci * cap_words;
-            // For the Vulkan encoder's own decode path the cmd-stream
-            // block-2 boundary is at `cmd_size` for sub-chunks larger
-            // than LZ_BLOCK_SIZE — every token gets attributed to block-1
-            // (CUDA writes the boundary at the actual encoder-side token
-            // count for block 1; we don't track that yet, so the
-            // boundary collapses to "the rest is block 1"). Multi-chunk
-            // round-trip with default chunks still works because
-            // `cmd_stream2_offset = 0` means "no block-2 boundary",
-            // i.e. everything is block-0 — and the encoder's
-            // off32_count_block1/2 split matches that view.
+            // Cluster C (F018): cmd-stream block-0/1 boundary IS tracked
+            // correctly by the encoder. lz_encode.comp writes
+            // `cmd_stream2_offset = token_count` at the block-0/1
+            // boundary (line 595) when g_src_size > LZ_BLOCK_SIZE,
+            // and leaves it as 0 (init value) when the chunk fits in a
+            // single LZ block (line 580-584 early-break). At L1 default
+            // geometry CHUNK_SIZE == LZ_BLOCK_SIZE so every chunk is
+            // single-block and the boundary stays 0 — which is the
+            // correct sentinel value the decoder reads (slot 14 → "no
+            // block-2 boundary, all tokens are block-0").
+            //
+            // For multi-chunk corpora the encoder's per-chunk
+            // off32_count_block1 / block2 split (read from sizes_buf
+            // slots 4 / 5) and the boundary above stay coherent
+            // because both are written in the same critical section of
+            // lz_encode.comp's main(). See sizes_buf write at
+            // shaders/lz_encode.comp:988.
             //
             const base = ci * 16;
             // Cluster A (F002): slots 0/1 (dst_offset, dst_size) are
