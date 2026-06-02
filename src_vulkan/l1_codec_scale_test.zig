@@ -25,6 +25,9 @@ const std = @import("std");
 const driver = @import("driver.zig");
 const probe_mod = @import("probe.zig");
 const l1_codec = @import("l1_codec.zig");
+// Cluster F (F037): add a parallel slz1 round-trip sweep that drives
+// the production wire-format wrap/unwrap path at scale.
+const slz1_codec = @import("slz1_codec.zig");
 
 const MAX_SPV_BYTES: usize = 1 << 20; // 1 MiB
 const SPV_DIR_REL: []const u8 = "zig-out/shaders";
@@ -163,6 +166,96 @@ fn runOne(
     };
     const t3 = qpcNow();
     r.decode_ns = qpcNs(t2, t3);
+
+    // Compare.
+    var first_diff: usize = 0;
+    var total_diffs: usize = 0;
+    var found_first = false;
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) {
+        if (src[i] != dst[i]) {
+            if (!found_first) {
+                first_diff = i;
+                found_first = true;
+            }
+            total_diffs += 1;
+        }
+    }
+    r.first_diff = first_diff;
+    r.total_diffs = total_diffs;
+    r.pass = (total_diffs == 0);
+    return r;
+}
+
+/// Cluster F (F037): parallel scale-test helper that drives the
+/// production `slz1_codec` wire-format-wrapping path. Mirror of
+/// `runOne` above but for the SLZ1 entry points; reports
+/// comp_bytes as the wrapped-frame on-disk size (what users see)
+/// and `n_chunks` from the encoder result.
+fn runOneSlz1(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ctx: *driver.Context,
+    src: []const u8,
+) CaseResult {
+    var r: CaseResult = .{
+        .pass = false,
+        .bytes = src.len,
+        .comp_bytes = 0,
+        .n_chunks = 0,
+        .encode_ns = 0,
+        .decode_ns = 0,
+    };
+
+    // Encode (timed).
+    const bound = slz1_codec.slz1Bound(src.len);
+    const slz_buf = allocator.alloc(u8, bound) catch |err| {
+        r.err_name = @errorName(err);
+        return r;
+    };
+    defer allocator.free(slz_buf);
+
+    const t0 = qpcNow();
+    const slz_size = slz1_codec.encodeL1ToSlz1(ctx, io, allocator, src, slz_buf) catch |err| {
+        r.err_name = @errorName(err);
+        return r;
+    };
+    const t1 = qpcNow();
+    r.encode_ns = qpcNs(t0, t1);
+    r.comp_bytes = @intCast(slz_size);
+    // n_chunks isn't surfaced by slz1Bound's interface; derive it
+    // from the input size + the VK codec's CHUNK_SIZE constant. This
+    // matches the per-row `chunks=` field the raw-kernel sweep prints.
+    r.n_chunks = @intCast((src.len + l1_codec.CHUNK_SIZE - 1) / l1_codec.CHUNK_SIZE);
+
+    // Decode (timed). Allocate dst once.
+    const dst = allocator.alloc(u8, src.len) catch |err| {
+        r.err_name = @errorName(err);
+        return r;
+    };
+    defer allocator.free(dst);
+    @memset(dst, 0);
+
+    const t2 = qpcNow();
+    const written = slz1_codec.decodeSlz1ToBytes(
+        ctx,
+        io,
+        allocator,
+        slz_buf[0..slz_size],
+        dst,
+    ) catch |err| {
+        r.err_name = @errorName(err);
+        return r;
+    };
+    const t3 = qpcNow();
+    r.decode_ns = qpcNs(t2, t3);
+
+    if (written != src.len) {
+        r.first_diff = @min(src.len, written);
+        r.total_diffs = 1;
+        r.pass = false;
+        return r;
+    }
 
     // Compare.
     var first_diff: usize = 0;
@@ -324,6 +417,40 @@ pub fn main(process_init: std.process.Init) !void {
         if (src_opt) |src| {
             defer allocator.free(src);
             const r = runOne(allocator, ctx, enc_spv, dec_spv, src);
+            try printResult(w, c.label, r);
+        } else {
+            try w.print("L1_SCALE SKIP {s} (load fail)\n", .{c.label});
+        }
+        try w.flush();
+    }
+
+    // ── Cluster F (F037): SLZ1 wire-format scale sweep ──────────────
+    // The raw-kernel sweep above pounds on lz_encode / lz_decode at
+    // scale. This second sweep does the same through the production
+    // wire-format wrap/unwrap path (encodeL1ToSlz1 + decodeSlz1ToBytes)
+    // — same corpora, same size sweep — so a regression in either
+    // path fails this test. Subset of `cases` chosen to bound runtime;
+    // full-file silesia is opt-in via the existing kernel-side sweep.
+    try w.print("\n--- SLZ1 wire-format scale sweep (production path) ---\n", .{});
+    try w.flush();
+    const slz1_cases = [_]CaseSpec{
+        .{ .label = "slz1_enwik8_first_4mb", .path = ENWIK8_PATH, .size_cap = 4 * 1024 * 1024 },
+        .{ .label = "slz1_enwik8_first_16mb", .path = ENWIK8_PATH, .size_cap = 16 * 1024 * 1024 },
+        .{ .label = "slz1_enwik8_first_64mb", .path = ENWIK8_PATH, .size_cap = 64 * 1024 * 1024 },
+        .{ .label = "slz1_enwik8_full", .path = ENWIK8_PATH, .size_cap = 0 },
+        .{ .label = "slz1_silesia_first_4mb", .path = SILESIA_PATH, .size_cap = 4 * 1024 * 1024 },
+        .{ .label = "slz1_silesia_first_16mb", .path = SILESIA_PATH, .size_cap = 16 * 1024 * 1024 },
+        .{ .label = "slz1_silesia_first_64mb", .path = SILESIA_PATH, .size_cap = 64 * 1024 * 1024 },
+        .{ .label = "slz1_silesia_full", .path = SILESIA_PATH, .size_cap = 0 },
+    };
+    for (slz1_cases) |c| {
+        const src_opt = loadCorpusSlice(allocator, io, c.path, c.size_cap) catch |err| blk: {
+            try w.print("L1_SCALE FAIL {s} load_err={s}\n", .{ c.label, @errorName(err) });
+            break :blk null;
+        };
+        if (src_opt) |src| {
+            defer allocator.free(src);
+            const r = runOneSlz1(allocator, io, ctx, src);
             try printResult(w, c.label, r);
         } else {
             try w.print("L1_SCALE SKIP {s} (load fail)\n", .{c.label});

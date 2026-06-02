@@ -290,16 +290,26 @@ pub fn build(b: *std.Build) void {
     // so the hard dependency on `vk-shaders` ensures the .spv files
     // exist before the test runs. Wired as `zig build vk-l1-test`.
     const vk_l1_test_module = b.createModule(.{
-        .root_source_file = b.path("src_vulkan/l1_codec_test.zig"),
+        // Cluster F (F037): root at repo top (`l1_codec_test_root.zig`)
+        // so the slz1_codec import chain — which transitively reaches
+        // `../src/format/...` via wire_format_gpu.zig — stays inside
+        // the package boundary. Same trick as tests_root.zig.
+        .root_source_file = b.path("l1_codec_test_root.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
         .link_libc = true,
     });
+    // Cluster F (F037): l1_codec_test now also drives the production
+    // `slz1_codec.encodeL1ToSlz1` / `decodeSlz1ToBytes` path, which
+    // transitively imports `spv_blobs` (the @embedFile()'d .spv
+    // blobs). Wire the embed module + the shader-build dependency.
+    addSpvBlobsImport(vk_l1_test_module, vk_shaders);
     const vk_l1_test_exe = b.addExecutable(.{
         .name = "vk_l1_test",
         .root_module = vk_l1_test_module,
     });
+    vk_l1_test_exe.step.dependOn(vk_shaders.embed_dir_step);
     const vk_l1_test_install = b.addInstallArtifact(vk_l1_test_exe, .{});
     const run_vk_l1_test = b.addRunArtifact(vk_l1_test_exe);
     // Detach from `b.getInstallStep()` so Vulkan-only test runs don't
@@ -319,16 +329,22 @@ pub fn build(b: *std.Build) void {
     // because the full silesia case touches ~3 GB of host-visible Vulkan
     // memory and takes minutes per run.
     const vk_l1_scale_test_module = b.createModule(.{
-        .root_source_file = b.path("src_vulkan/l1_codec_scale_test.zig"),
+        // Cluster F (F037): root at repo top so the slz1_codec import
+        // chain stays inside the package boundary (see vk-l1-test).
+        .root_source_file = b.path("l1_codec_scale_test_root.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
         .link_libc = true,
     });
+    // Cluster F (F037): scale test now also drives the production
+    // slz1_codec path, which transitively imports `spv_blobs`.
+    addSpvBlobsImport(vk_l1_scale_test_module, vk_shaders);
     const vk_l1_scale_test_exe = b.addExecutable(.{
         .name = "vk_l1_scale_test",
         .root_module = vk_l1_scale_test_module,
     });
+    vk_l1_scale_test_exe.step.dependOn(vk_shaders.embed_dir_step);
     const vk_l1_scale_test_install = b.addInstallArtifact(vk_l1_scale_test_exe, .{});
     const run_vk_l1_scale_test = b.addRunArtifact(vk_l1_scale_test_exe);
     run_vk_l1_scale_test.step.dependOn(&vk_l1_scale_test_install.step);

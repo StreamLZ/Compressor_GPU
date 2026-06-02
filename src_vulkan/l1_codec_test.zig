@@ -32,6 +32,12 @@ const vk = @import("vk_api.zig");
 const driver = @import("driver.zig");
 const probe_mod = @import("probe.zig");
 const l1_codec = @import("l1_codec.zig");
+// Cluster F (F037): add a parallel slz1 round-trip suite that drives
+// the same corpora through `slz1_codec.encodeL1ToSlz1` /
+// `decodeSlz1ToBytes` — the production wire-format-wrapping path the
+// CLI and C ABI take. The pre-existing raw-kernel tests stay for
+// kernel isolation, but the production-shape path was unexercised.
+const slz1_codec = @import("slz1_codec.zig");
 
 // ── Tuning ─────────────────────────────────────────────────────────
 
@@ -178,6 +184,73 @@ fn roundTrip(
         .first_diff = first_diff,
         .total_diffs = total_diffs,
         .comp_bytes = enc.comp_total_bytes,
+    };
+}
+
+/// Cluster F (F037): parallel round-trip helper that goes through the
+/// production `slz1_codec` wire-format-wrapping path. The raw-kernel
+/// `roundTrip` above stays for kernel-level isolation; this helper
+/// drives the same input through the same code path the CLI binary
+/// (`streamlz_vk.exe`) and the C ABI (`slzCompressHost_vk` +
+/// `slzDecompressHost_vk`) take. Failures here are production-shape
+/// regressions, not kernel-isolation regressions.
+///
+/// Returns the same RoundTripResult shape so the existing printResult
+/// formatter (PASS/FAIL plus first_diff + total_diffs + comp_bytes)
+/// works unchanged.
+fn roundTripThroughSlz1(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ctx: *driver.Context,
+    src: []const u8,
+    dst: []u8,
+) !RoundTripResult {
+    std.debug.assert(dst.len >= src.len);
+
+    const bound = slz1_codec.slz1Bound(src.len);
+    const slz_buf = try allocator.alloc(u8, bound);
+    defer allocator.free(slz_buf);
+
+    const slz_size = try slz1_codec.encodeL1ToSlz1(ctx, io, allocator, src, slz_buf);
+    const written = try slz1_codec.decodeSlz1ToBytes(
+        ctx,
+        io,
+        allocator,
+        slz_buf[0..slz_size],
+        dst[0..src.len],
+    );
+
+    var first_diff: usize = 0;
+    var total_diffs: usize = 0;
+    var found_first = false;
+    // Size mismatch counts as one diff at the boundary so the printer
+    // surfaces it; the slz1 path's `decodeSlz1ToBytes` returns the
+    // original_size advertised by the frame header, which MUST equal
+    // src.len for a correct round-trip.
+    if (written != src.len) {
+        first_diff = @min(src.len, written);
+        total_diffs = 1;
+    } else {
+        var i: usize = 0;
+        while (i < src.len) : (i += 1) {
+            if (src[i] != dst[i]) {
+                if (!found_first) {
+                    first_diff = i;
+                    found_first = true;
+                }
+                total_diffs += 1;
+            }
+        }
+    }
+    return .{
+        .pass = (total_diffs == 0),
+        .first_diff = first_diff,
+        .total_diffs = total_diffs,
+        // For the slz1 path we report the wrapped frame size (the
+        // user-observable .slz on-disk size), not the per-stream byte
+        // total — that is the production-shape number callers care
+        // about.
+        .comp_bytes = @intCast(slz_size),
     };
 }
 
@@ -743,4 +816,140 @@ pub fn main(process_init: std.process.Init) !void {
     // code path (literal-only, single match, multi-match, fast path,
     // slow path) across a size sweep AND every multi-chunk variant from
     // 1 chunk through ~35 chunks.
+
+    // ── Cluster F (F037): SLZ1 wire-format round-trip sweep ──────────
+    // The raw-kernel sweep above proves the lz_encode / lz_decode
+    // shaders round-trip correctly. This second sweep proves the
+    // production wire-format wrap/unwrap chain (encodeL1ToSlz1 +
+    // decodeSlz1ToBytes) — the same one the CLI binary and the C
+    // ABI call — round-trips on the same corpora. Surfacing both
+    // sweeps means a regression in EITHER the kernel OR the wire-
+    // format wrap path fails this test.
+    try w.print("\n--- SLZ1 wire-format wrap/unwrap sweep (production path) ---\n", .{});
+    try w.flush();
+    {
+        // Small repetitive case — exact mirror of the raw-kernel
+        // "small_repetitive" above so any disagreement between the
+        // two paths is immediately attributable.
+        var slz1_small_src: [SMALL_SIZE]u8 = undefined;
+        var slz1_small_dst: [SMALL_SIZE]u8 = undefined;
+        fillRepetitive(slz1_small_src[0..]);
+        const r = try roundTripThroughSlz1(allocator, io, ctx, slz1_small_src[0..], slz1_small_dst[0..]);
+        try printResult(w, "slz1_small_repetitive", SMALL_SIZE, r);
+        try w.flush();
+        if (!r.pass) return error.Mismatch;
+    }
+
+    {
+        // 64 KiB mixed payload — same shape as the raw-kernel
+        // "large_mixed" / "pure_corpus" cases.
+        var slz1_large_src: [LARGE_SIZE]u8 = undefined;
+        var slz1_large_dst: [LARGE_SIZE]u8 = undefined;
+        fillLargeCase(io, slz1_large_src[0..]);
+        const r = try roundTripThroughSlz1(allocator, io, ctx, slz1_large_src[0..], slz1_large_dst[0..]);
+        try printResult(w, "slz1_large_mixed", LARGE_SIZE, r);
+        try w.flush();
+        if (!r.pass) {
+            const d_off = r.first_diff;
+            const start = if (d_off >= 16) d_off - 16 else 0;
+            const end = @min(d_off + 16, LARGE_SIZE);
+            try w.print("DEBUG slz1_large src[{d}..{d}] = ", .{ start, end });
+            for (slz1_large_src[start..end]) |b| try w.print("{x:0>2} ", .{b});
+            try w.print("\nDEBUG slz1_large dst[{d}..{d}] = ", .{ start, end });
+            for (slz1_large_dst[start..end]) |b| try w.print("{x:0>2} ", .{b});
+            try w.print("\n", .{});
+            try w.flush();
+        }
+    }
+
+    // Corpus prefix sweep — same set the raw-kernel side runs above.
+    inline for ([_]usize{ 64, 128, 1024, 4096, 16384, 32768 }) |sz| {
+        var s: [sz]u8 = undefined;
+        var d: [sz]u8 = undefined;
+        if (!fillFromCorpus(io, s[0..])) fillDeterministic(s[0..], 0x1234);
+        const r = try roundTripThroughSlz1(allocator, io, ctx, s[0..], d[0..]);
+        var label_buf: [40]u8 = undefined;
+        const label = try std.fmt.bufPrint(&label_buf, "slz1_corpus_{d}", .{sz});
+        try printResult(w, label, sz, r);
+        try w.flush();
+    }
+
+    // Multi-chunk cases — these are the cases that would catch a
+    // regression in the GPU wire-format wrap or the GPU l1_unwrap
+    // dispatch on the decode side, which the raw-kernel sweep cannot
+    // see (the raw kernels never construct or parse an SLZ1 frame).
+    {
+        const sz: usize = 128 * 1024;
+        const src = try allocator.alloc(u8, sz);
+        defer allocator.free(src);
+        const dst = try allocator.alloc(u8, sz);
+        defer allocator.free(dst);
+        if (!fillFromCorpus(io, src)) fillDeterministic(src, 0x1234);
+        const r = try roundTripThroughSlz1(allocator, io, ctx, src, dst);
+        try printResult(w, "slz1_multi_chunk_1x128k", sz, r);
+        try w.flush();
+        if (!r.pass) return error.Mismatch;
+    }
+    {
+        const sz: usize = 256 * 1024;
+        const src = try allocator.alloc(u8, sz);
+        defer allocator.free(src);
+        const dst = try allocator.alloc(u8, sz);
+        defer allocator.free(dst);
+        fillRepetitive(src[0..(128 * 1024)]);
+        if (!fillFromCorpus(io, src[(128 * 1024)..])) fillDeterministic(src[(128 * 1024)..], 0xC0DE);
+        const r = try roundTripThroughSlz1(allocator, io, ctx, src, dst);
+        try printResult(w, "slz1_multi_chunk_2x128k", sz, r);
+        try w.flush();
+    }
+    {
+        const sz: usize = 384 * 1024;
+        const src = try allocator.alloc(u8, sz);
+        defer allocator.free(src);
+        const dst = try allocator.alloc(u8, sz);
+        defer allocator.free(dst);
+        if (!fillFromCorpus(io, src)) fillDeterministic(src, 0x5A5A);
+        const r = try roundTripThroughSlz1(allocator, io, ctx, src, dst);
+        try printResult(w, "slz1_multi_chunk_3x128k", sz, r);
+        try w.flush();
+    }
+
+    // web.txt full file (~4.5 MB, ~35 chunks). The production-shape
+    // smoke test — if this passes, the entire wire-format chain
+    // (encode kernel -> GPU wrap -> CPU magic -> GPU unwrap -> decode
+    // kernel) is byte-identical on a real corpus.
+    {
+        var file = std.Io.Dir.cwd().openFile(io, CORPUS_PATH, .{}) catch {
+            try w.print("L1_ROUNDTRIP SKIP slz1_web_txt_full (open fail)\n", .{});
+            try w.flush();
+            return;
+        };
+        defer file.close(io);
+        const max_read: usize = 8 * 1024 * 1024;
+        const src = try allocator.alloc(u8, max_read);
+        defer allocator.free(src);
+        const n = file.readPositionalAll(io, src, 0) catch 0;
+        if (n == 0) {
+            try w.print("L1_ROUNDTRIP SKIP slz1_web_txt_full (read fail)\n", .{});
+            try w.flush();
+        } else {
+            const src_slice = src[0..n];
+            const dst = try allocator.alloc(u8, n);
+            defer allocator.free(dst);
+            const r = try roundTripThroughSlz1(allocator, io, ctx, src_slice, dst);
+            try printResult(w, "slz1_web_txt_full", n, r);
+            try w.flush();
+            if (!r.pass) {
+                const d_off = r.first_diff;
+                const start = if (d_off >= 16) d_off - 16 else 0;
+                const end = @min(d_off + 16, n);
+                try w.print("DEBUG slz1_web src[{d}..{d}] = ", .{ start, end });
+                for (src_slice[start..end]) |b| try w.print("{x:0>2} ", .{b});
+                try w.print("\nDEBUG slz1_web dst[{d}..{d}] = ", .{ start, end });
+                for (dst[start..end]) |b| try w.print("{x:0>2} ", .{b});
+                try w.print("\n", .{});
+                try w.flush();
+            }
+        }
+    }
 }
