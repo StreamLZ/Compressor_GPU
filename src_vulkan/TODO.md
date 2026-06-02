@@ -132,17 +132,18 @@ perf work on the encoder host-overhead split.
 
 ### P2. GPU-side frame assembly — **DONE encode-side** (commit `f9af0a6`)
 
-Encode-side wire-format wrap moved to GPU via the L1-specialized port
-of `src/encode/assemble_kernel.cu`. Three new GLSL kernels +
-`src_vulkan/wire_format_gpu.zig` host glue replace the CPU
-`wire_format.wrapL1ToSlz1` path inside `slz1_codec.encodeL1ToSlz1`.
-The CPU path stays as a fallback (toggle `slz1_codec.use_gpu_wrap`).
+Encode-side wire-format wrap is GPU-only. Four GLSL kernels +
+`src_vulkan/wire_format_gpu.zig` host glue. No host CPU fallback —
+`slz1_codec.encodeL1ToSlz1` calls `wire_format_gpu.wrapL1ToSlz1Gpu`
+unconditionally (Cluster B / F004 deleted the toggle + the per-stream
+host-bounce path in commit-after-`f9af0a6`).
 
 | Shader | Purpose |
 |---|---|
 | `assemble_measure.comp` | per-chunk sub-chunk payload sizing |
+| `frame_layout.comp` | GPU prefix-sum over `assemble_measure` output → per-chunk asm/dst offsets + per-frame FrameMeta (total_frame_size, sc_tail_off, end_mark_off, block_payload_size) |
 | `assemble_write.comp` | per-chunk sub-chunk payload write into `asm_out` |
-| `frame_assemble.comp` | frame splice (per-chunk internal+chunk+sub-chunk headers, uncompressed-fallback raw copies, SC tail prefix, end mark) |
+| `frame_assemble.comp` | frame splice (per-chunk internal+chunk+sub-chunk headers, uncompressed-fallback raw copies, SC tail prefix, end mark) + INLINE synthesis of the SLZ1 frame header + block header (no CPU prefix upload) |
 
 L1-specialization: the CUDA kernel handles both raw (type-0) and
 Huffman (type-4) entropy chunks; the Vulkan L1 encoder only emits raw

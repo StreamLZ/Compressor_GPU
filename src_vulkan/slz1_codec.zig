@@ -40,20 +40,12 @@ const vk = @import("vk_api.zig");
 const driver = @import("driver.zig");
 const probe_mod = @import("probe.zig");
 const l1_codec = @import("l1_codec.zig");
-const wire_format = @import("wire_format.zig");
 const wire_format_gpu = @import("wire_format_gpu.zig");
 const decode_pipeline_gpu = @import("decode_pipeline_gpu.zig");
 const descriptors = @import("descriptors.zig");
 const dispatch = @import("dispatch.zig");
 const wire_constants = @import("wire_constants.zig");
 const spv_blobs = @import("spv_blobs");
-
-/// When true (the default), `encodeL1ToSlz1` uses the GPU-side
-/// frame-assembly path (`wire_format_gpu.wrapL1ToSlz1Gpu`); when false
-/// it falls back to the CPU `wire_format.wrapL1ToSlz1`. Exposed at
-/// module scope so tests can A/B compare the two; production callers
-/// should leave it at the default.
-pub var use_gpu_wrap: bool = true;
 
 pub const Slz1Error = error{
     UnsupportedTier,
@@ -67,10 +59,10 @@ pub const Slz1Error = error{
     MapMemoryFailed,
     BadFrame,
     BadLevel,
+    BadHeader,
+    TooManyChunks,
 } ||
     l1_codec.L1Error ||
-    wire_format.WrapError ||
-    wire_format.UnwrapError ||
     descriptors.DescriptorError ||
     dispatch.DispatchError ||
     driver.DriverError;
@@ -116,155 +108,6 @@ fn dupAlignedSpv(allocator: std.mem.Allocator, spv: []const u8) Slz1Error![]alig
 }
 
 // ── Encode path: src → SLZ1 ──────────────────────────────────────────
-
-const StreamBundle = struct {
-    lit_views: [][]const u8,
-    cmd_views: [][]const u8,
-    off16_views: [][]const u8,
-    length_views: [][]const u8,
-    off32_views: [][]const u8,
-    lit_arena: []u8,
-    cmd_arena: []u8,
-    off16_arena: []u8,
-    length_arena: []u8,
-    off32_arena: []u8,
-
-    fn deinit(self: *StreamBundle, allocator: std.mem.Allocator) void {
-        allocator.free(self.lit_arena);
-        allocator.free(self.cmd_arena);
-        allocator.free(self.off16_arena);
-        allocator.free(self.length_arena);
-        allocator.free(self.off32_arena);
-        allocator.free(self.lit_views);
-        allocator.free(self.cmd_views);
-        allocator.free(self.off16_views);
-        allocator.free(self.length_views);
-        allocator.free(self.off32_views);
-    }
-};
-
-fn copyOneStream(
-    ctx: *driver.Context,
-    mem: vk.VkDeviceMemory,
-    out: []u8,
-    chunk_capacity: u32,
-    n_chunks: u32,
-    per_chunk_size: *const [l1_codec.MAX_CHUNKS]u32,
-    is_off16: bool,
-) Slz1Error!void {
-    const map = vk.vkMapMemory_fn orelse return error.MapMemoryFailed;
-    const unmap = vk.vkUnmapMemory_fn orelse return error.MapMemoryFailed;
-    var raw: ?*anyopaque = null;
-    if (map(ctx.dev, mem, 0, vk.VK_WHOLE_SIZE, 0, &raw) != vk.VK_SUCCESS)
-        return error.MapMemoryFailed;
-    defer unmap(ctx.dev, mem);
-    const p: [*]const u8 = @ptrCast(raw.?);
-    var pos: usize = 0;
-    var ci: u32 = 0;
-    while (ci < n_chunks) : (ci += 1) {
-        const chunk_byte_base: usize = @as(usize, ci) * chunk_capacity;
-        const slice_bytes: usize = if (is_off16)
-            @as(usize, per_chunk_size[ci]) * 2
-        else
-            per_chunk_size[ci];
-        @memcpy(out[pos..][0..slice_bytes], p[chunk_byte_base..][0..slice_bytes]);
-        pos += slice_bytes;
-    }
-}
-
-fn copyOff32Stream(
-    ctx: *driver.Context,
-    streams: l1_codec.L1Streams,
-    out: []u8,
-) Slz1Error!void {
-    const map = vk.vkMapMemory_fn orelse return error.MapMemoryFailed;
-    const unmap = vk.vkUnmapMemory_fn orelse return error.MapMemoryFailed;
-    var raw: ?*anyopaque = null;
-    if (map(ctx.dev, streams.off32_mem, 0, vk.VK_WHOLE_SIZE, 0, &raw) != vk.VK_SUCCESS)
-        return error.MapMemoryFailed;
-    defer unmap(ctx.dev, streams.off32_mem);
-    const p: [*]const u8 = @ptrCast(raw.?);
-    var pos: usize = 0;
-    var ci: u32 = 0;
-    while (ci < streams.n_chunks) : (ci += 1) {
-        const chunk_byte_base: usize = @as(usize, ci) * streams.off32_capacity;
-        const slice_bytes: usize = @as(usize, streams.per_chunk_off32_count1[ci] + streams.per_chunk_off32_count2[ci]) * 3;
-        @memcpy(out[pos..][0..slice_bytes], p[chunk_byte_base..][0..slice_bytes]);
-        pos += slice_bytes;
-    }
-}
-
-fn buildStreamBundle(
-    allocator: std.mem.Allocator,
-    ctx: *driver.Context,
-    streams: l1_codec.L1Streams,
-) Slz1Error!StreamBundle {
-    var total_lit: usize = 0;
-    var total_cmd: usize = 0;
-    var total_off16_bytes: usize = 0;
-    var total_length: usize = 0;
-    var total_off32_bytes: usize = 0;
-    {
-        var ci: u32 = 0;
-        while (ci < streams.n_chunks) : (ci += 1) {
-            total_lit += streams.per_chunk_lit_size[ci];
-            total_cmd += streams.per_chunk_cmd_size[ci];
-            total_off16_bytes += @as(usize, streams.per_chunk_off16_count[ci]) * 2;
-            total_length += streams.per_chunk_length_used[ci];
-            total_off32_bytes += @as(usize, streams.per_chunk_off32_count1[ci] + streams.per_chunk_off32_count2[ci]) * 3;
-        }
-    }
-
-    var bundle: StreamBundle = .{
-        .lit_arena = try allocator.alloc(u8, total_lit + 16),
-        .cmd_arena = try allocator.alloc(u8, total_cmd + 16),
-        .off16_arena = try allocator.alloc(u8, total_off16_bytes + 16),
-        .length_arena = try allocator.alloc(u8, total_length + 16),
-        .off32_arena = try allocator.alloc(u8, total_off32_bytes + 16),
-        .lit_views = try allocator.alloc([]const u8, streams.n_chunks),
-        .cmd_views = try allocator.alloc([]const u8, streams.n_chunks),
-        .off16_views = try allocator.alloc([]const u8, streams.n_chunks),
-        .length_views = try allocator.alloc([]const u8, streams.n_chunks),
-        .off32_views = try allocator.alloc([]const u8, streams.n_chunks),
-    };
-    errdefer bundle.deinit(allocator);
-
-    try copyOneStream(ctx, streams.lit_mem, bundle.lit_arena, streams.chunk_capacity,
-        streams.n_chunks, &streams.per_chunk_lit_size, false);
-    try copyOneStream(ctx, streams.cmd_mem, bundle.cmd_arena, streams.chunk_capacity,
-        streams.n_chunks, &streams.per_chunk_cmd_size, false);
-    try copyOneStream(ctx, streams.off16_mem, bundle.off16_arena, streams.chunk_capacity,
-        streams.n_chunks, &streams.per_chunk_off16_count, true);
-    try copyOneStream(ctx, streams.length_mem, bundle.length_arena, streams.chunk_capacity,
-        streams.n_chunks, &streams.per_chunk_length_used, false);
-    try copyOff32Stream(ctx, streams, bundle.off32_arena);
-
-    var lit_pos: usize = 0;
-    var cmd_pos: usize = 0;
-    var off16_pos: usize = 0;
-    var length_pos: usize = 0;
-    var off32_pos: usize = 0;
-    var ci: u32 = 0;
-    while (ci < streams.n_chunks) : (ci += 1) {
-        const ls = streams.per_chunk_lit_size[ci];
-        const cs = streams.per_chunk_cmd_size[ci];
-        const os = @as(usize, streams.per_chunk_off16_count[ci]) * 2;
-        const xs = streams.per_chunk_length_used[ci];
-        const o32 = @as(usize, streams.per_chunk_off32_count1[ci] + streams.per_chunk_off32_count2[ci]) * 3;
-        bundle.lit_views[ci] = bundle.lit_arena[lit_pos..][0..ls];
-        bundle.cmd_views[ci] = bundle.cmd_arena[cmd_pos..][0..cs];
-        bundle.off16_views[ci] = bundle.off16_arena[off16_pos..][0..os];
-        bundle.length_views[ci] = bundle.length_arena[length_pos..][0..xs];
-        bundle.off32_views[ci] = bundle.off32_arena[off32_pos..][0..o32];
-        lit_pos += ls;
-        cmd_pos += cs;
-        off16_pos += os;
-        length_pos += xs;
-        off32_pos += o32;
-    }
-
-    return bundle;
-}
 
 /// Optional knobs for the D2D paths added in Phase 2 (TODO A2).
 /// Both fields default to null — the L1 codec falls through to the
@@ -327,44 +170,18 @@ pub fn encodeL1ToSlz1Ex(
     });
     defer l1_codec.freeStreams(ctx, &enc.streams);
 
-    // GPU wrap path (Phase 3). Default — pipelines the wire-format
-    // wrap behind the same VkQueue the encoder already drives, so the
-    // host never sees the per-chunk LZ streams. Falls back to the CPU
-    // path when `use_gpu_wrap` is toggled off (testing / debugging).
-    if (use_gpu_wrap) {
-        return wire_format_gpu.wrapL1ToSlz1Gpu(ctx, allocator, enc.streams, src, out) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.OutputTooSmall => return error.OutputTooSmall,
-            error.BadHeader => return error.BadHeader,
-            error.UnsupportedTier => return error.UnsupportedTier,
-            error.NoSpvForTier => return error.NoSpvForTier,
-            error.TooManyChunks => return error.OutOfMemory,
-            else => return error.OutOfMemory,
-        };
-    }
-
-    var bundle = try buildStreamBundle(allocator, ctx, enc.streams);
-    defer bundle.deinit(allocator);
-
-    const streams_view: wire_format.PerChunkStreams = .{
-        .lit_bytes = bundle.lit_views,
-        .cmd_bytes = bundle.cmd_views,
-        .off16_bytes = bundle.off16_views,
-        .length_bytes = bundle.length_views,
-        .off32_bytes = bundle.off32_views,
-        .per_chunk_off32_count1 = enc.streams.per_chunk_off32_count1[0..enc.streams.n_chunks],
-        .per_chunk_off32_count2 = enc.streams.per_chunk_off32_count2[0..enc.streams.n_chunks],
-        .per_chunk_cmd_stream2_offset = enc.streams.per_chunk_cmd_stream2_offset[0..enc.streams.n_chunks],
-        .src_bytes = src,
-        .per_chunk_initial_copy = enc.streams.per_chunk_initial_copy[0..enc.streams.n_chunks],
-        .n_chunks = enc.streams.n_chunks,
-        .chunk_size = wire_format.VK_CHUNK_SIZE,
-        .original_size = @intCast(src.len),
+    // GPU wrap is the ONLY path. The per-chunk LZ streams stay device-
+    // resident; the host never sees them. Frame + block headers are
+    // synthesized on-GPU (see wire_format_gpu.zig + shaders/frame_assemble.comp).
+    return wire_format_gpu.wrapL1ToSlz1Gpu(ctx, allocator, enc.streams, src, out) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.OutputTooSmall => return error.OutputTooSmall,
+        error.BadHeader => return error.BadHeader,
+        error.UnsupportedTier => return error.UnsupportedTier,
+        error.NoSpvForTier => return error.NoSpvForTier,
+        error.TooManyChunks => return error.TooManyChunks,
+        else => return error.OutOfMemory,
     };
-
-    const bound = wire_format.wrapBound(streams_view);
-    if (out.len < bound) return error.OutputTooSmall;
-    return try wire_format.wrapL1ToSlz1(streams_view, out);
 }
 
 // ── Decode path: SLZ1 → src ──────────────────────────────────────────
