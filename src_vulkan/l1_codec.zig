@@ -617,6 +617,20 @@ pub fn encodeL1MultiEx(
     }
     errdefer if (!use_src_override) destroyBuffer(ctx, &src_b);
 
+    // F061 guard: every encoded chunk reserves CHUNK_STREAM_CAPACITY
+    // bytes (= 2*CHUNK_SIZE + 16, ~128 KiB at 64 KiB chunks) in each
+    // of 5 output streams. The encoder genuinely needs the worst-case
+    // strided buffer because each chunk_id writes into its slice at
+    // `chunk_id * chunk_capacity` and the actual per-chunk sizes are
+    // a dispatch output. For very large corpora (silesia 200 MB =
+    // 3248 chunks → ~2 GiB per stream, ~10 GiB across all 5) this
+    // can exceed available VRAM. Fail loud rather than letting the
+    // driver return an opaque VK_ERROR_OUT_OF_DEVICE_MEMORY mid-
+    // allocation.
+    if (stream_cap_total > wire_constants.ENCODE_STREAM_VRAM_MAX_BYTES) {
+        return error.MemoryAllocateFailed;
+    }
+
     var lit_b = try createBuffer(ctx, stream_cap_total, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
     errdefer destroyBuffer(ctx, &lit_b);
     var cmd_b = try createBuffer(ctx, stream_cap_total, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
@@ -626,6 +640,9 @@ pub fn encodeL1MultiEx(
     var length_b = try createBuffer(ctx, stream_cap_total, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
     errdefer destroyBuffer(ctx, &length_b);
     const off32_cap_total: vk.VkDeviceSize = @as(vk.VkDeviceSize, n_chunks) * CHUNK_OFF32_CAPACITY;
+    if (off32_cap_total > wire_constants.ENCODE_STREAM_VRAM_MAX_BYTES) {
+        return error.MemoryAllocateFailed;
+    }
     var off32_b = try createBuffer(ctx, off32_cap_total, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
     errdefer destroyBuffer(ctx, &off32_b);
 

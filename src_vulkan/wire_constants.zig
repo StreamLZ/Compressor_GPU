@@ -208,6 +208,20 @@ pub const HASH_BITS: u32 = 17;
 pub const HASH_SIZE_BYTES: u64 = (@as(u64, 1) << HASH_BITS) * @sizeOf(u32); // 512 KiB
 pub const HASH_VRAM_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
 
+// F061 guard: the encoder over-allocates each of its five output
+// streams (lit/cmd/off16/length/off32) at worst-case CHUNK_STREAM_
+// CAPACITY × n_chunks. For silesia (3248 × 64 KiB chunks) this
+// works out to roughly 2 GiB per stream, ~10 GiB across all five.
+// The encoder genuinely needs the worst-case buffer because each
+// chunk writes into its slice at a fixed `chunk_id * chunk_capacity`
+// stride and the per-chunk actual sizes aren't known pre-dispatch.
+//
+// This ceiling caps the per-stream total bytes; if exceeded, encodeL1
+// returns `MemoryAllocateFailed` immediately rather than relying on
+// driver VRAM-exhaustion errors. Caller can split the input into
+// smaller invocations or raise the ceiling at build time.
+pub const ENCODE_STREAM_VRAM_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB per stream
+
 // ── Per-chunk encode stream capacity ────────────────────────────────
 //
 // CHUNK_STREAM_CAPACITY  — over-provisioning for each of lit/cmd/
