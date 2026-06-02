@@ -300,9 +300,12 @@ pub fn build(b: *std.Build) void {
         .name = "vk_l1_test",
         .root_module = vk_l1_test_module,
     });
-    b.installArtifact(vk_l1_test_exe);
+    const vk_l1_test_install = b.addInstallArtifact(vk_l1_test_exe, .{});
     const run_vk_l1_test = b.addRunArtifact(vk_l1_test_exe);
-    run_vk_l1_test.step.dependOn(b.getInstallStep());
+    // Detach from `b.getInstallStep()` so Vulkan-only test runs don't
+    // depend on the CUDA-side streamlz install (and its PTX-freshness
+    // gate). Same pattern as vk-perf-bench.
+    run_vk_l1_test.step.dependOn(&vk_l1_test_install.step);
     run_vk_l1_test.step.dependOn(&vk_shaders_top.step);
     b.step("vk-l1-test", "Run the phase-4 L1 codec round-trip test").dependOn(&run_vk_l1_test.step);
 
@@ -326,9 +329,9 @@ pub fn build(b: *std.Build) void {
         .name = "vk_l1_scale_test",
         .root_module = vk_l1_scale_test_module,
     });
-    b.installArtifact(vk_l1_scale_test_exe);
+    const vk_l1_scale_test_install = b.addInstallArtifact(vk_l1_scale_test_exe, .{});
     const run_vk_l1_scale_test = b.addRunArtifact(vk_l1_scale_test_exe);
-    run_vk_l1_scale_test.step.dependOn(b.getInstallStep());
+    run_vk_l1_scale_test.step.dependOn(&vk_l1_scale_test_install.step);
     run_vk_l1_scale_test.step.dependOn(&vk_shaders_top.step);
     // Surface stdout/stderr live so the per-case PASS/FAIL lines stream
     // out during the run rather than being buffered until exit.

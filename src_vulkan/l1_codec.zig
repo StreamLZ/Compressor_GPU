@@ -321,6 +321,36 @@ fn findMemoryType(
     return null;
 }
 
+/// Find a memory type that is HOST_VISIBLE+HOST_COHERENT and EXPLICITLY
+/// NOT DEVICE_LOCAL. On discrete GPUs with resizable BAR, the rebar
+/// region is reported as both DEVICE_LOCAL and HOST_VISIBLE — and the
+/// CPU reads from it are uncached PCIe BAR reads (very slow). Plain
+/// sysmem (HOST_VISIBLE only) is driver-cached and reads at full memory
+/// bandwidth. Returns null on integrated GPUs where every host-visible
+/// heap is also device-local — callers fall back to the regular
+/// HOST_VISIBLE search.
+fn findHostVisibleNonDeviceLocal(
+    pd: vk.VkPhysicalDevice,
+    type_bits_mask: u32,
+) ?u32 {
+    const get_mem_props = vk.vkGetPhysicalDeviceMemoryProperties_fn orelse return null;
+    var mem_props: vk.VkPhysicalDeviceMemoryProperties = .{};
+    get_mem_props(pd, &mem_props);
+
+    const want = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    var i: u32 = 0;
+    while (i < mem_props.memoryTypeCount) : (i += 1) {
+        const supported = (type_bits_mask & (@as(u32, 1) << @intCast(i))) != 0;
+        if (!supported) continue;
+        const flags = mem_props.memoryTypes[i].propertyFlags;
+        const has_want = (flags & want) == want;
+        const is_device_local = (flags & vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        if (has_want and !is_device_local) return i;
+    }
+    return null;
+}
+
 const Buffer = struct {
     buf: vk.VkBuffer = null,
     mem: vk.VkDeviceMemory = null,
@@ -328,11 +358,43 @@ const Buffer = struct {
     size: vk.VkDeviceSize = 0,
 };
 
+/// Memory-placement hint passed to `createBuffer`. Names describe the
+/// CPU↔GPU access pattern the caller actually wants.
+pub const MemMode = enum {
+    /// Prefer DEVICE_LOCAL+HOST_VISIBLE (rebar/BAR); fall back to plain
+    /// HOST_VISIBLE+HOST_COHERENT (sysmem). Best for buffers the host
+    /// fills once and the GPU reads many times (encoder input streams,
+    /// encoder output streams the host reads in the no-rebar fallback).
+    host_visible_prefer_device_local,
+    /// DEVICE_LOCAL only — no host mapping. Best for buffers the GPU
+    /// writes/reads hot (decoder output, hash table). On discrete GPUs
+    /// this lives in VRAM and gets full bandwidth.
+    device_local_only,
+    /// Plain HOST_VISIBLE+HOST_COHERENT — explicitly NOT DEVICE_LOCAL.
+    /// Best for staging buffers the host reads frequently after the
+    /// GPU writes them (decoder output staging). On a discrete GPU
+    /// with resizable BAR, the "ideal" host-visible+device-local
+    /// region is actually slow to read from the CPU (uncached PCIe
+    /// BAR reads → 20–60 MB/s on RTX 4060 Ti); plain sysmem is
+    /// driver-cached and the CPU reads at full memory bandwidth.
+    host_visible_sysmem,
+};
+
 fn createBuffer(
     ctx: *driver.Context,
     size: vk.VkDeviceSize,
     usage: vk.VkBufferUsageFlags,
     host_visible: bool,
+) L1Error!Buffer {
+    const mode: MemMode = if (host_visible) .host_visible_prefer_device_local else .device_local_only;
+    return createBufferEx(ctx, size, usage, mode);
+}
+
+fn createBufferEx(
+    ctx: *driver.Context,
+    size: vk.VkDeviceSize,
+    usage: vk.VkBufferUsageFlags,
+    mode: MemMode,
 ) L1Error!Buffer {
     ensureBufferFnSlots(ctx);
     const create_buf = vk.vkCreateBuffer_fn orelse return error.BufferCreateFailed;
@@ -354,16 +416,30 @@ fn createBuffer(
     get_req(ctx.dev, buf, &req);
 
     const mt_idx: u32 = blk: {
-        if (host_visible) {
-            const ideal = vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-            const fallback = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-            if (findMemoryType(ctx.pd, req.memoryTypeBits, ideal)) |i| break :blk i;
-            if (findMemoryType(ctx.pd, req.memoryTypeBits, fallback)) |i| break :blk i;
-        } else {
-            if (findMemoryType(ctx.pd, req.memoryTypeBits, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) |i| break :blk i;
+        switch (mode) {
+            .host_visible_prefer_device_local => {
+                const ideal = vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                    vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                const fallback = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                if (findMemoryType(ctx.pd, req.memoryTypeBits, ideal)) |i| break :blk i;
+                if (findMemoryType(ctx.pd, req.memoryTypeBits, fallback)) |i| break :blk i;
+            },
+            .device_local_only => {
+                if (findMemoryType(ctx.pd, req.memoryTypeBits, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) |i| break :blk i;
+            },
+            .host_visible_sysmem => {
+                // Walk memory types and pick the first HOST_VISIBLE+
+                // HOST_COHERENT type that is NOT also DEVICE_LOCAL.
+                // On discrete GPUs that's the sysmem heap; on an iGPU
+                // every host-visible heap is also device-local, so we
+                // fall back to the rebar-style ideal.
+                if (findHostVisibleNonDeviceLocal(ctx.pd, req.memoryTypeBits)) |i| break :blk i;
+                const fallback = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                if (findMemoryType(ctx.pd, req.memoryTypeBits, fallback)) |i| break :blk i;
+            },
         }
         if (vk.vkDestroyBuffer_fn) |d| d(ctx.dev, buf, null);
         return error.MemoryTypeNotFound;
@@ -385,7 +461,8 @@ fn createBuffer(
     }
 
     var mapped: ?[*]u8 = null;
-    if (host_visible) {
+    const wants_mapping = (mode != .device_local_only);
+    if (wants_mapping) {
         const map = vk.vkMapMemory_fn orelse {
             if (vk.vkFreeMemory_fn) |f| f(ctx.dev, mem, null);
             if (vk.vkDestroyBuffer_fn) |d| d(ctx.dev, buf, null);
@@ -731,20 +808,54 @@ pub fn decodeL1Sync(
     // Each chunk's slice is at byte offset `chunk_id * CHUNK_SIZE` and is
     // sized by the per-chunk dst_size descriptor entry.
     const dst_buf_size: vk.VkDeviceSize = @max(@as(vk.VkDeviceSize, 4), (@as(vk.VkDeviceSize, dst_size) + 3) & ~@as(vk.VkDeviceSize, 3));
+    // Discrete-GPU readback pattern (TODO P1 fix):
+    //   dst_b      = DEVICE_LOCAL-only — the kernel writes here at full
+    //                VRAM bandwidth instead of through PCIe BAR.
+    //   dst_stage  = HOST_VISIBLE | HOST_COHERENT (no DEVICE_LOCAL
+    //                preference) — lives in driver-cached sysmem, so
+    //                CPU readback is plain cached-memory bandwidth
+    //                (10+ GB/s) rather than uncached PCIe BAR reads
+    //                (20–60 MB/s observed on RTX 4060 Ti before the
+    //                fix, see commit before this one).
+    // The kernel writes Dst, then a vkCmdCopyBuffer in the SAME cmdbuf
+    // stages it into dst_stage; the host @memcpy at the end then reads
+    // from dst_stage at cached-memory speed. On Intel iGPU the same
+    // pattern is a tiny regression (one extra GPU copy at iGPU memory
+    // bandwidth) because shared memory makes the discrete-GPU asymmetry
+    // a non-issue — but the regression is in the 10s of µs and
+    // dwarfed by the wins everywhere else.
     const t_alloc0 = qpcNow();
-    var dst_b = try createBuffer(
+    var dst_b = try createBufferEx(
         ctx,
         dst_buf_size,
         vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        true,
+        .device_local_only,
     );
     defer destroyBuffer(ctx, &dst_b);
+    // Staging buffer for readback — explicitly pinned to HOST_VISIBLE+
+    // sysmem (NOT DEVICE_LOCAL). On NVIDIA RTX 4060 Ti the rebar region
+    // is reported as HOST_VISIBLE+DEVICE_LOCAL, but CPU reads from it
+    // are uncached PCIe BAR reads (~20-60 MB/s, measured pre-fix).
+    // Sysmem-backed HOST_VISIBLE is driver-cached and reads at full
+    // memory bandwidth (4-10 GB/s). On Intel iGPU every host-visible
+    // heap IS device-local (shared memory), so the .sysmem mode falls
+    // back to the rebar-style ideal — identical behavior on iGPU,
+    // dramatic win on discrete.
+    var dst_stage = try createBufferEx(
+        ctx,
+        dst_buf_size,
+        vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .host_visible_sysmem,
+    );
+    defer destroyBuffer(ctx, &dst_stage);
     const t_alloc1 = qpcNow();
     last_decode_dst_alloc_ns = qpcNs(t_alloc0, t_alloc1);
-    const t_memset0 = qpcNow();
-    @memset(dst_b.mapped.?[0..@intCast(dst_b.size)], 0);
-    const t_memset1 = qpcNow();
-    last_decode_dst_memset_ns = qpcNs(t_memset0, t_memset1);
+    // No @memset needed — the shader writes every output byte that
+    // the host will read. The 1–3 trailing bytes between dst_size and
+    // dst_buf_size (the round-up-to-4 padding) may contain garbage,
+    // but those bytes are not in [0..dst_size) and the @memcpy below
+    // only reads dst_size bytes.
+    last_decode_dst_memset_ns = 0;
 
     // ChunkDescs: 16 u32 per chunk. See lz_decode.comp head comment for
     // the slot layout (slots 12..14 plumb off32 counts + the cmd-stream
@@ -846,23 +957,30 @@ pub fn decodeL1Sync(
     @memcpy(dec_push_bytes[0..], std.mem.asBytes(&dec_push));
 
     const t_disp0 = qpcNow();
-    const dec_dispatch_result = try dispatch.submitOne(
+    const dec_dispatch_result = try dispatch.submitOneWithCopy(
         ctx,
         cached_dec.pipeline,
         cached_dec.pipeline_layout,
         dec_set,
         dec_push_bytes[0..],
         .{ n_chunks, 1, 1 },
+        .{
+            .src = dst_b.buf,
+            .dst = dst_stage.buf,
+            .size = @as(vk.VkDeviceSize, dst_size),
+        },
     );
     const t_disp1 = qpcNow();
     last_decode_dispatch_ns = dec_dispatch_result.ns;
     last_decode_dispatch_wall_ns = qpcNs(t_disp0, t_disp1);
 
-    // Copy dst out via the host map.
+    // Copy dst out via the host map. Reads from the host-visible
+    // staging buffer (which the GPU just filled via vkCmdCopyBuffer),
+    // not from BAR-mapped device memory.
     const t_read0 = qpcNow();
     if (dst_size > 0) {
-        const dst_mapped = dst_b.mapped orelse return error.MapMemoryFailed;
-        @memcpy(dst_host[0..dst_size], dst_mapped[0..dst_size]);
+        const stage_mapped = dst_stage.mapped orelse return error.MapMemoryFailed;
+        @memcpy(dst_host[0..dst_size], stage_mapped[0..dst_size]);
     }
     const t_read1 = qpcNow();
     last_decode_readback_ns = qpcNs(t_read0, t_read1);

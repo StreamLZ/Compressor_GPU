@@ -620,6 +620,7 @@ pub const VK_QUERY_RESULT_WAIT_BIT: VkQueryResultFlags = 0x2;
 pub const VkPipelineStageFlags = u32;
 pub const VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: VkPipelineStageFlags = 0x1;
 pub const VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT: VkPipelineStageFlags = 0x800;
+pub const VK_PIPELINE_STAGE_TRANSFER_BIT: VkPipelineStageFlags = 0x1000;
 pub const VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: VkPipelineStageFlags = 0x2000;
 
 pub const VkPipelineBindPoint = c_int;

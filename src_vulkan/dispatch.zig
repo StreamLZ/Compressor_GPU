@@ -135,6 +135,14 @@ fn ensureFnSlots(dev: vk.VkDevice) DispatchError!void {
         vk.vkCmdWriteTimestamp_fn = resolveDeviceFn(vk.FnCmdWriteTimestamp, dev, "vkCmdWriteTimestamp");
     if (vk.vkGetQueryPoolResults_fn == null)
         vk.vkGetQueryPoolResults_fn = resolveDeviceFn(vk.FnGetQueryPoolResults, dev, "vkGetQueryPoolResults");
+    // The discrete-GPU readback path uses a vkCmdCopyBuffer at the tail
+    // of the decode cmdbuf, plus a vkCmdPipelineBarrier for the
+    // compute-write → transfer-read sync. Both are core Vulkan 1.0 fns;
+    // resolve here so submitOneWithCopy doesn't need a sibling ensure.
+    if (vk.vkCmdCopyBuffer_fn == null)
+        vk.vkCmdCopyBuffer_fn = resolveDeviceFn(vk.FnCmdCopyBuffer, dev, "vkCmdCopyBuffer");
+    if (vk.vkCmdPipelineBarrier_fn == null)
+        vk.vkCmdPipelineBarrier_fn = resolveDeviceFn(vk.FnCmdPipelineBarrier, dev, "vkCmdPipelineBarrier");
 }
 
 /// Lazy-create the chassis state on `ctx` if not already present. Safe
@@ -425,6 +433,188 @@ pub fn submitOne(
     const period = if (ctx.timestamp_period_ns > 0.0) ctx.timestamp_period_ns else 1.0;
     // u64 → f64 → u64 round-trip; one tick at 1ns precision is plenty
     // for the µs-scale dispatches M8a will report.
+    const ns_f: f64 = @as(f64, @floatFromInt(delta_ticks)) * @as(f64, period);
+    const ns: u64 = if (ns_f <= 0.0) 0 else @intFromFloat(ns_f);
+
+    return .{ .ns = ns };
+}
+
+/// One follow-on buffer copy queued after the dispatch in the SAME
+/// command buffer. Used by the decoder's discrete-GPU readback path:
+/// the kernel writes into a DEVICE_LOCAL-only Dst buffer and this copy
+/// stages it into a HOST_VISIBLE buffer for fast CPU readback. Keeping
+/// dispatch + copy in one cmdbuf avoids a second submit/wait round-trip
+/// — the implicit pipeline barrier between the compute write and the
+/// transfer read is provided via the explicit vkCmdPipelineBarrier
+/// call below.
+pub const CopyOp = struct {
+    src: vk.VkBuffer,
+    dst: vk.VkBuffer,
+    size: vk.VkDeviceSize,
+    src_offset: vk.VkDeviceSize = 0,
+    dst_offset: vk.VkDeviceSize = 0,
+};
+
+/// Same as `submitOne` but also records a vkCmdCopyBuffer after the
+/// dispatch (with a SHADER_WRITE → TRANSFER_READ barrier so the copy
+/// sees the kernel's writes). All other behavior is identical to
+/// submitOne: TOP_OF_PIPE timestamp BEFORE the dispatch, BOTTOM_OF_PIPE
+/// AFTER the dispatch (the copy is NOT counted in the returned ns, so
+/// the caller can still attribute kernel time vs. copy time). Used by
+/// the L1 decoder; encoder doesn't need it because its readback stream
+/// buffers stay host-visible.
+pub fn submitOneWithCopy(
+    ctx: *driver_mod.Context,
+    pipeline: vk.VkPipeline,
+    pipeline_layout: vk.VkPipelineLayout,
+    descriptor_set: vk.VkDescriptorSet,
+    push_constants_bytes: []const u8,
+    group_count: [3]u32,
+    copy: CopyOp,
+) DispatchError!DispatchResult {
+    if (!ctx.initialized or ctx.dev == null or ctx.queue == null) {
+        return error.LoaderNotReady;
+    }
+    try ensureChassis(ctx);
+
+    const reset_cb = vk.vkResetCommandBuffer_fn orelse return error.LoaderNotReady;
+    const begin_cb = vk.vkBeginCommandBuffer_fn orelse return error.LoaderNotReady;
+    const end_cb = vk.vkEndCommandBuffer_fn orelse return error.LoaderNotReady;
+    const cmd_reset_qp = vk.vkCmdResetQueryPool_fn orelse return error.LoaderNotReady;
+    const cmd_write_ts = vk.vkCmdWriteTimestamp_fn orelse return error.LoaderNotReady;
+    const cmd_bind_pl = vk.vkCmdBindPipeline_fn orelse return error.LoaderNotReady;
+    const cmd_dispatch = vk.vkCmdDispatch_fn orelse return error.LoaderNotReady;
+    const cmd_copy = vk.vkCmdCopyBuffer_fn orelse return error.LoaderNotReady;
+    const cmd_barrier = vk.vkCmdPipelineBarrier_fn orelse return error.LoaderNotReady;
+    const reset_fence = vk.vkResetFences_fn orelse return error.LoaderNotReady;
+    const submit = vk.vkQueueSubmit_fn orelse return error.LoaderNotReady;
+    const wait_fence = vk.vkWaitForFences_fn orelse return error.LoaderNotReady;
+    const get_results = vk.vkGetQueryPoolResults_fn orelse return error.LoaderNotReady;
+
+    if (reset_cb(ctx.cmd_buf, 0) != vk.VK_SUCCESS) return error.ResetCommandBufferFailed;
+
+    const begin_info: vk.VkCommandBufferBeginInfo = .{
+        .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (begin_cb(ctx.cmd_buf, &begin_info) != vk.VK_SUCCESS) {
+        return error.BeginCommandBufferFailed;
+    }
+
+    cmd_reset_qp(ctx.cmd_buf, ctx.query_pool, 0, TS_SLOT_COUNT);
+    cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, TS_SLOT_BEGIN);
+
+    cmd_bind_pl(ctx.cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+
+    if (descriptor_set != null and pipeline_layout != null) {
+        const cmd_bind_ds = vk.vkCmdBindDescriptorSets_fn orelse return error.LoaderNotReady;
+        const sets: [1]vk.VkDescriptorSet = .{descriptor_set};
+        cmd_bind_ds(
+            ctx.cmd_buf,
+            vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout,
+            0,
+            1,
+            @ptrCast(&sets),
+            0,
+            null,
+        );
+    }
+
+    if (push_constants_bytes.len > 0) {
+        const cmd_push = vk.vkCmdPushConstants_fn orelse return error.LoaderNotReady;
+        if (pipeline_layout == null) return error.LoaderNotReady;
+        cmd_push(
+            ctx.cmd_buf,
+            pipeline_layout,
+            vk.VK_SHADER_STAGE_COMPUTE_BIT,
+            0,
+            @intCast(push_constants_bytes.len),
+            @ptrCast(push_constants_bytes.ptr),
+        );
+    }
+
+    cmd_dispatch(ctx.cmd_buf, group_count[0], group_count[1], group_count[2]);
+
+    // BOTTOM_OF_PIPE timestamp captures pure kernel time — the copy
+    // below stays OUTSIDE the timing window. Kernel ns + copy wall ns
+    // are reported as two distinct numbers in the bench.
+    cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, TS_SLOT_END);
+
+    // Buffer barrier: SHADER_WRITE in the compute stage must complete
+    // and be visible to the upcoming TRANSFER_READ from the transfer
+    // stage on the src buffer. dst buffer doesn't need a barrier here
+    // because it has no prior GPU writes (host writes were flushed by
+    // vkQueueSubmit's implicit host→queue domain transition).
+    const bbarrier: vk.VkBufferMemoryBarrier = .{
+        .srcAccessMask = vk.VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = vk.VK_ACCESS_TRANSFER_READ_BIT,
+        .srcQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
+        .buffer = copy.src,
+        .offset = copy.src_offset,
+        .size = copy.size,
+    };
+    const bbarriers: [1]vk.VkBufferMemoryBarrier = .{bbarrier};
+    cmd_barrier(
+        ctx.cmd_buf,
+        vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,
+        0,
+        null,
+        1,
+        @ptrCast(&bbarriers),
+        0,
+        null,
+    );
+
+    const region: vk.VkBufferCopy = .{
+        .srcOffset = copy.src_offset,
+        .dstOffset = copy.dst_offset,
+        .size = copy.size,
+    };
+    const regions: [1]vk.VkBufferCopy = .{region};
+    cmd_copy(ctx.cmd_buf, copy.src, copy.dst, 1, @ptrCast(&regions));
+
+    if (end_cb(ctx.cmd_buf) != vk.VK_SUCCESS) return error.EndCommandBufferFailed;
+
+    const fences: [1]vk.VkFence = .{ctx.fence};
+    if (reset_fence(ctx.dev, 1, @ptrCast(&fences)) != vk.VK_SUCCESS) {
+        return error.ResetFenceFailed;
+    }
+
+    const cmd_bufs: [1]vk.VkCommandBuffer = .{ctx.cmd_buf};
+    const submit_info: vk.VkSubmitInfo = .{
+        .commandBufferCount = 1,
+        .pCommandBuffers = @ptrCast(&cmd_bufs),
+    };
+    const submits: [1]vk.VkSubmitInfo = .{submit_info};
+    if (submit(ctx.queue, 1, @ptrCast(&submits), ctx.fence) != vk.VK_SUCCESS) {
+        return error.SubmitFailed;
+    }
+
+    const wait_result = wait_fence(ctx.dev, 1, @ptrCast(&fences), vk.VK_TRUE, vk.VK_M8A_FENCE_WAIT_NS);
+    if (wait_result == vk.VK_TIMEOUT) return error.FenceWaitTimeout;
+    if (wait_result != vk.VK_SUCCESS) return error.FenceWaitFailed;
+
+    var ts: [TS_SLOT_COUNT]u64 = .{ 0, 0 };
+    const result = get_results(
+        ctx.dev,
+        ctx.query_pool,
+        0,
+        TS_SLOT_COUNT,
+        @sizeOf(@TypeOf(ts)),
+        @ptrCast(&ts),
+        @sizeOf(u64),
+        vk.VK_QUERY_RESULT_64_BIT | vk.VK_QUERY_RESULT_WAIT_BIT,
+    );
+    if (result != vk.VK_SUCCESS) return error.QueryReadFailed;
+
+    const delta_ticks: u64 = if (ts[TS_SLOT_END] >= ts[TS_SLOT_BEGIN])
+        ts[TS_SLOT_END] - ts[TS_SLOT_BEGIN]
+    else
+        0;
+    const period = if (ctx.timestamp_period_ns > 0.0) ctx.timestamp_period_ns else 1.0;
     const ns_f: f64 = @as(f64, @floatFromInt(delta_ticks)) * @as(f64, period);
     const ns: u64 = if (ns_f <= 0.0) 0 else @intFromFloat(ns_f);
 
