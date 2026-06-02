@@ -722,6 +722,13 @@ fn addVulkanShaderSteps(b: *std.Build) VulkanShaders {
             cmd.addArg("-fshader-stage=compute");
             cmd.addArg("-O");
             cmd.addArg(b.fmt("--target-env={s}", .{variant.target_env}));
+            // Include path for the decode-pipeline shared header
+            // (`decode_pipeline_shared.glsl`). Kernels that `#include
+            // "decode_pipeline_shared.glsl"` resolve the path relative
+            // to this directory. The argument has to be in
+            // single-token form for glslc (no space between `-I` and
+            // the path), so we build it before addArg.
+            cmd.addArg(b.fmt("-I{s}", .{b.pathFromRoot("src_vulkan/shaders")}));
             for (variant.defines) |def| cmd.addArg(def);
             cmd.addArg("-o");
             const spv_lp = cmd.addOutputFileArg(out_name);
