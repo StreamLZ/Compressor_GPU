@@ -1231,13 +1231,25 @@ pub fn decodeL1Sync(
     @memcpy(dec_push_bytes[0..], std.mem.asBytes(&dec_push));
 
     const t_disp0 = qpcNow();
+    // Mirror CUDA src/decode/decode_dispatch.zig:400-401
+    //   lz_groups = (total_chunks + chunks_per_group - 1) / chunks_per_group;
+    //   lz_grid_x = (lz_groups + 1) / 2;            // = ceil(lz_groups / WARPS_PER_BLOCK)
+    // and src/decode/decode_dispatch.zig:430/451 which launches the kernel
+    // with `block(32, 2, 1)` = WARPS_PER_BLOCK = 2 warps per block.
+    //
+    // Each `n_chunks` here is one 64 KiB CHUNK_SIZE unit (src_vulkan/
+    // l1_codec.zig:101 + computeNChunks), the same shape walk_frame
+    // produces from sc_group_size = 0.25. lz_decode.comp dispatches
+    // 2 chunks per workgroup via gl_SubgroupID indexing.
+    const WARPS_PER_BLOCK: u32 = 2;
+    const lz_grid_x: u32 = (n_chunks + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
     const dec_dispatch_result = try dispatch.submitOneWithCopy(
         ctx,
         cached_dec.pipeline,
         cached_dec.pipeline_layout,
         dec_set,
         dec_push_bytes[0..],
-        .{ n_chunks, 1, 1 },
+        .{ lz_grid_x, 1, 1 },
         .{
             .src = dst_b.buf,
             .dst = dst_stage.buf,

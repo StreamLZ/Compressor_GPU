@@ -14,8 +14,13 @@
 //   * initial_copy = 0, dst_offset = 0 (encoder also skips the initial
 //     8-byte verbatim copy in phase 1; recent_offset still seeded to
 //     INITIAL_RECENT_OFFSET = -8 to match CUDA).
-//   * Workgroup-per-chunk: gl_WorkGroupID.x identifies the chunk; each
-//     chunk has its own src/dst slices given by ChunkDescs.
+//   * Subgroup-per-chunk: each workgroup runs WARPS_PER_BLOCK = 2 subgroups
+//     (mirror CUDA `block(32, 2, 1)` from src/decode/decode_dispatch.zig:430/451
+//     and `WARPS_PER_BLOCK = 2` in src/decode/slz_wire_format.cuh:100). The
+//     subgroup index is `chunk_id = gl_WorkGroupID.x * 2 + gl_SubgroupID`,
+//     mirroring CUDA src/decode/lz_decode_kernels.cuh:47
+//     `group_id = blockIdx.x * WARPS_PER_BLOCK + warp_id`. Each chunk has
+//     its own src/dst slices given by ChunkDescs.
 //
 // Buffer layout matches the encoder's u32-packed scheme (avoids the
 // shaderInt8 / storageBuffer8BitAccess feature dependency and keeps the
@@ -57,9 +62,14 @@
 // (pos & 3u) shift, so the bases need NOT be 4-aligned.
 //
 // Push constants (4 bytes):
-//   uint n_chunks       : number of chunks (== gl_NumWorkGroups.x)
+//   uint n_chunks       : number of chunks (each subgroup self-gates against
+//                          this; the host computes
+//                          `grid_x = (n_chunks + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK`,
+//                          mirroring src/decode/decode_dispatch.zig:400-401).
 //
 // Subgroup size: hard-required = 32 (enforced by host pipeline creation).
+// Workgroup: local_size_x = 64 = WARPS_PER_BLOCK (=2) * subgroupSize (=32),
+// matching CUDA `block(32, 2, 1)` in src/decode/decode_dispatch.zig:430/451.
 //
 // PHASE-4 PERF OPT (Intel iGPU silesia_all.tar): per-iteration decode
 // state (cmd_pos / lit_pos / dst_pos / off16_pos / recent_offset /
@@ -102,7 +112,12 @@
 // CHUNK_DESC_U32_COUNT, etc.) — the binding-7 walk_chunks layout.
 #include "decode_pipeline_shared.glsl"
 
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+// WARPS_PER_BLOCK = 2 (mirror src/decode/slz_wire_format.cuh:100). One
+// workgroup = LZ_KERNEL_BLOCK_THREADS = 64 threads = 2 subgroups of 32
+// (mirror src/decode/slz_wire_format.cuh:101 and the CUDA launch in
+// src/decode/decode_dispatch.zig:430/451 which uses `block(32, 2, 1)`).
+const uint WARPS_PER_BLOCK = 2u;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 // Cmd / Lit / Off16 / Length stay u32-packed (the encoder writes those
 // streams that way; switching them too would require encoder-side changes
@@ -144,35 +159,39 @@ layout(push_constant) uniform PC {
     uint n_chunks;
 } pc;
 
-// Per-chunk constants (loaded once by lane 0 at chunk entry, broadcast
-// via a workgroup barrier). These never change during the decode loop,
-// so the SLM cost is paid exactly once per chunk.
-shared uint g_cmd_size;
-shared uint g_lit_size;
-shared uint g_off16_count;
-shared uint g_length_remaining;
-shared uint g_dst_size;
-shared uint g_initial_copy;
-shared uint g_off32_count1;        // off32 entries for LZ block 0
-shared uint g_off32_count2;        // off32 entries for LZ block 1
-shared uint g_cmd_stream2_offset;  // boundary token index between blocks 0 / 1
-                                   // (0 means "no block-2 boundary", i.e.
-                                   // chunk fits in one 64 KiB LZ block).
+// Per-chunk constants. CUDA keeps these as per-warp registers (see
+// src/decode/lz_decode_kernels.cuh:56-92 + lz_decode_raw.cuh:25-39). In
+// GLSL with WARPS_PER_BLOCK = 2 subgroups sharing one workgroup, each
+// subgroup processes a DIFFERENT chunk, so each `g_*` needs its own
+// slot per subgroup. We index every read/write by `gl_SubgroupID`
+// (∈ [0, WARPS_PER_BLOCK)). Lane 0 of each subgroup loads + writes its
+// slot; the helpers below read it on every lane after a subgroupBarrier.
+shared uint g_cmd_size[WARPS_PER_BLOCK];
+shared uint g_lit_size[WARPS_PER_BLOCK];
+shared uint g_off16_count[WARPS_PER_BLOCK];
+shared uint g_length_remaining[WARPS_PER_BLOCK];
+shared uint g_dst_size[WARPS_PER_BLOCK];
+shared uint g_initial_copy[WARPS_PER_BLOCK];
+shared uint g_off32_count1[WARPS_PER_BLOCK];        // off32 entries for LZ block 0
+shared uint g_off32_count2[WARPS_PER_BLOCK];        // off32 entries for LZ block 1
+shared uint g_cmd_stream2_offset[WARPS_PER_BLOCK];  // boundary token index between blocks 0 / 1
+                                                    // (0 means "no block-2 boundary", i.e.
+                                                    // chunk fits in one 64 KiB LZ block).
 
 // Per-chunk byte/word bases into the wide global streams.
-shared uint g_cmd_byte_base;
-shared uint g_lit_byte_base;
-shared uint g_off16_byte_base;
-shared uint g_length_byte_base;
-shared uint g_dst_byte_base;
-shared uint g_off32_byte_base;     // base byte address into off32_buf for this chunk
-shared uint g_init_byte_base;      // base byte address into lit_buf for the
-                                   // initial-copy prefix (chunk 0 only — when
-                                   // initial_copy != 0 the decoder reads
-                                   // `initial_copy` bytes from this position
-                                   // before any token processing; for all
-                                   // other chunks `initial_copy == 0` so the
-                                   // value is unread).
+shared uint g_cmd_byte_base[WARPS_PER_BLOCK];
+shared uint g_lit_byte_base[WARPS_PER_BLOCK];
+shared uint g_off16_byte_base[WARPS_PER_BLOCK];
+shared uint g_length_byte_base[WARPS_PER_BLOCK];
+shared uint g_dst_byte_base[WARPS_PER_BLOCK];
+shared uint g_off32_byte_base[WARPS_PER_BLOCK];     // base byte address into off32_buf for this chunk
+shared uint g_init_byte_base[WARPS_PER_BLOCK];      // base byte address into lit_buf for the
+                                                    // initial-copy prefix (chunk 0 only — when
+                                                    // initial_copy != 0 the decoder reads
+                                                    // `initial_copy` bytes from this position
+                                                    // before any token processing; for all
+                                                    // other chunks `initial_copy == 0` so the
+                                                    // value is unread).
 
 // ── Constants (mirror src/decode/slz_wire_format.cuh) ───────────────
 // LZ_BLOCK_SIZE, INITIAL_RECENT_OFFSET, OFF16_ENTRY_BYTES, OFF32_ENTRY_
@@ -210,13 +229,13 @@ const uint EXT_LENGTH_SCALE         = 4u;
 // chunks never share a u32 word. Bases are byte-aligned to 4 host-side
 // (chunk_capacity is a multiple of 4) so the (pos & 3) shift is correct.
 uint loadCmdByte(uint pos) {
-    uint gpos = g_cmd_byte_base + pos;
+    uint gpos = g_cmd_byte_base[gl_SubgroupID] + pos;
     uint w = cmd_buf.w[gpos >> 2];
     return (w >> ((gpos & 3u) * 8u)) & 0xFFu;
 }
 
 uint loadLitByte(uint pos) {
-    uint gpos = g_lit_byte_base + pos;
+    uint gpos = g_lit_byte_base[gl_SubgroupID] + pos;
     uint w = lit_buf.w[gpos >> 2];
     return (w >> ((gpos & 3u) * 8u)) & 0xFFu;
 }
@@ -232,19 +251,19 @@ uint loadLitByte(uint pos) {
 // initial_copy` and the two readers land on the right bytes either
 // way. Only called when `g_initial_copy != 0` (chunk 0 only).
 uint loadInitByte(uint pos) {
-    uint gpos = g_init_byte_base + pos;
+    uint gpos = g_init_byte_base[gl_SubgroupID] + pos;
     uint w = lit_buf.w[gpos >> 2];
     return (w >> ((gpos & 3u) * 8u)) & 0xFFu;
 }
 
 uint loadOff16Byte(uint pos) {
-    uint gpos = g_off16_byte_base + pos;
+    uint gpos = g_off16_byte_base[gl_SubgroupID] + pos;
     uint w = off16_buf.w[gpos >> 2];
     return (w >> ((gpos & 3u) * 8u)) & 0xFFu;
 }
 
 uint loadLengthByte(uint pos) {
-    uint gpos = g_length_byte_base + pos;
+    uint gpos = g_length_byte_base[gl_SubgroupID] + pos;
     uint w = length_buf.w[gpos >> 2];
     return (w >> ((gpos & 3u) * 8u)) & 0xFFu;
 }
@@ -256,7 +275,7 @@ uint loadOff16Entry(uint entry_idx) {
 }
 
 uint loadOff32Byte(uint pos) {
-    uint gpos = g_off32_byte_base + pos;
+    uint gpos = g_off32_byte_base[gl_SubgroupID] + pos;
     uint w = off32_buf.w[gpos >> 2];
     return (w >> ((gpos & 3u) * 8u)) & 0xFFu;
 }
@@ -319,11 +338,11 @@ uvec2 loadOff32EntryFull(uint byte_pos) {
 // later token's match-copy read in the same lane sees the prior token's
 // stores without the prior read-modify-write race.
 uint loadDstByte(uint pos) {
-    return uint(dst_buf.b[g_dst_byte_base + pos]);
+    return uint(dst_buf.b[g_dst_byte_base[gl_SubgroupID] + pos]);
 }
 
 void storeDstByte(uint pos, uint b) {
-    dst_buf.b[g_dst_byte_base + pos] = uint8_t(b & 0xFFu);
+    dst_buf.b[g_dst_byte_base[gl_SubgroupID] + pos] = uint8_t(b & 0xFFu);
 }
 
 // ── readLength (per-lane, lane-0 drives) ────────────────────────────
@@ -476,9 +495,31 @@ void warpMatchCopy(uint dst_pos, uint match_src, uint match_len) {
 // ── main ────────────────────────────────────────────────────────────
 void main() {
     uint lane = gl_SubgroupInvocationID;
-    uint chunk_id = gl_WorkGroupID.x;
+    // Mirror CUDA src/decode/lz_decode_kernels.cuh:47 / :170
+    //   group_id = blockIdx.x * WARPS_PER_BLOCK + warp_id
+    // where warp_id = threadIdx.y. In GLSL with local_size_x = 64 and the
+    // host pinning subgroupSize = 32, gl_NumSubgroups = 2 and
+    // gl_SubgroupID ∈ {0, 1} plays the role of threadIdx.y.
+    uint sg_id = gl_SubgroupID;
+    uint chunk_id = gl_WorkGroupID.x * WARPS_PER_BLOCK + sg_id;
 
-    // Load this workgroup's chunk descriptor (16 u32 stride per chunk).
+    // Self-gate: mirror CUDA src/decode/lz_decode_kernels.cuh:49 / :172
+    //   if (group_id >= (total_chunks + chunks_per_group - 1) / chunks_per_group)
+    //     return;
+    // At the wire-format equivalent of `chunks_per_group = 1` (each
+    // walk_frame descriptor is already a single 64 KiB sub-chunk under
+    // sc_group_size = 0.25, see src_vulkan/wire_constants.zig:42 + the
+    // host-side dispatch grid in src_vulkan/slz1_codec.zig /
+    // src_vulkan/decode_pipeline_gpu.zig), this collapses to:
+    //   if (chunk_id >= n_chunks) return;
+    if (chunk_id >= pc.n_chunks) return;
+
+    // Load this subgroup's chunk descriptor (16 u32 stride per chunk).
+    // Lane 0 of each subgroup writes its g_*[sg_id] slot; the subsequent
+    // subgroupBarrier makes the writes visible to the other 31 lanes of
+    // the same subgroup. Lane 0 of subgroup 1 does the same for its own
+    // slot independently — the two subgroups process different chunks
+    // and never touch each other's slots.
     if (lane == 0u) {
         uint base = chunk_id * 16u;
         // Cluster A (F001): FRAME-level fields (dst_offset, decomp_size)
@@ -489,31 +530,31 @@ void main() {
         // truth populated either by walk_frame.comp (SLZ1 frame path)
         // or by a host-mirrored writer (l1_codec.decodeL1Sync path).
         uint wbase = chunk_id * CHUNK_DESC_U32_COUNT;
-        g_dst_byte_base     = walk_chunks_buf.d[wbase + CHUNK_DST_OFFSET_SLOT];
-        g_dst_size          = walk_chunks_buf.d[wbase + CHUNK_DECOMP_SIZE_SLOT];
+        g_dst_byte_base[sg_id]     = walk_chunks_buf.d[wbase + CHUNK_DST_OFFSET_SLOT];
+        g_dst_size[sg_id]          = walk_chunks_buf.d[wbase + CHUNK_DECOMP_SIZE_SLOT];
         // cmd / lit / off16 / length descs are BYTE bases. (Pre-port
         // these were u32-word bases × 4 to byte address; the new GPU
         // L1-unwrap kernel writes byte offsets into the compressed
         // frame directly so the *4 was dropped on both encode-roundtrip
         // and SLZ1-unwrap paths.)
-        g_cmd_byte_base     = chunks_buf.d[base + 2u];
-        g_cmd_size          = chunks_buf.d[base + 3u];
-        g_lit_byte_base     = chunks_buf.d[base + 4u];
-        g_lit_size          = chunks_buf.d[base + 5u];
-        g_off16_byte_base   = chunks_buf.d[base + 6u];
-        g_off16_count       = chunks_buf.d[base + 7u];
-        g_length_byte_base  = chunks_buf.d[base + 8u];
-        g_length_remaining  = chunks_buf.d[base + 9u];
+        g_cmd_byte_base[sg_id]     = chunks_buf.d[base + 2u];
+        g_cmd_size[sg_id]          = chunks_buf.d[base + 3u];
+        g_lit_byte_base[sg_id]     = chunks_buf.d[base + 4u];
+        g_lit_size[sg_id]          = chunks_buf.d[base + 5u];
+        g_off16_byte_base[sg_id]   = chunks_buf.d[base + 6u];
+        g_off16_count[sg_id]       = chunks_buf.d[base + 7u];
+        g_length_byte_base[sg_id]  = chunks_buf.d[base + 8u];
+        g_length_remaining[sg_id]  = chunks_buf.d[base + 9u];
         // Slot 10 = initial_copy bytes (0 or 8). For chunk 0 (is_first)
         // the encoder skips the first 8 source bytes in its token stream
         // and writes them as the first 8 literals of lit_buf; the
         // decoder reproduces those 8 bytes directly to dst[0..8] before
         // the token loop runs.
-        g_initial_copy      = chunks_buf.d[base + 10u];
+        g_initial_copy[sg_id]      = chunks_buf.d[base + 10u];
         // Slot 11 = BYTE base of this chunk's off32 stream slice. (See
         // the note above on slots 2/4/6/8 — units flipped from u32-word
         // to byte; both decode paths write byte bases now.)
-        g_off32_byte_base   = chunks_buf.d[base + 11u];
+        g_off32_byte_base[sg_id]   = chunks_buf.d[base + 11u];
 
         // Per-chunk off32 layout (read from a separate 4-u32-per-chunk
         // sidecar: see l1_codec.decodeL1Sync). Encoded as a single u32
@@ -522,9 +563,9 @@ void main() {
         // 16-slot layout — but to keep the change minimal we route
         // `off32_count1`, `off32_count2`, and `cmd_stream2_offset`
         // through dedicated slots 12, 13, 14 of the descriptor.
-        g_off32_count1       = chunks_buf.d[base + 12u];
-        g_off32_count2       = chunks_buf.d[base + 13u];
-        g_cmd_stream2_offset = chunks_buf.d[base + 14u];
+        g_off32_count1[sg_id]       = chunks_buf.d[base + 12u];
+        g_off32_count2[sg_id]       = chunks_buf.d[base + 13u];
+        g_cmd_stream2_offset[sg_id] = chunks_buf.d[base + 14u];
         // Slot 15 = init_byte_base. Separate byte base for the initial-
         // copy prefix bytes (chunk 0 only). On the encode-roundtrip
         // path the host writes this == lit_byte_base (prefix sits at
@@ -532,13 +573,17 @@ void main() {
         // path the GPU L1-unwrap kernel writes the in-frame byte
         // offset of the prefix, which is NOT contiguous with the
         // chunk's lit bytes.
-        g_init_byte_base     = chunks_buf.d[base + 15u];
+        g_init_byte_base[sg_id]     = chunks_buf.d[base + 15u];
     }
-    // Workgroup-wide barrier so the chunk-descriptor loads in lane 0 are
-    // visible to every lane before the main decode loop reads g_cmd_size /
-    // g_dst_byte_base / etc.
-    barrier();
-    memoryBarrierShared();
+    // Subgroup-wide barrier so the chunk-descriptor loads in lane 0 of
+    // each subgroup are visible to the other 31 lanes of THAT subgroup
+    // before the main decode loop reads g_cmd_size[sg_id] etc. The two
+    // subgroups in this workgroup process disjoint chunks and disjoint
+    // g_*[sg_id] slots — no workgroup-wide barrier is needed, mirroring
+    // CUDA src/decode/lz_decode_kernels.cuh which uses __syncwarp() (not
+    // __syncthreads) for the per-warp register state.
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
 
     // ── Initial verbatim copy (chunk-0 only when g_initial_copy != 0) ──
     // Mirrors CUDA's parseAndDecodeSubChunkRaw initial-prefix step: the
@@ -549,14 +594,14 @@ void main() {
     // lit-bytes slice. On the encode-roundtrip path the host sets
     // `init_byte_base == lit_byte_base`, so this resolves to the same
     // bytes the legacy `loadLitByte(i)` reader did.
-    if (lane == 0u && g_initial_copy != 0u) {
-        for (uint i = 0u; i < g_initial_copy; i++) {
+    if (lane == 0u && g_initial_copy[sg_id] != 0u) {
+        for (uint i = 0u; i < g_initial_copy[sg_id]; i++) {
             storeDstByte(i, loadInitByte(i));
         }
     }
-    barrier();
-    memoryBarrierShared();
-    memoryBarrierBuffer();
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+    subgroupMemoryBarrierBuffer();
 
     // ── Per-lane decode state (was: shared sh_* in the prior revision) ──
     // Every lane keeps an identical register copy. The fast-batched path
@@ -576,21 +621,21 @@ void main() {
     uint cmd_pos       = 0u;
     uint lit_pos       = 0u;
     uint off16_pos     = 0u;
-    uint dst_pos       = g_initial_copy;
+    uint dst_pos       = g_initial_copy[sg_id];
     int  recent_offset = INITIAL_RECENT_OFFSET;
     uint length_offset = 0u;
 
     // Active off32 block starts as block-0.
     uint off32_pos         = 0u;
-    uint off32_block_count = g_off32_count1;
+    uint off32_block_count = g_off32_count1[sg_id];
     uint off32_base_entry  = 0u;
-    uint block_dst_start   = g_initial_copy;
+    uint block_dst_start   = g_initial_copy[sg_id];
     // Block boundary in the cmd stream: if g_cmd_stream2_offset != 0
     // it splits the cmd stream between block-0 and block-1 (matching
     // CUDA's `block_cmd_end` in lz_decode_general.cuh:127). Else
     // there is no boundary, all tokens belong to block-0.
-    uint block_cmd_end = (g_cmd_stream2_offset != 0u && g_cmd_stream2_offset < g_cmd_size)
-        ? g_cmd_stream2_offset : g_cmd_size;
+    uint block_cmd_end = (g_cmd_stream2_offset[sg_id] != 0u && g_cmd_stream2_offset[sg_id] < g_cmd_size[sg_id])
+        ? g_cmd_stream2_offset[sg_id] : g_cmd_size[sg_id];
 
     // ── Outer decode loop ───────────────────────────────────────────
     // Runs while there are tokens to consume. Each iteration either:
@@ -603,7 +648,7 @@ void main() {
     // off16_pos+=total_off16_used, recent_offset=batch_recent_off if
     // fresh_mask!=0). Slow path: lane 0 parses, then subgroupBroadcast
     // (val, 0u) publishes the four parsed fields to every lane.
-    while (cmd_pos < g_cmd_size) {
+    while (cmd_pos < g_cmd_size[sg_id]) {
         // Block-boundary transition: once we finish all block-0 tokens,
         // switch the off32 cursor to the block-1 slice and bump the
         // active cmd_end to g_cmd_size. Matches CUDA's "advance to
@@ -611,12 +656,12 @@ void main() {
         // predicate is subgroup-uniform (cmd_pos and block_cmd_end are
         // identical across lanes), so every lane updates its own
         // register copy identically — no barrier needed.
-        if (cmd_pos == block_cmd_end && block_cmd_end < g_cmd_size) {
-            off32_base_entry  = g_off32_count1;
-            off32_block_count = g_off32_count2;
+        if (cmd_pos == block_cmd_end && block_cmd_end < g_cmd_size[sg_id]) {
+            off32_base_entry  = g_off32_count1[sg_id];
+            off32_block_count = g_off32_count2[sg_id];
             off32_pos         = 0u;
             block_dst_start   = dst_pos;
-            block_cmd_end     = g_cmd_size;
+            block_cmd_end     = g_cmd_size[sg_id];
         }
 
         // ── Fast-path batch detect ──────────────────────────────────
@@ -664,7 +709,7 @@ void main() {
             int my_match_offset = recent_offset;
             if (my_consumes_off16 != 0u) {
                 uint entry_idx = off16_pos + my_off16_local;
-                if (entry_idx < g_off16_count) {
+                if (entry_idx < g_off16_count[sg_id]) {
                     uint v = loadOff16Entry(entry_idx);
                     my_match_offset = -int(v);
                 }
@@ -787,7 +832,7 @@ void main() {
                 p_lit_len    = token & TOKEN_LIT_MASK;
                 p_match_len  = (token >> TOKEN_MATCH_SHIFT) & TOKEN_MATCH_MASK;
                 p_use_recent = (token >> TOKEN_USE_RECENT_SHIFT) & TOKEN_USE_RECENT_MASK;
-                if (p_use_recent == 0u && new_off16_pos < g_off16_count) {
+                if (p_use_recent == 0u && new_off16_pos < g_off16_count[sg_id]) {
                     uint v = loadOff16Entry(new_off16_pos);
                     p_match_offset = -int(v);
                     new_off16_pos += 1u;
@@ -795,20 +840,20 @@ void main() {
             } else if (token == TOKEN_LONG_LITERAL) {
                 // Literal-only command (CUDA L158-161).
                 p_use_recent = 1u;
-                p_lit_len    = readLengthFromStream(new_length_offset, g_length_remaining)
+                p_lit_len    = readLengthFromStream(new_length_offset, g_length_remaining[sg_id])
                              + LONG_LITERAL_BASE;
             } else if (token == TOKEN_LONG_NEAR) {
                 // Near-offset long match (CUDA L162-173).
-                p_match_len = readLengthFromStream(new_length_offset, g_length_remaining)
+                p_match_len = readLengthFromStream(new_length_offset, g_length_remaining[sg_id])
                             + LONG_NEAR_BASE;
-                if (new_off16_pos < g_off16_count) {
+                if (new_off16_pos < g_off16_count[sg_id]) {
                     uint v = loadOff16Entry(new_off16_pos);
                     p_match_offset = -int(v);
                     new_off16_pos += 1u;
                 }
             } else if (token == TOKEN_LONG_FAR) {
                 // Far-offset long match (CUDA L180-191).
-                p_match_len = readLengthFromStream(new_length_offset, g_length_remaining)
+                p_match_len = readLengthFromStream(new_length_offset, g_length_remaining[sg_id])
                             + LONG_FAR_BASE;
                 if (new_off32_pos < off32_block_count) {
                     // off32 entries are 3 bytes each (encoder writes byte
@@ -873,7 +918,7 @@ void main() {
     // copied verbatim into dst[dst_pos..]. With Dst as a byte SSBO each
     // lane writes a unique byte address per iteration, so we can do a
     // subgroup-strided cooperative copy (same shape as warpLiteralCopy).
-    uint trailing = (g_lit_size > lit_pos) ? (g_lit_size - lit_pos) : 0u;
+    uint trailing = (g_lit_size[sg_id] > lit_pos) ? (g_lit_size[sg_id] - lit_pos) : 0u;
     uint t_stride = gl_SubgroupSize;
     uint t_dst_pos = dst_pos;
     uint t_lit_pos = lit_pos;

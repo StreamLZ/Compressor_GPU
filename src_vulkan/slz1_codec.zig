@@ -732,6 +732,20 @@ pub fn decodeSlz1ToBytesEx(
     const copy_src: vk.VkBuffer = if (copy_size == 0) null else dst_b.buf;
     const copy_dst: vk.VkBuffer = if (copy_size == 0) null else dst_stage.buf;
 
+    // Mirror CUDA src/decode/decode_dispatch.zig:400-401
+    //   lz_groups = (total_chunks + chunks_per_group - 1) / chunks_per_group;
+    //   lz_grid_x = (lz_groups + 1) / 2;            // = ceil(lz_groups / WARPS_PER_BLOCK)
+    // and src/decode/decode_dispatch.zig:430/451 which launches the kernel
+    // with `block(32, 2, 1)` = WARPS_PER_BLOCK = 2 warps per block.
+    //
+    // In the Vulkan port each walk_frame ChunkDesc already represents one
+    // 64 KiB sub-chunk (sc_group_size = 0.25; src_vulkan/wire_constants.zig:42),
+    // so the wire-format equivalent of `chunks_per_group` is 1 and
+    // `lz_groups == n_chunks`. The lz_decode.comp shader handles 2 chunks
+    // per workgroup via `chunk_id = gl_WorkGroupID.x * WARPS_PER_BLOCK + gl_SubgroupID`,
+    // matching CUDA src/decode/lz_decode_kernels.cuh:47.
+    const WARPS_PER_BLOCK: u32 = 2;
+    const lz_grid_x: u32 = (n_chunks + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
     const dec_dispatch_result = try dispatch.submitTwoWithCopy(
         ctx,
         .{
@@ -746,7 +760,7 @@ pub fn decodeSlz1ToBytesEx(
             .pipeline_layout = cached_dec.pipeline_layout,
             .descriptor_set = dec_set,
             .push_constants_bytes = dec_push_bytes[0..],
-            .group_count = .{ n_chunks, 1, 1 },
+            .group_count = .{ lz_grid_x, 1, 1 },
         },
         // Inter-dispatch barrier on the chunks buffer that l1_unwrap
         // writes (binding 3 in its set) and lz_decode reads (binding 5
