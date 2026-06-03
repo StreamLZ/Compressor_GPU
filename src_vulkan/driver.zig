@@ -149,6 +149,12 @@ pub fn setSelector(s: device_mod.DeviceSelector) void {
 
 pub const DriverError = error{
     LoaderInitFailed,
+    /// SLZ_VK_DEVICE_INDEX env var was set to a non-empty string that
+    /// failed to parse as a base-10 u32. Surfaced as a hard error
+    /// rather than silently degraded to "default device" — a typo or
+    /// stale shell var that picks the wrong GPU is a worse failure
+    /// mode than reporting the bad value.
+    BadDeviceIndexEnv,
 } || instance_mod.InstanceError || device_mod.DeviceError;
 
 /// Resolve the device selector that `ensureInit` should pass to
@@ -156,12 +162,18 @@ pub const DriverError = error{
 ///   1. Explicit `g_selector` (anything other than `.default`).
 ///   2. `SLZ_VK_DEVICE_INDEX=<N>` env var when set + parseable.
 ///   3. `.default` — historical "first compute-capable device" behavior.
-fn resolveSelector() device_mod.DeviceSelector {
+fn resolveSelector() DriverError!device_mod.DeviceSelector {
     if (g_selector != .default) return g_selector;
     const raw = std.c.getenv("SLZ_VK_DEVICE_INDEX") orelse return .default;
     const s = std.mem.span(raw);
     if (s.len == 0) return .default;
-    const n = std.fmt.parseInt(u32, s, 10) catch return .default;
+    // Hard error on parse failure: silently degrading to "default
+    // device" hid stale shell variables that picked the wrong GPU in
+    // multi-device setups. The caller (slzCreate_vk → ensureInit) maps
+    // BadDeviceIndexEnv to SLZ_ERROR_VK_FEATURE_MISSING via the
+    // classify-Slz1Error switch (no Slz1Error mapping required — it's
+    // surfaced before the codec runs).
+    const n = std.fmt.parseInt(u32, s, 10) catch return error.BadDeviceIndexEnv;
     return .{ .by_index = n };
 }
 
@@ -178,7 +190,7 @@ pub fn ensureInit() DriverError!void {
     const inst = try instance_mod.createInstance(true);
     errdefer instance_mod.destroyInstance(inst);
 
-    const selector = resolveSelector();
+    const selector = try resolveSelector();
     const pd = try device_mod.pickPhysicalDeviceWith(inst, selector);
     // Probe BEFORE createDevice so we can opt into VK_KHR_8bit_storage
     // when the device reports it. The decoder's fast-batch path needs

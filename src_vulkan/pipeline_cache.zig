@@ -61,6 +61,14 @@ pub const PipelineCacheError = error{
     CacheTooLarge,
     /// All Win32 retries for SHARING_VIOLATION exhausted.
     SaveContention,
+    /// Caller's allocator exhausted while reading the cache file
+    /// (forwarded from `readFileAlloc` instead of silently degrading
+    /// to "no cache"; that would just defer the failure to the
+    /// caller's next allocation, masking the real cause).
+    OutOfMemory,
+    /// Unexpected OS error reading the on-disk cache blob. Forwarded
+    /// instead of swallowed so the caller sees the actual cause.
+    Unexpected,
 };
 
 // ── cacheDir ─────────────────────────────────────────────────────
@@ -182,14 +190,21 @@ pub fn loadOrCreate(dev: vk.VkDevice, io: std.Io, allocator: std.mem.Allocator, 
 
     // Try to slurp the existing blob. Use the cap as the read limit so a
     // corrupted multi-GB file doesn't OOM us at start-up.
+    //
+    // Error policy: the "expected on first run / cache eviction"
+    // variants degrade gracefully to an empty cache (returns
+    // null → fall through to vkCreatePipelineCache with size=0).
+    // OOM is a hard error — it indicates the caller's allocator is
+    // exhausted; silently degrading would just defer the failure to
+    // the next `try allocator.alloc` and confuse the cause. Other
+    // unexpected variants (Unexpected from the OS layer, etc.) also
+    // propagate so the caller sees the actual cause.
     const data_opt: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
         allocator,
         @enumFromInt(MAX_CACHE_BYTES),
     ) catch |err| switch (err) {
-        // Expected on first run / after cache eviction. Fall through to
-        // empty-cache create.
         error.FileNotFound,
         error.AccessDenied,
         error.PermissionDenied,
@@ -197,9 +212,8 @@ pub fn loadOrCreate(dev: vk.VkDevice, io: std.Io, allocator: std.mem.Allocator, 
         error.NotDir,
         error.StreamTooLong,
         => null,
-        // Anything else: log to stderr via the loader path (caller can
-        // observe via the empty-cache outcome) and fall through.
-        else => null,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Unexpected,
     };
     defer if (data_opt) |d| allocator.free(d);
 

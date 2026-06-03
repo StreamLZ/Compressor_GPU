@@ -367,13 +367,21 @@ pub export fn slzRegisterBuffer_vk(
 
     // Resolve address: either trust the caller (CUDA-symmetry path)
     // or query via vkGetBufferDeviceAddress.
+    //
+    // A query result of 0 used to be conflated with "query failed",
+    // but the spec allows the driver to legally place a BDA range
+    // starting at 0 (lookupRegistered now treats `addr == 0` as
+    // "address argument is null" — a null d_input/d_output, not a
+    // zero-addressed registered buffer — so the registry side is
+    // still safe). The query error path here only triggers when the
+    // device dispatch table is missing the entry point.
     const addr: u64 = if (d_base_address) |p|
         @intFromPtr(p)
-    else blk: {
-        const a = queryBufferAddress(vk_buf) catch return SLZ_ERROR_VK_FEATURE_MISSING;
-        if (a == 0) return SLZ_ERROR_VK_FEATURE_MISSING;
-        break :blk a;
-    };
+    else
+        queryBufferAddress(vk_buf) catch |err| switch (err) {
+            error.NullBuffer => return SLZ_ERROR_INVALID_ARG,
+            error.NoBdaFn => return SLZ_ERROR_VK_FEATURE_MISSING,
+        };
 
     h.registry[h.registry_count] = .{
         .address = addr,
@@ -408,11 +416,34 @@ pub export fn slzUnregisterBuffer_vk(
     return SLZ_SUCCESS;
 }
 
+/// Errors `queryBufferAddress` can surface. The C ABI surface
+/// (`slzBufferGetDeviceAddress_vk`) collapses these back to a u64
+/// return (0 on any failure) because the header reserves a plain
+/// `uint64_t` return type — but the internal callers use the
+/// distinct variants to set the right SLZ_ERROR_* code.
+const BdaQueryError = error{
+    /// VkBuffer handle was null. Caller passed a null cast through
+    /// `*anyopaque`.
+    NullBuffer,
+    /// `vkGetBufferDeviceAddress_fn` (and its KHR alias) could not be
+    /// resolved from the device dispatch table. The device doesn't
+    /// support `bufferDeviceAddress` — should be impossible on the
+    /// Tier-1 floor but degrades cleanly if it ever happens.
+    NoBdaFn,
+};
+
 /// Query the device address of a VkBuffer. Internal helper used by
 /// `slzRegisterBuffer_vk` when the caller didn't pre-query, AND
 /// exposed publicly (below) so test code can call it without
 /// importing all of vk_api.
-fn queryBufferAddress(buf: vk.VkBuffer) !u64 {
+///
+/// Returns the BDA `u64` as written by the driver. A return of 0 is
+/// VALID in principle (the spec allows the driver to assign any
+/// non-overlapping range starting from 0). Failures surface as
+/// distinct error variants so call sites can distinguish "address is
+/// actually 0" from "query couldn't run."
+fn queryBufferAddress(buf: vk.VkBuffer) BdaQueryError!u64 {
+    if (buf == null) return error.NullBuffer;
     // Lazy resolve.
     if (vk.vkGetBufferDeviceAddress_fn == null) {
         if (vk.vkGetDeviceProcAddr_fn) |gdpa| {
@@ -441,6 +472,12 @@ fn queryBufferAddress(buf: vk.VkBuffer) !u64 {
 /// returns the BDA u64 or 0 on failure. Surfaced through the C ABI
 /// so test code can build BDA-typed D2D round-trips without pulling
 /// in vk_api directly.
+///
+/// The 0-return-on-failure shape is dictated by the header
+/// (`uint64_t slzBufferGetDeviceAddress_vk(...)`). The internal
+/// `queryBufferAddress` distinguishes "address is 0" from "query
+/// failed" via its error union; callers that need that distinction
+/// go through Zig directly.
 pub export fn slzBufferGetDeviceAddress_vk(
     handle: ?*VkContext,
     vk_buffer_handle: ?*anyopaque,
@@ -543,8 +580,8 @@ fn d2dCompress(
         if (input_size > reg.size) return SLZ_ERROR_INVALID_ARG;
         const scratch = allocator.alloc(u8, input_size) catch return SLZ_ERROR_OUT_OF_MEMORY;
         d2h_scratch = scratch;
-        if (!stageBytesFromDeviceBuffer(reg.buffer, scratch))
-            return SLZ_ERROR_VK_FEATURE_MISSING;
+        stageBytesFromDeviceBuffer(reg.buffer, scratch) catch |err|
+            return mapStageError(err);
         src_view = scratch;
     } else {
         if (d_input_host == null and input_size != 0) return SLZ_ERROR_INVALID_ARG;
@@ -578,8 +615,8 @@ fn d2dCompress(
         // Stage scratch → caller's device buffer. Cheap CPU-side
         // copy through a host-visible staging buffer then a
         // GPU-side copy into the registered buffer.
-        const ok = stageBytesToDeviceBuffer(reg.buffer, scratch[0..written]);
-        if (!ok) return SLZ_ERROR_OUT_OF_MEMORY;
+        stageBytesToDeviceBuffer(reg.buffer, scratch[0..written]) catch |err|
+            return mapStageError(err);
         return @intCast(written);
     }
 
@@ -686,7 +723,8 @@ fn d2dDecompress(
         if (input_size > reg.size) return SLZ_ERROR_INVALID_ARG;
         const scratch = allocator.alloc(u8, input_size) catch return SLZ_ERROR_OUT_OF_MEMORY;
         input_owned_scratch = scratch;
-        if (!stageBytesFromDeviceBuffer(reg.buffer, scratch)) return SLZ_ERROR_VK_FEATURE_MISSING;
+        stageBytesFromDeviceBuffer(reg.buffer, scratch) catch |err|
+            return mapStageError(err);
         input_slice = scratch;
     } else {
         if (d_input_host == null) return SLZ_ERROR_INVALID_ARG;
@@ -723,23 +761,73 @@ fn d2dDecompress(
     return @intCast(written);
 }
 
+/// Errors the D2D staging helpers can surface. Every variant maps to
+/// a distinct SLZ_ERROR_* code via `mapStageError` so the caller's
+/// `slzCompress_vk` / `slzDecompress_vk` exit code carries the actual
+/// failure mode rather than a single sentinel.
+const StageError = error{
+    /// A core Vulkan entry point that should have been resolved at
+    /// `slzCreate_vk` time was missing from the vtable. Maps to
+    /// SLZ_ERROR_VK_FEATURE_MISSING — the device probably doesn't
+    /// support the codec floor.
+    LoaderNotReady,
+    /// vkCreateBuffer / vkAllocateMemory / vkBindBufferMemory /
+    /// vkMapMemory returned a non-success VkResult. Maps to
+    /// SLZ_ERROR_OUT_OF_MEMORY — the most common cause.
+    BufferCreateFailed,
+    MemoryAllocateFailed,
+    BindBufferFailed,
+    MapMemoryFailed,
+    /// No HOST_VISIBLE+HOST_COHERENT memory type covered the buffer's
+    /// memoryTypeBits. Should be impossible on a Vulkan-1.2 device but
+    /// surfaces as VK_FEATURE_MISSING if it ever happens.
+    MemoryTypeNotFound,
+    /// vkResetCommandBuffer / vkBeginCommandBuffer / vkEndCommandBuffer
+    /// / vkResetFences / vkQueueSubmit returned a non-success
+    /// VkResult, or the cmdbuf/fence chassis was not yet set up.
+    /// Maps to SLZ_ERROR_DEVICE_LOST.
+    CmdBufRecordFailed,
+    SubmitFailed,
+    /// vkWaitForFences timed out or returned an error. Maps to
+    /// SLZ_ERROR_DEVICE_LOST.
+    FenceWaitFailed,
+};
+
+/// Translate a `StageError` into the SLZ_ERROR_* code surfaced through
+/// the C ABI. Mirror of the categories used by `classifySlz1Error`.
+fn mapStageError(err: StageError) c_int {
+    return switch (err) {
+        StageError.LoaderNotReady,
+        StageError.MemoryTypeNotFound,
+        => SLZ_ERROR_VK_FEATURE_MISSING,
+        StageError.BufferCreateFailed,
+        StageError.MemoryAllocateFailed,
+        StageError.BindBufferFailed,
+        StageError.MapMemoryFailed,
+        => SLZ_ERROR_OUT_OF_MEMORY,
+        StageError.CmdBufRecordFailed,
+        StageError.SubmitFailed,
+        StageError.FenceWaitFailed,
+        => SLZ_ERROR_DEVICE_LOST,
+    };
+}
+
 /// Stage `bytes` into a caller-owned device VkBuffer via an
 /// internal HOST_VISIBLE staging buffer and a vkCmdCopyBuffer.
-/// Returns true on success.
-fn stageBytesToDeviceBuffer(dst: vk.VkBuffer, bytes: []const u8) bool {
+fn stageBytesToDeviceBuffer(dst: vk.VkBuffer, bytes: []const u8) StageError!void {
     // `to_device` direction only reads `host_bytes` — the @memcpy
     // inside `stageDeviceBufferCopy` clones the source bytes into
     // the staging buffer's mapped memory before submit. A
     // `@constCast` is fine here because the helper never writes
     // to the slice in this direction.
     const writable: []u8 = @constCast(bytes);
-    return stageDeviceBufferCopy(dst, writable, .to_device);
+    try stageDeviceBufferCopy(dst, writable, .to_device);
 }
 
 /// Read bytes from a caller-owned device VkBuffer into a host
-/// scratch (size = `out.len`). Returns true on success.
-fn stageBytesFromDeviceBuffer(src: vk.VkBuffer, out: []u8) bool {
-    return stageDeviceBufferCopy(src, out, .from_device);
+/// scratch (size = `out.len`).
+fn stageBytesFromDeviceBuffer(src: vk.VkBuffer, out: []u8) StageError!void {
+    try stageDeviceBufferCopy(src, out, .from_device);
 }
 
 const StageDir = enum { to_device, from_device };
@@ -749,21 +837,21 @@ const StageDir = enum { to_device, from_device };
 /// a single vkCmdCopyBuffer in either direction. Reuses the
 /// existing dispatch chassis on `driver.g_default` so the fence
 /// chassis doesn't get duplicated.
-fn stageDeviceBufferCopy(dev_buf: vk.VkBuffer, host_bytes: []u8, dir: StageDir) bool {
-    if (host_bytes.len == 0) return true;
+fn stageDeviceBufferCopy(dev_buf: vk.VkBuffer, host_bytes: []u8, dir: StageDir) StageError!void {
+    if (host_bytes.len == 0) return;
     const ctx = &driver.g_default;
     l1_codec.ensureBufferFnSlots(ctx);
 
     // Create the staging buffer.
-    const create_buf = vk.vkCreateBuffer_fn orelse return false;
-    const get_req = vk.vkGetBufferMemoryRequirements_fn orelse return false;
-    const alloc_mem = vk.vkAllocateMemory_fn orelse return false;
-    const free_mem = vk.vkFreeMemory_fn orelse return false;
-    const bind = vk.vkBindBufferMemory_fn orelse return false;
-    const destroy_buf = vk.vkDestroyBuffer_fn orelse return false;
-    const map = vk.vkMapMemory_fn orelse return false;
-    const unmap = vk.vkUnmapMemory_fn orelse return false;
-    const get_mem_props = vk.vkGetPhysicalDeviceMemoryProperties_fn orelse return false;
+    const create_buf = vk.vkCreateBuffer_fn orelse return error.LoaderNotReady;
+    const get_req = vk.vkGetBufferMemoryRequirements_fn orelse return error.LoaderNotReady;
+    const alloc_mem = vk.vkAllocateMemory_fn orelse return error.LoaderNotReady;
+    const free_mem = vk.vkFreeMemory_fn orelse return error.LoaderNotReady;
+    const bind = vk.vkBindBufferMemory_fn orelse return error.LoaderNotReady;
+    const destroy_buf = vk.vkDestroyBuffer_fn orelse return error.LoaderNotReady;
+    const map = vk.vkMapMemory_fn orelse return error.LoaderNotReady;
+    const unmap = vk.vkUnmapMemory_fn orelse return error.LoaderNotReady;
+    const get_mem_props = vk.vkGetPhysicalDeviceMemoryProperties_fn orelse return error.LoaderNotReady;
 
     const usage: vk.VkBufferUsageFlags = switch (dir) {
         .to_device => vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -775,7 +863,7 @@ fn stageDeviceBufferCopy(dev_buf: vk.VkBuffer, host_bytes: []u8, dir: StageDir) 
         .sharingMode = vk.VK_SHARING_MODE_EXCLUSIVE,
     };
     var stage_buf: vk.VkBuffer = null;
-    if (create_buf(ctx.dev, &bci, null, &stage_buf) != vk.VK_SUCCESS) return false;
+    if (create_buf(ctx.dev, &bci, null, &stage_buf) != vk.VK_SUCCESS) return error.BufferCreateFailed;
     defer destroy_buf(ctx.dev, stage_buf, null);
 
     var req: vk.VkMemoryRequirements = .{};
@@ -795,19 +883,19 @@ fn stageDeviceBufferCopy(dev_buf: vk.VkBuffer, host_bytes: []u8, dir: StageDir) 
             }
         }
     }
-    if (mt_idx == std.math.maxInt(u32)) return false;
+    if (mt_idx == std.math.maxInt(u32)) return error.MemoryTypeNotFound;
 
     const mai: vk.VkMemoryAllocateInfo = .{
         .allocationSize = req.size,
         .memoryTypeIndex = mt_idx,
     };
     var stage_mem: vk.VkDeviceMemory = null;
-    if (alloc_mem(ctx.dev, &mai, null, &stage_mem) != vk.VK_SUCCESS) return false;
+    if (alloc_mem(ctx.dev, &mai, null, &stage_mem) != vk.VK_SUCCESS) return error.MemoryAllocateFailed;
     defer free_mem(ctx.dev, stage_mem, null);
-    if (bind(ctx.dev, stage_buf, stage_mem, 0) != vk.VK_SUCCESS) return false;
+    if (bind(ctx.dev, stage_buf, stage_mem, 0) != vk.VK_SUCCESS) return error.BindBufferFailed;
 
     var raw: ?*anyopaque = null;
-    if (map(ctx.dev, stage_mem, 0, vk.VK_WHOLE_SIZE, 0, &raw) != vk.VK_SUCCESS) return false;
+    if (map(ctx.dev, stage_mem, 0, vk.VK_WHOLE_SIZE, 0, &raw) != vk.VK_SUCCESS) return error.MapMemoryFailed;
     defer unmap(ctx.dev, stage_mem);
     const mapped: [*]u8 = @ptrCast(@alignCast(raw.?));
 
@@ -818,12 +906,11 @@ fn stageDeviceBufferCopy(dev_buf: vk.VkBuffer, host_bytes: []u8, dir: StageDir) 
     }
 
     // Submit a one-shot vkCmdCopyBuffer using the driver chassis.
-    if (!recordAndSubmitCopy(ctx, stage_buf, dev_buf, host_bytes.len, dir)) return false;
+    try recordAndSubmitCopy(ctx, stage_buf, dev_buf, host_bytes.len, dir);
 
     if (dir == .from_device) {
         @memcpy(host_bytes, mapped[0..host_bytes.len]);
     }
-    return true;
 }
 
 /// Inline cmdbuf record + submit + wait for a single
@@ -835,33 +922,37 @@ fn recordAndSubmitCopy(
     dev_buf: vk.VkBuffer,
     size: usize,
     dir: StageDir,
-) bool {
+) StageError!void {
     // Ensure the chassis (cmd_pool, cmd_buf, fence, query_pool) is up.
     // dispatch.submitOne does this lazily on first dispatch; the D2D
     // stage-copy path may run before any codec dispatch, so prep it
-    // explicitly here.
+    // explicitly here. A chassis-init failure isn't a buffer-create
+    // failure — it's a loader / pool-create error, which maps to
+    // VK_FEATURE_MISSING via LoaderNotReady (the dispatch chassis
+    // returns CommandPoolCreateFailed / FenceCreateFailed / similar
+    // that the unified mapper treats as device-class failures).
     const dispatch_mod = @import("dispatch.zig");
-    dispatch_mod.ensureChassisPub(ctx) catch return false;
+    dispatch_mod.ensureChassisPub(ctx) catch return error.LoaderNotReady;
 
-    const reset_cb = vk.vkResetCommandBuffer_fn orelse return false;
-    const begin_cb = vk.vkBeginCommandBuffer_fn orelse return false;
-    const end_cb = vk.vkEndCommandBuffer_fn orelse return false;
-    const cmd_copy = vk.vkCmdCopyBuffer_fn orelse return false;
-    const reset_fence = vk.vkResetFences_fn orelse return false;
-    const submit = vk.vkQueueSubmit_fn orelse return false;
-    const wait_fence = vk.vkWaitForFences_fn orelse return false;
+    const reset_cb = vk.vkResetCommandBuffer_fn orelse return error.LoaderNotReady;
+    const begin_cb = vk.vkBeginCommandBuffer_fn orelse return error.LoaderNotReady;
+    const end_cb = vk.vkEndCommandBuffer_fn orelse return error.LoaderNotReady;
+    const cmd_copy = vk.vkCmdCopyBuffer_fn orelse return error.LoaderNotReady;
+    const reset_fence = vk.vkResetFences_fn orelse return error.LoaderNotReady;
+    const submit = vk.vkQueueSubmit_fn orelse return error.LoaderNotReady;
+    const wait_fence = vk.vkWaitForFences_fn orelse return error.LoaderNotReady;
 
     // The chassis is set up by `dispatch.submitOne` on first call —
     // we expect at least one codec dispatch has run by this point
     // (the encoder/decoder runs before we get here), so cmd_buf +
     // fence are already populated. If not, bail.
-    if (ctx.cmd_buf == null or ctx.fence == null) return false;
+    if (ctx.cmd_buf == null or ctx.fence == null) return error.LoaderNotReady;
 
-    if (reset_cb(ctx.cmd_buf, 0) != vk.VK_SUCCESS) return false;
+    if (reset_cb(ctx.cmd_buf, 0) != vk.VK_SUCCESS) return error.CmdBufRecordFailed;
     const begin_info: vk.VkCommandBufferBeginInfo = .{
         .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
-    if (begin_cb(ctx.cmd_buf, &begin_info) != vk.VK_SUCCESS) return false;
+    if (begin_cb(ctx.cmd_buf, &begin_info) != vk.VK_SUCCESS) return error.CmdBufRecordFailed;
     const region: vk.VkBufferCopy = .{
         .srcOffset = 0,
         .dstOffset = 0,
@@ -872,18 +963,18 @@ fn recordAndSubmitCopy(
         .to_device => cmd_copy(ctx.cmd_buf, stage_buf, dev_buf, 1, @ptrCast(&regions)),
         .from_device => cmd_copy(ctx.cmd_buf, dev_buf, stage_buf, 1, @ptrCast(&regions)),
     }
-    if (end_cb(ctx.cmd_buf) != vk.VK_SUCCESS) return false;
+    if (end_cb(ctx.cmd_buf) != vk.VK_SUCCESS) return error.CmdBufRecordFailed;
 
     const fences: [1]vk.VkFence = .{ctx.fence};
-    if (reset_fence(ctx.dev, 1, @ptrCast(&fences)) != vk.VK_SUCCESS) return false;
+    if (reset_fence(ctx.dev, 1, @ptrCast(&fences)) != vk.VK_SUCCESS) return error.SubmitFailed;
     const cmd_bufs: [1]vk.VkCommandBuffer = .{ctx.cmd_buf};
     const submit_info: vk.VkSubmitInfo = .{
         .commandBufferCount = 1,
         .pCommandBuffers = @ptrCast(&cmd_bufs),
     };
     const submits: [1]vk.VkSubmitInfo = .{submit_info};
-    if (submit(ctx.queue, 1, @ptrCast(&submits), ctx.fence) != vk.VK_SUCCESS) return false;
-    return wait_fence(ctx.dev, 1, @ptrCast(&fences), vk.VK_TRUE, vk.VK_M8A_FENCE_WAIT_NS) == vk.VK_SUCCESS;
+    if (submit(ctx.queue, 1, @ptrCast(&submits), ctx.fence) != vk.VK_SUCCESS) return error.SubmitFailed;
+    if (wait_fence(ctx.dev, 1, @ptrCast(&fences), vk.VK_TRUE, vk.VK_M8A_FENCE_WAIT_NS) != vk.VK_SUCCESS) return error.FenceWaitFailed;
 }
 
 pub export fn slzDecompressHost_vk(
@@ -1018,7 +1109,7 @@ fn classifySlz1Error(err: slz1_codec.Slz1Error) c_int {
         // driver.DriverError surfaces (instance/device bring-up). The
         // codec normally only reaches these if `slzCreate_vk` succeeded
         // but a per-call `driver.ensureInit` re-entry hit a transient
-        // failure — they're effectively DEVICE_LOST class.
+        // failure — they're effectively VK_FEATURE_MISSING class.
         error.LoaderInitFailed,
         error.CreateInstanceFailed,
         error.InstanceProcMissing,
@@ -1029,11 +1120,20 @@ fn classifySlz1Error(err: slz1_codec.Slz1Error) c_int {
         error.DeviceIndexOutOfRange,
         error.DeviceNameNotFound,
         error.DeviceNameAmbiguous,
+        // BadDeviceIndexEnv is the operator setting SLZ_VK_DEVICE_INDEX
+        // to a value that doesn't parse as u32. INVALID_ARG would be
+        // semantically more accurate but the ABI only carries it for
+        // direct function arguments — VK_FEATURE_MISSING is the
+        // closest "environment did not satisfy the codec's needs"
+        // code.
+        error.BadDeviceIndexEnv,
         => SLZ_ERROR_VK_FEATURE_MISSING,
 
-        // Catch-all for variants not yet enumerated. Audit when a new
-        // member is added to Slz1Error upstream.
-        else => SLZ_ERROR_UNSUPPORTED,
+        // No `else =>` — the arms above exhaustively enumerate every
+        // current Slz1Error variant (Zig 0.16 compile-time-checked).
+        // A new upstream variant added to Slz1Error fails the build
+        // here, forcing an explicit classification rather than a
+        // silent SLZ_ERROR_UNSUPPORTED fall-through.
     };
 }
 
@@ -1043,6 +1143,29 @@ fn mapEncodeError(err: slz1_codec.Slz1Error) c_int {
 
 fn mapDecodeError(err: slz1_codec.Slz1Error) c_int {
     return classifySlz1Error(err);
+}
+
+/// Map a `std.Thread.SpawnError` into the C ABI status. The CUDA
+/// backend never spawns its own threads from inside `slzCompressAsync`
+/// (it uses a per-call worker that the harness owns), so there's no
+/// CUDA-side analog to mirror — we classify by Posix/Win32 semantics:
+///   * OutOfMemory                  → SLZ_ERROR_OUT_OF_MEMORY
+///   * ThreadQuotaExceeded /
+///     SystemResources /
+///     LockedMemoryLimitExceeded    → SLZ_ERROR_DEVICE_LOST
+///                                    (system-resource pressure; the
+///                                    closest "transient system
+///                                    failure" code in the ABI)
+///   * Unexpected                   → SLZ_ERROR_DEVICE_LOST
+fn mapThreadSpawnError(err: std.Thread.SpawnError) c_int {
+    return switch (err) {
+        error.OutOfMemory => SLZ_ERROR_OUT_OF_MEMORY,
+        error.ThreadQuotaExceeded,
+        error.SystemResources,
+        error.LockedMemoryLimitExceeded,
+        error.Unexpected,
+        => SLZ_ERROR_DEVICE_LOST,
+    };
 }
 
 /// Always returns SLZ_ERROR_UNSUPPORTED. The Vulkan backend exposes
@@ -1113,10 +1236,10 @@ pub export fn slzCompressAsync_vk(
         .{ .stack_size = async_worker_stack },
         asyncCompressWorker,
         .{args},
-    ) catch {
+    ) catch |err| {
         allocator.destroy(args);
         h.async_enc = .{};
-        return SLZ_ERROR_OUT_OF_MEMORY;
+        return mapThreadSpawnError(err);
     };
     h.async_enc.thread = t;
     return SLZ_SUCCESS;
@@ -1154,10 +1277,10 @@ pub export fn slzDecompressAsync_vk(
         .{ .stack_size = async_worker_stack },
         asyncDecompressWorker,
         .{args},
-    ) catch {
+    ) catch |err| {
         allocator.destroy(args);
         h.async_dec = .{};
-        return SLZ_ERROR_OUT_OF_MEMORY;
+        return mapThreadSpawnError(err);
     };
     h.async_dec.thread = t;
     return SLZ_SUCCESS;

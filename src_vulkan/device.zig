@@ -36,6 +36,17 @@ pub const DeviceSelector = union(enum) {
     by_name: []const u8,
 };
 
+/// Returns whether the physical device exposes at least one compute
+/// queue family with queueCount > 0.
+///
+/// If `vkGetPhysicalDeviceQueueFamilyProperties` was never resolved
+/// (loader/init failure that escaped our gates), returns false. That
+/// degrade is sound: a missing fn pointer means the device can't be
+/// driven anyway, so reporting "no compute queue" is the only signal
+/// the caller (pickPhysicalDeviceWith) can act on — surfacing a
+/// dedicated `LoaderNotReady` here would force every device-iteration
+/// loop to plumb an extra error type without changing the outcome
+/// (device gets skipped). Documented as a best-effort fallback.
 fn hasComputeQueue(pd: vk.VkPhysicalDevice) bool {
     const get_qf = vk.vkGetPhysicalDeviceQueueFamilyProperties_fn orelse return false;
     var qf_count: u32 = 0;
@@ -53,6 +64,15 @@ fn hasComputeQueue(pd: vk.VkPhysicalDevice) bool {
     return false;
 }
 
+/// Copy the device's deviceName into `buf` as a NUL-terminated subslice.
+///
+/// If `vkGetPhysicalDeviceProperties` was never resolved, returns an
+/// empty slice. Used only for diagnostic logging (`SLZ_VK_DEBUG_DEVICES`
+/// dump, the bench device-name banner); an empty string is a sufficient
+/// signal to the operator that the device is mis-configured. A hard
+/// error union here would force every diagnostic call to either
+/// `try`-and-fail-the-init-path or `catch`-and-substitute-empty —
+/// substituting empty here is the same outcome with less plumbing.
 fn deviceNameCopy(pd: vk.VkPhysicalDevice, buf: []u8) []const u8 {
     const get_props = vk.vkGetPhysicalDeviceProperties_fn orelse return &.{};
     var props: vk.VkPhysicalDeviceProperties = .{};
