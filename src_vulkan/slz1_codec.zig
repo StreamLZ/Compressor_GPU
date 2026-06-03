@@ -520,24 +520,40 @@ pub fn decodeSlz1ToBytesEx(
     descriptors.resetAllPools(ctx, driver.getOrCreateDecodePipelineCache(ctx));
 
     // ── GPU decode pipeline: walk_frame → ... → gather_raw_off16 ──
-    // Produces pipeline_result.frame (compressed bytes uploaded
-    // device-side), pipeline_result.chunks (walk_frame's 6-u32 per
-    // chunk SlzChunkDesc), pipeline_result.meta (n_chunks /
-    // decomp_size / block_start). All three are LOAD-BEARING for the
-    // lz_decode dispatch below — there is no CPU unwrap path anymore.
     //
-    // The pipeline is run with no caller-side n_chunks hint because
-    // the host has not parsed the frame; the pipeline self-sizes from
-    // a frame-bytes-derived upper bound. The host reads `n_chunks`
-    // out of the meta buffer after `runDecodePipelineEx` returns
-    // (it does a fence-wait internally) and uses it to size the
-    // chunks descriptor + drive the lz_decode grid.
+    // S003: PREPARE the pipeline (buffer alloc + descriptor sets +
+    // pipeline build), but do NOT record/submit yet. The 5 GPU decode
+    // kernels' dispatches will be recorded into the SAME command buffer
+    // as l1_unwrap + lz_decode + dst→host copy below, riding ONE
+    // vkQueueSubmit + ONE vkWaitForFences. Mirrors the CUDA pattern at
+    // src/decode/decode_dispatch.zig:614-621 where the LZ kernel reads
+    // its self-gate count from the device-resident meta buffer
+    // (`d_n_chunks_dev = d_walk_meta + walk_meta_offsets.n_chunks`),
+    // eliminating the host fence wait between phases.
     last_decode_slz_unwrap_ns = 0; // legacy CPU-unwrap stage is gone
-    var pipeline_result = decode_pipeline_gpu.runDecodePipelineEx(
+    // S003: derive an n_chunks upper bound from the caller's out.len
+    // (host contract: out.len >= original_size). Each walk_frame
+    // ChunkDesc represents one 64 KiB sub-chunk
+    // (wire_constants.CHUNK_SIZE), so worst-case n_chunks =
+    // (out.len / 64 KiB) + 2. The frame-bytes-derived fallback in
+    // `prepareDecodePipeline` uses SLZ_CHUNK_SIZE_BYTES = 256 KiB which
+    // is the outer-block bound, NOT the sub-chunk bound — that's a
+    // 4× under-count for actual n_chunks. We override here with the
+    // tighter sub-chunk bound so the lz_decode grid covers every real
+    // chunk. For D2D-override callers `out.len` is 0 → fall back to
+    // the prepareDecodePipeline default.
+    const n_chunks_hint: u32 = if (opts.dst_buffer_override != null)
+        0
+    else
+        @intCast(@min(
+            @as(u64, decode_pipeline_gpu.WALK_MAX_CHUNKS),
+            (out.len / wire_constants.CHUNK_SIZE) + 2,
+        ));
+    var prepared = decode_pipeline_gpu.prepareDecodePipeline(
         ctx,
         allocator,
         slz_bytes,
-        .{},
+        .{ .n_chunks_hint = n_chunks_hint },
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.UnsupportedTier => return error.UnsupportedTier,
@@ -546,41 +562,41 @@ pub fn decodeSlz1ToBytesEx(
         error.TooManyChunks => return error.OutOfMemory,
         else => return error.OutOfMemory,
     };
-    defer decode_pipeline_gpu.destroyDecodeResult(ctx, &pipeline_result);
+    const pipeline_result = prepared.result;
 
-    if (pipeline_result.status != 0) return error.BadFrame;
-    if (pipeline_result.n_chunks == 0) return error.BadFrame;
+    // Worst-case sizing inputs derived from the frame size before submit.
+    // The real n_chunks and decomp_size live in `pipeline_result.meta`
+    // after the GPU dispatch chain runs; we read them post-fence at the
+    // bottom of this function to drive the host @memcpy. For all
+    // host-side ALLOC / DISPATCH / GRID decisions we use the worst-case
+    // upper bound (matches CUDA's `d_descs_persist` grow-only sizing at
+    // src/decode/decode_context.zig:35-43 — same shape: never shrink).
+    const n_chunks_max: u32 = prepared.n_chunks_max;
 
-    const n_chunks: u32 = pipeline_result.n_chunks;
-    const dst_total: u32 = pipeline_result.decomp_size;
-
-    // When dst_buffer_override is set, the `out` host slice may be
-    // empty — the codec writes only to the device buffer. The
-    // OutputTooSmall guard still fires for host-output paths.
+    // dst_total_max: upper bound on decompressed bytes for buffer
+    // sizing. When the caller passes a host `out` slice we trust their
+    // contract (out.len >= original_size); when they pass an
+    // override-only D2D path with empty `out`, dst sizing is irrelevant
+    // (the kernel writes to the caller's VkBuffer directly). The
+    // post-fence read of meta gives the real `decomp_size` for the
+    // host @memcpy size.
     const use_dst_override = opts.dst_buffer_override != null;
-    if (!use_dst_override and out.len < dst_total) return error.OutputTooSmall;
+    const dst_total_max: u32 = if (use_dst_override)
+        0
+    else
+        @intCast(@min(out.len, std.math.maxInt(u32)));
 
     // ── 16-u32 ChunkDescs (device-only) ─────────────────────────────
-    // This is the buffer l1_unwrap.comp WRITES and lz_decode.comp
-    // READS at binding 5. Per-chunk slots (see lz_decode.comp head
-    // comment): cmd/lit/off16/length/off32 byte bases + sizes,
-    // initial_copy, off32 counts, cmd_stream2_offset. Device-only —
-    // host never touches it.
-    //
-    // Pooled in the per-context decode workspace (`ws.chunks_16u32`)
-    // alongside the 14 pipeline-internal buffers and the 2 dst buffers
-    // below. Mirrors CUDA's `d_descs_persist` field
-    // (src/decode/decode_context.zig:207), grown lazily via
-    // `ensureDeviceBuf` at src/decode/decode_dispatch.zig:520 — same
-    // shape here. The alloc_ns timing slot reports the
-    // ensureWorkspaceBuf cost (~0 on warm calls; the first decode pays
-    // the buffer grow).
+    // S003: sized against worst-case n_chunks_max so the alloc happens
+    // BEFORE the GPU pipeline runs (we don't know the real n_chunks
+    // host-side yet). Mirrors CUDA's grow-only `ensureDeviceBuf` at
+    // src/decode/decode_context.zig:35: never shrink, only grow.
     const t_alloc_begin = qpcNow();
     const ws = driver.getOrCreateDecodeWorkspace(ctx) catch return error.OutOfMemory;
     try decode_workspace.ensureWorkspaceBuf(
         ctx,
         &ws.chunks_16u32,
-        @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * 16,
+        @as(vk.VkDeviceSize, n_chunks_max) * @sizeOf(u32) * 16,
         vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .device_local_only,
     );
@@ -618,12 +634,28 @@ pub fn decodeSlz1ToBytesEx(
     //
     // The shape decision lives here (per-call, cheap probe) so the
     // submit pattern downstream stays uniform: it's always one merged
-    // submitTwoWithCopy, with copy.size==0 (no copy emitted) for the
-    // single-buffer shape and copy.size==dst_total (full GPU staging
+    // dispatch chain, with copy.size==0 (no copy emitted) for the
+    // single-buffer shape and copy.size==dst_total_max (full GPU staging
     // copy with the compute→transfer barrier) for the two-buffer shape.
+    //
+    // S003: sized against `dst_total_max` (= out.len, the host
+    // contract) since we can't read the real decomp_size until after
+    // the merged fence wait. ensureWorkspaceBuf is grow-only so
+    // subsequent same-or-smaller calls are no-ops.
+    //
+    // PAD: lz_decode's warp-cooperative batched writes can land up to
+    // 32 bytes past the chunk's true decomp_size (the encoder pre-pads
+    // stream capacities so the unbounded `warpLiteralCopy` doesn't
+    // emit a bounds-check on every byte). Reserve 64 bytes of tail
+    // slack in dst_b so the kernel's over-write doesn't truncate the
+    // last batch when `out.len` is not 32-aligned. The CLI bench
+    // already pads dec_buf this way (cli_vk.zig:29 VK_SAFE_SPACE = 64
+    // → dec_buf_alloc_size = (src.len + 64 + 4095) & ~4095) which is
+    // why the bench passed but the L1 test failed before this pad.
+    const DST_TAIL_PAD: vk.VkDeviceSize = 64;
     const dst_buf_size: vk.VkDeviceSize = @max(
         @as(vk.VkDeviceSize, 4),
-        (@as(vk.VkDeviceSize, dst_total) + 3) & ~@as(vk.VkDeviceSize, 3),
+        (@as(vk.VkDeviceSize, dst_total_max) + DST_TAIL_PAD + 3) & ~@as(vk.VkDeviceSize, 3),
     );
 
     // ── Caller-pointer import path (preferred when supported) ──────
@@ -653,20 +685,25 @@ pub fn decodeSlz1ToBytesEx(
     // checks); previously that device fell into the two-buffer slow
     // path which paid both a 7.58 ms GPU staging copy AND a 9.50 ms
     // host @memcpy.
+    // S003: import_size is sized against `dst_total_max` (= out.len)
+    // because we don't know the real decomp_size host-side until after
+    // the merged fence wait. Caller's contract is out.len >= original
+    // bytes; the import covers the whole user buffer and the GPU only
+    // writes the first `decomp_size` bytes — the rest stay as-is.
     const ext_align: u64 = ctx.external_memory_host_alignment;
     const caller_ptr_aligned: bool = ext_align > 0 and
         (@intFromPtr(out.ptr) % ext_align) == 0;
     const import_size: vk.VkDeviceSize = if (ext_align > 0) blk_imp: {
         const a = ext_align;
-        const padded = (@as(u64, dst_total) + (a - 1)) & ~(a - 1);
-        // Caller's buffer must be big enough to hold the padded import
-        // size — out.len is the codec's only contract on the caller
-        // buffer size. When out.len < padded we fall back rather than
-        // overrunning the caller.
-        break :blk_imp if (padded <= out.len) @as(vk.VkDeviceSize, padded) else 0;
+        // Round DOWN to alignment (rather than up) so we never need
+        // padding past out.len. The dst→host copy uses the actual
+        // decomp_size (known post-fence) which is always ≤ out.len ≤
+        // import_size when import_size > 0.
+        const padded = @as(u64, dst_total_max) & ~(a - 1);
+        break :blk_imp @as(vk.VkDeviceSize, padded);
     } else 0;
     const use_caller_import: bool = !use_dst_override and
-        dst_total > 0 and
+        dst_total_max > 0 and
         ctx.has_external_memory_host and
         caller_ptr_aligned and
         import_size > 0;
@@ -794,13 +831,13 @@ pub fn decodeSlz1ToBytesEx(
     // Runs before any per-decode timing is captured so the diag work
     // does not pollute the dispatch/readback ns globals. Internally
     // gated by `diag_ran` so subsequent decode calls are no-ops.
-    if (!use_dst_override and dst_total > 0) {
+    if (!use_dst_override and dst_total_max > 0) {
         const want_profile: bool = blk2: {
             const raw = std.c.getenv("SLZ_VK_PROFILE_DECODE") orelse break :blk2 false;
             const s = std.mem.span(raw);
             break :blk2 s.len > 0 and s[0] != '0';
         };
-        if (want_profile) runReadbackDiagnostics(ctx, allocator, dst_total);
+        if (want_profile) runReadbackDiagnostics(ctx, allocator, dst_total_max);
     }
 
     // ── Descriptor sets ────────────────────────────────────────────
@@ -833,14 +870,18 @@ pub fn decodeSlz1ToBytesEx(
     };
     const unwrap_set = try descriptors.allocSet(ctx, cached_unwrap, unwrap_bindings[0..]);
 
+    // S003: lz_decode now reads n_chunks from a device-resident SSBO
+    // (binding 8 = WalkMeta) instead of a host push constant; push
+    // constant block removed from the shader. Pipeline-layout push
+    // size is therefore 0 and the binding count bumps 8 → 9.
     const cached_dec = try descriptors.getOrCreateWithPipelineCache(
         ctx,
         cache,
         "lz_decode",
         tier,
         dec_spv,
-        8,
-        @sizeOf(DecodePush),
+        9,
+        0,
         vk_pl_cache,
     );
 
@@ -865,7 +906,7 @@ pub fn decodeSlz1ToBytesEx(
         // a vkCmdCopyBuffer below stages it into dst_stage for
         // host readback.
         dst_b.buf;
-    const dec_bindings: [8]vk.VkDescriptorBufferInfo = .{
+    const dec_bindings: [9]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = pipeline_result.frame.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = pipeline_result.frame.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = pipeline_result.frame.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -876,42 +917,45 @@ pub fn decodeSlz1ToBytesEx(
         // Cluster A (F001/F002): walk_frame's GPU chunks output —
         // source of truth for dst_offset + decomp_size.
         .{ .buffer = pipeline_result.chunks.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        // S003: WalkMeta (binding 8) — n_chunks self-gate source.
+        // Mirrors CUDA's `d_n_chunks_dev = d_walk_meta + walk_meta_offsets
+        // .n_chunks` pattern (src/decode/decode_dispatch.zig:614-621).
+        // Bound to `n_chunks_scratch` (device-local 1×u32) rather than the
+        // host-visible meta buffer; the GPU pipeline copies meta[0] →
+        // n_chunks_scratch as part of recordDecodePipelineInto, so the
+        // value is identical and lz_decode reads from VRAM at full
+        // bandwidth (the sysmem meta buffer would otherwise cost a
+        // through-PCIe read per subgroup).
+        .{ .buffer = pipeline_result.n_chunks_scratch.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
     };
     const dec_set = try descriptors.allocSet(ctx, cached_dec, dec_bindings[0..]);
 
-    const dec_push: DecodePush = .{ .n_chunks = n_chunks };
-    var dec_push_bytes: [@sizeOf(DecodePush)]u8 = undefined;
-    @memcpy(dec_push_bytes[0..], std.mem.asBytes(&dec_push));
-
     last_decode_slz_descset_ns = qpcNs(t_descset_begin, qpcNow());
 
-    // ── Merged dispatch: l1_unwrap + lz_decode + dst→stage copy in
-    // one cmdbuf + one submit + one fence wait. Saves one
-    // vkQueueSubmit/vkWaitForFences round-trip per decode call vs the
-    // previous two-submit pattern (measured ~0.4 ms / call on NVIDIA
-    // RTX 4060 Ti, ~4 ms / call on Intel iGPU at the time of the
-    // merge). When the caller supplied a D2D dst override the copy
-    // step collapses to size=0 (no barrier, no vkCmdCopyBuffer) and
-    // the kernel's writes land directly in the caller's VkBuffer. ─
+    // ── S003 single-submit merged dispatch ──────────────────────────
+    //
+    // Records the entire decode pipeline + l1_unwrap + lz_decode +
+    // dst→host copy into ONE command buffer with ONE vkQueueSubmit and
+    // ONE vkWaitForFences. Saves one host↔GPU round-trip vs the prior
+    // two-submit pattern (~5-8 ms / 95 MB enwik8 on NVIDIA RTX 4060 Ti).
+    // lz_decode's self-gate count is read from WalkMeta (binding 8) so
+    // the host no longer needs to know n_chunks before recording.
     const t_dispatch_begin = qpcNow();
     const unwrap_push: UnwrapPush = .{ .frame_size = @intCast(slz_bytes.len) };
     var unwrap_push_bytes: [@sizeOf(UnwrapPush)]u8 = undefined;
     @memcpy(unwrap_push_bytes[0..], std.mem.asBytes(&unwrap_push));
 
-    // copy_size==0 → single-buffer path: kernel wrote straight into
-    // dst_stage (HOST_CACHED), no GPU staging copy needed; the COPY
-    // timestamp pair gets written but the resulting copy_ns is 0.
-    // copy_size==dst_total + dst_dst=caller_imported → caller-import
-    // path: dst_b → caller's host pointer via the GPU's DMA engine, no
-    // post-submit host @memcpy.
-    // copy_size==dst_total + dst_dst=dst_stage → two-buffer slow path:
-    // dst_b → dst_stage, then a host @memcpy below moves dst_stage → out.
-    // copy_size==0 when use_dst_override → D2D-style: caller's buffer
-    // is the kernel target, no copy needed.
-    const copy_size: vk.VkDeviceSize = if (use_dst_override or dst_total == 0 or direct_write)
+    // copy_size selection: 0 for single-buffer (kernel wrote into
+    // dst_stage directly) or D2D override; otherwise the worst-case
+    // dst_total_max bytes (= out.len). The actual decomp_size is only
+    // known post-fence — we over-copy a few bytes when decomp_size <
+    // out.len, but those bytes are either tail-zero in the dst_b
+    // buffer or pre-existing in the caller's buffer. We trim by using
+    // the actual decomp_size for the host @memcpy at the bottom.
+    const copy_size: vk.VkDeviceSize = if (use_dst_override or dst_total_max == 0 or direct_write)
         0
     else
-        @as(vk.VkDeviceSize, dst_total);
+        @as(vk.VkDeviceSize, dst_total_max);
     const copy_src: vk.VkBuffer = if (copy_size == 0) null else dst_b.buf;
     const copy_dst: vk.VkBuffer = if (copy_size == 0)
         null
@@ -920,78 +964,67 @@ pub fn decodeSlz1ToBytesEx(
     else
         dst_stage.buf;
 
-    // Mirror CUDA src/decode/decode_dispatch.zig:400-401
-    //   lz_groups = (total_chunks + chunks_per_group - 1) / chunks_per_group;
-    //   lz_grid_x = (lz_groups + 1) / 2;            // = ceil(lz_groups / WARPS_PER_BLOCK)
-    // and src/decode/decode_dispatch.zig:430/451 which launches the kernel
-    // with `block(32, 2, 1)` = WARPS_PER_BLOCK = 2 warps per block.
-    //
-    // In the Vulkan port each walk_frame ChunkDesc already represents one
-    // 64 KiB sub-chunk (sc_group_size = 0.25; src_vulkan/wire_constants.zig:42),
-    // so the wire-format equivalent of `chunks_per_group` is 1 and
-    // `lz_groups == n_chunks`. The lz_decode.comp shader handles 2 chunks
-    // per workgroup via `chunk_id = gl_WorkGroupID.x * WARPS_PER_BLOCK + gl_SubgroupID`,
-    // matching CUDA src/decode/lz_decode_kernels.cuh:47.
+    // Mirror CUDA src/decode/decode_dispatch.zig:400-401 grid sizing
+    // (lz_groups / WARPS_PER_BLOCK). With chunks_per_group = 1 and
+    // WARPS_PER_BLOCK = 2, the grid_x is ceil(n_chunks / 2). We use
+    // `n_chunks_max` here because the host doesn't know the real
+    // n_chunks (still living in pipeline_result.meta, read post-fence).
+    // The lz_decode shader self-gates on `chunk_id >= walk_meta_buf.w[0]`
+    // so extra workgroups beyond real n_chunks early-exit.
     const WARPS_PER_BLOCK: u32 = 2;
-    const lz_grid_x: u32 = (n_chunks + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-    const dec_dispatch_result = try dispatch.submitTwoWithCopyLabeled(
+    const lz_grid_x: u32 = (n_chunks_max + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+
+    const dec_dispatch_result = try recordAndSubmitMergedDecode(
         ctx,
+        &prepared,
+        chunks_b,
         .{
             .pipeline = cached_unwrap.pipeline,
             .pipeline_layout = cached_unwrap.pipeline_layout,
             .descriptor_set = unwrap_set,
             .push_constants_bytes = unwrap_push_bytes[0..],
-            .group_count = .{ n_chunks, 1, 1 },
+            .group_count = .{ n_chunks_max, 1, 1 },
             .label = "l1_unwrap",
         },
         .{
             .pipeline = cached_dec.pipeline,
             .pipeline_layout = cached_dec.pipeline_layout,
             .descriptor_set = dec_set,
-            .push_constants_bytes = dec_push_bytes[0..],
+            .push_constants_bytes = &.{},
             .group_count = .{ lz_grid_x, 1, 1 },
             .label = "lz_decode",
         },
-        // Inter-dispatch barrier on the chunks buffer that l1_unwrap
-        // writes (binding 3 in its set) and lz_decode reads (binding 5
-        // in its set). All other lz_decode inputs are either already
-        // visible from `vkQueueSubmit`'s implicit host→queue domain
-        // transition (the compressed frame uploaded before submit) or
-        // produced by the GPU decode pipeline that ran with its own
-        // fence wait inside `runDecodePipelineEx`.
-        chunks_b.buf,
-        vk.VK_WHOLE_SIZE,
         .{
             .src = copy_src,
             .dst = copy_dst,
             .size = copy_size,
         },
-        "dst_b->dst_stage",
     );
     last_decode_slz_dispatch_ns = qpcNs(t_dispatch_begin, qpcNow());
 
-    // The merged submit collapses the previous unwrap-submit's
-    // per-call wall (record/submit/wait/query) into the single
-    // submitTwoWithCopy call below. There is no separate l1_unwrap
-    // submit any more, so the unwrap_* globals stay at zero — kept
-    // around so the SLZ_VK_PROFILE_DECODE=1 printer doesn't need an
-    // out-of-band conditional.
+    // ── Post-fence: read meta to get the real n_chunks + decomp_size
+    // for status validation + host @memcpy sizing. Meta is host-visible
+    // sysmem (mapped pointer); the read is a few cached u32 loads.
+    const meta_words: [*]const u32 = if (pipeline_result.meta.mapped) |m|
+        @ptrCast(@alignCast(m))
+    else
+        return error.MapMemoryFailed;
+    const actual_n_chunks: u32 = meta_words[decode_pipeline_gpu.WALK_META_N_CHUNKS_SLOT];
+    const actual_decomp_size: u32 = meta_words[decode_pipeline_gpu.WALK_META_DECOMP_SIZE_SLOT];
+    const actual_status: u32 = meta_words[decode_pipeline_gpu.WALK_META_STATUS_SLOT];
+    if (actual_status != 0) return error.BadFrame;
+    if (actual_n_chunks == 0) return error.BadFrame;
+    if (!use_dst_override and out.len < actual_decomp_size) return error.OutputTooSmall;
+
+    // Unwrap-submit globals stay at zero — the merged submit collapses
+    // the previous unwrap-submit's per-call wall into the single
+    // recordAndSubmitMergedDecode call above.
     last_decode_slz_unwrap_submit_wait_wall_ns = 0;
     last_decode_slz_unwrap_record_ns = 0;
     last_decode_slz_unwrap_submit_call_ns = 0;
     last_decode_slz_unwrap_wait_call_ns = 0;
     last_decode_slz_unwrap_query_read_ns = 0;
-    // Phase 4: surface the GPU-side dispatch ns so the CLI bench
-    // and `slzGetLastTimings_vk` callers can report `d2d` numbers
-    // for the SLZ1 decode path. `decodeL1Sync` writes the same
-    // global from its own dispatch site (the lower-level direct
-    // codec); this path is the one the SLZ1 wire-format unwrap
-    // takes, so wiring it here closes the missing path.
     l1_codec.last_decode_dispatch_ns = dec_dispatch_result.ns;
-    // Readback-cost diagnostic globals: kernel GPU ns, GPU-side
-    // vkCmdCopyBuffer ns, host-wall around submit+fence-wait. All
-    // sourced from the per-submitOneWithCopy `DispatchResult` that
-    // dispatch.zig fills via the 4-slot timestamp pool + QPC.
     last_decode_slz_gpu_kernel_ns = dec_dispatch_result.ns;
     last_decode_slz_gpu_copy_ns = dec_dispatch_result.copy_ns;
     last_decode_slz_submit_wait_wall_ns = dec_dispatch_result.submit_wait_wall_ns;
@@ -1008,18 +1041,234 @@ pub fn decodeSlz1ToBytesEx(
     // src/decode/decode_dispatch.zig:485). Two-buffer slow path
     // still reads from dst_stage (sysmem, driver-cached).
     const t_readback_begin = qpcNow();
-    if (!use_dst_override and dst_total > 0 and !caller_import_active) {
+    if (!use_dst_override and actual_decomp_size > 0 and !caller_import_active) {
         const stage_mapped = dst_stage.mapped orelse return error.MapMemoryFailed;
-        @memcpy(out[0..dst_total], stage_mapped[0..dst_total]);
+        @memcpy(out[0..actual_decomp_size], stage_mapped[0..actual_decomp_size]);
     }
     last_decode_slz_readback_ns = qpcNs(t_readback_begin, qpcNow());
 
-    // No per-call teardown: the imported VkBuffer + VkDeviceMemory
-    // pair is owned by `ws.caller_imported` and freed once in
-    // `driver.deinit` (via decode_workspace.deinit). Repeat calls
-    // with the same `(out.ptr, import_size)` reuse the cached import
-    // and pay zero driver allocation cost — collapsing the ~7 ms /
-    // call VK_EXT_external_memory_host overhead that was eating the
-    // staging-copy savings before this cache landed.
-    return dst_total;
+    return actual_decomp_size;
+}
+
+/// S003: record the GPU decode pipeline + l1_unwrap + lz_decode +
+/// dst→host copy into ONE command buffer; submit; wait. Replaces the
+/// pre-S003 split of (runDecodePipelineEx fence wait) + (dispatch
+/// .submitTwoWithCopyLabeled fence wait) so the host pays ONE
+/// vkQueueSubmit + ONE vkWaitForFences per decode call.
+///
+/// Mirrors the CUDA pattern at src/decode/decode_dispatch.zig:614-621:
+/// the back-half LZ kernel reads its self-gate count from device-
+/// resident meta memory — no host round-trip between phases.
+fn recordAndSubmitMergedDecode(
+    ctx: *driver.Context,
+    prepared: *decode_pipeline_gpu.PreparedDecodePipeline,
+    chunks_b: l1_codec.Buffer,
+    unwrap_spec: dispatch.DispatchSpec,
+    dec_spec: dispatch.DispatchSpec,
+    copy: dispatch.CopyOp,
+) dispatch.DispatchError!dispatch.DispatchResult {
+    try dispatch.ensureChassisPub(ctx);
+
+    const reset_cb = vk.vkResetCommandBuffer_fn orelse return error.LoaderNotReady;
+    const begin_cb = vk.vkBeginCommandBuffer_fn orelse return error.LoaderNotReady;
+    const end_cb = vk.vkEndCommandBuffer_fn orelse return error.LoaderNotReady;
+    const cmd_reset_qp = vk.vkCmdResetQueryPool_fn orelse return error.LoaderNotReady;
+    const cmd_write_ts = vk.vkCmdWriteTimestamp_fn orelse return error.LoaderNotReady;
+    const cmd_bind_pl = vk.vkCmdBindPipeline_fn orelse return error.LoaderNotReady;
+    const cmd_bind_ds = vk.vkCmdBindDescriptorSets_fn orelse return error.LoaderNotReady;
+    const cmd_dispatch = vk.vkCmdDispatch_fn orelse return error.LoaderNotReady;
+    const cmd_copy = vk.vkCmdCopyBuffer_fn orelse return error.LoaderNotReady;
+    const cmd_barrier = vk.vkCmdPipelineBarrier_fn orelse return error.LoaderNotReady;
+    const reset_fence = vk.vkResetFences_fn orelse return error.LoaderNotReady;
+    const submit_fn = vk.vkQueueSubmit_fn orelse return error.LoaderNotReady;
+    const wait_fence = vk.vkWaitForFences_fn orelse return error.LoaderNotReady;
+    const get_results = vk.vkGetQueryPoolResults_fn orelse return error.LoaderNotReady;
+
+    const t_record_begin = qpcNow();
+    if (reset_cb(ctx.cmd_buf, 0) != vk.VK_SUCCESS) return error.ResetCommandBufferFailed;
+
+    const begin_info: vk.VkCommandBufferBeginInfo = .{
+        .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (begin_cb(ctx.cmd_buf, &begin_info) != vk.VK_SUCCESS) return error.BeginCommandBufferFailed;
+
+    cmd_reset_qp(ctx.cmd_buf, ctx.query_pool, 0, dispatch.TS_SLOT_COUNT);
+
+    // ── Phase 1: GPU decode pipeline (frame_staging→frame DMA + walk_
+    //    frame + prefix_sum + scan_parse + 4× compact_huff + compact_raw
+    //    + gather_raw_off16). recordDecodePipelineInto leaves a
+    //    SHADER_WRITE→SHADER_READ barrier on COMPUTE_SHADER at its end. ─
+    decode_pipeline_gpu.recordDecodePipelineInto(ctx, ctx.cmd_buf, prepared.*) catch |err| switch (err) {
+        error.LoaderNotReady => return error.LoaderNotReady,
+        // recordDecodePipelineInto can only fail with LoaderNotReady or
+        // OutOfMemory (latter only if workspace re-init races, which
+        // can't happen here since `prepareDecodePipeline` already ran).
+        // Fold every other variant into LoaderNotReady so this function
+        // can stay in dispatch.DispatchError without leaking pipeline-
+        // specific error variants.
+        else => return error.LoaderNotReady,
+    };
+
+    // ── Phase 2: l1_unwrap (untimed — fast, the legacy code didn't
+    //    time it either when riding submitTwoWithCopy). ─
+    cmd_bind_pl(ctx.cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, unwrap_spec.pipeline);
+    {
+        const sets: [1]vk.VkDescriptorSet = .{unwrap_spec.descriptor_set};
+        cmd_bind_ds(ctx.cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, unwrap_spec.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
+    }
+    if (unwrap_spec.push_constants_bytes.len > 0) {
+        const cmd_push = vk.vkCmdPushConstants_fn orelse return error.LoaderNotReady;
+        cmd_push(ctx.cmd_buf, unwrap_spec.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @intCast(unwrap_spec.push_constants_bytes.len), @ptrCast(unwrap_spec.push_constants_bytes.ptr));
+    }
+    cmd_dispatch(ctx.cmd_buf, unwrap_spec.group_count[0], unwrap_spec.group_count[1], unwrap_spec.group_count[2]);
+
+    // Inter-dispatch barrier on chunks_b (l1_unwrap writes; lz_decode
+    // reads at binding 5). Also covers the WalkMeta read at lz_decode's
+    // binding 8 — the global compute→compute SHADER_WRITE→SHADER_READ
+    // mb from recordDecodePipelineInto's tail already covered the
+    // meta visibility, but a per-buffer chunks_b barrier here is the
+    // minimal correct sync for the new chunks descriptor.
+    {
+        const bbarrier: vk.VkBufferMemoryBarrier = .{
+            .srcAccessMask = vk.VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT,
+            .srcQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
+            .buffer = chunks_b.buf,
+            .offset = 0,
+            .size = vk.VK_WHOLE_SIZE,
+        };
+        const bbarriers: [1]vk.VkBufferMemoryBarrier = .{bbarrier};
+        cmd_barrier(
+            ctx.cmd_buf,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            0,
+            null,
+            1,
+            @ptrCast(&bbarriers),
+            0,
+            null,
+        );
+    }
+
+    // ── Phase 3: lz_decode (timestamp-bracketed for kernel ns) ─
+    cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_BEGIN);
+    cmd_bind_pl(ctx.cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, dec_spec.pipeline);
+    {
+        const sets: [1]vk.VkDescriptorSet = .{dec_spec.descriptor_set};
+        cmd_bind_ds(ctx.cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, dec_spec.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
+    }
+    if (dec_spec.push_constants_bytes.len > 0) {
+        const cmd_push = vk.vkCmdPushConstants_fn orelse return error.LoaderNotReady;
+        cmd_push(ctx.cmd_buf, dec_spec.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @intCast(dec_spec.push_constants_bytes.len), @ptrCast(dec_spec.push_constants_bytes.ptr));
+    }
+    cmd_dispatch(ctx.cmd_buf, dec_spec.group_count[0], dec_spec.group_count[1], dec_spec.group_count[2]);
+    cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_END);
+
+    // ── Phase 4: dst→host copy (compute→transfer barrier, skipped when
+    //    copy.size == 0). The COPY_BEGIN/END timestamps are written
+    //    regardless so the query read below has defined values. ─
+    const has_copy = copy.size != 0;
+    if (has_copy) {
+        const cbarrier: vk.VkBufferMemoryBarrier = .{
+            .srcAccessMask = vk.VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = vk.VK_ACCESS_TRANSFER_READ_BIT,
+            .srcQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
+            .buffer = copy.src,
+            .offset = copy.src_offset,
+            .size = copy.size,
+        };
+        const cbarriers: [1]vk.VkBufferMemoryBarrier = .{cbarrier};
+        cmd_barrier(
+            ctx.cmd_buf,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0,
+            0,
+            null,
+            1,
+            @ptrCast(&cbarriers),
+            0,
+            null,
+        );
+    }
+
+    cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_COPY_BEGIN);
+    if (has_copy) {
+        const region: vk.VkBufferCopy = .{
+            .srcOffset = copy.src_offset,
+            .dstOffset = copy.dst_offset,
+            .size = copy.size,
+        };
+        const regions: [1]vk.VkBufferCopy = .{region};
+        cmd_copy(ctx.cmd_buf, copy.src, copy.dst, 1, @ptrCast(&regions));
+    }
+    cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_COPY_END);
+
+    if (end_cb(ctx.cmd_buf) != vk.VK_SUCCESS) return error.EndCommandBufferFailed;
+    const record_ns = qpcNs(t_record_begin, qpcNow());
+
+    // ── Single submit + single wait ─
+    const fences: [1]vk.VkFence = .{ctx.fence};
+    if (reset_fence(ctx.dev, 1, @ptrCast(&fences)) != vk.VK_SUCCESS) return error.ResetFenceFailed;
+    const cmd_bufs: [1]vk.VkCommandBuffer = .{ctx.cmd_buf};
+    const submit_info: vk.VkSubmitInfo = .{
+        .commandBufferCount = 1,
+        .pCommandBuffers = @ptrCast(&cmd_bufs),
+    };
+    const submits: [1]vk.VkSubmitInfo = .{submit_info};
+    const t_submit_begin = qpcNow();
+    if (submit_fn(ctx.queue, 1, @ptrCast(&submits), ctx.fence) != vk.VK_SUCCESS) return error.SubmitFailed;
+    const t_submit_end = qpcNow();
+    const submit_call_ns = qpcNs(t_submit_begin, t_submit_end);
+
+    const wait_result = wait_fence(ctx.dev, 1, @ptrCast(&fences), vk.VK_TRUE, vk.VK_M8A_FENCE_WAIT_NS);
+    const t_wait_end = qpcNow();
+    const wait_call_ns = qpcNs(t_submit_end, t_wait_end);
+    const submit_wait_ns = qpcNs(t_submit_begin, t_wait_end);
+    if (wait_result == vk.VK_TIMEOUT) return error.FenceWaitTimeout;
+    if (wait_result != vk.VK_SUCCESS) return error.FenceWaitFailed;
+
+    var ts: [dispatch.TS_SLOT_COUNT]u64 = .{ 0, 0, 0, 0 };
+    const t_query_begin = qpcNow();
+    const res = get_results(
+        ctx.dev,
+        ctx.query_pool,
+        0,
+        dispatch.TS_SLOT_COUNT,
+        @sizeOf(@TypeOf(ts)),
+        @ptrCast(&ts),
+        @sizeOf(u64),
+        vk.VK_QUERY_RESULT_64_BIT | vk.VK_QUERY_RESULT_WAIT_BIT,
+    );
+    const query_read_ns = qpcNs(t_query_begin, qpcNow());
+    if (res != vk.VK_SUCCESS) return error.QueryReadFailed;
+
+    const delta_ticks: u64 = if (ts[dispatch.TS_SLOT_END] >= ts[dispatch.TS_SLOT_BEGIN])
+        ts[dispatch.TS_SLOT_END] - ts[dispatch.TS_SLOT_BEGIN]
+    else
+        0;
+    const period = if (ctx.timestamp_period_ns > 0.0) ctx.timestamp_period_ns else 1.0;
+    const ns_f: f64 = @as(f64, @floatFromInt(delta_ticks)) * @as(f64, period);
+    const ns: u64 = if (ns_f <= 0.0) 0 else @intFromFloat(ns_f);
+
+    const copy_ticks: u64 = if (ts[dispatch.TS_SLOT_COPY_END] >= ts[dispatch.TS_SLOT_COPY_BEGIN])
+        ts[dispatch.TS_SLOT_COPY_END] - ts[dispatch.TS_SLOT_COPY_BEGIN]
+    else
+        0;
+    const copy_ns_f: f64 = @as(f64, @floatFromInt(copy_ticks)) * @as(f64, period);
+    const copy_ns: u64 = if (copy_ns_f <= 0.0) 0 else @intFromFloat(copy_ns_f);
+
+    return .{
+        .ns = ns,
+        .copy_ns = copy_ns,
+        .submit_wait_wall_ns = submit_wait_ns,
+        .record_wall_ns = record_ns,
+        .submit_call_ns = submit_call_ns,
+        .wait_call_ns = wait_call_ns,
+        .query_read_ns = query_read_ns,
+    };
 }

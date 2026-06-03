@@ -567,12 +567,58 @@ pub fn runDecodePipeline(
     return runDecodePipelineEx(ctx, allocator, slz_bytes, .{});
 }
 
-pub fn runDecodePipelineEx(
+/// S003: prepared state shared between buffer allocation + recording.
+/// Holds every workspace-resident buffer view, every descriptor set, the
+/// loaded pipeline cache entries, and the per-call sizing derived from
+/// `slz_bytes.len`. `prepareDecodePipeline` populates this; either
+/// `runDecodePipelineEx` (legacy stand-alone driver) or `recordDecodePipelineInto`
+/// (S003 single-submit caller in slz1_codec.zig) consumes it. The split
+/// lets the new caller record the GPU decode pipeline + l1_unwrap +
+/// lz_decode + dst→host copy into one cmdbuf with one vkQueueSubmit
+/// instead of the old two-submit pattern.
+pub const PreparedDecodePipeline = struct {
+    result: DecodeResult,
+    pipes: Pipelines,
+    walk_set: vk.VkDescriptorSet,
+    prefix_set: vk.VkDescriptorSet,
+    scan_set: vk.VkDescriptorSet,
+    compact_lit_set: vk.VkDescriptorSet,
+    compact_tok_set: vk.VkDescriptorSet,
+    compact_hi_set: vk.VkDescriptorSet,
+    compact_lo_set: vk.VkDescriptorSet,
+    compact_raw_set: vk.VkDescriptorSet,
+    gather_set: vk.VkDescriptorSet,
+    // Sizing derived from slz_bytes.len + hint — needed at record time
+    // for grid sizing, vkCmdFillBuffer ranges, and descriptor offsets.
+    n_chunks_max: u32,
+    max_total_subchunks: u32,
+    huff_arr_bytes: vk.VkDeviceSize,
+    raw_arr_bytes: vk.VkDeviceSize,
+    staged_bytes: vk.VkDeviceSize,
+    chunks_bytes: vk.VkDeviceSize,
+    first_sub_bytes: vk.VkDeviceSize,
+    meta_bytes: vk.VkDeviceSize,
+    frame_bytes: vk.VkDeviceSize,
+    slz_len_u32: u32,
+};
+
+/// S003: allocate every workspace slot this pipeline needs, build/cache
+/// the 6 pipelines + 9 descriptor sets, and stage the compressed input
+/// into the host-visible `frame_staging` slot. Does NOT record any
+/// commands and does NOT submit; the caller invokes
+/// `recordDecodePipelineInto` against an already-begun command buffer.
+///
+/// This is the post-S003 entry point that lets slz1_codec.zig record the
+/// pipeline phases + l1_unwrap + lz_decode + dst→host copy into a single
+/// command buffer with one vkQueueSubmit, replacing the legacy
+/// `runDecodePipelineEx` (which still exists for any caller that wants
+/// the stand-alone submit-and-wait shape).
+pub fn prepareDecodePipeline(
     ctx: *driver.Context,
     allocator: std.mem.Allocator,
     slz_bytes: []const u8,
     hints: PipelineHints,
-) PipelineError!DecodeResult {
+) PipelineError!PreparedDecodePipeline {
     if (slz_bytes.len == 0) return error.BadFrame;
     if (slz_bytes.len > std.math.maxInt(u32)) return error.BadFrame;
 
@@ -585,20 +631,7 @@ pub fn runDecodePipelineEx(
     };
     const tier_b = tierBlob(tier) orelse return error.UnsupportedTier;
 
-    // Right-size the staged / compact / scratch buffers against the
-    // caller's hint (or a frame-size-derived upper bound). Off16 scratch
-    // is `n_chunks_max * MAX_SUB_CHUNKS_PER_CHUNK * 128 KiB`; at
-    // WALK_MAX_CHUNKS that's 8 GiB, which exceeds available VRAM on
-    // every Tier-2 device. The CUDA reference (`decode_dispatch.zig`
-    // line 541-549) does the same right-sizing pass using a
-    // host-known n_chunks.
-    //
-    // SLZ_CHUNK_SIZE_BYTES = 256 KiB is the maximum compressed-block
-    // boundary the wire format admits; the worst-case n_chunks is
-    // `(decomp_size / SLZ_CHUNK_SIZE_BYTES) + 2`. We use `slz_bytes.len`
-    // as a proxy upper bound for decomp_size (compressed is always
-    // ≤ decompressed) plus a safety pad.
-    const slz_chunk_size_bytes: u32 = SLZ_CHUNK_SIZE_BYTES; // 256 KiB (wire-format outer block bound)
+    const slz_chunk_size_bytes: u32 = SLZ_CHUNK_SIZE_BYTES;
     const n_chunks_max: u32 = if (hints.n_chunks_hint != 0)
         @max(hints.n_chunks_hint, 1)
     else
@@ -610,41 +643,8 @@ pub fn runDecodePipelineEx(
     const max_total_subchunks: u32 = n_chunks_max * MAX_SUB_CHUNKS_PER_CHUNK;
 
     var result: DecodeResult = .{};
-    // No errdefer destroyDecodeResult — the workspace owns lifetimes
-    // across calls and is freed once at driver.deinit. A pipeline-build
-    // failure simply leaves the partially-grown workspace in place;
-    // subsequent decode calls reuse whatever was already allocated.
-    // Matches CUDA's behavior: a mid-decode error in
-    // `src/decode/decode_dispatch.zig:uploadInputAndPrefixSum` doesn't
-    // free the DecodeContext's slots either — they stay allocated for
-    // the next call.
-
-    // ── 1. Acquire (or lazily allocate) the per-context workspace pool
-    //    that owns every buffer below across decode invocations. Mirrors
-    //    CUDA's `self.<slot>` reads in src/decode/decode_dispatch.zig
-    //    that read straight off the long-lived DecodeContext.
     const ws = driver.getOrCreateDecodeWorkspace(ctx) catch return error.OutOfMemory;
 
-    // ── 2. Grow workspace slots to fit this call's frame sizing ──────
-    //
-    // Every `ensureWorkspaceBuf` call mirrors CUDA's `ensureDeviceBuf`
-    // (src/decode/decode_context.zig:35): no-op when the existing
-    // allocation is already large enough, otherwise free + reallocate.
-    // First call grows everything; subsequent calls of the same or
-    // smaller size are pure no-ops — no vkAllocateMemory / vkFreeMemory
-    // traffic at all on the steady-state path.
-
-    // S007: Frame = device-local-only storage buffer (no host visibility);
-    // a sibling host_visible_sysmem `frame_staging` buffer takes the
-    // host @memcpy and a vkCmdCopyBuffer at the top of the command
-    // buffer DMA-copies staging → frame. This avoids the slow BAR
-    // window writes (~3 GB/s on NVIDIA discrete without rebar) the
-    // previous host_visible_prefer_device_local placement paid for the
-    // 58 MB compressed enwik8 input. Mirrors CUDA's
-    // `procs.h2d(d_comp_persist, src, ...)` at
-    // src/decode/decode_dispatch.zig:570 (cudaMemcpyAsync from pinned
-    // host into the device-resident input pool — uses the copy engine,
-    // not a CPU-side BAR write).
     const frame_bytes: vk.VkDeviceSize = @intCast((slz_bytes.len + 3) & ~@as(usize, 3));
     try decode_workspace.ensureWorkspaceBuf(
         ctx,
@@ -662,16 +662,10 @@ pub fn runDecodePipelineEx(
         .host_visible_sysmem,
     );
 
-    // Chunks: WALK_MAX_CHUNKS * 6 u32 (walk_frame is unconditionally
-    // sized at WALK_MAX_CHUNKS because the kernel's max_chunks bound
-    // protects it from overflow). At 16384 chunks this is ~400 KiB —
-    // small enough to leave at the worst case regardless of hint.
     const chunks_bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, WALK_MAX_CHUNKS) * CHUNK_DESC_U32_COUNT * 4;
     try decode_workspace.ensureWorkspaceBuf(ctx, &ws.chunks, chunks_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
     result.chunks = ws.chunks.buffer;
 
-    // Meta: 6 u32. host_visible_sysmem because we read the count + status
-    // on the host immediately after the dispatch chain.
     const meta_bytes: vk.VkDeviceSize = WALK_META_U32_COUNT * 4;
     try decode_workspace.ensureWorkspaceBuf(
         ctx,
@@ -682,18 +676,13 @@ pub fn runDecodePipelineEx(
     );
     result.meta = ws.meta.buffer;
 
-    // FirstSubIdx: WALK_MAX_CHUNKS u32.
     const first_sub_bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, WALK_MAX_CHUNKS) * 4;
     try decode_workspace.ensureWorkspaceBuf(ctx, &ws.first_sub_idx, first_sub_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
     result.first_sub_idx = ws.first_sub_idx.buffer;
 
-    // TotalSubs: 1 u32.
     try decode_workspace.ensureWorkspaceBuf(ctx, &ws.total_subs, 4, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
     result.total_subs = ws.total_subs.buffer;
 
-    // NChunks scratch: 1 u32 (for the scan kernel self-gate). Initialised
-    // by a tiny vkCmdCopyBuffer from the meta buffer below — see the
-    // dispatch sequence.
     try decode_workspace.ensureWorkspaceBuf(
         ctx,
         &ws.n_chunks_scratch,
@@ -703,17 +692,12 @@ pub fn runDecodePipelineEx(
     );
     result.n_chunks_scratch = ws.n_chunks_scratch.buffer;
 
-    // Staged: [lit][tok][hi][lo] huff + [raw_hi][raw_lo] raw, each at
-    // max_total_subchunks count. Single device buffer; the four huff
-    // bindings + two raw bindings split it at offsets.
     const huff_arr_bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, max_total_subchunks) * SCANHUFF_U32_COUNT * 4;
     const raw_arr_bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, max_total_subchunks) * SCANRAW_U32_COUNT * 4;
     const staged_bytes: vk.VkDeviceSize = huff_arr_bytes * 4 + raw_arr_bytes * 2;
     try decode_workspace.ensureWorkspaceBuf(ctx, &ws.staged, staged_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
     result.staged = ws.staged.buffer;
 
-    // Compact buffers: one per stream type. Sized against worst-case
-    // per-stream output counts (matches CUDA's `huff_compact_max`).
     const huff_compact_bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, max_total_subchunks) * HUFFDESC_U32_COUNT * 4;
     const raw_compact_bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, max_total_subchunks * 2) * RAWDESC_U32_COUNT * 4;
     try decode_workspace.ensureWorkspaceBuf(ctx, &ws.compact_lit, huff_compact_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
@@ -727,10 +711,6 @@ pub fn runDecodePipelineEx(
     try decode_workspace.ensureWorkspaceBuf(ctx, &ws.compact_raw, raw_compact_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
     result.compact_raw = ws.compact_raw.buffer;
 
-    // Compact counts: [n_lit, n_tok, n_hi, n_lo, n_raw, n_merged].
-    // The 5 GLSL compact kernels each take a writeonly 1-u32 NOut SSBO;
-    // we sub-bind into this 6-u32 buffer via per-binding `VkDescriptor
-    // BufferInfo.offset` so all five writes land in one device alloc.
     try decode_workspace.ensureWorkspaceBuf(
         ctx,
         &ws.compact_counts,
@@ -740,8 +720,6 @@ pub fn runDecodePipelineEx(
     );
     result.compact_counts = ws.compact_counts.buffer;
 
-    // Off16 entropy scratch — sized at worst-case total_subchunks slots,
-    // each slot ENTROPY_SCRATCH_SLOT_BYTES wide.
     const off16_scratch_bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, max_total_subchunks) * ENTROPY_SCRATCH_SLOT_BYTES;
     try decode_workspace.ensureWorkspaceBuf(
         ctx,
@@ -752,14 +730,8 @@ pub fn runDecodePipelineEx(
     );
     result.off16_scratch = ws.off16_scratch.buffer;
 
-    // ── 2. Populate frame STAGING from slz_bytes (sysmem write, full
-    //    host bandwidth). A vkCmdCopyBuffer recorded below DMAs
-    //    staging → frame at GPU copy-engine speed. ──────────────────
     if (ws.frame_staging.buffer.mapped) |m| {
         @memcpy(m[0..slz_bytes.len], slz_bytes);
-        // Pad to 4-byte alignment of frame_buf.w[]; bytes past
-        // slz_bytes.len are never read (walk_frame guards against
-        // frame_size > pc.frame_size).
         if (frame_bytes > slz_bytes.len) {
             @memset(m[slz_bytes.len..@intCast(frame_bytes)], 0);
         }
@@ -767,25 +739,11 @@ pub fn runDecodePipelineEx(
         return error.MapMemoryFailed;
     }
 
-    // Pre-zero meta so the host read sees 0 if the dispatch chain
-    // somehow skipped writing.
     if (result.meta.mapped) |m| @memset(m[0..@intCast(meta_bytes)], 0);
 
-    // ── 3. Build pipelines + descriptor sets ─────────────────────────
-    //
-    // S001: cache is process-lifetime (owned by ctx.decode_pipeline_cache)
-    // so the 6 pipelines this function uses are built once on the first
-    // call and reused thereafter. Mirrors CUDA's process-init kernel
-    // load at src/decode/module_loader.zig:140-141, 169-173. The teardown
-    // happens in driver.deinit before destroyDevice; no per-call
-    // invalidateAll. Combined with the 2 pipelines slz1_codec builds
-    // (l1_unwrap, lz_decode) the total decode-side cache footprint is
-    // 8 entries, well under the 16-entry Cache cap.
     const cache = driver.getOrCreateDecodePipelineCache(ctx);
-
     const pipes = try loadAllPipelines(ctx, cache, tier, tier_b, allocator);
 
-    // walk_frame: 3 bindings [Frame, Chunks, Meta] + push (frame_size, max_chunks).
     const walk_bindings: [3]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = result.frame.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = result.chunks.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -793,7 +751,6 @@ pub fn runDecodePipelineEx(
     };
     const walk_set = try descriptors.allocSet(ctx, pipes.walk, walk_bindings[0..]);
 
-    // prefix_sum_chunks: 3 bindings [Chunks, FirstSubIdx, TotalSubs] + push.
     const prefix_bindings: [3]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = result.chunks.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = result.first_sub_idx.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -801,15 +758,6 @@ pub fn runDecodePipelineEx(
     };
     const prefix_set = try descriptors.allocSet(ctx, pipes.prefix, prefix_bindings[0..]);
 
-    // scan_parse: 10 bindings + push.
-    //   Bindings 4..7 (staged huff lit/tok/hi/lo) take the same staged
-    //   buffer at different offsets; binding 8/9 take the staged buffer
-    //   at the raw-hi/raw-lo offsets. All entries are 4-byte aligned
-    //   (descriptor offsets must satisfy
-    //   `minStorageBufferOffsetAlignment` — a few hundred bytes on every
-    //   sane device; the worst-case alignment is 256 on a few mobile
-    //   parts, which the multi-megabyte huff/raw arrays satisfy
-    //   trivially).
     const scan_bindings: [10]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = result.frame.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = result.chunks.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -824,7 +772,6 @@ pub fn runDecodePipelineEx(
     };
     const scan_set = try descriptors.allocSet(ctx, pipes.scan, scan_bindings[0..]);
 
-    // compact_huff_descs (×4): each needs (StagedIn, TotalSubs, Out, NOut).
     const compact_lit_bindings: [4]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = result.staged.buf, .offset = 0, .range = huff_arr_bytes },
         .{ .buffer = result.total_subs.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -857,7 +804,6 @@ pub fn runDecodePipelineEx(
     };
     const compact_lo_set = try descriptors.allocSet(ctx, pipes.compact_huff, compact_lo_bindings[0..]);
 
-    // compact_raw_descs: (StagedHi, StagedLo, TotalSubs, Out, NOut).
     const compact_raw_bindings: [5]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = result.staged.buf, .offset = huff_arr_bytes * 4, .range = raw_arr_bytes },
         .{ .buffer = result.staged.buf, .offset = huff_arr_bytes * 4 + raw_arr_bytes, .range = raw_arr_bytes },
@@ -867,7 +813,6 @@ pub fn runDecodePipelineEx(
     };
     const compact_raw_set = try descriptors.allocSet(ctx, pipes.compact_raw, compact_raw_bindings[0..]);
 
-    // gather_raw_off16: (Comp, Scratch, Descs, NDescs) + push (comp_len).
     const gather_bindings: [4]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = result.frame.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = result.off16_scratch.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -876,79 +821,89 @@ pub fn runDecodePipelineEx(
     };
     const gather_set = try descriptors.allocSet(ctx, pipes.gather, gather_bindings[0..]);
 
-    // ── 4. Record the command buffer ─────────────────────────────────
+    return .{
+        .result = result,
+        .pipes = pipes,
+        .walk_set = walk_set,
+        .prefix_set = prefix_set,
+        .scan_set = scan_set,
+        .compact_lit_set = compact_lit_set,
+        .compact_tok_set = compact_tok_set,
+        .compact_hi_set = compact_hi_set,
+        .compact_lo_set = compact_lo_set,
+        .compact_raw_set = compact_raw_set,
+        .gather_set = gather_set,
+        .n_chunks_max = n_chunks_max,
+        .max_total_subchunks = max_total_subchunks,
+        .huff_arr_bytes = huff_arr_bytes,
+        .raw_arr_bytes = raw_arr_bytes,
+        .staged_bytes = staged_bytes,
+        .chunks_bytes = chunks_bytes,
+        .first_sub_bytes = first_sub_bytes,
+        .meta_bytes = meta_bytes,
+        .frame_bytes = frame_bytes,
+        .slz_len_u32 = @intCast(slz_bytes.len),
+    };
+}
 
-    try dispatch.ensureChassisPub(ctx);
-
-    const reset_cb = vk.vkResetCommandBuffer_fn orelse return error.LoaderNotReady;
-    const begin_cb = vk.vkBeginCommandBuffer_fn orelse return error.LoaderNotReady;
-    const end_cb = vk.vkEndCommandBuffer_fn orelse return error.LoaderNotReady;
+/// S003: record the 5-kernel GPU decode pipeline (frame_staging→frame
+/// DMA + walk_frame + prefix_sum_chunks + scan_parse + 4× compact_huff +
+/// compact_raw + gather_raw_off16) plus the inter-dispatch barriers
+/// into a CALLER's already-begun command buffer. Does NOT begin/end the
+/// command buffer, does NOT submit, does NOT wait — the caller stitches
+/// in additional dispatches (l1_unwrap + lz_decode + dst→host copy) and
+/// drives a single vkQueueSubmit + vkWaitForFences at the end.
+///
+/// Mirrors CUDA's pattern at src/decode/decode_dispatch.zig:614-621:
+/// every back-half kernel reads its self-gate count from the device-
+/// resident meta buffer (`d_n_chunks_dev = d_walk_meta + walk_meta_offsets
+/// .n_chunks`), so no host fence wait is needed between phases.
+///
+/// Terminates with BARRIER E (SHADER_WRITE → SHADER_READ at COMPUTE) so
+/// the caller's subsequent dispatch reads from `result.meta`/`result.chunks`
+/// see the GPU pipeline's writes.
+pub fn recordDecodePipelineInto(
+    ctx: *driver.Context,
+    cmd_buf: vk.VkCommandBuffer,
+    prepared: PreparedDecodePipeline,
+) PipelineError!void {
     const cmd_bind_pl = vk.vkCmdBindPipeline_fn orelse return error.LoaderNotReady;
     const cmd_bind_ds = vk.vkCmdBindDescriptorSets_fn orelse return error.LoaderNotReady;
     const cmd_push = vk.vkCmdPushConstants_fn orelse return error.LoaderNotReady;
     const cmd_dispatch = vk.vkCmdDispatch_fn orelse return error.LoaderNotReady;
     const cmd_copy = vk.vkCmdCopyBuffer_fn orelse return error.LoaderNotReady;
-    const reset_fence = vk.vkResetFences_fn orelse return error.LoaderNotReady;
-    const submit = vk.vkQueueSubmit_fn orelse return error.LoaderNotReady;
-    const wait_fence = vk.vkWaitForFences_fn orelse return error.LoaderNotReady;
 
-    if (reset_cb(ctx.cmd_buf, 0) != vk.VK_SUCCESS) return error.ResetCommandBufferFailed;
+    const pipes = prepared.pipes;
+    const result = prepared.result;
+    const n_chunks_max = prepared.n_chunks_max;
+    const max_total_subchunks = prepared.max_total_subchunks;
 
-    const begin_info: vk.VkCommandBufferBeginInfo = .{
-        .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    };
-    if (begin_cb(ctx.cmd_buf, &begin_info) != vk.VK_SUCCESS) return error.BeginCommandBufferFailed;
-
-    // S007: DMA-copy compressed input from the sysmem staging buffer
-    // to the device-local frame buffer via the GPU copy engine. The
-    // host @memcpy above already filled the staging buffer at
-    // sysmem-bandwidth (~15 GB/s); the GPU copy runs on the dedicated
-    // transfer pipeline (or compute queue's copy capability when no
-    // dedicated transfer queue is requested — S009 follow-up). Mirrors
-    // CUDA's cudaMemcpyAsync(d_comp_persist, src, ..., HtoD) at
-    // src/decode/decode_dispatch.zig:570 which uses the same DMA path.
+    // S007: DMA-copy compressed input from sysmem staging → device-local
+    // frame via the GPU copy engine. The staging buffer lives on the
+    // workspace alongside the device-local frame buffer (= result.frame).
+    const ws = driver.getOrCreateDecodeWorkspace(ctx) catch return error.OutOfMemory;
     {
         const region: vk.VkBufferCopy = .{
             .srcOffset = 0,
             .dstOffset = 0,
-            .size = frame_bytes,
+            .size = prepared.frame_bytes,
         };
         const regions: [1]vk.VkBufferCopy = .{region};
-        beginLabel(ctx.cmd_buf, "frame_staging->frame (S007)");
-        cmd_copy(ctx.cmd_buf, ws.frame_staging.buffer.buf, result.frame.buf, 1, @ptrCast(&regions));
-        endLabel(ctx.cmd_buf, "frame_staging->frame (S007)");
+        beginLabel(cmd_buf, "frame_staging->frame (S007)");
+        cmd_copy(cmd_buf, ws.frame_staging.buffer.buf, result.frame.buf, 1, @ptrCast(&regions));
+        endLabel(cmd_buf, "frame_staging->frame (S007)");
     }
 
-    // 0. Zero-clear the chunks + total_subs buffers via vkCmdFillBuffer.
-    //    walk_frame only writes the first n_chunks slots of `chunks`;
-    //    prefix_sum_chunks iterates the full WALK_MAX_CHUNKS range (we
-    //    pass WALK_MAX_CHUNKS as n_chunks because we don't yet know the
-    //    walk-frame-determined value host-side). Zeroing every chunk
-    //    slot guarantees flagged-or-empty interpretations for the
-    //    over-counted tail, which falls into the `n_subs=1` branch and
-    //    keeps total_subchunks well-defined. Vulkan does NOT guarantee
-    //    zero-initialized VkDeviceMemory (spec §11.4.2), so the fill is
-    //    not optional — observed pre-fix on Intel Arc as garbage flags
-    //    in slots past n_chunks.
     if (vk.vkCmdFillBuffer_fn) |cmd_fill| {
-        cmd_fill(ctx.cmd_buf, result.chunks.buf, 0, chunks_bytes, 0);
-        cmd_fill(ctx.cmd_buf, result.total_subs.buf, 0, 4, 0);
-        cmd_fill(ctx.cmd_buf, result.first_sub_idx.buf, 0, first_sub_bytes, 0);
-        cmd_fill(ctx.cmd_buf, result.compact_counts.buf, 0, 6 * 4, 0);
-        // Staged-buffer pre-clear: scan_parse self-clears `valid=0`
-        // every iteration but only touches slots [0, n_chunks * MAX_SUB_
-        // CHUNKS_PER_CHUNK). Slots past that range MUST be `valid==0`
-        // for the compact kernels to drop them. Vulkan device memory is
-        // not zero-init; clear it explicitly here.
-        cmd_fill(ctx.cmd_buf, result.staged.buf, 0, staged_bytes, 0);
+        cmd_fill(cmd_buf, result.chunks.buf, 0, prepared.chunks_bytes, 0);
+        cmd_fill(cmd_buf, result.total_subs.buf, 0, 4, 0);
+        cmd_fill(cmd_buf, result.first_sub_idx.buf, 0, prepared.first_sub_bytes, 0);
+        cmd_fill(cmd_buf, result.compact_counts.buf, 0, 6 * 4, 0);
+        cmd_fill(cmd_buf, result.staged.buf, 0, prepared.staged_bytes, 0);
     } else {
-        // vkCmdFillBuffer is core Vulkan 1.0; missing slot indicates a
-        // broken loader. Bail rather than silently emit a kernel chain
-        // that reads uninitialized SSBO contents.
         return error.LoaderNotReady;
     }
-    // Barrier 0 — transfer (fill) → compute reads on chunks /
-    // total_subs / first_sub_idx / staged / compact_counts.
+
     {
         const cmd_barrier_fn = vk.vkCmdPipelineBarrier_fn orelse return error.LoaderNotReady;
         const mb: vk.VkMemoryBarrier = .{
@@ -957,7 +912,7 @@ pub fn runDecodePipelineEx(
         };
         const mbs: [1]vk.VkMemoryBarrier = .{mb};
         cmd_barrier_fn(
-            ctx.cmd_buf,
+            cmd_buf,
             vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
             vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0,
@@ -972,132 +927,34 @@ pub fn runDecodePipelineEx(
 
     // 1. walk_frame.
     {
-        cmd_bind_pl(ctx.cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.walk.pipeline);
-        const sets: [1]vk.VkDescriptorSet = .{walk_set};
-        cmd_bind_ds(
-            ctx.cmd_buf,
-            vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipes.walk.pipeline_layout,
-            0,
-            1,
-            @ptrCast(&sets),
-            0,
-            null,
-        );
-        const push: WalkPush = .{
-            .frame_size = @intCast(slz_bytes.len),
-            .max_chunks = WALK_MAX_CHUNKS,
-        };
+        cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.walk.pipeline);
+        const sets: [1]vk.VkDescriptorSet = .{prepared.walk_set};
+        cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.walk.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
+        const push: WalkPush = .{ .frame_size = prepared.slz_len_u32, .max_chunks = WALK_MAX_CHUNKS };
         var push_bytes: [@sizeOf(WalkPush)]u8 = undefined;
         @memcpy(push_bytes[0..], std.mem.asBytes(&push));
-        cmd_push(
-            ctx.cmd_buf,
-            pipes.walk.pipeline_layout,
-            vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0,
-            @intCast(push_bytes.len),
-            @ptrCast(&push_bytes),
-        );
-        beginLabel(ctx.cmd_buf, "walk_frame");
-        cmd_dispatch(ctx.cmd_buf, 1, 1, 1);
-        endLabel(ctx.cmd_buf, "walk_frame");
+        cmd_push(cmd_buf, pipes.walk.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @intCast(push_bytes.len), @ptrCast(&push_bytes));
+        beginLabel(cmd_buf, "walk_frame");
+        cmd_dispatch(cmd_buf, 1, 1, 1);
+        endLabel(cmd_buf, "walk_frame");
     }
+    try recordComputeBarrier(cmd_buf);
 
-    // BARRIER A — walk_frame writes → prefix_sum_chunks reads.
-    try recordComputeBarrier(ctx.cmd_buf);
-
-    // 2. prefix_sum_chunks. Push uses worst-case n_chunks = WALK_MAX_CHUNKS
-    //    minus a loop early-exit: the kernel iterates `i < n_chunks` but
-    //    we don't know n_chunks until after walk_frame ran. We compromise
-    //    by passing WALK_MAX_CHUNKS as n_chunks; the kernel will iterate
-    //    over the entire range but flagged-or-empty chunks beyond the
-    //    real n_chunks all read flags=0 and decomp_size=0 (we pre-zeroed
-    //    the device meta buffer above), so they fall into the `n_subs=1`
-    //    branch and bump first_sub_idx[i] by 1 each. That over-counts
-    //    total_subchunks for slots past n_chunks, but downstream kernels
-    //    self-gate on the real value (compact_*'s loop reads from
-    //    total_subs which mismatches reality, BUT each pre-zeroed staged
-    //    slot has valid=0 so the compact kernels emit no entries from
-    //    the over-counted slots — exact match for the L1 fast path).
-    //
-    //    NOTE: this is a correctness-preserving over-count. The CUDA
-    //    reference instead H2D's the real n_chunks before launching
-    //    prefix_sum (`gpuPrefixSumChunksImpl(self, ..., n_chunks, ...)`).
-    //    We can't do that here because we want the walk_frame result on
-    //    GPU. A future patch should split this into two command-buffer
-    //    submissions (walk → fence → readback n_chunks → prefix_sum...)
-    //    or add a meta→push-constant indirection kernel.
-    //
-    //    For the L1 fast path this is harmless: every over-counted
-    //    sub-chunk has valid=0 (chunks_buf slot 4 was zeroed) and the
-    //    compact kernels reject them.
-    //
-    //    The chunks buffer is pre-zeroed by the walk_frame kernel — it
-    //    only writes the first n_chunks slots, leaving slots
-    //    [n_chunks, WALK_MAX_CHUNKS) at the device-local-allocate-time
-    //    zero (Vulkan does not zero VkDeviceMemory by default, but
-    //    `VK_BUFFER_USAGE_STORAGE_BUFFER_BIT` allocations land in the
-    //    same zero-initialized device pages on every conforming driver
-    //    we exercise — verified by the L1 round-trip suite and the
-    //    Phase 2 scan-parse kernel's clearAllValid semantics).
-    //
-    //    Belt-and-suspenders: a vkCmdFillBuffer here would guarantee the
-    //    zero state but adds another barrier hop. The walk_frame kernel
-    //    explicitly writes slot 4 (flags) and slot 2 (decomp_size) for
-    //    every chunk it emits, so the over-count loop only reads
-    //    not-yet-written slots whose contents are device-allocator-zero
-    //    by spec on the production tier-1 drivers (NVIDIA, AMD RDNA,
-    //    Intel Arc — confirmed in `docs/vulkan_port_architecture.md`).
+    // 2. prefix_sum_chunks.
     {
-        cmd_bind_pl(ctx.cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.prefix.pipeline);
-        const sets: [1]vk.VkDescriptorSet = .{prefix_set};
-        cmd_bind_ds(
-            ctx.cmd_buf,
-            vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipes.prefix.pipeline_layout,
-            0,
-            1,
-            @ptrCast(&sets),
-            0,
-            null,
-        );
-        const push: PrefixPush = .{
-            // walk_frame wrote n_chunks into the device meta buffer; we
-            // can't read that here host-side before queue submit, so
-            // pass the caller-supplied hint (right-sized to the actual
-            // frame). The chunks buffer is pre-zeroed (vkCmdFillBuffer
-            // above), so every slot past the real n_chunks reads
-            // flags=0, decomp_size=0 — falls into the n_subs=1 branch.
-            // total_subchunks is over-counted by exactly
-            // (n_chunks_max - real_n_chunks) but that's harmless: the
-            // staged-buffer slots past the real range stay valid=0
-            // (scan_parse self-gates on real n_chunks from
-            // n_chunks_scratch) and the compact kernels skip them.
-            .n_chunks = n_chunks_max,
-            .sub_chunk_cap = 0, // 0 → DEFAULT_SUB_CHUNK_CAP per the shader
-        };
+        cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.prefix.pipeline);
+        const sets: [1]vk.VkDescriptorSet = .{prepared.prefix_set};
+        cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.prefix.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
+        const push: PrefixPush = .{ .n_chunks = n_chunks_max, .sub_chunk_cap = 0 };
         var push_bytes: [@sizeOf(PrefixPush)]u8 = undefined;
         @memcpy(push_bytes[0..], std.mem.asBytes(&push));
-        cmd_push(
-            ctx.cmd_buf,
-            pipes.prefix.pipeline_layout,
-            vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0,
-            @intCast(push_bytes.len),
-            @ptrCast(&push_bytes),
-        );
-        beginLabel(ctx.cmd_buf, "prefix_sum_chunks");
-        cmd_dispatch(ctx.cmd_buf, 1, 1, 1);
-        endLabel(ctx.cmd_buf, "prefix_sum_chunks");
+        cmd_push(cmd_buf, pipes.prefix.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @intCast(push_bytes.len), @ptrCast(&push_bytes));
+        beginLabel(cmd_buf, "prefix_sum_chunks");
+        cmd_dispatch(cmd_buf, 1, 1, 1);
+        endLabel(cmd_buf, "prefix_sum_chunks");
     }
+    try recordComputeBarrier(cmd_buf);
 
-    // BARRIER B — prefix_sum writes → scan_parse reads.
-    try recordComputeBarrier(ctx.cmd_buf);
-
-    // Copy meta[N_CHUNKS_SLOT] into n_chunks_scratch so scan_parse sees
-    // the actual walk-frame-determined n_chunks (its self-gate compares
-    // gl_GlobalInvocationID.x against *n_chunks_buf). The copy is
-    // device-to-device, in-buffer; runs at full VRAM bandwidth.
     {
         const region: vk.VkBufferCopy = .{
             .srcOffset = WALK_META_N_CHUNKS_SLOT * 4,
@@ -1105,14 +962,11 @@ pub fn runDecodePipelineEx(
             .size = 4,
         };
         const regions: [1]vk.VkBufferCopy = .{region};
-        beginLabel(ctx.cmd_buf, "meta->n_chunks_scratch");
-        cmd_copy(ctx.cmd_buf, result.meta.buf, result.n_chunks_scratch.buf, 1, @ptrCast(&regions));
-        endLabel(ctx.cmd_buf, "meta->n_chunks_scratch");
+        beginLabel(cmd_buf, "meta->n_chunks_scratch");
+        cmd_copy(cmd_buf, result.meta.buf, result.n_chunks_scratch.buf, 1, @ptrCast(&regions));
+        endLabel(cmd_buf, "meta->n_chunks_scratch");
     }
 
-    // BARRIER B' — the in-buffer copy above is a TRANSFER_WRITE; scan
-    // reads it as SHADER_READ. Need a transfer→compute barrier (the
-    // compute-only barrier we use otherwise doesn't cover transfer).
     {
         const cmd_barrier_fn = vk.vkCmdPipelineBarrier_fn orelse return error.LoaderNotReady;
         const mb: vk.VkMemoryBarrier = .{
@@ -1121,7 +975,7 @@ pub fn runDecodePipelineEx(
         };
         const mbs: [1]vk.VkMemoryBarrier = .{mb};
         cmd_barrier_fn(
-            ctx.cmd_buf,
+            cmd_buf,
             vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
             vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0,
@@ -1134,150 +988,101 @@ pub fn runDecodePipelineEx(
         );
     }
 
-    // 3. scan_parse — n_chunks workgroups × 32 threads. Over-launch at
-    //    WALK_MAX_CHUNKS / 32 workgroups; the kernel self-gates.
+    // 3. scan_parse.
     {
-        cmd_bind_pl(ctx.cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.scan.pipeline);
-        const sets: [1]vk.VkDescriptorSet = .{scan_set};
-        cmd_bind_ds(
-            ctx.cmd_buf,
-            vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipes.scan.pipeline_layout,
-            0,
-            1,
-            @ptrCast(&sets),
-            0,
-            null,
-        );
-        const push: ScanPush = .{
-            .block_len = @intCast(slz_bytes.len),
-            .sub_chunk_cap = 0, // 0 → DEFAULT_SUB_CHUNK_CAP per the shader
-        };
+        cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.scan.pipeline);
+        const sets: [1]vk.VkDescriptorSet = .{prepared.scan_set};
+        cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.scan.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
+        const push: ScanPush = .{ .block_len = prepared.slz_len_u32, .sub_chunk_cap = 0 };
         var push_bytes: [@sizeOf(ScanPush)]u8 = undefined;
         @memcpy(push_bytes[0..], std.mem.asBytes(&push));
-        cmd_push(
-            ctx.cmd_buf,
-            pipes.scan.pipeline_layout,
-            vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0,
-            @intCast(push_bytes.len),
-            @ptrCast(&push_bytes),
-        );
-        // local_size_x=32; grid sized to cover n_chunks_max lanes. The
-        // scan kernel self-gates per-lane on gl_GlobalInvocationID.x
-        // against *n_chunks_buf (= the walk-frame-determined real
-        // n_chunks), so over-launching is safe.
+        cmd_push(cmd_buf, pipes.scan.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @intCast(push_bytes.len), @ptrCast(&push_bytes));
         const scan_grid_x: u32 = (n_chunks_max + 31) / 32;
-        beginLabel(ctx.cmd_buf, "scan_parse");
-        cmd_dispatch(ctx.cmd_buf, scan_grid_x, 1, 1);
-        endLabel(ctx.cmd_buf, "scan_parse");
+        beginLabel(cmd_buf, "scan_parse");
+        cmd_dispatch(cmd_buf, scan_grid_x, 1, 1);
+        endLabel(cmd_buf, "scan_parse");
     }
+    try recordComputeBarrier(cmd_buf);
 
-    // BARRIER C — scan_parse writes → compact_* read.
-    try recordComputeBarrier(ctx.cmd_buf);
-
-    // 4a–4d. compact_huff_descs (lit, tok, hi, lo). All four launches
-    //    can ride the same barrier (BARRIER C) because they write
-    //    disjoint regions; no inter-compact-kernel barrier needed.
+    // 4a-4d. compact_huff_descs.
     const compact_huff_sets = [_]vk.VkDescriptorSet{
-        compact_lit_set, compact_tok_set, compact_hi_set, compact_lo_set,
+        prepared.compact_lit_set, prepared.compact_tok_set, prepared.compact_hi_set, prepared.compact_lo_set,
     };
     const compact_huff_labels = [_][]const u8{
         "compact_huff_lit", "compact_huff_tok", "compact_huff_hi", "compact_huff_lo",
     };
     for (compact_huff_sets, 0..) |cs, ci| {
-        cmd_bind_pl(ctx.cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.compact_huff.pipeline);
+        cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.compact_huff.pipeline);
         const sets: [1]vk.VkDescriptorSet = .{cs};
-        cmd_bind_ds(
-            ctx.cmd_buf,
-            vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipes.compact_huff.pipeline_layout,
-            0,
-            1,
-            @ptrCast(&sets),
-            0,
-            null,
-        );
-        beginLabel(ctx.cmd_buf, compact_huff_labels[ci]);
-        cmd_dispatch(ctx.cmd_buf, 1, 1, 1);
-        endLabel(ctx.cmd_buf, compact_huff_labels[ci]);
+        cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.compact_huff.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
+        beginLabel(cmd_buf, compact_huff_labels[ci]);
+        cmd_dispatch(cmd_buf, 1, 1, 1);
+        endLabel(cmd_buf, compact_huff_labels[ci]);
     }
 
     // 4e. compact_raw_descs.
     {
-        cmd_bind_pl(ctx.cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.compact_raw.pipeline);
-        const sets: [1]vk.VkDescriptorSet = .{compact_raw_set};
-        cmd_bind_ds(
-            ctx.cmd_buf,
-            vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipes.compact_raw.pipeline_layout,
-            0,
-            1,
-            @ptrCast(&sets),
-            0,
-            null,
-        );
-        beginLabel(ctx.cmd_buf, "compact_raw_descs");
-        cmd_dispatch(ctx.cmd_buf, 1, 1, 1);
-        endLabel(ctx.cmd_buf, "compact_raw_descs");
+        cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.compact_raw.pipeline);
+        const sets: [1]vk.VkDescriptorSet = .{prepared.compact_raw_set};
+        cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.compact_raw.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
+        beginLabel(cmd_buf, "compact_raw_descs");
+        cmd_dispatch(cmd_buf, 1, 1, 1);
+        endLabel(cmd_buf, "compact_raw_descs");
     }
+    try recordComputeBarrier(cmd_buf);
 
-    // BARRIER D — compact_* writes → gather_raw_off16 reads.
-    try recordComputeBarrier(ctx.cmd_buf);
-
-    // 5. gather_raw_off16 — total_subchunks*2 workgroups × 256 threads.
-    //    The kernel self-gates on compact_counts[4] (n_raw), so an
-    //    over-launch costs only an empty workgroup. We launch
-    //    max_total_subchunks*2 workgroups.
+    // 5. gather_raw_off16.
     {
-        cmd_bind_pl(ctx.cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.gather.pipeline);
-        const sets: [1]vk.VkDescriptorSet = .{gather_set};
-        cmd_bind_ds(
-            ctx.cmd_buf,
-            vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipes.gather.pipeline_layout,
-            0,
-            1,
-            @ptrCast(&sets),
-            0,
-            null,
-        );
-        const push: GatherPush = .{
-            .comp_len = @intCast(slz_bytes.len),
-        };
+        cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.gather.pipeline);
+        const sets: [1]vk.VkDescriptorSet = .{prepared.gather_set};
+        cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.gather.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
+        const push: GatherPush = .{ .comp_len = prepared.slz_len_u32 };
         var push_bytes: [@sizeOf(GatherPush)]u8 = undefined;
         @memcpy(push_bytes[0..], std.mem.asBytes(&push));
-        cmd_push(
-            ctx.cmd_buf,
-            pipes.gather.pipeline_layout,
-            vk.VK_SHADER_STAGE_COMPUTE_BIT,
-            0,
-            @intCast(push_bytes.len),
-            @ptrCast(&push_bytes),
-        );
-        // Worst-case grid — the kernel self-gates on the real n_raw
-        // count. For L1 the count is 0 so every workgroup early-exits.
-        //
-        // Cap the launch at the worst-case `total_subchunks*2`. Even on
-        // an L3 frame with the worst-case sub-chunk count this is
-        // 16384 * 4 * 2 = 131072 workgroups — well below
-        // VkPhysicalDeviceLimits.maxComputeWorkGroupCount[0] (2^31 on
-        // every supported device).
+        cmd_push(cmd_buf, pipes.gather.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @intCast(push_bytes.len), @ptrCast(&push_bytes));
         const gather_grid_x: u32 = max_total_subchunks * 2;
-        beginLabel(ctx.cmd_buf, "gather_raw_off16");
-        cmd_dispatch(ctx.cmd_buf, gather_grid_x, 1, 1);
-        endLabel(ctx.cmd_buf, "gather_raw_off16");
+        beginLabel(cmd_buf, "gather_raw_off16");
+        cmd_dispatch(cmd_buf, gather_grid_x, 1, 1);
+        endLabel(cmd_buf, "gather_raw_off16");
     }
+    try recordComputeBarrier(cmd_buf);
+}
 
-    // BARRIER E — gather writes → downstream LZ kernel reads. The
-    // downstream kernel is in a separate cmdbuf today (Phase 3+ kernel
-    // bodies aren't on the L1 path), but we end with the barrier so
-    // future single-cmdbuf merges can see a consistent shape.
-    try recordComputeBarrier(ctx.cmd_buf);
+/// Legacy stand-alone driver kept for callers that want the pre-S003
+/// shape (own command buffer, own submit, own fence wait, meta read on
+/// return). The new in-process callers in slz1_codec.zig drive
+/// `prepareDecodePipeline` + `recordDecodePipelineInto` directly so the
+/// GPU pipeline + l1_unwrap + lz_decode + dst→host copy ride one
+/// vkQueueSubmit. This implementation now delegates to the same two
+/// helpers to keep one source of truth for the dispatch shape.
+pub fn runDecodePipelineEx(
+    ctx: *driver.Context,
+    allocator: std.mem.Allocator,
+    slz_bytes: []const u8,
+    hints: PipelineHints,
+) PipelineError!DecodeResult {
+    var prepared = try prepareDecodePipeline(ctx, allocator, slz_bytes, hints);
+
+    try dispatch.ensureChassisPub(ctx);
+
+    const reset_cb = vk.vkResetCommandBuffer_fn orelse return error.LoaderNotReady;
+    const begin_cb = vk.vkBeginCommandBuffer_fn orelse return error.LoaderNotReady;
+    const end_cb = vk.vkEndCommandBuffer_fn orelse return error.LoaderNotReady;
+    const reset_fence = vk.vkResetFences_fn orelse return error.LoaderNotReady;
+    const submit = vk.vkQueueSubmit_fn orelse return error.LoaderNotReady;
+    const wait_fence = vk.vkWaitForFences_fn orelse return error.LoaderNotReady;
+
+    if (reset_cb(ctx.cmd_buf, 0) != vk.VK_SUCCESS) return error.ResetCommandBufferFailed;
+
+    const begin_info: vk.VkCommandBufferBeginInfo = .{
+        .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (begin_cb(ctx.cmd_buf, &begin_info) != vk.VK_SUCCESS) return error.BeginCommandBufferFailed;
+
+    try recordDecodePipelineInto(ctx, ctx.cmd_buf, prepared);
 
     if (end_cb(ctx.cmd_buf) != vk.VK_SUCCESS) return error.EndCommandBufferFailed;
 
-    // ── 5. Submit + wait ─────────────────────────────────────────────
     const fences: [1]vk.VkFence = .{ctx.fence};
     if (reset_fence(ctx.dev, 1, @ptrCast(&fences)) != vk.VK_SUCCESS) return error.ResetFenceFailed;
 
@@ -1293,22 +1098,18 @@ pub fn runDecodePipelineEx(
     if (wait_result == vk.VK_TIMEOUT) return error.FenceWaitTimeout;
     if (wait_result != vk.VK_SUCCESS) return error.FenceWaitFailed;
 
-    // ── 6. Read host-visible Meta into the result struct ─────────────
-    if (result.meta.mapped) |m| {
+    if (prepared.result.meta.mapped) |m| {
         const words: [*]const u32 = @ptrCast(@alignCast(m));
-        result.n_chunks = words[WALK_META_N_CHUNKS_SLOT];
-        result.decomp_size = words[WALK_META_DECOMP_SIZE_SLOT];
-        result.sub_chunk_cap = words[WALK_META_SUB_CHUNK_CAP_SLOT];
-        result.block_start = words[WALK_META_BLOCK_START_SLOT];
-        result.block_size = words[WALK_META_BLOCK_SIZE_SLOT];
-        result.status = words[WALK_META_STATUS_SLOT];
+        prepared.result.n_chunks = words[WALK_META_N_CHUNKS_SLOT];
+        prepared.result.decomp_size = words[WALK_META_DECOMP_SIZE_SLOT];
+        prepared.result.sub_chunk_cap = words[WALK_META_SUB_CHUNK_CAP_SLOT];
+        prepared.result.block_start = words[WALK_META_BLOCK_START_SLOT];
+        prepared.result.block_size = words[WALK_META_BLOCK_SIZE_SLOT];
+        prepared.result.status = words[WALK_META_STATUS_SLOT];
     } else {
         return error.MapMemoryFailed;
     }
-    // total_subchunks: an upper bound is enough for downstream kernels
-    // (they self-gate). The real value is in result.total_subs on
-    // device, readable by future Phase-3 dispatches without H2D.
-    result.total_subchunks = result.n_chunks * MAX_SUB_CHUNKS_PER_CHUNK;
+    prepared.result.total_subchunks = prepared.result.n_chunks * MAX_SUB_CHUNKS_PER_CHUNK;
 
-    return result;
+    return prepared.result;
 }

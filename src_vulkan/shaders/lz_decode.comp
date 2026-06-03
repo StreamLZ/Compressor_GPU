@@ -155,9 +155,17 @@ layout(set = 0, binding = 6) readonly buffer Off32  { uint w[]; } off32_buf;
 // walk_frame's GPU output for the SLZ1 frame path).
 layout(set = 0, binding = 7) readonly buffer WalkChunks { uint d[]; } walk_chunks_buf;
 
-layout(push_constant) uniform PC {
-    uint n_chunks;
-} pc;
+// S003: walk_frame's 6-u32 meta buffer. Slot 0 (= walk_meta_offsets.n_chunks
+// in src/decode/descriptors.zig:141-149 and src_vulkan/decode_pipeline_gpu.zig:111)
+// is the device-resident n_chunks count. Reading it from the SSBO here
+// (rather than from a host-supplied push constant) lets the back-half
+// lz_decode launch ride the SAME vkQueueSubmit as the runDecodePipelineEx
+// dispatch chain — the host no longer needs to fence-wait between submits
+// to learn n_chunks. Mirrors the CUDA pattern at
+// src/decode/decode_dispatch.zig:614-621 which passes
+// `d_n_chunks_dev = d_walk_meta + walk_meta_offsets.n_chunks` so the LZ
+// kernel reads its self-gate count straight from device memory.
+layout(set = 0, binding = 8) readonly buffer WalkMeta { uint w[]; } walk_meta_buf;
 
 // Per-chunk constants. CUDA keeps these as per-warp registers (see
 // src/decode/lz_decode_kernels.cuh:56-92 + lz_decode_raw.cuh:25-39). In
@@ -512,7 +520,12 @@ void main() {
     // host-side dispatch grid in src_vulkan/slz1_codec.zig /
     // src_vulkan/decode_pipeline_gpu.zig), this collapses to:
     //   if (chunk_id >= n_chunks) return;
-    if (chunk_id >= pc.n_chunks) return;
+    // S003: n_chunks now read from device-resident WalkMeta SSBO (slot 0 =
+    // walk_meta_offsets.n_chunks). The push-constant path was removed so
+    // this dispatch can ride the same vkQueueSubmit as the
+    // runDecodePipelineEx dispatch chain that produced WalkMeta — no host
+    // round-trip between phases.
+    if (chunk_id >= walk_meta_buf.w[0]) return;
 
     // Load this subgroup's chunk descriptor (16 u32 stride per chunk).
     // Lane 0 of each subgroup writes its g_*[sg_id] slot; the subsequent

@@ -115,11 +115,11 @@ pub const DispatchResult = struct {
 /// the first pair; `submitOneWithCopy` writes all four. M8c will bump
 /// this further (68 slots per arch §15) so the per-kernel-fixture
 /// indexing constants live in one place here.
-const TS_SLOT_BEGIN: u32 = 0;
-const TS_SLOT_END: u32 = 1;
-const TS_SLOT_COPY_BEGIN: u32 = 2;
-const TS_SLOT_COPY_END: u32 = 3;
-const TS_SLOT_COUNT: u32 = 4;
+pub const TS_SLOT_BEGIN: u32 = 0;
+pub const TS_SLOT_END: u32 = 1;
+pub const TS_SLOT_COPY_BEGIN: u32 = 2;
+pub const TS_SLOT_COPY_END: u32 = 3;
+pub const TS_SLOT_COUNT: u32 = 4;
 
 /// Resolve a device-level entry point; prefer vkGetDeviceProcAddr (one
 /// fewer dispatch hop) but fall back to the instance-level thunk via
