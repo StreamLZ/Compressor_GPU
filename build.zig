@@ -366,13 +366,15 @@ pub fn build(b: *std.Build) void {
     run_vk_l1_scale_test.has_side_effects = true;
     b.step("vk-l1-scale-test", "Run the L1 codec large-corpus scale test (16 MB -> 200 MB)").dependOn(&run_vk_l1_scale_test.step);
 
-    // ── Vulkan port (CLI): streamlz_vk.exe — sibling of streamlz.exe ────
-    // L1-only, level=1 CLI for end users: `streamlz_vk -c f -o f.slz`,
-    // `streamlz_vk -d f.slz -o f.out`. Linked statically against the L1
-    // codec + wire-format modules. SPV blobs are loaded at runtime from
-    // `zig-out/shaders/` (same pattern as the test exes), so the binary
-    // must be invoked with cwd set to a directory containing
-    // `zig-out/shaders/*.spv` — typically the repo root during dev.
+    // ── Vulkan port (LEGACY CLI): streamlz_vk_legacy.exe ────────────────
+    // L1-only, level=1 CLI built on the legacy `src_vulkan/` tree (the
+    // behaviorally-correct rewrite that the multi-wave `src_vk/` port is
+    // replacing). Renamed from `streamlz_vk` -> `streamlz_vk_legacy` so the
+    // foundation-wave `streamlz_vk` step below can take the canonical
+    // name without colliding mid-port. Existing tests
+    // (vk-cli-test, conformance harness) point at this binary until the
+    // foundation tree reaches feature parity, at which point this target
+    // retires.
     const cli_vk_module = b.createModule(.{
         .root_source_file = b.path("cli_vk_root.zig"),
         .target = target,
@@ -380,16 +382,61 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .link_libc = true,
     });
-    // SPV blobs are baked into streamlz_vk.exe via the embedded spv_blobs
-    // module (see addSpvBlobsImport) so the binary runs from any working
-    // directory with no zig-out/shaders dep at runtime. The
-    // embed_dir_step dependency makes Zig wait for glslc to finish before
-    // compiling spv_blobs.zig.
+    // SPV blobs are baked into streamlz_vk_legacy.exe via the embedded
+    // spv_blobs module (see addSpvBlobsImport) so the binary runs from
+    // any working directory with no zig-out/shaders dep at runtime. The
+    // embed_dir_step dependency makes Zig wait for glslc to finish
+    // before compiling spv_blobs.zig.
     addSpvBlobsImport(cli_vk_module, vk_shaders);
-    const cli_vk_exe = b.addExecutable(.{ .name = "streamlz_vk", .root_module = cli_vk_module });
+    const cli_vk_exe = b.addExecutable(.{ .name = "streamlz_vk_legacy", .root_module = cli_vk_module });
     cli_vk_exe.step.dependOn(vk_shaders.embed_dir_step);
     const cli_vk_install = b.addInstallArtifact(cli_vk_exe, .{});
-    b.step("streamlz_vk", "Build the Vulkan-backend CLI (streamlz_vk.exe)").dependOn(&cli_vk_install.step);
+    b.step("streamlz_vk_legacy", "Build the legacy Vulkan-backend CLI (streamlz_vk_legacy.exe)").dependOn(&cli_vk_install.step);
+
+    // ── Vulkan port (FOUNDATION): streamlz_vk.exe — src_vk/ tree ────────
+    // The multi-wave 1:1 CUDA->Vulkan port lives under src_vk/. This
+    // step builds the foundation-wave binary that pulls the foundational
+    // types (vulkan_api.zig procs.* surface, decode_context.zig
+    // DecodeContext, descriptors.zig GpuError with NotImplementedL2,
+    // VMA bindings via third_party/vma) into a linkable executable.
+    // Subsequent waves bring the L1 encode/decode handlers online.
+    //
+    // VMA is vendored at third_party/vma/vk_mem_alloc.h (v3.1.0, AMD
+    // MIT). third_party/vma/vk_mem_alloc_impl.cpp pulls VMA's full
+    // implementation into the binary as a single C++ translation
+    // unit. The cli_vk_module links libcpp so the C++ runtime is
+    // available; the codec only ever touches VMA through the
+    // procs.malloc_device / procs.free_device shims, never directly.
+    const streamlz_vk_exe_module = b.createModule(.{
+        .root_source_file = b.path("src_vk/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    streamlz_vk_exe_module.addCSourceFile(.{
+        .file = b.path("third_party/vma/vk_mem_alloc_impl.cpp"),
+        .flags = &.{
+            "-std=c++17",
+            "-Wno-everything",
+        },
+    });
+    streamlz_vk_exe_module.addIncludePath(b.path("third_party/vma"));
+    // VMA's vk_mem_alloc.h #includes <vulkan/vulkan.h>. Reach the
+    // Vulkan SDK headers via $VULKAN_SDK\Include on Windows. Fail
+    // loudly at configure time if the env var is missing — the port
+    // is Windows-first today and the SDK is mandatory.
+    if (b.graph.environ_map.get("VULKAN_SDK")) |sdk| {
+        const include_path = b.fmt("{s}{c}Include", .{ sdk, std.fs.path.sep });
+        streamlz_vk_exe_module.addIncludePath(.{ .cwd_relative = include_path });
+    }
+    const streamlz_vk_fnd_exe = b.addExecutable(.{
+        .name = "streamlz_vk",
+        .root_module = streamlz_vk_exe_module,
+    });
+    const streamlz_vk_fnd_install = b.addInstallArtifact(streamlz_vk_fnd_exe, .{});
+    b.step("streamlz_vk", "Build the foundation-wave Vulkan CLI (streamlz_vk.exe)").dependOn(&streamlz_vk_fnd_install.step);
 
     // ── Vulkan port (CLI test): self-roundtrip + cross-backend ───────────
     // Spawns streamlz_vk.exe and streamlz.exe (the CUDA build) via

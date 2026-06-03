@@ -12,7 +12,11 @@
 
 const std = @import("std");
 
-const STREAMLZ_VK_EXE: []const u8 = "c:/Users/james.JAMESWORK2025/Repos/Compressor_GPU/zig-out/bin/streamlz_vk.exe";
+// VK PORT NOTE: the legacy CLI was renamed `streamlz_vk` -> `streamlz_vk_legacy`
+// in build.zig when the foundation-wave src_vk/ tree took over the
+// canonical `streamlz_vk.exe` artifact name. This test still drives the
+// legacy binary (it carries the working L1 codec).
+const STREAMLZ_VK_EXE: []const u8 = "c:/Users/james.JAMESWORK2025/Repos/Compressor_GPU/zig-out/bin/streamlz_vk_legacy.exe";
 const STREAMLZ_EXE: []const u8 = "c:/Users/james.JAMESWORK2025/Repos/Compressor_GPU/zig-out/bin/streamlz.exe";
 const CORPUS_PATH: []const u8 = "assets/web.txt";
 const TMP_DIR: []const u8 = "c:/tmp";
