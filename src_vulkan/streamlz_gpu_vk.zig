@@ -1,17 +1,57 @@
-//! StreamLZ Vulkan-backend C ABI (M4 scaffolding).
+//! StreamLZ Vulkan-backend C ABI.
 //!
 //! Implements the contract in `include/streamlz_gpu_vk.h`: a handle-based
 //! Vulkan compressor exported as `streamlz_vk.dll` (+ `streamlz_vk.lib`).
-//! Mirrors the shape of `src/streamlz_gpu.zig`; the per-call codec paths
-//! are stubbed to `SLZ_ERROR_UNSUPPORTED` until the per-kernel
-//! milestones (M11..M27) wire them.
+//! Mirrors the shape of `src/streamlz_gpu.zig`.
 //!
-//! Currently wired:
-//!   - slzCreate_vk / slzDestroy_vk           (driver bring-up + tier probe)
-//!   - slzGetVersionString_vk                 (version.string + "+vk")
-//!   - slzRegisterBuffer_vk / Unregister_vk   (no-op on Tier-1; M6+ for T2)
+//! Wired entry points (level=1 only):
+//!   - slzCreate_vk / slzDestroy_vk           — driver bring-up + tier probe.
+//!   - slzGetVersionString_vk                 — version.string + "+vk".
+//!   - slzRegisterBuffer_vk / Unregister_vk   — D2D registry for
+//!                                              BDA-backed VkBuffer
+//!                                              arguments to {Compress,
+//!                                              Decompress}_vk.
+//!   - slzBufferGetDeviceAddress_vk           — public BDA query helper.
+//!   - slzCompress_vk / slzCompressHost_vk    — synchronous L1 encode +
+//!                                              wire-format wrap. Device-
+//!                                              pointer variant resolves
+//!                                              registered VkBuffer args
+//!                                              and skips the host bounce.
+//!   - slzDecompress_vk / slzDecompressHost_vk — synchronous L1 decode of
+//!                                              an SLZ1 frame; same D2D
+//!                                              registry resolution.
+//!   - slzCompressBound_vk                    — worst-case .slz size for
+//!                                              an L1-encoded payload.
+//!   - slzCompressAsync_vk / Poll, decode counterparts — worker-thread
+//!                                              wrappers around the sync
+//!                                              entry points.
+//!   - slzGetLastTimings_vk                   — per-handle kernel-ns
+//!                                              snapshot drain.
 //!
-//! Every other entry point returns SLZ_ERROR_UNSUPPORTED (== 5).
+//! Always-error entry point:
+//!   - slzMakeDeviceOnlyHandle_vk             — returns
+//!                                              SLZ_ERROR_UNSUPPORTED.
+//!                                              The CUDA backend uses
+//!                                              `device_only_host_stub_addr`
+//!                                              (src/streamlz_gpu.zig:44)
+//!                                              as an INTERNAL sentinel
+//!                                              for async-D2D inputs; it
+//!                                              is never exposed via the
+//!                                              CUDA C ABI. The Vulkan
+//!                                              header reserves the symbol
+//!                                              for ABI compat but there
+//!                                              is no wired D2D-only
+//!                                              path the sentinel could
+//!                                              flow into — every codec
+//!                                              entry point that saw the
+//!                                              old `0x10` sentinel
+//!                                              rejected it as
+//!                                              UNSUPPORTED. Returning
+//!                                              the error directly tells
+//!                                              callers honestly rather
+//!                                              than handing back a
+//!                                              sentinel that nothing
+//!                                              accepts.
 
 const std = @import("std");
 
@@ -237,24 +277,16 @@ fn asyncDecompressWorker(args_ptr: *AsyncDecompressArgs) void {
     @atomicStore(bool, &h.async_dec.done, true, .release);
 }
 
-/// Sentinel value handed back by `slzMakeDeviceOnlyHandle_vk`. Today
-/// (Phase 1) this is just a non-null marker pointer — the codec paths
-/// don't yet know how to dereference it as a device address. Phase 2
-/// (A2 — BDA wiring in `slzCompress_vk` / `slzDecompress_vk`) will
-/// teach the codec to recognize it and skip the H2D copy. The address
-/// is intentionally invalid for host dereference (matches CUDA's
-/// `device_only_host_stub_addr = 0x10` pattern) so any path that
-/// accidentally reads through it faults loudly.
-const device_only_sentinel_addr: usize = 0x10;
-
-/// Test whether a host pointer is the device-only sentinel from
-/// `slzMakeDeviceOnlyHandle_vk`. Phase 1: the codec rejects sentinels
-/// with `SLZ_ERROR_UNSUPPORTED` (no D2D path yet). Phase 2 makes this
-/// the trigger that flips the codec into device-address mode.
-fn isDeviceOnlySentinel(p: ?*const anyopaque) bool {
-    if (p == null) return false;
-    return @intFromPtr(p) == device_only_sentinel_addr;
-}
+// The Vulkan backend does NOT implement a host-sentinel-for-device
+// argument pattern. The CUDA backend uses
+// `device_only_host_stub_addr = 0x10` (src/streamlz_gpu.zig:44) but only
+// as an INTERNAL sentinel inside its async compress path — it is never
+// exposed via the CUDA C ABI. The Vulkan backend's D2D path resolves
+// caller VkBuffer arguments through the `slzRegisterBuffer_vk` registry
+// (BDA u64 lookup), not via a host-sentinel pointer. The
+// `slzMakeDeviceOnlyHandle_vk` ABI symbol survives only to preserve the
+// C-header ABI surface; its implementation returns SLZ_ERROR_UNSUPPORTED
+// (see below).
 
 // ── Diagnostics ───────────────────────────────────────────────────────
 pub export fn slzGetVersionString_vk() [*:0]const u8 {
@@ -424,23 +456,18 @@ pub export fn slzBufferGetDeviceAddress_vk(
 // Returns `int` (not slzStatus_t) to match the header — the byte count
 // surface mirrors the CUDA contract once implemented.
 
-/// Device-pointer variant. Phase 2 (TODO A2) wires the BDA path: if
-/// `d_input` is the device address of a previously-registered
-/// VkBuffer (via `slzRegisterBuffer_vk`), the encoder binds that
-/// buffer directly into the descriptor set and skips its internal
-/// HOST_VISIBLE staging + memcpy. Otherwise the call falls through
-/// to `slzCompressHost_vk` (treats the pointer as a host pointer).
+/// Device-pointer variant: if `d_input` is the device address of a
+/// previously-registered VkBuffer (via `slzRegisterBuffer_vk`), the
+/// encoder binds that buffer directly into the descriptor set and
+/// skips its internal HOST_VISIBLE staging + memcpy. Otherwise the
+/// call falls through to `slzCompressHost_vk` (treats the pointer
+/// as a host pointer).
 ///
 /// `d_output` is always host-side for compress today — the L1
 /// encoder's output goes through the CPU wire-format wrap before
 /// landing in `d_output`. Registering `d_output` as a device buffer
 /// is accepted (we copy the wrapped frame into it via staging) for
 /// API symmetry but is NOT a perf win at this phase.
-///
-/// The "device-only sentinel" from `slzMakeDeviceOnlyHandle_vk` is
-/// rejected here: it carries no registered buffer to bind, so the
-/// codec has no actual buffer to operate on. Use
-/// `slzRegisterBuffer_vk` + pass the BDA address instead.
 pub export fn slzCompress_vk(
     handle: ?*VkContext,
     d_input: ?*const anyopaque,
@@ -449,9 +476,6 @@ pub export fn slzCompress_vk(
     output_capacity: usize,
     opts: CompressOpts,
 ) c_int {
-    if (isDeviceOnlySentinel(d_input) or isDeviceOnlySentinel(d_output))
-        return SLZ_ERROR_UNSUPPORTED;
-
     const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
     if (d_input == null and input_size != 0) return SLZ_ERROR_INVALID_ARG;
     if (d_output == null) return SLZ_ERROR_INVALID_ARG;
@@ -610,15 +634,15 @@ pub export fn slzCompressHost_vk(
     return @intCast(written);
 }
 
-/// Device-pointer variant. Phase 2 (TODO A2) wires the BDA path. If
-/// `d_output` is a registered VkBuffer's device address, the decoder
-/// writes decoded bytes directly into the caller's VkBuffer without
-/// the internal HOST_VISIBLE staging copy + host @memcpy chain. If
-/// `d_input` is registered, the CPU wire-format unwrap still runs
-/// (the CPU path needs the bytes); we read them back from the device
-/// buffer via a staging copy. This is correctness-preserving but not
-/// a perf win for input D2D at this phase — Phase 4 (GPU decode
-/// pipeline) is the path to real D2D for input.
+/// Device-pointer variant. If `d_output` is a registered VkBuffer's
+/// device address, the decoder writes decoded bytes directly into the
+/// caller's VkBuffer without the internal HOST_VISIBLE staging copy +
+/// host @memcpy chain. If `d_input` is registered, the CPU
+/// wire-format unwrap still runs (the CPU path needs the bytes); we
+/// read them back from the device buffer via a staging copy. This is
+/// correctness-preserving but not a perf win for input D2D at this
+/// phase — Phase 4 (GPU decode pipeline) is the path to real D2D for
+/// input.
 pub export fn slzDecompress_vk(
     handle: ?*VkContext,
     d_input: ?*const anyopaque,
@@ -627,9 +651,6 @@ pub export fn slzDecompress_vk(
     output_capacity: usize,
     opts: DecompressOpts,
 ) c_int {
-    if (isDeviceOnlySentinel(d_input) or isDeviceOnlySentinel(d_output))
-        return SLZ_ERROR_UNSUPPORTED;
-
     const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
     if (d_input == null and input_size != 0) return SLZ_ERROR_INVALID_ARG;
     if (d_output == null and output_capacity != 0) return SLZ_ERROR_INVALID_ARG;
@@ -934,25 +955,24 @@ fn mapDecodeError(err: slz1_codec.Slz1Error) c_int {
     };
 }
 
-/// Build a sentinel pointer the codec recognizes as "this argument is
-/// already a device-resident buffer; skip the H2D copy and consume the
-/// pointer as a device address." Phase 1: returns the sentinel address
-/// (`0x10`) but the codec rejects it — calling `slzCompress_vk` /
-/// `slzDecompress_vk` with the sentinel currently returns
-/// SLZ_ERROR_UNSUPPORTED. Phase 2 wires the actual BDA path. The
-/// sentinel address is intentionally non-dereferenceable so any path
-/// that forgets the contract and reads through it faults loudly
-/// instead of corrupting silently (matches the CUDA backend's
-/// `device_only_host_stub_addr` pattern in `src/streamlz_gpu.zig`).
+/// Always returns SLZ_ERROR_UNSUPPORTED. The Vulkan backend exposes
+/// device-resident I/O via the `slzRegisterBuffer_vk` registry (the
+/// caller passes the BDA u64 as the `d_input`/`d_output` argument and
+/// the codec resolves it to the registered VkBuffer). There is no
+/// host-sentinel pattern equivalent to the CUDA backend's INTERNAL
+/// `device_only_host_stub_addr` (src/streamlz_gpu.zig:44) — that
+/// sentinel is not exposed in the CUDA C ABI either, so a CUDA caller
+/// using `slzMakeDeviceOnlyHandle` does not exist. The Vulkan
+/// `slzMakeDeviceOnlyHandle_vk` ABI symbol is retained for header
+/// compatibility but reports unsupported so callers branch on the
+/// real D2D path (`slzRegisterBuffer_vk` + BDA address argument).
 pub export fn slzMakeDeviceOnlyHandle_vk(
     out_handle: ?*?*const anyopaque,
     bytes: usize,
 ) c_int {
     _ = bytes;
-    const slot = out_handle orelse return SLZ_ERROR_INVALID_ARG;
-    const sentinel: *const anyopaque = @ptrFromInt(device_only_sentinel_addr);
-    slot.* = sentinel;
-    return SLZ_SUCCESS;
+    if (out_handle) |slot| slot.* = null;
+    return SLZ_ERROR_UNSUPPORTED;
 }
 
 // ── Async / polling ───────────────────────────────────────────────────
@@ -981,12 +1001,6 @@ pub export fn slzCompressAsync_vk(
     if (d_input == null and input_size != 0) return SLZ_ERROR_INVALID_ARG;
     if (d_output == null) return SLZ_ERROR_INVALID_ARG;
     if (opts.level != 1) return SLZ_ERROR_UNSUPPORTED;
-    // Phase 1: no BDA path yet — reject the device-only sentinel
-    // explicitly so the caller doesn't get a worker thread launched
-    // against an unreadable host pointer. Phase 2 makes this a real
-    // device-address dispatch.
-    if (isDeviceOnlySentinel(d_input) or isDeviceOnlySentinel(d_output))
-        return SLZ_ERROR_UNSUPPORTED;
     // Refuse to start a second op while one is already in flight —
     // the slot owns the worker thread and stomping on it leaks the
     // join.
@@ -1034,8 +1048,6 @@ pub export fn slzDecompressAsync_vk(
     const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
     if (d_input == null and input_size != 0) return SLZ_ERROR_INVALID_ARG;
     if (d_output == null and output_capacity != 0) return SLZ_ERROR_INVALID_ARG;
-    if (isDeviceOnlySentinel(d_input) or isDeviceOnlySentinel(d_output))
-        return SLZ_ERROR_UNSUPPORTED;
     if (h.async_dec.isBusy()) return SLZ_ERROR_UNSUPPORTED;
     h.async_dec = .{};
 

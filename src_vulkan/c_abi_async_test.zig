@@ -4,9 +4,11 @@
 //! constructor. Wired as `zig build vk-abi-async-test`.
 //!
 //! Exercises:
-//!   * slzMakeDeviceOnlyHandle_vk — returns a non-null sentinel; the
-//!     sync entry points reject the sentinel with SLZ_ERROR_UNSUPPORTED
-//!     pending the Phase 2 BDA wiring.
+//!   * slzMakeDeviceOnlyHandle_vk — always returns SLZ_ERROR_UNSUPPORTED
+//!     and writes null to the out-slot. The Vulkan backend's D2D path
+//!     goes through `slzRegisterBuffer_vk` + BDA u64 (no host-sentinel
+//!     pattern, unlike CUDA's INTERNAL `device_only_host_stub_addr`
+//!     which is not exposed via the CUDA C ABI either).
 //!   * slzCompressAsync_vk + slzCompressAsyncPoll_vk — submits, polls
 //!     non-blocking (may report not-ready), then blocking-polls to
 //!     completion; asserts the byte count round-trips with what a
@@ -135,40 +137,21 @@ pub fn main(process_init: std.process.Init) !void {
 
     const bound = vk_abi.slzCompressBound_vk(src.len);
 
-    // ── Case 1: slzMakeDeviceOnlyHandle_vk returns a non-null sentinel ─
+    // ── Case 1: slzMakeDeviceOnlyHandle_vk reports unsupported ─────
+    // The Vulkan backend does not implement the CUDA host-sentinel
+    // pattern (D2D goes through slzRegisterBuffer_vk + BDA u64), so
+    // the ABI symbol returns SLZ_ERROR_UNSUPPORTED and clears the
+    // out-slot. A future revision wiring a real host-sentinel pattern
+    // would need to update this case to assert SLZ_SUCCESS and a
+    // distinguishable sentinel pointer.
     {
-        var dev_handle: ?*const anyopaque = null;
+        var dev_handle: ?*const anyopaque = @ptrFromInt(0xdeadbeef);
         const rc = vk_abi.slzMakeDeviceOnlyHandle_vk(&dev_handle, src.len);
-        const passed = rc == 0 and dev_handle != null;
+        const passed = rc == 5 and dev_handle == null;
         try results.append(allocator, .{
-            .name = "make_device_only_handle",
+            .name = "make_device_only_handle_unsupported",
             .passed = passed,
-            .detail = if (passed) "ok" else "stub returned UNSUPPORTED or null",
-        });
-    }
-
-    // ── Case 2: slzCompress_vk with sentinel input → UNSUPPORTED ────
-    {
-        var dev_in: ?*const anyopaque = null;
-        _ = vk_abi.slzMakeDeviceOnlyHandle_vk(&dev_in, src.len);
-        const out_buf = try allocator.alloc(u8, bound);
-        defer allocator.free(out_buf);
-        const rc = vk_abi.slzCompress_vk(
-            handle,
-            dev_in,
-            src.len,
-            out_buf.ptr,
-            out_buf.len,
-            .{ .level = 1 },
-        );
-        // Phase 1: codec rejects device sentinels; Phase 2 will flip
-        // this to a real D2D compress (and this case will need to
-        // become a true device-buffer test).
-        const passed = rc == 5; // SLZ_ERROR_UNSUPPORTED
-        try results.append(allocator, .{
-            .name = "sentinel_rejected_pre_phase2",
-            .passed = passed,
-            .detail = if (passed) "ok" else "expected SLZ_ERROR_UNSUPPORTED (5) from codec",
+            .detail = if (passed) "ok" else "expected UNSUPPORTED + null out-slot",
         });
     }
 
