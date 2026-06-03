@@ -766,19 +766,27 @@ pub fn prepareDecodePipeline(
     const cache = driver.getOrCreateDecodePipelineCache(ctx);
     const pipes = try loadAllPipelines(ctx, cache, tier, tier_b, allocator);
 
+    // V-017/V-018: each set is allocated ONCE per (kernel, slot) pair
+    // across the process lifetime and re-bound to the current workspace
+    // buffer handles every call via vkUpdateDescriptorSets. Mirrors
+    // CUDA's `cuLaunchKernel(kernel, args)` zero-cost per-call arg
+    // rebind (src/decode/decode_dispatch.zig:530-545). The 9 calls
+    // below collapse the host overhead of allocating 9 fresh sets per
+    // decode (~12% of the 3.56 ms gap on NVIDIA RTX 4060 Ti) into a
+    // one-shot 9-alloc warmup + 9 cheap updates per call.
     const walk_bindings: [3]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = result.frame.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = result.chunks.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = result.meta.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
     };
-    const walk_set = try descriptors.allocSet(ctx, pipes.walk, walk_bindings[0..]);
+    const walk_set = try descriptors.getOrAllocPersistentSet(ctx, cache, "walk_frame", tier, 0, walk_bindings[0..]);
 
     const prefix_bindings: [3]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = result.chunks.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = result.first_sub_idx.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = result.total_subs.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
     };
-    const prefix_set = try descriptors.allocSet(ctx, pipes.prefix, prefix_bindings[0..]);
+    const prefix_set = try descriptors.getOrAllocPersistentSet(ctx, cache, "prefix_sum_chunks", tier, 0, prefix_bindings[0..]);
 
     const scan_bindings: [10]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = result.frame.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -792,15 +800,19 @@ pub fn prepareDecodePipeline(
         .{ .buffer = result.staged.buf, .offset = huff_arr_bytes * 4, .range = raw_arr_bytes },
         .{ .buffer = result.staged.buf, .offset = huff_arr_bytes * 4 + raw_arr_bytes, .range = raw_arr_bytes },
     };
-    const scan_set = try descriptors.allocSet(ctx, pipes.scan, scan_bindings[0..]);
+    const scan_set = try descriptors.getOrAllocPersistentSet(ctx, cache, "scan_parse", tier, 0, scan_bindings[0..]);
 
+    // compact_huff is dispatched 4 ways against the SAME pipeline with
+    // different bindings — each shape gets its own persistent-set slot
+    // (0=lit, 1=tok, 2=hi, 3=lo) so they don't trample each other's
+    // vkUpdateDescriptorSets writes.
     const compact_lit_bindings: [4]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = result.staged.buf, .offset = 0, .range = huff_arr_bytes },
         .{ .buffer = result.total_subs.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = result.compact_lit.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = result.compact_counts.buf, .offset = 0, .range = 4 },
     };
-    const compact_lit_set = try descriptors.allocSet(ctx, pipes.compact_huff, compact_lit_bindings[0..]);
+    const compact_lit_set = try descriptors.getOrAllocPersistentSet(ctx, cache, "compact_huff_descs", tier, 0, compact_lit_bindings[0..]);
 
     const compact_tok_bindings: [4]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = result.staged.buf, .offset = huff_arr_bytes, .range = huff_arr_bytes },
@@ -808,7 +820,7 @@ pub fn prepareDecodePipeline(
         .{ .buffer = result.compact_tok.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = result.compact_counts.buf, .offset = 4, .range = 4 },
     };
-    const compact_tok_set = try descriptors.allocSet(ctx, pipes.compact_huff, compact_tok_bindings[0..]);
+    const compact_tok_set = try descriptors.getOrAllocPersistentSet(ctx, cache, "compact_huff_descs", tier, 1, compact_tok_bindings[0..]);
 
     const compact_hi_bindings: [4]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = result.staged.buf, .offset = huff_arr_bytes * 2, .range = huff_arr_bytes },
@@ -816,7 +828,7 @@ pub fn prepareDecodePipeline(
         .{ .buffer = result.compact_hi.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = result.compact_counts.buf, .offset = 8, .range = 4 },
     };
-    const compact_hi_set = try descriptors.allocSet(ctx, pipes.compact_huff, compact_hi_bindings[0..]);
+    const compact_hi_set = try descriptors.getOrAllocPersistentSet(ctx, cache, "compact_huff_descs", tier, 2, compact_hi_bindings[0..]);
 
     const compact_lo_bindings: [4]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = result.staged.buf, .offset = huff_arr_bytes * 3, .range = huff_arr_bytes },
@@ -824,7 +836,7 @@ pub fn prepareDecodePipeline(
         .{ .buffer = result.compact_lo.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = result.compact_counts.buf, .offset = 12, .range = 4 },
     };
-    const compact_lo_set = try descriptors.allocSet(ctx, pipes.compact_huff, compact_lo_bindings[0..]);
+    const compact_lo_set = try descriptors.getOrAllocPersistentSet(ctx, cache, "compact_huff_descs", tier, 3, compact_lo_bindings[0..]);
 
     const compact_raw_bindings: [5]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = result.staged.buf, .offset = huff_arr_bytes * 4, .range = raw_arr_bytes },
@@ -833,7 +845,7 @@ pub fn prepareDecodePipeline(
         .{ .buffer = result.compact_raw.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = result.compact_counts.buf, .offset = 16, .range = 4 },
     };
-    const compact_raw_set = try descriptors.allocSet(ctx, pipes.compact_raw, compact_raw_bindings[0..]);
+    const compact_raw_set = try descriptors.getOrAllocPersistentSet(ctx, cache, "compact_raw_descs", tier, 0, compact_raw_bindings[0..]);
 
     const gather_bindings: [4]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = result.frame.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -841,7 +853,7 @@ pub fn prepareDecodePipeline(
         .{ .buffer = result.compact_raw.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = result.compact_counts.buf, .offset = 16, .range = 4 },
     };
-    const gather_set = try descriptors.allocSet(ctx, pipes.gather, gather_bindings[0..]);
+    const gather_set = try descriptors.getOrAllocPersistentSet(ctx, cache, "gather_raw_off16", tier, 0, gather_bindings[0..]);
 
     return .{
         .result = result,

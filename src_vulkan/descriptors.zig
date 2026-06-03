@@ -115,10 +115,36 @@ pub const CachedPipeline = struct {
     n_storage_buffers: u32,
 };
 
+/// Number of persistent descriptor-set slots per cache entry. Most
+/// pipelines need exactly one persistent set, but `compact_huff` is
+/// dispatched FOUR ways (lit/tok/hi/lo) against the same pipeline with
+/// different bindings — so each entry can host up to MAX_PERSISTENT_SETS
+/// independent sets, keyed by a caller-supplied `slot` index.
+///
+/// 8 is a safe upper bound: the largest fan-out today is 4 (compact_huff),
+/// and the bound is enforced at runtime via `getOrAllocPersistentSet`
+/// (returns TooManyBindings if the slot index is out of range — caller
+/// bug, not a recoverable runtime condition).
+const MAX_PERSISTENT_SETS: u32 = 8;
+
 const Entry = struct {
     key: PipelineKey,
     value: CachedPipeline,
     last_used: u32,
+    /// Persistent descriptor sets allocated lazily by
+    /// `getOrAllocPersistentSet`. Sized at MAX_PERSISTENT_SETS slots so
+    /// kernels with multiple per-call binding shapes (compact_huff:
+    /// lit/tok/hi/lo) can each cache an independent set on the same
+    /// underlying pipeline.
+    ///
+    /// V-017/V-018 mirror of CUDA's `cuLaunchKernel(kernel, args)`
+    /// pattern: every decode call re-supplies the kernel's argument list
+    /// at zero allocator cost. In Vulkan terms that's "re-update the
+    /// already-allocated descriptor set" instead of allocating a fresh
+    /// one. Allocation moved out of the per-call hot path entirely;
+    /// vkUpdateDescriptorSets per call is the new floor (cheap — driver
+    /// just copies VkDescriptorBufferInfo bytes into the resident set).
+    persistent_sets: [MAX_PERSISTENT_SETS]vk.VkDescriptorSet = @splat(null),
 };
 
 /// Fixed-size cache. `lru_counter` increments on every hit (and on every
@@ -486,37 +512,23 @@ pub fn getOrCreateWithPipelineCache(
     return built;
 }
 
-/// Reset every cached entry's descriptor pool (vkResetDescriptorPool) —
-/// frees every VkDescriptorSet previously minted by `allocSet` but keeps
-/// the underlying VkPipeline / VkPipelineLayout / VkDescriptorSetLayout /
-/// VkShaderModule / VkDescriptorPool alive for reuse.
+/// LEGACY (V-017/V-018): with persistent descriptor sets allocated once
+/// per (kernel, slot) via `getOrAllocPersistentSet`, the per-decode-call
+/// pool reset is no longer needed — sets stay resident across calls and
+/// are re-updated in place via vkUpdateDescriptorSets (no allocator
+/// traffic). Kept as a no-op so legacy callers compile; new callers
+/// should NOT invoke this.
 ///
-/// Mirrors CUDA's per-call kernel-arg pattern: in CUDA each
-/// `cuLaunchKernel` re-supplies the argument list (= "fresh descriptor
-/// set" in VK terms) with zero allocator cost because args go through
-/// the kernel function pointer's call ABI rather than a descriptor pool.
-/// Vulkan has no equivalent, so the closest port-faithful pattern is to
-/// reset the pool (constant-time, no allocator traffic) at every decode
-/// entry and re-allocate the fresh sets we need for this call.
-///
-/// S001 needed this: with the cache promoted to process-lifetime, the
-/// per-pipeline descriptor pool (sized at MAX_SETS_PER_POOL = 16) would
-/// otherwise fill after ~16 / sets-per-call decode invocations and
+/// Historical rationale (S001): pre-V-017 the decode path called
+/// `allocSet` per dispatch, which carved a fresh VkDescriptorSet out of
+/// the pool. Without a per-call reset the pool (MAX_SETS_PER_POOL = 16)
+/// would fill after ~16 / sets-per-call decode invocations and
 /// vkAllocateDescriptorSets would start returning OUT_OF_POOL_MEMORY.
-///
-/// Safe on an empty / never-populated cache (every empty slot is
-/// skipped).
+/// V-017/V-018 closes the gap by moving the alloc out of the hot path
+/// entirely — there is no longer a per-call set to reset.
 pub fn resetAllPools(ctx: *driver_mod.Context, cache: *Cache) void {
-    if (ctx.dev == null) return;
-    const reset_pool = vk.vkResetDescriptorPool_fn orelse return;
-    var i: usize = 0;
-    while (i < MAX_ENTRIES) : (i += 1) {
-        if (cache.entries[i]) |e| {
-            if (e.value.pool != null) {
-                _ = reset_pool(ctx.dev, e.value.pool, 0);
-            }
-        }
-    }
+    _ = ctx;
+    _ = cache;
 }
 
 /// Drop every cached entry. Destroys the Vulkan-side children of each
@@ -537,6 +549,102 @@ pub fn invalidateAll(ctx: *driver_mod.Context, cache: *Cache) void {
     cache.lru_counter = 0;
 }
 
+/// V-017/V-018: return a process-lifetime VkDescriptorSet for the
+/// `(kernel, tier, slot)` triple. The set is allocated lazily on first
+/// call (from the entry's pool, one vkAllocateDescriptorSets) and
+/// re-updated in place on every subsequent call (vkUpdateDescriptorSets
+/// with the caller's current `buffers`).
+///
+/// Ports CUDA's `cuLaunchKernel(kernel, args)` shape: each call re-
+/// supplies the kernel-argument list at zero allocator cost. In Vulkan
+/// terms, "supply args" is "update the descriptor set bindings", which
+/// vkUpdateDescriptorSets does without touching the descriptor pool.
+/// The pre-V-017 path called `allocSet` per decode (= ~11.67 sets per
+/// host-input decode on the nsys baseline); V-017/V-018 collapses that
+/// to ~0 amortized after the first call per (kernel, slot) pair.
+///
+/// `slot` is a caller-chosen index in [0, MAX_PERSISTENT_SETS). Most
+/// pipelines use slot 0; pipelines dispatched with multiple binding
+/// shapes (compact_huff: lit/tok/hi/lo at slots 0/1/2/3) pick distinct
+/// indices so each per-call-shape sees its own resident set.
+///
+/// `buffers.len` MUST equal the entry's `n_storage_buffers`. Returns
+/// TooManyBindings if `slot >= MAX_PERSISTENT_SETS` (caller bug). The
+/// returned set is owned by the cache and freed at `invalidateAll` /
+/// LRU eviction time — caller MUST NOT free it.
+pub fn getOrAllocPersistentSet(
+    ctx: *driver_mod.Context,
+    cache: *Cache,
+    kernel: []const u8,
+    tier: probe.Tier,
+    slot: u32,
+    buffers: []const vk.VkDescriptorBufferInfo,
+) DescriptorError!vk.VkDescriptorSet {
+    if (ctx.dev == null) return error.LoaderNotReady;
+    if (slot >= MAX_PERSISTENT_SETS) return error.TooManyBindings;
+    const alloc_sets = vk.vkAllocateDescriptorSets_fn orelse return error.LoaderNotReady;
+    const update_sets = vk.vkUpdateDescriptorSets_fn orelse return error.LoaderNotReady;
+
+    const key: PipelineKey = .{ .kernel = kernel, .tier = tier };
+
+    // Find the cache entry. Mirrors the hit-path scan in `getOrCreate`.
+    // Caller MUST have already called `getOrCreate(WithPipelineCache)`
+    // for this key — the persistent-set helper does NOT lazy-build the
+    // pipeline (keeping the spv-bytes / push-const-size / pipeline-cache
+    // arguments out of this function's signature).
+    var entry_ptr: ?*Entry = null;
+    var i: usize = 0;
+    while (i < MAX_ENTRIES) : (i += 1) {
+        if (cache.entries[i]) |*e| {
+            if (e.key.eql(key)) {
+                entry_ptr = e;
+                break;
+            }
+        }
+    }
+    const entry = entry_ptr orelse return error.DescriptorSetAllocateFailed;
+
+    std.debug.assert(buffers.len == entry.value.n_storage_buffers);
+
+    // Lazy-alloc the persistent set on first call. Subsequent calls
+    // see a non-null handle and skip straight to vkUpdateDescriptorSets.
+    if (entry.persistent_sets[slot] == null) {
+        const set_layouts: [1]vk.VkDescriptorSetLayout = .{entry.value.set_layout};
+        const alloc_ci: vk.VkDescriptorSetAllocateInfo = .{
+            .descriptorPool = entry.value.pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = @ptrCast(&set_layouts),
+        };
+        var sets: [1]vk.VkDescriptorSet = .{null};
+        if (alloc_sets(ctx.dev, &alloc_ci, @ptrCast(&sets)) != vk.VK_SUCCESS) {
+            return error.DescriptorSetAllocateFailed;
+        }
+        entry.persistent_sets[slot] = sets[0];
+    }
+
+    // Re-bind the caller's current buffer handles. This is the per-call
+    // hot-path replacement for `allocSet`'s alloc+update pair — only the
+    // update half runs per call now, and the update is fast (driver
+    // memcpy of N VkDescriptorBufferInfo structs into the resident set).
+    const n: u32 = entry.value.n_storage_buffers;
+    if (n > 0) {
+        var writes: [MAX_SSBOS]vk.VkWriteDescriptorSet = @splat(.{});
+        var b: u32 = 0;
+        while (b < n) : (b += 1) {
+            writes[b] = .{
+                .dstSet = entry.persistent_sets[slot],
+                .dstBinding = b,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pBufferInfo = @ptrCast(&buffers[b]),
+            };
+        }
+        update_sets(ctx.dev, n, @ptrCast(&writes), 0, null);
+    }
+    return entry.persistent_sets[slot];
+}
+
 /// Allocate a fresh VkDescriptorSet from the cached entry's pool and
 /// write the caller-supplied buffer infos into bindings 0..n-1.
 ///
@@ -547,6 +655,12 @@ pub fn invalidateAll(ctx: *driver_mod.Context, cache: *Cache) void {
 ///
 /// Returned set lifetime: valid until the next `invalidateAll` or until
 /// the entry's pool is exhausted (MAX_SETS_PER_POOL allocations).
+///
+/// Legacy: pre-V-017 entry point. Hot-path decode code should use
+/// `getOrAllocPersistentSet` instead — it allocates the set once at
+/// first call and re-updates the binding contents on subsequent calls
+/// (no allocator traffic). `allocSet` remains in use by tests and
+/// non-decode code paths.
 pub fn allocSet(
     ctx: *driver_mod.Context,
     cached: CachedPipeline,

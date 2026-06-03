@@ -542,16 +542,15 @@ pub fn decodeSlz1ToBytesEx(
     const unwrap_spv = try dupAlignedSpv(allocator, unwrap_spv_raw);
     defer allocator.free(unwrap_spv);
 
-    // S001 housekeeping: reset every descriptor pool in the
-    // process-lifetime decode cache at the start of every decode call.
-    // The pools themselves stay alive, so this is a constant-time call
-    // per pipeline rather than the destroy+rebuild traffic the old
-    // per-call invalidateAll paid. Without this, the per-pipeline pool
-    // (MAX_SETS_PER_POOL = 16) would fill after ~16 / sets-per-call
-    // decode invocations and vkAllocateDescriptorSets would start
-    // failing with OUT_OF_POOL_MEMORY. Mirrors CUDA's per-call kernel-
-    // arg pattern (every cuLaunchKernel re-supplies args at zero cost).
-    descriptors.resetAllPools(ctx, driver.getOrCreateDecodePipelineCache(ctx));
+    // V-017/V-018: persistent descriptor sets allocated once per
+    // (kernel, slot) via `descriptors.getOrAllocPersistentSet` —
+    // there are no per-call set allocations left to reset. Mirrors
+    // CUDA's per-call kernel-arg pattern (every cuLaunchKernel re-
+    // supplies args at zero cost) via vkUpdateDescriptorSets on the
+    // already-allocated resident set rather than a fresh alloc-and-
+    // write pair. Pre-V-017 this called `descriptors.resetAllPools`
+    // to free per-call sets back to the pool; that call is now a
+    // no-op and the call site is removed.
 
     // ── HOST WALK ───────────────────────────────────────────────────
     // Port of CUDA's host-input shape at
@@ -1066,7 +1065,13 @@ pub fn decodeSlz1ToBytesEx(
         // through-PCIe read per subgroup).
         .{ .buffer = pipeline_result.n_chunks_scratch.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
     };
-    const dec_set = try descriptors.allocSet(ctx, cached_dec, dec_bindings[0..]);
+    // V-017/V-018: persistent lz_decode descriptor set. The set is
+    // allocated ONCE on the first decode call (out of cached_dec.pool)
+    // and re-updated per call to point at the current dst_bind_buf
+    // (workspace's dst_b / dst_stage / caller_imported / D2D override).
+    // Mirrors CUDA's `cuLaunchKernel(kernel, args)` zero-cost per-call
+    // arg rebind at src/decode/decode_dispatch.zig:530-545.
+    const dec_set = try descriptors.getOrAllocPersistentSet(ctx, cache, "lz_decode", tier, 0, dec_bindings[0..]);
 
     last_decode_slz_descset_ns = qpcNs(t_descset_begin, qpcNow());
 
