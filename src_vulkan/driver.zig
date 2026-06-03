@@ -15,6 +15,7 @@ const device_mod = @import("device.zig");
 const dispatch_mod = @import("dispatch.zig");
 const probe_mod = @import("probe.zig");
 const decode_workspace_mod = @import("decode_workspace.zig");
+const descriptors_mod = @import("descriptors.zig");
 
 pub const Context = struct {
     inst: vk.VkInstance = null,
@@ -68,6 +69,28 @@ pub const Context = struct {
     // because embedding it inline would inflate every Context (~17
     // Slots × ~64 bytes = ~1 KiB) for callers that never decode.
     decode_workspace: ?*decode_workspace_mod.DecodeWorkspace = null,
+
+    // ── S001: process-lifetime pipeline cache for the decode path.
+    // CUDA loads each kernel ONCE at process init (see
+    // src/decode/module_loader.zig:140-141, 169-173 — cuModuleLoadData
+    // + cuModuleGetFunction are called exactly once and the function
+    // pointer is stored in a module-global slot for the lifetime of
+    // the process). The Vulkan port previously declared a local
+    // `var cache: descriptors.Cache = .{}` inside both decode entry
+    // points and tore the whole thing down at the end of each call
+    // via `defer descriptors.invalidateAll(...)`. That meant every
+    // decode rebuilt 8 pipelines (vkCreateShaderModule +
+    // vkCreateDescriptorSetLayout + vkCreatePipelineLayout +
+    // vkCreateComputePipelines + vkCreateDescriptorPool, ×8 — a few
+    // ms of wasted host work per call).
+    //
+    // The cache is created on first use by the decode path
+    // (`getOrCreateDecodePipelineCache`) and torn down in `deinit`
+    // before `destroyDevice`. It's stack-stored on Context (the
+    // Cache struct is ~16 entries × ~40 bytes = ~640 bytes, well
+    // under the heap-allocation threshold the workspace uses).
+    decode_pipeline_cache: descriptors_mod.Cache = .{},
+    decode_pipeline_cache_initialized: bool = false,
 };
 
 pub var g_default: Context = .{};
@@ -168,6 +191,23 @@ pub fn getOrCreateDecodeWorkspace(
     return ws;
 }
 
+/// Lazily prepare the per-context decode pipeline cache. The cache
+/// struct itself is value-stored on Context (no heap alloc here); this
+/// function exists to (a) mark the cache as initialized so deinit knows
+/// to drop it, and (b) give the call sites a single point that can
+/// later grow extra setup (e.g. seeding from disk via pipeline_cache
+/// after S002 lands).
+///
+/// Mirrors CUDA module_loader.init() (src/decode/module_loader.zig:135-148)
+/// which loads every kernel once at process init.
+pub fn getOrCreateDecodePipelineCache(ctx: *Context) *descriptors_mod.Cache {
+    if (!ctx.decode_pipeline_cache_initialized) {
+        ctx.decode_pipeline_cache = .{};
+        ctx.decode_pipeline_cache_initialized = true;
+    }
+    return &ctx.decode_pipeline_cache;
+}
+
 pub fn deinit() void {
     if (!g_default.initialized) return;
     // Decode workspace teardown BEFORE destroyDevice — every VkBuffer +
@@ -177,6 +217,16 @@ pub fn deinit() void {
         decode_workspace_mod.deinit(&g_default, ws);
         std.heap.page_allocator.destroy(ws);
         g_default.decode_workspace = null;
+    }
+    // S001: process-lifetime descriptor cache teardown BEFORE
+    // destroyDevice — every VkPipeline / VkPipelineLayout /
+    // VkDescriptorSetLayout / VkShaderModule / VkDescriptorPool it
+    // holds is device-owned and the spec requires they be destroyed
+    // before their parent VkDevice. invalidateAll is a no-op when the
+    // cache was never used (no decode ran in this process).
+    if (g_default.decode_pipeline_cache_initialized) {
+        descriptors_mod.invalidateAll(&g_default, &g_default.decode_pipeline_cache);
+        g_default.decode_pipeline_cache_initialized = false;
     }
     // M8a chassis teardown must happen BEFORE destroyDevice — command
     // pools, fences, and query pools are device-owned and the spec

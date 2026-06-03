@@ -1260,6 +1260,12 @@ pub const FnAllocateDescriptorSets = *const fn (
     pDescriptorSets: [*]VkDescriptorSet,
 ) callconv(.c) VkResult;
 
+pub const FnResetDescriptorPool = *const fn (
+    device: VkDevice,
+    descriptorPool: VkDescriptorPool,
+    flags: u32,
+) callconv(.c) VkResult;
+
 pub const FnUpdateDescriptorSets = *const fn (
     device: VkDevice,
     descriptorWriteCount: u32,
@@ -1318,6 +1324,7 @@ pub var vkDestroyDescriptorSetLayout_fn: ?FnDestroyDescriptorSetLayout = null;
 pub var vkCreateDescriptorPool_fn: ?FnCreateDescriptorPool = null;
 pub var vkDestroyDescriptorPool_fn: ?FnDestroyDescriptorPool = null;
 pub var vkAllocateDescriptorSets_fn: ?FnAllocateDescriptorSets = null;
+pub var vkResetDescriptorPool_fn: ?FnResetDescriptorPool = null;
 pub var vkUpdateDescriptorSets_fn: ?FnUpdateDescriptorSets = null;
 pub var vkCreatePipelineLayout_fn: ?FnCreatePipelineLayout = null;
 pub var vkDestroyPipelineLayout_fn: ?FnDestroyPipelineLayout = null;

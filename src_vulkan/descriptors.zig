@@ -163,6 +163,8 @@ fn ensureFnSlots(dev: vk.VkDevice) DescriptorError!void {
         vk.vkDestroyDescriptorPool_fn = resolveDeviceFn(vk.FnDestroyDescriptorPool, dev, "vkDestroyDescriptorPool");
     if (vk.vkAllocateDescriptorSets_fn == null)
         vk.vkAllocateDescriptorSets_fn = resolveDeviceFn(vk.FnAllocateDescriptorSets, dev, "vkAllocateDescriptorSets");
+    if (vk.vkResetDescriptorPool_fn == null)
+        vk.vkResetDescriptorPool_fn = resolveDeviceFn(vk.FnResetDescriptorPool, dev, "vkResetDescriptorPool");
     if (vk.vkUpdateDescriptorSets_fn == null)
         vk.vkUpdateDescriptorSets_fn = resolveDeviceFn(vk.FnUpdateDescriptorSets, dev, "vkUpdateDescriptorSets");
     if (vk.vkCreatePipelineLayout_fn == null)
@@ -459,6 +461,39 @@ pub fn getOrCreate(
         .last_used = cache.lru_counter,
     };
     return built;
+}
+
+/// Reset every cached entry's descriptor pool (vkResetDescriptorPool) —
+/// frees every VkDescriptorSet previously minted by `allocSet` but keeps
+/// the underlying VkPipeline / VkPipelineLayout / VkDescriptorSetLayout /
+/// VkShaderModule / VkDescriptorPool alive for reuse.
+///
+/// Mirrors CUDA's per-call kernel-arg pattern: in CUDA each
+/// `cuLaunchKernel` re-supplies the argument list (= "fresh descriptor
+/// set" in VK terms) with zero allocator cost because args go through
+/// the kernel function pointer's call ABI rather than a descriptor pool.
+/// Vulkan has no equivalent, so the closest port-faithful pattern is to
+/// reset the pool (constant-time, no allocator traffic) at every decode
+/// entry and re-allocate the fresh sets we need for this call.
+///
+/// S001 needed this: with the cache promoted to process-lifetime, the
+/// per-pipeline descriptor pool (sized at MAX_SETS_PER_POOL = 16) would
+/// otherwise fill after ~16 / sets-per-call decode invocations and
+/// vkAllocateDescriptorSets would start returning OUT_OF_POOL_MEMORY.
+///
+/// Safe on an empty / never-populated cache (every empty slot is
+/// skipped).
+pub fn resetAllPools(ctx: *driver_mod.Context, cache: *Cache) void {
+    if (ctx.dev == null) return;
+    const reset_pool = vk.vkResetDescriptorPool_fn orelse return;
+    var i: usize = 0;
+    while (i < MAX_ENTRIES) : (i += 1) {
+        if (cache.entries[i]) |e| {
+            if (e.value.pool != null) {
+                _ = reset_pool(ctx.dev, e.value.pool, 0);
+            }
+        }
+    }
 }
 
 /// Drop every cached entry. Destroys the Vulkan-side children of each

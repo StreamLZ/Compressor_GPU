@@ -498,6 +498,17 @@ pub fn decodeSlz1ToBytesEx(
     const unwrap_spv = try dupAlignedSpv(allocator, unwrap_spv_raw);
     defer allocator.free(unwrap_spv);
 
+    // S001 housekeeping: reset every descriptor pool in the
+    // process-lifetime decode cache at the start of every decode call.
+    // The pools themselves stay alive, so this is a constant-time call
+    // per pipeline rather than the destroy+rebuild traffic the old
+    // per-call invalidateAll paid. Without this, the per-pipeline pool
+    // (MAX_SETS_PER_POOL = 16) would fill after ~16 / sets-per-call
+    // decode invocations and vkAllocateDescriptorSets would start
+    // failing with OUT_OF_POOL_MEMORY. Mirrors CUDA's per-call kernel-
+    // arg pattern (every cuLaunchKernel re-supplies args at zero cost).
+    descriptors.resetAllPools(ctx, driver.getOrCreateDecodePipelineCache(ctx));
+
     // ── GPU decode pipeline: walk_frame → ... → gather_raw_off16 ──
     // Produces pipeline_result.frame (compressed bytes uploaded
     // device-side), pipeline_result.chunks (walk_frame's 6-u32 per
@@ -665,13 +676,18 @@ pub fn decodeSlz1ToBytesEx(
     }
 
     // ── Descriptor sets ────────────────────────────────────────────
+    // S001: cache is process-lifetime (owned by `ctx.decode_pipeline_cache`)
+    // so the unwrap + decode pipelines are built once on the first call
+    // and reused thereafter. Mirrors CUDA's pattern of loading every
+    // kernel once at process init (src/decode/module_loader.zig:140-141,
+    // 169-173). The teardown happens in driver.deinit before
+    // destroyDevice; no per-call invalidateAll.
     const t_descset_begin = qpcNow();
-    var cache: descriptors.Cache = .{};
-    defer descriptors.invalidateAll(ctx, &cache);
+    const cache = driver.getOrCreateDecodePipelineCache(ctx);
 
     const cached_unwrap = try descriptors.getOrCreate(
         ctx,
-        &cache,
+        cache,
         "l1_unwrap",
         tier,
         unwrap_spv,
@@ -689,7 +705,7 @@ pub fn decodeSlz1ToBytesEx(
 
     const cached_dec = try descriptors.getOrCreate(
         ctx,
-        &cache,
+        cache,
         "lz_decode",
         tier,
         dec_spv,

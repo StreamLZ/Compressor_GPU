@@ -751,11 +751,18 @@ pub fn runDecodePipelineEx(
     if (result.meta.mapped) |m| @memset(m[0..@intCast(meta_bytes)], 0);
 
     // ── 3. Build pipelines + descriptor sets ─────────────────────────
+    //
+    // S001: cache is process-lifetime (owned by ctx.decode_pipeline_cache)
+    // so the 6 pipelines this function uses are built once on the first
+    // call and reused thereafter. Mirrors CUDA's process-init kernel
+    // load at src/decode/module_loader.zig:140-141, 169-173. The teardown
+    // happens in driver.deinit before destroyDevice; no per-call
+    // invalidateAll. Combined with the 2 pipelines slz1_codec builds
+    // (l1_unwrap, lz_decode) the total decode-side cache footprint is
+    // 8 entries, well under the 16-entry Cache cap.
+    const cache = driver.getOrCreateDecodePipelineCache(ctx);
 
-    var cache: descriptors.Cache = .{};
-    defer descriptors.invalidateAll(ctx, &cache);
-
-    const pipes = try loadAllPipelines(ctx, &cache, tier, tier_b, allocator);
+    const pipes = try loadAllPipelines(ctx, cache, tier, tier_b, allocator);
 
     // walk_frame: 3 bindings [Frame, Chunks, Meta] + push (frame_size, max_chunks).
     const walk_bindings: [3]vk.VkDescriptorBufferInfo = .{
