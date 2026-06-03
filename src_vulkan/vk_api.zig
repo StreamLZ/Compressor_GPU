@@ -211,6 +211,17 @@ pub const VK_MAX_PHYSICAL_DEVICE_NAME_SIZE: usize = 256;
 pub const VK_UUID_SIZE: usize = 16;
 pub const VkPhysicalDeviceType = c_int;
 
+// VkPhysicalDeviceType enum values (spec, vulkan_core.h). Used by the
+// default device-selection scorer in device.zig::pickPhysicalDeviceWith
+// to prefer DISCRETE > INTEGRATED > VIRTUAL > CPU > OTHER when the
+// caller hasn't asked for a specific device. The raw integer values
+// must match the spec or the scorer mis-classifies devices.
+pub const VK_PHYSICAL_DEVICE_TYPE_OTHER: VkPhysicalDeviceType = 0;
+pub const VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: VkPhysicalDeviceType = 1;
+pub const VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: VkPhysicalDeviceType = 2;
+pub const VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: VkPhysicalDeviceType = 3;
+pub const VK_PHYSICAL_DEVICE_TYPE_CPU: VkPhysicalDeviceType = 4;
+
 const PROPS_TAIL_BYTES: usize = 528; // VkPhysicalDeviceLimits + sparse + pad
 
 pub const VkPhysicalDeviceProperties = extern struct {

@@ -64,6 +64,39 @@ fn deviceNameCopy(pd: vk.VkPhysicalDevice, buf: []u8) []const u8 {
     return buf[0..n];
 }
 
+/// Score a physical device by `VkPhysicalDeviceProperties.deviceType` so
+/// the default selector prefers a real GPU over an integrated/CPU
+/// fallback. The scoring order matches the project rule for `.default`
+/// selection: DISCRETE > INTEGRATED > VIRTUAL > CPU > OTHER. This
+/// fixes a footgun on machines with both an iGPU and a dGPU where the
+/// loader can hand back the iGPU as devices[0] and the codec ends up
+/// measured on the wrong hardware. Explicit selectors (`.by_index` /
+/// `.by_name`, plus the SLZ_VK_DEVICE_INDEX env override resolved in
+/// driver.zig::resolveSelector) still win — this only affects what the
+/// CLI / tests get when nobody asked for a specific device.
+fn deviceTypeScore(pd: vk.VkPhysicalDevice) u8 {
+    const get_props = vk.vkGetPhysicalDeviceProperties_fn orelse return 0;
+    var props: vk.VkPhysicalDeviceProperties = .{};
+    get_props(pd, &props);
+    return switch (props.deviceType) {
+        vk.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU => 4,
+        vk.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU => 3,
+        vk.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU => 2,
+        vk.VK_PHYSICAL_DEVICE_TYPE_CPU => 1,
+        else => 0,
+    };
+}
+
+/// Copy the bound physical device's `deviceName` into `buf`, sliced at
+/// the first NUL. Exposed so the CLI bench/compress/decompress headlines
+/// can print which device the codec actually ran on — without this the
+/// only way to confirm hardware was to set `SLZ_VK_PROFILE_DECODE=1`
+/// and read the per-run profile block, which is too easy to forget when
+/// triaging "regressions" that turn out to be iGPU-vs-dGPU mixups.
+pub fn readDeviceName(pd: vk.VkPhysicalDevice, buf: []u8) []const u8 {
+    return deviceNameCopy(pd, buf);
+}
+
 fn asciiEqIgnoreCase(a: u8, b: u8) bool {
     const al = if (a >= 'A' and a <= 'Z') a + 32 else a;
     const bl = if (b >= 'A' and b <= 'Z') b + 32 else b;
@@ -104,13 +137,32 @@ pub fn pickPhysicalDeviceWith(inst: vk.VkInstance, selector: DeviceSelector) Dev
 
     switch (selector) {
         .default => {
+            // Score every compute-capable device by deviceType and pick
+            // the highest. On ties the first-seen wins (stable), which
+            // matches the historical "devices[0] if compute-capable"
+            // behavior on single-GPU boxes. The scoring order
+            // (DISCRETE > INTEGRATED > VIRTUAL > CPU > OTHER) is what
+            // fixes the iGPU/dGPU footgun — see deviceTypeScore for the
+            // rationale. RAM/cores tiebreakers are intentionally NOT
+            // implemented; deviceType alone suffices for the hardware
+            // we ship on, and any future per-vendor preference belongs
+            // in `probe.zig`'s tier classifier rather than the loader-
+            // facing default.
+            var best: vk.VkPhysicalDevice = null;
+            var best_score: i16 = -1;
             var i: u32 = 0;
             while (i < count) : (i += 1) {
                 const pd = devices[i];
                 if (pd == null) continue;
-                if (hasComputeQueue(pd)) return pd;
+                if (!hasComputeQueue(pd)) continue;
+                const s: i16 = @intCast(deviceTypeScore(pd));
+                if (s > best_score) {
+                    best_score = s;
+                    best = pd;
+                }
             }
-            return error.NoComputeQueueFamily;
+            if (best == null) return error.NoComputeQueueFamily;
+            return best;
         },
         .by_index => |idx| {
             if (idx >= count) return error.DeviceIndexOutOfRange;

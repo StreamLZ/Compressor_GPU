@@ -225,6 +225,20 @@ fn writeFileAll(io: std.Io, path: []const u8, bytes: []const u8) !void {
     try file.writePositionalAll(io, bytes, 0);
 }
 
+/// Print the deviceName of the currently-bound Vulkan physical device.
+/// Must be called AFTER `ensureInitWithSelector` so `driver.g_default.pd`
+/// is populated. The line goes to the regular CLI writer (not gated
+/// behind SLZ_VK_PROFILE_DECODE=1) so every bench / compress / decompress
+/// run makes the bound hardware impossible to miss — the most common
+/// cause of "regression" reports has been measuring on the wrong device
+/// (Intel iGPU vs NVIDIA dGPU) without realizing it.
+fn printBoundDevice(w: *std.Io.Writer) !void {
+    if (driver.g_default.pd == null) return;
+    var name_buf: [vk.VK_MAX_PHYSICAL_DEVICE_NAME_SIZE]u8 = @splat(0);
+    const name = device_mod.readDeviceName(driver.g_default.pd, name_buf[0..]);
+    try w.print("Device: {s}\n", .{name});
+}
+
 fn ensureInitWithSelector(w: *std.Io.Writer, args: Args) !void {
     driver.setSelector(selectorFromSpec(args.device_spec));
     driver.ensureInit() catch |err| {
@@ -284,6 +298,7 @@ fn runCompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args
 
     try ensureInitWithSelector(w, args);
     defer driver.deinit();
+    try printBoundDevice(w);
 
     const bound = slz1_codec.slz1Bound(src.len);
     const out_buf = try allocator.alloc(u8, bound);
@@ -340,6 +355,7 @@ fn runDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, ar
 
     try ensureInitWithSelector(w, args);
     defer driver.deinit();
+    try printBoundDevice(w);
 
     // Page-align so the SLZ1 decoder takes the
     // VK_EXT_external_memory_host fast path (see bench comment in
@@ -487,6 +503,7 @@ fn runBench(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: A
 
     try ensureInitWithSelector(w, args);
     defer driver.deinit();
+    try printBoundDevice(w);
 
     const mb: f64 = @as(f64, @floatFromInt(src.len)) / (1024.0 * 1024.0);
     try w.print("Input: {s} ({d} bytes, {d:.2} MB)\n", .{ in_path, src.len, mb });
