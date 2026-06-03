@@ -693,11 +693,17 @@ pub fn decodeSlz1ToBytesEx(
     // grows; subsequent calls of the same-or-smaller decompressed
     // size are no-ops.
     //
-    // `caller_imported` is created per-call (the caller's `out` pointer
-    // changes call to call so we can't pool the imported VkBuffer +
-    // VkDeviceMemory pair). The import itself is cheap — no driver-side
-    // allocation, just a binding of an existing host pointer into a
-    // VkDeviceMemory handle.
+    // `caller_imported` is cache-fronted via the workspace
+    // `ImportedSlot` (see decode_workspace.zig::ensureImportedHostBuf).
+    // The IMPORT itself is NOT "just a binding" as the prior comment
+    // claimed — vkAllocateMemory + vkCreateBuffer + vkBindBufferMemory
+    // each take real driver time (measured ~7 ms / call on NVIDIA
+    // RTX 4060 Ti for the 95 MB enwik8 import). Caching keyed by
+    // `(caller_ptr, import_size)` collapses every same-buffer repeat
+    // call to zero driver work — mirror of CUDA's grow-only ensure
+    // pattern at src/decode/decode_context.zig:35-43. The CACHED
+    // import is owned by `ws.caller_imported` and freed once in
+    // `driver.deinit` (decode_workspace.deinit), NOT per call.
     var dst_b: l1_codec.Buffer = .{};
     var dst_stage: l1_codec.Buffer = .{};
     var caller_imported: l1_codec.Buffer = .{};
@@ -713,8 +719,9 @@ pub fn decodeSlz1ToBytesEx(
                 .device_local_only,
             );
             dst_b = ws.dst_b.buffer;
-            caller_imported = l1_codec.importHostPointerBuffer(
+            caller_imported = decode_workspace.ensureImportedHostBuf(
                 ctx,
+                &ws.caller_imported,
                 @ptrCast(out.ptr),
                 import_size,
                 vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -722,7 +729,9 @@ pub fn decodeSlz1ToBytesEx(
                 // If the import fails at runtime (unexpected — we
                 // already gated on alignment + extension support), fall
                 // through to the existing two-buffer slow path rather
-                // than failing the decode.
+                // than failing the decode. On error,
+                // `ensureImportedHostBuf` has already cleared the
+                // slot, so no stale cached buffer is leaked.
                 error.MemoryTypeNotFound,
                 error.BufferCreateFailed,
                 error.MemoryAllocateFailed,
@@ -760,9 +769,11 @@ pub fn decodeSlz1ToBytesEx(
             dst_stage = ws.dst_stage.buffer;
         }
     }
-    // Workspace owns dst_b / dst_stage across decode calls (frees once
-    // in driver.deinit). `caller_imported` is per-call and freed after
-    // submit+wait below.
+    // Workspace owns dst_b / dst_stage AND caller_imported across
+    // decode calls (frees once in driver.deinit). The caller-import
+    // pool was previously per-call but is now cached via
+    // `ws.caller_imported` keyed on (out.ptr, import_size) — see
+    // decode_workspace.ensureImportedHostBuf for the cache logic.
     // The import-path fallback (failed runtime import despite the
     // eligibility gate) leaves `caller_imported.buf == null` and means
     // we have neither dst_stage NOR a target — recover by allocating
@@ -1003,10 +1014,12 @@ pub fn decodeSlz1ToBytesEx(
     }
     last_decode_slz_readback_ns = qpcNs(t_readback_begin, qpcNow());
 
-    // Tear down the per-call imported VkBuffer + VkDeviceMemory pair.
-    // The host pointer itself belongs to the caller and is NOT freed.
-    if (caller_import_active) {
-        l1_codec.destroyBuffer(ctx, &caller_imported);
-    }
+    // No per-call teardown: the imported VkBuffer + VkDeviceMemory
+    // pair is owned by `ws.caller_imported` and freed once in
+    // `driver.deinit` (via decode_workspace.deinit). Repeat calls
+    // with the same `(out.ptr, import_size)` reuse the cached import
+    // and pay zero driver allocation cost — collapsing the ~7 ms /
+    // call VK_EXT_external_memory_host overhead that was eating the
+    // staging-copy savings before this cache landed.
     return dst_total;
 }

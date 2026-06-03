@@ -161,6 +161,64 @@ pub const DecodeWorkspace = struct {
     /// in role though Vulkan uses a HOST_VISIBLE VkBuffer instead of a
     /// cuMemAllocHost block.
     dst_stage: Slot = .{},
+
+    /// VK_EXT_external_memory_host import of the CALLER's output host
+    /// buffer. Holds the imported VkDeviceMemory + transient VkBuffer
+    /// pair created by `l1_codec.importHostPointerBuffer`. Cached
+    /// across decode calls keyed by `(caller_ptr, caller_size)` so the
+    /// per-call vkAllocateMemory + vkCreateBuffer + vkBindBufferMemory
+    /// triple (measured ~7 ms / call on NVIDIA RTX 4060 Ti for the
+    /// 95 MB enwik8 import) is paid once instead of every call.
+    ///
+    /// No CUDA mirror: CUDA's cuMemcpyDtoH_v2
+    /// (src/decode/decode_dispatch.zig:485) targets the caller's
+    /// pointer directly without any prior driver-side "register"
+    /// step, so there is nothing on the CUDA side to cache. This
+    /// slot exists purely to amortize the Vulkan-specific
+    /// `VkImportMemoryHostPointerInfoEXT` registration cost across
+    /// repeat calls with the same caller buffer (the canonical case:
+    /// CLI bench reuses `dec_buf` across all -r runs, and library
+    /// callers typically reuse a single output buffer across many
+    /// decompress calls).
+    ///
+    /// Cache-key fields (populated alongside `buffer`):
+    ///   * `caller_ptr` — the host pointer passed to importHostPointerBuffer
+    ///   * `size` (inherited from Slot) — the import size (= caller's
+    ///     dst_total padded up to `external_memory_host_alignment`).
+    ///     Reused only when the new request's import size is `<=`
+    ///     the cached size, matching the grow-only semantics of every
+    ///     other Slot in this struct.
+    ///
+    /// Lifetime: freed once in `deinit` before `destroyDevice`. The
+    /// caller's host buffer is NOT freed (we don't own it) — only the
+    /// driver-side VkDeviceMemory + VkBuffer handles created by the
+    /// import are torn down.
+    caller_imported: ImportedSlot = .{},
+};
+
+/// Specialized variant of `Slot` for the cached
+/// VK_EXT_external_memory_host import. The plain `Slot` fields don't
+/// fit cleanly because (a) the import does not carry a
+/// `VkBufferUsageFlags` set we'd want to compare for cache-eviction
+/// purposes (caller-imported buffers are always TRANSFER_DST_BIT),
+/// (b) there is no `MemMode` (the memory type is dictated by the
+/// host-pointer-properties query, not selectable), and (c) we need
+/// to remember which `host_ptr` produced this import so the cache
+/// can detect a caller swapping in a different buffer.
+pub const ImportedSlot = struct {
+    buffer: l1_codec.Buffer = .{},
+    /// Import size in bytes (caller's dst_total padded up to
+    /// `ctx.external_memory_host_alignment`). Reuse condition:
+    /// `new_import_size <= size`. Mirrors the grow-only shape of
+    /// `Slot.cap` (above) and CUDA's `current_size.* >= needed`
+    /// early-out (decode_context.zig:36).
+    size: vk.VkDeviceSize = 0,
+    /// Host pointer the cached import was bound to. Reuse requires an
+    /// exact match — a different caller pointer means a different
+    /// VkDeviceMemory binding (the host-pointer-properties result and
+    /// the VkImportMemoryHostPointerInfoEXT.pHostPointer field both
+    /// depend on the pointer value).
+    caller_ptr: ?*anyopaque = null,
 };
 
 /// Mirror of CUDA's `ensureDeviceBuf` (src/decode/decode_context.zig:35).
@@ -236,16 +294,87 @@ pub fn ensureWorkspaceBuf(
     slot.mode = mode;
 }
 
+/// Reuse-or-(re)import the caller-registered output host buffer via
+/// VK_EXT_external_memory_host. Returns the cached
+/// `l1_codec.Buffer` (always owned by the workspace — caller MUST NOT
+/// destroyBuffer it; teardown happens once in `deinit`).
+///
+/// Reuse condition (cache hit, no driver allocations performed):
+///   * cached buffer present AND
+///   * cached `caller_ptr == host_ptr` AND
+///   * cached `size >= needed_size`
+///
+/// Otherwise the prior import (if any) is freed, a fresh import is
+/// created via `l1_codec.importHostPointerBuffer`, and the cache key
+/// is updated. On any importHostPointerBuffer error the slot is left
+/// in the cleared post-free state and the error is propagated — the
+/// caller (slz1_codec) treats this exactly like the prior per-call
+/// import-failure case (fall back to the dst_stage staging path).
+///
+/// Mirrors CUDA's `ensureDeviceBuf` (decode_context.zig:35-43): grow
+/// the cached allocation when needed, no-op when the existing
+/// allocation already fits the request. The ptr-match extension is
+/// VK-specific (CUDA has no equivalent "register a host pointer"
+/// step to cache).
+pub fn ensureImportedHostBuf(
+    ctx: *driver.Context,
+    slot: *ImportedSlot,
+    host_ptr: *anyopaque,
+    needed_size: vk.VkDeviceSize,
+    usage: vk.VkBufferUsageFlags,
+) l1_codec.L1Error!l1_codec.Buffer {
+    // Cache-hit fast path: same caller pointer AND existing import is
+    // at least as large as the new request → reuse with zero driver
+    // calls. This is the canonical case (CLI bench reuses one
+    // `dec_buf` across all -r runs; library callers typically reuse
+    // a single output buffer across many decompress calls).
+    if (slot.buffer.buf != null and
+        slot.caller_ptr == host_ptr and
+        slot.size >= needed_size)
+    {
+        return slot.buffer;
+    }
+
+    // Cache miss: either first call, caller swapped pointers, or the
+    // request needs more bytes than the existing import covers.
+    // Tear down the prior import (if any) before creating the new one
+    // — `VkImportMemoryHostPointerInfoEXT.allocationSize` MUST match
+    // the registered region exactly, so we cannot "grow" in place.
+    if (slot.buffer.buf != null) {
+        l1_codec.destroyBuffer(ctx, &slot.buffer);
+        slot.* = .{};
+    }
+
+    const new_buf = try l1_codec.importHostPointerBuffer(
+        ctx,
+        host_ptr,
+        needed_size,
+        usage,
+    );
+
+    slot.buffer = new_buf;
+    slot.size = needed_size;
+    slot.caller_ptr = host_ptr;
+    return new_buf;
+}
+
 /// Free every owned VkBuffer + VkDeviceMemory in the workspace, reset
 /// every slot to its default. Mirrors CUDA's
 /// `DecodeContext.deinit` (decode_context.zig:320-374).
 pub fn deinit(ctx: *driver.Context, ws: *DecodeWorkspace) void {
     if (ctx.dev == null) return;
     inline for (std.meta.fields(DecodeWorkspace)) |f| {
-        const slot: *Slot = &@field(ws.*, f.name);
-        if (slot.buffer.buf != null) {
-            l1_codec.destroyBuffer(ctx, &slot.buffer);
+        // Two slot shapes live in DecodeWorkspace: the canonical
+        // grow-only `Slot` (one per CUDA `DecodeContext` field) and
+        // the cached VK_EXT_external_memory_host `ImportedSlot`. Both
+        // own a `buffer: l1_codec.Buffer` we tear down identically;
+        // the differing key/size fields don't affect destruction.
+        if (f.type == Slot or f.type == ImportedSlot) {
+            const slot_ptr = &@field(ws.*, f.name);
+            if (slot_ptr.buffer.buf != null) {
+                l1_codec.destroyBuffer(ctx, &slot_ptr.buffer);
+            }
+            slot_ptr.* = .{};
         }
-        slot.* = .{};
     }
 }
