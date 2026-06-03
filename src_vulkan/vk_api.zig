@@ -623,6 +623,8 @@ pub const VK_QUERY_TYPE_TIMESTAMP: VkQueryType = 2;
 pub const VkQueryResultFlags = u32;
 pub const VK_QUERY_RESULT_64_BIT: VkQueryResultFlags = 0x1;
 pub const VK_QUERY_RESULT_WAIT_BIT: VkQueryResultFlags = 0x2;
+pub const VK_QUERY_RESULT_WITH_AVAILABILITY_BIT: VkQueryResultFlags = 0x4;
+pub const VK_QUERY_RESULT_PARTIAL_BIT: VkQueryResultFlags = 0x8;
 
 // VkPipelineStageFlags — for vkCmdWriteTimestamp's pipeline-stage arg.
 // TOP_OF_PIPE for the "before dispatch" sample, BOTTOM_OF_PIPE for the
@@ -1660,6 +1662,19 @@ pub const FnCmdFillBuffer = *const fn (
     data: u32,
 ) callconv(.c) void;
 
+// Vulkan core 1.0: inline buffer update from cmd-buffer data (max 65536
+// bytes). The decode-pipeline host-input port uses this to stage the
+// host-known `n_chunks` (4 bytes) into `n_chunks_scratch` straight from
+// the recorded command buffer — mirrors CUDA's 4 B H2D at
+// `src/decode/decode_dispatch.zig:617-619`.
+pub const FnCmdUpdateBuffer = *const fn (
+    commandBuffer: VkCommandBuffer,
+    dstBuffer: VkBuffer,
+    dstOffset: VkDeviceSize,
+    dataSize: VkDeviceSize,
+    pData: *const anyopaque,
+) callconv(.c) void;
+
 // ── Phase 2 (L1 finish — TODO A2): BDA query ──────────────────────
 // VkBufferDeviceAddressInfo + vkGetBufferDeviceAddress (Vulkan 1.2 core,
 // also from VK_KHR_buffer_device_address). The Vulkan 1.2 device opts
@@ -1752,6 +1767,7 @@ pub var vkGetBufferMemoryRequirements_fn: ?FnGetBufferMemoryRequirements = null;
 pub var vkGetPhysicalDeviceMemoryProperties_fn: ?FnGetPhysicalDeviceMemoryProperties = null;
 pub var vkCmdCopyBuffer_fn: ?FnCmdCopyBuffer = null;
 pub var vkCmdFillBuffer_fn: ?FnCmdFillBuffer = null;
+pub var vkCmdUpdateBuffer_fn: ?FnCmdUpdateBuffer = null;
 pub var vkGetBufferDeviceAddress_fn: ?FnGetBufferDeviceAddress = null;
 // VK_EXT_external_memory_host — resolved by driver.zig at ensureInit
 // time (immediately after vkCreateDevice) when the device advertises

@@ -549,6 +549,15 @@ pub const PipelineHints = struct {
     /// hint" — the pipeline sizes against a conservative upper bound
     /// derived from `slz_bytes.len / SLZ_CHUNK_SIZE_BYTES + 2`.
     n_chunks_hint: u32 = 0,
+    /// When true, `prepareDecodePipeline` SKIPS the host @memcpy that
+    /// writes `slz_bytes` into the `frame_staging` HOST_VISIBLE buffer.
+    /// The host-input path uses this because it stages ONLY the block
+    /// payload (without the frame/block-header bytes and without the
+    /// SC tail prefix — mirrors CUDA's `req.compressed_block` slice at
+    /// `src/decode/decode_dispatch.zig:565-571`) into frame_staging on
+    /// its own immediately after this function returns. Skipping the
+    /// wasted full-slz write saves ~6 ms on a 95 MB enwik8 frame.
+    skip_frame_staging_write: bool = false,
 };
 
 /// Run the 5-kernel GPU decode pipeline on `slz_bytes`. Returns a
@@ -663,7 +672,17 @@ pub fn prepareDecodePipeline(
     );
 
     const chunks_bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, WALK_MAX_CHUNKS) * CHUNK_DESC_U32_COUNT * 4;
-    try decode_workspace.ensureWorkspaceBuf(ctx, &ws.chunks, chunks_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
+    try decode_workspace.ensureWorkspaceBuf(
+        ctx,
+        &ws.chunks,
+        chunks_bytes,
+        // TRANSFER_DST_BIT lets the host-input path stage CPU-built
+        // 6-u32 WalkChunks descriptors into this buffer via vkCmdCopyBuffer
+        // from `ws.walk_chunks_staging`. On the D2D path walk_frame.comp
+        // writes through STORAGE_BUFFER usage; both usage bits coexist.
+        vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .device_local_only,
+    );
     result.chunks = ws.chunks.buffer;
 
     const meta_bytes: vk.VkDeviceSize = WALK_META_U32_COUNT * 4;
@@ -730,10 +749,13 @@ pub fn prepareDecodePipeline(
     );
     result.off16_scratch = ws.off16_scratch.buffer;
 
-    if (ws.frame_staging.buffer.mapped) |m| {
-        @memcpy(m[0..slz_bytes.len], slz_bytes);
-        if (frame_bytes > slz_bytes.len) {
-            @memset(m[slz_bytes.len..@intCast(frame_bytes)], 0);
+    if (ws.frame_staging.buffer.mapped) |_| {
+        if (!hints.skip_frame_staging_write) {
+            const m = ws.frame_staging.buffer.mapped.?;
+            @memcpy(m[0..slz_bytes.len], slz_bytes);
+            if (frame_bytes > slz_bytes.len) {
+                @memset(m[slz_bytes.len..@intCast(frame_bytes)], 0);
+            }
         }
     } else {
         return error.MapMemoryFailed;
@@ -846,6 +868,77 @@ pub fn prepareDecodePipeline(
     };
 }
 
+/// Per-call gates on which GPU-decode-pipeline phases run. Mirrors the
+/// CUDA orchestrator's gating in `src/decode/decode_dispatch.zig`:
+///
+///   * `walk_frame` runs only on the D2D entry point — CUDA's host-input
+///     path parses the frame on CPU at `streamlz_decoder.zig:215-317`,
+///     while the D2D path's `decompressFramedFromDevice` runs the GPU
+///     walk because the source bytes are already device-resident
+///     (`decode_dispatch.zig:614-621`).
+///   * `prefix_sum_chunks`, `scan_parse`, `compact_huff_descs` ×4,
+///     `compact_raw_descs`, `gather_raw_off16` are gated on
+///     `module_loader.huff_build_fn != 0` — i.e. only when Huffman is
+///     alive (`decode_dispatch.zig:720-733`). On L1 every one of these
+///     dispatches is skipped on CUDA. The VK port mirrors that gate.
+///   * `l1_unwrap` has no CUDA equivalent — CUDA's `lz_decode_raw`
+///     warp-parses sub-chunk headers inline. VK's `lz_decode.comp`
+///     reader was rewritten to consume pre-computed byte bases, so the
+///     unwrap kernel produces them. On host-input the CPU does the
+///     same parse via `host_walk.buildHostDescriptors`, so the kernel
+///     is skipped.
+///
+/// These flags get baked at the slz1_codec entry point. Pipeline objects
+/// + descriptor sets stay LOADED for every call so a future D2D entry
+/// point can dispatch them without re-allocating; only the recorded
+/// dispatches are gated.
+pub const PipelinePhaseGates = struct {
+    /// Run `walk_frame.comp`. Set to true ONLY when the caller is a D2D
+    /// entry point (no VK D2D entry exists today). Host-input callers
+    /// MUST pass false — they parse the frame on CPU and upload
+    /// descriptors directly.
+    run_walk_frame: bool = false,
+    /// Run `l1_unwrap.comp`. Set to true ONLY on the D2D entry point.
+    /// Host-input callers pass false and write the 16-u32 chunks_buf
+    /// CPU-side via `host_walk.buildHostDescriptors`.
+    run_l1_unwrap: bool = false,
+    /// Run `prefix_sum_chunks.comp` + `scan_parse.comp` + 4× compact_huff +
+    /// compact_raw + `gather_raw_off16.comp`. Mirrors CUDA's
+    /// `if (module_loader.huff_build_fn != 0)` gate. Always false on L1
+    /// (no Huffman); will go true on a future L≥3 path.
+    run_huff_pipeline: bool = false,
+    /// Run the 5× vkCmdFillBuffer that zero scan/compact intermediates.
+    /// Off by default since when `run_huff_pipeline == false` nothing
+    /// reads those buffers; the fills are only needed when the gated
+    /// kernels actually dispatch. Mirrors V-005 from the divergence
+    /// audit (CUDA does no upfront zeroing).
+    run_intermediate_fills: bool = false,
+    /// Run the meta→n_chunks_scratch GPU copy. False on the host-input
+    /// path because the host writes n_chunks_scratch directly via
+    /// `vkCmdUpdateBuffer` (mirrors CUDA's 4 B H2D at
+    /// `decode_dispatch.zig:617-619`).
+    run_meta_to_scratch_copy: bool = false,
+    /// Run the frame_staging → frame DMA copy. True on the host-input
+    /// path because the host writes the (block-payload) bytes into
+    /// frame_staging; false on the D2D path which would bind a
+    /// caller-supplied device-resident source buffer directly.
+    run_frame_dma: bool = true,
+    /// Host-known n_chunks. When non-zero AND `run_walk_frame` is
+    /// false, the host expects the caller's CPU-side descriptor build
+    /// to have populated `chunks_buf` already; this function writes
+    /// the value to `n_chunks_scratch` via vkCmdUpdateBuffer so
+    /// lz_decode's binding-8 read picks it up. Required gate when
+    /// `run_walk_frame == false`.
+    host_n_chunks: u32 = 0,
+    /// Host-known block_payload_size (bytes uploaded to the `frame`
+    /// buffer). Used to size the frame_staging→frame DMA copy on the
+    /// host-input path so we don't copy the SC tail prefix bytes (which
+    /// the host strips and handles via post-dispatch @memcpy). Ignored
+    /// when `run_walk_frame == true`; on the D2D path the whole
+    /// caller-supplied source is bound.
+    host_block_payload_size: u32 = 0,
+};
+
 /// S003: record the 5-kernel GPU decode pipeline (frame_staging→frame
 /// DMA + walk_frame + prefix_sum_chunks + scan_parse + 4× compact_huff +
 /// compact_raw + gather_raw_off16) plus the inter-dispatch barriers
@@ -859,6 +952,11 @@ pub fn prepareDecodePipeline(
 /// resident meta buffer (`d_n_chunks_dev = d_walk_meta + walk_meta_offsets
 /// .n_chunks`), so no host fence wait is needed between phases.
 ///
+/// Phase gating: see `PipelinePhaseGates` — host-input callers skip
+/// walk_frame + l1_unwrap and the huff pipeline; D2D callers run the
+/// full chain. Pipeline objects + descriptor sets stay LOADED regardless
+/// so the second caller never pays a build cost.
+///
 /// Terminates with BARRIER E (SHADER_WRITE → SHADER_READ at COMPUTE) so
 /// the caller's subsequent dispatch reads from `result.meta`/`result.chunks`
 /// see the GPU pipeline's writes.
@@ -866,44 +964,107 @@ pub fn recordDecodePipelineInto(
     ctx: *driver.Context,
     cmd_buf: vk.VkCommandBuffer,
     prepared: PreparedDecodePipeline,
+    gates: PipelinePhaseGates,
 ) PipelineError!void {
     const cmd_bind_pl = vk.vkCmdBindPipeline_fn orelse return error.LoaderNotReady;
     const cmd_bind_ds = vk.vkCmdBindDescriptorSets_fn orelse return error.LoaderNotReady;
     const cmd_push = vk.vkCmdPushConstants_fn orelse return error.LoaderNotReady;
     const cmd_dispatch = vk.vkCmdDispatch_fn orelse return error.LoaderNotReady;
     const cmd_copy = vk.vkCmdCopyBuffer_fn orelse return error.LoaderNotReady;
+    const cmd_reset_qp = vk.vkCmdResetQueryPool_fn;
+    const cmd_write_ts = vk.vkCmdWriteTimestamp_fn;
 
     const pipes = prepared.pipes;
     const result = prepared.result;
     const n_chunks_max = prepared.n_chunks_max;
     const max_total_subchunks = prepared.max_total_subchunks;
 
+    // Per-kernel timestamp slot reset. Both callers of this function
+    // (`recordAndSubmitMergedDecode` and the legacy `runDecodePipelineEx`)
+    // share `ctx.query_pool`. The merged path resets slots 0..3 above
+    // for lz_decode + dst→host copy; we reset slots 4..29 here so the
+    // per-kernel BEGIN/END writes below have a clean canvas without
+    // requiring the legacy path to learn about the new slots. Spec
+    // requires every slot written by vkCmdWriteTimestamp to have been
+    // previously reset; missing the reset turns subsequent
+    // vkGetQueryPoolResults reads into UB. The reset is free on
+    // hardware that has a query-engine reset path (NVIDIA, AMD); ~1 µs
+    // wall cost on the few drivers that emulate it.
+    if (cmd_reset_qp) |reset_qp_fn| {
+        const dec_slot_first: u32 = dispatch.TS_SLOT_DEC_FRAME_DMA_BEGIN;
+        const dec_slot_count: u32 = dispatch.TS_SLOT_COUNT - dec_slot_first;
+        reset_qp_fn(cmd_buf, ctx.query_pool, dec_slot_first, dec_slot_count);
+    }
+
     // S007: DMA-copy compressed input from sysmem staging → device-local
     // frame via the GPU copy engine. The staging buffer lives on the
     // workspace alongside the device-local frame buffer (= result.frame).
+    //
+    // Host-input vs D2D: on host-input the host fills frame_staging with
+    // the BLOCK PAYLOAD (no frame/block-header bytes, no SC tail prefix —
+    // mirrors CUDA's `req.compressed_block` shape at
+    // `src/decode/decode_dispatch.zig:565-571`). The DMA size shrinks
+    // to `host_block_payload_size`. On D2D the caller's whole frame is
+    // bound and the DMA covers `prepared.frame_bytes`. The unused gate
+    // path (e.g. caller flagged D2D but supplied a host buffer anyway)
+    // falls back to copying the full prepared frame, matching the prior
+    // behaviour.
     const ws = driver.getOrCreateDecodeWorkspace(ctx) catch return error.OutOfMemory;
-    {
-        const region: vk.VkBufferCopy = .{
-            .srcOffset = 0,
-            .dstOffset = 0,
-            .size = prepared.frame_bytes,
-        };
-        const regions: [1]vk.VkBufferCopy = .{region};
-        beginLabel(cmd_buf, "frame_staging->frame (S007)");
-        cmd_copy(cmd_buf, ws.frame_staging.buffer.buf, result.frame.buf, 1, @ptrCast(&regions));
-        endLabel(cmd_buf, "frame_staging->frame (S007)");
+    if (gates.run_frame_dma) {
+        const dma_size: vk.VkDeviceSize = if (!gates.run_walk_frame and gates.host_block_payload_size != 0)
+            @intCast((@as(usize, gates.host_block_payload_size) + 3) & ~@as(usize, 3))
+        else
+            prepared.frame_bytes;
+        if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_FRAME_DMA_BEGIN);
+        {
+            const region: vk.VkBufferCopy = .{
+                .srcOffset = 0,
+                .dstOffset = 0,
+                .size = dma_size,
+            };
+            const regions: [1]vk.VkBufferCopy = .{region};
+            beginLabel(cmd_buf, "frame_staging->frame (S007)");
+            cmd_copy(cmd_buf, ws.frame_staging.buffer.buf, result.frame.buf, 1, @ptrCast(&regions));
+            endLabel(cmd_buf, "frame_staging->frame (S007)");
+        }
+        if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_FRAME_DMA_END);
     }
 
-    if (vk.vkCmdFillBuffer_fn) |cmd_fill| {
+    // Host-input n_chunks staging: write the host-known count straight
+    // into n_chunks_scratch via vkCmdUpdateBuffer. Mirrors CUDA's 4 B
+    // H2D at `src/decode/decode_dispatch.zig:617-619`. lz_decode reads
+    // it from binding 8 (= n_chunks_scratch) so dropping the
+    // meta→scratch GPU copy from this path is the symmetric optimisation.
+    if (!gates.run_walk_frame and gates.host_n_chunks != 0) {
+        const cmd_update = vk.vkCmdUpdateBuffer_fn orelse return error.LoaderNotReady;
+        const n_chunks_value: u32 = gates.host_n_chunks;
+        cmd_update(cmd_buf, result.n_chunks_scratch.buf, 0, 4, @ptrCast(&n_chunks_value));
+    }
+
+    if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_FILLS_BEGIN);
+    if (gates.run_intermediate_fills) {
+        // V-005: these zeroings are inputs to the scan/compact/gather
+        // kernels. CUDA's L1 path does NO equivalent of them because
+        // scan/compact/gather are gated off on L1 (see
+        // `src/decode/decode_dispatch.zig:720-733`). Mirror that: only
+        // run the fills when the kernels that read them are also
+        // dispatching. The chunks fill in particular is unnecessary on
+        // the host-input path because the host writes the descriptors
+        // CPU-side via `host_walk.buildHostDescriptors` (V-002).
+        const cmd_fill = vk.vkCmdFillBuffer_fn orelse return error.LoaderNotReady;
         cmd_fill(cmd_buf, result.chunks.buf, 0, prepared.chunks_bytes, 0);
         cmd_fill(cmd_buf, result.total_subs.buf, 0, 4, 0);
         cmd_fill(cmd_buf, result.first_sub_idx.buf, 0, prepared.first_sub_bytes, 0);
         cmd_fill(cmd_buf, result.compact_counts.buf, 0, 6 * 4, 0);
         cmd_fill(cmd_buf, result.staged.buf, 0, prepared.staged_bytes, 0);
-    } else {
-        return error.LoaderNotReady;
     }
+    if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_FILLS_END);
 
+    // Always emit the transfer→compute barrier: the frame DMA above is
+    // a transfer write that the next stage (compute shader on
+    // `result.frame`) must see. Also covers the n_chunks_scratch
+    // UpdateBuffer write (TRANSFER_WRITE → SHADER_READ on the lz_decode
+    // binding 8) and the optional intermediate fills.
     {
         const cmd_barrier_fn = vk.vkCmdPipelineBarrier_fn orelse return error.LoaderNotReady;
         const mb: vk.VkMemoryBarrier = .{
@@ -925,8 +1086,46 @@ pub fn recordDecodePipelineInto(
         );
     }
 
-    // 1. walk_frame.
-    {
+    // Defensive: write empty BEGIN/END pairs for every gated-off slot so
+    // the merged `vkGetQueryPoolResults(... VK_QUERY_RESULT_WAIT_BIT)`
+    // call in the caller doesn't block waiting for queries that no
+    // dispatch ever populated. Per VK spec, `vkCmdResetQueryPool` leaves
+    // each slot UNAVAILABLE; vkCmdWriteTimestamp transitions to
+    // AVAILABLE. Without these dummy writes, WAIT_BIT hangs forever on
+    // the host fence path even though the GPU finished. Each pair is two
+    // single-byte cmdbuf entries — negligible cost.
+    if (cmd_write_ts) |ts_fn| {
+        if (!gates.run_walk_frame) {
+            ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_WALK_BEGIN);
+            ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_WALK_END);
+        }
+        if (!gates.run_huff_pipeline) {
+            const dummy_slots = [_]u32{
+                dispatch.TS_SLOT_DEC_PREFIX_BEGIN, dispatch.TS_SLOT_DEC_PREFIX_END,
+                dispatch.TS_SLOT_DEC_META_COPY_BEGIN, dispatch.TS_SLOT_DEC_META_COPY_END,
+                dispatch.TS_SLOT_DEC_SCAN_BEGIN, dispatch.TS_SLOT_DEC_SCAN_END,
+                dispatch.TS_SLOT_DEC_COMPACT_LIT_BEGIN, dispatch.TS_SLOT_DEC_COMPACT_LIT_END,
+                dispatch.TS_SLOT_DEC_COMPACT_TOK_BEGIN, dispatch.TS_SLOT_DEC_COMPACT_TOK_END,
+                dispatch.TS_SLOT_DEC_COMPACT_HI_BEGIN, dispatch.TS_SLOT_DEC_COMPACT_HI_END,
+                dispatch.TS_SLOT_DEC_COMPACT_LO_BEGIN, dispatch.TS_SLOT_DEC_COMPACT_LO_END,
+                dispatch.TS_SLOT_DEC_COMPACT_RAW_BEGIN, dispatch.TS_SLOT_DEC_COMPACT_RAW_END,
+                dispatch.TS_SLOT_DEC_GATHER_BEGIN, dispatch.TS_SLOT_DEC_GATHER_END,
+            };
+            for (dummy_slots) |s| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, s);
+        }
+        if (!gates.run_l1_unwrap) {
+            ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_UNWRAP_BEGIN);
+            ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_UNWRAP_END);
+        }
+    }
+
+    // 1. walk_frame — D2D-only (gates.run_walk_frame). Mirrors CUDA's
+    // `decompressFramedFromDevice` at `src/decode/decode_dispatch.zig
+    // :614-621`. The host-input entry parses the frame on CPU at
+    // `streamlz_decoder.zig:215-317`; passing run_walk_frame=false from
+    // the host-input caller skips this dispatch.
+    if (gates.run_walk_frame) {
+        if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_WALK_BEGIN);
         cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.walk.pipeline);
         const sets: [1]vk.VkDescriptorSet = .{prepared.walk_set};
         cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.walk.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
@@ -937,115 +1136,143 @@ pub fn recordDecodePipelineInto(
         beginLabel(cmd_buf, "walk_frame");
         cmd_dispatch(cmd_buf, 1, 1, 1);
         endLabel(cmd_buf, "walk_frame");
+        if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_WALK_END);
+        try recordComputeBarrier(cmd_buf);
     }
-    try recordComputeBarrier(cmd_buf);
 
-    // 2. prefix_sum_chunks.
-    {
-        cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.prefix.pipeline);
-        const sets: [1]vk.VkDescriptorSet = .{prepared.prefix_set};
-        cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.prefix.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
-        const push: PrefixPush = .{ .n_chunks = n_chunks_max, .sub_chunk_cap = 0 };
-        var push_bytes: [@sizeOf(PrefixPush)]u8 = undefined;
-        @memcpy(push_bytes[0..], std.mem.asBytes(&push));
-        cmd_push(cmd_buf, pipes.prefix.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @intCast(push_bytes.len), @ptrCast(&push_bytes));
-        beginLabel(cmd_buf, "prefix_sum_chunks");
-        cmd_dispatch(cmd_buf, 1, 1, 1);
-        endLabel(cmd_buf, "prefix_sum_chunks");
-    }
-    try recordComputeBarrier(cmd_buf);
+    // The remaining scan/compact/gather phases are gated on `huff_alive`
+    // — mirrors CUDA's `if (module_loader.huff_build_fn != 0)` at
+    // `src/decode/decode_dispatch.zig:720-733`. On L1 every one of these
+    // is skipped. The pipeline objects + descriptor sets stay loaded so
+    // a future L≥3 path can light them up without re-prepare.
+    if (gates.run_huff_pipeline) {
+        // 2. prefix_sum_chunks.
+        if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_PREFIX_BEGIN);
+        {
+            cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.prefix.pipeline);
+            const sets: [1]vk.VkDescriptorSet = .{prepared.prefix_set};
+            cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.prefix.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
+            const push: PrefixPush = .{ .n_chunks = n_chunks_max, .sub_chunk_cap = 0 };
+            var push_bytes: [@sizeOf(PrefixPush)]u8 = undefined;
+            @memcpy(push_bytes[0..], std.mem.asBytes(&push));
+            cmd_push(cmd_buf, pipes.prefix.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @intCast(push_bytes.len), @ptrCast(&push_bytes));
+            beginLabel(cmd_buf, "prefix_sum_chunks");
+            cmd_dispatch(cmd_buf, 1, 1, 1);
+            endLabel(cmd_buf, "prefix_sum_chunks");
+        }
+        if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_PREFIX_END);
+        try recordComputeBarrier(cmd_buf);
 
-    {
-        const region: vk.VkBufferCopy = .{
-            .srcOffset = WALK_META_N_CHUNKS_SLOT * 4,
-            .dstOffset = 0,
-            .size = 4,
+        if (gates.run_meta_to_scratch_copy) {
+            if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_META_COPY_BEGIN);
+            {
+                const region: vk.VkBufferCopy = .{
+                    .srcOffset = WALK_META_N_CHUNKS_SLOT * 4,
+                    .dstOffset = 0,
+                    .size = 4,
+                };
+                const regions: [1]vk.VkBufferCopy = .{region};
+                beginLabel(cmd_buf, "meta->n_chunks_scratch");
+                cmd_copy(cmd_buf, result.meta.buf, result.n_chunks_scratch.buf, 1, @ptrCast(&regions));
+                endLabel(cmd_buf, "meta->n_chunks_scratch");
+            }
+            if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_META_COPY_END);
+
+            const cmd_barrier_fn = vk.vkCmdPipelineBarrier_fn orelse return error.LoaderNotReady;
+            const mb: vk.VkMemoryBarrier = .{
+                .srcAccessMask = vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT,
+            };
+            const mbs: [1]vk.VkMemoryBarrier = .{mb};
+            cmd_barrier_fn(
+                cmd_buf,
+                vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                1,
+                @ptrCast(&mbs),
+                0,
+                null,
+                0,
+                null,
+            );
+        }
+
+        // 3. scan_parse.
+        if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_SCAN_BEGIN);
+        {
+            cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.scan.pipeline);
+            const sets: [1]vk.VkDescriptorSet = .{prepared.scan_set};
+            cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.scan.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
+            const push: ScanPush = .{ .block_len = prepared.slz_len_u32, .sub_chunk_cap = 0 };
+            var push_bytes: [@sizeOf(ScanPush)]u8 = undefined;
+            @memcpy(push_bytes[0..], std.mem.asBytes(&push));
+            cmd_push(cmd_buf, pipes.scan.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @intCast(push_bytes.len), @ptrCast(&push_bytes));
+            const scan_grid_x: u32 = (n_chunks_max + 31) / 32;
+            beginLabel(cmd_buf, "scan_parse");
+            cmd_dispatch(cmd_buf, scan_grid_x, 1, 1);
+            endLabel(cmd_buf, "scan_parse");
+        }
+        if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_SCAN_END);
+        try recordComputeBarrier(cmd_buf);
+
+        // 4a-4d. compact_huff_descs.
+        const compact_huff_sets = [_]vk.VkDescriptorSet{
+            prepared.compact_lit_set, prepared.compact_tok_set, prepared.compact_hi_set, prepared.compact_lo_set,
         };
-        const regions: [1]vk.VkBufferCopy = .{region};
-        beginLabel(cmd_buf, "meta->n_chunks_scratch");
-        cmd_copy(cmd_buf, result.meta.buf, result.n_chunks_scratch.buf, 1, @ptrCast(&regions));
-        endLabel(cmd_buf, "meta->n_chunks_scratch");
-    }
-
-    {
-        const cmd_barrier_fn = vk.vkCmdPipelineBarrier_fn orelse return error.LoaderNotReady;
-        const mb: vk.VkMemoryBarrier = .{
-            .srcAccessMask = vk.VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT,
+        const compact_huff_labels = [_][]const u8{
+            "compact_huff_lit", "compact_huff_tok", "compact_huff_hi", "compact_huff_lo",
         };
-        const mbs: [1]vk.VkMemoryBarrier = .{mb};
-        cmd_barrier_fn(
-            cmd_buf,
-            vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
-            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0,
-            1,
-            @ptrCast(&mbs),
-            0,
-            null,
-            0,
-            null,
-        );
-    }
+        const compact_huff_begin_slots = [_]u32{
+            dispatch.TS_SLOT_DEC_COMPACT_LIT_BEGIN, dispatch.TS_SLOT_DEC_COMPACT_TOK_BEGIN,
+            dispatch.TS_SLOT_DEC_COMPACT_HI_BEGIN, dispatch.TS_SLOT_DEC_COMPACT_LO_BEGIN,
+        };
+        const compact_huff_end_slots = [_]u32{
+            dispatch.TS_SLOT_DEC_COMPACT_LIT_END, dispatch.TS_SLOT_DEC_COMPACT_TOK_END,
+            dispatch.TS_SLOT_DEC_COMPACT_HI_END, dispatch.TS_SLOT_DEC_COMPACT_LO_END,
+        };
+        for (compact_huff_sets, 0..) |cs, ci| {
+            if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, compact_huff_begin_slots[ci]);
+            cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.compact_huff.pipeline);
+            const sets: [1]vk.VkDescriptorSet = .{cs};
+            cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.compact_huff.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
+            beginLabel(cmd_buf, compact_huff_labels[ci]);
+            cmd_dispatch(cmd_buf, 1, 1, 1);
+            endLabel(cmd_buf, compact_huff_labels[ci]);
+            if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, compact_huff_end_slots[ci]);
+        }
 
-    // 3. scan_parse.
-    {
-        cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.scan.pipeline);
-        const sets: [1]vk.VkDescriptorSet = .{prepared.scan_set};
-        cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.scan.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
-        const push: ScanPush = .{ .block_len = prepared.slz_len_u32, .sub_chunk_cap = 0 };
-        var push_bytes: [@sizeOf(ScanPush)]u8 = undefined;
-        @memcpy(push_bytes[0..], std.mem.asBytes(&push));
-        cmd_push(cmd_buf, pipes.scan.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @intCast(push_bytes.len), @ptrCast(&push_bytes));
-        const scan_grid_x: u32 = (n_chunks_max + 31) / 32;
-        beginLabel(cmd_buf, "scan_parse");
-        cmd_dispatch(cmd_buf, scan_grid_x, 1, 1);
-        endLabel(cmd_buf, "scan_parse");
-    }
-    try recordComputeBarrier(cmd_buf);
+        // 4e. compact_raw_descs.
+        if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_COMPACT_RAW_BEGIN);
+        {
+            cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.compact_raw.pipeline);
+            const sets: [1]vk.VkDescriptorSet = .{prepared.compact_raw_set};
+            cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.compact_raw.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
+            beginLabel(cmd_buf, "compact_raw_descs");
+            cmd_dispatch(cmd_buf, 1, 1, 1);
+            endLabel(cmd_buf, "compact_raw_descs");
+        }
+        if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_COMPACT_RAW_END);
+        try recordComputeBarrier(cmd_buf);
 
-    // 4a-4d. compact_huff_descs.
-    const compact_huff_sets = [_]vk.VkDescriptorSet{
-        prepared.compact_lit_set, prepared.compact_tok_set, prepared.compact_hi_set, prepared.compact_lo_set,
-    };
-    const compact_huff_labels = [_][]const u8{
-        "compact_huff_lit", "compact_huff_tok", "compact_huff_hi", "compact_huff_lo",
-    };
-    for (compact_huff_sets, 0..) |cs, ci| {
-        cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.compact_huff.pipeline);
-        const sets: [1]vk.VkDescriptorSet = .{cs};
-        cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.compact_huff.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
-        beginLabel(cmd_buf, compact_huff_labels[ci]);
-        cmd_dispatch(cmd_buf, 1, 1, 1);
-        endLabel(cmd_buf, compact_huff_labels[ci]);
+        // 5. gather_raw_off16.
+        if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_GATHER_BEGIN);
+        {
+            cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.gather.pipeline);
+            const sets: [1]vk.VkDescriptorSet = .{prepared.gather_set};
+            cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.gather.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
+            const push: GatherPush = .{ .comp_len = prepared.slz_len_u32 };
+            var push_bytes: [@sizeOf(GatherPush)]u8 = undefined;
+            @memcpy(push_bytes[0..], std.mem.asBytes(&push));
+            cmd_push(cmd_buf, pipes.gather.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @intCast(push_bytes.len), @ptrCast(&push_bytes));
+            const gather_grid_x: u32 = max_total_subchunks * 2;
+            beginLabel(cmd_buf, "gather_raw_off16");
+            cmd_dispatch(cmd_buf, gather_grid_x, 1, 1);
+            endLabel(cmd_buf, "gather_raw_off16");
+        }
+        if (cmd_write_ts) |ts_fn| ts_fn(cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, dispatch.TS_SLOT_DEC_GATHER_END);
+        try recordComputeBarrier(cmd_buf);
     }
-
-    // 4e. compact_raw_descs.
-    {
-        cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.compact_raw.pipeline);
-        const sets: [1]vk.VkDescriptorSet = .{prepared.compact_raw_set};
-        cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.compact_raw.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
-        beginLabel(cmd_buf, "compact_raw_descs");
-        cmd_dispatch(cmd_buf, 1, 1, 1);
-        endLabel(cmd_buf, "compact_raw_descs");
-    }
-    try recordComputeBarrier(cmd_buf);
-
-    // 5. gather_raw_off16.
-    {
-        cmd_bind_pl(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.gather.pipeline);
-        const sets: [1]vk.VkDescriptorSet = .{prepared.gather_set};
-        cmd_bind_ds(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.gather.pipeline_layout, 0, 1, @ptrCast(&sets), 0, null);
-        const push: GatherPush = .{ .comp_len = prepared.slz_len_u32 };
-        var push_bytes: [@sizeOf(GatherPush)]u8 = undefined;
-        @memcpy(push_bytes[0..], std.mem.asBytes(&push));
-        cmd_push(cmd_buf, pipes.gather.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @intCast(push_bytes.len), @ptrCast(&push_bytes));
-        const gather_grid_x: u32 = max_total_subchunks * 2;
-        beginLabel(cmd_buf, "gather_raw_off16");
-        cmd_dispatch(cmd_buf, gather_grid_x, 1, 1);
-        endLabel(cmd_buf, "gather_raw_off16");
-    }
-    try recordComputeBarrier(cmd_buf);
 }
 
 /// Legacy stand-alone driver kept for callers that want the pre-S003
@@ -1079,7 +1306,20 @@ pub fn runDecodePipelineEx(
     };
     if (begin_cb(ctx.cmd_buf, &begin_info) != vk.VK_SUCCESS) return error.BeginCommandBufferFailed;
 
-    try recordDecodePipelineInto(ctx, ctx.cmd_buf, prepared);
+    // Legacy entry point: dispatch the full GPU pipeline like the
+    // pre-port path did. Mirrors a D2D-with-Huffman caller — every
+    // pipeline phase runs. No host-input shortcuts here; callers that
+    // want the new shape go through slz1_codec.decodeSlz1ToBytesEx.
+    try recordDecodePipelineInto(ctx, ctx.cmd_buf, prepared, .{
+        .run_walk_frame = true,
+        .run_l1_unwrap = false,
+        .run_huff_pipeline = true,
+        .run_intermediate_fills = true,
+        .run_meta_to_scratch_copy = true,
+        .run_frame_dma = true,
+        .host_n_chunks = 0,
+        .host_block_payload_size = 0,
+    });
 
     if (end_cb(ctx.cmd_buf) != vk.VK_SUCCESS) return error.EndCommandBufferFailed;
 

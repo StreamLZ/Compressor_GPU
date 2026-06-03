@@ -109,17 +109,67 @@ pub const DispatchResult = struct {
     query_read_ns: u64 = 0,
 };
 
-/// Slot indices within the 4-slot timestamp pool. Two slots (BEGIN/END)
-/// bracket the dispatch; two more (COPY_BEGIN/COPY_END) bracket the
-/// vkCmdCopyBuffer in `submitOneWithCopy`. Plain `submitOne` writes only
-/// the first pair; `submitOneWithCopy` writes all four. M8c will bump
-/// this further (68 slots per arch §15) so the per-kernel-fixture
-/// indexing constants live in one place here.
+/// Slot indices within the timestamp pool. The first 4 slots
+/// (BEGIN/END/COPY_BEGIN/COPY_END) are owned by the chassis submit
+/// helpers (submitOne writes the first pair; submitOneWithCopy writes
+/// all four). Slots 4..35 are the per-kernel-decode breakdown slots
+/// reserved for `recordDecodePipelineInto` + `recordAndSubmitMerged
+/// Decode` so the SLZ_VK_PROFILE_DECODE=1 printer can report per-
+/// kernel GPU ms on installs where nsys --trace=vulkan produces an
+/// empty Vulkan trace (the prior agent verified this is the case on
+/// Nsight Systems 2025.5.2 on Windows). The decode pipeline writes
+/// BEGIN/END pairs for every dispatched kernel (walk_frame, prefix_
+/// sum, scan_parse, 4× compact_huff, compact_raw, gather_raw_off16,
+/// l1_unwrap) plus 3 transfer-stage spans (frame_staging→frame DMA,
+/// 5× vkCmdFillBuffer lumped together, meta→n_chunks_scratch DMA);
+/// the existing lz_decode kernel + dst→host copy still ride
+/// slots 0-3 in the chassis-level reservation. Total = 36 slots.
 pub const TS_SLOT_BEGIN: u32 = 0;
 pub const TS_SLOT_END: u32 = 1;
 pub const TS_SLOT_COPY_BEGIN: u32 = 2;
 pub const TS_SLOT_COPY_END: u32 = 3;
-pub const TS_SLOT_COUNT: u32 = 4;
+/// Slot count for the chassis-level `submitOne` / `submitOneWithCopy`
+/// helpers — they only write slots 0..3 and must only `vkGetQueryPool
+/// Results` for that range (a larger range would wait forever on
+/// VK_QUERY_RESULT_WAIT_BIT for slots that were never written). The
+/// decode-pipeline per-kernel slots live in 4..29 and are read in a
+/// separate call from `recordAndSubmitMergedDecode`.
+pub const TS_SLOT_CHASSIS_COUNT: u32 = 4;
+
+// Per-kernel decode pipeline slots (begin/end pairs). Indices match the
+// dispatch order in `recordDecodePipelineInto` so a reader of the
+// SLZ_VK_PROFILE_DECODE=1 line can follow the slot numbers in source
+// order. SLOT_DEC_KERNEL_FIRST_BEGIN = 4 keeps the first 4 slots
+// reserved for the chassis-level BEGIN/END/COPY_BEGIN/COPY_END.
+pub const TS_SLOT_DEC_FRAME_DMA_BEGIN: u32 = 4; // frame_staging → frame
+pub const TS_SLOT_DEC_FRAME_DMA_END: u32 = 5;
+pub const TS_SLOT_DEC_FILLS_BEGIN: u32 = 6; // 5× vkCmdFillBuffer lumped
+pub const TS_SLOT_DEC_FILLS_END: u32 = 7;
+pub const TS_SLOT_DEC_WALK_BEGIN: u32 = 8;
+pub const TS_SLOT_DEC_WALK_END: u32 = 9;
+pub const TS_SLOT_DEC_PREFIX_BEGIN: u32 = 10;
+pub const TS_SLOT_DEC_PREFIX_END: u32 = 11;
+pub const TS_SLOT_DEC_META_COPY_BEGIN: u32 = 12; // meta → n_chunks_scratch
+pub const TS_SLOT_DEC_META_COPY_END: u32 = 13;
+pub const TS_SLOT_DEC_SCAN_BEGIN: u32 = 14;
+pub const TS_SLOT_DEC_SCAN_END: u32 = 15;
+pub const TS_SLOT_DEC_COMPACT_LIT_BEGIN: u32 = 16;
+pub const TS_SLOT_DEC_COMPACT_LIT_END: u32 = 17;
+pub const TS_SLOT_DEC_COMPACT_TOK_BEGIN: u32 = 18;
+pub const TS_SLOT_DEC_COMPACT_TOK_END: u32 = 19;
+pub const TS_SLOT_DEC_COMPACT_HI_BEGIN: u32 = 20;
+pub const TS_SLOT_DEC_COMPACT_HI_END: u32 = 21;
+pub const TS_SLOT_DEC_COMPACT_LO_BEGIN: u32 = 22;
+pub const TS_SLOT_DEC_COMPACT_LO_END: u32 = 23;
+pub const TS_SLOT_DEC_COMPACT_RAW_BEGIN: u32 = 24;
+pub const TS_SLOT_DEC_COMPACT_RAW_END: u32 = 25;
+pub const TS_SLOT_DEC_GATHER_BEGIN: u32 = 26;
+pub const TS_SLOT_DEC_GATHER_END: u32 = 27;
+pub const TS_SLOT_DEC_UNWRAP_BEGIN: u32 = 28;
+pub const TS_SLOT_DEC_UNWRAP_END: u32 = 29;
+// Slots 30..35 reserved for future per-kernel splits (e.g. splitting
+// the 5× vkCmdFillBuffer into per-buffer spans for finer attribution).
+pub const TS_SLOT_COUNT: u32 = 36;
 
 /// Resolve a device-level entry point; prefer vkGetDeviceProcAddr (one
 /// fewer dispatch hop) but fall back to the instance-level thunk via
@@ -199,6 +249,12 @@ fn ensureFnSlots(dev: vk.VkDevice) DispatchError!void {
         vk.vkCmdCopyBuffer_fn = resolveDeviceFn(vk.FnCmdCopyBuffer, dev, "vkCmdCopyBuffer");
     if (vk.vkCmdPipelineBarrier_fn == null)
         vk.vkCmdPipelineBarrier_fn = resolveDeviceFn(vk.FnCmdPipelineBarrier, dev, "vkCmdPipelineBarrier");
+    // CPU-built host-input decode path stages the host-known n_chunks
+    // (4 bytes) into the GPU-side `n_chunks_scratch` via vkCmdUpdateBuffer
+    // inline in the recorded cmdbuf — mirrors CUDA's 4 B H2D at
+    // `src/decode/decode_dispatch.zig:617-619`.
+    if (vk.vkCmdUpdateBuffer_fn == null)
+        vk.vkCmdUpdateBuffer_fn = resolveDeviceFn(vk.FnCmdUpdateBuffer, dev, "vkCmdUpdateBuffer");
 
     // VK_EXT_debug_utils label entry points — pure instrumentation. Slots
     // stay null on devices/loaders without the extension; the label-emit
@@ -788,13 +844,13 @@ pub fn submitOneWithCopyLabeled(
     if (wait_result == vk.VK_TIMEOUT) return error.FenceWaitTimeout;
     if (wait_result != vk.VK_SUCCESS) return error.FenceWaitFailed;
 
-    var ts: [TS_SLOT_COUNT]u64 = .{ 0, 0, 0, 0 };
+    var ts: [TS_SLOT_CHASSIS_COUNT]u64 = .{ 0, 0, 0, 0 };
     const t_query_begin = qpcNow();
     const result = get_results(
         ctx.dev,
         ctx.query_pool,
         0,
-        TS_SLOT_COUNT,
+        TS_SLOT_CHASSIS_COUNT,
         @sizeOf(@TypeOf(ts)),
         @ptrCast(&ts),
         @sizeOf(u64),
@@ -1100,13 +1156,13 @@ pub fn submitTwoWithCopyLabeled(
     if (wait_result == vk.VK_TIMEOUT) return error.FenceWaitTimeout;
     if (wait_result != vk.VK_SUCCESS) return error.FenceWaitFailed;
 
-    var ts: [TS_SLOT_COUNT]u64 = .{ 0, 0, 0, 0 };
+    var ts: [TS_SLOT_CHASSIS_COUNT]u64 = .{ 0, 0, 0, 0 };
     const t_query_begin = qpcNow();
     const result = get_results(
         ctx.dev,
         ctx.query_pool,
         0,
-        TS_SLOT_COUNT,
+        TS_SLOT_CHASSIS_COUNT,
         @sizeOf(@TypeOf(ts)),
         @ptrCast(&ts),
         @sizeOf(u64),

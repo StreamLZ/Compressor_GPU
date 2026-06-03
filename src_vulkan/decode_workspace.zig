@@ -150,6 +150,20 @@ pub const DecodeWorkspace = struct {
     /// 16-u32 ChunkDescs (l1_unwrap writes, lz_decode reads). Mirrors
     /// CUDA's `d_descs_persist` (decode_context.zig:207).
     chunks_16u32: Slot = .{},
+    /// HOST_VISIBLE staging buffer the CPU host-walk fills with the
+    /// 16-u32 per-chunk descriptors. A vkCmdCopyBuffer staged into
+    /// `chunks_16u32` runs inside the decode cmdbuf. Mirrors the
+    /// `frame_staging` shape above — sysmem write at ~15 GB/s, DMA to
+    /// VRAM on the GPU's copy engine, kernels read from VRAM-resident
+    /// `chunks_16u32`. CUDA equivalent: H2D copy at
+    /// `src/decode/decode_dispatch.zig:530`.
+    chunks_16u32_staging: Slot = .{},
+    /// HOST_VISIBLE staging buffer for the 6-u32 WalkChunks descriptors
+    /// (`pipeline_result.chunks`) on the host-input path. CPU fills it
+    /// via host_walk; a copy stages into the device-local `chunks` slot.
+    /// On the D2D path the GPU walk_frame kernel writes `chunks`
+    /// directly so this staging buffer is never used.
+    walk_chunks_staging: Slot = .{},
     /// Decoded output in DEVICE_LOCAL VRAM (two-buffer Intel-iGPU path).
     /// Mirrors CUDA's `d_output` (decode_context.zig:195).
     dst_b: Slot = .{},
