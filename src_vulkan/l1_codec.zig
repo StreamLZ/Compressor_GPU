@@ -1238,6 +1238,37 @@ pub fn decodeL1Sync(
             w[wbase + 5] = 0; // memset_fill (+ pad)
         }
     }
+    // S003 (parity with production slz1 path): lz_decode.comp reads
+    // n_chunks from a device-resident SSBO (binding 8 = WalkMeta, slot 0)
+    // — the push-constant path was removed when production migrated to
+    // single-submit merged dispatch (see slz1_codec.zig:885-898). The
+    // direct-test path here must mirror that binding or the shader reads
+    // an unbound SSBO. On NVIDIA tier1_nv that returns 0, so every
+    // subgroup early-returns at `if (chunk_id >= walk_meta_buf.w[0])`
+    // and the entire output is garbage from byte 0. Intel iGPU happens
+    // to return non-zero garbage that doesn't trip the gate (which is
+    // why this path looked healthy on Intel only).
+    //
+    // Production binds `pipeline_result.n_chunks_scratch` here — a
+    // DEVICE_LOCAL 1×u32 the GPU pipeline fills via vkCmdCopyBuffer
+    // from walk_frame's meta. We don't have walk_frame on this path, so
+    // we allocate a tiny host-visible buffer and write n_chunks CPU-
+    // side; same shape, just sourced differently. WalkMeta needs only
+    // slot 0; allocate 6 u32 to match the production layout (6-slot
+    // walk_meta) for any future shader read of other slots.
+    var walk_meta_b = try createBuffer(
+        ctx,
+        @as(vk.VkDeviceSize, 6) * @sizeOf(u32),
+        vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        true,
+    );
+    defer destroyBuffer(ctx, &walk_meta_b);
+    @memset(walk_meta_b.mapped.?[0..@intCast(walk_meta_b.size)], 0);
+    {
+        const wm: [*]u32 = @ptrCast(@alignCast(walk_meta_b.mapped.?));
+        wm[0] = n_chunks; // WALK_META_N_CHUNKS_SLOT
+    }
+
     @memset(chunks_b.mapped.?[0..@intCast(chunks_b.size)], 0);
     {
         const chunks_words: [*]u32 = @ptrCast(@alignCast(chunks_b.mapped.?));
@@ -1320,17 +1351,24 @@ pub fn decodeL1Sync(
     var cache: descriptors.Cache = .{};
     defer descriptors.invalidateAll(ctx, &cache);
 
+    // S003 parity: lz_decode.comp now has 9 bindings (0..8) and no
+    // push-constant block (see shaders/lz_decode.comp:127-168). Binding
+    // 8 = WalkMeta SSBO; the shader reads `walk_meta_buf.w[0]` for the
+    // n_chunks self-gate (line 528). Earlier this path requested 8
+    // bindings + a 4-byte push range, which created a pipeline layout
+    // that did not match the SPV — on NVIDIA tier1_nv that left binding
+    // 8 reading 0 and every workgroup early-returned.
     const cached_dec = try descriptors.getOrCreate(
         ctx,
         &cache,
         "lz_decode",
         tier,
         spv,
-        8, // bindings 0..7: cmd, lit, off16, length, dst, chunks, off32, walk_chunks
-        @sizeOf(DecodePush),
+        9, // bindings 0..8: cmd, lit, off16, length, dst, chunks, off32, walk_chunks, walk_meta
+        0, // no push constants — n_chunks lives in WalkMeta SSBO
     );
 
-    const dec_bindings: [8]vk.VkDescriptorBufferInfo = .{
+    const dec_bindings: [9]vk.VkDescriptorBufferInfo = .{
         .{ .buffer = streams.cmd_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = streams.lit_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
         .{ .buffer = streams.off16_buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
@@ -1341,17 +1379,18 @@ pub fn decodeL1Sync(
         // Cluster A (F001): walk-format chunks descriptor — source of
         // truth for dst_offset + decomp_size that lz_decode.comp reads.
         .{ .buffer = walk_chunks_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
+        // S003: WalkMeta — slot 0 holds n_chunks (host-written above
+        // since this direct-test path has no walk_frame kernel).
+        .{ .buffer = walk_meta_b.buf, .offset = 0, .range = vk.VK_WHOLE_SIZE },
     };
     const dec_set = try descriptors.allocSet(ctx, cached_dec, dec_bindings[0..]);
     const t_desc1 = qpcNow();
     last_decode_descriptors_ns = qpcNs(t_desc0, t_desc1);
 
     // ── Submit decode dispatch (n_chunks workgroups) ─────────────
-    const dec_push: DecodePush = .{
-        .n_chunks = n_chunks,
-    };
-    var dec_push_bytes: [@sizeOf(DecodePush)]u8 = undefined;
-    @memcpy(dec_push_bytes[0..], std.mem.asBytes(&dec_push));
+    // S003: no push constants — the shader reads n_chunks from
+    // walk_meta_buf binding 8 (host-written into walk_meta_b above).
+    const dec_push_bytes: []const u8 = &.{};
 
     const t_disp0 = qpcNow();
     // Mirror CUDA src/decode/decode_dispatch.zig:400-401
@@ -1371,7 +1410,7 @@ pub fn decodeL1Sync(
         cached_dec.pipeline,
         cached_dec.pipeline_layout,
         dec_set,
-        dec_push_bytes[0..],
+        dec_push_bytes,
         .{ lz_grid_x, 1, 1 },
         .{
             .src = dst_b.buf,
