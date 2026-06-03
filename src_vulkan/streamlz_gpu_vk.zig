@@ -1058,6 +1058,12 @@ fn classifySlz1Error(err: slz1_codec.Slz1Error) c_int {
         error.BadFrame,
         error.BadHeader,
         error.TooManyChunks,
+        error.Truncated,
+        error.UnknownDictionary,
+        error.ContentSizeTooLarge,
+        error.InvalidInternalHeader,
+        error.BadChunkHeader,
+        error.BadSubChunkHeader,
         => SLZ_ERROR_CORRUPT_FRAME,
 
         // Host or device alloc / map failure.
