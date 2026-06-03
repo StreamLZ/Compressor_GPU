@@ -52,6 +52,20 @@ pub const Context = struct {
     // the probe.has_8bit_storage check that gated feature enablement.
     has_8bit_storage: bool = false,
 
+    // ── VK_EXT_external_memory_host enabled at device creation. When
+    // true the SLZ1 decoder can register the caller's pageable host
+    // buffer as a VkDeviceMemory + VkBuffer pair and target it directly
+    // from the GPU's copy engine, eliminating the dst→stage staging
+    // copy and the post-submit host @memcpy. Mirrors CUDA's
+    // cuMemcpyDtoH_v2 semantics (src/decode/decode_dispatch.zig:485).
+    has_external_memory_host: bool = false,
+    /// `minImportedHostPointerAlignment` from
+    /// `VkPhysicalDeviceExternalMemoryHostPropertiesEXT`. Caller's
+    /// host pointer + import-size must both be multiples of this
+    /// (typically 4096 on NVIDIA/AMD/Intel desktop). 0 when the
+    /// extension is unavailable.
+    external_memory_host_alignment: u64 = 0,
+
     // ── Decode workspace pool — grow-only buffer pool reused across
     // every `decodeSlz1ToBytesEx` + `runDecodePipelineEx` invocation on
     // this context. Mirrors CUDA's `decode_context.DecodeContext` struct
@@ -184,6 +198,8 @@ pub fn ensureInit() DriverError!void {
         .initialized = true,
         .has_synchronization2 = pr.has_synchronization2,
         .has_8bit_storage = want_8bit,
+        .has_external_memory_host = bundle.external_memory_host_enabled,
+        .external_memory_host_alignment = bundle.external_memory_host_alignment,
     };
 }
 

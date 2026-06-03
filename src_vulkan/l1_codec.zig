@@ -638,6 +638,129 @@ pub fn destroyBuffer(ctx: *driver.Context, b: *Buffer) void {
     }
 }
 
+/// Wrap a caller-owned pageable host pointer as a VkBuffer + imported
+/// VkDeviceMemory pair. The returned Buffer's `mem` is owned by Vulkan
+/// (vkFreeMemory tears it down) and DOES NOT free the caller's host
+/// allocation — the host pointer's lifetime must outlive the import.
+/// `mapped` is left null because the caller already owns the host
+/// mapping directly.
+///
+/// Mirrors CUDA's cuMemcpyDtoH_v2 transfer pattern
+/// (src/decode/decode_dispatch.zig:485): the GPU's copy engine DMAs
+/// straight from VRAM into the caller's pageable host buffer, with no
+/// intermediate staging copy and no host-side @memcpy. The Vulkan
+/// equivalent is to register the host pointer via
+/// `VkImportMemoryHostPointerInfoEXT`, bind a transient VkBuffer to
+/// that VkDeviceMemory, and use that VkBuffer as the destination of
+/// vkCmdCopyBuffer.
+///
+/// Preconditions (caller's responsibility):
+///   * `ctx.has_external_memory_host == true`
+///   * `host_ptr` is aligned to `ctx.external_memory_host_alignment`
+///   * `size_bytes` is a multiple of `ctx.external_memory_host_alignment`
+///     (round the caller's requested size up to the alignment boundary;
+///     extra trailing bytes are OK since the caller's buffer is the
+///     copy destination and we only ever copy `dst_total` bytes into it).
+///   * `host_ptr[0 .. size_bytes]` outlives the returned Buffer.
+pub fn importHostPointerBuffer(
+    ctx: *driver.Context,
+    host_ptr: *anyopaque,
+    size_bytes: vk.VkDeviceSize,
+    usage: vk.VkBufferUsageFlags,
+) L1Error!Buffer {
+    ensureBufferFnSlots(ctx);
+    if (!ctx.has_external_memory_host) return error.MemoryTypeNotFound;
+    const get_props = vk.vkGetMemoryHostPointerPropertiesEXT_fn orelse
+        return error.MemoryTypeNotFound;
+    const create_buf = vk.vkCreateBuffer_fn orelse return error.BufferCreateFailed;
+    const get_req = vk.vkGetBufferMemoryRequirements_fn orelse
+        return error.BufferCreateFailed;
+    const alloc_mem = vk.vkAllocateMemory_fn orelse return error.MemoryAllocateFailed;
+    const bind = vk.vkBindBufferMemory_fn orelse return error.BindBufferFailed;
+
+    // Query which memory types are compatible with importing this host
+    // pointer. Drivers typically return the HOST_VISIBLE+HOST_COHERENT
+    // (no DEVICE_LOCAL) types — i.e. plain sysmem on the host side that
+    // the GPU can DMA into.
+    var host_ptr_props: vk.VkMemoryHostPointerPropertiesEXT = .{};
+    if (get_props(
+        ctx.dev,
+        vk.VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+        host_ptr,
+        &host_ptr_props,
+    ) != vk.VK_SUCCESS) return error.MemoryTypeNotFound;
+    if (host_ptr_props.memoryTypeBits == 0) return error.MemoryTypeNotFound;
+
+    // Create the VkBuffer with the usage flags the caller needs (typically
+    // TRANSFER_DST_BIT so vkCmdCopyBuffer can target it).
+    const bci: vk.VkBufferCreateInfo = .{
+        .size = size_bytes,
+        .usage = usage,
+        .sharingMode = vk.VK_SHARING_MODE_EXCLUSIVE,
+    };
+    var buf: vk.VkBuffer = null;
+    if (create_buf(ctx.dev, &bci, null, &buf) != vk.VK_SUCCESS) {
+        return error.BufferCreateFailed;
+    }
+    errdefer if (vk.vkDestroyBuffer_fn) |d| d(ctx.dev, buf, null);
+
+    // Pick a memory type that's BOTH supported for this VkBuffer's usage
+    // AND compatible with importing the host pointer. The intersection
+    // mask `buf_req.memoryTypeBits & host_ptr_props.memoryTypeBits` is
+    // what we search.
+    var buf_req: vk.VkMemoryRequirements = .{};
+    get_req(ctx.dev, buf, &buf_req);
+    const compatible_mask = buf_req.memoryTypeBits & host_ptr_props.memoryTypeBits;
+    if (compatible_mask == 0) return error.MemoryTypeNotFound;
+
+    // Among compatible types, prefer one that is NOT DEVICE_LOCAL — the
+    // imported memory IS the caller's sysmem so DEVICE_LOCAL types make
+    // no sense here. In practice drivers only ever advertise HOST_VISIBLE
+    // types in `host_ptr_props.memoryTypeBits`, but we keep the explicit
+    // preference for clarity.
+    var mem_props: vk.VkPhysicalDeviceMemoryProperties = .{};
+    vk.vkGetPhysicalDeviceMemoryProperties_fn.?(ctx.pd, &mem_props);
+    var picked: ?u32 = null;
+    var i: u32 = 0;
+    while (i < mem_props.memoryTypeCount) : (i += 1) {
+        const supported = (compatible_mask & (@as(u32, 1) << @intCast(i))) != 0;
+        if (!supported) continue;
+        const flags = mem_props.memoryTypes[i].propertyFlags;
+        // Need HOST_VISIBLE to bind the pointer at all.
+        if ((flags & vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) continue;
+        picked = i;
+        break;
+    }
+    const mt_idx: u32 = picked orelse return error.MemoryTypeNotFound;
+
+    // Chain VkImportMemoryHostPointerInfoEXT off the allocate-info pNext.
+    // `allocationSize` MUST exactly equal the imported region's size
+    // (per spec) — the caller has already rounded `size_bytes` up to
+    // `minImportedHostPointerAlignment`.
+    var import_info: vk.VkImportMemoryHostPointerInfoEXT = .{
+        .handleType = vk.VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+        .pHostPointer = host_ptr,
+    };
+    const mai: vk.VkMemoryAllocateInfo = .{
+        .pNext = @ptrCast(&import_info),
+        .allocationSize = size_bytes,
+        .memoryTypeIndex = mt_idx,
+    };
+    var mem: vk.VkDeviceMemory = null;
+    if (alloc_mem(ctx.dev, &mai, null, &mem) != vk.VK_SUCCESS) {
+        return error.MemoryAllocateFailed;
+    }
+    errdefer if (vk.vkFreeMemory_fn) |f| f(ctx.dev, mem, null);
+
+    if (bind(ctx.dev, buf, mem, 0) != vk.VK_SUCCESS) {
+        return error.BindBufferFailed;
+    }
+
+    // `mapped` stays null: the caller already owns the host pointer
+    // directly, so destroyBuffer doesn't try to unmap.
+    return .{ .buf = buf, .mem = mem, .mapped = null, .size = size_bytes };
+}
+
 // ── Helpers shared by encode + decode ─────────────────────────────
 
 fn pickTier(ctx: *driver.Context) L1Error!probe_mod.Tier {

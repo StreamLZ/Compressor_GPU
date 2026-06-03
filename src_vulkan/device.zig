@@ -145,6 +145,20 @@ pub const DeviceBundle = struct {
     dev: vk.VkDevice,
     queue: vk.VkQueue,
     queue_family_index: u32,
+    /// VK_EXT_external_memory_host enabled at device creation. When true,
+    /// driver.zig populates `vkGetMemoryHostPointerPropertiesEXT_fn` and
+    /// the slz1 decoder can register the caller's `out` buffer as a
+    /// VkDeviceMemory + VkBuffer pair, then vkCmdCopyBuffer's destination
+    /// is the caller's pageable host pointer — eliminating both the
+    /// dst→stage GPU copy and the host @memcpy in the two-buffer path.
+    /// Mirrors CUDA's cuMemcpyDtoH_v2 semantics
+    /// (src/decode/decode_dispatch.zig:485).
+    external_memory_host_enabled: bool = false,
+    /// `minImportedHostPointerAlignment` from
+    /// `VkPhysicalDeviceExternalMemoryHostPropertiesEXT`. Caller's host
+    /// pointer + size must both be a multiple of this (typically 4096 on
+    /// NVIDIA/AMD/Intel desktop). 0 when the extension isn't enabled.
+    external_memory_host_alignment: u64 = 0,
 };
 
 pub const DeviceCreateOptions = struct {
@@ -154,6 +168,45 @@ pub const DeviceCreateOptions = struct {
     /// RMW pattern that broke the original 32-token batch).
     enable_8bit_storage: bool = false,
 };
+
+/// True iff the physical device advertises `VK_EXT_external_memory_host`
+/// in its vkEnumerateDeviceExtensionProperties list. The extension lets us
+/// turn a caller-provided pageable host pointer into a VkDeviceMemory the
+/// GPU can DMA into directly — eliminating the dst→stage staging copy in
+/// the SLZ1 decode readback path (the analog of CUDA's cuMemcpyDtoH_v2,
+/// src/decode/decode_dispatch.zig:485).
+fn hasExternalMemoryHostExt(pd: vk.VkPhysicalDevice) bool {
+    const enum_ext = vk.vkEnumerateDeviceExtensionProperties_fn orelse return false;
+    var count: u32 = 0;
+    if (enum_ext(pd, null, &count, null) != vk.VK_SUCCESS) return false;
+    if (count == 0) return false;
+
+    var buf: [256]vk.VkExtensionProperties = @splat(.{});
+    var n: u32 = count;
+    if (n > buf.len) n = @intCast(buf.len);
+    if (enum_ext(pd, null, &n, @ptrCast(&buf)) != vk.VK_SUCCESS and
+        enum_ext(pd, null, &n, @ptrCast(&buf)) != vk.VK_INCOMPLETE) return false;
+
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const name_slice = std.mem.sliceTo(buf[i].extensionName[0..], 0);
+        if (std.mem.eql(u8, name_slice, "VK_EXT_external_memory_host")) return true;
+    }
+    return false;
+}
+
+/// Query `minImportedHostPointerAlignment` for the device. Caller must
+/// have already verified the extension is supported (and will enable it
+/// at device creation). Returns 0 if the query failed for any reason —
+/// the codec treats 0 as "extension disabled".
+fn queryExternalMemoryHostAlignment(pd: vk.VkPhysicalDevice) u64 {
+    const get_props2 = vk.vkGetPhysicalDeviceProperties2_fn orelse return 0;
+    var ext_props: vk.VkPhysicalDeviceExternalMemoryHostPropertiesEXT = .{};
+    var props2: vk.VkPhysicalDeviceProperties2 = .{};
+    props2.pNext = @ptrCast(&ext_props);
+    get_props2(pd, @ptrCast(&props2));
+    return ext_props.minImportedHostPointerAlignment;
+}
 
 pub fn createDevice(pd: vk.VkPhysicalDevice, opts: DeviceCreateOptions) DeviceError!DeviceBundle {
     const get_qf = vk.vkGetPhysicalDeviceQueueFamilyProperties_fn orelse return error.LoaderNotReady;
@@ -245,9 +298,14 @@ pub fn createDevice(pd: vk.VkPhysicalDevice, opts: DeviceCreateOptions) DeviceEr
     // device the v13 feature struct is the authoritative gate; passing
     // the EXT name to enabledExtensionNames is unnecessary and on some
     // 1.3 loaders triggers a "extension already promoted" rejection.
-    var ext_names_storage: [2][*:0]const u8 = .{
+    // VK_EXT_external_memory_host is added below when supported — it
+    // lets the SLZ1 decoder register the caller's pageable host pointer
+    // as a VkDeviceMemory + VkBuffer pair, mirroring CUDA's
+    // cuMemcpyDtoH_v2 (src/decode/decode_dispatch.zig:485).
+    var ext_names_storage: [3][*:0]const u8 = .{
         "VK_KHR_8bit_storage",
         "VK_KHR_storage_buffer_storage_class",
+        "VK_EXT_external_memory_host",
     };
     var ext_count: u32 = 0;
     if (opts.enable_8bit_storage) {
@@ -255,6 +313,15 @@ pub fn createDevice(pd: vk.VkPhysicalDevice, opts: DeviceCreateOptions) DeviceEr
         v12_feats.uniformAndStorageBuffer8BitAccess = vk.VK_TRUE;
         v12_feats.shaderInt8 = vk.VK_TRUE;
         ext_count = 2;
+    }
+    const has_ext_mem_host = hasExternalMemoryHostExt(pd);
+    if (has_ext_mem_host) {
+        // Pack the EXT name into the next free slot. When 8bit storage
+        // is enabled we land at index 2; otherwise at index 0 (and we
+        // need to shift the name into the [0] slot since the array's
+        // [0]/[1] are the 8bit-storage names which aren't enabled).
+        ext_names_storage[ext_count] = "VK_EXT_external_memory_host";
+        ext_count += 1;
     }
     const dev_ci: vk.VkDeviceCreateInfo = .{
         .pNext = p_next,
@@ -279,13 +346,29 @@ pub fn createDevice(pd: vk.VkPhysicalDevice, opts: DeviceCreateOptions) DeviceEr
         if (gdpa(dev, "vkDestroyDevice")) |raw| {
             vk.vkDestroyDevice_fn = @ptrCast(@alignCast(raw));
         }
+        if (has_ext_mem_host) {
+            if (gdpa(dev, "vkGetMemoryHostPointerPropertiesEXT")) |raw| {
+                vk.vkGetMemoryHostPointerPropertiesEXT_fn = @ptrCast(@alignCast(raw));
+            }
+        }
     }
 
     var queue: vk.VkQueue = null;
     const get_queue_now = vk.vkGetDeviceQueue_fn orelse get_queue;
     get_queue_now(dev, qfi, 0, &queue);
 
-    return .{ .dev = dev, .queue = queue, .queue_family_index = qfi };
+    // If the function pointer didn't resolve (driver oddity), treat the
+    // extension as unavailable so the codec falls back to the staging path.
+    const ext_active = has_ext_mem_host and vk.vkGetMemoryHostPointerPropertiesEXT_fn != null;
+    const ext_align: u64 = if (ext_active) queryExternalMemoryHostAlignment(pd) else 0;
+
+    return .{
+        .dev = dev,
+        .queue = queue,
+        .queue_family_index = qfi,
+        .external_memory_host_enabled = ext_active and ext_align > 0,
+        .external_memory_host_alignment = ext_align,
+    };
 }
 
 pub fn destroyDevice(dev: vk.VkDevice) void {

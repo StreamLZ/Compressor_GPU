@@ -257,6 +257,16 @@ pub var last_decode_slz_dec_submit_call_ns: u64 = 0;
 pub var last_decode_slz_dec_wait_call_ns: u64 = 0;
 pub var last_decode_slz_dec_query_read_ns: u64 = 0;
 
+// Path-selection telemetry (updated every decode call). 0/1 booleans
+// for the gates and the resolved alignment + import size. Used by the
+// bench harness to confirm the VK_EXT_external_memory_host fast path
+// is engaged after the staging-copy elimination.
+pub var last_decode_slz_caller_import_taken: u64 = 0;
+pub var last_decode_slz_caller_import_align: u64 = 0;
+pub var last_decode_slz_caller_ptr_aligned: u64 = 0;
+pub var last_decode_slz_caller_has_ext: u64 = 0;
+pub var last_decode_slz_caller_import_size: u64 = 0;
+
 // One-shot diagnostic outputs filled by `runReadbackDiagnostics`. The
 // helper runs once per process the first time decodeSlz1ToBytesEx is
 // called with SLZ_VK_PROFILE_DECODE=1, then sets `_ran` to disable
@@ -615,9 +625,64 @@ pub fn decodeSlz1ToBytesEx(
         @as(vk.VkDeviceSize, 4),
         (@as(vk.VkDeviceSize, dst_total) + 3) & ~@as(vk.VkDeviceSize, 3),
     );
+
+    // ── Caller-pointer import path (preferred when supported) ──────
+    //
+    // CUDA's readback at `src/decode/decode_dispatch.zig:485` issues a
+    // single cuMemcpyDtoH_v2 from VRAM straight into the caller's
+    // pageable host buffer — no GPU staging copy, no host @memcpy. The
+    // Vulkan analog is VK_EXT_external_memory_host: register the
+    // caller's `out` buffer as a VkDeviceMemory, bind a transient
+    // VkBuffer to it, and make THAT the destination of vkCmdCopyBuffer.
+    //
+    // Eligibility (all must hold):
+    //   * extension enabled at device-creation time
+    //   * caller didn't pass a device-side dst override (D2D path)
+    //   * dst_total > 0 (skip empty decodes)
+    //   * caller's `out` pointer is page-aligned per
+    //     `minImportedHostPointerAlignment` AND we can pad the import
+    //     size up to a multiple of that same alignment without
+    //     overflowing `out.len`.
+    //
+    // When eligible: kernel writes into dst_b (DEVICE_LOCAL VRAM, full
+    // bandwidth) → vkCmdCopyBuffer(dst_b → caller_imported) inside the
+    // same submit → caller's bytes land directly in `out`. No host
+    // @memcpy. Saves ~7 ms / 95 MB enwik8 on NVIDIA RTX 4060 Ti where
+    // no memory type satisfies DEVICE_LOCAL+HOST_VISIBLE+HOST_COHERENT+
+    // HOST_CACHED simultaneously (the gate `deviceHasDeviceLocalHostCached`
+    // checks); previously that device fell into the two-buffer slow
+    // path which paid both a 7.58 ms GPU staging copy AND a 9.50 ms
+    // host @memcpy.
+    const ext_align: u64 = ctx.external_memory_host_alignment;
+    const caller_ptr_aligned: bool = ext_align > 0 and
+        (@intFromPtr(out.ptr) % ext_align) == 0;
+    const import_size: vk.VkDeviceSize = if (ext_align > 0) blk_imp: {
+        const a = ext_align;
+        const padded = (@as(u64, dst_total) + (a - 1)) & ~(a - 1);
+        // Caller's buffer must be big enough to hold the padded import
+        // size — out.len is the codec's only contract on the caller
+        // buffer size. When out.len < padded we fall back rather than
+        // overrunning the caller.
+        break :blk_imp if (padded <= out.len) @as(vk.VkDeviceSize, padded) else 0;
+    } else 0;
+    const use_caller_import: bool = !use_dst_override and
+        dst_total > 0 and
+        ctx.has_external_memory_host and
+        caller_ptr_aligned and
+        import_size > 0;
+
+    // Probe diagnostic globals — updated every decode call so callers
+    // can verify which path was taken. Cheap (just stores u64s).
+    last_decode_slz_caller_import_taken = if (use_caller_import) 1 else 0;
+    last_decode_slz_caller_import_align = ext_align;
+    last_decode_slz_caller_ptr_aligned = if (caller_ptr_aligned) 1 else 0;
+    last_decode_slz_caller_has_ext = if (ctx.has_external_memory_host) 1 else 0;
+    last_decode_slz_caller_import_size = @intCast(import_size);
+
     const direct_write: bool = !use_dst_override and
+        !use_caller_import and
         l1_codec.deviceHasDeviceLocalHostCached(ctx);
-    // Both dst_b and dst_stage are pooled in the per-context workspace
+    // dst_b and dst_stage are pooled in the per-context workspace
     // — mirrors CUDA's `d_output` field and pinned-host mirror
     // (src/decode/decode_context.zig:195-201). Per-call free + realloc
     // was the largest single contributor to the 23.7 ms alloc overhead
@@ -627,10 +692,46 @@ pub fn decodeSlz1ToBytesEx(
     // memory heap). After this change, the first decode pays both
     // grows; subsequent calls of the same-or-smaller decompressed
     // size are no-ops.
+    //
+    // `caller_imported` is created per-call (the caller's `out` pointer
+    // changes call to call so we can't pool the imported VkBuffer +
+    // VkDeviceMemory pair). The import itself is cheap — no driver-side
+    // allocation, just a binding of an existing host pointer into a
+    // VkDeviceMemory handle.
     var dst_b: l1_codec.Buffer = .{};
     var dst_stage: l1_codec.Buffer = .{};
+    var caller_imported: l1_codec.Buffer = .{};
     if (!use_dst_override) {
-        if (direct_write) {
+        if (use_caller_import) {
+            // dst_b is the kernel's DEVICE_LOCAL VRAM target; the imported
+            // VkBuffer is the vkCmdCopyBuffer destination.
+            try decode_workspace.ensureWorkspaceBuf(
+                ctx,
+                &ws.dst_b,
+                dst_buf_size,
+                vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                .device_local_only,
+            );
+            dst_b = ws.dst_b.buffer;
+            caller_imported = l1_codec.importHostPointerBuffer(
+                ctx,
+                @ptrCast(out.ptr),
+                import_size,
+                vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ) catch |err| switch (err) {
+                // If the import fails at runtime (unexpected — we
+                // already gated on alignment + extension support), fall
+                // through to the existing two-buffer slow path rather
+                // than failing the decode.
+                error.MemoryTypeNotFound,
+                error.BufferCreateFailed,
+                error.MemoryAllocateFailed,
+                error.BindBufferFailed,
+                error.MapMemoryFailed,
+                => l1_codec.Buffer{},
+                else => return error.OutOfMemory,
+            };
+        } else if (direct_write) {
             // Single-buffer: dst_stage IS the kernel write target.
             try decode_workspace.ensureWorkspaceBuf(
                 ctx,
@@ -659,8 +760,24 @@ pub fn decodeSlz1ToBytesEx(
             dst_stage = ws.dst_stage.buffer;
         }
     }
-    // No defer destroyBuffer — the workspace owns dst_b / dst_stage
-    // across decode calls (frees once in driver.deinit).
+    // Workspace owns dst_b / dst_stage across decode calls (frees once
+    // in driver.deinit). `caller_imported` is per-call and freed after
+    // submit+wait below.
+    // The import-path fallback (failed runtime import despite the
+    // eligibility gate) leaves `caller_imported.buf == null` and means
+    // we have neither dst_stage NOR a target — recover by allocating
+    // dst_stage on demand so the readback path still has a destination.
+    const caller_import_active: bool = use_caller_import and caller_imported.buf != null;
+    if (use_caller_import and !caller_import_active) {
+        try decode_workspace.ensureWorkspaceBuf(
+            ctx,
+            &ws.dst_stage,
+            dst_buf_size,
+            vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .host_visible_sysmem,
+        );
+        dst_stage = ws.dst_stage.buffer;
+    }
 
     // One-shot readback-cost diagnostic (controlled by SLZ_VK_PROFILE_DECODE=1).
     // Runs before any per-decode timing is captured so the diag work
@@ -723,6 +840,11 @@ pub fn decodeSlz1ToBytesEx(
     // anywhere on this path.
     const dst_bind_buf: vk.VkBuffer = if (opts.dst_buffer_override) |b|
         b
+    else if (caller_import_active)
+        // Caller-import path: kernel writes into dst_b (DEVICE_LOCAL VRAM
+        // for full bandwidth); a vkCmdCopyBuffer below stages dst_b into
+        // the caller's imported VkBuffer (no host @memcpy after submit).
+        dst_b.buf
     else if (direct_write)
         // Single-buffer: kernel writes directly into the host-cached
         // staging buffer (no GPU copy needed).
@@ -768,8 +890,11 @@ pub fn decodeSlz1ToBytesEx(
     // copy_size==0 → single-buffer path: kernel wrote straight into
     // dst_stage (HOST_CACHED), no GPU staging copy needed; the COPY
     // timestamp pair gets written but the resulting copy_ns is 0.
-    // copy_size==dst_total → two-buffer path: stage dst_b → dst_stage
-    // with the compute→transfer barrier.
+    // copy_size==dst_total + dst_dst=caller_imported → caller-import
+    // path: dst_b → caller's host pointer via the GPU's DMA engine, no
+    // post-submit host @memcpy.
+    // copy_size==dst_total + dst_dst=dst_stage → two-buffer slow path:
+    // dst_b → dst_stage, then a host @memcpy below moves dst_stage → out.
     // copy_size==0 when use_dst_override → D2D-style: caller's buffer
     // is the kernel target, no copy needed.
     const copy_size: vk.VkDeviceSize = if (use_dst_override or dst_total == 0 or direct_write)
@@ -777,7 +902,12 @@ pub fn decodeSlz1ToBytesEx(
     else
         @as(vk.VkDeviceSize, dst_total);
     const copy_src: vk.VkBuffer = if (copy_size == 0) null else dst_b.buf;
-    const copy_dst: vk.VkBuffer = if (copy_size == 0) null else dst_stage.buf;
+    const copy_dst: vk.VkBuffer = if (copy_size == 0)
+        null
+    else if (caller_import_active)
+        caller_imported.buf
+    else
+        dst_stage.buf;
 
     // Mirror CUDA src/decode/decode_dispatch.zig:400-401
     //   lz_groups = (total_chunks + chunks_per_group - 1) / chunks_per_group;
@@ -861,13 +991,22 @@ pub fn decodeSlz1ToBytesEx(
 
     // Host readback only when the host buffer was actually the
     // dst — D2D callers skip it entirely (the bytes are already
-    // in their device buffer). Reads from dst_stage (sysmem,
-    // driver-cached) instead of dst_b (DEVICE_LOCAL VRAM).
+    // in their device buffer). Caller-import path also skips: the
+    // GPU's copy engine already DMA'd straight into `out` via the
+    // imported VkBuffer (the analog of CUDA's cuMemcpyDtoH_v2 at
+    // src/decode/decode_dispatch.zig:485). Two-buffer slow path
+    // still reads from dst_stage (sysmem, driver-cached).
     const t_readback_begin = qpcNow();
-    if (!use_dst_override and dst_total > 0) {
+    if (!use_dst_override and dst_total > 0 and !caller_import_active) {
         const stage_mapped = dst_stage.mapped orelse return error.MapMemoryFailed;
         @memcpy(out[0..dst_total], stage_mapped[0..dst_total]);
     }
     last_decode_slz_readback_ns = qpcNs(t_readback_begin, qpcNow());
+
+    // Tear down the per-call imported VkBuffer + VkDeviceMemory pair.
+    // The host pointer itself belongs to the caller and is NOT freed.
+    if (caller_import_active) {
+        l1_codec.destroyBuffer(ctx, &caller_imported);
+    }
     return dst_total;
 }

@@ -341,7 +341,11 @@ fn runDecompress(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, ar
     try ensureInitWithSelector(w, args);
     defer driver.deinit();
 
-    const out_buf = try allocator.alloc(u8, content_size + VK_SAFE_SPACE);
+    // Page-align so the SLZ1 decoder takes the
+    // VK_EXT_external_memory_host fast path (see bench comment in
+    // runBenchOrPrintHelp for the rationale).
+    const out_buf_size = ((content_size + VK_SAFE_SPACE + 4095) & ~@as(usize, 4095));
+    const out_buf = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(4096), out_buf_size);
     defer allocator.free(out_buf);
 
     const written = slz1_codec.decodeSlz1ToBytes(&driver.g_default, io, allocator, src, out_buf) catch |err| {
@@ -511,7 +515,15 @@ fn runBench(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: A
     });
 
     // ── Decompress runs ──────────────────────────────────────────
-    const dec_buf = try allocator.alloc(u8, src.len + VK_SAFE_SPACE);
+    // Page-align the decode output buffer AND round the length up to a
+    // multiple of the page so the SLZ1 decoder can take the
+    // VK_EXT_external_memory_host fast path (the import requires
+    // pointer + size both aligned to `minImportedHostPointerAlignment`
+    // — typically 4096). Without alignment the decoder falls back to
+    // the dst_stage staging copy + post-submit host @memcpy, which was
+    // what made enwik8 e2e ~7 ms slower than CUDA's cuMemcpyDtoH_v2.
+    const dec_buf_alloc_size = ((src.len + VK_SAFE_SPACE + 4095) & ~@as(usize, 4095));
+    const dec_buf = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(4096), dec_buf_alloc_size);
     defer allocator.free(dec_buf);
 
     // Warm-up decompress (same rationale as the encode warm-up).

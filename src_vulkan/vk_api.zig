@@ -765,6 +765,17 @@ pub const FnCmdDispatch = *const fn (
     groupCountZ: u32,
 ) callconv(.c) void;
 
+// S003: indirect dispatch reads the (x, y, z) workgroup count from a
+// device buffer (3 × u32 = 12 bytes at `offset`). Lets us derive the
+// L1 unwrap + LZ decode workgroup count from the walk-meta n_chunks
+// without a host-side fence wait + meta readback. Mirrors CUDA's
+// implicit "kernel arg reads device value via the launch ABI" pattern.
+pub const FnCmdDispatchIndirect = *const fn (
+    commandBuffer: VkCommandBuffer,
+    buffer: VkBuffer,
+    offset: VkDeviceSize,
+) callconv(.c) void;
+
 pub const FnQueueSubmit = *const fn (
     queue: VkQueue,
     submitCount: u32,
@@ -857,6 +868,7 @@ pub var vkCmdBindPipeline_fn: ?FnCmdBindPipeline = null;
 pub var vkCmdBindDescriptorSets_fn: ?FnCmdBindDescriptorSets = null;
 pub var vkCmdPushConstants_fn: ?FnCmdPushConstants = null;
 pub var vkCmdDispatch_fn: ?FnCmdDispatch = null;
+pub var vkCmdDispatchIndirect_fn: ?FnCmdDispatchIndirect = null;
 pub var vkQueueSubmit_fn: ?FnQueueSubmit = null;
 pub var vkQueueWaitIdle_fn: ?FnQueueWaitIdle = null;
 pub var vkCreateFence_fn: ?FnCreateFence = null;
@@ -1667,6 +1679,52 @@ pub const VkMemoryAllocateFlagsInfo = extern struct {
     deviceMask: u32 = 0,
 };
 
+// ── VK_EXT_external_memory_host: import caller's pageable host pointer
+// as a VkDeviceMemory, bind a VkBuffer to it, then vkCmdCopyBuffer's
+// destination is the caller's buffer — the equivalent of CUDA's
+// `cuMemcpyDtoH_v2` which DMAs straight from VRAM into a pageable host
+// pointer (src/decode/decode_dispatch.zig:485). With this extension we
+// eliminate BOTH the dst_b → dst_stage staging copy AND the post-submit
+// host @memcpy that the two-buffer slow path pays on devices without a
+// single DEVICE_LOCAL+HOST_VISIBLE+HOST_COHERENT+HOST_CACHED memory
+// type (i.e. NVIDIA RTX 4060 Ti at the time of this writing).
+//
+// The extension is widely supported on NVIDIA / AMD desktop drivers and
+// most modern Intel iGPUs; on devices without it we keep the existing
+// two-buffer fallback (slz1_codec gates on `ctx.has_external_memory_host`).
+pub const VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT: u32 = 0x80;
+pub const VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT: VkStructureType = 1000178000;
+pub const VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT: VkStructureType = 1000178001;
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT: VkStructureType = 1000178002;
+
+pub const VkExternalMemoryHandleTypeFlags = u32;
+
+pub const VkImportMemoryHostPointerInfoEXT = extern struct {
+    sType: VkStructureType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+    pNext: ?*const anyopaque = null,
+    handleType: VkExternalMemoryHandleTypeFlags = 0,
+    pHostPointer: ?*anyopaque = null,
+};
+
+pub const VkMemoryHostPointerPropertiesEXT = extern struct {
+    sType: VkStructureType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
+    pNext: ?*anyopaque = null,
+    memoryTypeBits: u32 = 0,
+};
+
+pub const VkPhysicalDeviceExternalMemoryHostPropertiesEXT = extern struct {
+    sType: VkStructureType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
+    pNext: ?*anyopaque = null,
+    minImportedHostPointerAlignment: VkDeviceSize = 0,
+};
+
+pub const FnGetMemoryHostPointerPropertiesEXT = *const fn (
+    device: VkDevice,
+    handleType: VkExternalMemoryHandleTypeFlags,
+    pHostPointer: *const anyopaque,
+    pMemoryHostPointerProperties: *VkMemoryHostPointerPropertiesEXT,
+) callconv(.c) VkResult;
+
 // ── M8c function-pointer slots ───────────────────────────────────
 // Same lazy-on-first-use pattern as M8a/M8b. sync.zig + timing.zig
 // populate these inside their ensure helpers.
@@ -1684,6 +1742,11 @@ pub var vkGetPhysicalDeviceMemoryProperties_fn: ?FnGetPhysicalDeviceMemoryProper
 pub var vkCmdCopyBuffer_fn: ?FnCmdCopyBuffer = null;
 pub var vkCmdFillBuffer_fn: ?FnCmdFillBuffer = null;
 pub var vkGetBufferDeviceAddress_fn: ?FnGetBufferDeviceAddress = null;
+// VK_EXT_external_memory_host — resolved by driver.zig at ensureInit
+// time (immediately after vkCreateDevice) when the device advertises
+// the extension. Stays null on devices without it; slz1_codec consults
+// `ctx.has_external_memory_host` before using.
+pub var vkGetMemoryHostPointerPropertiesEXT_fn: ?FnGetMemoryHostPointerPropertiesEXT = null;
 
 // ── VK_EXT_debug_utils: cmd-buffer labels for nsys / RenderDoc ───
 // Pure instrumentation — `vkCmdBeginDebugUtilsLabelEXT` /
