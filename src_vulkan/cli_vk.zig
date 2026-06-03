@@ -28,7 +28,7 @@ const l1_codec = @import("l1_codec.zig");
 
 const VK_SAFE_SPACE: usize = 64;
 
-const Mode = enum { compress, decompress, version, help, probe, bench };
+const Mode = enum { compress, decompress, version, help, probe, bench, decompress_bench };
 
 const Args = struct {
     mode: Mode = .compress,
@@ -136,6 +136,10 @@ fn parseArgs(raw: []const []const u8, w: *std.Io.Writer) Args {
         }
         if (eql(arg, "-d")) {
             result.mode = .decompress;
+            continue;
+        }
+        if (eql(arg, "-db")) {
+            result.mode = .decompress_bench;
             continue;
         }
         if (eql(arg, "-b")) {
@@ -741,6 +745,105 @@ fn runBench(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: A
     }
 }
 
+/// Decompress-only bench. Takes a pre-compressed .slz file and runs
+/// `runs` timed decompresses against it (+ 1 warmup). Mirrors CUDA's
+/// `streamlz -db` shape so nsys traces can be compared apples-to-apples
+/// without the encoder's allocations polluting the per-API counts.
+fn runDecompressBench(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: Args) !void {
+    const in_path = args.input orelse {
+        try w.writeAll("error: -db requires an input file (.slz)\n");
+        return error.NoInput;
+    };
+    const runs: u32 = args.runs;
+
+    const compressed = readFileAll(allocator, io, in_path) catch |err| {
+        try w.print("error: cannot read '{s}': {s}\n", .{ in_path, @errorName(err) });
+        return err;
+    };
+    defer allocator.free(compressed);
+    if (compressed.len == 0) {
+        try w.writeAll("error: input file is empty\n");
+        return error.EmptyInput;
+    }
+
+    // Peek at the frame header for content_size so we can size dec_buf.
+    const hdr = frame.parseHeader(compressed) catch |err| {
+        try w.print("error: not a valid SLZ1 frame: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const content_size: usize = if (hdr.content_size) |cs| @intCast(cs) else {
+        try w.writeAll("error: frame missing content_size (streaming mode unsupported)\n");
+        return error.NoContentSize;
+    };
+
+    try ensureInitWithSelector(w, args);
+    defer driver.deinit();
+    try printBoundDevice(w);
+
+    const mb: f64 = @as(f64, @floatFromInt(content_size)) / (1024.0 * 1024.0);
+    try w.print("Input: {s} ({d} bytes compressed, {d} bytes decompressed, {d:.2} MB)\n", .{
+        in_path, compressed.len, content_size, mb,
+    });
+
+    // Page-align dec_buf so the SLZ1 decoder takes the
+    // VK_EXT_external_memory_host fast path.
+    const dec_buf_alloc_size = ((content_size + VK_SAFE_SPACE + 4095) & ~@as(usize, 4095));
+    const dec_buf = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(4096), dec_buf_alloc_size);
+    defer allocator.free(dec_buf);
+
+    // Warm-up decompress.
+    _ = try slz1_codec.decodeSlz1ToBytes(&driver.g_default, io, allocator, compressed, dec_buf);
+
+    const dec_e2e_ns = try allocator.alloc(u64, runs);
+    defer allocator.free(dec_e2e_ns);
+    const dec_d2d_ns = try allocator.alloc(u64, runs);
+    defer allocator.free(dec_d2d_ns);
+
+    var r: u32 = 0;
+    while (r < runs) : (r += 1) {
+        l1_codec.last_decode_dispatch_ns = 0;
+        const t0 = qpcNow();
+        _ = try slz1_codec.decodeSlz1ToBytes(&driver.g_default, io, allocator, compressed, dec_buf);
+        const t1 = qpcNow();
+        dec_e2e_ns[r] = qpcNs(t0, t1);
+        dec_d2d_ns[r] = l1_codec.last_decode_dispatch_ns;
+        const e2e_ms = @as(f64, @floatFromInt(dec_e2e_ns[r])) / 1_000_000.0;
+        const d2d_ms = @as(f64, @floatFromInt(dec_d2d_ns[r])) / 1_000_000.0;
+        if (dec_d2d_ns[r] > 0) {
+            try w.print(
+                "  Decompress run {d}: e2e {d:.0}ms ({d:.1} MB/s)  d2d {d:.2}ms ({d:.1} MB/s)\n",
+                .{ r + 1, e2e_ms, mb * 1000.0 / e2e_ms, d2d_ms, mb * 1000.0 / d2d_ms },
+            );
+        } else {
+            try w.print(
+                "  Decompress run {d}: {d:.0}ms ({d:.1} MB/s)\n",
+                .{ r + 1, e2e_ms, mb * 1000.0 / e2e_ms },
+            );
+        }
+    }
+
+    const e2e_med = medianU64(dec_e2e_ns);
+    const e2e_med_ms = @as(f64, @floatFromInt(e2e_med)) / 1_000_000.0;
+    var nz_d2d: std.ArrayList(u64) = .empty;
+    defer nz_d2d.deinit(allocator);
+    for (dec_d2d_ns) |x| {
+        if (x > 0) try nz_d2d.append(allocator, x);
+    }
+    if (nz_d2d.items.len > 0) {
+        const d2d_med = medianU64(nz_d2d.items);
+        const d2d_med_ms = @as(f64, @floatFromInt(d2d_med)) / 1_000_000.0;
+        try w.print(
+            "  Decompress median: e2e {d:.0}ms ({d:.1} MB/s)  d2d {d:.2}ms ({d:.1} MB/s)\n",
+            .{ e2e_med_ms, mb * 1000.0 / e2e_med_ms, d2d_med_ms, mb * 1000.0 / d2d_med_ms },
+        );
+    } else {
+        try w.print(
+            "  Decompress median: {d:.0}ms ({d:.1} MB/s)\n",
+            .{ e2e_med_ms, mb * 1000.0 / e2e_med_ms },
+        );
+    }
+}
+
 pub fn main(process_init: std.process.Init) !void {
     const allocator = process_init.gpa;
     const io = process_init.io;
@@ -769,6 +872,7 @@ pub fn main(process_init: std.process.Init) !void {
         .compress => try runCompress(allocator, io, w, args),
         .decompress => try runDecompress(allocator, io, w, args),
         .bench => try runBench(allocator, io, w, args),
+        .decompress_bench => try runDecompressBench(allocator, io, w, args),
         .probe => try runProbe(w),
     }
 }
