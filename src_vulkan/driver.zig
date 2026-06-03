@@ -14,6 +14,7 @@ const instance_mod = @import("instance.zig");
 const device_mod = @import("device.zig");
 const dispatch_mod = @import("dispatch.zig");
 const probe_mod = @import("probe.zig");
+const decode_workspace_mod = @import("decode_workspace.zig");
 
 pub const Context = struct {
     inst: vk.VkInstance = null,
@@ -49,6 +50,24 @@ pub const Context = struct {
     // fast-batch lz_decode shader and the u32-packed fallback. Mirrors
     // the probe.has_8bit_storage check that gated feature enablement.
     has_8bit_storage: bool = false,
+
+    // ── Decode workspace pool — grow-only buffer pool reused across
+    // every `decodeSlz1ToBytesEx` + `runDecodePipelineEx` invocation on
+    // this context. Mirrors CUDA's `decode_context.DecodeContext` struct
+    // (src/decode/decode_context.zig:188-375) which carries every
+    // device buffer as a `(ptr, size)` field pair and grows lazily via
+    // `ensureDeviceBuf` (src/decode/decode_context.zig:35). Before this
+    // pool existed, the Vulkan decode path freed + reallocated 17
+    // buffers per call (~34 ms / call alloc+free overhead in the Nsight
+    // trace on NVIDIA enwik8).
+    //
+    // Allocated on first use (`getOrCreateDecodeWorkspace`) so contexts
+    // that never decode (probe-only callers, encode-only callers) don't
+    // pay the workspace heap cost. Freed once in `deinit` before
+    // `destroyDevice`. The workspace is a separate heap allocation
+    // because embedding it inline would inflate every Context (~17
+    // Slots × ~64 bytes = ~1 KiB) for callers that never decode.
+    decode_workspace: ?*decode_workspace_mod.DecodeWorkspace = null,
 };
 
 pub var g_default: Context = .{};
@@ -127,8 +146,38 @@ pub fn ensureInit() DriverError!void {
     };
 }
 
+/// Lazily allocate the decode workspace pool on first use. Subsequent
+/// calls return the existing pointer. Mirrors CUDA's pattern where the
+/// `DecodeContext` is created once (per handle in the C ABI, or as the
+/// `g_default` singleton in the CLI) and reused across every
+/// `slzDecompress` call — see `src/decode/driver.zig` `g_default`.
+///
+/// Returns `error.OutOfMemory` if the workspace heap allocation fails;
+/// callers route this through their existing error paths (the
+/// `DecodeError`/`PipelineError`/`Slz1Error` sets all carry
+/// `OutOfMemory`).
+pub fn getOrCreateDecodeWorkspace(
+    ctx: *Context,
+) error{OutOfMemory}!*decode_workspace_mod.DecodeWorkspace {
+    if (ctx.decode_workspace) |ws| return ws;
+    const ws = std.heap.page_allocator.create(decode_workspace_mod.DecodeWorkspace) catch {
+        return error.OutOfMemory;
+    };
+    ws.* = .{};
+    ctx.decode_workspace = ws;
+    return ws;
+}
+
 pub fn deinit() void {
     if (!g_default.initialized) return;
+    // Decode workspace teardown BEFORE destroyDevice — every VkBuffer +
+    // VkDeviceMemory the pool owns is device-scoped. Frees nothing if
+    // no decode ever ran (workspace pointer stays null).
+    if (g_default.decode_workspace) |ws| {
+        decode_workspace_mod.deinit(&g_default, ws);
+        std.heap.page_allocator.destroy(ws);
+        g_default.decode_workspace = null;
+    }
     // M8a chassis teardown must happen BEFORE destroyDevice — command
     // pools, fences, and query pools are device-owned and the spec
     // requires they be destroyed before their parent VkDevice.

@@ -73,6 +73,7 @@ const descriptors = @import("descriptors.zig");
 const dispatch = @import("dispatch.zig");
 const wire_constants = @import("wire_constants.zig");
 const spv_blobs = @import("spv_blobs");
+const decode_workspace = @import("decode_workspace.zig");
 
 // ── Constants that mirror the shared GLSL header ─────────────────────
 //
@@ -215,12 +216,12 @@ const BufferMode = enum {
     host_visible_sysmem,
 };
 
-const Buffer = struct {
-    buf: vk.VkBuffer = null,
-    mem: vk.VkDeviceMemory = null,
-    mapped: ?[*]u8 = null,
-    size: vk.VkDeviceSize = 0,
-};
+// Use l1_codec.Buffer directly so DecodeResult fields can hold by-value
+// copies of the per-context workspace's `Slot.buffer` field (which is
+// also l1_codec.Buffer). The two types were already structurally
+// identical pre-workspace; aliasing removes the duplication and lets
+// the workspace own the lifetime.
+const Buffer = l1_codec.Buffer;
 
 fn createBuffer(
     ctx: *driver.Context,
@@ -344,7 +345,15 @@ fn dupAlignedSpv(allocator: std.mem.Allocator, spv: []const u8) PipelineError![]
 // ── Public result type ───────────────────────────────────────────────
 
 pub const DecodeResult = struct {
-    // Device buffers — caller owns lifetime via destroyDecodeResult.
+    // Device buffers — VIEWS into the per-context DecodeWorkspace pool
+    // (`driver.Context.decode_workspace`). The workspace owns the
+    // VkBuffer + VkDeviceMemory lifetime across decode calls; this
+    // struct's fields are by-value Buffer copies populated by
+    // runDecodePipelineEx from `ws.<slot>.buffer`. `destroyDecodeResult`
+    // is therefore a no-op — the workspace frees everything once at
+    // `driver.deinit`. Mirrors CUDA's pattern where the dispatch reads
+    // `self.d_<slot>` straight off the long-lived DecodeContext
+    // (src/decode/decode_dispatch.zig:411, 519, 549).
     frame: Buffer = .{},
     chunks: Buffer = .{},
     meta: Buffer = .{},
@@ -376,21 +385,20 @@ pub const DecodeResult = struct {
     total_subchunks: u32 = 0,
 };
 
+/// No-op since the workspace pool was introduced: every Buffer field
+/// in DecodeResult is a view into a workspace slot whose lifetime is
+/// owned by `driver.Context.decode_workspace`. Kept around so existing
+/// callers (slz1_codec.decodeSlz1ToBytesEx via its `defer
+/// destroyDecodeResult` line) compile unchanged and so the documented
+/// API contract doesn't break for future re-use cases.
+///
+/// Mirrors CUDA's per-call pattern in `src/decode/decode_dispatch.zig`
+/// which never frees the per-decode workspace slots — they're owned by
+/// `DecodeContext` for the lifetime of the context. See
+/// `src/decode/decode_context.zig:320` for the once-per-context teardown.
 pub fn destroyDecodeResult(ctx: *driver.Context, r: *DecodeResult) void {
-    destroyBuffer(ctx, &r.frame);
-    destroyBuffer(ctx, &r.chunks);
-    destroyBuffer(ctx, &r.meta);
-    destroyBuffer(ctx, &r.first_sub_idx);
-    destroyBuffer(ctx, &r.total_subs);
-    destroyBuffer(ctx, &r.n_chunks_scratch);
-    destroyBuffer(ctx, &r.staged);
-    destroyBuffer(ctx, &r.compact_lit);
-    destroyBuffer(ctx, &r.compact_tok);
-    destroyBuffer(ctx, &r.compact_hi);
-    destroyBuffer(ctx, &r.compact_lo);
-    destroyBuffer(ctx, &r.compact_raw);
-    destroyBuffer(ctx, &r.compact_counts);
-    destroyBuffer(ctx, &r.off16_scratch);
+    _ = ctx;
+    _ = r;
 }
 
 // ── Internal pipeline-cache holder ───────────────────────────────────
@@ -597,54 +605,84 @@ pub fn runDecodePipelineEx(
     const max_total_subchunks: u32 = n_chunks_max * MAX_SUB_CHUNKS_PER_CHUNK;
 
     var result: DecodeResult = .{};
-    errdefer destroyDecodeResult(ctx, &result);
+    // No errdefer destroyDecodeResult — the workspace owns lifetimes
+    // across calls and is freed once at driver.deinit. A pipeline-build
+    // failure simply leaves the partially-grown workspace in place;
+    // subsequent decode calls reuse whatever was already allocated.
+    // Matches CUDA's behavior: a mid-decode error in
+    // `src/decode/decode_dispatch.zig:uploadInputAndPrefixSum` doesn't
+    // free the DecodeContext's slots either — they stay allocated for
+    // the next call.
 
-    // ── 1. Allocate buffers ──────────────────────────────────────────
+    // ── 1. Acquire (or lazily allocate) the per-context workspace pool
+    //    that owns every buffer below across decode invocations. Mirrors
+    //    CUDA's `self.<slot>` reads in src/decode/decode_dispatch.zig
+    //    that read straight off the long-lived DecodeContext.
+    const ws = driver.getOrCreateDecodeWorkspace(ctx) catch return error.OutOfMemory;
+
+    // ── 2. Grow workspace slots to fit this call's frame sizing ──────
+    //
+    // Every `ensureWorkspaceBuf` call mirrors CUDA's `ensureDeviceBuf`
+    // (src/decode/decode_context.zig:35): no-op when the existing
+    // allocation is already large enough, otherwise free + reallocate.
+    // First call grows everything; subsequent calls of the same or
+    // smaller size are pure no-ops — no vkAllocateMemory / vkFreeMemory
+    // traffic at all on the steady-state path.
 
     // Frame: u32-packed compressed SLZ1 bytes. host_visible_prefer_
     // device_local so the host fill below stays cheap on both NVIDIA
-    // (rebar) and Intel iGPU (shared heap).
+    // (rebar) and Intel iGPU (shared heap). CUDA pools the input buffer
+    // identically at src/decode/decode_dispatch.zig:519.
     const frame_bytes: vk.VkDeviceSize = @intCast((slz_bytes.len + 3) & ~@as(usize, 3));
-    result.frame = try createBuffer(
+    try decode_workspace.ensureWorkspaceBuf(
         ctx,
+        &ws.frame,
         @max(frame_bytes, 4),
         vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .host_visible_prefer_device_local,
     );
+    result.frame = ws.frame.buffer;
 
     // Chunks: WALK_MAX_CHUNKS * 6 u32 (walk_frame is unconditionally
     // sized at WALK_MAX_CHUNKS because the kernel's max_chunks bound
     // protects it from overflow). At 16384 chunks this is ~400 KiB —
     // small enough to leave at the worst case regardless of hint.
     const chunks_bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, WALK_MAX_CHUNKS) * CHUNK_DESC_U32_COUNT * 4;
-    result.chunks = try createBuffer(ctx, chunks_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
+    try decode_workspace.ensureWorkspaceBuf(ctx, &ws.chunks, chunks_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
+    result.chunks = ws.chunks.buffer;
 
     // Meta: 6 u32. host_visible_sysmem because we read the count + status
     // on the host immediately after the dispatch chain.
     const meta_bytes: vk.VkDeviceSize = WALK_META_U32_COUNT * 4;
-    result.meta = try createBuffer(
+    try decode_workspace.ensureWorkspaceBuf(
         ctx,
+        &ws.meta,
         meta_bytes,
         vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .host_visible_sysmem,
     );
+    result.meta = ws.meta.buffer;
 
     // FirstSubIdx: WALK_MAX_CHUNKS u32.
     const first_sub_bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, WALK_MAX_CHUNKS) * 4;
-    result.first_sub_idx = try createBuffer(ctx, first_sub_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
+    try decode_workspace.ensureWorkspaceBuf(ctx, &ws.first_sub_idx, first_sub_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
+    result.first_sub_idx = ws.first_sub_idx.buffer;
 
     // TotalSubs: 1 u32.
-    result.total_subs = try createBuffer(ctx, 4, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
+    try decode_workspace.ensureWorkspaceBuf(ctx, &ws.total_subs, 4, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
+    result.total_subs = ws.total_subs.buffer;
 
     // NChunks scratch: 1 u32 (for the scan kernel self-gate). Initialised
     // by a tiny vkCmdCopyBuffer from the meta buffer below — see the
     // dispatch sequence.
-    result.n_chunks_scratch = try createBuffer(
+    try decode_workspace.ensureWorkspaceBuf(
         ctx,
+        &ws.n_chunks_scratch,
         4,
         vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .device_local_only,
     );
+    result.n_chunks_scratch = ws.n_chunks_scratch.buffer;
 
     // Staged: [lit][tok][hi][lo] huff + [raw_hi][raw_lo] raw, each at
     // max_total_subchunks count. Single device buffer; the four huff
@@ -652,42 +690,48 @@ pub fn runDecodePipelineEx(
     const huff_arr_bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, max_total_subchunks) * SCANHUFF_U32_COUNT * 4;
     const raw_arr_bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, max_total_subchunks) * SCANRAW_U32_COUNT * 4;
     const staged_bytes: vk.VkDeviceSize = huff_arr_bytes * 4 + raw_arr_bytes * 2;
-    // Bind separate VkBuffers for each sub-region (descriptors need disjoint
-    // VkBuffer handles) — one device allocation with VkBuffers at different
-    // offsets would work too, but each `createBuffer` call allocates its own
-    // VkDeviceMemory anyway. Sized at the worst-case per-region count.
-    result.staged = try createBuffer(ctx, staged_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
+    try decode_workspace.ensureWorkspaceBuf(ctx, &ws.staged, staged_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
+    result.staged = ws.staged.buffer;
 
     // Compact buffers: one per stream type. Sized against worst-case
     // per-stream output counts (matches CUDA's `huff_compact_max`).
     const huff_compact_bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, max_total_subchunks) * HUFFDESC_U32_COUNT * 4;
     const raw_compact_bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, max_total_subchunks * 2) * RAWDESC_U32_COUNT * 4;
-    result.compact_lit = try createBuffer(ctx, huff_compact_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
-    result.compact_tok = try createBuffer(ctx, huff_compact_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
-    result.compact_hi = try createBuffer(ctx, huff_compact_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
-    result.compact_lo = try createBuffer(ctx, huff_compact_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
-    result.compact_raw = try createBuffer(ctx, raw_compact_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
+    try decode_workspace.ensureWorkspaceBuf(ctx, &ws.compact_lit, huff_compact_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
+    result.compact_lit = ws.compact_lit.buffer;
+    try decode_workspace.ensureWorkspaceBuf(ctx, &ws.compact_tok, huff_compact_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
+    result.compact_tok = ws.compact_tok.buffer;
+    try decode_workspace.ensureWorkspaceBuf(ctx, &ws.compact_hi, huff_compact_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
+    result.compact_hi = ws.compact_hi.buffer;
+    try decode_workspace.ensureWorkspaceBuf(ctx, &ws.compact_lo, huff_compact_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
+    result.compact_lo = ws.compact_lo.buffer;
+    try decode_workspace.ensureWorkspaceBuf(ctx, &ws.compact_raw, raw_compact_bytes, vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .device_local_only);
+    result.compact_raw = ws.compact_raw.buffer;
 
     // Compact counts: [n_lit, n_tok, n_hi, n_lo, n_raw, n_merged].
     // The 5 GLSL compact kernels each take a writeonly 1-u32 NOut SSBO;
     // we sub-bind into this 6-u32 buffer via per-binding `VkDescriptor
     // BufferInfo.offset` so all five writes land in one device alloc.
-    result.compact_counts = try createBuffer(
+    try decode_workspace.ensureWorkspaceBuf(
         ctx,
+        &ws.compact_counts,
         6 * 4,
         vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .device_local_only,
     );
+    result.compact_counts = ws.compact_counts.buffer;
 
     // Off16 entropy scratch — sized at worst-case total_subchunks slots,
     // each slot ENTROPY_SCRATCH_SLOT_BYTES wide.
     const off16_scratch_bytes: vk.VkDeviceSize = @as(vk.VkDeviceSize, max_total_subchunks) * ENTROPY_SCRATCH_SLOT_BYTES;
-    result.off16_scratch = try createBuffer(
+    try decode_workspace.ensureWorkspaceBuf(
         ctx,
+        &ws.off16_scratch,
         off16_scratch_bytes,
         vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .device_local_only,
     );
+    result.off16_scratch = ws.off16_scratch.buffer;
 
     // ── 2. Populate frame buffer from slz_bytes ──────────────────────
     if (result.frame.mapped) |m| {

@@ -42,6 +42,7 @@ const probe_mod = @import("probe.zig");
 const l1_codec = @import("l1_codec.zig");
 const wire_format_gpu = @import("wire_format_gpu.zig");
 const decode_pipeline_gpu = @import("decode_pipeline_gpu.zig");
+const decode_workspace = @import("decode_workspace.zig");
 const descriptors = @import("descriptors.zig");
 const dispatch = @import("dispatch.zig");
 const wire_constants = @import("wire_constants.zig");
@@ -544,14 +545,25 @@ pub fn decodeSlz1ToBytesEx(
     // comment): cmd/lit/off16/length/off32 byte bases + sizes,
     // initial_copy, off32 counts, cmd_stream2_offset. Device-only —
     // host never touches it.
+    //
+    // Pooled in the per-context decode workspace (`ws.chunks_16u32`)
+    // alongside the 14 pipeline-internal buffers and the 2 dst buffers
+    // below. Mirrors CUDA's `d_descs_persist` field
+    // (src/decode/decode_context.zig:207), grown lazily via
+    // `ensureDeviceBuf` at src/decode/decode_dispatch.zig:520 — same
+    // shape here. The alloc_ns timing slot reports the
+    // ensureWorkspaceBuf cost (~0 on warm calls; the first decode pays
+    // the buffer grow).
     const t_alloc_begin = qpcNow();
-    var chunks_b = try l1_codec.createBufferEx(
+    const ws = driver.getOrCreateDecodeWorkspace(ctx) catch return error.OutOfMemory;
+    try decode_workspace.ensureWorkspaceBuf(
         ctx,
+        &ws.chunks_16u32,
         @as(vk.VkDeviceSize, n_chunks) * @sizeOf(u32) * 16,
         vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .device_local_only,
     );
-    defer l1_codec.destroyBuffer(ctx, &chunks_b);
+    const chunks_b: l1_codec.Buffer = ws.chunks_16u32.buffer;
     last_decode_slz_alloc_ns = qpcNs(t_alloc_begin, qpcNow());
 
     // No per-stream allocations and no host fill: lz_decode reads
@@ -594,34 +606,50 @@ pub fn decodeSlz1ToBytesEx(
     );
     const direct_write: bool = !use_dst_override and
         l1_codec.deviceHasDeviceLocalHostCached(ctx);
+    // Both dst_b and dst_stage are pooled in the per-context workspace
+    // — mirrors CUDA's `d_output` field and pinned-host mirror
+    // (src/decode/decode_context.zig:195-201). Per-call free + realloc
+    // was the largest single contributor to the 23.7 ms alloc overhead
+    // the Nsight Systems trace flagged (dst_b is the ~95 MB
+    // DEVICE_LOCAL slot, dst_stage is the ~95 MB HOST_VISIBLE+
+    // HOST_CACHED mirror — both vkAllocateMemory calls on the same
+    // memory heap). After this change, the first decode pays both
+    // grows; subsequent calls of the same-or-smaller decompressed
+    // size are no-ops.
     var dst_b: l1_codec.Buffer = .{};
     var dst_stage: l1_codec.Buffer = .{};
     if (!use_dst_override) {
         if (direct_write) {
             // Single-buffer: dst_stage IS the kernel write target.
-            dst_stage = try l1_codec.createBufferEx(
+            try decode_workspace.ensureWorkspaceBuf(
                 ctx,
+                &ws.dst_stage,
                 dst_buf_size,
                 vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 .host_visible_sysmem,
             );
+            dst_stage = ws.dst_stage.buffer;
         } else {
-            dst_b = try l1_codec.createBufferEx(
+            try decode_workspace.ensureWorkspaceBuf(
                 ctx,
+                &ws.dst_b,
                 dst_buf_size,
                 vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 .device_local_only,
             );
-            dst_stage = try l1_codec.createBufferEx(
+            dst_b = ws.dst_b.buffer;
+            try decode_workspace.ensureWorkspaceBuf(
                 ctx,
+                &ws.dst_stage,
                 dst_buf_size,
                 vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 .host_visible_sysmem,
             );
+            dst_stage = ws.dst_stage.buffer;
         }
     }
-    defer if (!use_dst_override and !direct_write) l1_codec.destroyBuffer(ctx, &dst_b);
-    defer if (!use_dst_override) l1_codec.destroyBuffer(ctx, &dst_stage);
+    // No defer destroyBuffer — the workspace owns dst_b / dst_stage
+    // across decode calls (frees once in driver.deinit).
 
     // One-shot readback-cost diagnostic (controlled by SLZ_VK_PROFILE_DECODE=1).
     // Runs before any per-decode timing is captured so the diag work
