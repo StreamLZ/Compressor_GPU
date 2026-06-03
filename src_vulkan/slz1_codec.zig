@@ -174,15 +174,13 @@ pub fn encodeL1ToSlz1Ex(
     // GPU wrap is the ONLY path. The per-chunk LZ streams stay device-
     // resident; the host never sees them. Frame + block headers are
     // synthesized on-GPU (see wire_format_gpu.zig + shaders/frame_assemble.comp).
-    return wire_format_gpu.wrapL1ToSlz1Gpu(ctx, allocator, enc.streams, src, out) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.OutputTooSmall => return error.OutputTooSmall,
-        error.BadHeader => return error.BadHeader,
-        error.UnsupportedTier => return error.UnsupportedTier,
-        error.NoSpvForTier => return error.NoSpvForTier,
-        error.TooManyChunks => return error.TooManyChunks,
-        else => return error.OutOfMemory,
-    };
+    //
+    // `wrapL1ToSlz1Gpu` returns `GpuWrapError`; every variant in that
+    // set is already a member of `Slz1Error` (which `||`-unions the
+    // GPU-wrap shape with the rest of the codec error set), so the
+    // forwarding is implicit — no `catch` arm that mangles distinct
+    // variants into a single sentinel.
+    return try wire_format_gpu.wrapL1ToSlz1Gpu(ctx, allocator, enc.streams, src, out);
 }
 
 // ── Decode path: SLZ1 → src ──────────────────────────────────────────
@@ -549,19 +547,17 @@ pub fn decodeSlz1ToBytesEx(
             @as(u64, decode_pipeline_gpu.WALK_MAX_CHUNKS),
             (out.len / wire_constants.CHUNK_SIZE) + 2,
         ));
-    var prepared = decode_pipeline_gpu.prepareDecodePipeline(
+    // `prepareDecodePipeline` returns `PipelineError`. Every variant is
+    // already a member of `Slz1Error` (the inline error sets share the
+    // same VkResult-derived shape, and Slz1Error `||`-unions
+    // `dispatch.DispatchError` which provides all 13 cmdbuf-side
+    // variants). Direct propagation preserves the diagnostic.
+    var prepared = try decode_pipeline_gpu.prepareDecodePipeline(
         ctx,
         allocator,
         slz_bytes,
         .{ .n_chunks_hint = n_chunks_hint },
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.UnsupportedTier => return error.UnsupportedTier,
-        error.NoSpvForTier => return error.NoSpvForTier,
-        error.BadFrame => return error.BadFrame,
-        error.TooManyChunks => return error.OutOfMemory,
-        else => return error.OutOfMemory,
-    };
+    );
     const pipeline_result = prepared.result;
 
     // Worst-case sizing inputs derived from the frame size before submit.
@@ -781,14 +777,17 @@ pub fn decodeSlz1ToBytesEx(
                 // through to the existing two-buffer slow path rather
                 // than failing the decode. On error,
                 // `ensureImportedHostBuf` has already cleared the
-                // slot, so no stale cached buffer is leaked.
+                // slot, so no stale cached buffer is leaked. Only the
+                // import-shape variants degrade silently; any other
+                // variant (OOM, driver-side failure, etc.) propagates
+                // verbatim so the caller sees the real cause.
                 error.MemoryTypeNotFound,
                 error.BufferCreateFailed,
                 error.MemoryAllocateFailed,
                 error.BindBufferFailed,
                 error.MapMemoryFailed,
                 => l1_codec.Buffer{},
-                else => return error.OutOfMemory,
+                else => |e| return e,
             };
         } else if (direct_write) {
             // Single-buffer: dst_stage IS the kernel write target.
@@ -1079,7 +1078,7 @@ fn recordAndSubmitMergedDecode(
     unwrap_spec: dispatch.DispatchSpec,
     dec_spec: dispatch.DispatchSpec,
     copy: dispatch.CopyOp,
-) dispatch.DispatchError!dispatch.DispatchResult {
+) decode_pipeline_gpu.PipelineError!dispatch.DispatchResult {
     try dispatch.ensureChassisPub(ctx);
 
     const reset_cb = vk.vkResetCommandBuffer_fn orelse return error.LoaderNotReady;
@@ -1110,17 +1109,14 @@ fn recordAndSubmitMergedDecode(
     // ── Phase 1: GPU decode pipeline (frame_staging→frame DMA + walk_
     //    frame + prefix_sum + scan_parse + 4× compact_huff + compact_raw
     //    + gather_raw_off16). recordDecodePipelineInto leaves a
-    //    SHADER_WRITE→SHADER_READ barrier on COMPUTE_SHADER at its end. ─
-    decode_pipeline_gpu.recordDecodePipelineInto(ctx, ctx.cmd_buf, prepared.*) catch |err| switch (err) {
-        error.LoaderNotReady => return error.LoaderNotReady,
-        // recordDecodePipelineInto can only fail with LoaderNotReady or
-        // OutOfMemory (latter only if workspace re-init races, which
-        // can't happen here since `prepareDecodePipeline` already ran).
-        // Fold every other variant into LoaderNotReady so this function
-        // can stay in dispatch.DispatchError without leaking pipeline-
-        // specific error variants.
-        else => return error.LoaderNotReady,
-    };
+    //    SHADER_WRITE→SHADER_READ barrier on COMPUTE_SHADER at its end.
+    //
+    //    Forward every PipelineError variant verbatim — the function's
+    //    return type is widened from DispatchError to PipelineError so
+    //    LoaderNotReady, the OutOfMemory from a workspace re-init race,
+    //    and every other variant the inner function surfaces survive
+    //    the call boundary intact.
+    try decode_pipeline_gpu.recordDecodePipelineInto(ctx, ctx.cmd_buf, prepared.*);
 
     // ── Phase 2: l1_unwrap (untimed — fast, the legacy code didn't
     //    time it either when riding submitTwoWithCopy). ─

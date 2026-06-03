@@ -924,35 +924,125 @@ pub export fn slzCompressBound_vk(input_size: usize) usize {
 }
 
 // ── Error mapping helpers ─────────────────────────────────────────────
+//
+// Map distinct `Slz1Error` variants to distinct SLZ_ERROR_* codes so
+// callers can diagnose which subsystem failed. The categories follow
+// CUDA's mapping shape (`src/streamlz_gpu.zig:mapCompressError` /
+// `mapDecompressError`):
+//   * caller-shape rejected (tier floor / opt-out) → VK_FEATURE_MISSING
+//   * output buffer / chunk-count cap exceeded     → BUFFER_TOO_SMALL
+//   * frame parse / chunk-count overflow / header  → CORRUPT_FRAME
+//   * host / device memory allocation failure      → OUT_OF_MEMORY
+//   * Vulkan loader / device / dispatch failure    → DEVICE_LOST
+//   * anything else (audit on add)                 → UNSUPPORTED
+//
+// The arms below enumerate every current `Slz1Error` member explicitly
+// so a future variant added upstream silently falls through to
+// `else => SLZ_ERROR_UNSUPPORTED` only if it doesn't already match by
+// name. Both helpers share a single classifier to keep the encode /
+// decode surfaces consistent — the only difference is the
+// encode-specific `OutputTooSmall` interpretation as "the slz1Bound
+// you allocated wasn't enough", which is identical to the decode
+// interpretation ("the host out slice wasn't big enough for
+// decomp_size").
 
-fn mapEncodeError(err: slz1_codec.Slz1Error) c_int {
+fn classifySlz1Error(err: slz1_codec.Slz1Error) c_int {
     return switch (err) {
+        // Caller-shape: device/library can't run this build at all.
+        error.UnsupportedTier,
+        error.NoSpvForTier,
+        => SLZ_ERROR_VK_FEATURE_MISSING,
+
+        // Output buffer too small. `BadLevel` is an encode opt-out
+        // rather than a "this is corrupt" — surface as
+        // BUFFER_TOO_SMALL's nearest neighbour: UNSUPPORTED.
         error.OutputTooSmall => SLZ_ERROR_BUFFER_TOO_SMALL,
-        error.OutOfMemory => SLZ_ERROR_OUT_OF_MEMORY,
-        error.UnsupportedTier => SLZ_ERROR_VK_FEATURE_MISSING,
-        error.NoSpvForTier => SLZ_ERROR_VK_FEATURE_MISSING,
+        error.BadLevel => SLZ_ERROR_UNSUPPORTED,
+
+        // Frame parsing / structural overflow. `BadFrame` and
+        // `BadHeader` come from the GPU-side wire-format scanner;
+        // `TooManyChunks` is the WALK_MAX_CHUNKS guard in
+        // `prepareDecodePipeline` (decode_pipeline_gpu.zig:642) and
+        // the symmetric `slz1Bound` guard on the encode side.
+        error.BadFrame,
+        error.BadHeader,
+        error.TooManyChunks,
+        => SLZ_ERROR_CORRUPT_FRAME,
+
+        // Host or device alloc / map failure.
+        error.OutOfMemory,
+        error.BufferCreateFailed,
+        error.MemoryAllocateFailed,
+        error.MemoryTypeNotFound,
+        error.BindBufferFailed,
+        error.MapMemoryFailed,
+        => SLZ_ERROR_OUT_OF_MEMORY,
+
+        // Vulkan dispatch chassis: loader vtable missing / cmdbuf
+        // record-or-submit failure / fence-wait timeout. The CUDA
+        // backend reports these as SLZ_ERROR_CUDA; the Vulkan
+        // backend's analog is SLZ_ERROR_DEVICE_LOST. A future
+        // VK_ERROR_DEVICE_LOST coming out of the loader maps here
+        // too once the chassis surfaces it explicitly.
+        error.LoaderNotReady,
+        error.CommandPoolCreateFailed,
+        error.CommandBufferAllocateFailed,
+        error.FenceCreateFailed,
+        error.QueryPoolCreateFailed,
+        error.BeginCommandBufferFailed,
+        error.EndCommandBufferFailed,
+        error.ResetCommandBufferFailed,
+        error.ResetFenceFailed,
+        error.SubmitFailed,
+        error.FenceWaitTimeout,
+        error.FenceWaitFailed,
+        error.QueryReadFailed,
+        => SLZ_ERROR_DEVICE_LOST,
+
+        // l1_codec.L1Error variants (encode-side cmdbuf record/submit).
+        error.BeginRecordFailed,
+        error.EndRecordFailed,
+        => SLZ_ERROR_DEVICE_LOST,
+
+        // descriptors.DescriptorError variants (descriptor-pool +
+        // pipeline cache failures during shader binding).
+        error.TooManyBindings,
+        error.ShaderModuleCreateFailed,
+        error.SetLayoutCreateFailed,
+        error.PipelineLayoutCreateFailed,
+        error.PipelineCreateFailed,
+        error.DescriptorPoolCreateFailed,
+        error.DescriptorSetAllocateFailed,
+        => SLZ_ERROR_DEVICE_LOST,
+
+        // driver.DriverError surfaces (instance/device bring-up). The
+        // codec normally only reaches these if `slzCreate_vk` succeeded
+        // but a per-call `driver.ensureInit` re-entry hit a transient
+        // failure — they're effectively DEVICE_LOST class.
+        error.LoaderInitFailed,
+        error.CreateInstanceFailed,
+        error.InstanceProcMissing,
+        error.NoVulkanDevice,
+        error.NoComputeQueueFamily,
+        error.EnumerateFailed,
+        error.CreateDeviceFailed,
+        error.DeviceIndexOutOfRange,
+        error.DeviceNameNotFound,
+        error.DeviceNameAmbiguous,
+        => SLZ_ERROR_VK_FEATURE_MISSING,
+
+        // Catch-all for variants not yet enumerated. Audit when a new
+        // member is added to Slz1Error upstream.
         else => SLZ_ERROR_UNSUPPORTED,
     };
 }
 
+fn mapEncodeError(err: slz1_codec.Slz1Error) c_int {
+    return classifySlz1Error(err);
+}
+
 fn mapDecodeError(err: slz1_codec.Slz1Error) c_int {
-    return switch (err) {
-        error.OutputTooSmall => SLZ_ERROR_BUFFER_TOO_SMALL,
-        error.OutOfMemory => SLZ_ERROR_OUT_OF_MEMORY,
-        error.UnsupportedTier => SLZ_ERROR_VK_FEATURE_MISSING,
-        error.NoSpvForTier => SLZ_ERROR_VK_FEATURE_MISSING,
-        // Cluster B (F004) collapsed the decoder's CPU-unwrap error
-        // set into the two device-side failures the GPU pipeline can
-        // surface: a frame the GPU couldn't parse (`BadFrame`) and
-        // chunk-count overflow (`TooManyChunks`). The fine-grained
-        // BadMagic / UnsupportedVersion / BadCodec / etc. used to come
-        // from `wire_format.UnwrapError`, which is no longer reachable
-        // from the production decode path (the CPU unwrap was deleted
-        // in commit `146c5a6`; the toggle that fell back to it was
-        // deleted in Cluster B's F004 commit).
-        error.BadFrame, error.TooManyChunks => SLZ_ERROR_CORRUPT_FRAME,
-        else => SLZ_ERROR_UNSUPPORTED,
-    };
+    return classifySlz1Error(err);
 }
 
 /// Always returns SLZ_ERROR_UNSUPPORTED. The Vulkan backend exposes
