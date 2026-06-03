@@ -641,6 +641,32 @@ fn runBench(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: A
                     slz1_codec.last_decode_slz_caller_import_size,
                 },
             );
+            // Per-kernel GPU breakdown from the VkQueryPool timestamps
+            // written around each dispatch in recordDecodePipelineInto +
+            // recordAndSubmitMergedDecode. Format matches what the
+            // CUDA-side `nsys stats --report cuda_gpu_kern_sum` table
+            // gives for the corresponding kernels so a parity comparison
+            // can be done by eye. `lz_decode` and `dst_copy` reuse the
+            // existing `sub: gpu_kernel`/`gpu_copy` numbers above; this
+            // line covers the front-half pipeline kernels + transfers.
+            try w.print(
+                "      kper: walk={d:.3} prefix={d:.3} scan={d:.3} compact_lit={d:.3} compact_tok={d:.3} compact_hi={d:.3} compact_lo={d:.3} compact_raw={d:.3} gather={d:.3} unwrap={d:.3} frame_dma={d:.3} fills={d:.3} meta_copy={d:.3}\n",
+                .{
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_per_kernel_walk_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_per_kernel_prefix_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_per_kernel_scan_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_per_kernel_compact_lit_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_per_kernel_compact_tok_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_per_kernel_compact_hi_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_per_kernel_compact_lo_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_per_kernel_compact_raw_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_per_kernel_gather_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_per_kernel_unwrap_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_per_kernel_frame_dma_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_per_kernel_fills_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(slz1_codec.last_decode_per_kernel_meta_copy_ns)) / 1_000_000.0,
+                },
+            );
         }
     }
 
