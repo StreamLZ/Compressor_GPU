@@ -282,6 +282,7 @@ fn testVkToCuda(
     src: []const u8,
     tmp_slz: []const u8,
     tmp_out: []const u8,
+    expected_failure_byte: ?usize,
 ) !void {
     const t0 = qpcNow();
     var enc = l1_codec.encodeL1Multi(ctx, src, enc_spv) catch |err| {
@@ -353,10 +354,40 @@ fn testVkToCuda(
 
     const diff = compareBytes(src, decoded);
     if (diff.total_diffs == 0 and src.len == decoded.len) {
-        try w.print(
-            "VK_TO_CUDA_SCALE PASS {s} bytes={d} slz_bytes={d} vk_enc_ns={d} bundle_ns={d} wrap_ns={d} cuda_dec_ns={d}\n",
-            .{ label, src.len, slz_size, vk_encode_ns, bundle_ns, wrap_ns, cuda_decode_ns },
-        );
+        if (expected_failure_byte) |_| {
+            // Round-trip succeeded for a corpus that was annotated as
+            // a pre-existing failure: the underlying bug was fixed.
+            // Report as REGRESS so the operator notices and removes
+            // the expected_failure_byte slot from the corpus table.
+            try w.print(
+                "VK_TO_CUDA_SCALE REGRESS_FIXED {s} bytes={d} slz_bytes={d}\n",
+                .{ label, src.len, slz_size },
+            );
+        } else {
+            try w.print(
+                "VK_TO_CUDA_SCALE PASS {s} bytes={d} slz_bytes={d} vk_enc_ns={d} bundle_ns={d} wrap_ns={d} cuda_dec_ns={d}\n",
+                .{ label, src.len, slz_size, vk_encode_ns, bundle_ns, wrap_ns, cuda_decode_ns },
+            );
+        }
+    } else if (expected_failure_byte) |expected| {
+        // Corpus is known to fail at `expected`; assert the actual
+        // diff position is within range of it (chunk-boundary slop is
+        // SLZ_CHUNK_SIZE = 64 KiB, so allow ±1 chunk before tagging
+        // it as a NEW failure mode that needs investigation).
+        const slop: usize = 64 * 1024;
+        const lo = if (expected > slop) expected - slop else 0;
+        const hi = expected + slop;
+        if (diff.first_diff >= lo and diff.first_diff <= hi) {
+            try w.print(
+                "VK_TO_CUDA_SCALE EXPECTED_FAIL {s} bytes={d} decoded_bytes={d} first_diff={d} total_diffs={d} (within ±64KiB of expected_failure_byte={d})\n",
+                .{ label, src.len, decoded.len, diff.first_diff, diff.total_diffs, expected },
+            );
+        } else {
+            try w.print(
+                "VK_TO_CUDA_SCALE UNEXPECTED_FAIL {s} bytes={d} decoded_bytes={d} first_diff={d} total_diffs={d} (expected near byte {d} ±64KiB)\n",
+                .{ label, src.len, decoded.len, diff.first_diff, diff.total_diffs, expected },
+            );
+        }
     } else {
         try w.print(
             "VK_TO_CUDA_SCALE FAIL {s} bytes={d} decoded_bytes={d} first_diff={d} total_diffs={d}\n",
@@ -488,9 +519,21 @@ pub fn main(process_init: std.process.Init) !void {
     // L1 codec self-roundtrip (chunk 77, binary-data pattern), so the
     // VK_TO_CUDA direction is expected to FAIL on silesia for the same
     // reason — included for completeness, not as a regression gate.
-    const corpora = [_]struct { name: []const u8, path: []const u8, size: ?usize }{
-        .{ .name = "enwik8_full", .path = "assets/enwik8.txt", .size = null },
-        .{ .name = "silesia_full", .path = "assets/silesia_all.tar", .size = null },
+    // `expected_failure_byte` encodes the pre-existing failure mode
+    // for silesia (chunk 77, binary-data L1 self-roundtrip diff at
+    // byte 10,206,968 — see the file-level NOTE above). The test
+    // asserts the failure occurs at-or-after that offset (the exact
+    // byte depends on chunk-boundary parsing); if a future fix moves
+    // first_diff PAST the corpus length the case reports a real PASS
+    // and the operator should rip out this expected-failure box.
+    const corpora = [_]struct {
+        name: []const u8,
+        path: []const u8,
+        size: ?usize,
+        expected_failure_byte: ?usize,
+    }{
+        .{ .name = "enwik8_full", .path = "assets/enwik8.txt", .size = null, .expected_failure_byte = null },
+        .{ .name = "silesia_full", .path = "assets/silesia_all.tar", .size = null, .expected_failure_byte = 10_206_968 },
     };
 
     // Direction 1: VK encode -> CUDA decode.
@@ -530,7 +573,7 @@ pub fn main(process_init: std.process.Init) !void {
         var out_path_buf: [256]u8 = undefined;
         const slz_path = try std.fmt.bufPrint(&slz_path_buf, "{s}/vk_l1_scale_{s}.slz", .{ TMP_DIR, c.name });
         const out_path = try std.fmt.bufPrint(&out_path_buf, "{s}/vk_l1_scale_{s}.out", .{ TMP_DIR, c.name });
-        try testVkToCuda(w, io, allocator, ctx, enc_spv, c.name, src, slz_path, out_path);
+        try testVkToCuda(w, io, allocator, ctx, enc_spv, c.name, src, slz_path, out_path, c.expected_failure_byte);
         try w.flush();
     }
 

@@ -196,16 +196,39 @@ pub fn main(process_init: std.process.Init) !void {
             // Now drain timings.
             var timings: [8]vk_abi.KernelTimingC = undefined;
             const count = vk_abi.slzGetLastTimings_vk(handle, &timings, timings.len);
-            // The decoder writes the most-recent dispatch ns; the
-            // encoder did too. Both slots should be non-zero. (On a
-            // device that reports timestampValidBits == 0 the ns
-            // could be 0 — but every supported tier has timestamps.)
-            const passed = count >= 1 and count <= 2 and
-                timings[0].ms >= 0.0 and (count == 1 or timings[1].ms >= 0.0);
+            // After a sync compress + sync decompress, exactly TWO
+            // entries should appear ("lz_encode" then "lz_decode"
+            // per the contract in streamlz_gpu_vk.zig:1124-1126).
+            // `ms >= 0.0` was tautological — `ns` is a u64 cast to
+            // f32, never negative. Assert strict positivity instead:
+            // both kernels did real work so both ms values must be
+            // > 0. Validate the reported kernel names against the
+            // contract too; a future renaming would silently break
+            // the production telemetry without the name check.
+            const c_ok = count == 2;
+            var t0_name_ok = false;
+            var t1_name_ok = false;
+            var t0_ms_ok = false;
+            var t1_ms_ok = false;
+            if (c_ok) {
+                t0_name_ok = std.mem.eql(u8, std.mem.span(timings[0].name), "lz_encode");
+                t1_name_ok = std.mem.eql(u8, std.mem.span(timings[1].name), "lz_decode");
+                t0_ms_ok = timings[0].ms > 0.0;
+                t1_ms_ok = timings[1].ms > 0.0;
+            }
+            const passed = c_ok and t0_name_ok and t1_name_ok and t0_ms_ok and t1_ms_ok;
+            const detail: []const u8 = if (passed)
+                "ok"
+            else if (!c_ok)
+                "expected exactly 2 entries"
+            else if (!t0_name_ok or !t1_name_ok)
+                "expected names lz_encode / lz_decode"
+            else
+                "expected strictly positive ms for both kernels";
             try results.append(allocator, .{
                 .name = "get_last_timings_after_sync_pair",
                 .passed = passed,
-                .detail = if (passed) "ok" else "expected 1-2 entries with non-negative ms",
+                .detail = detail,
             });
         }
     }
