@@ -693,19 +693,32 @@ pub fn decodeSlz1ToBytesEx(
     const ext_align: u64 = ctx.external_memory_host_alignment;
     const caller_ptr_aligned: bool = ext_align > 0 and
         (@intFromPtr(out.ptr) % ext_align) == 0;
-    const import_size: vk.VkDeviceSize = if (ext_align > 0) blk_imp: {
-        const a = ext_align;
-        // Round DOWN to alignment (rather than up) so we never need
-        // padding past out.len. The dst→host copy uses the actual
-        // decomp_size (known post-fence) which is always ≤ out.len ≤
-        // import_size when import_size > 0.
-        const padded = @as(u64, dst_total_max) & ~(a - 1);
-        break :blk_imp @as(vk.VkDeviceSize, padded);
-    } else 0;
+    // S003 tail-byte fix: import_size MUST cover the GPU copy size
+    // (= dst_total_max = out.len) exactly, with no rounding gap.
+    // Mirrors pre-S003 gate semantics (padded_up(decomp_size) <= out.len)
+    // collapsed to the post-S003 worst-case-sizing reality where
+    // dst_total_max == out.len: the import region has to cover every
+    // byte the GPU copy will write, so we only take the caller-import
+    // path when out.len is itself a multiple of ext_align (no slack to
+    // pad over). Tight-sized callers (e.g. the L1 codec test with
+    // out.len = src.len, not page-padded) fall through to the two-
+    // buffer slow path, which is what the pre-S003 code also did
+    // (its gate was `padded_up(decomp_size) <= out.len`, which fails
+    // whenever out.len is exactly decomp_size and decomp_size isn't
+    // ext_align-multiple). Page-padded bench callers (cli_vk.zig:526
+    // `(src.len + 64 + 4095) & ~4095` allocation) still hit the fast
+    // path because their out.len is page-aligned.
+    const out_len_aligned: bool = ext_align > 0 and
+        (@as(u64, out.len) % ext_align) == 0;
+    const import_size: vk.VkDeviceSize = if (out_len_aligned)
+        @as(vk.VkDeviceSize, dst_total_max)
+    else
+        0;
     const use_caller_import: bool = !use_dst_override and
         dst_total_max > 0 and
         ctx.has_external_memory_host and
         caller_ptr_aligned and
+        out_len_aligned and
         import_size > 0;
 
     // Probe diagnostic globals — updated every decode call so callers
