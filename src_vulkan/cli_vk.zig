@@ -608,6 +608,22 @@ fn runBench(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: A
                     @as(f64, @floatFromInt(slz1_codec.last_decode_slz_dec_query_read_ns)) / 1_000_000.0,
                 },
             );
+            // Caller-import path telemetry — exposes the gate decision
+            // from slz1_codec so the bench reader can confirm the
+            // VK_EXT_external_memory_host fast path is actually firing
+            // (vs the two-buffer staging-copy fallback). taken=1 means
+            // the kernel wrote into dst_b and vkCmdCopyBuffer'd straight
+            // into the caller's pageable `out` buffer (no host @memcpy).
+            try w.print(
+                "      import: taken={d} has_ext={d} ptr_aligned={d} align={d} size={d}\n",
+                .{
+                    slz1_codec.last_decode_slz_caller_import_taken,
+                    slz1_codec.last_decode_slz_caller_has_ext,
+                    slz1_codec.last_decode_slz_caller_ptr_aligned,
+                    slz1_codec.last_decode_slz_caller_import_align,
+                    slz1_codec.last_decode_slz_caller_import_size,
+                },
+            );
         }
     }
 
