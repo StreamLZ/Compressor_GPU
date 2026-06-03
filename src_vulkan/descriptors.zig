@@ -192,6 +192,7 @@ fn buildPipeline(
     spv_bytes: []const u8,
     n_storage_buffers: u32,
     push_const_size: u32,
+    pipeline_cache: vk.VkPipelineCache,
 ) DescriptorError!CachedPipeline {
     if (n_storage_buffers > MAX_SSBOS) return error.TooManyBindings;
 
@@ -322,7 +323,9 @@ fn buildPipeline(
     var pipeline: vk.VkPipeline = null;
     if (create_cp(
         ctx.dev,
-        null, // pipeline cache — M7 wires this into the Context in a follow-up.
+        pipeline_cache, // S002: caller-supplied VkPipelineCache (decode
+        // path passes ctx.vk_pipeline_cache; null is accepted by the
+        // spec and means "no driver cache").
         1,
         @ptrCast(&cp_cis),
         null,
@@ -407,6 +410,26 @@ pub fn getOrCreate(
     n_storage_buffers: u32,
     push_const_size: u32,
 ) DescriptorError!CachedPipeline {
+    return getOrCreateWithPipelineCache(ctx, cache, kernel, tier, spv_bytes, n_storage_buffers, push_const_size, null);
+}
+
+/// S002 entry point: caller supplies an explicit VkPipelineCache to
+/// pass to vkCreateComputePipelines. The decode path uses this with
+/// `driver.getOrCreateVkPipelineCache(ctx)` so all 8 decode pipelines
+/// share a single driver-managed SPV→ISA cache (otherwise the first
+/// build of each pipeline pays full SPV→ISA cost). The legacy
+/// `getOrCreate` overload passes null (= no cache) for non-decode call
+/// sites that haven't been migrated.
+pub fn getOrCreateWithPipelineCache(
+    ctx: *driver_mod.Context,
+    cache: *Cache,
+    kernel: []const u8,
+    tier: probe.Tier,
+    spv_bytes: []const u8,
+    n_storage_buffers: u32,
+    push_const_size: u32,
+    pipeline_cache: vk.VkPipelineCache,
+) DescriptorError!CachedPipeline {
     if (!ctx.initialized or ctx.dev == null) return error.LoaderNotReady;
     try ensureFnSlots(ctx.dev);
 
@@ -426,7 +449,7 @@ pub fn getOrCreate(
 
     // Miss path. Build first (so on construction failure the cache stays
     // unchanged — callers can retry without observing a torn entry).
-    const built = try buildPipeline(ctx, spv_bytes, n_storage_buffers, push_const_size);
+    const built = try buildPipeline(ctx, spv_bytes, n_storage_buffers, push_const_size, pipeline_cache);
 
     // Find target slot: prefer the first empty slot; otherwise evict the
     // entry with the smallest `last_used`.

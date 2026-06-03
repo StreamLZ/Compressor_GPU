@@ -419,35 +419,40 @@ fn loadAllPipelines(
     tier_b: spv_blobs.Tier,
     allocator: std.mem.Allocator,
 ) PipelineError!Pipelines {
+    // S002: pass the process-lifetime VkPipelineCache so the driver
+    // can dedupe SPV→ISA work across the 6 pipelines built here
+    // (and the 2 more built by slz1_codec — they share the cache).
+    const vk_pl_cache = driver.getOrCreateVkPipelineCache(ctx);
+
     const walk_spv_raw = spv_blobs.find("walk_frame", tier_b) orelse return error.NoSpvForTier;
     const walk_spv = try dupAlignedSpv(allocator, walk_spv_raw);
     defer allocator.free(walk_spv);
-    const walk = try descriptors.getOrCreate(ctx, cache, "walk_frame", tier, walk_spv, 3, @sizeOf(WalkPush));
+    const walk = try descriptors.getOrCreateWithPipelineCache(ctx, cache, "walk_frame", tier, walk_spv, 3, @sizeOf(WalkPush), vk_pl_cache);
 
     const prefix_spv_raw = spv_blobs.find("prefix_sum_chunks", tier_b) orelse return error.NoSpvForTier;
     const prefix_spv = try dupAlignedSpv(allocator, prefix_spv_raw);
     defer allocator.free(prefix_spv);
-    const prefix = try descriptors.getOrCreate(ctx, cache, "prefix_sum_chunks", tier, prefix_spv, 3, @sizeOf(PrefixPush));
+    const prefix = try descriptors.getOrCreateWithPipelineCache(ctx, cache, "prefix_sum_chunks", tier, prefix_spv, 3, @sizeOf(PrefixPush), vk_pl_cache);
 
     const scan_spv_raw = spv_blobs.find("scan_parse", tier_b) orelse return error.NoSpvForTier;
     const scan_spv = try dupAlignedSpv(allocator, scan_spv_raw);
     defer allocator.free(scan_spv);
-    const scan = try descriptors.getOrCreate(ctx, cache, "scan_parse", tier, scan_spv, 10, @sizeOf(ScanPush));
+    const scan = try descriptors.getOrCreateWithPipelineCache(ctx, cache, "scan_parse", tier, scan_spv, 10, @sizeOf(ScanPush), vk_pl_cache);
 
     const compact_huff_spv_raw = spv_blobs.find("compact_huff_descs", tier_b) orelse return error.NoSpvForTier;
     const compact_huff_spv = try dupAlignedSpv(allocator, compact_huff_spv_raw);
     defer allocator.free(compact_huff_spv);
-    const compact_huff = try descriptors.getOrCreate(ctx, cache, "compact_huff_descs", tier, compact_huff_spv, 4, 0);
+    const compact_huff = try descriptors.getOrCreateWithPipelineCache(ctx, cache, "compact_huff_descs", tier, compact_huff_spv, 4, 0, vk_pl_cache);
 
     const compact_raw_spv_raw = spv_blobs.find("compact_raw_descs", tier_b) orelse return error.NoSpvForTier;
     const compact_raw_spv = try dupAlignedSpv(allocator, compact_raw_spv_raw);
     defer allocator.free(compact_raw_spv);
-    const compact_raw = try descriptors.getOrCreate(ctx, cache, "compact_raw_descs", tier, compact_raw_spv, 5, 0);
+    const compact_raw = try descriptors.getOrCreateWithPipelineCache(ctx, cache, "compact_raw_descs", tier, compact_raw_spv, 5, 0, vk_pl_cache);
 
     const gather_spv_raw = spv_blobs.find("gather_raw_off16", tier_b) orelse return error.NoSpvForTier;
     const gather_spv = try dupAlignedSpv(allocator, gather_spv_raw);
     defer allocator.free(gather_spv);
-    const gather = try descriptors.getOrCreate(ctx, cache, "gather_raw_off16", tier, gather_spv, 4, @sizeOf(GatherPush));
+    const gather = try descriptors.getOrCreateWithPipelineCache(ctx, cache, "gather_raw_off16", tier, gather_spv, 4, @sizeOf(GatherPush), vk_pl_cache);
 
     return .{
         .walk = walk,

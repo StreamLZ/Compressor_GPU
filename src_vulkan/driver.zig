@@ -91,6 +91,24 @@ pub const Context = struct {
     // under the heap-allocation threshold the workspace uses).
     decode_pipeline_cache: descriptors_mod.Cache = .{},
     decode_pipeline_cache_initialized: bool = false,
+
+    // ── S002: process-lifetime VkPipelineCache.
+    // The driver-managed pipeline cache lets vkCreateComputePipelines
+    // dedupe SPIR-V → ISA compilation work across the 8 decode
+    // pipelines we build at process init (l1_unwrap + lz_decode +
+    // walk_frame + prefix_sum_chunks + scan_parse + compact_huff_descs
+    // + compact_raw_descs + gather_raw_off16). Passing a real cache
+    // handle instead of null is what the audit's S002 calls out —
+    // previously `descriptors.zig:323` passed null, so every build
+    // recompiled from scratch even though several pipelines share
+    // SPV preamble bytes.
+    //
+    // Disk persistence (loadOrCreate/save in pipeline_cache.zig)
+    // requires a std.Io handle that driver.deinit doesn't have
+    // visibility into in the current shape; the in-process cache
+    // alone still produces a measurable warm-up improvement and is
+    // strictly a strict subset of the disk-backed behavior.
+    vk_pipeline_cache: vk.VkPipelineCache = null,
 };
 
 pub var g_default: Context = .{};
@@ -208,6 +226,53 @@ pub fn getOrCreateDecodePipelineCache(ctx: *Context) *descriptors_mod.Cache {
     return &ctx.decode_pipeline_cache;
 }
 
+/// S002: Lazily create a process-lifetime VkPipelineCache. Returns
+/// the existing handle on subsequent calls. Returns null if creation
+/// fails (the caller falls back to passing null to
+/// vkCreateComputePipelines — same behavior as before this hook
+/// landed).
+///
+/// Mirrors the CUDA PTX-cache behavior (CUDA's cuModuleLoadData
+/// internally caches compiled module bytes via the driver's
+/// $LOCALAPPDATA cache); the Vulkan equivalent is an application-
+/// managed VkPipelineCache passed to every vkCreateComputePipelines.
+pub fn getOrCreateVkPipelineCache(ctx: *Context) vk.VkPipelineCache {
+    if (ctx.vk_pipeline_cache != null) return ctx.vk_pipeline_cache;
+    if (ctx.dev == null) return null;
+    // Lazy-resolve the create/destroy entry points (device.zig only
+    // refines a couple of slots itself; the rest of the codebase
+    // lazy-resolves at first use).
+    if (vk.vkCreatePipelineCache_fn == null) {
+        if (vk.vkGetDeviceProcAddr_fn) |gdpa| {
+            if (gdpa(ctx.dev, "vkCreatePipelineCache")) |raw| {
+                vk.vkCreatePipelineCache_fn = @ptrCast(@alignCast(raw));
+            }
+        }
+    }
+    if (vk.vkDestroyPipelineCache_fn == null) {
+        if (vk.vkGetDeviceProcAddr_fn) |gdpa| {
+            if (gdpa(ctx.dev, "vkDestroyPipelineCache")) |raw| {
+                vk.vkDestroyPipelineCache_fn = @ptrCast(@alignCast(raw));
+            }
+        }
+    }
+    const create_fn = vk.vkCreatePipelineCache_fn orelse return null;
+    // Empty seed — no initialDataSize. A future patch can read the
+    // disk-backed blob via pipeline_cache.loadOrCreate (requires a
+    // std.Io handle plumbed into Context). The empty-seed shape still
+    // lets the driver dedupe SPV→ISA work across the 8 pipelines
+    // built in the same process run.
+    const ci: vk.VkPipelineCacheCreateInfo = .{
+        .flags = 0,
+        .initialDataSize = 0,
+        .pInitialData = null,
+    };
+    var cache: vk.VkPipelineCache = null;
+    if (create_fn(ctx.dev, &ci, null, &cache) != vk.VK_SUCCESS) return null;
+    ctx.vk_pipeline_cache = cache;
+    return cache;
+}
+
 pub fn deinit() void {
     if (!g_default.initialized) return;
     // Decode workspace teardown BEFORE destroyDevice — every VkBuffer +
@@ -227,6 +292,15 @@ pub fn deinit() void {
     if (g_default.decode_pipeline_cache_initialized) {
         descriptors_mod.invalidateAll(&g_default, &g_default.decode_pipeline_cache);
         g_default.decode_pipeline_cache_initialized = false;
+    }
+    // S002: VkPipelineCache teardown BEFORE destroyDevice — the cache
+    // is a device-owned object and must outlive every VkPipeline
+    // built against it (which invalidateAll above just destroyed).
+    if (g_default.vk_pipeline_cache != null) {
+        if (vk.vkDestroyPipelineCache_fn) |destroy_fn| {
+            destroy_fn(g_default.dev, g_default.vk_pipeline_cache, null);
+        }
+        g_default.vk_pipeline_cache = null;
     }
     // M8a chassis teardown must happen BEFORE destroyDevice — command
     // pools, fences, and query pools are device-owned and the spec

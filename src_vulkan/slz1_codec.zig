@@ -685,7 +685,8 @@ pub fn decodeSlz1ToBytesEx(
     const t_descset_begin = qpcNow();
     const cache = driver.getOrCreateDecodePipelineCache(ctx);
 
-    const cached_unwrap = try descriptors.getOrCreate(
+    const vk_pl_cache = driver.getOrCreateVkPipelineCache(ctx);
+    const cached_unwrap = try descriptors.getOrCreateWithPipelineCache(
         ctx,
         cache,
         "l1_unwrap",
@@ -693,6 +694,7 @@ pub fn decodeSlz1ToBytesEx(
         unwrap_spv,
         4,
         @sizeOf(UnwrapPush),
+        vk_pl_cache,
     );
 
     const unwrap_bindings: [4]vk.VkDescriptorBufferInfo = .{
@@ -703,7 +705,7 @@ pub fn decodeSlz1ToBytesEx(
     };
     const unwrap_set = try descriptors.allocSet(ctx, cached_unwrap, unwrap_bindings[0..]);
 
-    const cached_dec = try descriptors.getOrCreate(
+    const cached_dec = try descriptors.getOrCreateWithPipelineCache(
         ctx,
         cache,
         "lz_decode",
@@ -711,6 +713,7 @@ pub fn decodeSlz1ToBytesEx(
         dec_spv,
         8,
         @sizeOf(DecodePush),
+        vk_pl_cache,
     );
 
     // lz_decode bindings 0..3 (cmd/lit/off16/length) and 6 (off32) all
