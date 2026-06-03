@@ -95,6 +95,17 @@ pub const DecodeWorkspace = struct {
     /// CUDA's `d_comp_persist` (decode_context.zig:205). CUDA pools this
     /// per decode_dispatch.zig:519 — same shape here.
     frame: Slot = .{},
+    /// S007: host-visible staging buffer the host @memcpy's compressed
+    /// bytes into. A vkCmdCopyBuffer recorded at the top of the decode
+    /// command buffer copies staging→frame via the GPU's DMA/copy
+    /// engine. Splits the upload so the host write lands in sysmem
+    /// (~15 GB/s on this dev box) rather than the BAR window (~3 GB/s
+    /// on NVIDIA discrete without rebar), and the device-side compute
+    /// reads from VRAM-resident `frame`. Mirrors CUDA's
+    /// `procs.h2d(d_comp_persist, src, ...)` at
+    /// src/decode/decode_dispatch.zig:570 which uses cudaMemcpyAsync
+    /// (DMA engine) from pinned host into the device pool.
+    frame_staging: Slot = .{},
     /// walk_frame's per-chunk SlzChunkDesc output. Mirrors CUDA's
     /// `d_walk_chunks` (decode_context.zig:242).
     chunks: Slot = .{},

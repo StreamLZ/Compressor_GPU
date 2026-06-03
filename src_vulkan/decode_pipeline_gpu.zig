@@ -634,19 +634,33 @@ pub fn runDecodePipelineEx(
     // smaller size are pure no-ops — no vkAllocateMemory / vkFreeMemory
     // traffic at all on the steady-state path.
 
-    // Frame: u32-packed compressed SLZ1 bytes. host_visible_prefer_
-    // device_local so the host fill below stays cheap on both NVIDIA
-    // (rebar) and Intel iGPU (shared heap). CUDA pools the input buffer
-    // identically at src/decode/decode_dispatch.zig:519.
+    // S007: Frame = device-local-only storage buffer (no host visibility);
+    // a sibling host_visible_sysmem `frame_staging` buffer takes the
+    // host @memcpy and a vkCmdCopyBuffer at the top of the command
+    // buffer DMA-copies staging → frame. This avoids the slow BAR
+    // window writes (~3 GB/s on NVIDIA discrete without rebar) the
+    // previous host_visible_prefer_device_local placement paid for the
+    // 58 MB compressed enwik8 input. Mirrors CUDA's
+    // `procs.h2d(d_comp_persist, src, ...)` at
+    // src/decode/decode_dispatch.zig:570 (cudaMemcpyAsync from pinned
+    // host into the device-resident input pool — uses the copy engine,
+    // not a CPU-side BAR write).
     const frame_bytes: vk.VkDeviceSize = @intCast((slz_bytes.len + 3) & ~@as(usize, 3));
     try decode_workspace.ensureWorkspaceBuf(
         ctx,
         &ws.frame,
         @max(frame_bytes, 4),
-        vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        .host_visible_prefer_device_local,
+        vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .device_local_only,
     );
     result.frame = ws.frame.buffer;
+    try decode_workspace.ensureWorkspaceBuf(
+        ctx,
+        &ws.frame_staging,
+        @max(frame_bytes, 4),
+        vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .host_visible_sysmem,
+    );
 
     // Chunks: WALK_MAX_CHUNKS * 6 u32 (walk_frame is unconditionally
     // sized at WALK_MAX_CHUNKS because the kernel's max_chunks bound
@@ -738,8 +752,10 @@ pub fn runDecodePipelineEx(
     );
     result.off16_scratch = ws.off16_scratch.buffer;
 
-    // ── 2. Populate frame buffer from slz_bytes ──────────────────────
-    if (result.frame.mapped) |m| {
+    // ── 2. Populate frame STAGING from slz_bytes (sysmem write, full
+    //    host bandwidth). A vkCmdCopyBuffer recorded below DMAs
+    //    staging → frame at GPU copy-engine speed. ──────────────────
+    if (ws.frame_staging.buffer.mapped) |m| {
         @memcpy(m[0..slz_bytes.len], slz_bytes);
         // Pad to 4-byte alignment of frame_buf.w[]; bytes past
         // slz_bytes.len are never read (walk_frame guards against
@@ -882,6 +898,26 @@ pub fn runDecodePipelineEx(
         .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
     if (begin_cb(ctx.cmd_buf, &begin_info) != vk.VK_SUCCESS) return error.BeginCommandBufferFailed;
+
+    // S007: DMA-copy compressed input from the sysmem staging buffer
+    // to the device-local frame buffer via the GPU copy engine. The
+    // host @memcpy above already filled the staging buffer at
+    // sysmem-bandwidth (~15 GB/s); the GPU copy runs on the dedicated
+    // transfer pipeline (or compute queue's copy capability when no
+    // dedicated transfer queue is requested — S009 follow-up). Mirrors
+    // CUDA's cudaMemcpyAsync(d_comp_persist, src, ..., HtoD) at
+    // src/decode/decode_dispatch.zig:570 which uses the same DMA path.
+    {
+        const region: vk.VkBufferCopy = .{
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = frame_bytes,
+        };
+        const regions: [1]vk.VkBufferCopy = .{region};
+        beginLabel(ctx.cmd_buf, "frame_staging->frame (S007)");
+        cmd_copy(ctx.cmd_buf, ws.frame_staging.buffer.buf, result.frame.buf, 1, @ptrCast(&regions));
+        endLabel(ctx.cmd_buf, "frame_staging->frame (S007)");
+    }
 
     // 0. Zero-clear the chunks + total_subs buffers via vkCmdFillBuffer.
     //    walk_frame only writes the first n_chunks slots of `chunks`;
