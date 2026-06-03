@@ -46,7 +46,26 @@ pub fn createInstance(want_validation: bool) InstanceError!vk.VkInstance {
 
     const create_fn = vk.vkCreateInstance_fn orelse return error.LoaderNotReady;
 
+    // VK_EXT_debug_utils — pure-instrumentation extension that exposes the
+    // vkCmd{Begin,End}DebugUtilsLabelEXT entry points dispatch.zig wraps
+    // around recorded compute dispatches / buffer copies. Nsight Systems'
+    // Vulkan trace and RenderDoc both consume these labels to attribute
+    // per-kernel GPU intervals in their UI (without labels, Nsight reports
+    // anonymous "vkCmdDispatch" entries that aren't useful for the per-
+    // kernel breakdown the host-side profiling workflow needs).
+    //
+    // We attempt the create-instance call with the extension requested
+    // first; if the loader/driver rejects with VK_ERROR_EXTENSION_NOT_
+    // PRESENT (clean box without the Vulkan SDK installed) we retry
+    // without it. The dispatch.zig label call sites null-check the
+    // function-pointer slots before invoking, so missing extension is a
+    // silent no-op on the production path.
+    var ext_names_storage: [1][*:0]const u8 = .{vk.VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
+
     // Try 1.3 first, fall back to 1.2 on VK_ERROR_INCOMPATIBLE_DRIVER.
+    // For each API version we first try WITH the debug_utils extension;
+    // if that fails with EXTENSION_NOT_PRESENT we retry without it. Any
+    // other failure exits the retry loop (e.g. host OOM, layer missing).
     const try_versions = [_]u32{ vk.VK_API_VERSION_1_3, vk.VK_API_VERSION_1_2 };
     var inst: vk.VkInstance = null;
 
@@ -58,14 +77,26 @@ pub fn createInstance(want_validation: bool) InstanceError!vk.VkInstance {
             .engineVersion = vk.VK_MAKE_API_VERSION(0, 0, 1, 0),
             .apiVersion = api_ver,
         };
-        const create_info: vk.VkInstanceCreateInfo = .{
+        // Attempt #1 — request VK_EXT_debug_utils.
+        const create_info_with_ext: vk.VkInstanceCreateInfo = .{
             .pApplicationInfo = &app_info,
             .enabledLayerCount = layer_count,
             .ppEnabledLayerNames = layer_ptr,
-            .enabledExtensionCount = 0,
-            .ppEnabledExtensionNames = null,
+            .enabledExtensionCount = 1,
+            .ppEnabledExtensionNames = @ptrCast(&ext_names_storage),
         };
-        const r = create_fn(&create_info, null, &inst);
+        var r = create_fn(&create_info_with_ext, null, &inst);
+        if (r == vk.VK_ERROR_EXTENSION_NOT_PRESENT) {
+            // Retry without the extension — instrumentation is best-effort.
+            const create_info_no_ext: vk.VkInstanceCreateInfo = .{
+                .pApplicationInfo = &app_info,
+                .enabledLayerCount = layer_count,
+                .ppEnabledLayerNames = layer_ptr,
+                .enabledExtensionCount = 0,
+                .ppEnabledExtensionNames = null,
+            };
+            r = create_fn(&create_info_no_ext, null, &inst);
+        }
         if (r == vk.VK_SUCCESS) {
             try resolveInstanceLevel(inst);
             return inst;

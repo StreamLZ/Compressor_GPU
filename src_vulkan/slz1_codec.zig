@@ -746,7 +746,7 @@ pub fn decodeSlz1ToBytesEx(
     // matching CUDA src/decode/lz_decode_kernels.cuh:47.
     const WARPS_PER_BLOCK: u32 = 2;
     const lz_grid_x: u32 = (n_chunks + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-    const dec_dispatch_result = try dispatch.submitTwoWithCopy(
+    const dec_dispatch_result = try dispatch.submitTwoWithCopyLabeled(
         ctx,
         .{
             .pipeline = cached_unwrap.pipeline,
@@ -754,6 +754,7 @@ pub fn decodeSlz1ToBytesEx(
             .descriptor_set = unwrap_set,
             .push_constants_bytes = unwrap_push_bytes[0..],
             .group_count = .{ n_chunks, 1, 1 },
+            .label = "l1_unwrap",
         },
         .{
             .pipeline = cached_dec.pipeline,
@@ -761,6 +762,7 @@ pub fn decodeSlz1ToBytesEx(
             .descriptor_set = dec_set,
             .push_constants_bytes = dec_push_bytes[0..],
             .group_count = .{ lz_grid_x, 1, 1 },
+            .label = "lz_decode",
         },
         // Inter-dispatch barrier on the chunks buffer that l1_unwrap
         // writes (binding 3 in its set) and lz_decode reads (binding 5
@@ -776,6 +778,7 @@ pub fn decodeSlz1ToBytesEx(
             .dst = copy_dst,
             .size = copy_size,
         },
+        "dst_b->dst_stage",
     );
     last_decode_slz_dispatch_ns = qpcNs(t_dispatch_begin, qpcNow());
 

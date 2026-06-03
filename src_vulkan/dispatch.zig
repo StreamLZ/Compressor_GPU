@@ -199,6 +199,51 @@ fn ensureFnSlots(dev: vk.VkDevice) DispatchError!void {
         vk.vkCmdCopyBuffer_fn = resolveDeviceFn(vk.FnCmdCopyBuffer, dev, "vkCmdCopyBuffer");
     if (vk.vkCmdPipelineBarrier_fn == null)
         vk.vkCmdPipelineBarrier_fn = resolveDeviceFn(vk.FnCmdPipelineBarrier, dev, "vkCmdPipelineBarrier");
+
+    // VK_EXT_debug_utils label entry points — pure instrumentation. Slots
+    // stay null on devices/loaders without the extension; the label-emit
+    // helper below null-checks and silently no-ops. Resolved here (lazy
+    // on first dispatch) so we don't pay the GetDeviceProcAddr cost
+    // before the first decode/encode runs.
+    if (vk.vkCmdBeginDebugUtilsLabelEXT_fn == null)
+        vk.vkCmdBeginDebugUtilsLabelEXT_fn = resolveDeviceFn(vk.FnCmdBeginDebugUtilsLabelEXT, dev, "vkCmdBeginDebugUtilsLabelEXT");
+    if (vk.vkCmdEndDebugUtilsLabelEXT_fn == null)
+        vk.vkCmdEndDebugUtilsLabelEXT_fn = resolveDeviceFn(vk.FnCmdEndDebugUtilsLabelEXT, dev, "vkCmdEndDebugUtilsLabelEXT");
+}
+
+// ── VK_EXT_debug_utils label helpers ─────────────────────────────
+// `beginLabel` / `endLabel` wrap the cmd-buffer label entry points
+// with a null-check (silent no-op when the extension was not loaded).
+// All four submit* helpers below call these around the recorded
+// `vkCmdDispatch` (and `vkCmdCopyBuffer` for the staging copy) so
+// Nsight Systems' Vulkan trace can attribute per-kernel GPU intervals
+// to a human-readable name like "lz_decode" / "dst_b->dst_stage".
+//
+// `name` is a non-null-terminated slice; we copy it into a fixed
+// stack buffer + zero-terminator so the Vulkan call sees a [*:0]
+// without needing the caller to provide a sentinel-terminated string.
+// 64-byte cap covers every label we emit ("prefix_sum_chunks" at 17
+// bytes is the longest); longer names are truncated.
+inline fn beginLabel(cmd_buf: vk.VkCommandBuffer, name: ?[]const u8) void {
+    const fn_ptr = vk.vkCmdBeginDebugUtilsLabelEXT_fn orelse return;
+    const n = name orelse return;
+    if (n.len == 0) return;
+    var buf: [64]u8 = @splat(0);
+    const cap: usize = @min(n.len, buf.len - 1);
+    @memcpy(buf[0..cap], n[0..cap]);
+    buf[cap] = 0;
+    const info: vk.VkDebugUtilsLabelEXT = .{
+        .pLabelName = @ptrCast(&buf[0]),
+        .color = .{ 0, 0, 0, 0 },
+    };
+    fn_ptr(cmd_buf, &info);
+}
+
+inline fn endLabel(cmd_buf: vk.VkCommandBuffer, name: ?[]const u8) void {
+    const fn_ptr = vk.vkCmdEndDebugUtilsLabelEXT_fn orelse return;
+    const n = name orelse return;
+    if (n.len == 0) return;
+    fn_ptr(cmd_buf);
 }
 
 /// Lazy-create the chassis state on `ctx` if not already present. Safe
@@ -361,6 +406,24 @@ pub fn submitOne(
     push_constants_bytes: []const u8,
     group_count: [3]u32,
 ) DispatchError!DispatchResult {
+    return submitOneLabeled(ctx, pipeline, pipeline_layout, descriptor_set, push_constants_bytes, group_count, null);
+}
+
+/// Same as `submitOne` but emits a `VK_EXT_debug_utils` label region
+/// around the recorded `vkCmdDispatch`. `label` is a non-null-terminated
+/// slice (the helper null-terminates into a stack buffer); pass `null`
+/// for no label (silent no-op when the extension is absent). Nsight
+/// Systems' Vulkan trace picks up the label and attributes the GPU-side
+/// kernel time to the human-readable name in vulkan_gpu_marker_sum.
+pub fn submitOneLabeled(
+    ctx: *driver_mod.Context,
+    pipeline: vk.VkPipeline,
+    pipeline_layout: vk.VkPipelineLayout,
+    descriptor_set: vk.VkDescriptorSet,
+    push_constants_bytes: []const u8,
+    group_count: [3]u32,
+    label: ?[]const u8,
+) DispatchError!DispatchResult {
     if (!ctx.initialized or ctx.dev == null or ctx.queue == null) {
         return error.LoaderNotReady;
     }
@@ -439,7 +502,9 @@ pub fn submitOne(
         );
     }
 
+    beginLabel(ctx.cmd_buf, label);
     cmd_dispatch(ctx.cmd_buf, group_count[0], group_count[1], group_count[2]);
+    endLabel(ctx.cmd_buf, label);
 
     cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, TS_SLOT_END);
 
@@ -556,6 +621,25 @@ pub fn submitOneWithCopy(
     group_count: [3]u32,
     copy: CopyOp,
 ) DispatchError!DispatchResult {
+    return submitOneWithCopyLabeled(ctx, pipeline, pipeline_layout, descriptor_set, push_constants_bytes, group_count, copy, null, null);
+}
+
+/// Same as `submitOneWithCopy` but emits `VK_EXT_debug_utils` label
+/// regions around the recorded `vkCmdDispatch` (named by
+/// `dispatch_label`) and `vkCmdCopyBuffer` (named by `copy_label`).
+/// Pass `null` for either to skip the corresponding label (silent
+/// no-op when the extension is absent).
+pub fn submitOneWithCopyLabeled(
+    ctx: *driver_mod.Context,
+    pipeline: vk.VkPipeline,
+    pipeline_layout: vk.VkPipelineLayout,
+    descriptor_set: vk.VkDescriptorSet,
+    push_constants_bytes: []const u8,
+    group_count: [3]u32,
+    copy: CopyOp,
+    dispatch_label: ?[]const u8,
+    copy_label: ?[]const u8,
+) DispatchError!DispatchResult {
     if (!ctx.initialized or ctx.dev == null or ctx.queue == null) {
         return error.LoaderNotReady;
     }
@@ -618,7 +702,9 @@ pub fn submitOneWithCopy(
         );
     }
 
+    beginLabel(ctx.cmd_buf, dispatch_label);
     cmd_dispatch(ctx.cmd_buf, group_count[0], group_count[1], group_count[2]);
+    endLabel(ctx.cmd_buf, dispatch_label);
 
     // BOTTOM_OF_PIPE timestamp captures pure kernel time — the copy
     // below is bracketed by its own COPY_BEGIN/COPY_END timestamp pair
@@ -668,7 +754,9 @@ pub fn submitOneWithCopy(
         .size = copy.size,
     };
     const regions: [1]vk.VkBufferCopy = .{region};
+    beginLabel(ctx.cmd_buf, copy_label);
     cmd_copy(ctx.cmd_buf, copy.src, copy.dst, 1, @ptrCast(&regions));
+    endLabel(ctx.cmd_buf, copy_label);
 
     cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, TS_SLOT_COPY_END);
 
@@ -743,13 +831,17 @@ pub fn submitOneWithCopy(
 
 /// Description of one compute dispatch within a multi-dispatch command
 /// buffer. `descriptor_set == null` skips the bind; `push_constants_bytes
-/// .len == 0` skips the push.
+/// .len == 0` skips the push. `label` (when non-null) is the
+/// `VK_EXT_debug_utils` region name emitted around the recorded
+/// `vkCmdDispatch`; pass `null` for no label (silent no-op when the
+/// extension is absent).
 pub const DispatchSpec = struct {
     pipeline: vk.VkPipeline,
     pipeline_layout: vk.VkPipelineLayout,
     descriptor_set: vk.VkDescriptorSet,
     push_constants_bytes: []const u8,
     group_count: [3]u32,
+    label: ?[]const u8 = null,
 };
 
 /// Two-dispatch + buffer-copy in a single command buffer + single submit.
@@ -791,6 +883,23 @@ pub fn submitTwoWithCopy(
     inter_barrier_buf: vk.VkBuffer,
     inter_barrier_size: vk.VkDeviceSize,
     copy: CopyOp,
+) DispatchError!DispatchResult {
+    return submitTwoWithCopyLabeled(ctx, first, second, inter_barrier_buf, inter_barrier_size, copy, null);
+}
+
+/// Same as `submitTwoWithCopy` but takes an additional `copy_label`
+/// for the trailing `vkCmdCopyBuffer`. The per-dispatch labels come
+/// from `first.label` / `second.label` (DispatchSpec fields). All
+/// labels are `VK_EXT_debug_utils` regions; `null` skips the
+/// corresponding emit (silent no-op when the extension is absent).
+pub fn submitTwoWithCopyLabeled(
+    ctx: *driver_mod.Context,
+    first: DispatchSpec,
+    second: DispatchSpec,
+    inter_barrier_buf: vk.VkBuffer,
+    inter_barrier_size: vk.VkDeviceSize,
+    copy: CopyOp,
+    copy_label: ?[]const u8,
 ) DispatchError!DispatchResult {
     if (!ctx.initialized or ctx.dev == null or ctx.queue == null) {
         return error.LoaderNotReady;
@@ -851,7 +960,9 @@ pub fn submitTwoWithCopy(
             @ptrCast(first.push_constants_bytes.ptr),
         );
     }
+    beginLabel(ctx.cmd_buf, first.label);
     cmd_dispatch(ctx.cmd_buf, first.group_count[0], first.group_count[1], first.group_count[2]);
+    endLabel(ctx.cmd_buf, first.label);
 
     // ── Inter-dispatch barrier (compute write → compute read) ──
     // The first dispatch writes `inter_barrier_buf`; the second reads
@@ -910,7 +1021,9 @@ pub fn submitTwoWithCopy(
             @ptrCast(second.push_constants_bytes.ptr),
         );
     }
+    beginLabel(ctx.cmd_buf, second.label);
     cmd_dispatch(ctx.cmd_buf, second.group_count[0], second.group_count[1], second.group_count[2]);
+    endLabel(ctx.cmd_buf, second.label);
     cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, TS_SLOT_END);
 
     // ── Compute → Transfer barrier + vkCmdCopyBuffer (skipped when
@@ -953,7 +1066,9 @@ pub fn submitTwoWithCopy(
             .size = copy.size,
         };
         const regions: [1]vk.VkBufferCopy = .{region};
+        beginLabel(ctx.cmd_buf, copy_label);
         cmd_copy(ctx.cmd_buf, copy.src, copy.dst, 1, @ptrCast(&regions));
+        endLabel(ctx.cmd_buf, copy_label);
     }
     cmd_write_ts(ctx.cmd_buf, vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.query_pool, TS_SLOT_COPY_END);
 

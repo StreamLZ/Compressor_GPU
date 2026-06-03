@@ -451,6 +451,40 @@ fn loadAllPipelines(
     };
 }
 
+// ── VK_EXT_debug_utils label helpers ─────────────────────────────────
+//
+// `beginLabel` / `endLabel` wrap `vkCmd{Begin,End}DebugUtilsLabelEXT`
+// with a null-check (silent no-op when the extension was not loaded,
+// e.g. on a clean box without the Vulkan SDK installed). All five
+// inline `cmd_dispatch` calls below are wrapped so Nsight Systems'
+// Vulkan trace can attribute the per-kernel GPU intervals in the
+// vulkan_gpu_marker_sum report.
+//
+// 64-byte stack buffer caps the label length (longest emitted here
+// is "prefix_sum_chunks" at 17 bytes; "compact_huff_*" at 14 bytes).
+// dispatch.zig has the same helper for its submit* wrappers; the
+// duplicate here exists because runDecodePipelineEx records the
+// cmdbuf inline rather than going through dispatch.submitOne.
+inline fn beginLabel(cmd_buf: vk.VkCommandBuffer, name: []const u8) void {
+    const fn_ptr = vk.vkCmdBeginDebugUtilsLabelEXT_fn orelse return;
+    if (name.len == 0) return;
+    var buf: [64]u8 = @splat(0);
+    const cap: usize = @min(name.len, buf.len - 1);
+    @memcpy(buf[0..cap], name[0..cap]);
+    buf[cap] = 0;
+    const info: vk.VkDebugUtilsLabelEXT = .{
+        .pLabelName = @ptrCast(&buf[0]),
+        .color = .{ 0, 0, 0, 0 },
+    };
+    fn_ptr(cmd_buf, &info);
+}
+
+inline fn endLabel(cmd_buf: vk.VkCommandBuffer, name: []const u8) void {
+    const fn_ptr = vk.vkCmdEndDebugUtilsLabelEXT_fn orelse return;
+    if (name.len == 0) return;
+    fn_ptr(cmd_buf);
+}
+
 // ── Inter-dispatch barrier ───────────────────────────────────────────
 //
 // All five logical fences (Barriers A..E in the Phase-1 plan) use the
@@ -872,7 +906,9 @@ pub fn runDecodePipelineEx(
             @intCast(push_bytes.len),
             @ptrCast(&push_bytes),
         );
+        beginLabel(ctx.cmd_buf, "walk_frame");
         cmd_dispatch(ctx.cmd_buf, 1, 1, 1);
+        endLabel(ctx.cmd_buf, "walk_frame");
     }
 
     // BARRIER A — walk_frame writes → prefix_sum_chunks reads.
@@ -958,7 +994,9 @@ pub fn runDecodePipelineEx(
             @intCast(push_bytes.len),
             @ptrCast(&push_bytes),
         );
+        beginLabel(ctx.cmd_buf, "prefix_sum_chunks");
         cmd_dispatch(ctx.cmd_buf, 1, 1, 1);
+        endLabel(ctx.cmd_buf, "prefix_sum_chunks");
     }
 
     // BARRIER B — prefix_sum writes → scan_parse reads.
@@ -975,7 +1013,9 @@ pub fn runDecodePipelineEx(
             .size = 4,
         };
         const regions: [1]vk.VkBufferCopy = .{region};
+        beginLabel(ctx.cmd_buf, "meta->n_chunks_scratch");
         cmd_copy(ctx.cmd_buf, result.meta.buf, result.n_chunks_scratch.buf, 1, @ptrCast(&regions));
+        endLabel(ctx.cmd_buf, "meta->n_chunks_scratch");
     }
 
     // BARRIER B' — the in-buffer copy above is a TRANSFER_WRITE; scan
@@ -1036,7 +1076,9 @@ pub fn runDecodePipelineEx(
         // against *n_chunks_buf (= the walk-frame-determined real
         // n_chunks), so over-launching is safe.
         const scan_grid_x: u32 = (n_chunks_max + 31) / 32;
+        beginLabel(ctx.cmd_buf, "scan_parse");
         cmd_dispatch(ctx.cmd_buf, scan_grid_x, 1, 1);
+        endLabel(ctx.cmd_buf, "scan_parse");
     }
 
     // BARRIER C — scan_parse writes → compact_* read.
@@ -1048,7 +1090,10 @@ pub fn runDecodePipelineEx(
     const compact_huff_sets = [_]vk.VkDescriptorSet{
         compact_lit_set, compact_tok_set, compact_hi_set, compact_lo_set,
     };
-    for (compact_huff_sets) |cs| {
+    const compact_huff_labels = [_][]const u8{
+        "compact_huff_lit", "compact_huff_tok", "compact_huff_hi", "compact_huff_lo",
+    };
+    for (compact_huff_sets, 0..) |cs, ci| {
         cmd_bind_pl(ctx.cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pipes.compact_huff.pipeline);
         const sets: [1]vk.VkDescriptorSet = .{cs};
         cmd_bind_ds(
@@ -1061,7 +1106,9 @@ pub fn runDecodePipelineEx(
             0,
             null,
         );
+        beginLabel(ctx.cmd_buf, compact_huff_labels[ci]);
         cmd_dispatch(ctx.cmd_buf, 1, 1, 1);
+        endLabel(ctx.cmd_buf, compact_huff_labels[ci]);
     }
 
     // 4e. compact_raw_descs.
@@ -1078,7 +1125,9 @@ pub fn runDecodePipelineEx(
             0,
             null,
         );
+        beginLabel(ctx.cmd_buf, "compact_raw_descs");
         cmd_dispatch(ctx.cmd_buf, 1, 1, 1);
+        endLabel(ctx.cmd_buf, "compact_raw_descs");
     }
 
     // BARRIER D — compact_* writes → gather_raw_off16 reads.
@@ -1123,7 +1172,9 @@ pub fn runDecodePipelineEx(
         // VkPhysicalDeviceLimits.maxComputeWorkGroupCount[0] (2^31 on
         // every supported device).
         const gather_grid_x: u32 = max_total_subchunks * 2;
+        beginLabel(ctx.cmd_buf, "gather_raw_off16");
         cmd_dispatch(ctx.cmd_buf, gather_grid_x, 1, 1);
+        endLabel(ctx.cmd_buf, "gather_raw_off16");
     }
 
     // BARRIER E — gather writes → downstream LZ kernel reads. The

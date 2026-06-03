@@ -1678,6 +1678,39 @@ pub var vkCmdCopyBuffer_fn: ?FnCmdCopyBuffer = null;
 pub var vkCmdFillBuffer_fn: ?FnCmdFillBuffer = null;
 pub var vkGetBufferDeviceAddress_fn: ?FnGetBufferDeviceAddress = null;
 
+// ── VK_EXT_debug_utils: cmd-buffer labels for nsys / RenderDoc ───
+// Pure instrumentation — `vkCmdBeginDebugUtilsLabelEXT` /
+// `vkCmdEndDebugUtilsLabelEXT` emit named region markers into the
+// recorded command buffer. Tools (Nsight Systems' Vulkan trace,
+// RenderDoc) pick them up and attribute GPU intervals to the
+// human-readable label. The extension itself is an INSTANCE-level
+// extension (VK_EXT_debug_utils); both Cmd entry points are device-
+// level. Instance.zig enables the extension when available, and
+// dispatch.zig resolves these slots via vkGetDeviceProcAddr on first
+// use. Slots stay null on devices/loaders without the extension —
+// the call sites null-check before invoking, so absence is a silent
+// no-op (instrumentation only, never load-bearing).
+pub const VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT: VkStructureType = 1000128002;
+pub const VkDebugUtilsLabelEXT = extern struct {
+    sType: VkStructureType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT,
+    pNext: ?*const anyopaque = null,
+    pLabelName: ?[*:0]const u8 = null,
+    color: [4]f32 = .{ 0, 0, 0, 0 },
+};
+pub const FnCmdBeginDebugUtilsLabelEXT = *const fn (
+    commandBuffer: VkCommandBuffer,
+    pLabelInfo: *const VkDebugUtilsLabelEXT,
+) callconv(.c) void;
+pub const FnCmdEndDebugUtilsLabelEXT = *const fn (
+    commandBuffer: VkCommandBuffer,
+) callconv(.c) void;
+pub var vkCmdBeginDebugUtilsLabelEXT_fn: ?FnCmdBeginDebugUtilsLabelEXT = null;
+pub var vkCmdEndDebugUtilsLabelEXT_fn: ?FnCmdEndDebugUtilsLabelEXT = null;
+
+// VK_EXT_debug_utils extension name string (passed at instance create
+// time via VkInstanceCreateInfo.ppEnabledExtensionNames).
+pub const VK_EXT_DEBUG_UTILS_EXTENSION_NAME: [*:0]const u8 = "VK_EXT_debug_utils";
+
 // ── Loader helpers ───────────────────────────────────────────────
 
 /// Resolve a symbol from the loaded vulkan-1.dll via Win32 GetProcAddress.
