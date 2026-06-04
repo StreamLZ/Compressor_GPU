@@ -1,0 +1,44 @@
+// 1:1 port of src/decode/huffman_kernel.cu, entry point
+// slzHuffDecode4StreamKernel.
+// CUDA reference: src/decode/huffman_kernel.cu:631-637.
+// See srcVK/PortInstructions.md.
+//
+// L2 stub: Huffman 4-stream decode (kernel decodes HUFF_NUM_STREAMS = 32
+// streams in parallel — one per warp lane). The "4Stream" suffix is the
+// historical CUDA dispatch ABI name; preserved verbatim per audit
+// Section C.5.1 row 180.
+
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+// CUDA: __launch_bounds__(32, 8) — one warp per block, eight resident
+// blocks per SM. Local size matches the 32-lane warp.
+layout(local_size_x = 32) in;
+
+// arg 0: const uint8_t* comp
+layout(std430, binding = 0) readonly buffer CompBuf {
+    uint comp[];
+};
+
+// arg 1: const HuffDecChunkDesc* descs
+layout(std430, binding = 1) readonly buffer DescsBuf {
+    uint descs[];
+};
+
+// arg 2: const uint32_t* luts
+layout(std430, binding = 2) readonly buffer LutsBuf {
+    uint luts[];
+};
+
+// arg 3: uint8_t* output
+layout(std430, binding = 3) buffer OutputBuf {
+    uint output_data[];
+};
+
+// arg 4: const uint32_t* d_n_blocks
+layout(std430, binding = 4) readonly buffer NBlocksBuf {
+    uint d_n_blocks;
+};
+
+void main() { return; }

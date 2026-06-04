@@ -1,0 +1,11 @@
+// 1:1 port of src/encode/huffman_kernel.cu, entry point slzHuffBuildTablesKernel.
+// CUDA reference: src/encode/huffman_kernel.cu.
+// See srcVK/PortInstructions.md.
+// L2 stub: Huffman tables build (L3+).
+
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 32) in;
+
+void main() {}

@@ -1,0 +1,59 @@
+// 1:1 port of src/decode/walk_frame_kernel.cuh, entry point slzWalkFrameKernel.
+// CUDA reference: src/decode/walk_frame_kernel.cuh:50-60.
+// See srcVK/PortInstructions.md.
+//
+// L2 stub: device-side frame walker (async D2D path). Bindings mirror
+// the CUDA arg list verbatim.
+
+#version 460 core
+
+// CUDA: single-thread launch (1 block × 1 thread).
+layout(local_size_x = 1) in;
+
+// arg 0: const uint8_t* d_frame
+layout(std430, binding = 0) readonly buffer FrameBuf {
+    uint d_frame[];
+};
+
+// arg 2: SlzChunkDesc* d_chunks
+layout(std430, binding = 1) buffer ChunksBuf {
+    uint d_chunks[];
+};
+
+// arg 4: uint32_t* d_n_chunks
+layout(std430, binding = 2) buffer NChunksBuf {
+    uint d_n_chunks;
+};
+
+// arg 5: uint32_t* d_decompressed_size
+layout(std430, binding = 3) buffer DecompressedSizeBuf {
+    uint d_decompressed_size;
+};
+
+// arg 6: uint32_t* d_sub_chunk_cap
+layout(std430, binding = 4) buffer SubChunkCapBuf {
+    uint d_sub_chunk_cap;
+};
+
+// arg 7: uint32_t* d_block_start
+layout(std430, binding = 5) buffer BlockStartBuf {
+    uint d_block_start;
+};
+
+// arg 8: uint32_t* d_block_size
+layout(std430, binding = 6) buffer BlockSizeBuf {
+    uint d_block_size;
+};
+
+// arg 9: uint32_t* d_status
+layout(std430, binding = 7) buffer StatusBuf {
+    uint d_status;
+};
+
+// Scalar args 1, 3: frame_size, max_chunks.
+layout(push_constant) uniform Push {
+    uint frame_size;
+    uint max_chunks;
+} pc;
+
+void main() { return; }

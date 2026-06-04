@@ -1,0 +1,137 @@
+// 1:1 port of src/decode/lz_decode_kernels.cuh, entry point slzLzDecodeRawKernel.
+// CUDA reference: src/decode/lz_decode_kernels.cuh:158-231 (raw-mode entry).
+// See srcVK/PortInstructions.md.
+// L1 hot path: this is the raw LZ decode kernel for level-1 frames.
+
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "slz_wire_format.glsl"
+#include "lz_decode_core.glsl"
+#include "lz_decode_raw.glsl"
+#include "lz_dispatch.glsl"
+
+// CUDA: lz_grid_x blocks × (32, 2, 1) threads per decode_dispatch.zig:430.
+// 32 lanes × 2 warps = 64 threads per block, matching CUDA
+// LZ_KERNEL_BLOCK_THREADS.
+layout(local_size_x = 32, local_size_y = 2, local_size_z = 1) in;
+
+// arg 0: const uint8_t* compressed.
+layout(std430, binding = 0) readonly buffer CompressedBuf {
+    uint8_t compressed[];
+};
+
+// arg 1: const SlzChunkDesc* chunks.
+layout(std430, binding = 1) readonly buffer ChunksBuf {
+    SlzChunkDesc chunks[];
+};
+
+// arg 2: uint8_t* dst.
+layout(std430, binding = 2) buffer DstBuf {
+    uint8_t dst[];
+};
+
+// arg 4: const uint32_t* d_total_chunks. CUDA reads `*d_total_chunks` at
+// kernel entry so the self-gate count flows D2D rather than via
+// push-constant scalar.
+layout(std430, binding = 3) readonly buffer TotalChunksBuf {
+    uint d_total_chunks;
+};
+
+// Scalar args 3, 5: chunks_per_group, sub_chunk_cap.
+layout(push_constant) uniform Push {
+    uint chunks_per_group;
+    uint sub_chunk_cap;
+} pc;
+
+void main() {
+    // CUDA reference: src/decode/lz_decode_kernels.cuh:168-173.
+    uint total_chunks = d_total_chunks;
+    uint warp_id = gl_LocalInvocationID.y;
+    uint group_id = gl_WorkGroupID.x * WARPS_PER_BLOCK + warp_id;
+    int  lane = int(gl_LocalInvocationID.x & LANE_MASK);
+    if (group_id >= (total_chunks + pc.chunks_per_group - 1u) / pc.chunks_per_group) return;
+    uint base_chunk = group_id * pc.chunks_per_group;
+
+    // CUDA reference: src/decode/lz_decode_kernels.cuh:175-230.
+    for (uint c = 0u; c < pc.chunks_per_group; c = c + 1u) {
+        uint chunk_idx = base_chunk + c;
+        if (chunk_idx >= total_chunks) return;
+
+        SlzChunkDesc ch = chunks[chunk_idx];
+        if (ch.decomp_size == 0u) continue;
+
+        // Uncompressed chunk: warp-cooperative copy. CUDA reference:
+        // src/decode/lz_decode_kernels.cuh:182-187.
+        if ((ch.flags & CHUNK_FLAG_UNCOMPRESSED) != 0u) {
+            for (uint i = uint(lane); i < ch.decomp_size; i = i + WARP_SIZE)
+                dst[ch.dst_offset + i] = compressed[ch.src_offset + i];
+            subgroupBarrier();
+            subgroupMemoryBarrierBuffer();
+            continue;
+        }
+
+        // Memset chunk. CUDA reference: src/decode/lz_decode_kernels.cuh:189-194.
+        if ((ch.flags & CHUNK_FLAG_MEMSET) != 0u) {
+            uint8_t fill_byte = uint8_t(chunkMemsetFill(ch));
+            for (uint i = uint(lane); i < ch.decomp_size; i = i + WARP_SIZE)
+                dst[ch.dst_offset + i] = fill_byte;
+            subgroupBarrier();
+            subgroupMemoryBarrierBuffer();
+            continue;
+        }
+
+        // LZ-compressed chunk: iterate sub-chunks. CUDA reference:
+        // src/decode/lz_decode_kernels.cuh:197-230.
+        uint chunk_src = ch.src_offset;
+        uint sc_dst_off = ch.dst_offset;
+        uint sc_remaining = ch.decomp_size;
+
+        while (sc_remaining > 0u) {
+            uint sc_size = sc_remaining;
+            if (sc_size > pc.sub_chunk_cap) sc_size = pc.sub_chunk_cap;
+
+            // CUDA reference: src/decode/lz_decode_kernels.cuh:205-208.
+            // 3-byte big-endian sub-chunk header, parsed on lane 0 and
+            // broadcast across the warp.
+            uint sub_chunk_header = 0u;
+            if (lane == 0) {
+                uint h0 = uint(compressed[chunk_src + 0u]);
+                uint h1 = uint(compressed[chunk_src + 1u]);
+                uint h2 = uint(compressed[chunk_src + 2u]);
+                sub_chunk_header = readBE24(h0, h1, h2);
+            }
+            sub_chunk_header = subgroupShuffle(sub_chunk_header, 0u);
+
+            if (!subchunkIsLz(sub_chunk_header)) break;
+
+            uint sc_comp_size = subchunkCompSize(sub_chunk_header);
+            uint sc_payload = chunk_src + 3u;
+
+            if (sc_comp_size < sc_size) {
+                // CUDA reference: src/decode/lz_decode_kernels.cuh:216-219.
+                // L1 raw fast path: parseAndDecodeSubChunkRaw inline parse
+                // + decodeSubChunkRawMode<false>.
+                parseAndDecodeSubChunkRaw(
+                    compressed, sc_payload, sc_comp_size, sc_size,
+                    dst, sc_dst_off, sc_dst_off, lane);
+            } else {
+                // Uncompressed sub-chunk: copy. CUDA reference:
+                // src/decode/lz_decode_kernels.cuh:220-223.
+                for (uint i = uint(lane); i < sc_size; i = i + WARP_SIZE)
+                    dst[sc_dst_off + i] = compressed[sc_payload + i];
+            }
+            subgroupBarrier();
+            subgroupMemoryBarrierBuffer();
+
+            chunk_src += 3u + sc_comp_size;
+            sc_dst_off += sc_size;
+            sc_remaining -= sc_size;
+        }
+    }
+}

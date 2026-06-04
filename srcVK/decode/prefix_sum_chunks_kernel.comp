@@ -1,0 +1,56 @@
+// 1:1 port of src/decode/prefix_sum_chunks_kernel.cuh, entry point slzPrefixSumChunksKernel.
+// CUDA reference: src/decode/prefix_sum_chunks_kernel.cuh:17-38.
+// See srcVK/PortInstructions.md.
+// L1 hot path: per-chunk first-sub-chunk-index prefix sum.
+
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+
+#include "slz_wire_format.glsl"
+
+// CUDA: 1 block × 1 thread.
+layout(local_size_x = 1) in;
+
+// arg 0: const SlzChunkDesc* d_chunks. std430-packed SlzChunkDesc is
+// 6 × u32 = 24 bytes, matching descriptors.zig::ChunkDesc.
+layout(std430, binding = 0) readonly buffer ChunksBuf {
+    SlzChunkDesc d_chunks[];
+};
+
+// arg 3: uint32_t* d_first_sub_idx.
+layout(std430, binding = 1) buffer FirstSubIdxBuf {
+    uint d_first_sub_idx[];
+};
+
+// arg 4: uint32_t* d_total_subchunks.
+layout(std430, binding = 2) buffer TotalSubchunksBuf {
+    uint d_total_subchunks;
+};
+
+// Scalar args 1, 2: uint32_t n_chunks, uint32_t sub_chunk_cap.
+layout(push_constant) uniform Push {
+    uint n_chunks;
+    uint sub_chunk_cap;
+} pc;
+
+void main() {
+    SLZ_GUARD_SINGLE_THREAD();
+
+    // CUDA reference: src/decode/prefix_sum_chunks_kernel.cuh:25-37.
+    uint n = pc.n_chunks;
+    uint cap = pc.sub_chunk_cap;
+    if (cap == 0u) cap = DEFAULT_SUB_CHUNK_CAP;
+    uint total = 0u;
+    for (uint i = 0u; i < n; i = i + 1u) {
+        d_first_sub_idx[i] = total;
+        SlzChunkDesc ch = d_chunks[i];
+        uint n_subs;
+        if (ch.flags != 0u || ch.decomp_size == 0u) {
+            n_subs = 1u;
+        } else {
+            n_subs = (ch.decomp_size + cap - 1u) / cap;
+        }
+        total = total + n_subs;
+    }
+    d_total_subchunks = total;
+}

@@ -1,0 +1,39 @@
+// 1:1 port of src/decode/compact_descs_kernels.cuh, entry point
+// slzCompactRawDescsKernel.
+// CUDA reference: src/decode/compact_descs_kernels.cuh:62-67.
+// See srcVK/PortInstructions.md.
+//
+// L2 stub. Single-threaded compaction.
+
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+
+// CUDA: 1 block × 1 thread.
+layout(local_size_x = 1) in;
+
+// arg 0: const SlzScanRawDesc* d_staged_hi
+layout(std430, binding = 0) readonly buffer StagedHiBuf {
+    uint d_staged_hi[];
+};
+
+// arg 1: const SlzScanRawDesc* d_staged_lo
+layout(std430, binding = 1) readonly buffer StagedLoBuf {
+    uint d_staged_lo[];
+};
+
+// arg 2: const uint32_t* d_total_subs
+layout(std430, binding = 2) readonly buffer TotalSubsBuf {
+    uint d_total_subs;
+};
+
+// arg 3: SlzRawOff16Desc* d_out
+layout(std430, binding = 3) buffer OutBuf {
+    uint d_out[];
+};
+
+// arg 4: uint32_t* d_n_out
+layout(std430, binding = 4) buffer NOutBuf {
+    uint d_n_out;
+};
+
+void main() { return; }

@@ -393,21 +393,17 @@ pub fn build(b: *std.Build) void {
     const cli_vk_install = b.addInstallArtifact(cli_vk_exe, .{});
     b.step("streamlz_vk_legacy", "Build the legacy Vulkan-backend CLI (streamlz_vk_legacy.exe)").dependOn(&cli_vk_install.step);
 
-    // ── Vulkan port (FOUNDATION): streamlz_vk.exe — src_vk/ tree ────────
-    // The multi-wave 1:1 CUDA->Vulkan port lives under src_vk/. This
+    // ── Vulkan port (PRIOR src_vk/ tree): streamlz_vk_old.exe ─────────
+    // The prior (botched) Audit-phase output lives under src_vk/. This
     // step builds the foundation-wave binary that pulls the foundational
-    // types (vulkan_api.zig procs.* surface, decode_context.zig
-    // DecodeContext, descriptors.zig GpuError with NotImplementedL2,
-    // VMA bindings via third_party/vma) into a linkable executable.
-    // Subsequent waves bring the L1 encode/decode handlers online.
+    // types from that tree. RENAMED from `streamlz_vk` to
+    // `streamlz_vk_old` so the new `srcVK/` skeleton can take the
+    // canonical `streamlz_vk` step name below. Behaviour is unchanged.
     //
     // VMA is vendored at third_party/vma/vk_mem_alloc.h (v3.1.0, AMD
     // MIT). third_party/vma/vk_mem_alloc_impl.cpp pulls VMA's full
-    // implementation into the binary as a single C++ translation
-    // unit. The cli_vk_module links libcpp so the C++ runtime is
-    // available; the codec only ever touches VMA through the
-    // procs.malloc_device / procs.free_device shims, never directly.
-    const streamlz_vk_exe_module = b.createModule(.{
+    // implementation into the binary as a single C++ translation unit.
+    const streamlz_vk_old_exe_module = b.createModule(.{
         .root_source_file = b.path("src_vk/main.zig"),
         .target = target,
         .optimize = optimize,
@@ -415,28 +411,71 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .link_libcpp = true,
     });
-    streamlz_vk_exe_module.addCSourceFile(.{
+    streamlz_vk_old_exe_module.addCSourceFile(.{
         .file = b.path("third_party/vma/vk_mem_alloc_impl.cpp"),
         .flags = &.{
             "-std=c++17",
             "-Wno-everything",
         },
     });
-    streamlz_vk_exe_module.addIncludePath(b.path("third_party/vma"));
-    // VMA's vk_mem_alloc.h #includes <vulkan/vulkan.h>. Reach the
-    // Vulkan SDK headers via $VULKAN_SDK\Include on Windows. Fail
-    // loudly at configure time if the env var is missing — the port
-    // is Windows-first today and the SDK is mandatory.
+    streamlz_vk_old_exe_module.addIncludePath(b.path("third_party/vma"));
     if (b.graph.environ_map.get("VULKAN_SDK")) |sdk| {
         const include_path = b.fmt("{s}{c}Include", .{ sdk, std.fs.path.sep });
-        streamlz_vk_exe_module.addIncludePath(.{ .cwd_relative = include_path });
+        streamlz_vk_old_exe_module.addIncludePath(.{ .cwd_relative = include_path });
     }
-    const streamlz_vk_fnd_exe = b.addExecutable(.{
-        .name = "streamlz_vk",
-        .root_module = streamlz_vk_exe_module,
+    const streamlz_vk_old_exe = b.addExecutable(.{
+        .name = "streamlz_vk_old",
+        .root_module = streamlz_vk_old_exe_module,
     });
-    const streamlz_vk_fnd_install = b.addInstallArtifact(streamlz_vk_fnd_exe, .{});
-    b.step("streamlz_vk", "Build the foundation-wave Vulkan CLI (streamlz_vk.exe)").dependOn(&streamlz_vk_fnd_install.step);
+    const streamlz_vk_old_install = b.addInstallArtifact(streamlz_vk_old_exe, .{});
+    b.step("streamlz_vk_old", "Build the prior src_vk/ Vulkan CLI (streamlz_vk_old.exe)").dependOn(&streamlz_vk_old_install.step);
+
+    // ── Vulkan port (NEW srcVK/ skeleton): streamlz_vk.exe ────────────
+    // The Step-2 skeleton lives under srcVK/. This step compiles the
+    // skeleton entry point at srcVK/main.zig into streamlz_vk.exe.
+    // Every L1-scope path returns error.NotYetPorted and every L2-stub
+    // path returns error.NotImplementedL2 until the Step-3+ fleshout
+    // agents land the real bodies.
+    //
+    // SPV blobs are compiled from every srcVK/**/*.comp by
+    // addSrcVkShaderSteps below and embedded via @embedFile at compile
+    // time. VMA is self-contained under srcVK/vma/ (header + impl TU)
+    // so the srcVK build graph never references /third_party/.
+    const srcvk_shaders = addSrcVkShaderSteps(b);
+    const srcvk_exe_module = b.createModule(.{
+        .root_source_file = b.path("srcVK/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    srcvk_exe_module.addCSourceFile(.{
+        .file = b.path("srcVK/vma/vk_mem_alloc_impl.cpp"),
+        .flags = &.{
+            "-std=c++17",
+            "-Wno-everything",
+        },
+    });
+    // VMA's vk_mem_alloc.h lives at srcVK/vma/vk_mem_alloc.h.
+    // The @cInclude("vma/vk_mem_alloc.h") in srcVK/vma.zig resolves
+    // against the srcVK/ include path.
+    srcvk_exe_module.addIncludePath(b.path("srcVK"));
+    if (b.graph.environ_map.get("VULKAN_SDK")) |sdk| {
+        const include_path = b.fmt("{s}{c}Include", .{ sdk, std.fs.path.sep });
+        srcvk_exe_module.addIncludePath(.{ .cwd_relative = include_path });
+    }
+    // Wire spv_blobs module into srcvk_exe_module so module_loader.zig can
+    // @import("spv_blobs") for the @embedFile()'d kernel binaries.
+    addSrcVkSpvBlobsImport(b, srcvk_exe_module, srcvk_shaders);
+    const srcvk_exe = b.addExecutable(.{
+        .name = "streamlz_vk",
+        .root_module = srcvk_exe_module,
+    });
+    srcvk_exe.step.dependOn(srcvk_shaders.step);
+    srcvk_exe.step.dependOn(srcvk_shaders.embed_dir_step);
+    const srcvk_install = b.addInstallArtifact(srcvk_exe, .{});
+    b.step("streamlz_vk", "Build the foundation-wave Vulkan CLI (streamlz_vk.exe, srcVK/ tree)").dependOn(&srcvk_install.step);
 
     // ── Vulkan port (CLI test): self-roundtrip + cross-backend ───────────
     // Spawns streamlz_vk.exe and streamlz.exe (the CUDA build) via
@@ -928,4 +967,96 @@ fn ptxFreshnessCheck(step: *std.Build.Step, opts: std.Build.Step.MakeOptions) an
             .{ newest_src_path.?, oldest_ptx_path.? },
         );
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  srcVK/ SPV blob compilation
+// ────────────────────────────────────────────────────────────────────────
+//
+// Compiles every .comp under srcVK/{decode,encode}/ to a sibling .spv
+// blob via glslc. Surfaces a single composite step the srcVK exe step
+// depends on so the SPV files exist before linking. The skeleton
+// shaders only contain `void main() {}` so the compilation is a
+// formality at Step 2; the fleshout agent expands the bodies.
+
+const srcvk_kernels = [_][]const u8{
+    // decode (11)
+    "decode/lz_decode_raw_kernel",
+    "decode/lz_decode_kernel",
+    "decode/prefix_sum_chunks_kernel",
+    "decode/gather_raw_off16_kernel",
+    "decode/walk_frame_kernel",
+    "decode/compact_huff_descs_kernel",
+    "decode/compact_raw_descs_kernel",
+    "decode/merge_huff_descs_kernel",
+    "decode/scan_parse_kernel",
+    "decode/huff_build_lut_kernel",
+    "decode/huff_decode_4stream_kernel",
+    // encode (6)
+    "encode/lz_encode_kernel",
+    "encode/huff_build_tables_kernel",
+    "encode/huff_encode_4stream_kernel",
+    "encode/assemble_measure_kernel",
+    "encode/assemble_write_kernel",
+    "encode/frame_assemble_kernel",
+};
+
+const SrcVkShaders = struct {
+    step: *std.Build.Step,
+    embed_dir: std.Build.LazyPath,
+    embed_dir_step: *std.Build.Step,
+    spv_blobs_zig: std.Build.LazyPath,
+};
+
+fn addSrcVkShaderSteps(b: *std.Build) SrcVkShaders {
+    const glslc = resolveGlslc(b);
+    const step = b.step("srcvk-shaders", "Compile every srcVK/**/*.comp to SPIR-V");
+
+    // Aggregate every .spv blob into one WriteFiles directory so module_loader
+    // can @embedFile() the bare filenames at compile time.
+    const spv_wf = b.addWriteFiles();
+
+    for (srcvk_kernels) |kernel| {
+        const src_path = b.fmt("srcVK/{s}.comp", .{kernel});
+        const out_name = b.fmt("{s}.spv", .{std.fs.path.basename(kernel)});
+
+        const cmd = b.addSystemCommand(&.{glslc});
+        cmd.addArg("-fshader-stage=compute");
+        cmd.addArg("-O");
+        cmd.addArg("--target-env=vulkan1.3");
+        cmd.addArg(b.fmt("-I{s}", .{b.pathFromRoot("srcVK/common")}));
+        cmd.addArg(b.fmt("-I{s}", .{b.pathFromRoot("srcVK/decode")}));
+        cmd.addArg(b.fmt("-I{s}", .{b.pathFromRoot("srcVK/encode")}));
+        cmd.addArg("-o");
+        const spv_lp = cmd.addOutputFileArg(out_name);
+        cmd.addFileArg(b.path(src_path));
+
+        // Gather into the embed dir under a flat filename so spv_blobs.zig
+        // resolves the bare names via @embedFile().
+        _ = spv_wf.addCopyFile(spv_lp, out_name);
+
+        const install = b.addInstallFileWithDir(spv_lp, .prefix, b.fmt("srcvk_shaders/{s}", .{out_name}));
+        step.dependOn(&install.step);
+    }
+
+    // Copy spv_blobs.zig alongside the .spv files so its @embedFile("...spv")
+    // calls find the colocated blobs at compile time.
+    const blobs_in_dir = spv_wf.addCopyFile(b.path("srcVK/spv_blobs.zig"), "spv_blobs.zig");
+    return .{
+        .step = step,
+        .embed_dir = spv_wf.getDirectory(),
+        .embed_dir_step = &spv_wf.step,
+        .spv_blobs_zig = blobs_in_dir,
+    };
+}
+
+/// Wire the embedded `spv_blobs` module into `m` so calls to
+/// `@import("spv_blobs")` resolve to the colocated-in-embed_dir copy of
+/// `srcVK/spv_blobs.zig`. Mirrors addSpvBlobsImport for the src_vulkan
+/// tree but targets the srcVK build outputs.
+fn addSrcVkSpvBlobsImport(b: *std.Build, m: *std.Build.Module, vk_shaders: SrcVkShaders) void {
+    const spv_mod = b.createModule(.{
+        .root_source_file = vk_shaders.spv_blobs_zig,
+    });
+    m.addImport("spv_blobs", spv_mod);
 }

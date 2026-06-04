@@ -1,0 +1,33 @@
+// 1:1 port of src/decode/huffman_kernel.cu, entry point slzHuffBuildLutKernel.
+// CUDA reference: src/decode/huffman_kernel.cu:155-159.
+// See srcVK/PortInstructions.md.
+//
+// L2 stub: Huffman LUT build. Bindings mirror the CUDA arg list.
+
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+
+// CUDA: warp-per-block (32 lanes). One block per Huffman descriptor.
+layout(local_size_x = 32) in;
+
+// arg 0: const uint8_t* comp
+layout(std430, binding = 0) readonly buffer CompBuf {
+    uint comp[];
+};
+
+// arg 1: const HuffDecChunkDesc* descs
+layout(std430, binding = 1) readonly buffer DescsBuf {
+    uint descs[];
+};
+
+// arg 2: uint32_t* luts
+layout(std430, binding = 2) buffer LutsBuf {
+    uint luts[];
+};
+
+// arg 3: const uint32_t* d_n_blocks
+layout(std430, binding = 3) readonly buffer NBlocksBuf {
+    uint d_n_blocks;
+};
+
+void main() { return; }

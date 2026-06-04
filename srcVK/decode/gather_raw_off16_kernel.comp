@@ -1,0 +1,41 @@
+// 1:1 port of src/decode/gather_raw_off16_kernel.cuh, entry point
+// slzGatherRawOff16Kernel.
+// CUDA reference: src/decode/gather_raw_off16_kernel.cuh:23-29.
+// See srcVK/PortInstructions.md.
+//
+// L2 stub. Bindings mirror the CUDA arg list so the compiled SPV emits a
+// descriptor set layout the host can bind without rework when the L2
+// fleshout body lands.
+
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+
+// CUDA: grid_x blocks × 256 threads per decode_dispatch.zig:177.
+layout(local_size_x = 256) in;
+
+// arg 0: const uint8_t* comp_base
+layout(std430, binding = 0) readonly buffer CompBaseBuf {
+    uint comp_base[];
+};
+
+// arg 2: uint8_t* scratch_base
+layout(std430, binding = 1) buffer ScratchBaseBuf {
+    uint scratch_base[];
+};
+
+// arg 3: const SlzRawOff16Desc* descs
+layout(std430, binding = 2) readonly buffer DescsBuf {
+    uint descs_raw[];
+};
+
+// arg 4: const uint32_t* d_count
+layout(std430, binding = 3) readonly buffer CountBuf {
+    uint d_count;
+};
+
+// Scalar arg 1: uint32_t comp_len.
+layout(push_constant) uniform Push {
+    uint comp_len;
+} pc;
+
+void main() { return; }

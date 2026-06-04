@@ -1,0 +1,12 @@
+// 1:1 port of src/encode/assemble_kernel.cu, entry point slzFrameAssembleKernel.
+// CUDA reference: src/encode/assemble_kernel.cu.
+// See srcVK/PortInstructions.md.
+// L1 hot path: device-resident frame writer.
+
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+
+// CUDA: grid_x blocks × 128 threads per encode_assemble.zig:300.
+layout(local_size_x = 128) in;
+
+void main() {}

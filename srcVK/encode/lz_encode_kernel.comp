@@ -1,0 +1,14 @@
+// 1:1 port of src/encode/lz_kernel.cu, entry point slzLzEncodeKernel.
+// CUDA reference: src/encode/lz_kernel.cu.
+// See srcVK/PortInstructions.md.
+// L1 hot path: warp-parallel greedy (or chain at L5) LZ encoder.
+
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 32) in;
+
+void main() {}

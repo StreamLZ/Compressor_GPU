@@ -1,0 +1,70 @@
+// 1:1 port of src/decode/merge_huff_descs_kernel.cuh, entry point
+// slzMergeHuffDescsKernel.
+// CUDA reference: src/decode/merge_huff_descs_kernel.cuh:41-53.
+// See srcVK/PortInstructions.md.
+//
+// L2 stub. Single-threaded merge.
+
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+
+// CUDA: 1 block × 1 thread (SLZ_GUARD_SINGLE_THREAD).
+layout(local_size_x = 1) in;
+
+// arg 0: const SlzHuffDecChunkDesc* d_lit
+layout(std430, binding = 0) readonly buffer LitBuf {
+    uint d_lit[];
+};
+
+// arg 1: const SlzHuffDecChunkDesc* d_tok
+layout(std430, binding = 1) readonly buffer TokBuf {
+    uint d_tok[];
+};
+
+// arg 2: const SlzHuffDecChunkDesc* d_hi
+layout(std430, binding = 2) readonly buffer HiBuf {
+    uint d_hi[];
+};
+
+// arg 3: const SlzHuffDecChunkDesc* d_lo
+layout(std430, binding = 3) readonly buffer LoBuf {
+    uint d_lo[];
+};
+
+// arg 4: const uint32_t* d_n_lit
+layout(std430, binding = 4) readonly buffer NLitBuf {
+    uint d_n_lit;
+};
+
+// arg 5: const uint32_t* d_n_tok
+layout(std430, binding = 5) readonly buffer NTokBuf {
+    uint d_n_tok;
+};
+
+// arg 6: const uint32_t* d_n_hi
+layout(std430, binding = 6) readonly buffer NHiBuf {
+    uint d_n_hi;
+};
+
+// arg 7: const uint32_t* d_n_lo
+layout(std430, binding = 7) readonly buffer NLoBuf {
+    uint d_n_lo;
+};
+
+// arg 10: SlzHuffDecChunkDesc* d_merged
+layout(std430, binding = 8) buffer MergedBuf {
+    uint d_merged[];
+};
+
+// arg 11: uint32_t* d_n_merged
+layout(std430, binding = 9) buffer NMergedBuf {
+    uint d_n_merged;
+};
+
+// Scalar args 8, 9: tok_region_off, off16_region_off.
+layout(push_constant) uniform Push {
+    uint tok_region_off;
+    uint off16_region_off;
+} pc;
+
+void main() { return; }
