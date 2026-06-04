@@ -1,14 +1,299 @@
 // 1:1 port of src/encode/lz_kernel.cu, entry point slzLzEncodeKernel.
-// CUDA reference: src/encode/lz_kernel.cu.
+// CUDA reference: src/encode/lz_kernel.cu:64-248. L1 hot path: warp-
+// parallel greedy LZ encoder. One warp per chunk, one chunk per
+// workgroup (matching CUDA's grid_x=num_chunks, block(32,1,1) launch).
+//
 // See srcVK/PortInstructions.md.
-// L1 hot path: warp-parallel greedy (or chain at L5) LZ encoder.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
 #extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_vote : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
-layout(local_size_x = 32) in;
+#include "lz_format.glsl"
+#include "lz_token_emit.glsl"
+#include "lz_greedy_parser.glsl"
+#include "lz_chain_parser.glsl"
 
-void main() {}
+// CUDA: num_chunks blocks × (32, 1, 1) threads per encode_lz.zig:127.
+// One warp (= one subgroup of width 32) per chunk.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// arg 0: const uint8_t* input
+layout(std430, binding = 0) readonly buffer InputBuf {
+    uint8_t input_buf[];
+};
+
+// arg 1: uint8_t* output
+layout(std430, binding = 1) buffer OutputBuf {
+    uint8_t output_buf[];
+};
+
+// arg 2: const CompressChunkDesc* descs (5 u32 per chunk, 20 bytes)
+layout(std430, binding = 2) readonly buffer DescsBuf {
+    uint descs_raw[];
+};
+
+// arg 3: uint32_t* global_hash
+layout(std430, binding = 3) buffer GlobalHashBuf {
+    uint global_hash[];
+};
+
+// arg 4: uint32_t* comp_sizes
+layout(std430, binding = 4) buffer CompSizesBuf {
+    uint comp_sizes[];
+};
+
+// Scalar args 5..8 ride in via push constants. Layout matches the CUDA
+// arg-list order.
+layout(push_constant) uniform Push {
+    uint total_chunks;
+    uint hash_bits;
+    uint use_chain;
+    uint l4_features;
+} pc;
+
+void main() {
+    const uint chunk_id = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x & LANE_MASK;
+    if (chunk_id >= pc.total_chunks) return;
+
+    const uint hash_size = 1u << pc.hash_bits;
+    const uint hash_mask = hash_size - 1u;
+
+    // CUDA reference: src/encode/lz_kernel.cu:82-86. Parse the per-chunk
+    // descriptor (5 u32 fields = 20 bytes) out of the descs SSBO.
+    const uint desc_base = chunk_id * COMPRESS_CHUNK_DESC_U32_STRIDE;
+    const uint src_offset   = descs_raw[desc_base + COMPRESS_CHUNK_DESC_OFF_SRC];
+    const uint src_size     = descs_raw[desc_base + COMPRESS_CHUNK_DESC_OFF_SRC_SIZE];
+    const uint dst_offset   = descs_raw[desc_base + COMPRESS_CHUNK_DESC_OFF_DST];
+    // dst_capacity unused by the kernel (CUDA reads desc.is_first only).
+    const uint is_first     = descs_raw[desc_base + COMPRESS_CHUNK_DESC_OFF_FIRST];
+
+    const uint src_base = src_offset;
+    const uint dst_base = dst_offset;
+    const uint lit_data_start = (is_first != 0u ? INITIAL_LITERAL_COPY_BYTES : 0u)
+                              + LZ_SUBSTREAM_COUNT_HDR_BYTES;
+
+    // CUDA reference: src/encode/lz_kernel.cu:99-112. Sub-stream working
+    // buffers carved out of dst. Each region is sized for its worst case
+    // relative to src_size.
+    const uint lit_base   = dst_base + lit_data_start;
+    const uint token_base = dst_base + src_size;
+    const uint off16_base = token_base + (src_size / 4u);
+    const uint off32_base = off16_base + (src_size / 2u);
+    const uint len_base   = off32_base + (src_size / 4u);
+
+    uint lit_count   = 0u;
+    uint token_count = 0u;
+    uint off16_count = 0u;
+    uint off32_pos   = 0u;
+    uint off32_count = 0u;
+    uint length_count = 0u;
+
+    uint off32_count_block1 = 0u;
+    uint off32_count_block2 = 0u;
+    uint cmd_stream2_offset = 0u;
+    int  anchor = int(is_first != 0u ? INITIAL_LITERAL_COPY_BYTES : 0u);
+    int  recent_offset = INITIAL_RECENT_OFFSET;
+
+    // CUDA reference: src/encode/lz_kernel.cu:119-193. use_chain selects
+    // greedy (L1-L4) or chain (L5) parser; both branches scan block 1
+    // then block 2 with the same lane-0 framing tail.
+    if (pc.use_chain == 0u) {
+        // useGlobalHash() returns true for every level — the driver
+        // always passes a non-null global_hash. CUDA layout:
+        //   ht[chunk_id] = global_hash + chunk_id * hash_size  (u32 stride)
+        const uint ht_base = chunk_id * hash_size;
+        for (uint i = lane; i < hash_size; i += WARP_SIZE) {
+            global_hash[ht_base + i] = HASH_EMPTY;
+        }
+        subgroupBarrier();
+        subgroupMemoryBarrierBuffer();
+
+        // Block 1 pass: [anchor, min(src_size, LZ_BLOCK_SIZE))
+        {
+            uint block1_end = (src_size < LZ_BLOCK_SIZE) ? src_size : LZ_BLOCK_SIZE;
+            scanBlock(input_buf, src_base, src_size,
+                      global_hash, ht_base, pc.hash_bits, hash_mask,
+                      output_buf, lit_base, lit_count,
+                      output_buf, token_base, token_count,
+                      output_buf, off16_base, off16_count,
+                      output_buf, off32_base, off32_pos, off32_count,
+                      output_buf, len_base, length_count,
+                      anchor, recent_offset,
+                      anchor, block1_end, 0u,
+                      pc.l4_features, lane);
+            off32_count_block1 = off32_count;
+            off32_count = 0u;
+        }
+
+        // Block 2 pass: [max(anchor, LZ_BLOCK_SIZE), src_size)
+        if (src_size > LZ_BLOCK_SIZE) {
+            cmd_stream2_offset = token_count;
+            uint block2_start_pos = (uint(anchor) > LZ_BLOCK_SIZE) ? uint(anchor) : LZ_BLOCK_SIZE;
+            scanBlock(input_buf, src_base, src_size,
+                      global_hash, ht_base, pc.hash_bits, hash_mask,
+                      output_buf, lit_base, lit_count,
+                      output_buf, token_base, token_count,
+                      output_buf, off16_base, off16_count,
+                      output_buf, off32_base, off32_pos, off32_count,
+                      output_buf, len_base, length_count,
+                      anchor, recent_offset,
+                      block2_start_pos, src_size, LZ_BLOCK_SIZE,
+                      pc.l4_features, lane);
+            off32_count_block2 = off32_count;
+        }
+    } else {
+        // CUDA reference: src/encode/lz_kernel.cu:119-161. Chain parser
+        // mode. Three hash tables per chunk laid out contiguously in
+        // global_hash:
+        //   chain_first_hash: hash_size u32
+        //   chain_long_hash : hash_size u32
+        //   chain_next_hash : NEXT_HASH_SIZE u16  (= NEXT_HASH_SIZE/2 u32 words)
+        const uint table_stride = hash_size + hash_size + (NEXT_HASH_SIZE / 2u);
+        const uint chain_base             = chunk_id * table_stride;
+        const uint chain_first_hash_base  = chain_base;
+        const uint chain_long_hash_base   = chain_base + hash_size;
+        const uint chain_next_hash_base   = chain_base + hash_size + hash_size;
+
+        // Initialize all three tables to 0
+        for (uint i = lane; i < table_stride; i += WARP_SIZE) {
+            global_hash[chain_base + i] = 0u;
+        }
+        subgroupBarrier();
+        subgroupMemoryBarrierBuffer();
+
+        // Block 1 pass: [anchor, min(src_size, LZ_BLOCK_SIZE))
+        {
+            uint block1_end = (src_size < LZ_BLOCK_SIZE) ? src_size : LZ_BLOCK_SIZE;
+            scanBlockChain(input_buf, src_base, src_size,
+                           global_hash,
+                           chain_first_hash_base, chain_long_hash_base, chain_next_hash_base,
+                           pc.hash_bits, hash_mask,
+                           output_buf, lit_base, lit_count,
+                           output_buf, token_base, token_count,
+                           output_buf, off16_base, off16_count,
+                           output_buf, off32_base, off32_pos, off32_count,
+                           output_buf, len_base, length_count,
+                           anchor, recent_offset,
+                           anchor, block1_end, 0u,
+                           lane);
+            off32_count_block1 = off32_count;
+            off32_count = 0u;
+        }
+
+        // Block 2 pass: [max(anchor, LZ_BLOCK_SIZE), src_size)
+        if (src_size > LZ_BLOCK_SIZE) {
+            cmd_stream2_offset = token_count;
+            uint block2_start_pos = (uint(anchor) > LZ_BLOCK_SIZE) ? uint(anchor) : LZ_BLOCK_SIZE;
+            scanBlockChain(input_buf, src_base, src_size,
+                           global_hash,
+                           chain_first_hash_base, chain_long_hash_base, chain_next_hash_base,
+                           pc.hash_bits, hash_mask,
+                           output_buf, lit_base, lit_count,
+                           output_buf, token_base, token_count,
+                           output_buf, off16_base, off16_count,
+                           output_buf, off32_base, off32_pos, off32_count,
+                           output_buf, len_base, length_count,
+                           anchor, recent_offset,
+                           block2_start_pos, src_size, LZ_BLOCK_SIZE,
+                           lane);
+            off32_count_block2 = off32_count;
+        }
+    }
+
+    subgroupBarrier();
+    subgroupMemoryBarrierBuffer();
+
+    // CUDA reference: src/encode/lz_kernel.cu:197-247. Lane-0 frames the
+    // output: initial-copy prefix, sub-stream count headers, packed
+    // off32 counts, then concatenates the working buffers.
+    if (lane == 0u) {
+        uint out_pos = 0u;
+        if (is_first != 0u) {
+            for (uint i = 0u; i < INITIAL_LITERAL_COPY_BYTES; i += 1u) {
+                output_buf[dst_base + i] = input_buf[src_base + i];
+            }
+            out_pos = INITIAL_LITERAL_COPY_BYTES;
+        }
+
+        uint b0; uint b1; uint b2;
+        writeBE24(b0, b1, b2, lit_count);
+        output_buf[dst_base + out_pos + 0u] = uint8_t(b0);
+        output_buf[dst_base + out_pos + 1u] = uint8_t(b1);
+        output_buf[dst_base + out_pos + 2u] = uint8_t(b2);
+        out_pos += LZ_SUBSTREAM_COUNT_HDR_BYTES + lit_count;
+
+        writeBE24(b0, b1, b2, token_count);
+        output_buf[dst_base + out_pos + 0u] = uint8_t(b0);
+        output_buf[dst_base + out_pos + 1u] = uint8_t(b1);
+        output_buf[dst_base + out_pos + 2u] = uint8_t(b2);
+        out_pos += LZ_SUBSTREAM_COUNT_HDR_BYTES;
+        for (uint i = 0u; i < token_count; i += 1u) {
+            output_buf[dst_base + out_pos + i] = output_buf[token_base + i];
+        }
+        out_pos += token_count;
+
+        if (src_size > LZ_BLOCK_SIZE) {
+            uint cs2o = (cmd_stream2_offset > 0u) ? cmd_stream2_offset : token_count;
+            uint p0; uint p1;
+            storeU16LE(p0, p1, cs2o);
+            output_buf[dst_base + out_pos + 0u] = uint8_t(p0);
+            output_buf[dst_base + out_pos + 1u] = uint8_t(p1);
+            out_pos += 2u;
+        }
+
+        uint p0; uint p1;
+        storeU16LE(p0, p1, off16_count);
+        output_buf[dst_base + out_pos + 0u] = uint8_t(p0);
+        output_buf[dst_base + out_pos + 1u] = uint8_t(p1);
+        out_pos += OFF16_HEADER_BYTES;
+        for (uint i = 0u; i < off16_count * 2u; i += 1u) {
+            output_buf[dst_base + out_pos + i] = output_buf[off16_base + i];
+        }
+        out_pos += off16_count * 2u;
+
+        uint off32_count1_clamped = (off32_count_block1 < OFF32_COUNT_PACK_MAX)
+            ? off32_count_block1 : OFF32_COUNT_PACK_MAX;
+        uint off32_count2_clamped = (off32_count_block2 < OFF32_COUNT_PACK_MAX)
+            ? off32_count_block2 : OFF32_COUNT_PACK_MAX;
+        uint packed_off32_counts = (off32_count1_clamped << OFF32_COUNT_FIELD_BITS)
+                                 | off32_count2_clamped;
+        uint q0; uint q1; uint q2;
+        writeLE24(q0, q1, q2, packed_off32_counts);
+        output_buf[dst_base + out_pos + 0u] = uint8_t(q0);
+        output_buf[dst_base + out_pos + 1u] = uint8_t(q1);
+        output_buf[dst_base + out_pos + 2u] = uint8_t(q2);
+        out_pos += 3u;
+        if (off32_count_block1 >= OFF32_COUNT_PACK_MAX) {
+            uint r0; uint r1;
+            storeU16LE(r0, r1, off32_count_block1);
+            output_buf[dst_base + out_pos + 0u] = uint8_t(r0);
+            output_buf[dst_base + out_pos + 1u] = uint8_t(r1);
+            out_pos += 2u;
+        }
+        if (off32_count_block2 >= OFF32_COUNT_PACK_MAX) {
+            uint r0; uint r1;
+            storeU16LE(r0, r1, off32_count_block2);
+            output_buf[dst_base + out_pos + 0u] = uint8_t(r0);
+            output_buf[dst_base + out_pos + 1u] = uint8_t(r1);
+            out_pos += 2u;
+        }
+        for (uint i = 0u; i < off32_pos; i += 1u) {
+            output_buf[dst_base + out_pos + i] = output_buf[off32_base + i];
+        }
+        out_pos += off32_pos;
+
+        for (uint i = 0u; i < length_count; i += 1u) {
+            output_buf[dst_base + out_pos + i] = output_buf[len_base + i];
+        }
+        out_pos += length_count;
+
+        comp_sizes[chunk_id] = out_pos;
+    }
+}

@@ -1,11 +1,83 @@
 // 1:1 port of src/encode/assemble_kernel.cu, entry point slzAssembleWriteKernel.
-// CUDA reference: src/encode/assemble_kernel.cu.
+// CUDA reference: src/encode/assemble_kernel.cu:338-363. Pass B of the
+// 3-pass assembly chain: write [3-byte sub-chunk header][assembled
+// payload] for every sub-chunk into d_frame. One warp per sub-chunk.
+//
 // See srcVK/PortInstructions.md.
-// L1 hot path: frame assembly pass B.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
-layout(local_size_x = 32) in;
+#include "lz_format.glsl"
+#include "assemble_core.glsl"
 
-void main() {}
+// CUDA: n_subchunks blocks × (32, 1, 1) threads per encode_assemble.zig:152.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// arg 0: const uint8_t* d_raw
+layout(std430, binding = 0) readonly buffer DRawBuf {
+    uint8_t d_raw[];
+};
+
+// arg 1: const uint8_t* d_huff_lit
+layout(std430, binding = 1) readonly buffer DHuffLitBuf {
+    uint8_t d_huff_lit[];
+};
+
+// arg 2: const uint8_t* d_huff_tok
+layout(std430, binding = 2) readonly buffer DHuffTokBuf {
+    uint8_t d_huff_tok[];
+};
+
+// arg 3: const uint8_t* d_huff_off16
+layout(std430, binding = 3) readonly buffer DHuffOff16Buf {
+    uint8_t d_huff_off16[];
+};
+
+// arg 4: const AssembleDesc* descs
+layout(std430, binding = 4) readonly buffer DescsBuf {
+    uint descs_raw[];
+};
+
+// arg 5: uint8_t* d_frame
+layout(std430, binding = 5) buffer DFrameBuf {
+    uint8_t d_frame[];
+};
+
+// Scalar arg 6 — n_subchunks — rides in via push constants.
+layout(push_constant) uniform Push {
+    uint n_subchunks;
+} pc;
+
+void main() {
+    const uint i = gl_WorkGroupID.x;
+    if (i >= pc.n_subchunks) return;
+    const uint lane = gl_LocalInvocationID.x & LANE_MASK;
+
+    // CUDA reference: src/encode/assemble_kernel.cu:351-353. Load
+    // out_offset from the desc; hdr is at d_frame[out_offset], payload
+    // starts at d_frame[out_offset + SUBCHUNK_HDR_BYTES].
+    const uint desc_base = i * ASSEMBLE_DESC_U32_STRIDE;
+    const uint out_offset = descs_raw[desc_base + ASSEMBLE_DESC_OFF_OUT_OFFSET];
+    const uint payload_base = out_offset + SUBCHUNK_HDR_BYTES;
+
+    uint enc_n = 0u;
+    assembleSubChunk(true,
+                     d_raw, d_huff_lit, d_huff_tok, d_huff_off16,
+                     descs_raw, i,
+                     d_frame, payload_base, lane, enc_n);
+
+    // CUDA reference: src/encode/assemble_kernel.cu:359-362. Lane 0 writes
+    // the 3-byte BE sub-chunk header: comp_size | mode<<19 | LZ_FLAG.
+    if (lane == 0u) {
+        const uint sc_hdr = enc_n | (1u << SUBCHUNK_MODE_SHIFT) | SUBCHUNK_LZ_FLAG_BIT;
+        uint h0; uint h1; uint h2;
+        writeBE24(h0, h1, h2, sc_hdr);
+        d_frame[out_offset + 0u] = uint8_t(h0);
+        d_frame[out_offset + 1u] = uint8_t(h1);
+        d_frame[out_offset + 2u] = uint8_t(h2);
+    }
+}

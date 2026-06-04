@@ -161,12 +161,29 @@ const EncodeKernelDecl = struct {
 };
 
 const ENCODE_KERNELS = struct {
-    pub const lz: EncodeKernelDecl = .{ .name = "lz_encode", .n_bindings = 0, .push_constant_size = 0 };
+    // Bindings + push-constant sizes mirror the .comp layout declarations
+    // under srcVK/encode/. Each entry is CUDA arg-list verbatim — N SSBO
+    // args become bindings 0..N-1, the trailing scalar args ride in a
+    // single push-constant block.
+    //
+    // lz_encode: SSBO[0]=input, [1]=output, [2]=descs, [3]=global_hash,
+    //   [4]=comp_sizes; push={total_chunks,hash_bits,use_chain,l4_features} = 16 B.
+    pub const lz: EncodeKernelDecl = .{ .name = "lz_encode", .n_bindings = 5, .push_constant_size = 16 };
     pub const huff_tables: EncodeKernelDecl = .{ .name = "huff_build_tables", .n_bindings = 0, .push_constant_size = 0 };
     pub const huff_encode: EncodeKernelDecl = .{ .name = "huff_encode_4stream", .n_bindings = 0, .push_constant_size = 0 };
-    pub const assemble_measure: EncodeKernelDecl = .{ .name = "assemble_measure", .n_bindings = 0, .push_constant_size = 0 };
-    pub const assemble_write: EncodeKernelDecl = .{ .name = "assemble_write", .n_bindings = 0, .push_constant_size = 0 };
-    pub const frame_assemble: EncodeKernelDecl = .{ .name = "frame_assemble", .n_bindings = 0, .push_constant_size = 0 };
+    // assemble_measure: SSBO[0..3]={d_raw,d_huff_lit,d_huff_tok,d_huff_off16},
+    //   [4]=descs, [5]=enc_sizes, [6]=scratch_u8 (a tiny placeholder needed
+    //   by the assembleSubChunk macro's static l-value check — see the
+    //   comment in assemble_measure_kernel.comp); push={n_subchunks} = 4 B.
+    pub const assemble_measure: EncodeKernelDecl = .{ .name = "assemble_measure", .n_bindings = 7, .push_constant_size = 4 };
+    // assemble_write: SSBO[0..3] same as measure, [4]=descs, [5]=d_frame;
+    //   push={n_subchunks} = 4 B.
+    pub const assemble_write: EncodeKernelDecl = .{ .name = "assemble_write", .n_bindings = 6, .push_constant_size = 4 };
+    // frame_assemble: SSBO[0]=d_input, [1]=d_asm_out, [2]=d_asm_offsets,
+    //   [3]=d_asm_chunk_sizes, [4]=d_chunk_dst, [5]=d_prefix_bytes,
+    //   [6]=d_output; push={prefix_size, hdr0, hdr1, n_chunks, eff_chunk_size,
+    //   src_len, sc_tail_off, end_mark_off} = 32 B.
+    pub const frame_assemble: EncodeKernelDecl = .{ .name = "frame_assemble", .n_bindings = 7, .push_constant_size = 32 };
 };
 
 /// CUDA reference: src/encode/module_loader.zig:50-98. One-shot loader.

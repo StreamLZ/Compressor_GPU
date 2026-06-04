@@ -1,12 +1,153 @@
 // 1:1 port of src/encode/assemble_kernel.cu, entry point slzFrameAssembleKernel.
-// CUDA reference: src/encode/assemble_kernel.cu.
+// CUDA reference: src/encode/assemble_kernel.cu:388-476. Final
+// device-resident frame writer: splices the assembled sub-chunk blocks
+// + host-precomputed per-chunk layout into a complete StreamLZ frame.
+// L1 hot path.
+//
 // See srcVK/PortInstructions.md.
-// L1 hot path: device-resident frame writer.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
-// CUDA: grid_x blocks × 128 threads per encode_assemble.zig:300.
-layout(local_size_x = 128) in;
+#include "lz_format.glsl"
 
-void main() {}
+// CUDA: (n_chunks + 1) blocks × 128 threads per encode_assemble.zig:300.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// CUDA reference: src/encode/assemble_kernel.cu:388-389. Sentinel +
+// flag bits.
+const uint UNCOMPRESSED_CHUNK_MARKER       = 0xFFFFFFFFu;
+const uint INTERNAL_BLOCK_UNCOMPRESSED_FLAG = 0x80u;
+
+// arg 0: const uint8_t* d_input
+layout(std430, binding = 0) readonly buffer DInputBuf {
+    uint8_t d_input[];
+};
+
+// arg 1: const uint8_t* d_asm_out
+layout(std430, binding = 1) readonly buffer DAsmOutBuf {
+    uint8_t d_asm_out[];
+};
+
+// arg 2: const uint32_t* d_asm_offsets
+layout(std430, binding = 2) readonly buffer DAsmOffsetsBuf {
+    uint d_asm_offsets[];
+};
+
+// arg 3: const uint32_t* d_asm_chunk_sizes
+layout(std430, binding = 3) readonly buffer DAsmChunkSizesBuf {
+    uint d_asm_chunk_sizes[];
+};
+
+// arg 4: const uint32_t* d_chunk_dst
+layout(std430, binding = 4) readonly buffer DChunkDstBuf {
+    uint d_chunk_dst[];
+};
+
+// arg 5: const uint8_t* d_prefix_bytes
+layout(std430, binding = 5) readonly buffer DPrefixBytesBuf {
+    uint8_t d_prefix_bytes[];
+};
+
+// arg 14: uint8_t* d_output
+layout(std430, binding = 6) buffer DOutputBuf {
+    uint8_t d_output[];
+};
+
+// Scalar args 6..13 ride in via push constants. Layout matches CUDA's
+// arg-list order. The two byte-sized args ride as uint slots so the
+// push-constant block stays std430-aligned.
+layout(push_constant) uniform Push {
+    uint prefix_size;
+    uint internal_hdr0;
+    uint internal_hdr1;
+    uint n_chunks;
+    uint eff_chunk_size;
+    uint src_len;
+    uint sc_tail_off;
+    uint end_mark_off;
+} pc;
+
+void main() {
+    const uint block_id = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint bdim = gl_WorkGroupSize.x;
+
+    // CUDA reference: src/encode/assemble_kernel.cu:412-448. Per-chunk
+    // payload block.
+    if (block_id < pc.n_chunks) {
+        const uint dst_off = d_chunk_dst[block_id];
+        const uint asm_start = d_asm_offsets[block_id];
+        const uint payload_size = d_asm_chunk_sizes[block_id];
+        const bool is_uncompressed = (asm_start == UNCOMPRESSED_CHUNK_MARKER);
+
+        if (lane == 0u) {
+            uint hdr0 = pc.internal_hdr0 & 0xFFu;
+            if (is_uncompressed) hdr0 = hdr0 | INTERNAL_BLOCK_UNCOMPRESSED_FLAG;
+            d_output[dst_off + 0u] = uint8_t(hdr0);
+            d_output[dst_off + 1u] = uint8_t(pc.internal_hdr1 & 0xFFu);
+            if (!is_uncompressed) {
+                // CUDA reference: src/encode/assemble_kernel.cu:425-431.
+                // 4-byte LE chunk header carries (payload_size - 1) in its
+                // low 18 bits.
+                uint hdr_u32 = payload_size - 1u;
+                uint w0; uint w1; uint w2; uint w3;
+                writeU32LE(w0, w1, w2, w3, hdr_u32);
+                d_output[dst_off + 2u] = uint8_t(w0);
+                d_output[dst_off + 3u] = uint8_t(w1);
+                d_output[dst_off + 4u] = uint8_t(w2);
+                d_output[dst_off + 5u] = uint8_t(w3);
+            }
+        }
+        // Cooperative copy. Compressed chunks pay 6 bytes (2-byte
+        // internal_hdr + 4-byte chunk_hdr); uncompressed pay 2.
+        const uint payload_dst = is_uncompressed ? (dst_off + 2u) : (dst_off + 6u);
+        if (is_uncompressed) {
+            const uint src_off = block_id * pc.eff_chunk_size;
+            for (uint i = lane; i < payload_size; i += bdim) {
+                d_output[payload_dst + i] = d_input[src_off + i];
+            }
+        } else {
+            for (uint i = lane; i < payload_size; i += bdim) {
+                d_output[payload_dst + i] = d_asm_out[asm_start + i];
+            }
+        }
+        return;
+    }
+
+    // CUDA reference: src/encode/assemble_kernel.cu:450-475. Final
+    // block writes the prefix bytes, SC tail prefix table, and end mark.
+    if (block_id == pc.n_chunks) {
+        for (uint i = lane; i < pc.prefix_size; i += bdim) {
+            d_output[i] = d_prefix_bytes[i];
+        }
+
+        // SC tail prefix: (n_chunks - 1) entries of 8 bytes each. Each
+        // entry copies the first 8 bytes of chunk (entry_idx+1) from
+        // d_input. The last entry may have fewer than 8 source bytes —
+        // pad with zeros.
+        if (pc.n_chunks > 1u) {
+            const uint total_tail_bytes = (pc.n_chunks - 1u) * 8u;
+            for (uint i = lane; i < total_tail_bytes; i += bdim) {
+                const uint entry_idx = i / 8u;
+                const uint byte_in_entry = i - entry_idx * 8u;
+                const uint chunk_idx = entry_idx + 1u;
+                const uint src_off = chunk_idx * pc.eff_chunk_size + byte_in_entry;
+                uint v = (src_off < pc.src_len) ? uint(d_input[src_off]) : 0u;
+                d_output[pc.sc_tail_off + i] = uint8_t(v);
+            }
+        }
+
+        // End mark: 4 zero bytes (lane-0 u32 store).
+        if (lane == 0u) {
+            uint e0; uint e1; uint e2; uint e3;
+            writeU32LE(e0, e1, e2, e3, 0u);
+            d_output[pc.end_mark_off + 0u] = uint8_t(e0);
+            d_output[pc.end_mark_off + 1u] = uint8_t(e1);
+            d_output[pc.end_mark_off + 2u] = uint8_t(e2);
+            d_output[pc.end_mark_off + 3u] = uint8_t(e3);
+        }
+        return;
+    }
+}

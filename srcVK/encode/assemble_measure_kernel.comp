@@ -1,11 +1,77 @@
 // 1:1 port of src/encode/assemble_kernel.cu, entry point slzAssembleMeasureKernel.
-// CUDA reference: src/encode/assemble_kernel.cu.
+// CUDA reference: src/encode/assemble_kernel.cu:317-332. Pass A of the
+// 3-pass assembly chain: measure each sub-chunk's assembled payload size
+// into `enc_sizes`. One warp per sub-chunk.
+//
 // See srcVK/PortInstructions.md.
-// L1 hot path: frame assembly pass A.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
-layout(local_size_x = 32) in;
+#include "lz_format.glsl"
+#include "assemble_core.glsl"
 
-void main() {}
+// CUDA: n_subchunks blocks × (32, 1, 1) threads per encode_assemble.zig:118.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// arg 0: const uint8_t* d_raw
+layout(std430, binding = 0) readonly buffer DRawBuf {
+    uint8_t d_raw[];
+};
+
+// arg 1: const uint8_t* d_huff_lit
+layout(std430, binding = 1) readonly buffer DHuffLitBuf {
+    uint8_t d_huff_lit[];
+};
+
+// arg 2: const uint8_t* d_huff_tok
+layout(std430, binding = 2) readonly buffer DHuffTokBuf {
+    uint8_t d_huff_tok[];
+};
+
+// arg 3: const uint8_t* d_huff_off16
+layout(std430, binding = 3) readonly buffer DHuffOff16Buf {
+    uint8_t d_huff_off16[];
+};
+
+// arg 4: const AssembleDesc* descs  (13 u32 per sub-chunk, 52 bytes)
+layout(std430, binding = 4) readonly buffer DescsBuf {
+    uint descs_raw[];
+};
+
+// arg 5: uint32_t* enc_sizes
+layout(std430, binding = 5) buffer EncSizesBuf {
+    uint enc_sizes[];
+};
+
+// Scalar arg 6 — n_subchunks — rides in via push constants.
+layout(push_constant) uniform Push {
+    uint n_subchunks;
+} pc;
+
+// VK adaptation: the measure pass never writes into a frame buffer.
+// glslc still l-value-checks the disabled-write branches statically, so
+// the `out_ssbo` slot needs a writable u8 SSBO even though the macro's
+// `out_write=false` argument turns every actual store into dead code.
+// `scratch_u8[]` is a 1-byte placeholder kept alive purely to satisfy
+// glslc; the driver does not bind real storage to binding 6 for this
+// pipeline.
+layout(std430, binding = 6) buffer ScratchBuf {
+    uint8_t scratch_u8[];
+};
+
+void main() {
+    const uint i = gl_WorkGroupID.x;
+    if (i >= pc.n_subchunks) return;
+    const uint lane = gl_LocalInvocationID.x & LANE_MASK;
+
+    uint enc_n = 0u;
+    assembleSubChunk(false,
+                     d_raw, d_huff_lit, d_huff_tok, d_huff_off16,
+                     descs_raw, i,
+                     scratch_u8, 0u, lane, enc_n);
+    if (lane == 0u) enc_sizes[i] = enc_n;
+}

@@ -10,6 +10,8 @@
 
 Project root: `c:/Users/james.JAMESWORK2025/Repos/Compressor_GPU`
 
+**Last commit: `cff79ec` — "srcVK port: phases 1-6 (foundation through decode context + timing)"** — this is the rollback point. 83 files, 28892 insertions. Everything in srcVK/ + build.zig wiring is committed. Pre-existing modifications to `/src/`, `/include/`, `CHANGELOG.md` are uncommitted and NOT ours.
+
 ### Phases complete
 
 | Phase | Scope | Status |
@@ -19,8 +21,10 @@ Project root: `c:/Users/james.JAMESWORK2025/Repos/Compressor_GPU`
 | Phase 1 fleshout | 10 foundation files (error.zig, version.zig, mmap.zig, format/*, common/*.glsl) + fix-up wave for missed L1 helpers (subchunkIsLz/Mode/CompSize, read8safe, warpCopy) | DONE — clean |
 | Phase 2 fleshout | 4 driver-layer files (vma.zig, decode/vulkan_api.zig, decode/descriptors.zig, encode/vulkan_ffi.zig) + fix-up adding 4 missing procs slots (ctx_set/get_current, h2d_async, d2h_async) | DONE — clean |
 | Phase 3+5 combined | 2 module_loader.zig (decode + encode) + 11 L2 stub .comp + 2 .glsl headers + 2 fix-ups (real vkCreateComputePipelines, real procs.launch_kernel, correct workgroup sizes, real encodeModuleLoadData) | DONE — clean |
+| Phase 4 | 6 L1 decode kernel files (slz_wire_format.glsl, lz_decode_core.glsl, lz_decode_raw.glsl, lz_dispatch.glsl, lz_decode_raw_kernel.comp, prefix_sum_chunks_kernel.comp) + fix-up (ported missing CUDA symbols ParsedStreams/parseRawStreamSize/parseEntropyHeader/skipEntropyStream; restored verbatim ENTROPY_SCRATCH_SLOT_BYTES name; ported both OFF16_SPLIT instantiations; parseAndDecodeSubChunk real body + off32 else-branch; updated module_loader KERNEL_DECLS) | DONE — clean |
+| Phase 6 | decode_context.zig (workspace pool with grow-only ensureDeviceBuf; real beginKernelTiming/endKernelTiming/finalizeProfiling) + scan_gpu.zig (gpuPrefixSumChunksImpl L1 real body via procs.launch_kernel; gpuScanChunks + gpuWalkFrameImpl L2 stubs) + timing infrastructure fix-up (5 new procs.event_* slots backed by VkQueryPool + vkCmdWriteTimestamp + vkGetQueryPoolResults) | DONE — clean |
 
-**Build state right now:** `zig build streamlz_vk -Doptimize=ReleaseFast` succeeds, exit 0. Produces `zig-out/bin/streamlz_vk.exe`. Runtime would return `error.NotYetPorted` or `error.NotImplementedL2` on any call because the L1 host orchestration (Phases 4, 6, 7, 10, 11) is still skeleton.
+**Build state right now:** `zig build streamlz_vk -Doptimize=ReleaseFast` succeeds, exit 0. Produces `zig-out/bin/streamlz_vk.exe`. Build passing means the type system + compilation are correct — **NOT that decompression works.** The L1 raw decode kernel body is real, the prefix-sum kernel is real, procs.* and module loader are real, decode_context workspace pool is real — but the host orchestration that actually wires buffers, builds descriptor sets, dispatches the kernel, and reads results back lives in Phase 7 (`decode_dispatch.zig::fullGpuLaunchImpl`) and Phase 11 (`streamlz_decoder.zig::decompressFramed` + `streamlz_gpu.zig::slzDecompressHost`). Both are still skeleton (return `error.NotYetPorted`). Earliest end-to-end decode = end of Phase 12.
 
 `zig build streamlz_vk_old -Doptimize=ReleaseFast` also succeeds — produces `streamlz_vk_old.exe` from `/src_vulkan/` (the legacy reimplementation). This keeps existing tooling working while the port progresses.
 
@@ -47,6 +51,20 @@ Phase 3+5 verifier rounds confirmed:
   - `scan_parse`, `gather_off16`: `local_size_x=256`
   - `lz_decode`, `lz_decode_raw`: `local_size_x=32, local_size_y=2`
   - `frame_assemble`: `local_size_x=128`
+
+Phase 4 verifier rounds confirmed:
+- `lz_decode_raw_kernel.comp`: real `slzLzDecodeRawKernel` body with 4 SSBO bindings (CompressedBuf, ChunksBuf, DstBuf, TotalChunksBuf) + 8B push constants (chunks_per_group + sub_chunk_cap). Per-chunk loop, sub-chunk header parse, parseAndDecodeSubChunkRaw dispatch, CHUNK_FLAG_UNCOMPRESSED + CHUNK_FLAG_MEMSET handling.
+- `prefix_sum_chunks_kernel.comp`: real `slzPrefixSumChunksKernel` body with 3 SSBO bindings (ChunksBuf, FirstSubIdxBuf, TotalSubchunksBuf) + 8B push constants. Sequential prefix-sum over chunks.
+- `lz_decode_raw.glsl`: both `decodeSubChunkRawMode_false` AND `decodeSubChunkRawMode_true` macros mirroring CUDA template instantiations.
+- `lz_dispatch.glsl`: `parseAndDecodeSubChunkRaw` real body (off32==0 fast path + off32!=0 else-branch dispatching to decodeSubChunkGeneral L2 stub). `parseAndDecodeSubChunk` real body (calls parseSubChunkHeaders L2 stub + dispatches to decodeSubChunkRawMode_{true,false} or decodeSubChunkGeneral_{true,false} based on mode bits).
+- CUDA → GLSL intrinsic mapping verified: `__shfl_sync` → `subgroupShuffle`, `__ballot_sync` → `subgroupBallot.x`, `__syncwarp` → `subgroupBarrier()+subgroupMemoryBarrierBuffer()`. `__clz(0)=32` edge case guarded externally at call sites.
+
+Phase 6 verifier rounds confirmed:
+- `decode_context.zig`: every `d_*` device buffer field present with verbatim CUDA name as `VkDeviceBuffer`. `ensureDeviceBuf` grow-only (early-return when `current_size >= needed`; free-then-alloc only when growing). Every device op routed through `vk.procs.*` — zero direct vk*/vma calls. `bindContextToCallingThread` calls `procs.ctx_set_current`. **Profiling is real**: `beginKernelTiming` calls `procs.event_create` twice + `procs.event_record(start)` + appends to pending. `endKernelTiming` calls `procs.event_record(end)`. `finalizeProfiling` iterates pending, calls `procs.event_synchronize` + `procs.event_elapsed_time` + `procs.event_destroy` for each, appends to last_timings.
+- `scan_gpu.zig`: `gpuPrefixSumChunksImpl` real L1 body — `procs.launch_kernel(prefix_sum_chunks_fn, ...)` with params[] = 3 buffer pointers + 8B push constants. `gpuScanChunks` and `gpuWalkFrameImpl` are L2 stubs returning `error.NotImplementedL2`. (Note: `gpuScanChunks` signature changed from CUDA's `?ScanResult` to `GpuError!ScanResult` for L2 stub pattern — defensible.)
+- `vulkan_api.zig` Procs struct grew from 18 → 23 slots (added event_create, event_record, event_synchronize, event_elapsed_time, event_destroy). `VkEvent` type alias declared.
+- `module_loader.zig`: VkQueryPool of 4096 timestamp slots created at init via `vkCreateQueryPool`. `timestampPeriod` queried from `VkPhysicalDeviceLimits` via newly-added `vkGetPhysicalDeviceProperties` FFI. 5 `procEvent*` functions implemented using `vkCmdResetQueryPool` + `vkCmdWriteTimestamp(BOTTOM_OF_PIPE)` + `vkGetQueryPoolResults(VK_QUERY_RESULT_64_BIT|WAIT)` + `index * timestampPeriod / 1_000_000` ms conversion. Free-list `g_query_index_free` manages slot allocation. All 5 slots registered into `vulkan_api.procs.event_*` at init.
+
 - Grep across all touched files for forbidden rationalization phrases: **zero hits**
 
 ---
@@ -55,9 +73,7 @@ Phase 3+5 verifier rounds confirmed:
 
 | Phase | Scope | Files |
 |---|---|---|
-| 4 | L1 decode kernels (real GLSL ports) | 6: slz_wire_format.glsl, lz_decode_core.glsl, lz_decode_raw.glsl, lz_dispatch.glsl, lz_decode_raw_kernel.comp, prefix_sum_chunks_kernel.comp |
-| 6 | Decode context + scan_gpu | 2: decode/decode_context.zig, decode/scan_gpu.zig |
-| 7 | Decode dispatch orchestration (L2 gate) | 2: decode/decode_dispatch.zig, decode/driver.zig |
+| 7 | Decode dispatch orchestration (L2 gate at `fullGpuLaunchImpl`) | 2: decode/decode_dispatch.zig, decode/driver.zig |
 | 8 | L1 encode kernels (real GLSL ports) | 7: lz_format.glsl, lz_token_emit.glsl, lz_greedy_parser.glsl, lz_encode_kernel.comp, assemble_measure_kernel.comp, assemble_write_kernel.comp, frame_assemble_kernel.comp |
 | 9 | L2 stub encode kernels | 3: lz_chain_parser.glsl, huff_build_tables_kernel.comp, huff_encode_4stream_kernel.comp |
 | 10 | Encode context + LZ + assemble host orchestration | 5: encode/encode_context.zig, levels.zig, encode_lz.zig, encode_assemble.zig, encode_huff.zig (stub bodies) |
@@ -66,6 +82,8 @@ Phase 3+5 verifier rounds confirmed:
 | 13 | Tests (Exception 3) | 8 test files + test runner |
 
 After Phase 13: **Step 5 — get it working** (allowed to consult `/src_vulkan/` as a troubleshooting reference at this point ONLY).
+
+**Earliest end-to-end decompression = end of Phase 12.** Phase 7 lights up the GPU-side decode flow. Phase 11 lights up the host orchestration + C ABI. Phase 12 wires the CLI. Step 5 debugs.
 
 ### Done bar (all three required, NOT before)
 
@@ -375,36 +393,191 @@ CUDA wastefully dispatches L2 kernels (prefix_sum, scan_parse, compact_*, gather
 
 ---
 
-## 8. Specific Next Step (Phase 4)
+## 8. Per-Phase Roadmap
 
-Phase 4 is the **L1 decode kernels — real GLSL ports**. 6 files. **Highest port-fidelity risk yet** because CUDA `__device__` C++ + warp intrinsics become GLSL with subgroup intrinsics, and subgroup semantics differ subtly from CUDA warp semantics on edge cases.
+Detailed playbook for each remaining phase. Each phase is its own fleshout workflow + verify pass. Phase 7 is next; the others run sequentially after.
 
-### Files
-1. `srcVK/decode/slz_wire_format.glsl` ← `src/decode/slz_wire_format.cuh` (device-side wire-format constants + SSBO descriptor struct layouts MUST match `descriptors.zig` byte-for-byte)
-2. `srcVK/decode/lz_decode_core.glsl` ← `src/decode/lz_decode_core.cuh` (shared warp primitives: `warpScanU32`, `warpLiteralCopy`, `warpMatchCopy` — these are L1 hot-path inner loops)
-3. `srcVK/decode/lz_decode_raw.glsl` ← `src/decode/lz_decode_raw.cuh` (raw-mode sub-chunk decoder helpers)
-4. `srcVK/decode/lz_dispatch.glsl` ← `src/decode/lz_dispatch.cuh` (parseAndDecodeSubChunkRaw — L1; general path stays stubbed)
-5. `srcVK/decode/lz_decode_raw_kernel.comp` (entry `slzLzDecodeRawKernel` — the actual L1 decode workhorse kernel; bindings already declared in Phase 3+5 fix-up — fill the body)
-6. `srcVK/decode/prefix_sum_chunks_kernel.comp` (entry `slzPrefixSumChunksKernel` — always runs)
+### Phase 7 — Decode dispatch orchestration with the L2 gate
 
-### Critical port concerns
-- CUDA `__shfl_sync` → GLSL `subgroupShuffle`
-- CUDA `__ballot_sync` → GLSL `subgroupBallot`
-- CUDA `__clz` → GLSL `findMSB` (be careful: `__clz(0) = 32` on CUDA; `findMSB(0) = -1` on GLSL — possibly needs `(32 - 1) - findMSB(x)` wrapper)
-- CUDA `__popc` → GLSL `bitCount`
-- WARP_SIZE = 32 verbatim per gpu_warp.glsl
-- SSBO bindings already declared in Phase 3+5 fix-up — fill the body, don't rewrite the bindings
-- Cite CUDA file:line for every device function ported
-- DO NOT consult src_vulkan/'s `lz_decode.comp` for structure (it's the failed reimplementation); only for "how does GLSL handle X" patterns
+2 files. This is where the actual GPU-side decode flow lights up — `fullGpuLaunchImpl` orchestrates input H2D, the prefix-sum dispatch, the L1 raw decode dispatch, and output D2H.
 
-### Workflow shape for Phase 4
-- Single fleshout agent
-- 6 parallel verifiers (one per file)
-- Verifier checks: function names verbatim, SSBO bindings preserved, subgroup intrinsics used correctly, NO rationalization, NO src_vulkan wholesale-copy
-- If any verifier returns partial/fake → fix-up sub-workflow
+**Files:**
+1. `srcVK/decode/decode_dispatch.zig` ← `src/decode/decode_dispatch.zig`
+   - `fullGpuLaunchImpl` — orchestrates the full decode pipeline. Reads compressed input via `procs.h2d`, calls `gpuPrefixSumChunksImpl` (always runs on L1), gates L2 work, dispatches the LZ raw kernel via `procs.launch_kernel(module_loader.kernel_raw_fn, ...)`, reads result back via `procs.d2h`.
+   - `runHuffBuildAndDecode`, `runLzPipeline`, `finalizeOutput`, `uploadInputAndPrefixSum`, `runBackHalf`, `mergeHuffDescs`, `gatherRawOff16`, `emitE2eTrace`
+   - `VkProcs` struct (renamed from `CudaProcs`) — bundle of function pointer slots resolved at entry. Real implementation.
+   - **L2 gate position:** wrap `if (level >= 2) { ... }` around the Huff/scan/compact/merge/gather paths AND their buffer allocations. Earliest possible point. See gameplan EXCEPTION 2.
+   - Per-call `level` plumbed via `DecodeRequest.level`.
 
-### After Phase 4
-Phase 6 is decode_context.zig + scan_gpu.zig. Phase 7 is decode_dispatch.zig with the L2 gate. After Phases 6+7 the decode path is fully real. Then encode (8+9+10), then top-level (11), then CLI (12), then tests (13).
+2. `srcVK/decode/driver.zig` ← `src/decode/driver.zig`
+   - Façade. Re-exports + `pub var g_default: DecodeContext`, `pub var last_kernel_ns`, `last_lz_kernel_ns`, `last_huff_kernel_ns`
+   - `init` (chains into `module_loader.init`), `isAvailable`, descriptor types, host I/O helpers, `qpcNow`/`qpcMs`
+   - Mostly pub var declarations and pass-through re-exports.
+
+**Critical port concerns:**
+- **L2 gate at the EARLIEST point** before any L2-specific allocation. Wrap allocations of `d_compact_counts`, `d_scan_staged`, `d_first_subchunk_idx`, `d_entropy_scratch`, etc. behind the gate. Skip the gpuScanChunks/gpuWalkFrameImpl calls entirely.
+- VkProcs gets populated from `vulkan_api.procs` at entry. Don't call `procs.h2d` directly; use the `VkProcs` struct passed through `fullGpuLaunchImpl` signature.
+- KERNEL_DECLS for `kernel_raw_fn` is `n_bindings=4, push_constant_size=8` (CompressedBuf, ChunksBuf, DstBuf, TotalChunksBuf + chunks_per_group + sub_chunk_cap). `prefix_sum_chunks_fn` is `n_bindings=3, push=8`. When you call `procs.launch_kernel`, build params[] matching those declarations exactly.
+- Use `decode_context.ensureDeviceBuf` for buffer slot growth — DO NOT call `procs.malloc_device` directly. The pool pattern is grow-only.
+
+**Workflow:** single fleshout + 2 parallel verifiers. Verifier checks: L2 gate at earliest point, function names verbatim, procs.* used throughout, real `fullGpuLaunchImpl` body (not return-only stub), NO rationalization, NO src_vulkan wholesale-copy.
+
+---
+
+### Phase 8 — L1 encode kernels (real GLSL ports)
+
+7 files. The encode hot path: warp-parallel greedy LZ parser (L1-L4) + 3-pass frame assembler. **Same port-fidelity risk as Phase 4** because CUDA `__device__` C++ + warp intrinsics become GLSL with subgroup intrinsics.
+
+**Files:**
+1. `srcVK/encode/lz_format.glsl` ← `src/encode/lz_format.cuh` — encoder-private hash-table constants (`NEXT_HASH_SIZE`, hash-layout, etc.)
+2. `srcVK/encode/lz_token_emit.glsl` ← `src/encode/lz_token_emit.cuh` — token-emission helpers shared by greedy + chain parsers
+3. `srcVK/encode/lz_greedy_parser.glsl` ← `src/encode/lz_greedy_parser.cuh` — warp-parallel greedy LZ parser (L1-L4 path; the encoder hot path workhorse)
+4. `srcVK/encode/lz_encode_kernel.comp` (entry `slzLzEncodeKernel`) ← `src/encode/lz_kernel.cu` — the L1 hot encode kernel
+5. `srcVK/encode/assemble_measure_kernel.comp` (entry `slzAssembleMeasureKernel`) ← `src/encode/assemble_kernel.cu` — pass A of frame assembly
+6. `srcVK/encode/assemble_write_kernel.comp` (entry `slzAssembleWriteKernel`) ← `src/encode/assemble_kernel.cu` — pass B of frame assembly
+7. `srcVK/encode/frame_assemble_kernel.comp` (entry `slzFrameAssembleKernel`) ← `src/encode/assemble_kernel.cu` — device-resident frame writer
+
+**Critical port concerns:**
+- CUDA → GLSL intrinsic mapping (same as Phase 4): `__shfl_sync` → `subgroupShuffle`, `__ballot_sync` → `subgroupBallot.x`, `__syncwarp` → `subgroupBarrier()+subgroupMemoryBarrierBuffer()`. `__clz(0)=32` edge case guarded externally.
+- WARP_SIZE = 32 verbatim per `gpu_warp.glsl`.
+- SSBO bindings + workgroup sizes already declared from Phase 3+5 stub layout — verify match against CUDA kernel arg lists; the .comp bodies are what get filled.
+- The greedy parser is the encoder workhorse — CUDA uses per-warp work distribution, hash-table lookups for match finding, lazy token emission.
+- The 3-pass assembly chain has dependency edges (measure → write → frame_assemble) — preserve CUDA's pass order verbatim.
+- DO NOT consult `src_vulkan/`'s `lz_encode.comp` for structure (different failed reimplementation; F019 audit finding). Only for "how does GLSL handle X" patterns.
+
+**Workflow:** single fleshout + 7 parallel verifiers. Verifier checks: function names verbatim, SSBO bindings preserved, subgroup intrinsics correct, NO rationalization, NO src_vulkan wholesale-copy, kernel arg lists match CUDA byte-for-byte.
+
+---
+
+### Phase 9 — L2 stub encode kernels
+
+3 files. Small scope. Declarations only; bodies stubbed (L5 chain parser + L3-5 Huffman).
+
+**Files:**
+1. `srcVK/encode/lz_chain_parser.glsl` ← `src/encode/lz_chain_parser.cuh` — serial chain-hash lazy LZ parser (L5 only)
+2. `srcVK/encode/huff_build_tables_kernel.comp` (entry `slzHuffBuildTablesKernel`) ← `src/encode/huffman_kernel.cu` — L3-5 Huffman table construction
+3. `srcVK/encode/huff_encode_4stream_kernel.comp` (entry `slzHuffEncode4StreamKernel`) ← `src/encode/huffman_kernel.cu` — L3-5 4-stream Huffman encode
+
+**Critical port concerns:**
+- Pattern is the same as decode L2 stubs from Phase 5: function/kernel declarations exist with SSBO bindings matching CUDA arg lists; `void main() { return; }` bodies.
+- SSBO bindings + workgroup sizes already declared from Phase 3+5 stub layout — verify still correct against CUDA arg lists.
+- L2 gate in `fast_framed.zig::compressFramedOne` (Phase 11) skips these via `opts.level >= 3` — they never run on L1/L2.
+- KERNEL_DECLS in encode `module_loader.zig` already accounts for these slots (Phase 3+5 work).
+- `lz_chain_parser.glsl` declares parser device functions matching CUDA's signature with empty bodies (the parser is called from inside `lz_encode_kernel.comp` only at L5; L1 dispatch never reaches it).
+
+**Workflow:** single fleshout + 3 parallel verifiers. Verifier checks: stub pattern preserved, bindings match CUDA arg list, main() empty, no L1 logic accidentally leaked, no rationalization.
+
+---
+
+### Phase 10 — Encode host orchestration
+
+5 files. Pure host Zig. Encode equivalent of Phase 6 (decode_context + scan_gpu).
+
+**Files:**
+1. `srcVK/encode/encode_context.zig` ← `src/encode/encode_context.zig` — encode workspace pool. Mirrors `decode_context.zig` but with encoder-specific `d_*` fields (d_input, d_hash, d_cmd_stream, d_lit_stream, d_off16_stream, d_length_stream, d_off32_stream, d_assembled_offsets, d_assembled_sizes, d_huff_*, etc.). Has its own `ensureBuf` grow-only helper. Defines `CompressChunkDesc`, `AssembleDesc`, `HuffEncDesc`.
+2. `srcVK/encode/levels.zig` ← `src/encode/levels.zig` — `hashBitsForLevel(level)` (L1=17, L2-3 higher), `useChainParser(level)` (true only at L5). Pure host Zig, ~20 lines.
+3. `srcVK/encode/encode_lz.zig` ← `src/encode/encode_lz.zig` — `gpuCompressImpl` — the L1 hot encode kernel launcher. Calls `procs.launch_kernel(module_loader.kernel_fn, ...)` (encode-side `kernel_fn` from Phase 3+5).
+4. `srcVK/encode/encode_assemble.zig` ← `src/encode/encode_assemble.zig` — `gpuAssembleFrameImpl` + `gpuFrameAssembleImpl`. The 3-pass assembly chain: measure (kernel 1) + write (kernel 2) + frame_assemble (kernel 3).
+5. `srcVK/encode/encode_huff.zig` ← `src/encode/encode_huff.zig` — **L2 stub**. `gpuEncodeHuffImpl`, `gpuEncodeLiteralsHuffImpl`, `gpuEncodeTokensHuffImpl`, `gpuEncodeOff16HuffImpl` bodies return `false` (the bool-convention matching CUDA's L1 gate fall-through pattern — `fast_framed.zig` at Phase 11 checks `opts.level >= 3` and skips).
+
+**Critical port concerns:**
+- procs.* surface only — no direct vk*/vma calls in any encode_*.zig file.
+- `encode_context.zig::ensureBuf` mirrors CUDA's grow-only semantics (same pattern as `decode_context.zig::ensureDeviceBuf` from Phase 6).
+- The 3-pass assembly chain uses dependency edges between kernels — preserve CUDA's pass order verbatim. Each pass writes outputs that the next pass reads.
+- Huff stubs return `false` not `error.NotImplementedL2` — CUDA uses bool return on the L1 gate; matching the call-site shape in `fast_framed.zig`.
+- `gpuCompressImpl` calls into the encode-side procs surface via `vulkan_ffi.zig` slots from Phase 2 (which delegate to vulkan_api.procs via the shared FFI shim from Phase 3+5).
+
+**Workflow:** single fleshout + 5 parallel verifiers. Verifier checks: procs.* used (no direct vk*/vma), `encode_context.ensureBuf` grow-only, `encode_lz`/`encode_assemble` real L1 bodies calling procs.launch_kernel with correct params[] matching encode-side KERNEL_DECLS, `encode_huff` returns false for L2 stub pattern, no rationalization.
+
+---
+
+### Phase 11 — Top-level encoder + decoder + C ABI
+
+5 files. **This is when the public API surface becomes callable.** `slzCompressHost` and `slzDecompressHost` actually execute end-to-end (modulo CLI wiring in Phase 12).
+
+**Files:**
+1. `srcVK/encode/fast_framed.zig` ← `src/encode/fast_framed.zig` — `compressFramedOne` — the L1 encode orchestrator. **Contains the encode-side L2 gate: `if (opts.level >= 3) { ... }` already in CUDA — preserve verbatim.** Sizes buffers, chunks input, calls `gpuCompressImpl` + `gpuAssembleFrameImpl` + `gpuFrameAssembleImpl`. Reads `cuda_api.sm_count` to pick `sc_group_size` — VK equivalent must decide via gameplan Section H.Q2.
+2. `srcVK/encode/streamlz_encoder.zig` ← `src/encode/streamlz_encoder.zig` — `compressFramed`, `compressFramedWithIo`, `compressBound`, `CompressError`, `Options`. Entry point from public C ABI.
+3. `srcVK/encode/driver.zig` ← `src/encode/driver.zig` — facade. Re-exports + `pub var g_default: EncodeContext`, `pub var last_kernel_ns: i64`, `init`, `isAvailable`, descriptor types, host I/O helpers, kernel-arg constants (`SC_TAIL_PER_CHUNK_BYTES`, `CHUNK_INTERNAL_HDR_BYTES`, etc.).
+4. `srcVK/decode/streamlz_decoder.zig` ← `src/decode/streamlz_decoder.zig` — `decompressFramed`, `decompressFramedThreaded`, `decompressFramedFromDevice` (L2 stub — async D2D), `decompressFrameInner`, `dispatchCompressedBlock`, **`buildChunkDescriptors`** (CPU walk — see critical concern below).
+5. `srcVK/streamlz_gpu.zig` ← `src/streamlz_gpu.zig` — public C ABI: `slzCompressHost`, `slzDecompressHost`, `slzCompressAsync`, `slzDecompressAsync`, `slzCreate`, `slzDestroy`, `slzGetDecompressedSize`, `slzVersionString`, `slzStatusString`. Signatures from `/include/streamlz_gpu.h` (UNCHANGED at /include/).
+
+**Critical port concerns:**
+- `fast_framed.zig` has the encode-side L2 gate at `opts.level >= 3` — port verbatim from CUDA.
+- **`streamlz_decoder.zig::buildChunkDescriptors` is CPU walk in CUDA** — the L1 host-input decode path. The prior failed session moved this to GPU as `walk_frame` + `l1_unwrap` kernels; **THAT WAS A PORT VIOLATION.** Keep buildChunkDescriptors on CPU. The `walk_frame` GPU kernel is gated to the D2D entry point only (`decompressFramedFromDevice`, currently L2 stub per audit Section H Q3). See [feedback-port-means-port] memory rule.
+- C ABI signatures in `/include/streamlz_gpu.h` are unchanged — match them exactly.
+- Async paths (`slzCompressAsync`, `slzDecompressAsync`) — L2 stub for now (audit Section H Q3); only sync C ABI is L1 scope.
+- `slzGetDecompressedSize` reads the frame header using `frame_format.parseHeader` from Phase 1.
+- `streamlz_gpu.zig` binds the public C ABI to the underlying encoder/decoder dispatchers; Phase 12 CLI calls into this layer.
+
+**Workflow:** single fleshout + 5 parallel verifiers. Verifier checks: encode-side L2 gate present at `fast_framed`, **`buildChunkDescriptors` is CPU walk** (NOT moved to GPU — this is the smoking-gun check for port-fidelity), C ABI signatures match `/include/streamlz_gpu.h`, async paths stub to `NotImplementedL2`, no rationalization, no src_vulkan wholesale-copy.
+
+---
+
+### Phase 12 — CLI surface
+
+9 files. Mechanical port from CUDA's CLI; mirrors `streamlz.exe`'s command list exactly.
+
+**Files:**
+1. `srcVK/cli/util.zig` ← `src/cli/util.zig` — `Args` parsing struct, `requireInput`, `checkLevel`, output-path derivation, memory reporting. Default device-spec resolution from `SLZ_VK_DEVICE_INDEX` env var.
+2. `srcVK/cli/info.zig` ← `src/cli/info.zig` — frame-format dumper. Pure host — parses SLZ1 frame header + block headers + chunk headers, prints summary. No GPU init required.
+3. `srcVK/cli/decompress.zig` ← `src/cli/decompress.zig` — `streamlz_vk -d in.slz -o out` — single decompress. Calls `slzDecompressHost` (Phase 11).
+4. `srcVK/cli/compress.zig` ← `src/cli/compress.zig` — `streamlz_vk -c in -o out.slz -l 1` — single compress. Calls `slzCompressHost` (Phase 11).
+5. `srcVK/cli/bench_decompress.zig` ← `src/cli/bench_decompress.zig` — `streamlz_vk -db in.slz -r N` — decompress benchmark. Median of N runs + warm-up. Prints e2e + d2d.
+6. `srcVK/cli/bench_compress.zig` ← `src/cli/bench_compress.zig` — `streamlz_vk -bc in -r N` — compress benchmark.
+7. `srcVK/cli/bench_all.zig` ← `src/cli/bench_all.zig` — `streamlz_vk -b in -r N` — full encode+decode roundtrip benchmark sweeping levels 1..5.
+8. `srcVK/cli.zig` ← `src/cli.zig` — dispatcher. Parses argv mode flag, dispatches to runCompress/runDecompress/runBench*/etc.
+9. `srcVK/main.zig` ← `src/main.zig` — entry point. Sets up allocator + IO, calls `cli.run`.
+
+**Critical port concerns:**
+- The CLI MUST print the bound `vkPhysicalDeviceProperties.deviceName` on every invocation. Non-negotiable per the gameplan rules (Intel-iGPU saga from prior session). Pattern: print `Device: NVIDIA GeForce RTX 4060 Ti` once at startup after device selection.
+- Default device selection: prefer DISCRETE_GPU > INTEGRATED_GPU > VIRTUAL_GPU > CPU > OTHER. Env override: `SLZ_VK_DEVICE_INDEX=N`. Explicit `--device N` or `--device <name-substring>` CLI flag.
+- Diagnostic env var `SLZ_VK_PROFILE_DECODE=1` toggles per-phase QPC timing + per-kernel `kper:` line + caller-import path telemetry (already wired via `decode_context.last_*` fields from Phase 6).
+- Bench output format MUST match CUDA's `streamlz -db` output for apples-to-apples comparison (per gameplan Perf bar section). Format: `Decompress median: e2e <N>ms (<X> MB/s)  d2d <N>ms (<X> MB/s)`.
+- `cli/info.zig` is pure host — no GPU init. Lets the user inspect frames without device dependencies.
+- DO NOT add extra flags or modes that CUDA's CLI doesn't have — 1:1 port. The only allowed Vulkan-specific flag is `--device N|name` (CUDA doesn't need it because CUDA picks GPU 0 by convention).
+
+**Workflow:** single fleshout + 9 parallel verifiers. Verifier checks: every CUDA CLI flag/mode preserved, deviceName print wired at startup, SLZ_VK_DEVICE_INDEX env handled, no extra flags invented, no rationalization, bench output format matches CUDA's `streamlz -b`/`-db` format byte-for-byte where possible.
+
+---
+
+### Phase 13 — Tests (Exception 3)
+
+8 test files + 1 test runner. **NEW files** — CUDA has no tests. The user explicitly approved adding them (Exception 3). `tests/goldens/` directory at repo root already has byte-fixtures from prior runs.
+
+**Files:**
+1. `srcVK/test_runner_parallel.zig` ← `src/test_runner_parallel.zig` — parallel test runner used by `zig build ptest`. **Verbatim port** (CUDA has this file; only the test-content files in `srcVK/tests/` are new).
+2. `srcVK/tests/decoder_unit.zig` (NEW) — unit tests for `srcVK/decode/streamlz_decoder.zig`: `parseHeader` / `parseBlockHeader` / `parseChunkHeader` edge cases. Pure host, no GPU.
+3. `srcVK/tests/encoder_unit.zig` (NEW) — unit tests for `srcVK/encode/streamlz_encoder.zig`: `compressBound` math, `Options` validation (BadLevel, BadBlockSize, BadScGroupSize), `writeUncompressedFrame` path for tiny inputs. No GPU.
+4. `srcVK/tests/dispatch_unit.zig` (NEW) — unit tests for `srcVK/decode/decode_dispatch.zig`: **L2 gate behavior** (level=1 skips Huff/scan/compact/merge/gather), `runLzPipeline` raw-kernel selection, `buildChunkDescriptors` output. Some GPU.
+5. `srcVK/tests/kernel_conformance.zig` (NEW) — kernel conformance. Feed known sub-chunk inputs into `slzLzDecodeRawKernel`, `slzPrefixSumChunksKernel`, `slzLzEncodeKernel`, `slzAssembleMeasureKernel`, `slzAssembleWriteKernel`, `slzFrameAssembleKernel` via VK; assert byte-identical outputs vs CUDA goldens stored in `tests/goldens/`.
+6. `srcVK/tests/l1_decode_roundtrip.zig` (NEW) — golden L1 frames (encoded via CUDA reference or fresh VK encode) → decoded via VK port → byte-compare against original.
+7. `srcVK/tests/l1_encode_roundtrip.zig` (NEW) — random + structured payloads encoded via VK port → decoded via VK port → byte-compare. Levels 1-2 exercised here.
+8. `srcVK/tests/cross_backend_roundtrip.zig` (NEW) — encode via CUDA, decode via VK; encode via VK, decode via CUDA. Levels 1-2 full. **The strictest fidelity check.**
+9. `srcVK/tests/cli_smoke.zig` (NEW) — smoke test the VK binary: `streamlz_vk -c file -o out.slz` then `streamlz_vk -d out.slz -o roundtrip` and compare to original. Exercises every CLI mode at L1.
+
+**Critical port concerns:**
+- Tests are NEW — no CUDA counterpart in `/src/`. They go in `srcVK/tests/` (already created in Step 2 stub layout).
+- `tests/goldens/` directory exists at repo root with byte-fixtures from CUDA runs — reuse for VK kernel conformance.
+- Test runner (`test_runner_parallel.zig`) IS a verbatim port from CUDA (one of the few "ported as Zig"-extension files).
+- The cross-backend roundtrip tests are the strictest fidelity check — they validate byte-identical encode AND decode against CUDA. If they pass, the L1 port is functionally complete.
+- DO NOT skip tests that fail. If a test fails, the port has a bug — fix it in Step 5.
+- build.zig already has the `ptest_vk` step (or equivalent) wired in Step 2.
+- For Phase 13 specifically: assertions must FIRE (not tautological). The verifier should check that each test would fail if the underlying invariant were broken.
+
+**Workflow:** single fleshout + 9 parallel verifiers. Each verifier checks: covers public surface, uses real srcVK code (not src_vulkan/), assertions fire (not tautological), cross-backend tests reach CUDA reference, kernel conformance reads `tests/goldens/`, build verification of `zig build ptest_vk` passes.
+
+---
+
+### After Phase 13: Step 5 — Get it working
+
+The binary builds, the test suite is wired. Now run it. Debug whatever doesn't work.
+
+`/src_vulkan/` is allowed as a troubleshooting reference at this point ONLY for: which Vulkan extensions to enable on a given GPU, what memory-type bits work on which device, what command buffer / fence / submit pattern handles a specific bug. NEVER as a structural reference (the port structure stays from CUDA).
+
+Compare srcVK behavior against CUDA byte-by-byte using the round-trip tests until everything passes. Use nsys for per-kernel perf comparison (see gameplan Section 5 M7 for the env vars that make Vulkan tracing actually work).
+
+The done bar is `functional + structural + perf` (gameplan Section 1). All three. Not before. Not "good enough." Not "1.14× is fine."
 
 ---
 
@@ -427,11 +600,12 @@ The user's vibe: precise, exacting, has been burned, will catch every rationaliz
 If you're the post-compact me (or any agent picking this up), the immediate action is:
 
 1. Read `/srcVK/audit.md` end-to-end
-2. Read `/srcVK/PortInstructions.md` Phase 4 section
+2. Read `/srcVK/PortInstructions.md` Phase 7 section (next phase)
 3. Verify build still works: `zig build streamlz_vk -Doptimize=ReleaseFast` from project root
 4. Verify build of legacy: `zig build streamlz_vk_old -Doptimize=ReleaseFast`
-5. Read the prior Phase 3+5 module_loader.zig files as templates of correct port style
-6. Confirm with user before launching Phase 4 fleshout — they'll want to review the agent prompt first
+5. Read the prior Phase 6 `decode_context.zig` + `scan_gpu.zig` for the procs.* usage pattern Phase 7 will follow
+6. Confirm with user before launching Phase 7 fleshout — they'll want to review the agent prompt first
+7. Current commit: `cff79ec` — this is the rollback point if Phase 7+ goes sideways
 
 The done bar is **functional + structural + perf**. Not before. Not "good enough." Not "1.14× is fine."
 
