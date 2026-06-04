@@ -29,6 +29,245 @@ const VkDeviceBuffer = vulkan_api.VkDeviceBuffer;
 const VkStream = vulkan_api.VkStream;
 const VK_SUCCESS_RC = vulkan_api.VK_SUCCESS_RC;
 
+// ── Device selection (VK port carve-out) ─────────────────────────────
+// VK adaptation: CUDA always picks device 0; the VK port lets the CLI
+// override the picked device via setDeviceSelector before init() runs.
+// Selectors map to vkEnumeratePhysicalDevices ordering (by_index) or a
+// case-insensitive substring of vkPhysicalDeviceProperties.deviceName
+// (by_name); .default falls back to SLZ_VK_DEVICE_INDEX env then the
+// "discrete > integrated > virtual > cpu > other" priority scorer.
+pub const DeviceSelector = union(enum) {
+    default,
+    by_index: u32,
+    by_name: []const u8,
+};
+var g_requested_selector: DeviceSelector = .default;
+
+pub fn setDeviceSelector(sel: DeviceSelector) void {
+    g_requested_selector = sel;
+}
+
+// Cached name of the physically-bound device, populated by init() after
+// vkCreateDevice succeeds. Sliced at the first NUL for CLI printing.
+var g_bound_device_name_buf: [256]u8 = @splat(0);
+var g_bound_device_name_len: usize = 0;
+
+pub fn readBoundDeviceName(buf: []u8) []const u8 {
+    const n = if (g_bound_device_name_len > buf.len) buf.len else g_bound_device_name_len;
+    @memcpy(buf[0..n], g_bound_device_name_buf[0..n]);
+    return buf[0..n];
+}
+
+// VK adaptation: lowercase one ASCII byte for case-insensitive deviceName
+// substring matching used by the `by_name` selector branch below.
+fn asciiToLowerLocal(c: u8) u8 {
+    return if (c >= 'A' and c <= 'Z') c + 32 else c;
+}
+
+fn containsIgnoreCaseLocal(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var match = true;
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (asciiToLowerLocal(haystack[i + j]) != asciiToLowerLocal(needle[j])) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+// VK adaptation: deviceType priority scorer (DISCRETE > INTEGRATED >
+// VIRTUAL > CPU > OTHER) used by the `default` selector branch when
+// SLZ_VK_DEVICE_INDEX is unset. Mirrors src_vulkan/device.zig:deviceTypeScore.
+fn deviceTypeScoreLocal(device_type: c_int) u8 {
+    // VkPhysicalDeviceType: OTHER=0, INTEGRATED=1, DISCRETE=2, VIRTUAL=3, CPU=4
+    return switch (device_type) {
+        2 => 4,
+        1 => 3,
+        3 => 2,
+        4 => 1,
+        else => 0,
+    };
+}
+
+fn hasComputeQueueLocal(pd: VkPhysicalDevice) bool {
+    const get_qf = vkGetPhysicalDeviceQueueFamilyProperties_fn orelse return false;
+    var qf_count: u32 = 0;
+    get_qf(pd, &qf_count, null);
+    if (qf_count == 0) return false;
+    var qf_buf: [32]VkQueueFamilyProperties = undefined;
+    var qfc = if (qf_count > 32) @as(u32, 32) else qf_count;
+    get_qf(pd, &qfc, @ptrCast(&qf_buf));
+    for (qf_buf[0..qfc]) |qf| {
+        if ((qf.queueFlags & VK_QUEUE_COMPUTE_BIT) != 0 and qf.queueCount > 0) return true;
+    }
+    return false;
+}
+
+fn readPdNameInto(pd: VkPhysicalDevice, buf: []u8) []const u8 {
+    const gpdp = vkGetPhysicalDeviceProperties_fn orelse return &.{};
+    var props: VkPhysicalDeviceProperties = undefined;
+    gpdp(pd, &props);
+    var n: usize = 0;
+    while (n < props.deviceName.len and n < buf.len and props.deviceName[n] != 0) : (n += 1) {
+        buf[n] = props.deviceName[n];
+    }
+    return buf[0..n];
+}
+
+// VK adaptation: resolve g_requested_selector + SLZ_VK_DEVICE_INDEX into
+// one of the enumerated VkPhysicalDevice handles. Returns null on lookup
+// failure (caller surfaces as init() returning false).
+fn pickPhysicalDeviceFromList(devices: []const VkPhysicalDevice) ?VkPhysicalDevice {
+    var effective: DeviceSelector = g_requested_selector;
+    if (effective == .default) {
+        if (std.c.getenv("SLZ_VK_DEVICE_INDEX")) |raw| {
+            const s = std.mem.span(raw);
+            if (s.len > 0) {
+                if (std.fmt.parseInt(u32, s, 10)) |idx| {
+                    effective = .{ .by_index = idx };
+                } else |_| {}
+            }
+        }
+    }
+    switch (effective) {
+        .default => {
+            var best: ?VkPhysicalDevice = null;
+            var best_score: i16 = -1;
+            for (devices) |pd| {
+                if (pd == null) continue;
+                if (!hasComputeQueueLocal(pd)) continue;
+                const gpdp = vkGetPhysicalDeviceProperties_fn orelse continue;
+                var props: VkPhysicalDeviceProperties = undefined;
+                gpdp(pd, &props);
+                const s: i16 = @intCast(deviceTypeScoreLocal(props.deviceType));
+                if (s > best_score) {
+                    best_score = s;
+                    best = pd;
+                }
+            }
+            return best;
+        },
+        .by_index => |idx| {
+            if (idx >= devices.len) return null;
+            const pd = devices[idx];
+            if (pd == null) return null;
+            if (!hasComputeQueueLocal(pd)) return null;
+            return pd;
+        },
+        .by_name => |needle| {
+            var match: ?VkPhysicalDevice = null;
+            var match_count: u32 = 0;
+            var name_buf: [256]u8 = undefined;
+            for (devices) |pd| {
+                if (pd == null) continue;
+                const name = readPdNameInto(pd, name_buf[0..]);
+                if (containsIgnoreCaseLocal(name, needle)) {
+                    match = pd;
+                    match_count += 1;
+                }
+            }
+            if (match_count != 1) return null;
+            if (!hasComputeQueueLocal(match.?)) return null;
+            return match;
+        },
+    }
+}
+
+// VK adaptation: enumeration helper for the CLI's --probe mode. Stands
+// up only the loader + instance + vkEnumeratePhysicalDevices long enough
+// to print one line per device, then tears down. Does NOT call
+// vkCreateDevice, so it's safe to invoke before / instead of init().
+pub const ProbedDevice = struct {
+    name_buf: [256]u8,
+    name_len: usize,
+    device_type: c_int,
+    vendor_id: u32,
+    api_version: u32,
+};
+
+pub fn enumerateDevicesForProbe(out: []ProbedDevice) ?u32 {
+    if (vulkan_api.lib == null) {
+        vulkan_api.lib = vulkan_api.win32.LoadLibraryA("vulkan-1.dll");
+        if (vulkan_api.lib == null) return null;
+    }
+    if (vkGetInstanceProcAddr_fn == null) {
+        vkGetInstanceProcAddr_fn = vulkan_api.getProc(FnGetInstanceProcAddr, "vkGetInstanceProcAddr") orelse return null;
+    }
+    const gipa = vkGetInstanceProcAddr_fn.?;
+    if (vkCreateInstance_fn == null) {
+        vkCreateInstance_fn = @ptrCast(gipa(null, "vkCreateInstance"));
+        if (vkCreateInstance_fn == null) return null;
+    }
+    var inst: VkInstance = null;
+    const app = VkApplicationInfo{
+        .pApplicationName = "streamlz_vk",
+        .applicationVersion = (1 << 22),
+        .pEngineName = "streamlz",
+        .engineVersion = (1 << 22),
+        .apiVersion = (1 << 22) | (3 << 12),
+    };
+    const ici = VkInstanceCreateInfo{ .pApplicationInfo = &app };
+    if (vkCreateInstance_fn.?(&ici, null, &inst) != VK_SUCCESS_RC) return null;
+    if (vkEnumeratePhysicalDevices_fn == null) {
+        vkEnumeratePhysicalDevices_fn = @ptrCast(gipa(inst, "vkEnumeratePhysicalDevices"));
+    }
+    if (vkGetPhysicalDeviceProperties_fn == null) {
+        vkGetPhysicalDeviceProperties_fn = @ptrCast(gipa(inst, "vkGetPhysicalDeviceProperties"));
+    }
+    const enumerate = vkEnumeratePhysicalDevices_fn orelse return null;
+    var count: u32 = 0;
+    if (enumerate(inst, &count, null) != VK_SUCCESS_RC) return null;
+    if (count == 0) return 0;
+    var phys_buf: [16]VkPhysicalDevice = @splat(null);
+    var pc = if (count > 16) @as(u32, 16) else count;
+    if (enumerate(inst, &pc, phys_buf[0..pc].ptr) != VK_SUCCESS_RC) return null;
+    const cap: u32 = @intCast(out.len);
+    const n: u32 = if (pc > cap) cap else pc;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const pd = phys_buf[i];
+        var name: [256]u8 = @splat(0);
+        var name_len: usize = 0;
+        var dtype: c_int = 0;
+        var vendor: u32 = 0;
+        var api: u32 = 0;
+        if (vkGetPhysicalDeviceProperties_fn) |gpdp| {
+            var props: VkPhysicalDeviceProperties = undefined;
+            gpdp(pd, &props);
+            dtype = props.deviceType;
+            vendor = props.vendorID;
+            api = props.apiVersion;
+            while (name_len < props.deviceName.len and props.deviceName[name_len] != 0) : (name_len += 1) {
+                name[name_len] = props.deviceName[name_len];
+            }
+        }
+        out[i] = .{
+            .name_buf = name,
+            .name_len = name_len,
+            .device_type = dtype,
+            .vendor_id = vendor,
+            .api_version = api,
+        };
+    }
+    return n;
+}
+
+// VK adaptation: text label for VkPhysicalDeviceType in --probe output.
+pub fn deviceTypeName(device_type: c_int) []const u8 {
+    return switch (device_type) {
+        0 => "OTHER",
+        1 => "INTEGRATED_GPU",
+        2 => "DISCRETE_GPU",
+        3 => "VIRTUAL_GPU",
+        4 => "CPU",
+        else => "UNKNOWN",
+    };
+}
+
 // ── Pipeline handle slots (CUDA: CUfunction handles → VkPipeline).
 // CUDA reference: src/decode/module_loader.zig:35-47. Slot names must
 // stay verbatim per audit Section C.5.1 row 180. Each slot stores the
@@ -792,20 +1031,38 @@ pub fn init() bool {
     vkGetPhysicalDeviceQueueFamilyProperties_fn = @ptrCast(gipa(inst, "vkGetPhysicalDeviceQueueFamilyProperties"));
     vkCreateDevice_fn = @ptrCast(gipa(inst, "vkCreateDevice"));
     vkGetDeviceProcAddr_fn = @ptrCast(gipa(inst, "vkGetDeviceProcAddr"));
+    // VK adaptation: resolve vkGetPhysicalDeviceProperties NOW so the
+    // pickPhysicalDeviceFromList helper below can score deviceType and
+    // match deviceName for the --device / SLZ_VK_DEVICE_INDEX selectors.
+    vkGetPhysicalDeviceProperties_fn = @ptrCast(gipa(inst, "vkGetPhysicalDeviceProperties"));
     if (vkEnumeratePhysicalDevices_fn == null or
         vkGetPhysicalDeviceQueueFamilyProperties_fn == null or
         vkCreateDevice_fn == null or
         vkGetDeviceProcAddr_fn == null) return false;
 
-    // Pick the first physical device. Mirrors CUDA's "device 0" default.
+    // VK adaptation: pick the physical device per g_requested_selector
+    // (set by CLI before init). Default falls back to SLZ_VK_DEVICE_INDEX
+    // env then a deviceType priority scorer. Mirrors CUDA's "device 0"
+    // shape when only one compute device exists.
     var phys_count: u32 = 0;
     if (vkEnumeratePhysicalDevices_fn.?(inst, &phys_count, null) != VK_SUCCESS_RC) return false;
     if (phys_count == 0) return false;
     var phys_buf: [16]VkPhysicalDevice = @splat(null);
     var pc = if (phys_count > 16) @as(u32, 16) else phys_count;
     if (vkEnumeratePhysicalDevices_fn.?(inst, &pc, phys_buf[0..pc].ptr) != VK_SUCCESS_RC) return false;
-    const phys = phys_buf[0];
+    const phys = pickPhysicalDeviceFromList(phys_buf[0..pc]) orelse return false;
     vulkan_api.physical_device = @intFromPtr(phys);
+
+    // Cache deviceName for later readBoundDeviceName().
+    if (vkGetPhysicalDeviceProperties_fn) |gpdp| {
+        var props_for_name: VkPhysicalDeviceProperties = undefined;
+        gpdp(phys, &props_for_name);
+        var n: usize = 0;
+        while (n < props_for_name.deviceName.len and props_for_name.deviceName[n] != 0) : (n += 1) {
+            g_bound_device_name_buf[n] = props_for_name.deviceName[n];
+        }
+        g_bound_device_name_len = n;
+    }
 
     // Find a queue family that supports compute. Mirrors the CUDA driver's
     // implicit "first compute capable queue" selection.
@@ -881,7 +1138,8 @@ pub fn init() bool {
     vkCmdResetQueryPool_fn = @ptrCast(gdpa(dev, "vkCmdResetQueryPool"));
     vkCmdWriteTimestamp_fn = @ptrCast(gdpa(dev, "vkCmdWriteTimestamp"));
     vkGetQueryPoolResults_fn = @ptrCast(gdpa(dev, "vkGetQueryPoolResults"));
-    vkGetPhysicalDeviceProperties_fn = @ptrCast(gipa(inst, "vkGetPhysicalDeviceProperties"));
+    // vkGetPhysicalDeviceProperties_fn already resolved above (before device
+    // pick) so it's available to the deviceType priority scorer.
     if (vkGetDeviceQueue_fn == null or vkCreateCommandPool_fn == null or
         vkAllocateCommandBuffers_fn == null or vkCreateShaderModule_fn == null or
         vkBeginCommandBuffer_fn == null or vkEndCommandBuffer_fn == null or

@@ -2,8 +2,6 @@
 //!
 //! Entry point for the streamlz_vk CLI. Delegates to cli.zig::run, which
 //! routes to the per-mode handlers under srcVK/cli/.
-//!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
 
 const std = @import("std");
 const cli = @import("cli.zig");
