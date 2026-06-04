@@ -47,6 +47,10 @@ pub const finalizeProfiling = decode_context.finalizeProfiling;
 pub const gpuWalkFrameImpl = scan_gpu.gpuWalkFrameImpl;
 pub const fullGpuLaunchImpl = decode_dispatch.fullGpuLaunchImpl;
 
+// ── Per-phase host-overhead profiling (SLZ_VK_PROFILE_PHASES=1) ───────
+pub const phaseProfileInit = decode_dispatch.phaseProfileInit;
+pub const printAndResetPhaseProfile = decode_dispatch.printAndResetPhaseProfile;
+
 // ── Singletons ─────────────────────────────────────────────────────────
 pub var g_default: DecodeContext = .{};
 

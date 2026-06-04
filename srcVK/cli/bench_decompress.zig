@@ -8,6 +8,7 @@ const std = @import("std");
 const util = @import("util.zig");
 const decoder = @import("../decode/streamlz_decoder.zig");
 const gpu_dec_driver = @import("../decode/driver.zig");
+const module_loader = @import("../decode/module_loader.zig");
 const frame = @import("../format/frame_format.zig");
 
 /// CUDA reference: src/cli/bench_decompress.zig:11-end. -db mode entry point.
@@ -64,6 +65,15 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     var best_huff_ns: i64 = std.math.maxInt(i64);
     var total_huff_ns: i64 = 0;
 
+    // Per-kernel profile (SLZ_VK_PROFILE_DECODE=1) — reset after the
+    // warm-up decompress above so only the measured runs accumulate.
+    module_loader.printAndResetProfile(w);
+    // Per-phase host-overhead profile (SLZ_VK_PROFILE_PHASES=1) — same
+    // pattern: enable+reset here so the warm-up decode doesn't pollute
+    // the measured-run accumulators.
+    gpu_dec_driver.phaseProfileInit();
+    try w.flush();
+
     var run_i: u32 = 0;
     while (run_i < runs) : (run_i += 1) {
         const t0 = std.Io.Clock.awake.now(io);
@@ -118,4 +128,12 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
             try w.print("  huff kernel mean: {d:.3} ms  ({d:.0} MB/s)\n", .{ mean_huff_ms, mb * 1000.0 / mean_huff_ms });
         }
     }
+
+    // Per-kernel GPU profile breakdown (SLZ_VK_PROFILE_DECODE=1). Sums
+    // over all `runs` measured iterations and prints "kper:" lines.
+    try w.flush();
+    module_loader.printAndResetProfile(w);
+    // Per-phase host-overhead breakdown (SLZ_VK_PROFILE_PHASES=1).
+    gpu_dec_driver.printAndResetPhaseProfile(w);
+    try w.flush();
 }

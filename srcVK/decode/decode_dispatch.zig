@@ -33,6 +33,86 @@ const beginKernelTiming = decode_context.beginKernelTiming;
 const endKernelTiming = decode_context.endKernelTiming;
 const finalizeProfiling = decode_context.finalizeProfiling;
 
+// ── Per-phase host-overhead profiling (SLZ_VK_PROFILE_PHASES=1) ──────
+// Accumulates wall-clock QPC time spent in each logical sub-phase of
+// fullGpuLaunchImpl across calls. Read+printed by bench_decompress
+// via printAndResetPhaseProfile(). Orthogonal to SLZ_VK_PROFILE_DECODE
+// (per-kernel GPU timestamps): this captures HOST overhead between
+// vk_proc.* calls so we can localize where the 1.6x e2e gap comes from.
+pub var g_phase_profile_enabled: bool = false;
+pub var g_phase_decode_count: u64 = 0;
+pub var g_phase_upload_ns: i64 = 0;          // entire uploadInputAndPrefixSum
+pub var g_phase_upload_h2d_ns: i64 = 0;      // just the h2d_async() calls
+pub var g_phase_upload_prefixsum_ns: i64 = 0; // gpuPrefixSumChunksImpl
+pub var g_phase_upload_misc_ns: i64 = 0;     // everything else (ensureDeviceBuf etc)
+pub var g_phase_backhalf_ns: i64 = 0;        // entire runBackHalf
+pub var g_phase_backhalf_h2d_count_ns: i64 = 0; // 4B n_chunks h2d
+pub var g_phase_backhalf_lz_launch_ns: i64 = 0; // runLzPipeline (just the launch call)
+pub var g_phase_backhalf_fence_wait_ns: i64 = 0; // end-of-back-half stream_sync
+pub var g_phase_finalize_ns: i64 = 0;        // finalizeOutput + post-finalize sync
+pub var g_phase_finalize_d2h_ns: i64 = 0;    // just the d2h_async() call
+pub var g_phase_finalize_sync_ns: i64 = 0;   // post-finalize stream_sync (flushes deferred D2H memcpy)
+pub var g_phase_resolve_ns: i64 = 0;         // VkProcs.resolve()
+pub var g_phase_other_ns: i64 = 0;           // everything else inside fullGpuLaunchImpl
+
+pub fn phaseProfileInit() void {
+    g_phase_profile_enabled = std.c.getenv("SLZ_VK_PROFILE_PHASES") != null;
+    g_phase_decode_count = 0;
+    g_phase_upload_ns = 0;
+    g_phase_upload_h2d_ns = 0;
+    g_phase_upload_prefixsum_ns = 0;
+    g_phase_upload_misc_ns = 0;
+    g_phase_backhalf_ns = 0;
+    g_phase_backhalf_h2d_count_ns = 0;
+    g_phase_backhalf_lz_launch_ns = 0;
+    g_phase_backhalf_fence_wait_ns = 0;
+    g_phase_finalize_ns = 0;
+    g_phase_finalize_d2h_ns = 0;
+    g_phase_finalize_sync_ns = 0;
+    g_phase_resolve_ns = 0;
+    g_phase_other_ns = 0;
+}
+
+inline fn qpcNs() i64 {
+    // Convert QPC ticks to ns via qpcMs (ms * 1e6). Stable across threads.
+    const t = vk.qpcNow();
+    return t;
+}
+inline fn qpcDeltaNs(start: i64, end: i64) i64 {
+    // Use qpcMs to ticks-to-ns: ms = (end-start)*1000/freq → ns = ms*1e6.
+    // Avoid a second freq query by inlining: qpcMs is f64 already.
+    return @intFromFloat(vk.qpcMs(start, end) * 1e6);
+}
+
+pub fn printAndResetPhaseProfile(w: anytype) void {
+    if (!g_phase_profile_enabled or g_phase_decode_count == 0) return;
+    const n = @as(f64, @floatFromInt(g_phase_decode_count));
+    const ns_to_ms_per = struct {
+        fn f(total_ns: i64, count: f64) f64 {
+            return (@as(f64, @floatFromInt(total_ns)) / 1e6) / count;
+        }
+    }.f;
+    w.print("phase: decode_count            {d}\n", .{g_phase_decode_count}) catch {};
+    w.print("phase: VkProcs.resolve         {d:.4} ms/decode\n", .{ns_to_ms_per(g_phase_resolve_ns, n)}) catch {};
+    w.print("phase: upload_total            {d:.4} ms/decode\n", .{ns_to_ms_per(g_phase_upload_ns, n)}) catch {};
+    w.print("phase:   upload_h2d            {d:.4} ms/decode  (chunk_descs+comp_input)\n", .{ns_to_ms_per(g_phase_upload_h2d_ns, n)}) catch {};
+    w.print("phase:   upload_prefixsum      {d:.4} ms/decode  (gpuPrefixSumChunksImpl)\n", .{ns_to_ms_per(g_phase_upload_prefixsum_ns, n)}) catch {};
+    w.print("phase:   upload_misc           {d:.4} ms/decode  (ensureDeviceBuf+sizing)\n", .{ns_to_ms_per(g_phase_upload_misc_ns, n)}) catch {};
+    w.print("phase: backhalf_total          {d:.4} ms/decode\n", .{ns_to_ms_per(g_phase_backhalf_ns, n)}) catch {};
+    w.print("phase:   backhalf_h2d_count    {d:.4} ms/decode  (4B n_chunks)\n", .{ns_to_ms_per(g_phase_backhalf_h2d_count_ns, n)}) catch {};
+    w.print("phase:   backhalf_lz_launch    {d:.4} ms/decode  (runLzPipeline launch)\n", .{ns_to_ms_per(g_phase_backhalf_lz_launch_ns, n)}) catch {};
+    w.print("phase:   backhalf_fence_wait   {d:.4} ms/decode  (vkWaitForFences)\n", .{ns_to_ms_per(g_phase_backhalf_fence_wait_ns, n)}) catch {};
+    w.print("phase: finalize_total          {d:.4} ms/decode\n", .{ns_to_ms_per(g_phase_finalize_ns, n)}) catch {};
+    w.print("phase:   finalize_d2h          {d:.4} ms/decode  (d2h_async submit)\n", .{ns_to_ms_per(g_phase_finalize_d2h_ns, n)}) catch {};
+    w.print("phase:   finalize_sync         {d:.4} ms/decode  (stream_sync drain)\n", .{ns_to_ms_per(g_phase_finalize_sync_ns, n)}) catch {};
+    w.print("phase: other                   {d:.4} ms/decode\n", .{ns_to_ms_per(g_phase_other_ns, n)}) catch {};
+    const totalled =
+        g_phase_resolve_ns + g_phase_upload_ns + g_phase_backhalf_ns +
+        g_phase_finalize_ns + g_phase_other_ns;
+    w.print("phase: SUM                     {d:.4} ms/decode\n", .{ns_to_ms_per(totalled, n)}) catch {};
+    phaseProfileInit();
+}
+
 // Local function-pointer typedefs mirroring CUDA's FnMemcpyHtoD /
 // FnMemcpyDtoH / FnLaunchKernel / FnCtxSync / FnStreamSync /
 // FnMemcpyDtoDAsync. Substitute CUdeviceptr → VkDeviceBuffer and
@@ -519,7 +599,9 @@ pub fn finalizeOutput(
         // so it batches into the same cmdbuf that ran the LZ kernel.
         // The staging→host memcpy is deferred to streamEndAndWait which
         // fullGpuLaunchImpl triggers via the back-half stream_sync.
+        const _t_d2h0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
         try vkCall(d2hRoute(procs, heavy_stream, @ptrCast(req.dst_full + req.dst_start_off), self.d_output + req.dst_start_off, req.decompressed_size), .copy);
+        if (g_phase_profile_enabled) g_phase_finalize_d2h_ns += qpcDeltaNs(_t_d2h0, vk.qpcNow());
     }
 }
 
@@ -543,14 +625,18 @@ pub fn uploadInputAndPrefixSum(
     req: DecodeRequest,
     procs: *const VkProcs,
 ) GpuError!FrameLayout {
+    const _t_upload_misc_start = if (g_phase_profile_enabled) vk.qpcNow() else 0;
     const total_output = req.dst_start_off + req.decompressed_size;
     try ensureDeviceOutput(self, total_output + 64);
     // Iter 4: route H2D copies via h2d_async on the work_stream when
     // available. Sync semantics still hold on the dispatcher's caller
     // because fullGpuLaunchImpl drains the stream before return; the
     // batching collapses N submit+wait cycles into 1 per block.
-    if (req.dst_start_off > 0)
+    if (req.dst_start_off > 0) {
+        const _t_h2d0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
         try vkCall(h2dRoute(procs, self.work_stream, self.d_output, @ptrCast(req.dst_full), req.dst_start_off), .copy);
+        if (g_phase_profile_enabled) g_phase_upload_h2d_ns += qpcDeltaNs(_t_h2d0, vk.qpcNow());
+    }
 
     // `procs.malloc_device(0)` is rejected by VMA (mirrors CUDA's
     // `cuMemAlloc(0)`); route an empty-input frame through a small dummy
@@ -569,12 +655,20 @@ pub fn uploadInputAndPrefixSum(
         const d2d = procs.d2d orelse return error.BackendNotAvailable;
         try vkCall(d2d(self.d_descs_persist, dev_ptr, desc_bytes, self.work_stream), .copy);
     } else {
+        const _t_h2d_descs0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
         try vkCall(h2dRoute(procs, self.work_stream, self.d_descs_persist, @ptrCast(req.chunk_descs.ptr), desc_bytes), .copy);
+        if (g_phase_profile_enabled) g_phase_upload_h2d_ns += qpcDeltaNs(_t_h2d_descs0, vk.qpcNow());
     }
+
+    // Account misc time up to here (everything before prefix-sum).
+    if (g_phase_profile_enabled) g_phase_upload_misc_ns += qpcDeltaNs(_t_upload_misc_start, vk.qpcNow());
 
     // `gpuPrefixSumChunksImpl` returns `GpuError!T` (not `?T`) because
     // there is no host fallback — every GPU decode path needs it.
+    const _t_ps0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
     _ = try scan_gpu.gpuPrefixSumChunksImpl(self, self.d_descs_persist, @intCast(req.chunk_descs.len), req.sub_chunk_cap);
+    if (g_phase_profile_enabled) g_phase_upload_prefixsum_ns += qpcDeltaNs(_t_ps0, vk.qpcNow());
+    const _t_upload_misc_resume = if (g_phase_profile_enabled) vk.qpcNow() else 0;
 
     // Skip the D2H of `total_subchunks` and use a host-computed
     // worst-case bound: `chunk_count * ceil(chunk_size / sub_chunk_cap)`.
@@ -609,9 +703,13 @@ pub fn uploadInputAndPrefixSum(
             const d2d = procs.d2d orelse return error.BackendNotAvailable;
             try vkCall(d2d(self.d_comp_persist, dev_src, req.compressed_block.len, self.work_stream), .copy);
         } else {
+            const _t_h2d_comp0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
             try vkCall(h2dRoute(procs, self.work_stream, self.d_comp_persist, @ptrCast(req.compressed_block.ptr), req.compressed_block.len), .copy);
+            if (g_phase_profile_enabled) g_phase_upload_h2d_ns += qpcDeltaNs(_t_h2d_comp0, vk.qpcNow());
         }
     }
+
+    if (g_phase_profile_enabled) g_phase_upload_misc_ns += qpcDeltaNs(_t_upload_misc_resume, vk.qpcNow());
 
     return .{
         .total_subchunks = total_subchunks,
@@ -669,7 +767,9 @@ pub fn runBackHalf(
     const lz_total_count_dev: u64 = if (req.d_n_chunks_dev) |dev| dev else blk: {
         try ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4);
         var host_total_chunks: u32 = total_chunks;
+        const _t_h2d_n0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
         try vkCall(h2dRoute(procs, heavy_stream, self.d_n_groups_scratch, @ptrCast(&host_total_chunks), 4), .copy);
+        if (g_phase_profile_enabled) g_phase_backhalf_h2d_count_ns += qpcDeltaNs(_t_h2d_n0, vk.qpcNow());
         break :blk self.d_n_groups_scratch;
     };
 
@@ -706,6 +806,7 @@ pub fn runBackHalf(
         });
     }
 
+    const _t_lz0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
     const split_lz_ns = try runLzPipeline(
         self, procs,
         req.chunks_per_group, req.sub_chunk_cap, n_huff,
@@ -713,6 +814,7 @@ pub fn runBackHalf(
         heavy_stream, split_timer, io,
         lz_total_count_dev, lz_dst_base_dev,
     );
+    if (g_phase_profile_enabled) g_phase_backhalf_lz_launch_ns += qpcDeltaNs(_t_lz0, vk.qpcNow());
 
     // Back-half stream sync: skip in async mode (caller's stream
     // carries the queued work; they sync themselves).
@@ -723,7 +825,9 @@ pub fn runBackHalf(
     // the call, so the original check would now mis-classify sync-mode
     // decodes as async and skip the flush.
     if (is_sync_mode) {
+        const _t_fw0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
         const sync_rc = stream_sync_fn(heavy_stream);
+        if (g_phase_profile_enabled) g_phase_backhalf_fence_wait_ns += qpcDeltaNs(_t_fw0, vk.qpcNow());
         if (sync_rc != VK_SUCCESS_RC) {
             std.debug.print("GPU heavy stream: sync FAILED rc={d}\n", .{sync_rc});
             return error.SyncFailed;
@@ -797,11 +901,15 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     }
     defer if (is_sync_mode) module_loader.unlockDispatcherMutex();
 
+    const _t_resolve0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
     const procs = try VkProcs.resolve();
+    if (g_phase_profile_enabled) g_phase_resolve_ns += qpcDeltaNs(_t_resolve0, vk.qpcNow());
 
     // Phase 1: upload + prefix sum (always runs — needed for chunk
     // descriptor sizing on L1 and L2+).
+    const _t_upload0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
     const layout = try uploadInputAndPrefixSum(self, req, &procs);
+    if (g_phase_profile_enabled) g_phase_upload_ns += qpcDeltaNs(_t_upload0, vk.qpcNow());
     if (t_e2e0) |t0| if (io) |io_val| {
         e2e_cum.h2d = nsSince(t0, io_val);
         e2e_cum.postscan = e2e_cum.h2d;
@@ -866,7 +974,9 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     const total_chunks: u32 = @intCast(req.chunk_descs.len);
 
     // Phase 4: back half (Huff predecode + LZ pipeline + sync + timing).
+    const _t_bh0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
     try runBackHalf(self, req, &procs, layout, n_huff, have_huff, total_chunks, heavy_stream, facade, is_sync_mode);
+    if (g_phase_profile_enabled) g_phase_backhalf_ns += qpcDeltaNs(_t_bh0, vk.qpcNow());
     if (t_e2e0) |t0| if (io) |io_val| {
         e2e_cum.predh = nsSince(t0, io_val);
     };
@@ -880,11 +990,18 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // BUT in the L1 path finalize is called AFTER the sync, so the
     // d2h_async records into a freshly-reset cmdbuf and needs another
     // flush. Issue an extra stream_sync after finalize to drain it.
+    const _t_fin0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
     if (!req.writesDirectlyToTarget()) {
         try finalizeOutput(self, &procs, req, heavy_stream);
         if (is_sync_mode) {
+            const _t_fsync0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
             try vkCall(procs.stream_sync(heavy_stream), .sync);
+            if (g_phase_profile_enabled) g_phase_finalize_sync_ns += qpcDeltaNs(_t_fsync0, vk.qpcNow());
         }
+    }
+    if (g_phase_profile_enabled) {
+        g_phase_finalize_ns += qpcDeltaNs(_t_fin0, vk.qpcNow());
+        g_phase_decode_count += 1;
     }
     // Iter 4: gate profiling drain on captured is_sync_mode (not the
     // live work_stream check, which now reads non-zero due to the

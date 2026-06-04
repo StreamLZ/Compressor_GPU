@@ -93,6 +93,34 @@ fn deviceTypeScoreLocal(device_type: c_int) u8 {
     };
 }
 
+// Iter 7: probe whether the physical device advertises
+// VK_EXT_external_memory_host. Mirrors src_vulkan/device.zig:250
+// (hasExternalMemoryHostExt). Returns false if the enumerate call
+// fails, the device exports zero extensions, or the name isn't in
+// the list. Caller passes the same VkPhysicalDevice that will go to
+// vkCreateDevice so the answer matches what's actually available on
+// the bound device.
+fn hasExternalMemoryHostExt(pd: VkPhysicalDevice) bool {
+    const enum_ext = vkEnumerateDeviceExtensionProperties_fn orelse return false;
+    var count: u32 = 0;
+    if (enum_ext(pd, null, &count, null) != VK_SUCCESS_RC) return false;
+    if (count == 0) return false;
+    // Bounded scan — modern drivers expose <200 extensions; 256 is safe.
+    var buf: [256]VkExtensionProperties = undefined;
+    var n: u32 = count;
+    if (n > buf.len) n = @intCast(buf.len);
+    const rc = enum_ext(pd, null, &n, @ptrCast(&buf));
+    // VK_INCOMPLETE (5) is non-fatal: we just have a subset, which is
+    // enough to check for the EXT name. Anything else is a hard failure.
+    if (rc != VK_SUCCESS_RC and rc != 5) return false;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const name_slice = std.mem.sliceTo(buf[i].extensionName[0..], 0);
+        if (std.mem.eql(u8, name_slice, "VK_EXT_external_memory_host")) return true;
+    }
+    return false;
+}
+
 fn hasComputeQueueLocal(pd: VkPhysicalDevice) bool {
     const get_qf = vkGetPhysicalDeviceQueueFamilyProperties_fn orelse return false;
     var qf_count: u32 = 0;
@@ -347,6 +375,7 @@ const VK_PIPELINE_BIND_POINT_COMPUTE: c_int = 1;
 // Timestamp query pool surface used by procs.event_*.
 const VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO: c_int = 11;
 const VK_QUERY_TYPE_TIMESTAMP: c_int = 2;
+const VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: u32 = 0x00000001;
 const VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: u32 = 0x00002000;
 const VK_QUERY_RESULT_64_BIT: u32 = 0x00000002;
 const VK_QUERY_RESULT_WAIT_BIT: u32 = 0x00000001;
@@ -863,6 +892,108 @@ const FnGetQueryPoolResults = *const fn (VkDevice, VkQueryPool, u32, u32, usize,
 const FnResetQueryPool = *const fn (VkDevice, VkQueryPool, u32, u32) callconv(.c) void;
 const FnGetPhysicalDeviceProperties = *const fn (VkPhysicalDevice, *VkPhysicalDeviceProperties) callconv(.c) void;
 
+// ── Iter 7: VK_EXT_external_memory_host FFI ──────────────────────────
+// Mirrors src_vulkan/vk_api.zig:1708-1776. The extension lets the
+// decoder turn the caller's pageable host pointer into a VkDeviceMemory
+// the GPU can DMA into directly — eliminating the dst_b→staging copy
+// plus the post-fence host @memcpy that iter-4's two-buffer path pays.
+// CUDA's equivalent is cuMemcpyDtoH_v2 against a pinned-host pointer
+// (src/decode/decode_dispatch.zig:485).
+const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2: c_int = 1000059001;
+const VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: c_int = 5;
+const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: c_int = 12;
+const VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT: c_int = 1000178000;
+const VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT: c_int = 1000178001;
+const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT: c_int = 1000178002;
+const VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT: u32 = 0x80;
+const VK_SHARING_MODE_EXCLUSIVE: c_int = 0;
+const VK_BUFFER_USAGE_TRANSFER_DST_BIT: u32 = 0x00000002;
+const VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT: u32 = 0x00000002;
+const VK_MAX_MEMORY_TYPES: usize = 32;
+const VK_MAX_MEMORY_HEAPS: usize = 16;
+
+const VkExtensionProperties = extern struct {
+    extensionName: [256]u8,
+    specVersion: u32,
+};
+
+const VkPhysicalDeviceProperties2 = extern struct {
+    sType: c_int = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+    pNext: ?*anyopaque = null,
+    properties: VkPhysicalDeviceProperties = undefined,
+};
+
+const VkPhysicalDeviceExternalMemoryHostPropertiesEXT = extern struct {
+    sType: c_int = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
+    pNext: ?*anyopaque = null,
+    minImportedHostPointerAlignment: VkDeviceSize = 0,
+};
+
+const VkImportMemoryHostPointerInfoEXT = extern struct {
+    sType: c_int = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+    pNext: ?*const anyopaque = null,
+    handleType: u32 = 0,
+    pHostPointer: ?*anyopaque = null,
+};
+
+const VkMemoryHostPointerPropertiesEXT = extern struct {
+    sType: c_int = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
+    pNext: ?*anyopaque = null,
+    memoryTypeBits: u32 = 0,
+};
+
+const VkMemoryAllocateInfo = extern struct {
+    sType: c_int = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+    pNext: ?*const anyopaque = null,
+    allocationSize: VkDeviceSize,
+    memoryTypeIndex: u32,
+};
+
+const VkBufferCreateInfo = extern struct {
+    sType: c_int = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+    pNext: ?*const anyopaque = null,
+    flags: u32 = 0,
+    size: VkDeviceSize,
+    usage: u32,
+    sharingMode: c_int = VK_SHARING_MODE_EXCLUSIVE,
+    queueFamilyIndexCount: u32 = 0,
+    pQueueFamilyIndices: ?[*]const u32 = null,
+};
+
+const VkMemoryRequirements = extern struct {
+    size: VkDeviceSize,
+    alignment: VkDeviceSize,
+    memoryTypeBits: u32,
+};
+
+const VkMemoryType = extern struct {
+    propertyFlags: u32,
+    heapIndex: u32,
+};
+
+const VkMemoryHeap = extern struct {
+    size: VkDeviceSize,
+    flags: u32,
+};
+
+const VkPhysicalDeviceMemoryProperties = extern struct {
+    memoryTypeCount: u32,
+    memoryTypes: [VK_MAX_MEMORY_TYPES]VkMemoryType,
+    memoryHeapCount: u32,
+    memoryHeaps: [VK_MAX_MEMORY_HEAPS]VkMemoryHeap,
+};
+
+const FnEnumerateDeviceExtensionProperties = *const fn (VkPhysicalDevice, ?[*:0]const u8, *u32, ?[*]VkExtensionProperties) callconv(.c) VkResult;
+const FnGetPhysicalDeviceProperties2 = *const fn (VkPhysicalDevice, *VkPhysicalDeviceProperties2) callconv(.c) void;
+const FnGetPhysicalDeviceMemoryProperties = *const fn (VkPhysicalDevice, *VkPhysicalDeviceMemoryProperties) callconv(.c) void;
+const FnCreateBuffer = *const fn (VkDevice, *const VkBufferCreateInfo, ?*const anyopaque, *VkBuffer) callconv(.c) VkResult;
+const FnDestroyBuffer = *const fn (VkDevice, VkBuffer, ?*const anyopaque) callconv(.c) void;
+const FnAllocateMemory = *const fn (VkDevice, *const VkMemoryAllocateInfo, ?*const anyopaque, *VkDeviceMemory) callconv(.c) VkResult;
+const FnFreeMemory = *const fn (VkDevice, VkDeviceMemory, ?*const anyopaque) callconv(.c) void;
+const FnBindBufferMemory = *const fn (VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize) callconv(.c) VkResult;
+const FnGetBufferMemoryRequirements = *const fn (VkDevice, VkBuffer, *VkMemoryRequirements) callconv(.c) void;
+const FnGetMemoryHostPointerPropertiesEXT = *const fn (VkDevice, u32, *const anyopaque, *VkMemoryHostPointerPropertiesEXT) callconv(.c) VkResult;
+
 // Resolved Vulkan entry points. Populated by init() after bring-up.
 var vkGetInstanceProcAddr_fn: ?FnGetInstanceProcAddr = null;
 var vkGetDeviceProcAddr_fn: ?FnGetDeviceProcAddr = null;
@@ -912,6 +1043,41 @@ var vkCmdWriteTimestamp_fn: ?FnCmdWriteTimestamp = null;
 var vkGetQueryPoolResults_fn: ?FnGetQueryPoolResults = null;
 var vkGetPhysicalDeviceProperties_fn: ?FnGetPhysicalDeviceProperties = null;
 
+// Iter 7: VK_EXT_external_memory_host fn-ptr slots. Resolved at init()
+// when the device advertises the extension (NVIDIA RTX 4060 Ti does;
+// most Intel iGPUs do; AMD does). When unavailable the procD2HAsync
+// import fast path is skipped and the iter-4 staging path stays in use.
+var vkEnumerateDeviceExtensionProperties_fn: ?FnEnumerateDeviceExtensionProperties = null;
+var vkGetPhysicalDeviceProperties2_fn: ?FnGetPhysicalDeviceProperties2 = null;
+var vkGetPhysicalDeviceMemoryProperties_fn: ?FnGetPhysicalDeviceMemoryProperties = null;
+var vkCreateBuffer_fn: ?FnCreateBuffer = null;
+var vkDestroyBuffer_fn: ?FnDestroyBuffer = null;
+var vkAllocateMemory_fn: ?FnAllocateMemory = null;
+var vkFreeMemory_fn: ?FnFreeMemory = null;
+var vkBindBufferMemory_fn: ?FnBindBufferMemory = null;
+var vkGetBufferMemoryRequirements_fn: ?FnGetBufferMemoryRequirements = null;
+var vkGetMemoryHostPointerPropertiesEXT_fn: ?FnGetMemoryHostPointerPropertiesEXT = null;
+
+// VK_EXT_external_memory_host gate. Set at init() to true iff the
+// device advertises the extension AND the loader resolved every
+// fn-ptr the import path needs. False keeps procD2HAsync on the
+// iter-4 staging path.
+var g_ext_memory_host_supported: bool = false;
+// minImportedHostPointerAlignment cached from
+// VkPhysicalDeviceExternalMemoryHostPropertiesEXT. Typically 4096 on
+// NVIDIA. Caller's pointer + import size must both be multiples of
+// this. Stays 0 when the extension is unavailable.
+var g_imported_host_alignment: u64 = 0;
+// Cached physical-device memory properties used by the import path
+// to pick a HOST_VISIBLE memory type compatible with the imported
+// pointer. Populated at init().
+var g_phys_mem_props: VkPhysicalDeviceMemoryProperties = .{
+    .memoryTypeCount = 0,
+    .memoryTypes = @splat(.{ .propertyFlags = 0, .heapIndex = 0 }),
+    .memoryHeapCount = 0,
+    .memoryHeaps = @splat(.{ .size = 0, .flags = 0 }),
+};
+
 // ── Module-private bring-up state ────────────────────────────────────
 // VK adaptation: the shared command pool + per-context staging buffer
 // the procs.h2d / procs.d2h closures funnel work through. Sized at
@@ -933,6 +1099,25 @@ var g_timestamp_query_pool: VkQueryPool = VK_NULL_HANDLE;
 const g_query_capacity: u32 = 4096;
 var g_query_index_free: std.ArrayListUnmanaged(u32) = .empty;
 var g_timestamp_period_ns: f32 = 1.0;
+
+// ── Per-kernel GPU profiling (SLZ_VK_PROFILE_DECODE=1) ───────────────
+// Reserves a fixed range of query-pool slots [g_profile_slot_base ..
+// g_profile_slot_base + g_profile_slot_count) carved out of
+// g_timestamp_query_pool. procLaunchKernel records a start+end
+// timestamp around every vkCmdDispatch when g_profile_enabled is true.
+// readbackAndPrintProfile (called from cli/bench_decompress.zig) drains
+// streams, reads all timestamps, sums per KernelKind, prints "kper:"
+// lines to stderr, and resets the recording cursor. Pure measurement
+// instrumentation — no algorithm change. See M5/M6/M7 in
+// srcVK/gameplan.md for the env-var contract.
+var g_profile_enabled: bool = false;
+const g_profile_max_records: u32 = 1024;
+const g_profile_slot_count: u32 = g_profile_max_records * 2;
+const g_profile_slot_base: u32 = g_query_capacity - g_profile_slot_count;
+const ProfileRecord = struct { kind_index: i32, start_slot: u32, end_slot: u32 };
+var g_profile_records: [g_profile_max_records]ProfileRecord = undefined;
+var g_profile_record_count: u32 = 0;
+var g_profile_overflow_count: u32 = 0;
 
 // Registry of live device buffer allocations keyed by VkDeviceBuffer (u64).
 // CUDA returns a flat CUdeviceptr; VK needs to track the
@@ -975,6 +1160,21 @@ const PendingD2H = struct {
     staging_off: usize,
     size: usize,
 };
+
+// Iter 7: per-D2H import record (VK_EXT_external_memory_host fast path).
+// procD2HAsync allocates a transient VkBuffer + VkDeviceMemory pair that
+// wraps the caller's host pointer; vkCmdCopyBuffer targets it as the
+// destination of a DEVICE_LOCAL → HOST_VISIBLE-imported copy. The
+// resources MUST stay live until the fence the GPU writes against has
+// signaled, so we queue them here and free in streamEndAndWait after
+// vkWaitForFences. No host @memcpy is needed — the bytes land in the
+// caller's buffer directly. Mirrors CUDA's cuMemcpyDtoH_v2 against a
+// pinned destination (src/decode/decode_dispatch.zig:485).
+const PendingImportedD2H = struct {
+    buffer: VkBuffer,
+    memory: VkDeviceMemory,
+};
+
 const StreamEntry = struct {
     cmdbuf: VkCommandBuffer,
     fence: VkFence,
@@ -985,6 +1185,12 @@ const StreamEntry = struct {
     staging_size: usize = 0,
     staging_used: usize = 0,
     pending_d2h: std.ArrayListUnmanaged(PendingD2H) = .empty,
+    // Iter 7: D2H records whose destination was imported via
+    // VK_EXT_external_memory_host. The (VkBuffer, VkDeviceMemory) pair
+    // must outlive the fence wait; freed after vkWaitForFences in
+    // streamEndAndWait. Empty when the import path was skipped (no
+    // extension support, or unaligned caller pointer).
+    pending_imported_d2h: std.ArrayListUnmanaged(PendingImportedD2H) = .empty,
 };
 var g_streams: std.ArrayListUnmanaged(?StreamEntry) = .empty;
 
@@ -1187,6 +1393,20 @@ fn metaFor(kind: KernelKind) *KernelMeta {
     unreachable;
 }
 
+// Per-kernel profiler: given a VkPipeline handle (cast to usize), return
+// the matching KERNEL_DECLS index, or -1 for unknown / externally-
+// registered (encode) pipelines. Used by procLaunchKernel to tag the
+// timestamp pair with a stable kernel identifier.
+fn kindIndexForPipeline(handle: usize) i32 {
+    if (handle == 0) return -1;
+    inline for (KERNEL_DECLS, 0..) |_, i| {
+        if (g_kernel_metas[i].pipeline != 0 and @as(usize, @intCast(g_kernel_metas[i].pipeline)) == handle) {
+            return @intCast(i);
+        }
+    }
+    return -1;
+}
+
 /// Test-only accessor exposing the per-kernel binding count + push-constant
 /// size declared in KERNEL_DECLS. Used by srcVK/tests/dispatch_unit.zig to
 /// pin the kernel ABI against the params[] layout in decode_dispatch.zig.
@@ -1260,6 +1480,14 @@ pub fn init() bool {
     // pickPhysicalDeviceFromList helper below can score deviceType and
     // match deviceName for the --device / SLZ_VK_DEVICE_INDEX selectors.
     vkGetPhysicalDeviceProperties_fn = @ptrCast(gipa(inst, "vkGetPhysicalDeviceProperties"));
+    // Iter 7: instance-level probes for VK_EXT_external_memory_host.
+    // vkEnumerateDeviceExtensionProperties is core; vkGetPhysicalDevice
+    // Properties2 is core in 1.1 (the instance was created with 1.3 above).
+    // vkGetPhysicalDeviceMemoryProperties is core. Resolve them all NOW
+    // so we can decide whether to enable the extension at vkCreateDevice.
+    vkEnumerateDeviceExtensionProperties_fn = @ptrCast(gipa(inst, "vkEnumerateDeviceExtensionProperties"));
+    vkGetPhysicalDeviceProperties2_fn = @ptrCast(gipa(inst, "vkGetPhysicalDeviceProperties2"));
+    vkGetPhysicalDeviceMemoryProperties_fn = @ptrCast(gipa(inst, "vkGetPhysicalDeviceMemoryProperties"));
     if (vkEnumeratePhysicalDevices_fn == null or
         vkGetPhysicalDeviceQueueFamilyProperties_fn == null or
         vkCreateDevice_fn == null or
@@ -1341,10 +1569,21 @@ pub fn init() bool {
         .bufferDeviceAddress = VK_TRUE,
         .pNext = @ptrCast(&v13_feats),
     };
+    // Iter 7: enable VK_EXT_external_memory_host when the physical device
+    // advertises it. The decoder's procD2HAsync uses the extension to
+    // import the caller's pageable host pointer directly as the
+    // vkCmdCopyBuffer destination — eliminating the iter-4 dst→staging
+    // copy + post-fence host @memcpy. Mirrors src_vulkan/device.zig:380
+    // and src_vulkan/l1_codec.zig:670 (importHostPointerBuffer).
+    const ext_mem_host_available = hasExternalMemoryHostExt(phys);
+    var ext_names_storage: [1][*:0]const u8 = .{"VK_EXT_external_memory_host"};
+    const ext_count: u32 = if (ext_mem_host_available) 1 else 0;
     const dci = VkDeviceCreateInfo{
         .pNext = @ptrCast(&v12_feats),
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = @ptrCast(&qci),
+        .enabledExtensionCount = ext_count,
+        .ppEnabledExtensionNames = if (ext_count > 0) @ptrCast(&ext_names_storage) else null,
     };
     var dev: VkDevice = null;
     if (vkCreateDevice_fn.?(phys, &dci, null, &dev) != VK_SUCCESS_RC) return false;
@@ -1392,6 +1631,21 @@ pub fn init() bool {
     vkCmdResetQueryPool_fn = @ptrCast(gdpa(dev, "vkCmdResetQueryPool"));
     vkCmdWriteTimestamp_fn = @ptrCast(gdpa(dev, "vkCmdWriteTimestamp"));
     vkGetQueryPoolResults_fn = @ptrCast(gdpa(dev, "vkGetQueryPoolResults"));
+    // Iter 7: device-level entry points for the VK_EXT_external_memory_host
+    // import path used by procD2HAsync. vkCreateBuffer / vkAllocateMemory /
+    // vkBindBufferMemory / vkGetBufferMemoryRequirements / vkFreeMemory /
+    // vkDestroyBuffer are all core (Vulkan 1.0). vkGetMemoryHostPointer
+    // PropertiesEXT is part of the extension itself and is only resolved
+    // when the extension was enabled at vkCreateDevice above.
+    vkCreateBuffer_fn = @ptrCast(gdpa(dev, "vkCreateBuffer"));
+    vkDestroyBuffer_fn = @ptrCast(gdpa(dev, "vkDestroyBuffer"));
+    vkAllocateMemory_fn = @ptrCast(gdpa(dev, "vkAllocateMemory"));
+    vkFreeMemory_fn = @ptrCast(gdpa(dev, "vkFreeMemory"));
+    vkBindBufferMemory_fn = @ptrCast(gdpa(dev, "vkBindBufferMemory"));
+    vkGetBufferMemoryRequirements_fn = @ptrCast(gdpa(dev, "vkGetBufferMemoryRequirements"));
+    if (ext_mem_host_available) {
+        vkGetMemoryHostPointerPropertiesEXT_fn = @ptrCast(gdpa(dev, "vkGetMemoryHostPointerPropertiesEXT"));
+    }
     // vkGetPhysicalDeviceProperties_fn already resolved above (before device
     // pick) so it's available to the deviceType priority scorer.
     if (vkGetDeviceQueue_fn == null or vkCreateCommandPool_fn == null or
@@ -1410,6 +1664,35 @@ pub fn init() bool {
     vkGetDeviceQueue_fn.?(dev, queue_family, 0, &queue);
     if (queue == null) return false;
     vulkan_api.compute_queue = @intFromPtr(queue);
+
+    // Iter 7: cache physical-device memory properties + the imported-host
+    // alignment for the procD2HAsync import fast path. The extension is
+    // only "supported" when every fn-ptr we need also resolved (defensive
+    // — a buggy driver might advertise the extension but not actually
+    // export vkGetMemoryHostPointerPropertiesEXT via gdpa).
+    if (vkGetPhysicalDeviceMemoryProperties_fn) |gpmp| {
+        gpmp(phys, &g_phys_mem_props);
+    }
+    g_ext_memory_host_supported = ext_mem_host_available and
+        vkGetMemoryHostPointerPropertiesEXT_fn != null and
+        vkGetPhysicalDeviceProperties2_fn != null and
+        vkCreateBuffer_fn != null and
+        vkDestroyBuffer_fn != null and
+        vkAllocateMemory_fn != null and
+        vkFreeMemory_fn != null and
+        vkBindBufferMemory_fn != null and
+        vkGetBufferMemoryRequirements_fn != null;
+    if (g_ext_memory_host_supported) {
+        var ext_props: VkPhysicalDeviceExternalMemoryHostPropertiesEXT = .{};
+        var props2: VkPhysicalDeviceProperties2 = .{};
+        props2.pNext = @ptrCast(&ext_props);
+        vkGetPhysicalDeviceProperties2_fn.?(phys, &props2);
+        g_imported_host_alignment = ext_props.minImportedHostPointerAlignment;
+        if (g_imported_host_alignment == 0) {
+            // Driver returned 0 — defensive disable.
+            g_ext_memory_host_supported = false;
+        }
+    }
 
     // Per-context staging command pool + buffer + fence. Reused by every
     // procs.h2d / d2h / d2d / memset call. The pool has the
@@ -1486,11 +1769,22 @@ pub fn init() bool {
         } else {
             const gpa = std.heap.page_allocator;
             g_query_index_free.ensureTotalCapacity(gpa, g_query_capacity) catch {};
+            // Only seed slots [0 .. g_profile_slot_base). The top
+            // g_profile_slot_count slots are reserved for the per-kernel
+            // profiler (SLZ_VK_PROFILE_DECODE) so procEvent never collides
+            // with timestamps procLaunchKernel records.
             var i: u32 = 0;
-            while (i < g_query_capacity) : (i += 1) {
+            while (i < g_profile_slot_base) : (i += 1) {
                 g_query_index_free.append(gpa, i) catch break;
             }
         }
+    }
+
+    // Enable per-kernel GPU profiling if SLZ_VK_PROFILE_DECODE is set.
+    if (std.c.getenv("SLZ_VK_PROFILE_DECODE") != null) {
+        g_profile_enabled = (g_timestamp_query_pool != VK_NULL_HANDLE);
+        g_profile_record_count = 0;
+        g_profile_overflow_count = 0;
     }
 
     // Wire up the procs.* surface. All slots use the module-private
@@ -1821,6 +2115,7 @@ fn streamEndAndWait(entry: *StreamEntry) VkResult {
         // for symmetry (defensive: caller may have skipped the body).
         entry.staging_used = 0;
         entry.pending_d2h.clearRetainingCapacity();
+        freePendingImportedD2H(entry);
         return VK_SUCCESS_RC;
     }
     const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
@@ -1830,6 +2125,7 @@ fn streamEndAndWait(entry: *StreamEntry) VkResult {
         entry.recording = false;
         entry.staging_used = 0;
         entry.pending_d2h.clearRetainingCapacity();
+        freePendingImportedD2H(entry);
         return rc;
     }
     const cb = entry.cmdbuf;
@@ -1843,6 +2139,7 @@ fn streamEndAndWait(entry: *StreamEntry) VkResult {
         entry.recording = false;
         entry.staging_used = 0;
         entry.pending_d2h.clearRetainingCapacity();
+        freePendingImportedD2H(entry);
         return rc;
     }
     rc = vkWaitForFences_fn.?(dev, 1, @ptrCast(&entry.fence), 1, ~@as(u64, 0));
@@ -1854,10 +2151,29 @@ fn streamEndAndWait(entry: *StreamEntry) VkResult {
             }
         }
     }
+    // Iter 7: imported (VK_EXT_external_memory_host) D2H destinations
+    // are safe to free now that the fence has signaled — the GPU is no
+    // longer reading/writing through the VkBuffer or VkDeviceMemory.
+    // No host @memcpy is needed; the GPU wrote the bytes straight into
+    // the caller's pageable buffer.
+    freePendingImportedD2H(entry);
     entry.recording = false;
     entry.staging_used = 0;
     entry.pending_d2h.clearRetainingCapacity();
     return rc;
+}
+
+// Iter 7: free every (VkBuffer, VkDeviceMemory) pair queued by
+// procD2HAsync's import fast path on this stream. Safe to call when
+// the list is empty.
+fn freePendingImportedD2H(entry: *StreamEntry) void {
+    if (entry.pending_imported_d2h.items.len == 0) return;
+    const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
+    for (entry.pending_imported_d2h.items) |p| {
+        vkDestroyBuffer_fn.?(dev, p.buffer, null);
+        vkFreeMemory_fn.?(dev, p.memory, null);
+    }
+    entry.pending_imported_d2h.clearRetainingCapacity();
 }
 
 // ── procs.* implementations ───────────────────────────────────────────
@@ -1978,16 +2294,139 @@ fn procH2DAsync(dst: VkDeviceBuffer, src: *const anyopaque, size: usize, stream:
     return procH2D(dst, src, size);
 }
 
+// Iter 7: try to set up a transient (VkBuffer, VkDeviceMemory) pair that
+// wraps the caller's host pointer via VK_EXT_external_memory_host. On
+// success the GPU can DMA straight into the caller's buffer through this
+// VkBuffer — no staging, no post-fence host @memcpy. Returns null when:
+//   * the extension isn't supported, or
+//   * the caller's pointer / size aren't aligned to the imported-host
+//     alignment (typically 4096), or
+//   * vkGetMemoryHostPointerPropertiesEXT reports no compatible mem type, or
+//   * any of the create/allocate/bind calls fail.
+// The (VkBuffer, VkDeviceMemory) returned must be kept alive until the
+// fence the GPU writes against has signaled; streamEndAndWait frees them
+// after vkWaitForFences.
+fn tryImportHostBuffer(host_ptr: *anyopaque, size: usize) ?PendingImportedD2H {
+    if (!g_ext_memory_host_supported) return null;
+    if (g_imported_host_alignment == 0) return null;
+    const align_mask = g_imported_host_alignment - 1;
+    const addr = @intFromPtr(host_ptr);
+    if ((addr & align_mask) != 0) return null;
+    // Round size UP to the alignment boundary — spec requires
+    // VkImportMemoryHostPointerInfoEXT.allocationSize to be a multiple
+    // of minImportedHostPointerAlignment. We only ever vkCmdCopyBuffer
+    // `size` bytes into the imported region, so the trailing pad (up
+    // to alignment - 1) bytes are never touched. The caller's buffer
+    // was page-rounded in procMallocHost so this never reads past the
+    // caller's allocation.
+    const aligned_size: u64 = (@as(u64, size) + align_mask) & ~@as(u64, align_mask);
+
+    const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
+    const get_props = vkGetMemoryHostPointerPropertiesEXT_fn orelse return null;
+
+    var host_ptr_props: VkMemoryHostPointerPropertiesEXT = .{};
+    if (get_props(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host_ptr, &host_ptr_props) != VK_SUCCESS_RC) return null;
+    if (host_ptr_props.memoryTypeBits == 0) return null;
+
+    // Create a VkBuffer sized to the aligned region with TRANSFER_DST
+    // usage — vkCmdCopyBuffer writes through it.
+    const bci = VkBufferCreateInfo{
+        .size = aligned_size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    };
+    var buf: VkBuffer = 0;
+    if (vkCreateBuffer_fn.?(dev, &bci, null, &buf) != VK_SUCCESS_RC) return null;
+
+    var buf_req: VkMemoryRequirements = .{
+        .size = 0,
+        .alignment = 0,
+        .memoryTypeBits = 0,
+    };
+    vkGetBufferMemoryRequirements_fn.?(dev, buf, &buf_req);
+    // The memory type must be supported by BOTH the buffer's own
+    // memory-type mask AND the pointer's importable mask.
+    const compatible_mask: u32 = buf_req.memoryTypeBits & host_ptr_props.memoryTypeBits;
+    if (compatible_mask == 0) {
+        vkDestroyBuffer_fn.?(dev, buf, null);
+        return null;
+    }
+    // Prefer the first HOST_VISIBLE memory type in the compatible mask.
+    // Drivers only ever advertise HOST_VISIBLE types in the importable
+    // mask, but we check explicitly for safety.
+    var mt_idx: i32 = -1;
+    var i: u32 = 0;
+    while (i < g_phys_mem_props.memoryTypeCount) : (i += 1) {
+        if ((compatible_mask & (@as(u32, 1) << @intCast(i))) == 0) continue;
+        const flags = g_phys_mem_props.memoryTypes[i].propertyFlags;
+        if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) continue;
+        mt_idx = @intCast(i);
+        break;
+    }
+    if (mt_idx < 0) {
+        vkDestroyBuffer_fn.?(dev, buf, null);
+        return null;
+    }
+
+    // Chain VkImportMemoryHostPointerInfoEXT off the allocate-info pNext.
+    // Per spec allocationSize must EXACTLY equal the imported region —
+    // already rounded above.
+    var import_info = VkImportMemoryHostPointerInfoEXT{
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+        .pHostPointer = host_ptr,
+    };
+    const mai = VkMemoryAllocateInfo{
+        .pNext = @ptrCast(&import_info),
+        .allocationSize = aligned_size,
+        .memoryTypeIndex = @intCast(mt_idx),
+    };
+    var mem: VkDeviceMemory = 0;
+    if (vkAllocateMemory_fn.?(dev, &mai, null, &mem) != VK_SUCCESS_RC) {
+        vkDestroyBuffer_fn.?(dev, buf, null);
+        return null;
+    }
+    if (vkBindBufferMemory_fn.?(dev, buf, mem, 0) != VK_SUCCESS_RC) {
+        vkFreeMemory_fn.?(dev, mem, null);
+        vkDestroyBuffer_fn.?(dev, buf, null);
+        return null;
+    }
+    return .{ .buffer = buf, .memory = mem };
+}
+
 fn procD2HAsync(dst: *anyopaque, src: VkDeviceBuffer, size: usize, stream: VkStream) callconv(.c) VkResult {
     const entry = lookupAlloc(src) orelse return -1;
     if (streamEntryFor(stream)) |se| {
-        // Iter 4: defer both the cmdbuf record AND the staging → host
-        // memcpy so a single end-of-decode streamEndAndWait flushes all
-        // queued H2Ds + kernels + D2Hs in ONE submit. The old code
-        // submitted-and-waited inline per d2h_async, which defeated
-        // batching for the decoder's d2h-after-LZ-kernel path.
         const rc_begin = streamBeginIfNeeded(se);
         if (rc_begin != VK_SUCCESS_RC) return rc_begin;
+
+        // Iter 7: try the VK_EXT_external_memory_host fast path first.
+        // If the caller's buffer is page-aligned (procMallocHost rounds
+        // to 4 KiB) and the extension is supported, we vkCmdCopyBuffer
+        // straight into the imported VkBuffer wrapping the caller's
+        // host memory — no staging, no host @memcpy. The transient
+        // (VkBuffer, VkDeviceMemory) pair is freed after the fence
+        // wait in streamEndAndWait. Mirrors src_vulkan/l1_codec.zig
+        // (importHostPointerBuffer) and CUDA's cuMemcpyDtoH_v2 against
+        // a pinned destination (src/decode/decode_dispatch.zig:485).
+        if (tryImportHostBuffer(dst, size)) |imported| {
+            const region = VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = size };
+            vkCmdCopyBuffer_fn.?(se.cmdbuf, entry.buffer, imported.buffer, 1, @ptrCast(&region));
+            const gpa = std.heap.page_allocator;
+            se.pending_imported_d2h.append(gpa, imported) catch {
+                // Append failed — free the import resources before bailing
+                // (streamEndAndWait would never see them otherwise).
+                const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
+                vkFreeMemory_fn.?(dev, imported.memory, null);
+                vkDestroyBuffer_fn.?(dev, imported.buffer, null);
+                return -1;
+            };
+            return VK_SUCCESS_RC;
+        }
+
+        // Iter 4 staging path: defer both the cmdbuf record AND the
+        // staging → host memcpy so a single end-of-decode
+        // streamEndAndWait flushes all queued H2Ds + kernels + D2Hs in
+        // ONE submit. Used as the fallback when the caller's buffer
+        // isn't page-aligned or the extension is unavailable.
         const off = streamStagingBump(se, size) orelse return -1;
         const region = VkBufferCopy{ .srcOffset = 0, .dstOffset = off, .size = size };
         vkCmdCopyBuffer_fn.?(se.cmdbuf, entry.buffer, se.staging_buffer, 1, @ptrCast(&region));
@@ -2000,7 +2439,20 @@ fn procD2HAsync(dst: *anyopaque, src: VkDeviceBuffer, size: usize, stream: VkStr
 
 fn procMallocHost(out: *?*anyopaque, size: usize) callconv(.c) VkResult {
     const gpa = std.heap.page_allocator;
-    const buf = gpa.alignedAlloc(u8, .@"64", size) catch return -1;
+    // Iter 7: bump alignment from 64 B → 4 KiB (page) so the CLI's
+    // pinned output buffer is eligible for the VK_EXT_external_memory_host
+    // import fast path in procD2HAsync. minImportedHostPointerAlignment
+    // is 4096 on NVIDIA / AMD / Intel desktop; 64 B was not enough.
+    // CUDA's cuMemAllocHost returns page-aligned memory implicitly —
+    // this matches that shape, eliminating the iter-4 dst→staging copy.
+    // Round size up to the page so the allocation tail also satisfies
+    // VkImportMemoryHostPointerInfoEXT.allocationSize % alignment == 0.
+    const page: usize = 4096;
+    const rounded = (size + page - 1) & ~(page - 1);
+    // 4096 = 2^12 → Alignment enum value 12. std.mem.Alignment only
+    // exposes named values up to 64; larger powers-of-two go through
+    // @enumFromInt on the log2 exponent.
+    const buf = gpa.alignedAlloc(u8, @as(std.mem.Alignment, @enumFromInt(12)), rounded) catch return -1;
     g_host_allocs.append(gpa, .{ .ptr = buf.ptr, .len = buf.len }) catch {
         gpa.free(buf);
         return -1;
@@ -2014,7 +2466,8 @@ fn procFreeHost(buf: *anyopaque) callconv(.c) VkResult {
     const target: [*]u8 = @ptrCast(buf);
     for (g_host_allocs.items, 0..) |entry, i| {
         if (entry.ptr == target) {
-            const slice: []align(64) u8 = @alignCast(entry.ptr[0..entry.len]);
+            // Match the procMallocHost alignment bump (iter 7).
+            const slice: []align(4096) u8 = @alignCast(entry.ptr[0..entry.len]);
             gpa.free(slice);
             _ = g_host_allocs.swapRemove(i);
             return VK_SUCCESS_RC;
@@ -2097,6 +2550,12 @@ fn procStreamDestroy(stream: VkStream) callconv(.c) VkResult {
         vma.destroyBuffer(allocator(), slot.staging_buffer, slot.staging_alloc);
     }
     slot.pending_d2h.deinit(std.heap.page_allocator);
+    // Iter 7: drain any pending imported-D2H records before tearing the
+    // stream down. freePendingImportedD2H is safe even if the GPU never
+    // completed (procStreamDestroy should only be called after a sync),
+    // but be defensive in case the caller skipped the sync.
+    freePendingImportedD2H(&slot);
+    slot.pending_imported_d2h.deinit(std.heap.page_allocator);
     var cb = slot.cmdbuf;
     vkFreeCommandBuffers_fn.?(dev, g_command_pool, 1, @ptrCast(&cb));
     vkDestroyFence_fn.?(dev, slot.fence, null);
@@ -2181,6 +2640,59 @@ fn procEventElapsedTime(out_ms: *f32, start_event: vulkan_api.VkEvent, end_event
     const delta_ns: f64 = @as(f64, @floatFromInt(delta_ticks)) * @as(f64, g_timestamp_period_ns);
     out_ms.* = @floatCast(delta_ns / 1_000_000.0);
     return VK_SUCCESS_RC;
+}
+
+/// Per-kernel GPU profile readback. Walks every (start, end) pair
+/// recorded by procLaunchKernel under SLZ_VK_PROFILE_DECODE=1, sums
+/// ns by KERNEL_DECLS kind, prints one "kper: <kind> count=N total=Xms
+/// avg=Yus" line per kernel to the supplied writer, then resets the
+/// record cursor so the next decode iteration starts clean.
+/// Safe to call when profiling is disabled (no-op).
+pub fn printAndResetProfile(w: anytype) void {
+    if (!g_profile_enabled) return;
+    if (g_profile_record_count == 0) return;
+    // Drain every stream so the timestamps we wrote have committed.
+    // (procCtxSync covers both per-stream cmdbufs and a deviceWaitIdle.)
+    _ = procCtxSync();
+
+    const get_results = vkGetQueryPoolResults_fn orelse return;
+    const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
+    const flags: u32 = VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT;
+
+    // Per-kind running totals (count + total ticks).
+    const N = KERNEL_DECLS.len;
+    var counts: [N]u64 = @splat(0);
+    var totals_ticks: [N]u64 = @splat(0);
+
+    var idx: u32 = 0;
+    while (idx < g_profile_record_count) : (idx += 1) {
+        const rec = g_profile_records[idx];
+        if (rec.kind_index < 0) continue;
+        var start_ts: u64 = 0;
+        var end_ts: u64 = 0;
+        if (get_results(dev, g_timestamp_query_pool, rec.start_slot, 1, @sizeOf(u64), @ptrCast(&start_ts), @sizeOf(u64), flags) != VK_SUCCESS_RC) continue;
+        if (get_results(dev, g_timestamp_query_pool, rec.end_slot, 1, @sizeOf(u64), @ptrCast(&end_ts), @sizeOf(u64), flags) != VK_SUCCESS_RC) continue;
+        if (end_ts < start_ts) continue;
+        const ki: usize = @intCast(rec.kind_index);
+        counts[ki] += 1;
+        totals_ticks[ki] += (end_ts - start_ts);
+    }
+
+    w.print("kper: --- per-kernel GPU profile ({d} dispatches recorded, {d} overflow) ---\n", .{ g_profile_record_count, g_profile_overflow_count }) catch {};
+    inline for (KERNEL_DECLS, 0..) |decl, i| {
+        if (counts[i] > 0) {
+            const ticks_f: f64 = @floatFromInt(totals_ticks[i]);
+            const total_ns: f64 = ticks_f * @as(f64, g_timestamp_period_ns);
+            const total_ms: f64 = total_ns / 1_000_000.0;
+            const avg_us: f64 = (total_ns / @as(f64, @floatFromInt(counts[i]))) / 1000.0;
+            w.print("kper: {s} count={d} total={d:.4}ms avg={d:.3}us\n", .{
+                @tagName(decl.kind), counts[i], total_ms, avg_us,
+            }) catch {};
+        }
+    }
+
+    g_profile_record_count = 0;
+    g_profile_overflow_count = 0;
 }
 
 fn procEventDestroy(event: vulkan_api.VkEvent) callconv(.c) VkResult {
@@ -2325,7 +2837,39 @@ fn procLaunchKernel(
         }
         vkCmdPushConstants_fn.?(cb, meta.pl_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, meta.push_constant_size, @ptrCast(&pc_buf));
     }
+
+    // ── Per-kernel profile timestamps (SLZ_VK_PROFILE_DECODE=1) ────────
+    // Reserve a (start, end) timestamp pair out of the profile slot
+    // range and bracket the dispatch with vkCmdWriteTimestamp. Reset
+    // the slots first so re-use across runs is safe. Pure measurement
+    // — no behavioural impact when profiling is disabled.
+    var profile_start_slot: u32 = 0;
+    var profile_end_slot: u32 = 0;
+    var profile_active: bool = false;
+    if (g_profile_enabled and vkCmdResetQueryPool_fn != null and vkCmdWriteTimestamp_fn != null) {
+        if (g_profile_record_count < g_profile_max_records) {
+            const rec = g_profile_record_count;
+            profile_start_slot = g_profile_slot_base + rec * 2;
+            profile_end_slot = profile_start_slot + 1;
+            vkCmdResetQueryPool_fn.?(cb, g_timestamp_query_pool, profile_start_slot, 2);
+            vkCmdWriteTimestamp_fn.?(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_timestamp_query_pool, profile_start_slot);
+            g_profile_records[rec] = .{
+                .kind_index = kindIndexForPipeline(pipeline),
+                .start_slot = profile_start_slot,
+                .end_slot = profile_end_slot,
+            };
+            g_profile_record_count = rec + 1;
+            profile_active = true;
+        } else {
+            g_profile_overflow_count += 1;
+        }
+    }
+
     vkCmdDispatch_fn.?(cb, grid_x, grid_y, grid_z);
+
+    if (profile_active) {
+        vkCmdWriteTimestamp_fn.?(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_timestamp_query_pool, profile_end_slot);
+    }
 
     if (inline_submit_wait) {
         // End + submit + fence wait on the default-stream path.
