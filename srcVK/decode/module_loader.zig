@@ -984,6 +984,28 @@ fn metaFor(kind: KernelKind) *KernelMeta {
     unreachable;
 }
 
+/// Test-only accessor exposing the per-kernel binding count + push-constant
+/// size declared in KERNEL_DECLS. Used by srcVK/tests/dispatch_unit.zig to
+/// pin the kernel ABI against the params[] layout in decode_dispatch.zig.
+/// Names mirror the `pub var *_fn` slot names above.
+pub const KernelLayoutInfo = struct {
+    n_bindings: u32,
+    push_constant_size: u32,
+};
+
+pub fn kernelLayoutByName(name: []const u8) ?KernelLayoutInfo {
+    inline for (KERNEL_DECLS) |decl| {
+        const decl_name = @tagName(decl.kind);
+        if (std.mem.eql(u8, decl_name, name)) {
+            return .{
+                .n_bindings = decl.n_bindings,
+                .push_constant_size = decl.push_constant_size,
+            };
+        }
+    }
+    return null;
+}
+
 const STAGING_INITIAL_SIZE: usize = 1 << 20; // 1 MiB
 
 // CUDA reference: src/decode/module_loader.zig:49-194. One-shot module

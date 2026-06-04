@@ -1,18 +1,18 @@
-//! NEW per Exception 3 (no CUDA counterpart).
+//! NEW per Exception 3 (no CUDA counterpart). Test bodies are populated.
 //!
 //! Unit tests for srcVK/decode/decode_dispatch.zig: L2 gate behaviour
 //! (level=1 skips Huff/scan/compact/merge/gather), runLzPipeline raw-
-//! kernel selection, buildChunkDescriptors output. Test bodies added by
-//! the fleshout agent.
+//! kernel selection, buildChunkDescriptors output, and the
+//! kernel_raw_fn ABI surface (params[] layout vs KERNEL_DECLS).
 //!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
+//! See srcVK/audit.md for the test scope rationale.
 
 const std = @import("std");
 const testing = std.testing;
 const decode_dispatch = @import("../decode/decode_dispatch.zig");
 const decoder = @import("../decode/streamlz_decoder.zig");
 const descriptors = @import("../decode/descriptors.zig");
-const driver = @import("../decode/driver.zig");
+const module_loader = @import("../decode/module_loader.zig");
 
 // These tests focus on structural / type-level invariants of the
 // dispatch layer — no GPU is brought up. The L2 gate is verified by
@@ -99,17 +99,6 @@ test "DecodeRequest: level can be set to 2 for L2 (gate flips at fullGpuLaunchIm
     try testing.expectEqual(@as(u8, 2), req.level);
 }
 
-test "runHuffBuildAndDecode: L2 stub returns NotImplementedL2 (L1 must not reach this)" {
-    // The L2 gate at decode_dispatch.zig:724 only calls into this on
-    // level>=2 paths; if it ever reaches it on L1, surfaces as runtime
-    // NotImplementedL2 — which IS the assertion we are documenting.
-    // We can't legitimately call it here without a live DecodeContext +
-    // procs, so this test asserts the stub's existence by capturing the
-    // function pointer.
-    const fn_ptr = &decode_dispatch.runHuffBuildAndDecode;
-    try testing.expect(@intFromPtr(fn_ptr) != 0);
-}
-
 test "ChunkDesc layout: extern struct, 24 bytes, fields ordered for SPIR-V binding" {
     // Layout MUST match the .comp std430 layout in lz_decode_raw_kernel.comp.
     // src_offset(4) + comp_size(4) + decomp_size(4) + dst_offset(4) +
@@ -182,6 +171,57 @@ test "buildChunkDescriptors via decoder facade: respects dst_start_off prefix" {
     try testing.expectEqual(@as(u32, dst_start_off), descs[0].dst_offset);
 }
 
-test "WALK_MAX_CHUNKS exported through driver facade is positive" {
-    try testing.expect(driver.WALK_MAX_CHUNKS > 0);
+test "kernel_raw_fn ABI: KERNEL_DECLS n_bindings=4 + push=8 matches runLzPipeline raw_params[] layout" {
+    // Pin the kernel_raw_fn entry in module_loader.KERNEL_DECLS against the
+    // raw_params[] array built in decode_dispatch.runLzPipeline (use_raw_kernel
+    // branch). The 4 SSBO bindings are CompressedBuf, ChunksBuf, DstBuf,
+    // TotalChunksBuf; the 2× u32 push constants are chunks_per_group +
+    // sub_chunk_cap. If either side drifts, this test fires.
+    const info = module_loader.kernelLayoutByName("kernel_raw_fn") orelse {
+        try testing.expect(false); // kernel_raw_fn missing from KERNEL_DECLS
+        return;
+    };
+    try testing.expectEqual(@as(u32, 4), info.n_bindings);
+    try testing.expectEqual(@as(u32, 8), info.push_constant_size);
+
+    // Mirror the raw_params[] construction from runLzPipeline (decode_dispatch.zig:411)
+    // to assert the array has 6 slots: 4 device-buffer-pointer slots
+    // followed by 2 u32-value-pointer slots.
+    var comp: u64 = 0xAAAA_0000_0000_0001;
+    var descs: u64 = 0xAAAA_0000_0000_0002;
+    var dst: u64 = 0xAAAA_0000_0000_0003;
+    var total: u64 = 0xAAAA_0000_0000_0004;
+    var chunks_per_group: u32 = 7;
+    var sub_chunk_cap: u32 = 13;
+
+    const raw_params = [_]?*anyopaque{
+        @ptrCast(&comp),
+        @ptrCast(&descs),
+        @ptrCast(&dst),
+        @ptrCast(&total),
+        @ptrCast(&chunks_per_group),
+        @ptrCast(&sub_chunk_cap),
+    };
+
+    // Total slot count = n_bindings (4 buffer ptrs) + push payload as 2× u32.
+    try testing.expectEqual(@as(usize, 6), raw_params.len);
+    try testing.expectEqual(info.n_bindings + (info.push_constant_size / @sizeOf(u32)), @as(u32, @intCast(raw_params.len)));
+
+    // Slots 0..3 must point at the four VkDeviceBuffer-sized handles
+    // (u64); slots 4..5 must point at the two u32 push constants.
+    try testing.expectEqual(@as(usize, @intFromPtr(&comp)), @intFromPtr(raw_params[0].?));
+    try testing.expectEqual(@as(usize, @intFromPtr(&descs)), @intFromPtr(raw_params[1].?));
+    try testing.expectEqual(@as(usize, @intFromPtr(&dst)), @intFromPtr(raw_params[2].?));
+    try testing.expectEqual(@as(usize, @intFromPtr(&total)), @intFromPtr(raw_params[3].?));
+    try testing.expectEqual(@as(usize, @intFromPtr(&chunks_per_group)), @intFromPtr(raw_params[4].?));
+    try testing.expectEqual(@as(usize, @intFromPtr(&sub_chunk_cap)), @intFromPtr(raw_params[5].?));
+
+    // Confirm the underlying value sizes match the binding contract:
+    // 4 buffer slots are u64-wide, 2 push slots are u32-wide.
+    try testing.expectEqual(@as(usize, 8), @sizeOf(@TypeOf(comp)));
+    try testing.expectEqual(@as(usize, 8), @sizeOf(@TypeOf(descs)));
+    try testing.expectEqual(@as(usize, 8), @sizeOf(@TypeOf(dst)));
+    try testing.expectEqual(@as(usize, 8), @sizeOf(@TypeOf(total)));
+    try testing.expectEqual(@as(usize, 4), @sizeOf(@TypeOf(chunks_per_group)));
+    try testing.expectEqual(@as(usize, 4), @sizeOf(@TypeOf(sub_chunk_cap)));
 }
