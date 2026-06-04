@@ -477,6 +477,26 @@ pub fn build(b: *std.Build) void {
     const srcvk_install = b.addInstallArtifact(srcvk_exe, .{});
     b.step("streamlz_vk", "Build the foundation-wave Vulkan CLI (streamlz_vk.exe, srcVK/ tree)").dependOn(&srcvk_install.step);
 
+    // ── Vulkan port (Phase 13): srcVK/ parallel unit test runner ────────
+    // Mirrors the CUDA `zig build ptest` shape: re-uses srcvk_exe_module
+    // so the test binary sees the same imports as the production CLI,
+    // and runs every `test {}` block aggregated from srcVK/main.zig
+    // (which now pulls in the 8 NEW test files under srcVK/tests/).
+    const srcvk_test = b.addTest(.{
+        .root_module = srcvk_exe_module,
+        .test_runner = .{ .path = b.path("srcVK/test_runner_parallel.zig"), .mode = .simple },
+    });
+    srcvk_test.step.dependOn(srcvk_shaders.step);
+    srcvk_test.step.dependOn(srcvk_shaders.embed_dir_step);
+    const run_srcvk_tests = b.addRunArtifact(srcvk_test);
+    // The CLI smoke / cross-backend tests shell out to
+    // zig-out/bin/streamlz_vk.exe, so the test runner must wait for the
+    // production binary install before spawning the child processes.
+    run_srcvk_tests.step.dependOn(&srcvk_install.step);
+    run_srcvk_tests.has_side_effects = true;
+    b.step("ptest_vk", "Run the srcVK/ parallel unit test suite (8 new test files + srcVK module aggregator)").dependOn(&run_srcvk_tests.step);
+    b.step("test_vk", "Alias for ptest_vk").dependOn(&run_srcvk_tests.step);
+
     // ── Vulkan port (CLI test): self-roundtrip + cross-backend ───────────
     // Spawns streamlz_vk.exe and streamlz.exe (the CUDA build) via
     // std.process.Child to verify four directions of round-trip on

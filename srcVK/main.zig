@@ -21,4 +21,13 @@ test {
     _ = @import("encode/streamlz_encoder.zig");
     _ = @import("encode/fast_framed.zig");
     _ = @import("encode/gpu_roundtrip_tests.zig");
+    // Phase 13 fleshout: 8 NEW test files under srcVK/tests/.
+    _ = @import("tests/decoder_unit.zig");
+    _ = @import("tests/encoder_unit.zig");
+    _ = @import("tests/dispatch_unit.zig");
+    _ = @import("tests/kernel_conformance.zig");
+    _ = @import("tests/l1_decode_roundtrip.zig");
+    _ = @import("tests/l1_encode_roundtrip.zig");
+    _ = @import("tests/cross_backend_roundtrip.zig");
+    _ = @import("tests/cli_smoke.zig");
 }
