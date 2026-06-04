@@ -1,11 +1,45 @@
 // 1:1 port of src/encode/huffman_kernel.cu, entry point slzHuffBuildTablesKernel.
-// CUDA reference: src/encode/huffman_kernel.cu.
+// CUDA reference: src/encode/huffman_kernel.cu:111-227.
 // See srcVK/PortInstructions.md.
-// L2 stub: Huffman tables build (L3+).
+//
+// L2 stub: Huffman tables build (L3+). Histogram + canonical code-length
+// build, one block per sub-chunk, WARP_SIZE lanes. Bindings match the
+// CUDA arg list verbatim; the body is empty per the L2 stub pattern.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
-layout(local_size_x = 32) in;
+// CUDA: n_blocks blocks × (32, 1, 1) threads per encode_huff.zig:153.
+// One warp (= one subgroup of width 32) per sub-chunk.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
-void main() {}
+// arg 0: const uint8_t* input
+layout(std430, binding = 0) readonly buffer InputBuf {
+    uint8_t input_buf[];
+};
+
+// arg 1: const HuffEncDesc* descs  (5 u32 per block, 20 bytes:
+//   src_offset, src_size, src_stride, dst_offset, dst_capacity)
+layout(std430, binding = 1) readonly buffer DescsBuf {
+    uint descs_raw[];
+};
+
+// arg 2: uint8_t* code_lengths_out  (HUFF_ALPHABET × n_blocks)
+layout(std430, binding = 2) buffer CodeLengthsBuf {
+    uint8_t code_lengths_out[];
+};
+
+// arg 3: uint32_t* codes_out  (HUFF_ALPHABET × n_blocks)
+layout(std430, binding = 3) buffer CodesBuf {
+    uint codes_out[];
+};
+
+// Scalar args 4..5 ride in via push constants. Layout matches the CUDA
+// arg-list order.
+layout(push_constant) uniform Push {
+    uint tables_stride;
+    uint n_blocks;
+} pc;
+
+void main() { return; }

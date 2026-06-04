@@ -1,11 +1,65 @@
 // 1:1 port of src/encode/huffman_kernel.cu, entry point slzHuffEncode4StreamKernel.
-// CUDA reference: src/encode/huffman_kernel.cu.
+// CUDA reference: src/encode/huffman_kernel.cu:246-395.
 // See srcVK/PortInstructions.md.
-// L2 stub: Huffman 4-stream encode (L3+).
+//
+// L2 stub: Huffman HUFF_NUM_STREAMS-way parallel encode (L3+). One block
+// per sub-chunk, WARP_SIZE lanes; each lane encodes one input slice into
+// per-stream scratch, then the warp cooperatively writes the BIL body.
+// Bindings match the CUDA arg list verbatim; the body is empty per the
+// L2 stub pattern.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
-layout(local_size_x = 32) in;
+// CUDA: n_blocks blocks × (32, 1, 1) threads per encode_huff.zig:171.
+// One warp (= one subgroup of width 32) per sub-chunk.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
-void main() {}
+// arg 0: const uint8_t* input
+layout(std430, binding = 0) readonly buffer InputBuf {
+    uint8_t input_buf[];
+};
+
+// arg 1: const HuffEncDesc* descs_in  (5 u32 per block, 20 bytes:
+//   src_offset, src_size, src_stride, dst_offset, dst_capacity)
+layout(std430, binding = 1) readonly buffer DescsBuf {
+    uint descs_raw[];
+};
+
+// arg 2: const uint8_t* code_lengths  (HUFF_ALPHABET × n_blocks)
+layout(std430, binding = 2) readonly buffer CodeLengthsBuf {
+    uint8_t code_lengths[];
+};
+
+// arg 3: const uint32_t* codes  (HUFF_ALPHABET × n_blocks)
+layout(std430, binding = 3) readonly buffer CodesBuf {
+    uint codes[];
+};
+
+// arg 4: uint8_t* scratch  (per-stream scratch slab)
+layout(std430, binding = 4) buffer ScratchBuf {
+    uint8_t scratch[];
+};
+
+// arg 5: uint8_t* output  (packed BIL bodies)
+layout(std430, binding = 5) buffer OutputBuf {
+    uint8_t output_buf[];
+};
+
+// arg 6: uint32_t* out_sizes  (per-block body size)
+layout(std430, binding = 6) buffer OutSizesBuf {
+    uint out_sizes[];
+};
+
+// Scalar args 7..9 ride in via push constants. Layout matches the CUDA
+// arg-list order.
+layout(push_constant) uniform Push {
+    uint scratch_per_stream;
+    uint tables_stride;
+    uint n_blocks;
+} pc;
+
+void main() { return; }

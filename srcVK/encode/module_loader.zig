@@ -169,8 +169,13 @@ const ENCODE_KERNELS = struct {
     // lz_encode: SSBO[0]=input, [1]=output, [2]=descs, [3]=global_hash,
     //   [4]=comp_sizes; push={total_chunks,hash_bits,use_chain,l4_features} = 16 B.
     pub const lz: EncodeKernelDecl = .{ .name = "lz_encode", .n_bindings = 5, .push_constant_size = 16 };
-    pub const huff_tables: EncodeKernelDecl = .{ .name = "huff_build_tables", .n_bindings = 0, .push_constant_size = 0 };
-    pub const huff_encode: EncodeKernelDecl = .{ .name = "huff_encode_4stream", .n_bindings = 0, .push_constant_size = 0 };
+    // huff_build_tables: SSBO[0]=input, [1]=descs, [2]=code_lengths_out,
+    //   [3]=codes_out; push={tables_stride, n_blocks} = 8 B.
+    pub const huff_tables: EncodeKernelDecl = .{ .name = "huff_build_tables", .n_bindings = 4, .push_constant_size = 8 };
+    // huff_encode_4stream: SSBO[0]=input, [1]=descs_in, [2]=code_lengths,
+    //   [3]=codes, [4]=scratch, [5]=output, [6]=out_sizes;
+    //   push={scratch_per_stream, tables_stride, n_blocks} = 12 B.
+    pub const huff_encode: EncodeKernelDecl = .{ .name = "huff_encode_4stream", .n_bindings = 7, .push_constant_size = 12 };
     // assemble_measure: SSBO[0..3]={d_raw,d_huff_lit,d_huff_tok,d_huff_off16},
     //   [4]=descs, [5]=enc_sizes, [6]=scratch_u8 (a tiny placeholder needed
     //   by the assembleSubChunk macro's static l-value check — see the

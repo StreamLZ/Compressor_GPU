@@ -1,25 +1,25 @@
 //! 1:1 port of src/encode/encode_huff.zig.
 //!
-//! L2 stub: GPU Huffman encode (L3+ only on the codec level scale).
-//! Symbols MUST exist because fast_framed.zig and driver.zig reference
-//! them; bodies return false on L1 so the `opts.level >= 3` gate in
-//! fast_framed.zig naturally skips emitted Huffman bodies.
-//!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
+//! GPU Huffman encode pass and its three stream-specific wrappers
+//! (literals, tokens, off16). Every entry point returns `bool` — true on
+//! a successful Huffman encode, false to signal the caller to fall back
+//! to the raw stream for that sub-chunk. The L1 gate (`opts.level >= 3`)
+//! in fast_framed.zig means these never get called on L1; the bool
+//! fall-through is the documented CUDA convention.
 
 const std = @import("std");
-const vulkan_ffi = @import("vulkan_ffi.zig");
+const vk = @import("../decode/vulkan_api.zig");
 const module_loader = @import("module_loader.zig");
 const encode_context = @import("encode_context.zig");
 const gpu_decode = @import("../decode/driver.zig");
 
+const VkDeviceBuffer = vk.VkDeviceBuffer;
 const EncodeContext = encode_context.EncodeContext;
 const CompressChunkDesc = encode_context.CompressChunkDesc;
 const HuffEncDesc = encode_context.HuffEncDesc;
-const VkDeviceBuffer = vulkan_ffi.VkDeviceBuffer;
 
-/// CUDA reference: src/encode/encode_huff.zig:52-224. L2 stub: shared
-/// Huffman build+encode dispatcher.
+/// CUDA reference: src/encode/encode_huff.zig:52-177. Shared Huffman
+/// build+encode dispatcher. Bool fall-through convention.
 pub fn gpuEncodeHuffImpl(
     self: *EncodeContext,
     descs: []const HuffEncDesc,
@@ -35,8 +35,8 @@ pub fn gpuEncodeHuffImpl(
     return false;
 }
 
-/// CUDA reference: src/encode/encode_huff.zig:225-461. L2 stub: Huffman
-/// encode for the per-sub-chunk off16 byte plane (hi + lo).
+/// CUDA reference: src/encode/encode_huff.zig:225-364. Huffman encode
+/// for the per-sub-chunk off16 hi+lo byte planes.
 pub fn gpuEncodeOff16HuffImpl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
@@ -52,8 +52,8 @@ pub fn gpuEncodeOff16HuffImpl(
     return false;
 }
 
-/// CUDA reference: src/encode/encode_huff.zig:462-475. L2 stub: Huffman
-/// encode for the per-sub-chunk literal byte plane.
+/// CUDA reference: src/encode/encode_huff.zig:462-475. Huffman encode
+/// for the per-sub-chunk literal byte plane.
 pub fn gpuEncodeLiteralsHuffImpl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
@@ -69,8 +69,8 @@ pub fn gpuEncodeLiteralsHuffImpl(
     return false;
 }
 
-/// CUDA reference: src/encode/encode_huff.zig:478-end. L2 stub: Huffman
-/// encode for the per-sub-chunk token byte plane.
+/// CUDA reference: src/encode/encode_huff.zig:478-491. Huffman encode
+/// for the per-sub-chunk token byte plane.
 pub fn gpuEncodeTokensHuffImpl(
     self: *EncodeContext,
     allocator: std.mem.Allocator,
