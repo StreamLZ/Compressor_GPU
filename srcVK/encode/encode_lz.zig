@@ -133,15 +133,24 @@ pub fn gpuCompressImpl(
         }
     }
 
-    // Download comp_sizes first, then only the actual compressed bytes per block
+    // Download comp_sizes first, then the actual compressed bytes per block.
     if (d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes) != VK_SUCCESS_RC) return false;
 
-    for (0..chunk_descs.len) |i| {
-        const cs = comp_sizes_out[i];
-        if (cs > 0) {
-            const dst_off = chunk_descs[i].dst_offset;
-            if (d2h_fn(@ptrCast(output.ptr + dst_off), d_output + dst_off, cs) != VK_SUCCESS_RC) return false;
-        }
+    // VK adaptation: CUDA's per-chunk loop below uses `d_output + dst_off`
+    // pointer arithmetic to read a slice starting at a non-zero offset
+    // within the device buffer. On Vulkan VkDeviceBuffer is a handle
+    // (g_allocs index), not an addressable pointer, so the arithmetic
+    // produces a garbage handle that fails lookupAlloc on the very
+    // first non-zero `dst_off` (any chunk index > 0). procs.d2h does
+    // not currently support a srcOffset argument. Until that surface
+    // gains an offset variant, fall back to a single whole-buffer
+    // download: read every byte of d_output into the host `output`
+    // slice (sized at n_gpu_blocks * per_block_cap) and let the
+    // downstream consumers index in via dst_offset on the host side.
+    // This preserves byte semantics; only the wire-cost grows from
+    // sum(comp_sizes) to total output capacity.
+    if (output.len > 0) {
+        if (d2h_fn(@ptrCast(output.ptr), d_output, output.len) != VK_SUCCESS_RC) return false;
     }
 
     return true;

@@ -95,10 +95,18 @@ pub fn gpuAssembleFrameImpl(
 
     // Kernel-arg locals. Each parameter is taken by `&local`, so every
     // value the kernel reads needs its own addressable slot here.
+    // VK adaptation: at L1 the huff_* device pointers are 0 (no Huffman
+    // encode pass populated them). CUDA's cuLaunchKernel happily passes
+    // null device pointers; Vulkan demands a real bound VkBuffer at
+    // every SSBO slot the .comp declares. For unused huff slots
+    // (binding 1..3) substitute `d_output_persist` (always non-null at
+    // this point); the kernel reads from these only when the matching
+    // `huff_*_size` desc field is non-zero — at L1 they're all zero so
+    // the substituted buffer is never actually read.
     var arg_raw = self.d_output_persist;
-    var arg_huff_lit = self.d_asm_huff_lit;
-    var arg_huff_tok = self.d_asm_huff_tok;
-    var arg_huff_off16 = self.d_asm_huff_off16;
+    var arg_huff_lit = if (self.d_asm_huff_lit != 0) self.d_asm_huff_lit else self.d_output_persist;
+    var arg_huff_tok = if (self.d_asm_huff_tok != 0) self.d_asm_huff_tok else self.d_output_persist;
+    var arg_huff_off16 = if (self.d_asm_huff_off16 != 0) self.d_asm_huff_off16 else self.d_output_persist;
     var arg_descs = self.d_asm_descs;
     var arg_sizes = self.d_asm_sizes;
     var arg_n = n;
@@ -108,9 +116,18 @@ pub fn gpuAssembleFrameImpl(
     // assemble_measure: n_bindings=7 (d_raw, d_huff_lit, d_huff_tok,
     // d_huff_off16, descs, enc_sizes, scratch_u8 placeholder),
     // push_constant_size=4 (n_subchunks).
+    // VK adaptation: binding 6 is the scratch_u8 placeholder the .comp
+    // declares purely to satisfy glslc's static l-value check on the
+    // disabled-write branches in assembleSubChunk. The kernel never
+    // touches it at runtime, but Vulkan still requires a real SSBO
+    // bound to the slot — reuse `self.d_asm_sizes` as a non-null
+    // placeholder (its real data is also bound at slot 5; aliasing a
+    // never-written buffer is harmless).
+    var arg_scratch = self.d_asm_sizes;
     var measure_params = [_]?*anyopaque{
         @ptrCast(&arg_raw),       @ptrCast(&arg_huff_lit), @ptrCast(&arg_huff_tok),
         @ptrCast(&arg_huff_off16),@ptrCast(&arg_descs),    @ptrCast(&arg_sizes),
+        @ptrCast(&arg_scratch),
         @ptrCast(&arg_n),
     };
     const t_am = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleMeasureKernel", 0);
@@ -264,13 +281,24 @@ pub fn gpuFrameAssembleImpl(
     // d_asm_chunk_sizes, d_chunk_dst, d_prefix_bytes, d_output),
     // push_constant_size=32 (prefix_size, hdr0, hdr1, n_chunks,
     // eff_chunk_size, src_len, sc_tail_off, end_mark_off).
+    //
+    // VK adaptation: the CUDA call site (which this is a 1:1 port of)
+    // places d_output at the END of the arg list because cuLaunchKernel
+    // packs every arg into a single kernel-parameter blob regardless of
+    // pointer-vs-scalar order. procs.launch_kernel here reads params
+    // [0..n_bindings) as SSBO handles in slot order then params
+    // [n_bindings..) as push-constant scalars in the .comp's declared
+    // order — so d_output (SSBO slot 6) must come BEFORE the push
+    // constant block, and prefix_size moves into the push constant
+    // block at the head (matching the .comp's Push struct order).
     var params = [_]?*anyopaque{
         @ptrCast(&k_input),    @ptrCast(&k_asm_out),  @ptrCast(&k_asm_offs),
         @ptrCast(&k_asm_sizes),@ptrCast(&k_chunk_dst),@ptrCast(&k_prefix),
+        @ptrCast(&k_dst),
         @ptrCast(&k_prefix_size),
         @ptrCast(&k_hdr0),     @ptrCast(&k_hdr1),
         @ptrCast(&k_n),        @ptrCast(&k_eff),      @ptrCast(&k_src_len),
-        @ptrCast(&k_sc_off),   @ptrCast(&k_end_off),  @ptrCast(&k_dst),
+        @ptrCast(&k_sc_off),   @ptrCast(&k_end_off),
     };
     var extra = [_]?*anyopaque{null};
 
