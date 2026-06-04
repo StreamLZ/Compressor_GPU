@@ -3,8 +3,6 @@
 //! Public encoder facade: compressBound + compressFramed +
 //! compressFramedWithIo. Delegates to fast_framed.compressFramedOne for
 //! the actual GPU dispatch.
-//!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
 
 const std = @import("std");
 const frame = @import("../format/frame_format.zig");
@@ -19,7 +17,6 @@ pub const CompressError = error{
     BadBlockSize,
     BadScGroupSize,
     DestinationTooSmall,
-    NotYetPorted,
 } || std.mem.Allocator.Error;
 
 /// CUDA reference: src/encode/streamlz_encoder.zig:43-64. Encoder
@@ -34,11 +31,19 @@ pub const Options = struct {
 /// CUDA reference: src/encode/streamlz_encoder.zig:70-84. Upper bound on
 /// the compressed-output size for a given input length.
 pub fn compressBound(src_len: usize) usize {
-    _ = src_len;
-    return 0;
+    const chunk_count: usize = (src_len + lz_constants.chunk_size - 1) / lz_constants.chunk_size;
+    const sub_chunks: usize = (src_len + lz_constants.sub_chunk_size - 1) / lz_constants.sub_chunk_size;
+    const per_sub_chunk_overhead: usize = 3 + 8 + 3 + 256;
+    const sc_prefix_upper_bound: usize = chunk_count * 8;
+    return frame.max_header_size + 4
+        + chunk_count * (8 + 2 + 4)
+        + sub_chunks * per_sub_chunk_overhead
+        + src_len
+        + 64
+        + sc_prefix_upper_bound;
 }
 
-/// CUDA reference: src/encode/streamlz_encoder.zig:97-105. Host→host
+/// CUDA reference: src/encode/streamlz_encoder.zig:97-105. Host->host
 /// frame compress. Bytes-written variant.
 pub fn compressFramed(
     allocator: std.mem.Allocator,
@@ -47,15 +52,10 @@ pub fn compressFramed(
     opts: Options,
     enc_ctx: *gpu_encoder.EncodeContext,
 ) CompressError!usize {
-    _ = allocator;
-    _ = src;
-    _ = dst;
-    _ = opts;
-    _ = enc_ctx;
-    return error.NotYetPorted;
+    return compressFramedWithIo(allocator, std.Io.failing, src, dst, opts, enc_ctx);
 }
 
-/// CUDA reference: src/encode/streamlz_encoder.zig:112-end. Same as
+/// CUDA reference: src/encode/streamlz_encoder.zig:112-123. Same as
 /// compressFramed plus a std.Io for telemetry.
 pub fn compressFramedWithIo(
     allocator: std.mem.Allocator,
@@ -65,11 +65,7 @@ pub fn compressFramedWithIo(
     opts: Options,
     enc_ctx: *gpu_encoder.EncodeContext,
 ) CompressError!usize {
-    _ = allocator;
-    _ = io;
-    _ = src;
-    _ = dst;
-    _ = opts;
-    _ = enc_ctx;
-    return error.NotYetPorted;
+    if (opts.level < 1 or opts.level > 5) return error.BadLevel;
+    if (dst.len < compressBound(src.len)) return error.DestinationTooSmall;
+    return fast_framed.compressFramedOne(allocator, io, src, dst, opts, enc_ctx);
 }
