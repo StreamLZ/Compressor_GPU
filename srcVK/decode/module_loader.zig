@@ -959,12 +959,117 @@ var g_host_allocs: std.ArrayListUnmanaged(HostAllocEntry) = .empty;
 // "default stream" → the global g_command_buffer/g_fence pair used for
 // sync ops). Each entry owns its own VkCommandBuffer (allocated off the
 // shared g_command_pool) + VkFence.
+//
+// Iter 4 host-perf fix (single-submit batching): each StreamEntry also
+// owns a per-stream "staging arena" — a bump-allocator on top of a
+// host-visible/coherent VkBuffer that procH2DAsync / procD2HAsync write
+// into instead of sharing the global g_staging_buffer. This lets the
+// decode dispatcher queue multiple H2D copies + N kernel dispatches +
+// the D2H readback into ONE cmdbuf + ONE vkQueueSubmit + ONE
+// vkWaitForFences per decoded block, matching src_vulkan's
+// submitTwoWithCopy pattern. Pending D2H memcpys (staging → host)
+// land in `pending_d2h` and flush in streamEndAndWait after the GPU
+// completes.
+const PendingD2H = struct {
+    host_dst: *anyopaque,
+    staging_off: usize,
+    size: usize,
+};
 const StreamEntry = struct {
     cmdbuf: VkCommandBuffer,
     fence: VkFence,
     recording: bool, // true if Begin has been called but End/Submit not yet
+    staging_buffer: vma.VkBuffer = 0,
+    staging_alloc: vma.VmaAllocation = null,
+    staging_mapped: ?*anyopaque = null,
+    staging_size: usize = 0,
+    staging_used: usize = 0,
+    pending_d2h: std.ArrayListUnmanaged(PendingD2H) = .empty,
 };
 var g_streams: std.ArrayListUnmanaged(?StreamEntry) = .empty;
+
+// Iter 4: parallel-test guard. The decoder's pipeline_stream is shared
+// between threads (ptest_vk runs tests on up to 16 threads against the
+// singleton g_default DecodeContext). Pre-iter4 each procs.launch_kernel
+// inline-submitted + waited, so the cmdbuf-race window was tiny and
+// hidden. Post-iter4 the whole decode block records into one cmdbuf
+// before submission, so concurrent threads can interleave their
+// streamBeginIfNeeded → vkCmdDispatch → streamEndAndWait calls and
+// corrupt each other's recordings. Serializing through a Win32
+// SRWLOCK (used directly because std.Io.Mutex requires an Io context
+// the codec doesn't thread through here) preserves correctness;
+// production callers using per-thread DecodeContext (via async
+// streams) skip the lock by routing through their own stream entry
+// (which still serializes per-stream, not globally). A future revision
+// should move the mutex onto StreamEntry itself to allow lock-free
+// parallelism across distinct streams.
+const SRWLOCK = extern struct { ptr: ?*anyopaque = null };
+extern "kernel32" fn AcquireSRWLockExclusive(lock: *SRWLOCK) callconv(.c) void;
+extern "kernel32" fn ReleaseSRWLockExclusive(lock: *SRWLOCK) callconv(.c) void;
+var g_dispatcher_lock: SRWLOCK = .{};
+
+pub fn lockDispatcherMutex() void {
+    AcquireSRWLockExclusive(&g_dispatcher_lock);
+}
+
+pub fn unlockDispatcherMutex() void {
+    ReleaseSRWLockExclusive(&g_dispatcher_lock);
+}
+
+// Iter 4: nonCoherentAtomSize for staging-arena bump alignment. VK spec
+// requires offset/size of host-visible non-coherent mappings to align to
+// this when flushing/invalidating; we use HOST_COHERENT so flush is
+// implicit, but keep 64 B alignment for cache-line friendliness anyway.
+const STAGING_BUMP_ALIGN: usize = 64;
+
+// Iter 4: ensure the per-stream staging arena is at least `needed` bytes
+// (grow-only). Returns false on alloc failure; true when the arena is
+// ready to bump-allocate.
+fn ensureStreamStaging(entry: *StreamEntry, needed: usize) bool {
+    if (entry.staging_size >= needed) return true;
+    if (entry.staging_alloc != null) {
+        vma.destroyBuffer(allocator(), entry.staging_buffer, entry.staging_alloc);
+        entry.staging_buffer = 0;
+        entry.staging_alloc = null;
+        entry.staging_mapped = null;
+        entry.staging_size = 0;
+    }
+    var size: usize = if (entry.staging_size == 0) STAGING_INITIAL_SIZE else entry.staging_size;
+    while (size < needed) size *= 2;
+    var buf: vma.VkBuffer = 0;
+    var alc: vma.VmaAllocation = null;
+    const bci = vma.VkBufferCreateInfo{
+        .size = size,
+        .usage = vma.VK_BUFFER_USAGE_TRANSFER_SRC_BIT | vma.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    };
+    const aci = vma.VmaAllocationCreateInfo{
+        .flags = vma.VMA_ALLOCATION_CREATE_MAPPED_BIT | vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+        .usage = vma.VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        .requiredFlags = vma.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vma.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+    };
+    var info: vma.VmaAllocationInfo = .{};
+    if (vma.vmaCreateBuffer(allocator(), &bci, &aci, &buf, &alc, &info) != vma.VK_SUCCESS) return false;
+    entry.staging_buffer = buf;
+    entry.staging_alloc = alc;
+    entry.staging_size = size;
+    entry.staging_mapped = info.pMappedData;
+    return true;
+}
+
+// Iter 4: bump-allocate `size` bytes from the stream's staging arena.
+// Returns the byte offset within entry.staging_buffer on success; null
+// on alloc failure. Caller is responsible for ensureStreamStaging if a
+// known large size is needed (the bump-allocator only grows lazily).
+fn streamStagingBump(entry: *StreamEntry, size: usize) ?usize {
+    const aligned_used = (entry.staging_used + STAGING_BUMP_ALIGN - 1) & ~@as(usize, STAGING_BUMP_ALIGN - 1);
+    const end = aligned_used + size;
+    if (end > entry.staging_size) {
+        // Grow to next pow-2 that fits the cumulative footprint.
+        if (!ensureStreamStaging(entry, end)) return null;
+    }
+    entry.staging_used = end;
+    return aligned_used;
+}
 
 // Per-kernel metadata. Indexed by KernelKind; each entry carries the
 // VkDescriptorSetLayout + VkPipelineLayout + VkPipeline triple plus the
@@ -1703,13 +1808,28 @@ fn streamBeginIfNeeded(entry: *StreamEntry) VkResult {
 }
 
 // End + submit the stream's cmdbuf (if recording) and wait on its fence.
+//
+// Iter 4: also flushes deferred D2H staging→host memcpys queued by
+// procD2HAsync, then resets the staging arena bump-allocator so the
+// next decode reuses the buffer. The flush MUST happen after the
+// vkWaitForFences (the GPU writes to staging are not host-visible
+// until then, even with HOST_COHERENT memory — coherence covers
+// CPU↔GPU cache visibility, not pipeline ordering).
 fn streamEndAndWait(entry: *StreamEntry) VkResult {
-    if (!entry.recording) return VK_SUCCESS_RC;
+    if (!entry.recording) {
+        // Even when no cmdbuf was recorded, reset arena/pending state
+        // for symmetry (defensive: caller may have skipped the body).
+        entry.staging_used = 0;
+        entry.pending_d2h.clearRetainingCapacity();
+        return VK_SUCCESS_RC;
+    }
     const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
     const queue: VkQueue = @ptrFromInt(vulkan_api.compute_queue);
     var rc = vkEndCommandBuffer_fn.?(entry.cmdbuf);
     if (rc != VK_SUCCESS_RC) {
         entry.recording = false;
+        entry.staging_used = 0;
+        entry.pending_d2h.clearRetainingCapacity();
         return rc;
     }
     const cb = entry.cmdbuf;
@@ -1721,10 +1841,22 @@ fn streamEndAndWait(entry: *StreamEntry) VkResult {
     rc = vkQueueSubmit_fn.?(queue, 1, @ptrCast(&submit), entry.fence);
     if (rc != VK_SUCCESS_RC) {
         entry.recording = false;
+        entry.staging_used = 0;
+        entry.pending_d2h.clearRetainingCapacity();
         return rc;
     }
     rc = vkWaitForFences_fn.?(dev, 1, @ptrCast(&entry.fence), 1, ~@as(u64, 0));
+    if (rc == VK_SUCCESS_RC and entry.pending_d2h.items.len > 0) {
+        if (entry.staging_mapped) |mapped| {
+            const base: [*]const u8 = @ptrCast(mapped);
+            for (entry.pending_d2h.items) |p| {
+                @memcpy(@as([*]u8, @ptrCast(p.host_dst))[0..p.size], base[p.staging_off .. p.staging_off + p.size]);
+            }
+        }
+    }
     entry.recording = false;
+    entry.staging_used = 0;
+    entry.pending_d2h.clearRetainingCapacity();
     return rc;
 }
 
@@ -1828,14 +1960,19 @@ fn procMemsetD8Async(dst: VkDeviceBuffer, value: u8, size: usize, stream: VkStre
 
 fn procH2DAsync(dst: VkDeviceBuffer, src: *const anyopaque, size: usize, stream: VkStream) callconv(.c) VkResult {
     const entry = lookupAlloc(dst) orelse return -1;
-    if (!ensureStaging(size)) return -1;
-    const mapped = g_staging_mapped orelse return -1;
-    @memcpy(@as([*]u8, @ptrCast(mapped))[0..size], @as([*]const u8, @ptrCast(src))[0..size]);
     if (streamEntryFor(stream)) |se| {
-        const rc = streamBeginIfNeeded(se);
-        if (rc != VK_SUCCESS_RC) return rc;
-        const region = VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = size };
-        vkCmdCopyBuffer_fn.?(se.cmdbuf, g_staging_buffer, entry.buffer, 1, @ptrCast(&region));
+        // Iter 4: bump-allocate from the per-stream staging arena so
+        // back-to-back h2d_async calls on the same stream don't clobber
+        // each other (the old code shared g_staging_buffer, which made
+        // it unsafe to queue >1 H2D before stream_sync). The arena
+        // resets in streamEndAndWait after the GPU consumes the data.
+        const rc_begin = streamBeginIfNeeded(se);
+        if (rc_begin != VK_SUCCESS_RC) return rc_begin;
+        const off = streamStagingBump(se, size) orelse return -1;
+        const mapped = se.staging_mapped orelse return -1;
+        @memcpy(@as([*]u8, @ptrCast(mapped))[off .. off + size], @as([*]const u8, @ptrCast(src))[0..size]);
+        const region = VkBufferCopy{ .srcOffset = off, .dstOffset = 0, .size = size };
+        vkCmdCopyBuffer_fn.?(se.cmdbuf, se.staging_buffer, entry.buffer, 1, @ptrCast(&region));
         return VK_SUCCESS_RC;
     }
     return procH2D(dst, src, size);
@@ -1843,23 +1980,19 @@ fn procH2DAsync(dst: VkDeviceBuffer, src: *const anyopaque, size: usize, stream:
 
 fn procD2HAsync(dst: *anyopaque, src: VkDeviceBuffer, size: usize, stream: VkStream) callconv(.c) VkResult {
     const entry = lookupAlloc(src) orelse return -1;
-    if (!ensureStaging(size)) return -1;
     if (streamEntryFor(stream)) |se| {
-        // Record the device → staging copy on the stream. The caller is
-        // expected to call procs.stream_sync before reading `dst`; we
-        // emit the host-side memcpy from staging after the wait, which
-        // means we have to remember to do it. Here we resolve by
-        // submitting on the stream synchronously: the caller already has
-        // a stream model where stream_sync is the join. Submit then
-        // memcpy keeps semantics correct on the deferred path.
-        var rc = streamBeginIfNeeded(se);
-        if (rc != VK_SUCCESS_RC) return rc;
-        const region = VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = size };
-        vkCmdCopyBuffer_fn.?(se.cmdbuf, entry.buffer, g_staging_buffer, 1, @ptrCast(&region));
-        rc = streamEndAndWait(se);
-        if (rc != VK_SUCCESS_RC) return rc;
-        const mapped = g_staging_mapped orelse return -1;
-        @memcpy(@as([*]u8, @ptrCast(dst))[0..size], @as([*]const u8, @ptrCast(mapped))[0..size]);
+        // Iter 4: defer both the cmdbuf record AND the staging → host
+        // memcpy so a single end-of-decode streamEndAndWait flushes all
+        // queued H2Ds + kernels + D2Hs in ONE submit. The old code
+        // submitted-and-waited inline per d2h_async, which defeated
+        // batching for the decoder's d2h-after-LZ-kernel path.
+        const rc_begin = streamBeginIfNeeded(se);
+        if (rc_begin != VK_SUCCESS_RC) return rc_begin;
+        const off = streamStagingBump(se, size) orelse return -1;
+        const region = VkBufferCopy{ .srcOffset = 0, .dstOffset = off, .size = size };
+        vkCmdCopyBuffer_fn.?(se.cmdbuf, entry.buffer, se.staging_buffer, 1, @ptrCast(&region));
+        const gpa = std.heap.page_allocator;
+        se.pending_d2h.append(gpa, .{ .host_dst = dst, .staging_off = off, .size = size }) catch return -1;
         return VK_SUCCESS_RC;
     }
     return procD2H(dst, src, size);
@@ -1954,8 +2087,16 @@ fn procStreamDestroy(stream: VkStream) callconv(.c) VkResult {
     if (stream == 0) return VK_SUCCESS_RC;
     const idx: usize = @intCast(stream - 1);
     if (idx >= g_streams.items.len) return VK_SUCCESS_RC;
-    const slot = g_streams.items[idx] orelse return VK_SUCCESS_RC;
+    var slot = g_streams.items[idx] orelse return VK_SUCCESS_RC;
     const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
+    // Iter 4: free per-stream staging arena before tearing down cmdbuf
+    // + fence. Order doesn't matter for VK (host-visible buffers carry
+    // no GPU references after the fence-wait above), but we destroy in
+    // reverse-creation order for symmetry with the encode side.
+    if (slot.staging_alloc != null) {
+        vma.destroyBuffer(allocator(), slot.staging_buffer, slot.staging_alloc);
+    }
+    slot.pending_d2h.deinit(std.heap.page_allocator);
     var cb = slot.cmdbuf;
     vkFreeCommandBuffers_fn.?(dev, g_command_pool, 1, @ptrCast(&cb));
     vkDestroyFence_fn.?(dev, slot.fence, null);

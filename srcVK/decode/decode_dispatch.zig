@@ -39,6 +39,8 @@ const finalizeProfiling = decode_context.finalizeProfiling;
 // CUstream → VkStream; argument order preserved.
 const FnH2D = *const fn (VkDeviceBuffer, *const anyopaque, usize) callconv(.c) VkResult;
 const FnD2H = *const fn (*anyopaque, VkDeviceBuffer, usize) callconv(.c) VkResult;
+const FnH2DAsync = *const fn (VkDeviceBuffer, *const anyopaque, usize, VkStream) callconv(.c) VkResult;
+const FnD2HAsync = *const fn (*anyopaque, VkDeviceBuffer, usize, VkStream) callconv(.c) VkResult;
 const FnLaunchKernel = *const fn (
     usize,
     c_uint,
@@ -72,6 +74,8 @@ const FnD2D = *const fn (VkDeviceBuffer, VkDeviceBuffer, usize, VkStream) callco
 pub const VkProcs = struct {
     h2d: FnH2D,
     d2h: FnD2H,
+    h2d_async: ?FnH2DAsync,
+    d2h_async: ?FnD2HAsync,
     launch: FnLaunchKernel,
     sync: FnCtxSync,
     stream_sync: FnStreamSync,
@@ -81,6 +85,12 @@ pub const VkProcs = struct {
         return .{
             .h2d = vk.procs.h2d orelse return error.BackendNotAvailable,
             .d2h = vk.procs.d2h orelse return error.BackendNotAvailable,
+            // Iter 4: h2d_async/d2h_async are populated by module_loader
+            // (see :1407-1408) and required by the single-submit batching
+            // path; null fallback keeps the codec working against legacy
+            // backends that didn't expose them.
+            .h2d_async = vk.procs.h2d_async,
+            .d2h_async = vk.procs.d2h_async,
             .launch = vk.procs.launch_kernel orelse return error.BackendNotAvailable,
             .sync = vk.procs.ctx_sync orelse return error.BackendNotAvailable,
             .stream_sync = vk.procs.stream_sync orelse return error.BackendNotAvailable,
@@ -227,6 +237,32 @@ inline fn nsSince(t0: anytype, io: std.Io) i64 {
 
 inline fn nsToMs(ns: i64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;
+}
+
+/// Iter 4 host-perf helper: prefer h2d_async on the supplied stream so
+/// the dispatcher batches all H2D copies + kernel launches + the D2H
+/// readback into a single per-stream cmdbuf + single vkQueueSubmit +
+/// single vkWaitForFences per decoded block. Falls back to the sync
+/// h2d slot when no h2d_async is available (legacy backends) or when
+/// stream == 0 (caller explicitly opted out of batching).
+inline fn h2dRoute(procs: *const VkProcs, stream: VkStream, dst: VkDeviceBuffer, src: *const anyopaque, size: usize) VkResult {
+    if (stream != 0) {
+        if (procs.h2d_async) |f| return f(dst, src, size, stream);
+    }
+    return procs.h2d(dst, src, size);
+}
+
+/// Iter 4 host-perf helper (paired with h2dRoute). Routes D2H through
+/// d2h_async on the supplied stream when available. The staging → host
+/// memcpy is deferred to the next streamEndAndWait so the caller MUST
+/// invoke procs.stream_sync(stream) before reading the destination
+/// pointer — fullGpuLaunchImpl's back-half sync (runBackHalf line 665)
+/// covers this for the dispatcher's only D2H caller (finalizeOutput).
+inline fn d2hRoute(procs: *const VkProcs, stream: VkStream, dst: *anyopaque, src: VkDeviceBuffer, size: usize) VkResult {
+    if (stream != 0) {
+        if (procs.d2h_async) |f| return f(dst, src, size, stream);
+    }
+    return procs.d2h(dst, src, size);
 }
 
 /// CUDA reference: src/decode/decode_dispatch.zig:216-241. SLZ_E2E_TIMER
@@ -479,7 +515,11 @@ pub fn finalizeOutput(
         try vkCall(d2d(dev_target + req.dst_start_off, self.d_output + req.dst_start_off, req.decompressed_size, heavy_stream), .copy);
         if (self.work_stream == 0) try vkCall(procs.sync(), .sync);
     } else {
-        try vkCall(procs.d2h(@ptrCast(req.dst_full + req.dst_start_off), self.d_output + req.dst_start_off, req.decompressed_size), .copy);
+        // Iter 4: route D2H via d2h_async on heavy_stream when available
+        // so it batches into the same cmdbuf that ran the LZ kernel.
+        // The staging→host memcpy is deferred to streamEndAndWait which
+        // fullGpuLaunchImpl triggers via the back-half stream_sync.
+        try vkCall(d2hRoute(procs, heavy_stream, @ptrCast(req.dst_full + req.dst_start_off), self.d_output + req.dst_start_off, req.decompressed_size), .copy);
     }
 }
 
@@ -505,8 +545,12 @@ pub fn uploadInputAndPrefixSum(
 ) GpuError!FrameLayout {
     const total_output = req.dst_start_off + req.decompressed_size;
     try ensureDeviceOutput(self, total_output + 64);
+    // Iter 4: route H2D copies via h2d_async on the work_stream when
+    // available. Sync semantics still hold on the dispatcher's caller
+    // because fullGpuLaunchImpl drains the stream before return; the
+    // batching collapses N submit+wait cycles into 1 per block.
     if (req.dst_start_off > 0)
-        try vkCall(procs.h2d(self.d_output, @ptrCast(req.dst_full), req.dst_start_off), .copy);
+        try vkCall(h2dRoute(procs, self.work_stream, self.d_output, @ptrCast(req.dst_full), req.dst_start_off), .copy);
 
     // `procs.malloc_device(0)` is rejected by VMA (mirrors CUDA's
     // `cuMemAlloc(0)`); route an empty-input frame through a small dummy
@@ -525,7 +569,7 @@ pub fn uploadInputAndPrefixSum(
         const d2d = procs.d2d orelse return error.BackendNotAvailable;
         try vkCall(d2d(self.d_descs_persist, dev_ptr, desc_bytes, self.work_stream), .copy);
     } else {
-        try vkCall(procs.h2d(self.d_descs_persist, @ptrCast(req.chunk_descs.ptr), desc_bytes), .copy);
+        try vkCall(h2dRoute(procs, self.work_stream, self.d_descs_persist, @ptrCast(req.chunk_descs.ptr), desc_bytes), .copy);
     }
 
     // `gpuPrefixSumChunksImpl` returns `GpuError!T` (not `?T`) because
@@ -558,14 +602,14 @@ pub fn uploadInputAndPrefixSum(
     // Source-side input: D2D when the bytes are already device-resident,
     // H2D otherwise. The D2D copy issues on `self.work_stream` so the
     // post-copy stream sync only has to wait on the caller's stream;
-    // the H2D path is host-synchronous, so there is no async hand-off
-    // to wait on.
+    // the H2D path uses h2d_async into the same per-stream cmdbuf when
+    // available so it batches with the surrounding kernels (iter 4).
     if (req.compressed_block.len > 0) {
         if (req.d_compressed_src) |dev_src| {
             const d2d = procs.d2d orelse return error.BackendNotAvailable;
             try vkCall(d2d(self.d_comp_persist, dev_src, req.compressed_block.len, self.work_stream), .copy);
         } else {
-            try vkCall(procs.h2d(self.d_comp_persist, @ptrCast(req.compressed_block.ptr), req.compressed_block.len), .copy);
+            try vkCall(h2dRoute(procs, self.work_stream, self.d_comp_persist, @ptrCast(req.compressed_block.ptr), req.compressed_block.len), .copy);
         }
     }
 
@@ -591,6 +635,11 @@ pub fn runBackHalf(
     total_chunks: u32,
     heavy_stream: usize,
     facade: anytype,
+    /// Iter 4: true when the dispatcher entered in sync mode (caller's
+    /// work_stream was 0 before the iter-4 promotion to pipeline_stream).
+    /// Gates the end-of-back-half stream_sync that flushes the batched
+    /// cmdbuf and deferred D2H memcpys.
+    is_sync_mode: bool,
 ) GpuError!void {
     const io = req.io;
     const stream_sync_fn = procs.stream_sync;
@@ -611,10 +660,16 @@ pub fn runBackHalf(
     // Stage the LZ kernel's self-gate count. D2D path: the caller
     // supplies `d_n_chunks_dev` (typically `d_walk_meta + offset`).
     // Else stage `total_chunks` into `d_n_groups_scratch` via 4 B H2D.
+    //
+    // Iter 4: route through h2d_async on heavy_stream so this trailing
+    // 4 B copy batches with the LZ kernel that consumes it instead of
+    // triggering its own submit+wait round-trip. `host_total_chunks`
+    // must outlive h2dRoute's call — h2d_async memcpys into staging
+    // immediately so the local-variable lifetime is fine.
     const lz_total_count_dev: u64 = if (req.d_n_chunks_dev) |dev| dev else blk: {
         try ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4);
         var host_total_chunks: u32 = total_chunks;
-        try vkCall(procs.h2d(self.d_n_groups_scratch, @ptrCast(&host_total_chunks), 4), .copy);
+        try vkCall(h2dRoute(procs, heavy_stream, self.d_n_groups_scratch, @ptrCast(&host_total_chunks), 4), .copy);
         break :blk self.d_n_groups_scratch;
     };
 
@@ -661,7 +716,13 @@ pub fn runBackHalf(
 
     // Back-half stream sync: skip in async mode (caller's stream
     // carries the queued work; they sync themselves).
-    if (self.work_stream == 0) {
+    //
+    // Iter 4: gate on the captured `is_sync_mode` instead of the live
+    // `self.work_stream == 0` check — the dispatcher's iter-4 batching
+    // path promotes work_stream to pipeline_stream for the duration of
+    // the call, so the original check would now mis-classify sync-mode
+    // decodes as async and skip the flush.
+    if (is_sync_mode) {
         const sync_rc = stream_sync_fn(heavy_stream);
         if (sync_rc != VK_SUCCESS_RC) {
             std.debug.print("GPU heavy stream: sync FAILED rc={d}\n", .{sync_rc});
@@ -687,6 +748,17 @@ pub fn runBackHalf(
 /// decode entry. Orchestrates upload + prefix-sum, optional L2
 /// scan/compact/merge/gather/huff, back-half (LZ pipeline + sync +
 /// timing), finalize.
+///
+/// VK iter 4 host-perf adaptation: when the caller is in sync mode
+/// (req.work_stream == 0 on entry → self.work_stream == 0 here), the
+/// dispatcher temporarily reassigns self.work_stream = pipeline_stream
+/// so every internal procs.{h2d_async, d2h_async, d2d, launch_kernel,
+/// prefix_sum} call records into the same per-stream cmdbuf instead of
+/// triggering its own vkQueueSubmit + vkWaitForFences. The whole batch
+/// drains in ONE submit at the end. Original work_stream is restored
+/// before return so the caller-visible state is unchanged. This single
+/// change collapses ~7 submit/wait round-trips per decode block to 1,
+/// recovering the host overhead that put VK at 21x CUDA on enwik8.
 pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void {
     if (!module_loader.init()) return error.BackendNotAvailable;
     if (module_loader.kernel_fn == 0 and module_loader.kernel_raw_fn == 0) return error.KernelMissing;
@@ -702,6 +774,28 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     else
         null;
     var e2e_cum: E2eCumulative = .{};
+
+    // Iter 4 host-perf fix: capture sync-mode entry state, then promote
+    // work_stream to pipeline_stream so all in-decode procs.* ops batch
+    // through one cmdbuf. The `is_sync_mode` flag preserves the original
+    // gate semantics for the `work_stream == 0` checks below (sync-mode
+    // call needs the end-of-decode stream_sync + profiling drain to run).
+    const is_sync_mode = self.work_stream == 0;
+    const original_work_stream = self.work_stream;
+    if (is_sync_mode) self.work_stream = self.pipeline_stream;
+    defer self.work_stream = original_work_stream;
+
+    // Iter 4 parallel-safety: when running in sync mode the dispatcher
+    // routes all work through the singleton pipeline_stream's cmdbuf.
+    // Two concurrent threads (e.g. ptest_vk's 16-worker test runner)
+    // would otherwise interleave their cmdbuf records and corrupt each
+    // other's batched submission. Serialize through this dispatcher
+    // mutex; async-mode callers using their own VkStream skip it and
+    // serialize per-stream inside module_loader instead.
+    if (is_sync_mode) {
+        module_loader.lockDispatcherMutex();
+    }
+    defer if (is_sync_mode) module_loader.unlockDispatcherMutex();
 
     const procs = try VkProcs.resolve();
 
@@ -772,7 +866,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     const total_chunks: u32 = @intCast(req.chunk_descs.len);
 
     // Phase 4: back half (Huff predecode + LZ pipeline + sync + timing).
-    try runBackHalf(self, req, &procs, layout, n_huff, have_huff, total_chunks, heavy_stream, facade);
+    try runBackHalf(self, req, &procs, layout, n_huff, have_huff, total_chunks, heavy_stream, facade, is_sync_mode);
     if (t_e2e0) |t0| if (io) |io_val| {
         e2e_cum.predh = nsSince(t0, io_val);
     };
@@ -780,10 +874,22 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // Phase 5: finalize, profiling drain, e2e emit. Skip the finalize
     // D2D when the LZ kernel already wrote straight to the caller's
     // device buffer — same predicate as the LZ dst-pick in runBackHalf.
+    //
+    // Iter 4: finalizeOutput records D2H into the batched cmdbuf via
+    // d2h_async; the runBackHalf stream_sync above already flushed it,
+    // BUT in the L1 path finalize is called AFTER the sync, so the
+    // d2h_async records into a freshly-reset cmdbuf and needs another
+    // flush. Issue an extra stream_sync after finalize to drain it.
     if (!req.writesDirectlyToTarget()) {
         try finalizeOutput(self, &procs, req, heavy_stream);
+        if (is_sync_mode) {
+            try vkCall(procs.stream_sync(heavy_stream), .sync);
+        }
     }
-    if (self.work_stream == 0) {
+    // Iter 4: gate profiling drain on captured is_sync_mode (not the
+    // live work_stream check, which now reads non-zero due to the
+    // dispatcher's pipeline_stream promotion).
+    if (is_sync_mode) {
         finalizeProfiling(&self.pending_timings, &self.last_timings);
     }
     if (t_e2e0) |t0| if (io) |io_val| {
