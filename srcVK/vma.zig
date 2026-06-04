@@ -225,16 +225,34 @@ pub extern "c" fn vmaGetAllocationInfo(
 /// Initialise a VMA allocator on the supplied (instance, physical,
 /// logical) triplet. Wraps vmaCreateAllocator with the buffer-device-
 /// address flag enabled so callers can later query VAs for D2D paths.
+///
+/// VK adaptation: srcVK/vma/vk_mem_alloc_impl.cpp builds VMA with
+/// VMA_STATIC_VULKAN_FUNCTIONS=0 + VMA_DYNAMIC_VULKAN_FUNCTIONS=1. As of
+/// VMA v3.x (see vk_mem_alloc.h:13035-13040), that combination REQUIRES
+/// the caller to pass a VmaVulkanFunctions struct populated with at
+/// least vkGetInstanceProcAddr + vkGetDeviceProcAddr — VMA resolves
+/// everything else off those two roots. Passing pVulkanFunctions = null
+/// (the previous default here) made VMA dereference a null function
+/// pointer inside ImportVulkanFunctions_Dynamic and segfault hard. The
+/// caller supplies the two pointers it already resolved during the
+/// instance/device bring-up; we cast them into the slot.
 pub fn createAllocator(
     instance: VkInstance,
     phys: VkPhysicalDevice,
     device: VkDevice,
+    vk_get_instance_proc_addr: ?*const anyopaque,
+    vk_get_device_proc_addr: ?*const anyopaque,
 ) error{AllocatorCreateFailed}!VmaAllocator {
     var out: VmaAllocator = null;
+    const vk_fns = VmaVulkanFunctions{
+        .vkGetInstanceProcAddr = vk_get_instance_proc_addr,
+        .vkGetDeviceProcAddr = vk_get_device_proc_addr,
+    };
     const ci = VmaAllocatorCreateInfo{
         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
         .physicalDevice = phys,
         .device = device,
+        .pVulkanFunctions = &vk_fns,
         .instance = instance,
         // Vulkan API version baked at allocator creation time. 1.3 matches
         // the build.zig --target-env so VMA enables every feature path the

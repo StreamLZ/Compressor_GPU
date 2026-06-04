@@ -352,6 +352,104 @@ const VK_QUERY_RESULT_64_BIT: u32 = 0x00000002;
 const VK_QUERY_RESULT_WAIT_BIT: u32 = 0x00000001;
 const VkQueryPool = u64;
 
+// VK adaptation: feature-chain sTypes for the VkDeviceCreateInfo pNext.
+// Mirrors src_vulkan/vk_api.zig:113-114 + the sub-struct sTypes — we need
+// these to chain bufferDeviceAddress + shaderInt8 + storageBuffer8BitAccess
+// + subgroupSizeControl at vkCreateDevice time. The SPV blobs declare
+// OpCapability Int8 + StorageBuffer8BitAccess (see spirv-dis output of
+// lz_decode_raw_kernel.spv); without these features enabled the driver
+// will accept the device create but later crash inside vkCreate*Pipeline
+// or vkGetBufferDeviceAddress (NVIDIA hits a hard segfault, no validation
+// message). VMA was also being created with
+// VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT (see vma.zig:235); when
+// the matching feature isn't enabled VMA tries to call
+// vkGetBufferDeviceAddress through a nullptr fn-ptr and segfaults.
+const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: c_int = 51;
+const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: c_int = 53;
+const VK_TRUE: u32 = 1;
+
+// Minimal subset of VkPhysicalDeviceVulkan12Features — only the fields
+// the codec actually needs to set are named; the rest land in the
+// trailing _filler so the driver's writes never overflow this struct
+// (spec layout is 47 VkBool32 fields after sType/pNext). Mirrors
+// src_vulkan/vk_api.zig:506-556 layout. ORDER MATTERS — the spec fixes
+// the field order; storageBuffer8BitAccess is the 3rd VkBool32,
+// shaderInt8 is the 9th, bufferDeviceAddress is the 39th.
+const VkPhysicalDeviceVulkan12Features = extern struct {
+    sType: c_int = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+    pNext: ?*anyopaque = null,
+    samplerMirrorClampToEdge: u32 = 0,
+    drawIndirectCount: u32 = 0,
+    storageBuffer8BitAccess: u32 = 0,
+    uniformAndStorageBuffer8BitAccess: u32 = 0,
+    storagePushConstant8: u32 = 0,
+    shaderBufferInt64Atomics: u32 = 0,
+    shaderSharedInt64Atomics: u32 = 0,
+    shaderFloat16: u32 = 0,
+    shaderInt8: u32 = 0,
+    descriptorIndexing: u32 = 0,
+    shaderInputAttachmentArrayDynamicIndexing: u32 = 0,
+    shaderUniformTexelBufferArrayDynamicIndexing: u32 = 0,
+    shaderStorageTexelBufferArrayDynamicIndexing: u32 = 0,
+    shaderUniformBufferArrayNonUniformIndexing: u32 = 0,
+    shaderSampledImageArrayNonUniformIndexing: u32 = 0,
+    shaderStorageBufferArrayNonUniformIndexing: u32 = 0,
+    shaderStorageImageArrayNonUniformIndexing: u32 = 0,
+    shaderInputAttachmentArrayNonUniformIndexing: u32 = 0,
+    shaderUniformTexelBufferArrayNonUniformIndexing: u32 = 0,
+    shaderStorageTexelBufferArrayNonUniformIndexing: u32 = 0,
+    descriptorBindingUniformBufferUpdateAfterBind: u32 = 0,
+    descriptorBindingSampledImageUpdateAfterBind: u32 = 0,
+    descriptorBindingStorageImageUpdateAfterBind: u32 = 0,
+    descriptorBindingStorageBufferUpdateAfterBind: u32 = 0,
+    descriptorBindingUniformTexelBufferUpdateAfterBind: u32 = 0,
+    descriptorBindingStorageTexelBufferUpdateAfterBind: u32 = 0,
+    descriptorBindingUpdateUnusedWhilePending: u32 = 0,
+    descriptorBindingPartiallyBound: u32 = 0,
+    descriptorBindingVariableDescriptorCount: u32 = 0,
+    runtimeDescriptorArray: u32 = 0,
+    samplerFilterMinmax: u32 = 0,
+    scalarBlockLayout: u32 = 0,
+    imagelessFramebuffer: u32 = 0,
+    uniformBufferStandardLayout: u32 = 0,
+    shaderSubgroupExtendedTypes: u32 = 0,
+    separateDepthStencilLayouts: u32 = 0,
+    hostQueryReset: u32 = 0,
+    timelineSemaphore: u32 = 0,
+    bufferDeviceAddress: u32 = 0,
+    bufferDeviceAddressCaptureReplay: u32 = 0,
+    bufferDeviceAddressMultiDevice: u32 = 0,
+    vulkanMemoryModel: u32 = 0,
+    vulkanMemoryModelDeviceScope: u32 = 0,
+    vulkanMemoryModelAvailabilityVisibilityChains: u32 = 0,
+    shaderOutputViewportIndex: u32 = 0,
+    shaderOutputLayer: u32 = 0,
+    subgroupBroadcastDynamicId: u32 = 0,
+};
+
+// VkPhysicalDeviceVulkan13Features — full spec layout so the driver's
+// writes don't clobber adjacent memory. We only set subgroupSizeControl
+// + computeFullSubgroups; mirrors src_vulkan/vk_api.zig:561-579.
+const VkPhysicalDeviceVulkan13Features = extern struct {
+    sType: c_int = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+    pNext: ?*anyopaque = null,
+    robustImageAccess: u32 = 0,
+    inlineUniformBlock: u32 = 0,
+    descriptorBindingInlineUniformBlockUpdateAfterBind: u32 = 0,
+    pipelineCreationCacheControl: u32 = 0,
+    privateData: u32 = 0,
+    shaderDemoteToHelperInvocation: u32 = 0,
+    shaderTerminateInvocation: u32 = 0,
+    subgroupSizeControl: u32 = 0,
+    computeFullSubgroups: u32 = 0,
+    synchronization2: u32 = 0,
+    textureCompressionASTC_HDR: u32 = 0,
+    shaderZeroInitializeWorkgroupMemory: u32 = 0,
+    dynamicRendering: u32 = 0,
+    shaderIntegerDotProduct: u32 = 0,
+    maintenance4: u32 = 0,
+};
+
 const VkApplicationInfo = extern struct {
     sType: c_int = VK_STRUCTURE_TYPE_APPLICATION_INFO,
     pNext: ?*const anyopaque = null,
@@ -1110,7 +1208,36 @@ pub fn init() bool {
         .queueCount = 1,
         .pQueuePriorities = &priorities,
     };
+    // VK adaptation: chain VkPhysicalDeviceVulkan12Features +
+    // VkPhysicalDeviceVulkan13Features off VkDeviceCreateInfo.pNext so
+    // the device is created with:
+    //   * bufferDeviceAddress (required by VMA's
+    //     VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT in vma.zig:235 +
+    //     by VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT used in
+    //     procMallocDevice).
+    //   * shaderInt8 + storageBuffer8BitAccess +
+    //     uniformAndStorageBuffer8BitAccess (the .spv blobs declare
+    //     OpCapability Int8 + OpCapability StorageBuffer8BitAccess; see
+    //     spirv-dis output of lz_decode_raw_kernel.spv).
+    //   * subgroupSizeControl + computeFullSubgroups (every SPV blob
+    //     declares GroupNonUniform* capabilities and the dispatch path
+    //     assumes WARP_SIZE=32; Intel iGPU otherwise picks 16-wide
+    //     subgroups and breaks every warp-cooperative kernel).
+    //
+    // Mirrors src_vulkan/device.zig:338-368.
+    var v13_feats = VkPhysicalDeviceVulkan13Features{
+        .subgroupSizeControl = VK_TRUE,
+        .computeFullSubgroups = VK_TRUE,
+    };
+    var v12_feats = VkPhysicalDeviceVulkan12Features{
+        .storageBuffer8BitAccess = VK_TRUE,
+        .uniformAndStorageBuffer8BitAccess = VK_TRUE,
+        .shaderInt8 = VK_TRUE,
+        .bufferDeviceAddress = VK_TRUE,
+        .pNext = @ptrCast(&v13_feats),
+    };
     const dci = VkDeviceCreateInfo{
+        .pNext = @ptrCast(&v12_feats),
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = @ptrCast(&qci),
     };
@@ -1197,10 +1324,18 @@ pub fn init() bool {
 
     // VMA allocator on the (instance, phys, dev) triple. The VMA Zig
     // wrapper hides the vmaCreateAllocator boilerplate.
+    // VK adaptation: VMA is built with VMA_DYNAMIC_VULKAN_FUNCTIONS=1 and
+    // VMA_STATIC_VULKAN_FUNCTIONS=0 (see srcVK/vma/vk_mem_alloc_impl.cpp).
+    // It REQUIRES the caller to supply vkGetInstanceProcAddr +
+    // vkGetDeviceProcAddr through VmaVulkanFunctions; otherwise VMA
+    // segfaults dereferencing a null fn-ptr inside
+    // ImportVulkanFunctions_Dynamic (see vk_mem_alloc.h:13035-13040).
     const vma_alloc = vma.createAllocator(
         @ptrFromInt(vulkan_api.instance),
         @ptrFromInt(vulkan_api.physical_device),
         @ptrFromInt(vulkan_api.ctx),
+        @ptrCast(vkGetInstanceProcAddr_fn),
+        @ptrCast(vkGetDeviceProcAddr_fn),
     ) catch return false;
     vulkan_api.vma_allocator = @intFromPtr(vma_alloc);
 
