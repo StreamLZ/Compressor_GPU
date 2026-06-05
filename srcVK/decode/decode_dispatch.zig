@@ -54,6 +54,12 @@ pub var g_phase_finalize_d2h_ns: i64 = 0;    // just the d2h_async() call
 pub var g_phase_finalize_sync_ns: i64 = 0;   // post-finalize stream_sync (flushes deferred D2H memcpy)
 pub var g_phase_resolve_ns: i64 = 0;         // VkProcs.resolve()
 pub var g_phase_other_ns: i64 = 0;           // everything else inside fullGpuLaunchImpl
+// Iter 8 subfix 3: prepareImportHostBuffer time (moved out of finalize
+// so it overlaps with runBackHalf on the GPU). Reported separately so
+// we can verify subfix 3 is actually overlapping (the value here is
+// the would-have-been serialized cost; it's still spent — just not on
+// the finalize critical path).
+pub var g_phase_import_prep_ns: i64 = 0;
 
 pub fn phaseProfileInit() void {
     g_phase_profile_enabled = std.c.getenv("SLZ_VK_PROFILE_PHASES") != null;
@@ -71,6 +77,7 @@ pub fn phaseProfileInit() void {
     g_phase_finalize_sync_ns = 0;
     g_phase_resolve_ns = 0;
     g_phase_other_ns = 0;
+    g_phase_import_prep_ns = 0;
 }
 
 inline fn qpcNs() i64 {
@@ -105,6 +112,11 @@ pub fn printAndResetPhaseProfile(w: anytype) void {
     w.print("phase: finalize_total          {d:.4} ms/decode\n", .{ns_to_ms_per(g_phase_finalize_ns, n)}) catch {};
     w.print("phase:   finalize_d2h          {d:.4} ms/decode  (d2h_async submit)\n", .{ns_to_ms_per(g_phase_finalize_d2h_ns, n)}) catch {};
     w.print("phase:   finalize_sync         {d:.4} ms/decode  (stream_sync drain)\n", .{ns_to_ms_per(g_phase_finalize_sync_ns, n)}) catch {};
+    w.print("phase: import_prep             {d:.4} ms/decode  (subfix 3: overlapped with back-half; cache_hits={d}, misses={d})\n", .{
+        ns_to_ms_per(g_phase_import_prep_ns, n),
+        module_loader.g_import_prep_cache_hits,
+        module_loader.g_import_prep_cache_misses,
+    }) catch {};
     w.print("phase: other                   {d:.4} ms/decode\n", .{ns_to_ms_per(g_phase_other_ns, n)}) catch {};
     const totalled =
         g_phase_resolve_ns + g_phase_upload_ns + g_phase_backhalf_ns +
@@ -972,6 +984,27 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // by the unconditional `ensurePipelineStream` call above).
     const heavy_stream: usize = if (self.work_stream != 0) self.work_stream else self.pipeline_stream;
     const total_chunks: u32 = @intCast(req.chunk_descs.len);
+
+    // Iter 8 subfix 3: pre-create / pre-allocate the imported host
+    // buffer that the eventual finalize-phase D2H will target. Doing
+    // this BEFORE runBackHalf overlaps the ~1 ms
+    // vkCreateBuffer+vkAllocateMemory cost (cache miss) or ~0 ms
+    // (cache hit) with the LZ kernel's GPU execution. The prep is
+    // stashed on the heavy_stream so procD2HAsync inside
+    // finalizeOutput consumes it without re-running the alloc.
+    //
+    // Only run when the D2H path will actually execute: skipped when
+    // writesDirectlyToTarget() is true (LZ kernel writes straight to
+    // d_output_target — no D2H). The dst pointer arithmetic mirrors
+    // finalizeOutput's d2hRoute call below.
+    if (!req.writesDirectlyToTarget()) {
+        const _t_prep0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
+        const dst_ptr: *anyopaque = @ptrCast(req.dst_full + req.dst_start_off);
+        if (module_loader.prepareImportHostBuffer(dst_ptr, req.decompressed_size)) |prep| {
+            _ = module_loader.stashPreparedImportForStream(heavy_stream, prep);
+        }
+        if (g_phase_profile_enabled) g_phase_import_prep_ns += qpcDeltaNs(_t_prep0, vk.qpcNow());
+    }
 
     // Phase 4: back half (Huff predecode + LZ pipeline + sync + timing).
     const _t_bh0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;

@@ -7,6 +7,7 @@ const std = @import("std");
 const util = @import("util.zig");
 const decoder = @import("../decode/streamlz_decoder.zig");
 const gpu_dec_driver = @import("../decode/driver.zig");
+const dec_module_loader = @import("../decode/module_loader.zig");
 const frame = @import("../format/frame_format.zig");
 const mmap_helpers = @import("../mmap.zig");
 
@@ -84,11 +85,26 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     };
 
     const result = decoder.decompressFramedThreaded(allocator, io, src, out_map.slice(), &gpu_dec_driver.g_default) catch |err| {
+        // Iter 8 subfix 1: release any cached imports that reference
+        // the mmap'd output before tearing the mapping down. The
+        // imported VkDeviceMemory keeps the pages pinned from the OS's
+        // perspective; truncating the file (below in the success path)
+        // or unmapping cleanly requires the imports to be released.
+        const slice = out_map.slice();
+        dec_module_loader.releaseImportsByHostRange(@ptrCast(slice.ptr), slice.len);
         out_map.unmap();
         try w.print("error: decompression failed: {s}\n", .{@errorName(err)});
         try w.flush();
         std.process.exit(1);
     };
+    // Iter 8 subfix 1: same release before unmap on the success path —
+    // setLength() below would otherwise fail with AccessDenied because
+    // the cached VkDeviceMemory imports against pages the kernel still
+    // considers in use.
+    {
+        const slice = out_map.slice();
+        dec_module_loader.releaseImportsByHostRange(@ptrCast(slice.ptr), slice.len);
+    }
     out_map.unmap();
 
     out_file.setLength(io, result.written) catch |err| {
