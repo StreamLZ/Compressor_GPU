@@ -917,6 +917,36 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     const procs = try VkProcs.resolve();
     if (g_phase_profile_enabled) g_phase_resolve_ns += qpcDeltaNs(_t_resolve0, vk.qpcNow());
 
+    // Iter 9: pre-create / pre-fetch the imported host SOURCE buffer
+    // wrapping the caller's compressed-input pointer. The actual H2D
+    // runs inside uploadInputAndPrefixSum on self.work_stream; doing
+    // the import (vkCreateBuffer + vkAllocateMemory + vkBindBufferMemory)
+    // BEFORE that overlaps the ~200 us cache-miss cost with VkProcs
+    // resolution and any other dispatcher prep, and is ~0 on cache hit.
+    // Stashed on self.work_stream so procH2DAsync matches on consumption.
+    // Gated by the same eligibility constraints as the inline path
+    // (alignment / extension support / size threshold-equivalent — we
+    // only stash for the big comp_input, the tiny chunk_descs H2D will
+    // bypass the import even if a stash existed).
+    // TEMPORARILY DISABLED in concert with H2D_IMPORT_THRESHOLD =
+    // maxInt — see module_loader iter9 note. Empirical: the H2D
+    // import path on RTX 4060 Ti is ~10 ms slower than iter-4 staging
+    // for the 58 MB enwik8 comp_input even with NON-cached
+    // HOST_COHERENT memory selection. Re-enable when the GPU DMA
+    // bottleneck is understood.
+    if (false and req.d_compressed_src == null and req.compressed_block.len >= (4 * 1024 * 1024)) {
+        const src_ptr_const: *const anyopaque = @ptrCast(req.compressed_block.ptr);
+        const src_addr = @intFromPtr(src_ptr_const);
+        if (module_loader.prepareImportHostBufferForUpload(src_ptr_const, req.compressed_block.len)) |prep| {
+            _ = module_loader.stashPreparedUploadImportForStream(
+                self.work_stream,
+                src_addr,
+                req.compressed_block.len,
+                prep,
+            );
+        }
+    }
+
     // Phase 1: upload + prefix sum (always runs — needed for chunk
     // descriptor sizing on L1 and L2+).
     const _t_upload0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;

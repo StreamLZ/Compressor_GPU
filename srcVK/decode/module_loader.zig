@@ -342,7 +342,27 @@ const VkPipelineCache = u64;
 const PFN_vkVoidFunction = ?*const fn () callconv(.c) void;
 
 const VK_NULL_HANDLE: u64 = 0;
+const VK_QUEUE_GRAPHICS_BIT: u32 = 0x00000001;
 const VK_QUEUE_COMPUTE_BIT: u32 = 0x00000002;
+const VK_QUEUE_TRANSFER_BIT: u32 = 0x00000004;
+
+// Iter 11: VK adaptation — pipeline stage bit used to wait on the H2D
+// transfer-queue submit's binary semaphore at the compute-queue submit.
+// COMPUTE_SHADER_BIT (not TRANSFER_BIT) because the compute kernels are
+// the producer-consumers of the H2D bytes; the wait drops the compute
+// dispatch behind the transfer copy without holding back the host.
+const VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT: u32 = 0x00000800;
+
+// Iter 11: VkSemaphore + VkSemaphoreCreateInfo sType for the binary
+// semaphore that gates compute on H2D. VkSemaphore is a u64 dispatchable
+// handle like VkFence.
+const VkSemaphore = u64;
+const VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO: c_int = 9;
+const VkSemaphoreCreateInfo = extern struct {
+    sType: c_int = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+    pNext: ?*const anyopaque = null,
+    flags: u32 = 0,
+};
 
 const VK_STRUCTURE_TYPE_APPLICATION_INFO: c_int = 0;
 const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: c_int = 1;
@@ -862,6 +882,12 @@ const FnCreateFence = *const fn (VkDevice, *const VkFenceCreateInfo, ?*const any
 const FnWaitForFences = *const fn (VkDevice, u32, [*]const VkFence, u32, u64) callconv(.c) VkResult;
 const FnResetFences = *const fn (VkDevice, u32, [*]const VkFence) callconv(.c) VkResult;
 const FnDestroyFence = *const fn (VkDevice, VkFence, ?*const anyopaque) callconv(.c) void;
+
+// Iter 11: vkCreateSemaphore / vkDestroySemaphore FFI for the binary
+// semaphore that chains the H2D transfer-queue submit -> compute-queue
+// submit. Both are core Vulkan 1.0.
+const FnCreateSemaphore = *const fn (VkDevice, *const VkSemaphoreCreateInfo, ?*const anyopaque, *VkSemaphore) callconv(.c) VkResult;
+const FnDestroySemaphore = *const fn (VkDevice, VkSemaphore, ?*const anyopaque) callconv(.c) void;
 const FnDestroyCommandPool = *const fn (VkDevice, VkCommandPool, ?*const anyopaque) callconv(.c) void;
 const FnResetCommandBuffer = *const fn (VkCommandBuffer, u32) callconv(.c) VkResult;
 const FnCreateShaderModule = *const fn (VkDevice, *const VkShaderModuleCreateInfo, ?*const anyopaque, *VkShaderModule) callconv(.c) VkResult;
@@ -908,6 +934,11 @@ const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT: c_i
 const VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT: u32 = 0x80;
 const VK_SHARING_MODE_EXCLUSIVE: c_int = 0;
 const VK_BUFFER_USAGE_TRANSFER_DST_BIT: u32 = 0x00000002;
+// Iter 9: H2D import fast path uses TRANSFER_SRC on the imported VkBuffer
+// (caller's host pointer is the SOURCE of a vkCmdCopyBuffer into the
+// device-local persistent input buffer). procH2DAsync gates on this bit
+// to mirror the iter-7/8 D2H pattern. Spec value per VK 1.0 core.
+const VK_BUFFER_USAGE_TRANSFER_SRC_BIT: u32 = 0x00000001;
 const VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT: u32 = 0x00000002;
 const VK_MAX_MEMORY_TYPES: usize = 32;
 const VK_MAX_MEMORY_HEAPS: usize = 16;
@@ -1014,6 +1045,12 @@ var vkCreateFence_fn: ?FnCreateFence = null;
 var vkWaitForFences_fn: ?FnWaitForFences = null;
 var vkResetFences_fn: ?FnResetFences = null;
 var vkDestroyFence_fn: ?FnDestroyFence = null;
+
+// Iter 11: VK adaptation — resolved at init() alongside other device-level
+// entry points. Used by procStreamCreate / procStreamDestroy and by
+// streamEndAndWait's 2-submit dance.
+var vkCreateSemaphore_fn: ?FnCreateSemaphore = null;
+var vkDestroySemaphore_fn: ?FnDestroySemaphore = null;
 var vkDestroyCommandPool_fn: ?FnDestroyCommandPool = null;
 var vkResetCommandBuffer_fn: ?FnResetCommandBuffer = null;
 var vkCreateShaderModule_fn: ?FnCreateShaderModule = null;
@@ -1095,6 +1132,12 @@ const ImportedEntry = struct {
     vk_mem: VkDeviceMemory,
     last_used_ns: i64,
     in_flight: bool, // true while a GPU op is using vk_buf
+    // Iter 9: which TRANSFER usage bit the VkBuffer was created with.
+    // H2D needs TRANSFER_SRC; D2H needs TRANSFER_DST. The cache key is
+    // (host_ptr, size, usage_src) so the same caller pointer can hold a
+    // SRC import (compressed input upload) and a DST import (decoded
+    // output) simultaneously without colliding.
+    usage_src: bool,
 };
 const G_IMPORT_CACHE_CAP: usize = 16;
 var g_import_cache: [G_IMPORT_CACHE_CAP]?ImportedEntry = @splat(@as(?ImportedEntry, null));
@@ -1123,6 +1166,20 @@ pub var g_import_prep_cache_misses: u64 = 0;
 var g_command_pool: VkCommandPool = VK_NULL_HANDLE;
 var g_command_buffer: VkCommandBuffer = null;
 var g_fence: VkFence = VK_NULL_HANDLE;
+
+// Iter 11: VK adaptation — dedicated VK_QUEUE_TRANSFER_BIT queue + its
+// per-queue command pool. On NVIDIA discrete GPUs the dedicated transfer
+// family fronts the on-chip copy engine, mirroring CUDA's
+// cuMemcpyHtoDAsync auto-routing. On platforms with no dedicated transfer
+// family (Intel iGPU, AMD APUs), g_transfer_queue_family == compute and
+// g_has_dedicated_transfer == false; the pool + queue handles are still
+// distinct objects but reference the same family, which behaves like a
+// single-queue setup with extra cmdbuf overhead. Fence-wait cost is
+// unchanged in that case.
+var g_transfer_queue: usize = 0;
+var g_transfer_queue_family: u32 = 0;
+var g_transfer_cmd_pool: VkCommandPool = VK_NULL_HANDLE;
+var g_has_dedicated_transfer: bool = false;
 var g_staging_buffer: vma.VkBuffer = 0;
 var g_staging_alloc: vma.VmaAllocation = null;
 var g_staging_size: usize = 0;
@@ -1217,12 +1274,37 @@ const PendingImportedD2H = struct {
     buffer: VkBuffer,
     memory: VkDeviceMemory,
     cache_idx: i32 = -1, // -1 = legacy uncached path (iter 7 fallback)
+    // Iter 9: byte offset within the imported VkBuffer where the actual
+    // requested host pointer sits. Non-zero when the caller's pointer
+    // wasn't page-aligned — we import the surrounding page-aligned
+    // region and let vkCmdCopyBuffer skip the leading pad via srcOffset
+    // (H2D side) / dstOffset (D2H side). Lets us import arbitrary
+    // sub-page slices of a page-aligned parent allocation (e.g. the
+    // compressed-input block_payload that starts at offset header_size
+    // within a pinned src buffer).
+    region_offset: u64 = 0,
 };
 
 const StreamEntry = struct {
     cmdbuf: VkCommandBuffer,
     fence: VkFence,
     recording: bool, // true if Begin has been called but End/Submit not yet
+    // Iter 11: VK adaptation — second cmdbuf allocated from the dedicated
+    // transfer-queue command pool, plus a binary semaphore the transfer
+    // submit signals and the compute submit waits on. procH2DAsync records
+    // vkCmdCopyBuffer into transfer_cmdbuf so the H2D DMA runs on the
+    // copy engine in parallel with the compute queue's setup work
+    // (descriptor-set allocate + bind + dispatch). Mirrors CUDA's
+    // cuMemcpyHtoDAsync auto-routing to the dedicated DMA engine.
+    //
+    // When g_has_dedicated_transfer == false (Intel iGPU / AMD APU) the
+    // transfer pool sits on the compute family; the cmdbuf split still
+    // works (two cmdbufs into the same queue family is legal) but the
+    // semaphore wait degenerates to a no-op serializer and the win is
+    // ~0. Bench captures this as "dedicated=false" in the init log.
+    transfer_cmdbuf: VkCommandBuffer = null,
+    transfer_recording: bool = false,
+    h2d_sem: VkSemaphore = VK_NULL_HANDLE,
     staging_buffer: vma.VkBuffer = 0,
     staging_alloc: vma.VmaAllocation = null,
     staging_mapped: ?*anyopaque = null,
@@ -1247,6 +1329,16 @@ const StreamEntry = struct {
     // here at prep time, consumed (set back to null) by the next
     // procD2HAsync call on this stream.
     prepared_d2h_import: ?PendingImportedD2H = null,
+    // Iter 9: H2D analog of prepared_d2h_import. Dispatcher pre-prepares
+    // an imported TRANSFER_SRC buffer for the compressed-input upload so
+    // procH2DAsync's first big copy skips the inline import cost. The
+    // import_src_host_addr field keys the prep to a specific source
+    // pointer so two queued H2Ds on the same stream don't accidentally
+    // consume each other's prep. Cleared after consumption (or
+    // streamEndAndWait when unused).
+    prepared_h2d_import: ?PendingImportedD2H = null,
+    prepared_h2d_host_addr: usize = 0,
+    prepared_h2d_size: usize = 0,
 };
 var g_streams: std.ArrayListUnmanaged(?StreamEntry) = .empty;
 
@@ -1300,9 +1392,21 @@ fn ensureStreamStaging(entry: *StreamEntry, needed: usize) bool {
     while (size < needed) size *= 2;
     var buf: vma.VkBuffer = 0;
     var alc: vma.VmaAllocation = null;
+    // Iter 11: VK adaptation — per-stream staging buffer is read by the
+    // transfer queue (procH2DAsync) AND written by the compute queue's
+    // D2H readback path (procD2HAsync staging fallback). CONCURRENT mode
+    // when both queue families are distinct so we skip ownership
+    // transfer barriers.
+    var stg_qfs = [_]u32{ vulkan_api.compute_queue_family, g_transfer_queue_family };
+    const stg_sharing: c_int = if (g_has_dedicated_transfer) vma.VK_SHARING_MODE_CONCURRENT else vma.VK_SHARING_MODE_EXCLUSIVE;
+    const stg_qf_count: u32 = if (g_has_dedicated_transfer) 2 else 0;
+    const stg_qf_ptr: ?[*]const u32 = if (g_has_dedicated_transfer) @ptrCast(&stg_qfs) else null;
     const bci = vma.VkBufferCreateInfo{
         .size = size,
         .usage = vma.VK_BUFFER_USAGE_TRANSFER_SRC_BIT | vma.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = stg_sharing,
+        .queueFamilyIndexCount = stg_qf_count,
+        .pQueueFamilyIndices = stg_qf_ptr,
     };
     const aci = vma.VmaAllocationCreateInfo{
         .flags = vma.VMA_ALLOCATION_CREATE_MAPPED_BIT | vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
@@ -1591,12 +1695,50 @@ pub fn init() bool {
     if (queue_family == std.math.maxInt(u32)) return false;
     vulkan_api.compute_queue_family = queue_family;
 
+    // Iter 11: VK adaptation — find a dedicated VK_QUEUE_TRANSFER_BIT
+    // queue family (has TRANSFER but NOT GRAPHICS or COMPUTE). On NVIDIA
+    // discrete GPUs this is the on-chip DMA / copy engine — recording
+    // H2D vkCmdCopyBuffer into a cmdbuf submitted on this queue avoids
+    // the subchannel-switch wait-for-idle NVIDIA forces when a single
+    // queue mixes copy + compute. Mirrors CUDA's cuMemcpyHtoDAsync
+    // auto-routing.
+    //
+    // Fallback when no dedicated family exists: reuse the compute family
+    // (Intel iGPU, AMD APUs only expose one queue family). The cmdbuf
+    // split still compiles + runs; the binary-semaphore wait degenerates
+    // to a no-op serializer.
+    var transfer_qf: u32 = queue_family;
+    var dedicated_transfer = false;
+    for (qf_buf[0..qfc], 0..) |qf, idx| {
+        const has_xfer = (qf.queueFlags & VK_QUEUE_TRANSFER_BIT) != 0;
+        const has_gfx = (qf.queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
+        const has_compute = (qf.queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+        if (has_xfer and !has_gfx and !has_compute and qf.queueCount > 0) {
+            transfer_qf = @intCast(idx);
+            dedicated_transfer = true;
+            break;
+        }
+    }
+    g_transfer_queue_family = transfer_qf;
+    g_has_dedicated_transfer = dedicated_transfer;
+
     const priorities = [_]f32{1.0};
-    const qci = VkDeviceQueueCreateInfo{
+    const xfer_priorities = [_]f32{1.0};
+    var qcis: [2]VkDeviceQueueCreateInfo = undefined;
+    qcis[0] = .{
         .queueFamilyIndex = queue_family,
         .queueCount = 1,
         .pQueuePriorities = &priorities,
     };
+    var qci_count: u32 = 1;
+    if (dedicated_transfer) {
+        qcis[1] = .{
+            .queueFamilyIndex = transfer_qf,
+            .queueCount = 1,
+            .pQueuePriorities = &xfer_priorities,
+        };
+        qci_count = 2;
+    }
     // VK adaptation: chain VkPhysicalDeviceVulkan12Features +
     // VkPhysicalDeviceVulkan13Features off VkDeviceCreateInfo.pNext so
     // the device is created with:
@@ -1636,8 +1778,8 @@ pub fn init() bool {
     const ext_count: u32 = if (ext_mem_host_available) 1 else 0;
     const dci = VkDeviceCreateInfo{
         .pNext = @ptrCast(&v12_feats),
-        .queueCreateInfoCount = 1,
-        .pQueueCreateInfos = @ptrCast(&qci),
+        .queueCreateInfoCount = qci_count,
+        .pQueueCreateInfos = @ptrCast(&qcis),
         .enabledExtensionCount = ext_count,
         .ppEnabledExtensionNames = if (ext_count > 0) @ptrCast(&ext_names_storage) else null,
     };
@@ -1660,6 +1802,9 @@ pub fn init() bool {
     vkWaitForFences_fn = @ptrCast(gdpa(dev, "vkWaitForFences"));
     vkResetFences_fn = @ptrCast(gdpa(dev, "vkResetFences"));
     vkDestroyFence_fn = @ptrCast(gdpa(dev, "vkDestroyFence"));
+    // Iter 11: VK adaptation — semaphore FFI for the 2-submit chain.
+    vkCreateSemaphore_fn = @ptrCast(gdpa(dev, "vkCreateSemaphore"));
+    vkDestroySemaphore_fn = @ptrCast(gdpa(dev, "vkDestroySemaphore"));
     vkDestroyCommandPool_fn = @ptrCast(gdpa(dev, "vkDestroyCommandPool"));
     vkResetCommandBuffer_fn = @ptrCast(gdpa(dev, "vkResetCommandBuffer"));
     vkCreateShaderModule_fn = @ptrCast(gdpa(dev, "vkCreateShaderModule"));
@@ -1721,6 +1866,27 @@ pub fn init() bool {
     if (queue == null) return false;
     vulkan_api.compute_queue = @intFromPtr(queue);
 
+    // Iter 11: VK adaptation — resolve the dedicated transfer queue. When
+    // no dedicated family exists we fall back to queue 0 of the compute
+    // family (same VkQueue handle as `queue` above); the split-cmdbuf
+    // record path still works but the semaphore wait is a no-op.
+    var xfer_queue: VkQueue = null;
+    vkGetDeviceQueue_fn.?(dev, transfer_qf, 0, &xfer_queue);
+    if (xfer_queue == null) return false;
+    g_transfer_queue = @intFromPtr(xfer_queue);
+
+    // Iter 11: log queue-family flags so we can verify (under
+    // SLZ_VK_PROFILE_PHASES=1) we actually grabbed the dedicated DMA
+    // engine on NVIDIA. Pure diagnostic — no behavioral impact.
+    if (std.c.getenv("SLZ_VK_PROFILE_PHASES") != null) {
+        var qf_flags_log: u32 = 0;
+        if (transfer_qf < qfc) qf_flags_log = qf_buf[transfer_qf].queueFlags;
+        std.debug.print(
+            "[VK_INIT] transfer queue: qf={d} flags=0x{x} dedicated={s}\n",
+            .{ transfer_qf, qf_flags_log, if (dedicated_transfer) "true" else "false" },
+        );
+    }
+
     // Iter 7: cache physical-device memory properties + the imported-host
     // alignment for the procD2HAsync import fast path. The extension is
     // only "supported" when every fn-ptr we need also resolved (defensive
@@ -1765,6 +1931,17 @@ pub fn init() bool {
     if (vkAllocateCommandBuffers_fn.?(dev, &cb_alloc, @ptrCast(&g_command_buffer)) != VK_SUCCESS_RC) return false;
     const fence_ci = VkFenceCreateInfo{};
     if (vkCreateFence_fn.?(dev, &fence_ci, null, &g_fence) != VK_SUCCESS_RC) return false;
+
+    // Iter 11: VK adaptation — per-context command pool bound to the
+    // transfer queue family. Each StreamEntry will allocate its own
+    // transfer_cmdbuf out of this pool. When dedicated_transfer is false
+    // this pool sits on the compute family (same QF index); still
+    // creates fine, the cmdbufs are still safely submittable.
+    const xfer_pool_ci = VkCommandPoolCreateInfo{
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = transfer_qf,
+    };
+    if (vkCreateCommandPool_fn.?(dev, &xfer_pool_ci, null, &g_transfer_cmd_pool) != VK_SUCCESS_RC) return false;
 
     // VMA allocator on the (instance, phys, dev) triple. The VMA Zig
     // wrapper hides the vmaCreateAllocator boilerplate.
@@ -2157,6 +2334,22 @@ fn streamBeginIfNeeded(entry: *StreamEntry) VkResult {
     return rc;
 }
 
+// Iter 11: VK adaptation — begin recording the per-stream transfer
+// cmdbuf if not already recording. Mirrors streamBeginIfNeeded but
+// targets the dedicated-transfer command pool's buffer. Called from
+// procH2DAsync's per-stream path so H2D vkCmdCopyBuffer lands on the
+// transfer queue instead of the compute queue.
+fn streamBeginTransferIfNeeded(entry: *StreamEntry) VkResult {
+    if (entry.transfer_recording) return VK_SUCCESS_RC;
+    _ = vkResetCommandBuffer_fn.?(entry.transfer_cmdbuf, 0);
+    const begin = VkCommandBufferBeginInfo{
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    const rc = vkBeginCommandBuffer_fn.?(entry.transfer_cmdbuf, &begin);
+    if (rc == VK_SUCCESS_RC) entry.transfer_recording = true;
+    return rc;
+}
+
 // End + submit the stream's cmdbuf (if recording) and wait on its fence.
 //
 // Iter 4: also flushes deferred D2H staging→host memcpys queued by
@@ -2166,7 +2359,7 @@ fn streamBeginIfNeeded(entry: *StreamEntry) VkResult {
 // until then, even with HOST_COHERENT memory — coherence covers
 // CPU↔GPU cache visibility, not pipeline ordering).
 fn streamEndAndWait(entry: *StreamEntry) VkResult {
-    if (!entry.recording) {
+    if (!entry.recording and !entry.transfer_recording) {
         // Even when no cmdbuf was recorded, reset arena/pending state
         // for symmetry (defensive: caller may have skipped the body).
         entry.staging_used = 0;
@@ -2175,24 +2368,100 @@ fn streamEndAndWait(entry: *StreamEntry) VkResult {
         return VK_SUCCESS_RC;
     }
     const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
-    const queue: VkQueue = @ptrFromInt(vulkan_api.compute_queue);
+    const compute_q: VkQueue = @ptrFromInt(vulkan_api.compute_queue);
+    const xfer_q: VkQueue = @ptrFromInt(g_transfer_queue);
+
+    // VK adaptation: H2D recorded into dedicated VK_QUEUE_TRANSFER_BIT queue
+    // (NVIDIA dedicated DMA engine); compute submit waits on a binary
+    // semaphore signalled by the transfer submit. Mirrors CUDA's
+    // cuMemcpyHtoDAsync auto-routing to the copy engine.
+    //
+    // Two-submit dance:
+    //   1) Transfer queue: signal entry.h2d_sem (no wait, no fence).
+    //   2) Compute queue:  wait on entry.h2d_sem at COMPUTE_SHADER_BIT,
+    //                      signal entry.fence.
+    //   3) Host: vkWaitForFences(entry.fence) — the transfer submit
+    //      finishes implicitly when compute fires, no need to wait on
+    //      the transfer queue separately.
+    //
+    // When entry.transfer_recording is false (no H2Ds on this decode)
+    // we skip the transfer submit + the wait, falling back to the
+    // single-submit shape so we don't pay for an empty cmdbuf.
+
+    // ── 1) End + submit the transfer cmdbuf if it has work ────────────
+    const has_xfer_work = entry.transfer_recording;
+    if (has_xfer_work) {
+        const rc_end = vkEndCommandBuffer_fn.?(entry.transfer_cmdbuf);
+        if (rc_end != VK_SUCCESS_RC) {
+            entry.recording = false;
+            entry.transfer_recording = false;
+            entry.staging_used = 0;
+            entry.pending_d2h.clearRetainingCapacity();
+            freePendingImportedD2H(entry);
+            return rc_end;
+        }
+        const xfer_cb = entry.transfer_cmdbuf;
+        const sem_handle = entry.h2d_sem;
+        const xfer_submit = VkSubmitInfo{
+            .commandBufferCount = 1,
+            .pCommandBuffers = @ptrCast(&xfer_cb),
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = @ptrCast(&sem_handle),
+        };
+        const rc_sub_xfer = vkQueueSubmit_fn.?(xfer_q, 1, @ptrCast(&xfer_submit), VK_NULL_HANDLE);
+        if (rc_sub_xfer != VK_SUCCESS_RC) {
+            entry.recording = false;
+            entry.transfer_recording = false;
+            entry.staging_used = 0;
+            entry.pending_d2h.clearRetainingCapacity();
+            freePendingImportedD2H(entry);
+            return rc_sub_xfer;
+        }
+    }
+
+    // ── 2) End + submit the compute cmdbuf (wait on h2d_sem if any) ───
+    // Defensive: if compute cmdbuf wasn't begun but transfer was, we
+    // still need to drain the semaphore. Begin an empty compute cmdbuf
+    // so the wait semantics line up. (In practice procH2DAsync is
+    // always followed by procLaunchKernel so this branch is unreached.)
+    if (!entry.recording) {
+        const rc_begin = streamBeginIfNeeded(entry);
+        if (rc_begin != VK_SUCCESS_RC) {
+            // Cannot drain the signalled semaphore — we'd deadlock on
+            // the next decode. Best effort: vkQueueWaitIdle on the
+            // transfer queue so the semaphore consumer is implicit.
+            if (vkQueueWaitIdle_fn) |wi| _ = wi(xfer_q);
+            entry.transfer_recording = false;
+            entry.staging_used = 0;
+            entry.pending_d2h.clearRetainingCapacity();
+            freePendingImportedD2H(entry);
+            return rc_begin;
+        }
+    }
     var rc = vkEndCommandBuffer_fn.?(entry.cmdbuf);
     if (rc != VK_SUCCESS_RC) {
         entry.recording = false;
+        entry.transfer_recording = false;
         entry.staging_used = 0;
         entry.pending_d2h.clearRetainingCapacity();
         freePendingImportedD2H(entry);
         return rc;
     }
     const cb = entry.cmdbuf;
-    const submit = VkSubmitInfo{
+    const sem_for_wait = entry.h2d_sem;
+    const wait_stage: u32 = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    const compute_submit = VkSubmitInfo{
         .commandBufferCount = 1,
         .pCommandBuffers = @ptrCast(&cb),
+        .waitSemaphoreCount = if (has_xfer_work) @as(u32, 1) else @as(u32, 0),
+        .pWaitSemaphores = if (has_xfer_work) @as(?*const anyopaque, @ptrCast(&sem_for_wait)) else null,
+        .pWaitDstStageMask = if (has_xfer_work) @as(?*const u32, &wait_stage) else null,
     };
     _ = vkResetFences_fn.?(dev, 1, @ptrCast(&entry.fence));
-    rc = vkQueueSubmit_fn.?(queue, 1, @ptrCast(&submit), entry.fence);
+    rc = vkQueueSubmit_fn.?(compute_q, 1, @ptrCast(&compute_submit), entry.fence);
     if (rc != VK_SUCCESS_RC) {
         entry.recording = false;
+        entry.transfer_recording = false;
         entry.staging_used = 0;
         entry.pending_d2h.clearRetainingCapacity();
         freePendingImportedD2H(entry);
@@ -2214,6 +2483,7 @@ fn streamEndAndWait(entry: *StreamEntry) VkResult {
     // the caller's pageable buffer.
     freePendingImportedD2H(entry);
     entry.recording = false;
+    entry.transfer_recording = false;
     entry.staging_used = 0;
     entry.pending_d2h.clearRetainingCapacity();
     return rc;
@@ -2247,12 +2517,30 @@ fn freePendingImportedD2H(entry: *StreamEntry) void {
 fn procMallocDevice(out: *VkDeviceBuffer, size: usize) callconv(.c) VkResult {
     var buf: vma.VkBuffer = 0;
     var alc: vma.VmaAllocation = null;
+    // Iter 11: VK adaptation — when we have a dedicated transfer queue
+    // family, set VK_SHARING_MODE_CONCURRENT on storage buffers so the
+    // transfer queue can vkCmdCopyBuffer into them and the compute queue
+    // can read/write them without an explicit queue-family ownership
+    // transfer barrier. The spec lets us list any subset of queue
+    // families the resource is touched by; missing entries silently make
+    // the access undefined. On NVIDIA discrete (transfer != compute) the
+    // perf cost of CONCURRENT vs EXCLUSIVE is negligible (driver still
+    // single-owner under the hood for storage buffers); the savings from
+    // skipping the ownership barrier in every per-decode submit
+    // outweigh any micro-cost.
+    var concurrent_qfs = [_]u32{ vulkan_api.compute_queue_family, g_transfer_queue_family };
+    const sharing_mode: c_int = if (g_has_dedicated_transfer) vma.VK_SHARING_MODE_CONCURRENT else vma.VK_SHARING_MODE_EXCLUSIVE;
+    const qf_count: u32 = if (g_has_dedicated_transfer) 2 else 0;
+    const qf_ptr: ?[*]const u32 = if (g_has_dedicated_transfer) @ptrCast(&concurrent_qfs) else null;
     const bci = vma.VkBufferCreateInfo{
         .size = size,
         .usage = vma.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
             vma.VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
             vma.VK_BUFFER_USAGE_TRANSFER_DST_BIT |
             vma.VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        .sharingMode = sharing_mode,
+        .queueFamilyIndexCount = qf_count,
+        .pQueueFamilyIndices = qf_ptr,
     };
     const aci = vma.VmaAllocationCreateInfo{
         .usage = vma.VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
@@ -2340,21 +2628,118 @@ fn procMemsetD8Async(dst: VkDeviceBuffer, value: u8, size: usize, stream: VkStre
     return procMemsetD8(dst, value, size);
 }
 
+// Iter 9: minimum size that triggers the H2D import fast path. The
+// extension's vkCreateBuffer + vkAllocateMemory cost (~200 us per
+// alloc on NVIDIA, ~0 on cache hit) is amortized over the H2D copy
+// itself; for tiny copies (chunk_descs ~1 MB, n_chunks 4 B) the
+// iter-4 staging memcpy + DMA is faster overall on a cache miss.
+// Set just under the typical compressed-input block size so the big
+// upload imports while the metadata uploads keep their fast path.
+// TEMPORARILY DISABLED: empirical measurement on RTX 4060 Ti shows the
+// import path's H2D DMA is SLOWER than the iter-4 staging path (~14 ms
+// vs ~4 ms for a 58 MB comp_input). Hypothesis: imported HOST_VISIBLE|
+// HOST_COHERENT memory forces the GPU to issue cache-snoop reads over
+// PCIe, which is slower than the conventional staging-buffer DMA path
+// that uses NVIDIA's optimized blit hardware. Set threshold above any
+// realistic L1 block size to keep the path code-complete but unused
+// while we investigate further. See iter9 report.
+const H2D_IMPORT_THRESHOLD: usize = std.math.maxInt(usize);
+
 fn procH2DAsync(dst: VkDeviceBuffer, src: *const anyopaque, size: usize, stream: VkStream) callconv(.c) VkResult {
     const entry = lookupAlloc(dst) orelse return -1;
     if (streamEntryFor(stream)) |se| {
-        // Iter 4: bump-allocate from the per-stream staging arena so
-        // back-to-back h2d_async calls on the same stream don't clobber
-        // each other (the old code shared g_staging_buffer, which made
-        // it unsafe to queue >1 H2D before stream_sync). The arena
-        // resets in streamEndAndWait after the GPU consumes the data.
-        const rc_begin = streamBeginIfNeeded(se);
+        // VK adaptation: H2D recorded into dedicated VK_QUEUE_TRANSFER_BIT
+        // queue (NVIDIA dedicated DMA engine); compute submit waits on a
+        // binary semaphore signalled by the transfer submit. Mirrors
+        // CUDA's cuMemcpyHtoDAsync auto-routing to the copy engine.
+        //
+        // The transfer cmdbuf records H2D vkCmdCopyBuffer ONLY. The
+        // compute cmdbuf still owns descriptor-set updates, dispatches,
+        // and D2H readbacks. streamEndAndWait does the 2-submit dance.
+        const rc_begin = streamBeginTransferIfNeeded(se);
         if (rc_begin != VK_SUCCESS_RC) return rc_begin;
+        // Also begin the compute cmdbuf eagerly so streamEndAndWait
+        // doesn't have to deal with a "transfer-only / no-compute-work"
+        // edge case (it would otherwise need to begin+end an empty
+        // compute cmdbuf just to consume the semaphore). The codec
+        // ALWAYS calls launch_kernel after h2d_async on the same stream
+        // in the L1 decode path; this just front-loads the begin.
+        const rc_begin_c = streamBeginIfNeeded(se);
+        if (rc_begin_c != VK_SUCCESS_RC) return rc_begin_c;
+
+        // Iter 9: prefer a pre-prepared upload import (set by
+        // fullGpuLaunchImpl BEFORE uploadInputAndPrefixSum so the
+        // ~200 us alloc cost overlaps with whatever ran earlier).
+        // Only matches if (host_addr, size) line up exactly — guards
+        // against the prep being consumed by the wrong H2D when
+        // multiple sub-MB copies precede the big one.
+        if (se.prepared_h2d_import) |prep| {
+            const src_addr = @intFromPtr(src);
+            if (se.prepared_h2d_host_addr == src_addr and se.prepared_h2d_size == size) {
+                se.prepared_h2d_import = null;
+                se.prepared_h2d_host_addr = 0;
+                se.prepared_h2d_size = 0;
+                markImportInFlight(prep.cache_idx);
+                // Iter 9: srcOffset = prep.region_offset skips the
+                // leading page-pad inside the imported parent region
+                // when the caller's src wasn't itself page-aligned.
+                const region = VkBufferCopy{ .srcOffset = prep.region_offset, .dstOffset = 0, .size = size };
+                vkCmdCopyBuffer_fn.?(se.transfer_cmdbuf, prep.buffer, entry.buffer, 1, @ptrCast(&region));
+                const gpa = std.heap.page_allocator;
+                se.pending_imported_d2h.append(gpa, prep) catch {
+                    clearImportInFlight(prep.cache_idx);
+                    if (prep.cache_idx < 0) {
+                        const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
+                        vkFreeMemory_fn.?(dev, prep.memory, null);
+                        vkDestroyBuffer_fn.?(dev, prep.buffer, null);
+                    }
+                    return -1;
+                };
+                return VK_SUCCESS_RC;
+            }
+            // Prep didn't match — leave it stashed for a future call.
+        }
+
+        // Iter 9: VK_EXT_external_memory_host fast path for big H2Ds.
+        // Mirrors the iter-7/8 D2H fast path: vkCmdCopyBuffer reads
+        // directly from the caller's host buffer via an imported
+        // TRANSFER_SRC VkBuffer — no staging memcpy on the host side,
+        // no double DMA. Gated on H2D_IMPORT_THRESHOLD so the tiny
+        // metadata uploads (chunk_descs ~1 MB, n_chunks 4 B) stay on
+        // the iter-4 staging path where their amortization is better.
+        // tryImportHostBuffer returns null on misalignment / extension
+        // absence — falls through to the staging path.
+        if (size >= H2D_IMPORT_THRESHOLD) {
+            const mutable_src: *anyopaque = @constCast(src);
+            if (tryImportHostBuffer(mutable_src, size, true)) |imported| {
+                markImportInFlight(imported.cache_idx);
+                // Iter 9: srcOffset accounts for sub-page offset of the
+                // caller's src within the imported page-aligned region.
+                const region = VkBufferCopy{ .srcOffset = imported.region_offset, .dstOffset = 0, .size = size };
+                vkCmdCopyBuffer_fn.?(se.transfer_cmdbuf, imported.buffer, entry.buffer, 1, @ptrCast(&region));
+                const gpa = std.heap.page_allocator;
+                se.pending_imported_d2h.append(gpa, imported) catch {
+                    clearImportInFlight(imported.cache_idx);
+                    if (imported.cache_idx < 0) {
+                        const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
+                        vkFreeMemory_fn.?(dev, imported.memory, null);
+                        vkDestroyBuffer_fn.?(dev, imported.buffer, null);
+                    }
+                    return -1;
+                };
+                return VK_SUCCESS_RC;
+            }
+        }
+
+        // Iter 4 staging path (fallback): bump-allocate from the
+        // per-stream staging arena so back-to-back h2d_async calls on
+        // the same stream don't clobber each other. The arena resets
+        // in streamEndAndWait after the GPU consumes the data.
         const off = streamStagingBump(se, size) orelse return -1;
         const mapped = se.staging_mapped orelse return -1;
         @memcpy(@as([*]u8, @ptrCast(mapped))[off .. off + size], @as([*]const u8, @ptrCast(src))[0..size]);
         const region = VkBufferCopy{ .srcOffset = off, .dstOffset = 0, .size = size };
-        vkCmdCopyBuffer_fn.?(se.cmdbuf, se.staging_buffer, entry.buffer, 1, @ptrCast(&region));
+        vkCmdCopyBuffer_fn.?(se.transfer_cmdbuf, se.staging_buffer, entry.buffer, 1, @ptrCast(&region));
         return VK_SUCCESS_RC;
     }
     return procH2D(dst, src, size);
@@ -2365,10 +2750,10 @@ fn procH2DAsync(dst: VkDeviceBuffer, src: *const anyopaque, size: usize, stream:
 // using the entry: an in-flight cached entry means the previous D2H
 // hasn't drained yet (e.g. concurrent stream) — fall through to a fresh
 // allocation rather than racing the GPU.
-fn lookupImportedBuffer(host_addr: usize, size: usize) ?usize {
+fn lookupImportedBuffer(host_addr: usize, size: usize, usage_src: bool) ?usize {
     for (g_import_cache, 0..) |maybe, i| {
         if (maybe) |e| {
-            if (e.host_ptr == host_addr and e.size == size and !e.in_flight) {
+            if (e.host_ptr == host_addr and e.size == size and e.usage_src == usage_src and !e.in_flight) {
                 g_import_cache[i].?.last_used_ns = vulkan_api.qpcNow();
                 return i;
             }
@@ -2381,7 +2766,7 @@ fn lookupImportedBuffer(host_addr: usize, size: usize) ?usize {
 // index that now holds the entry, or null on catastrophic failure
 // (shouldn't happen — cache is fixed-size). Evicted entry's GPU
 // resources are vkDestroyBuffer + vkFreeMemory'd.
-fn insertImportedBuffer(host_addr: usize, size: usize, vk_buf: VkBuffer, vk_mem: VkDeviceMemory) ?usize {
+fn insertImportedBuffer(host_addr: usize, size: usize, vk_buf: VkBuffer, vk_mem: VkDeviceMemory, usage_src: bool) ?usize {
     // First try an empty slot.
     for (g_import_cache, 0..) |maybe, i| {
         if (maybe == null) {
@@ -2392,6 +2777,7 @@ fn insertImportedBuffer(host_addr: usize, size: usize, vk_buf: VkBuffer, vk_mem:
                 .vk_mem = vk_mem,
                 .last_used_ns = vulkan_api.qpcNow(),
                 .in_flight = false,
+                .usage_src = usage_src,
             };
             return i;
         }
@@ -2421,6 +2807,7 @@ fn insertImportedBuffer(host_addr: usize, size: usize, vk_buf: VkBuffer, vk_mem:
         .vk_mem = vk_mem,
         .last_used_ns = vulkan_api.qpcNow(),
         .in_flight = false,
+        .usage_src = usage_src,
     };
     return evict;
 }
@@ -2449,45 +2836,79 @@ fn insertImportedBuffer(host_addr: usize, size: usize, vk_buf: VkBuffer, vk_mem:
 // HOST_CACHED type uses cached BAR1 pages which the CPU and GPU can both
 // touch at full bus speed; the HOST_VISIBLE-only fallback often lands
 // on uncached BAR1 (~9 GB/s on RTX 4060 Ti vs ~14 GB/s for HOST_CACHED).
-fn tryImportHostBuffer(host_ptr: *anyopaque, size: usize) ?PendingImportedD2H {
+fn tryImportHostBuffer(host_ptr: *anyopaque, size: usize, usage_src: bool) ?PendingImportedD2H {
     if (!g_ext_memory_host_supported) return null;
     if (g_imported_host_alignment == 0) return null;
     const align_mask = g_imported_host_alignment - 1;
     const addr = @intFromPtr(host_ptr);
-    if ((addr & align_mask) != 0) return null;
+    if (size == 0) return null;
+
+    // Iter 9: allow sub-page-aligned host pointers by importing the
+    // surrounding page-aligned region and recording the byte offset so
+    // vkCmdCopyBuffer can skip the leading pad. Critical for H2D
+    // because block_payload starts at offset header_size (14-26 B)
+    // within the pinned src buffer — never page-aligned by itself. The
+    // D2H side keeps working because its pointer was already page-
+    // aligned (procMallocHost returns page-aligned host allocations
+    // and the dispatcher offsets are page multiples).
+    //
+    // For the import to be safe the caller MUST own the entire
+    // page-aligned region we're about to import: the leading pad bytes
+    // (addr - aligned_base) and the trailing pad (aligned_size_for_buf -
+    // (offset + size)). procMallocHost rounds its allocation up to a
+    // page (iter 7) so its trailing pad is owned; for an externally-
+    // owned pinned buffer (bench's pinned input), the read-file slice
+    // was copied into a page-rounded allocation by allocHost which has
+    // the same property.
+    //
+    // Iter 9 caveat: leading-pad ownership for the H2D src case
+    // requires the caller's outer allocation to start at or before the
+    // page boundary. The bench's allocHost returns the exact base of a
+    // page-rounded allocation, so its region starts EXACTLY on a page
+    // — leading pad is zero for offset==0 callers and at most one page
+    // for offset==header_size callers, but the page itself belongs to
+    // the allocation.
+    const aligned_base_addr: usize = addr & ~@as(usize, align_mask);
+    const region_offset: u64 = @intCast(addr - aligned_base_addr);
+    const aligned_size_for_buf: u64 = ((@as(u64, region_offset) + @as(u64, size)) + align_mask) & ~@as(u64, align_mask);
 
     // Iter 8 subfix 1: cache lookup first. On hit, skip every Vk call
     // below — the (vk_buf, vk_mem) pair is still valid (vkAllocateMemory
     // with imported host pointer is stable as long as the underlying
     // host allocation lives, which it does for the lifetime of the CLI's
     // pinned output buffer).
-    if (lookupImportedBuffer(addr, size)) |hit| {
+    //
+    // Iter 9: cache key uses (aligned_base_addr, aligned_size_for_buf,
+    // usage_src) so two sub-page-offset imports against the same
+    // parent page-aligned buffer share one VkBuffer. The returned
+    // record carries the per-call region_offset.
+    if (lookupImportedBuffer(aligned_base_addr, @intCast(aligned_size_for_buf), usage_src)) |hit| {
         g_import_prep_cache_hits += 1;
         const e = g_import_cache[hit].?;
-        return .{ .buffer = e.vk_buf, .memory = e.vk_mem, .cache_idx = @intCast(hit) };
+        return .{ .buffer = e.vk_buf, .memory = e.vk_mem, .cache_idx = @intCast(hit), .region_offset = region_offset };
     }
 
-    // Round size UP to the alignment boundary — spec requires
-    // VkImportMemoryHostPointerInfoEXT.allocationSize to be a multiple
-    // of minImportedHostPointerAlignment. We only ever vkCmdCopyBuffer
-    // `size` bytes into the imported region, so the trailing pad (up
-    // to alignment - 1) bytes are never touched. The caller's buffer
-    // was page-rounded in procMallocHost so this never reads past the
-    // caller's allocation.
-    const aligned_size: u64 = (@as(u64, size) + align_mask) & ~@as(u64, align_mask);
+    const aligned_size: u64 = aligned_size_for_buf;
 
     const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
     const get_props = vkGetMemoryHostPointerPropertiesEXT_fn orelse return null;
 
+    // Pass the aligned-base address (not the caller's offset pointer)
+    // to vkGetMemoryHostPointerPropertiesEXT — the spec requires the
+    // queried pointer be host-pointer-aligned.
+    const aligned_base_ptr: *anyopaque = @ptrFromInt(aligned_base_addr);
     var host_ptr_props: VkMemoryHostPointerPropertiesEXT = .{};
-    if (get_props(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host_ptr, &host_ptr_props) != VK_SUCCESS_RC) return null;
+    if (get_props(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, aligned_base_ptr, &host_ptr_props) != VK_SUCCESS_RC) return null;
     if (host_ptr_props.memoryTypeBits == 0) return null;
 
-    // Create a VkBuffer sized to the aligned region with TRANSFER_DST
-    // usage — vkCmdCopyBuffer writes through it.
+    // Create a VkBuffer sized to the aligned region. usage_src=true →
+    // TRANSFER_SRC (H2D: GPU reads from this buffer into the device-local
+    // input). usage_src=false → TRANSFER_DST (D2H: GPU writes into this
+    // buffer from the device-local output). vkCmdCopyBuffer requires
+    // matching SRC/DST bits on the source and destination respectively.
     const bci = VkBufferCreateInfo{
         .size = aligned_size,
-        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .usage = if (usage_src) VK_BUFFER_USAGE_TRANSFER_SRC_BIT else VK_BUFFER_USAGE_TRANSFER_DST_BIT,
     };
     var buf: VkBuffer = 0;
     if (vkCreateBuffer_fn.?(dev, &bci, null, &buf) != VK_SUCCESS_RC) return null;
@@ -2514,6 +2935,14 @@ fn tryImportHostBuffer(host_ptr: *anyopaque, size: usize) ?PendingImportedD2H {
     // this driver. HOST_CACHED gives the CPU a writeback cache for
     // reads of GPU output — bench mode then reads bytes back at full
     // memory speed instead of streaming over uncached PCIe.
+    //
+    // Iter 9: direction-aware. HOST_CACHED is great for D2H (CPU reads
+    // GPU output → cache hits help) but HARMFUL for H2D (CPU wrote the
+    // bytes earlier; HOST_CACHED forces the GPU DMA to snoop the CPU
+    // cache or wait on a writeback, which on NVIDIA RTX 4060 Ti slows
+    // 58 MB H2D from ~4 ms (HOST_COHERENT direct DMA from RAM) to
+    // ~12 ms (HOST_CACHED with snoops). Prefer NON-cached for
+    // usage_src=true; cached for usage_src=false.
     var mt_idx: i32 = -1;
     var best_flags: u32 = 0;
     var i: u32 = 0;
@@ -2533,15 +2962,19 @@ fn tryImportHostBuffer(host_ptr: *anyopaque, size: usize) ?PendingImportedD2H {
         } else {
             // Upgrade rules (in priority order):
             //   1. If current best is DEVICE_LOCAL and this isn't, swap.
-            //   2. Else if current best is NOT cached and this IS, swap.
+            //   2. For D2H (usage_src=false): prefer cached.
+            //      For H2D (usage_src=true): prefer NON-cached.
             const cur_dev_local = (best_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT_CONST) != 0;
             const cur_cached = (best_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT_CONST) != 0;
             if (cur_dev_local and !is_dev_local) {
                 mt_idx = @intCast(i);
                 best_flags = flags;
-            } else if (cur_dev_local == is_dev_local and !cur_cached and is_cached) {
-                mt_idx = @intCast(i);
-                best_flags = flags;
+            } else if (cur_dev_local == is_dev_local) {
+                const cache_better = if (usage_src) (cur_cached and !is_cached) else (!cur_cached and is_cached);
+                if (cache_better) {
+                    mt_idx = @intCast(i);
+                    best_flags = flags;
+                }
             }
         }
     }
@@ -2550,28 +2983,41 @@ fn tryImportHostBuffer(host_ptr: *anyopaque, size: usize) ?PendingImportedD2H {
         return null;
     }
 
-    // Iter 8 subfix 2: one-time stderr log so we can verify HOST_CACHED
-    // was chosen on the target device. Gated on SLZ_VK_PROFILE_PHASES=1
-    // to avoid noise on production runs.
-    if (!g_import_mem_type_logged) {
-        g_import_mem_type_logged = true;
-        if (std.c.getenv("SLZ_VK_PROFILE_PHASES") != null) {
-            const has_visible = (best_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
-            const has_coherent = (best_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT_CONST) != 0;
-            const has_cached = (best_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT_CONST) != 0;
-            const has_dev_local = (best_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT_CONST) != 0;
-            std.debug.print("import-mem-type idx={d} flags=0x{x:0>8} HOST_VISIBLE={} HOST_COHERENT={} HOST_CACHED={} DEVICE_LOCAL={}\n", .{
-                mt_idx, best_flags, has_visible, has_coherent, has_cached, has_dev_local,
-            });
+    // Iter 8 subfix 2 / Iter 9: one-time stderr log per direction so we
+    // can verify the right memory type was chosen. Gated on
+    // SLZ_VK_PROFILE_PHASES=1 to avoid noise on production runs.
+    {
+        const LogState = struct {
+            var src_logged: bool = false;
+            var dst_logged: bool = false;
+        };
+        const need_log = if (usage_src) !LogState.src_logged else !LogState.dst_logged;
+        if (need_log) {
+            if (usage_src) LogState.src_logged = true else LogState.dst_logged = true;
+            if (std.c.getenv("SLZ_VK_PROFILE_PHASES") != null) {
+                const has_visible = (best_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+                const has_coherent = (best_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT_CONST) != 0;
+                const has_cached = (best_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT_CONST) != 0;
+                const has_dev_local = (best_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT_CONST) != 0;
+                const dir: []const u8 = if (usage_src) "H2D-SRC" else "D2H-DST";
+                std.debug.print("import-mem-type[{s}] idx={d} flags=0x{x:0>8} HOST_VISIBLE={} HOST_COHERENT={} HOST_CACHED={} DEVICE_LOCAL={}\n", .{
+                    dir, mt_idx, best_flags, has_visible, has_coherent, has_cached, has_dev_local,
+                });
+            }
         }
+        // Keep g_import_mem_type_logged true so any pre-existing code
+        // path that checks it doesn't re-log.
+        g_import_mem_type_logged = true;
     }
 
     // Chain VkImportMemoryHostPointerInfoEXT off the allocate-info pNext.
     // Per spec allocationSize must EXACTLY equal the imported region —
-    // already rounded above.
+    // already rounded above. Iter 9: pHostPointer is the page-aligned
+    // BASE (aligned_base_ptr), not the caller's potentially-offset
+    // pointer.
     var import_info = VkImportMemoryHostPointerInfoEXT{
         .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
-        .pHostPointer = host_ptr,
+        .pHostPointer = aligned_base_ptr,
     };
     const mai = VkMemoryAllocateInfo{
         .pNext = @ptrCast(&import_info),
@@ -2589,15 +3035,17 @@ fn tryImportHostBuffer(host_ptr: *anyopaque, size: usize) ?PendingImportedD2H {
         return null;
     }
     g_import_prep_cache_misses += 1;
-    // Iter 8 subfix 1: park the fresh entry in the LRU cache.
-    const slot = insertImportedBuffer(addr, size, buf, mem);
+    // Iter 8 subfix 1: park the fresh entry in the LRU cache. Iter 9:
+    // cache key is (aligned_base_addr, aligned_size, usage_src) — see
+    // lookupImportedBuffer above.
+    const slot = insertImportedBuffer(aligned_base_addr, @intCast(aligned_size), buf, mem, usage_src);
     if (slot) |idx| {
-        return .{ .buffer = buf, .memory = mem, .cache_idx = @intCast(idx) };
+        return .{ .buffer = buf, .memory = mem, .cache_idx = @intCast(idx), .region_offset = region_offset };
     }
     // Cache insert failed (every slot in-flight). Fall back to iter-7
     // legacy semantics: streamEndAndWait will free this pair after the
     // fence wait. cache_idx = -1 signals "not cached".
-    return .{ .buffer = buf, .memory = mem, .cache_idx = -1 };
+    return .{ .buffer = buf, .memory = mem, .cache_idx = -1, .region_offset = region_offset };
 }
 
 // Iter 8 subfix 1: mark a cache slot as in-flight. Called when the GPU
@@ -2632,7 +3080,24 @@ fn clearImportInFlight(cache_idx: i32) void {
 // (unaligned, extension unavailable, etc.) — caller falls through to
 // the iter-4 staging path.
 pub fn prepareImportHostBuffer(host_ptr: *anyopaque, size: usize) ?PendingImportedD2H {
-    return tryImportHostBuffer(host_ptr, size);
+    return tryImportHostBuffer(host_ptr, size, false);
+}
+
+// Iter 9: H2D-side analog of prepareImportHostBuffer. Pre-creates (or
+// fetches from cache) a TRANSFER_SRC imported VkBuffer wrapping the
+// caller's source pointer. Lets the dispatcher overlap the
+// vkCreateBuffer+vkAllocateMemory+vkBindBufferMemory cost with whatever
+// else is running before the H2D actually executes. Returns null when
+// the import path isn't eligible (unaligned src, extension absent, etc.)
+// — caller falls through to the iter-4 staging path.
+//
+// Const-ness: VkImportMemoryHostPointerInfoEXT.pHostPointer is declared
+// non-const in the spec but the extension treats the imported region as
+// read-only when the VkBuffer is TRANSFER_SRC only. Caller's pointer
+// stays logically const for H2D.
+pub fn prepareImportHostBufferForUpload(host_ptr: *const anyopaque, size: usize) ?PendingImportedD2H {
+    const mutable_ptr: *anyopaque = @constCast(host_ptr);
+    return tryImportHostBuffer(mutable_ptr, size, true);
 }
 
 // Iter 8 subfix 3: type alias so decode_dispatch.zig can store the
@@ -2658,6 +3123,21 @@ pub fn stashPreparedImportForStream(stream: VkStream, prepared: PreparedImport) 
         return false;
     }
     se.prepared_d2h_import = prepared;
+    return true;
+}
+
+// Iter 9: H2D analog of stashPreparedImportForStream. The dispatcher
+// pre-allocates (or fetches from cache) the TRANSFER_SRC imported
+// VkBuffer for the compressed-input upload before procH2DAsync runs.
+// procH2DAsync matches against (host_addr, size) on consumption so a
+// concurrent prep against a different src pointer can't accidentally
+// short-circuit the wrong copy.
+pub fn stashPreparedUploadImportForStream(stream: VkStream, host_addr: usize, size: usize, prepared: PreparedImport) bool {
+    const se = streamEntryFor(stream) orelse return false;
+    if (se.prepared_h2d_import != null) return false;
+    se.prepared_h2d_import = prepared;
+    se.prepared_h2d_host_addr = host_addr;
+    se.prepared_h2d_size = size;
     return true;
 }
 
@@ -2713,22 +3193,30 @@ fn procD2HAsync(dst: *anyopaque, src: VkDeviceBuffer, size: usize, stream: VkStr
             // — the prep is single-shot per decode.
             se.prepared_d2h_import = null;
             const ok_for_this_d2h = blk: {
-                // Verify the prep matches THIS d2h call (same host_ptr
-                // and size). Walk the cache to find the entry the prep
-                // came from; if the host_ptr/size disagree, fall
-                // through to the legacy path. cache_idx == -1 (cache
+                // Verify the prep matches THIS d2h call. Iter 9: cache
+                // key is now (aligned_base, aligned_size, usage_src) —
+                // a matching prep against caller's dst exists when the
+                // page-aligned base + aligned region of (dst,size)
+                // matches the cache entry. cache_idx == -1 (cache
                 // overflow) makes us trust the caller blindly.
                 if (prep.cache_idx < 0) break :blk true;
                 const ci: usize = @intCast(prep.cache_idx);
                 if (ci >= G_IMPORT_CACHE_CAP) break :blk false;
                 if (g_import_cache[ci]) |e| {
-                    break :blk (e.host_ptr == @intFromPtr(dst) and e.size == size);
+                    const dst_addr = @intFromPtr(dst);
+                    const align_mask = g_imported_host_alignment - 1;
+                    const dst_base = dst_addr & ~@as(usize, align_mask);
+                    const dst_off: u64 = @intCast(dst_addr - dst_base);
+                    const dst_region: u64 = ((@as(u64, dst_off) + @as(u64, size)) + align_mask) & ~@as(u64, align_mask);
+                    break :blk (e.host_ptr == dst_base and e.size == @as(usize, @intCast(dst_region)) and !e.usage_src);
                 }
                 break :blk false;
             };
             if (ok_for_this_d2h) {
                 markImportInFlight(prep.cache_idx);
-                const region = VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = size };
+                // Iter 9: dstOffset = prep.region_offset to skip the
+                // leading page-pad inside the imported parent region.
+                const region = VkBufferCopy{ .srcOffset = 0, .dstOffset = prep.region_offset, .size = size };
                 vkCmdCopyBuffer_fn.?(se.cmdbuf, entry.buffer, prep.buffer, 1, @ptrCast(&region));
                 const gpa = std.heap.page_allocator;
                 se.pending_imported_d2h.append(gpa, prep) catch {
@@ -2761,9 +3249,11 @@ fn procD2HAsync(dst: *anyopaque, src: VkDeviceBuffer, size: usize, stream: VkStr
         // wait in streamEndAndWait. Mirrors src_vulkan/l1_codec.zig
         // (importHostPointerBuffer) and CUDA's cuMemcpyDtoH_v2 against
         // a pinned destination (src/decode/decode_dispatch.zig:485).
-        if (tryImportHostBuffer(dst, size)) |imported| {
+        if (tryImportHostBuffer(dst, size, false)) |imported| {
             markImportInFlight(imported.cache_idx);
-            const region = VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = size };
+            // Iter 9: dstOffset = imported.region_offset accounts for
+            // sub-page offset of caller's dst within imported region.
+            const region = VkBufferCopy{ .srcOffset = 0, .dstOffset = imported.region_offset, .size = size };
             vkCmdCopyBuffer_fn.?(se.cmdbuf, entry.buffer, imported.buffer, 1, @ptrCast(&region));
             const gpa = std.heap.page_allocator;
             se.pending_imported_d2h.append(gpa, imported) catch {
@@ -2876,8 +3366,40 @@ fn procStreamCreate(out: *VkStream, flags: c_uint) callconv(.c) VkResult {
         return -1;
     }
 
+    // Iter 11: VK adaptation — per-stream transfer cmdbuf off the
+    // dedicated-transfer command pool, plus a binary semaphore the
+    // transfer submit signals + compute submit waits on. Binary
+    // semaphore is created unsignalled (default flags = 0) and auto-
+    // resets on each consumed wait, so a single instance survives the
+    // full lifetime of the stream.
+    var xfer_cb: VkCommandBuffer = null;
+    const xfer_cb_alloc = VkCommandBufferAllocateInfo{
+        .commandPool = g_transfer_cmd_pool,
+        .commandBufferCount = 1,
+    };
+    if (vkAllocateCommandBuffers_fn.?(dev, &xfer_cb_alloc, @ptrCast(&xfer_cb)) != VK_SUCCESS_RC) {
+        vkDestroyFence_fn.?(dev, fence, null);
+        vkFreeCommandBuffers_fn.?(dev, g_command_pool, 1, @ptrCast(&cb));
+        return -1;
+    }
+    var h2d_sem: VkSemaphore = VK_NULL_HANDLE;
+    const sem_ci = VkSemaphoreCreateInfo{};
+    if (vkCreateSemaphore_fn.?(dev, &sem_ci, null, &h2d_sem) != VK_SUCCESS_RC) {
+        vkFreeCommandBuffers_fn.?(dev, g_transfer_cmd_pool, 1, @ptrCast(&xfer_cb));
+        vkDestroyFence_fn.?(dev, fence, null);
+        vkFreeCommandBuffers_fn.?(dev, g_command_pool, 1, @ptrCast(&cb));
+        return -1;
+    }
+
     const gpa = std.heap.page_allocator;
-    const entry = StreamEntry{ .cmdbuf = cb, .fence = fence, .recording = false };
+    const entry = StreamEntry{
+        .cmdbuf = cb,
+        .fence = fence,
+        .recording = false,
+        .transfer_cmdbuf = xfer_cb,
+        .transfer_recording = false,
+        .h2d_sem = h2d_sem,
+    };
     // Reuse a freed slot if available.
     for (g_streams.items, 0..) |slot, i| {
         if (slot == null) {
@@ -2887,6 +3409,8 @@ fn procStreamCreate(out: *VkStream, flags: c_uint) callconv(.c) VkResult {
         }
     }
     g_streams.append(gpa, entry) catch {
+        vkDestroySemaphore_fn.?(dev, h2d_sem, null);
+        vkFreeCommandBuffers_fn.?(dev, g_transfer_cmd_pool, 1, @ptrCast(&xfer_cb));
         vkDestroyFence_fn.?(dev, fence, null);
         vkFreeCommandBuffers_fn.?(dev, g_command_pool, 1, @ptrCast(&cb));
         return -1;
@@ -2915,6 +3439,14 @@ fn procStreamDestroy(stream: VkStream) callconv(.c) VkResult {
     // but be defensive in case the caller skipped the sync.
     freePendingImportedD2H(&slot);
     slot.pending_imported_d2h.deinit(std.heap.page_allocator);
+    // Iter 11: tear down the per-stream transfer cmdbuf + binary semaphore.
+    if (slot.h2d_sem != VK_NULL_HANDLE) {
+        vkDestroySemaphore_fn.?(dev, slot.h2d_sem, null);
+    }
+    if (slot.transfer_cmdbuf != null) {
+        var xfer_cb = slot.transfer_cmdbuf;
+        vkFreeCommandBuffers_fn.?(dev, g_transfer_cmd_pool, 1, @ptrCast(&xfer_cb));
+    }
     var cb = slot.cmdbuf;
     vkFreeCommandBuffers_fn.?(dev, g_command_pool, 1, @ptrCast(&cb));
     vkDestroyFence_fn.?(dev, slot.fence, null);

@@ -17,8 +17,30 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     const runs = args.runs orelse 10;
     if (runs == 0) util.die(w, "error: runs must be >= 1\n");
 
-    const src = util.readFile(allocator, io, in_path, w);
-    defer allocator.free(src);
+    const src_raw = util.readFile(allocator, io, in_path, w);
+    defer allocator.free(src_raw);
+
+    // Iter 9: copy `src_raw` into a pinned/page-aligned buffer so the
+    // VK_EXT_external_memory_host import fast path in procH2DAsync can
+    // wrap it as a TRANSFER_SRC VkBuffer (requires page-aligned host
+    // pointer; readFileAlloc returns a non-page-aligned slice). Matches
+    // the iter-7/8 dst-side trick: `dh.pinned = true` lets the D2H
+    // import wrap the output buffer. This is bench-only — production
+    // callers can hand us pinned input via allocHost themselves.
+    const SrcBuf = struct { buf: []u8, pinned: bool };
+    const sh: SrcBuf = blk: {
+        if (gpu_dec_driver.allocHost(src_raw.len)) |p| {
+            @memcpy(p[0..src_raw.len], src_raw);
+            break :blk .{ .buf = p[0..src_raw.len], .pinned = true };
+        }
+        // Fallback: use the raw read-result (non-pinned). The import path
+        // will reject it and we revert to the iter-4 staging copy.
+        const dup = allocator.alloc(u8, src_raw.len) catch break :blk .{ .buf = @constCast(src_raw), .pinned = false };
+        @memcpy(dup, src_raw);
+        break :blk .{ .buf = dup, .pinned = false };
+    };
+    const src: []const u8 = sh.buf;
+    defer if (sh.pinned) gpu_dec_driver.freeHost(sh.buf) else if (sh.buf.ptr != src_raw.ptr) allocator.free(sh.buf);
 
     const hdr = frame.parseHeader(src) catch |err| {
         try w.print("error: not a valid SLZ1 frame: {s}\n", .{@errorName(err)});
