@@ -78,6 +78,10 @@ pub fn phaseProfileInit() void {
     g_phase_resolve_ns = 0;
     g_phase_other_ns = 0;
     g_phase_import_prep_ns = 0;
+    // Iter 12: H2D path-taken counters live in module_loader.
+    module_loader.g_h2d_path_prepared_import = 0;
+    module_loader.g_h2d_path_inline_import = 0;
+    module_loader.g_h2d_path_staging = 0;
 }
 
 inline fn qpcNs() i64 {
@@ -116,6 +120,16 @@ pub fn printAndResetPhaseProfile(w: anytype) void {
         ns_to_ms_per(g_phase_import_prep_ns, n),
         module_loader.g_import_prep_cache_hits,
         module_loader.g_import_prep_cache_misses,
+    }) catch {};
+    // Iter 12: which H2D path did procH2DAsync actually take? prepared_import
+    // = consumed a pre-stashed prep (cheapest); inline_import = imported
+    // mid-call (no host @memcpy, ~200us alloc on cache miss); staging =
+    // iter-4 fallback (pays host @memcpy of the full size). Confirms that
+    // the iter-12 re-enable of H2D import is actually firing.
+    w.print("phase: h2d_paths               prepared_import={d}, inline_import={d}, staging={d}\n", .{
+        module_loader.g_h2d_path_prepared_import,
+        module_loader.g_h2d_path_inline_import,
+        module_loader.g_h2d_path_staging,
     }) catch {};
     w.print("phase: other                   {d:.4} ms/decode\n", .{ns_to_ms_per(g_phase_other_ns, n)}) catch {};
     const totalled =
@@ -928,13 +942,17 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // (alignment / extension support / size threshold-equivalent — we
     // only stash for the big comp_input, the tiny chunk_descs H2D will
     // bypass the import even if a stash existed).
-    // TEMPORARILY DISABLED in concert with H2D_IMPORT_THRESHOLD =
-    // maxInt — see module_loader iter9 note. Empirical: the H2D
-    // import path on RTX 4060 Ti is ~10 ms slower than iter-4 staging
-    // for the 58 MB enwik8 comp_input even with NON-cached
-    // HOST_COHERENT memory selection. Re-enable when the GPU DMA
-    // bottleneck is understood.
-    if (false and req.d_compressed_src == null and req.compressed_block.len >= (4 * 1024 * 1024)) {
+    //
+    // Iter 12: RE-ENABLED. The iter-9 regression that motivated the
+    // disable was that the import-path H2D landed on the universal
+    // COMPUTE queue (per iter-4 batching), bypassing NVIDIA's dedicated
+    // copy engine. Iter 11 added a dedicated VK_QUEUE_TRANSFER_BIT-only
+    // queue and routes every H2D vkCmdCopyBuffer through it, so the
+    // imported-memory DMA now executes on the same fast path the
+    // staging copy was using — minus the 3.5 ms host @memcpy of
+    // the 58 MB block.
+    if (req.d_compressed_src == null and req.compressed_block.len >= (4 * 1024 * 1024)) {
+        const _t_prep_h2d0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
         const src_ptr_const: *const anyopaque = @ptrCast(req.compressed_block.ptr);
         const src_addr = @intFromPtr(src_ptr_const);
         if (module_loader.prepareImportHostBufferForUpload(src_ptr_const, req.compressed_block.len)) |prep| {
@@ -945,6 +963,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
                 prep,
             );
         }
+        if (g_phase_profile_enabled) g_phase_import_prep_ns += qpcDeltaNs(_t_prep_h2d0, vk.qpcNow());
     }
 
     // Phase 1: upload + prefix sum (always runs — needed for chunk

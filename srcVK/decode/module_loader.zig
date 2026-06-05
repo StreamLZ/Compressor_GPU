@@ -1159,6 +1159,15 @@ const VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT_CONST: u32 = 0x00000001;
 pub var g_import_prep_cache_hits: u64 = 0;
 pub var g_import_prep_cache_misses: u64 = 0;
 
+// Iter 12: H2D path-taken counters. Increment in procH2DAsync at the
+// site of each branch so SLZ_VK_PROFILE_PHASES output can confirm the
+// big comp_input H2D actually went through the import path (vs falling
+// through to staging on alignment failure / extension absence). Printed
+// next to the prep-cache stats by decode_dispatch's phase printer.
+pub var g_h2d_path_prepared_import: u64 = 0; // hit on se.prepared_h2d_import
+pub var g_h2d_path_inline_import: u64 = 0;   // inline tryImportHostBuffer in procH2DAsync
+pub var g_h2d_path_staging: u64 = 0;         // iter-4 staging fallback
+
 // ── Module-private bring-up state ────────────────────────────────────
 // VK adaptation: the shared command pool + per-context staging buffer
 // the procs.h2d / procs.d2h closures funnel work through. Sized at
@@ -2635,15 +2644,20 @@ fn procMemsetD8Async(dst: VkDeviceBuffer, value: u8, size: usize, stream: VkStre
 // iter-4 staging memcpy + DMA is faster overall on a cache miss.
 // Set just under the typical compressed-input block size so the big
 // upload imports while the metadata uploads keep their fast path.
-// TEMPORARILY DISABLED: empirical measurement on RTX 4060 Ti shows the
-// import path's H2D DMA is SLOWER than the iter-4 staging path (~14 ms
-// vs ~4 ms for a 58 MB comp_input). Hypothesis: imported HOST_VISIBLE|
-// HOST_COHERENT memory forces the GPU to issue cache-snoop reads over
-// PCIe, which is slower than the conventional staging-buffer DMA path
-// that uses NVIDIA's optimized blit hardware. Set threshold above any
-// realistic L1 block size to keep the path code-complete but unused
-// while we investigate further. See iter9 report.
-const H2D_IMPORT_THRESHOLD: usize = std.math.maxInt(usize);
+// Iter 12: re-enable at 4 MiB. The iter-9 regression (import path
+// ~10 ms slower than staging for 58 MB enwik8 comp_input) was rooted
+// in QUEUE ROUTING, not in imported-memory itself: at iter-9 time the
+// H2D was submitted to the universal COMPUTE queue, whose vkCmdCopyBuffer
+// path bypassed NVIDIA's dedicated blit/DMA engine. Iter 11 added a
+// dedicated VK_QUEUE_TRANSFER_BIT-only queue (qf=1, flags=0x0c) and
+// routes every H2D vkCmdCopyBuffer through it; the imported-memory
+// DMA now hits the same fast copy engine the staging path used. The
+// expected win is removing the host @memcpy(58 MB) staging cost
+// (~3.5 ms) and letting the GPU DMA overlap with host prep + the
+// eventual compute submit. Threshold = 4 MiB so comp_input (~58 MB)
+// imports while chunk_descs (~1 MB) and n_chunks (4 B) stay on the
+// already-cheap staging path.
+const H2D_IMPORT_THRESHOLD: usize = 4 * 1024 * 1024;
 
 fn procH2DAsync(dst: VkDeviceBuffer, src: *const anyopaque, size: usize, stream: VkStream) callconv(.c) VkResult {
     const entry = lookupAlloc(dst) orelse return -1;
@@ -2679,6 +2693,7 @@ fn procH2DAsync(dst: VkDeviceBuffer, src: *const anyopaque, size: usize, stream:
                 se.prepared_h2d_import = null;
                 se.prepared_h2d_host_addr = 0;
                 se.prepared_h2d_size = 0;
+                g_h2d_path_prepared_import += 1;
                 markImportInFlight(prep.cache_idx);
                 // Iter 9: srcOffset = prep.region_offset skips the
                 // leading page-pad inside the imported parent region
@@ -2712,6 +2727,7 @@ fn procH2DAsync(dst: VkDeviceBuffer, src: *const anyopaque, size: usize, stream:
         if (size >= H2D_IMPORT_THRESHOLD) {
             const mutable_src: *anyopaque = @constCast(src);
             if (tryImportHostBuffer(mutable_src, size, true)) |imported| {
+                g_h2d_path_inline_import += 1;
                 markImportInFlight(imported.cache_idx);
                 // Iter 9: srcOffset accounts for sub-page offset of the
                 // caller's src within the imported page-aligned region.
@@ -2740,6 +2756,7 @@ fn procH2DAsync(dst: VkDeviceBuffer, src: *const anyopaque, size: usize, stream:
         @memcpy(@as([*]u8, @ptrCast(mapped))[off .. off + size], @as([*]const u8, @ptrCast(src))[0..size]);
         const region = VkBufferCopy{ .srcOffset = off, .dstOffset = 0, .size = size };
         vkCmdCopyBuffer_fn.?(se.transfer_cmdbuf, se.staging_buffer, entry.buffer, 1, @ptrCast(&region));
+        g_h2d_path_staging += 1;
         return VK_SUCCESS_RC;
     }
     return procH2D(dst, src, size);
