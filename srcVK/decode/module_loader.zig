@@ -1379,6 +1379,65 @@ pub fn unlockDispatcherMutex() void {
     ReleaseSRWLockExclusive(&g_dispatcher_lock);
 }
 
+// VK adaptation: init() reads + writes the global
+// `vulkan_api.init_state` non-atomically (uninit → in_progress → ready).
+// Pre-iter5 the only test of this path was the CLI (single-threaded),
+// so the race was invisible; ptest_vk's 16-worker runner exposes it:
+// thread A flips `.uninit` → `.in_progress` and starts a ~10 ms
+// LoadLibraryA + vkCreateInstance + vkCreateDevice + pipeline-build
+// sequence, while thread B enters init(), reads `.in_progress`, and
+// short-circuits to `return false` — which the dispatcher surfaces as
+// error.BackendNotAvailable. Serialize the whole init() body through a
+// dedicated SRWLOCK so any concurrent re-entry waits for `.ready`
+// before evaluating its branch. Hot-path callers (post-init) still
+// short-circuit on the `.ready` check before taking the lock.
+var g_init_lock: SRWLOCK = .{};
+// Separate encode-init lock so the encode-side init can serialize its
+// own one-shot setup without recursively acquiring the decode init
+// lock (Win32 SRWLOCK is non-recursive; encode init() chains into
+// decode_driver.init() which itself takes g_init_lock).
+var g_encode_init_lock: SRWLOCK = .{};
+
+pub fn lockInitMutex() void {
+    AcquireSRWLockExclusive(&g_init_lock);
+}
+
+pub fn unlockInitMutex() void {
+    ReleaseSRWLockExclusive(&g_init_lock);
+}
+
+pub fn lockEncodeInitMutex() void {
+    AcquireSRWLockExclusive(&g_encode_init_lock);
+}
+
+pub fn unlockEncodeInitMutex() void {
+    ReleaseSRWLockExclusive(&g_encode_init_lock);
+}
+
+// VK adaptation: encode-side serialization for the sync path. The encode
+// hot path (gpuCompressImpl + gpuAssembleFrameImpl + gpuFrameAssembleImpl)
+// reads/writes per-context persistent device buffers (EncodeContext.
+// d_input_persist / d_output_persist / d_descs_persist / d_sizes_persist
+// / d_hash_persist / d_asm_out / d_frame_*) via encode_context.ensureBuf
+// AND submits its sync H2D/D2H copies through the singleton
+// g_command_buffer + g_staging_buffer in procH2D/procD2H, AND submits
+// kernels to vkQueueSubmit on the shared compute queue. Vulkan requires
+// vkQueueSubmit on the same VkQueue to be externally synchronized
+// across threads — without that, two test workers' submits can corrupt
+// each other's command buffers and (silently) produce all-zero output
+// or surface as DestinationTooSmall in the framer's bounds checks.
+// We reuse `g_dispatcher_lock` itself (not a parallel encode lock) so
+// any concurrent decode call ALSO serializes against the encode submit
+// for the same queue. Async-mode callers (per-worker EncodeContext +
+// non-zero work_stream) skip the lock and serialize per-stream.
+pub fn lockEncodeDispatcherMutex() void {
+    AcquireSRWLockExclusive(&g_dispatcher_lock);
+}
+
+pub fn unlockEncodeDispatcherMutex() void {
+    ReleaseSRWLockExclusive(&g_dispatcher_lock);
+}
+
 // Iter 4: nonCoherentAtomSize for staging-arena bump alignment. VK spec
 // requires offset/size of host-visible non-coherent mappings to align to
 // this when flushing/invalidating; we use HOST_COHERENT so flush is
@@ -1604,9 +1663,22 @@ const STAGING_INITIAL_SIZE: usize = 1 << 20; // 1 MiB
 // loader. Brings up vulkan-1.dll, picks a physical device + queue,
 // creates the VkDevice, fills procs, loads SPV blobs.
 pub fn init() bool {
+    // Fast path: post-init, every dispatch enters here. Read .ready
+    // first so the steady-state hot path never touches the SRWLOCK.
+    if (vulkan_api.init_state == .ready) return true;
+    // VK adaptation: serialize the one-shot init across the ptest_vk
+    // 16-worker test runner. Without this lock, two threads both see
+    // .uninit (or one sees .in_progress and short-circuits to false),
+    // surfacing as error.BackendNotAvailable in the dispatcher.
+    AcquireSRWLockExclusive(&g_init_lock);
+    defer ReleaseSRWLockExclusive(&g_init_lock);
     switch (vulkan_api.init_state) {
         .ready => return true,
-        .failed, .in_progress => return false,
+        .failed => return false,
+        // .in_progress can only be observed under the lock if a prior
+        // init aborted mid-body without resetting the state; treat it
+        // as a hard failure (matches pre-iter5 semantics).
+        .in_progress => return false,
         .uninit => {},
     }
     vulkan_api.init_state = .in_progress;

@@ -19,6 +19,7 @@ const CompressError = encoder.CompressError;
 
 const gpu_enc = @import("driver.zig");
 const vk_api = @import("../decode/vulkan_api.zig");
+const decode_module_loader = @import("../decode/module_loader.zig");
 
 /// CUDA reference: src/encode/fast_framed.zig:27. Inputs at or below this
 /// size are too small for the LZ kernel's per-warp setup cost to ever
@@ -86,6 +87,22 @@ pub fn compressFramedOne(
     enc_ctx: *gpu_enc.EncodeContext,
 ) CompressError!usize {
     if (!gpu_enc.isAvailable()) return error.DestinationTooSmall;
+
+    // VK adaptation: ptest_vk's 16-worker test runner dispatches multiple
+    // concurrent encodes through enc_driver.g_default. The frame orchestration
+    // below (gpuCompressImpl + gpuAssembleFrameImpl + gpuFrameAssembleImpl)
+    // grows EncodeContext's persistent device buffers via
+    // encode_context.ensureBuf (destroy+create), and stages intra-frame
+    // state on enc_ctx fields (d_input_override, d_output_override,
+    // assembled_offsets/sizes, output_written_to_device). A sibling worker
+    // running mid-frame clobbers the device handles and surfaces as
+    // DestinationTooSmall or all-zero decode output. Serialize the whole
+    // frame compress through the encode dispatcher mutex in sync mode
+    // (work_stream == 0). Async-mode callers (per-worker EncodeContext +
+    // stream) skip the lock and serialize per-stream upstream.
+    const enc_is_sync = enc_ctx.work_stream == 0;
+    if (enc_is_sync) decode_module_loader.lockEncodeDispatcherMutex();
+    defer if (enc_is_sync) decode_module_loader.unlockEncodeDispatcherMutex();
 
     var pos: usize = 0;
     const sc_grp = resolveScGroupSize(src.len, opts.sc_group_size_override);

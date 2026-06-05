@@ -49,7 +49,14 @@ pub fn main() void {
     // same constant to match.
     const MAX_WORKERS = 16;
     const cpu_count = std.Thread.getCpuCount() catch 4;
-    const worker_count: usize = @min(cpu_count, MAX_WORKERS);
+    // VK adaptation: honour SLZ_VK_TEST_THREADS (1..MAX_WORKERS) so the
+    // test runner can be coerced to single-threaded for race diagnosis.
+    var worker_count: usize = @min(cpu_count, MAX_WORKERS);
+    if (std.c.getenv("SLZ_VK_TEST_THREADS")) |env_c| {
+        const env_str = std.mem.span(env_c);
+        const env_n = std.fmt.parseInt(usize, env_str, 10) catch worker_count;
+        worker_count = @min(@max(env_n, 1), MAX_WORKERS);
+    }
 
     std.debug.print("Running {d} tests on {d} threads...\n", .{ test_fns.len, worker_count });
 

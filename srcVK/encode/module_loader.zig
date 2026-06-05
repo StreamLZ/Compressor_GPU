@@ -194,8 +194,29 @@ const ENCODE_KERNELS = struct {
 /// CUDA reference: src/encode/module_loader.zig:50-98. One-shot loader.
 /// Brings up the encode-side pipelines on top of the decode-side init.
 pub fn init() bool {
+    // Fast path: post-init, every dispatch enters here. Read the flag
+    // first so the steady-state hot path never touches the SRWLOCK.
     if (initialized) return kernel_fn != 0;
-    initialized = true;
+    // VK adaptation: serialize the one-shot encode init across the
+    // ptest_vk 16-worker test runner. Two threads both seeing
+    // `initialized == false` would each run LoadLibraryA + buildPipeline
+    // against the same module slots; the second runner clobbers the
+    // first's VkPipeline handles. Use a dedicated encode-init lock —
+    // distinct from the decode g_init_lock so the recursive
+    // encode → decode init chain is non-recursive on each lock.
+    decode_module_loader.lockEncodeInitMutex();
+    defer decode_module_loader.unlockEncodeInitMutex();
+    if (initialized) return kernel_fn != 0;
+    // VK adaptation: ONLY flip `initialized` to true after the full
+    // init body succeeds. Pre-iter5 the flag was set at entry; a
+    // mid-init failure (decode_driver.init false / vulkan-1.dll load
+    // failure / pipeline-build failure) latched `initialized=true`
+    // with `kernel_fn=0`, locking every future encode dispatch into
+    // the false branch of `return kernel_fn != 0`.
+    var ok = false;
+    defer if (ok) {
+        initialized = true;
+    };
 
     // Reuse the VkDevice + VMA allocator the decode driver brings up.
     // CUDA reference: src/encode/module_loader.zig:56-57.
@@ -266,6 +287,10 @@ pub fn init() bool {
         if (buildPipeline(spv_blobs.frame_assemble, ENCODE_KERNELS.frame_assemble, &fa_layout, &frame_assemble_fn)) {}
     }
 
+    // Tell the deferred `initialized = true` setter at the top that we
+    // got here cleanly (kernel_fn was populated by the lz buildPipeline
+    // call above; subsequent dispatches return kernel_fn != 0).
+    ok = true;
     return true;
 }
 

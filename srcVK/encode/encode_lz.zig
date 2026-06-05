@@ -29,6 +29,13 @@ pub fn gpuCompressImpl(
 ) bool {
     if (!module_loader.init()) return false;
 
+    // VK adaptation: parallel-test serialization for this entry is
+    // applied at compressFramedOne (fast_framed.zig) — it must span
+    // gpuCompressImpl + the assemble trio so the inter-call shared
+    // device buffers on enc_driver.g_default don't get clobbered by
+    // a sibling worker between calls. See lockEncodeDispatcherMutex
+    // comment in decode/module_loader.zig.
+
     const h2d_fn = vk.procs.h2d orelse return false;
     const d2h_fn = vk.procs.d2h orelse return false;
     const launch_fn = vk.procs.launch_kernel orelse return false;

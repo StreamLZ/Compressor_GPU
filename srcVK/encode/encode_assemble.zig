@@ -40,6 +40,10 @@ pub fn gpuAssembleFrameImpl(
     const n: u32 = @intCast(chunk_descs.len);
     if (n == 0) return false;
 
+    // VK adaptation: parallel-test serialization for this entry is
+    // applied at compressFramedOne (fast_framed.zig). See the
+    // lockEncodeDispatcherMutex comment in decode/module_loader.zig.
+
     // Per-stream Huffman metadata. L1/L2 do not run the Huffman pass so
     // all six per-stream slots are null; the assembly kernel sees
     // `huff_*_size == 0` for every sub-chunk and emits raw (chunk-type=0)
@@ -216,6 +220,10 @@ pub fn gpuFrameAssembleImpl(
     if (!module_loader.init()) return null;
     if (module_loader.frame_assemble_fn == 0) return null;
     if (self.d_asm_out == 0) return null;
+
+    // VK adaptation: parallel-test serialization for this entry is
+    // applied at compressFramedOne (fast_framed.zig). See the
+    // lockEncodeDispatcherMutex comment in decode/module_loader.zig.
     const n_chunks = layout.n_chunks;
     const eff_chunk_size = layout.eff_chunk_size;
     const src_len = layout.src_len;
