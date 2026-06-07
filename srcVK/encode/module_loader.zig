@@ -523,7 +523,19 @@ fn buildPipeline(
         .layout = pl,
     };
     var pipeline: u64 = 0;
-    if (vkCreateComputePipelines_fn.?(dev, 0, 1, @ptrCast(&ci), null, @ptrCast(&pipeline)) != VK_SUCCESS_RC) return false;
+    // VK adaptation (PHASE 2 — persistent VkPipelineCache): pull the
+    // process-wide VkPipelineCache off the decode-side loader (which
+    // owns its lifecycle — load on init, save on atexit). encode init
+    // chains into decode_driver.init() above, so by the time control
+    // reaches this buildPipeline call the cache is guaranteed populated
+    // (or VK_NULL_HANDLE if cache creation failed, which is spec-
+    // tolerated). Mirrors the decode-side g_pipeline_cache argument in
+    // srcVK/decode/module_loader.zig::buildKernel — without it the
+    // 6 encode pipelines (lz + huff_tables + huff_encode + 3 frame-
+    // assemble) would silently bypass the cache and pay full SPIR-V →
+    // ISA compile every CLI launch.
+    const pipeline_cache: VkPipelineCache = decode_module_loader.pipelineCacheHandle();
+    if (vkCreateComputePipelines_fn.?(dev, pipeline_cache, 1, @ptrCast(&ci), null, @ptrCast(&pipeline)) != VK_SUCCESS_RC) return false;
 
     if (!decode_module_loader.registerExternalPipeline(pipeline, pl, dset_layout, decl.n_bindings, decl.push_constant_size)) {
         return false;
