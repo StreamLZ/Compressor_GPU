@@ -75,20 +75,6 @@ pub const EncodeContext = struct {
 
     work_stream: usize = 0,
 
-    // VK adaptation (H2): library-owned VkStream used as the encode
-    // pipeline stream whenever the caller did not provide one. Created
-    // once at compressFramedOne via `module_loader.ensurePipelineStream`
-    // (mirrors decode_context.pipeline_stream from iter `4f00e11`) and
-    // destroyed in deinit via `procs.stream_destroy`. Promoting
-    // `work_stream` to this slot lets every encode H2D/D2H/launch
-    // funnel through the split-submit + dedicated transfer queue path
-    // decode iter-11/iter-13 already use, batching the ~20 sync points
-    // the encode pipeline previously hit per call (each ~11 ms on the
-    // singleton g_command_buffer) into a single end-of-frame
-    // procs.stream_sync.
-    pipeline_stream: usize = 0,
-    pipeline_stream_created: bool = false,
-
     d_input_override: u64 = 0,
     d_output_override: u64 = 0,
     output_written_to_device: bool = false,
@@ -202,17 +188,6 @@ pub const EncodeContext = struct {
         if (self.huff_lit_offsets) |s| { allocator.free(s); self.huff_lit_offsets = null; }
         if (self.huff_tok_sizes) |s| { allocator.free(s); self.huff_tok_sizes = null; }
         if (self.huff_tok_offsets) |s| { allocator.free(s); self.huff_tok_offsets = null; }
-
-        // VK adaptation (H2): persistent pipeline stream created in
-        // module_loader.ensurePipelineStream (mirrors decode_context's
-        // pipeline_stream deinit branch).
-        if (self.pipeline_stream_created) {
-            if (vk.procs.stream_destroy) |destroy_fn| {
-                if (self.pipeline_stream != 0) _ = destroy_fn(self.pipeline_stream);
-            }
-            self.pipeline_stream = 0;
-            self.pipeline_stream_created = false;
-        }
 
         self.pending_timings.deinit(std.heap.page_allocator);
         self.last_timings.deinit(std.heap.page_allocator);

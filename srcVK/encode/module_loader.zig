@@ -330,24 +330,6 @@ pub fn isAvailable() bool {
     return init();
 }
 
-/// VK adaptation (H2): mirrors decode/module_loader.zig::ensurePipelineStream.
-/// Lazily allocates the EncodeContext's library-owned VkStream via the
-/// shared `procs.stream_create` slot the decode loader staged. The stream
-/// inherits the split-submit + dedicated transfer-queue plumbing from
-/// decode iters 11-13 — every subsequent encode H2D / launch / D2H on
-/// it routes through the same transfer cmdbuf + compute cmdbuf pair that
-/// decode's pipeline_stream uses, batching the encode pipeline's ~20
-/// sync points into a single end-of-frame procs.stream_sync.
-pub fn ensurePipelineStream(enc_ctx: *@import("encode_context.zig").EncodeContext) bool {
-    if (enc_ctx.pipeline_stream_created) return true;
-    const create = vulkan_api.procs.stream_create orelse return false;
-    var stream: vulkan_api.VkStream = 0;
-    if (create(&stream, 0) != vulkan_api.VK_SUCCESS_RC) return false;
-    enc_ctx.pipeline_stream = stream;
-    enc_ctx.pipeline_stream_created = true;
-    return true;
-}
-
 // ── Internal helpers ──────────────────────────────────────────────────
 
 /// Load a SPV blob into a VkShaderModule.

@@ -20,7 +20,6 @@ const CompressError = encoder.CompressError;
 const gpu_enc = @import("driver.zig");
 const vk_api = @import("../decode/vulkan_api.zig");
 const decode_module_loader = @import("../decode/module_loader.zig");
-const encode_module_loader = @import("module_loader.zig");
 
 /// CUDA reference: src/encode/fast_framed.zig:27. Inputs at or below this
 /// size are too small for the LZ kernel's per-warp setup cost to ever
@@ -101,40 +100,9 @@ pub fn compressFramedOne(
     // frame compress through the encode dispatcher mutex in sync mode
     // (work_stream == 0). Async-mode callers (per-worker EncodeContext +
     // stream) skip the lock and serialize per-stream upstream.
-    //
-    // VK adaptation (H2): capture the original sync/async state BEFORE
-    // we promote work_stream below; the lock decision needs the
-    // original semantics. Mirrors decode_dispatch.fullGpuLaunchImpl's
-    // `is_sync_mode = self.work_stream == 0` capture from iter `4f00e11`.
     const enc_is_sync = enc_ctx.work_stream == 0;
     if (enc_is_sync) decode_module_loader.lockEncodeDispatcherMutex();
     defer if (enc_is_sync) decode_module_loader.unlockEncodeDispatcherMutex();
-
-    // VK adaptation (H2): plumb non-zero work_stream through the encode
-    // hot path. Before iter H2 every encode call hard-coded stream=0,
-    // funnelling ~20 sync points (procs.h2d + procs.d2h +
-    // procs.launch_kernel + procs.ctx_sync) through the singleton
-    // g_command_buffer + g_staging_buffer pair — each begin+submit+wait
-    // costing ~11.4 ms on the nsys VK trace for a total of ~228 ms on
-    // enwik8. Promote work_stream to the EncodeContext's pipeline_stream
-    // so every H2D/D2H/launch downstream routes through the split-submit
-    // + dedicated transfer-queue pattern decode iter-11 / iter-13
-    // already use, batching the whole frame into a single
-    // procs.stream_sync at the end of gpuCompressImpl + a second at
-    // the end of gpuAssembleFrameImpl's measure pass + one final
-    // stream_sync (implicit in d2h_async + copyDeviceToHost) at the
-    // host wrap_output D2H.
-    //
-    // The 95 MB enwik8 input H2D auto-fires the iter-12
-    // VK_EXT_external_memory_host import path inside procH2DAsync
-    // when the host_addr is page-aligned and size >= 4 MiB — see
-    // procH2DAsync's H2D_IMPORT_THRESHOLD comment in decode/module_loader.zig.
-    if (encode_module_loader.ensurePipelineStream(enc_ctx)) {
-        if (enc_is_sync) enc_ctx.work_stream = enc_ctx.pipeline_stream;
-    }
-    defer if (enc_is_sync) {
-        enc_ctx.work_stream = 0;
-    };
 
     var pos: usize = 0;
     const sc_grp = resolveScGroupSize(src.len, opts.sc_group_size_override);
@@ -225,27 +193,11 @@ fn gpuEncodeAndAssemble(
     const owns_wrap_input = enc_ctx.d_input_override == 0;
     const owns_wrap_output = enc_ctx.d_output_override == 0;
     if (owns_wrap_input) {
-        // VK adaptation (H2): on the stream path, skip the wrap_input
-        // staging buffer entirely. The sync path materializes
-        // d_host_wrap_input here so gpuCompressImpl's D2D path picks
-        // it up via d_input_override, but on the stream path that D2D
-        // routes through the singleton g_command_buffer (procD2D
-        // ignores its stream arg) — running a sync submit+wait between
-        // the queued h2d_async and the LZ kernel would defeat the
-        // batching. Instead leave d_input_override at 0 so
-        // gpuCompressImpl picks the h2d_async branch and uploads
-        // directly into d_input_persist on the work_stream's transfer
-        // cmdbuf. The big 95 MB enwik8 H2D then auto-hits the iter-12
-        // VK_EXT_external_memory_host zero-copy import (size >= 4 MiB
-        // + page-aligned src.ptr — see procH2DAsync H2D_IMPORT_THRESHOLD
-        // in decode/module_loader.zig).
-        if (enc_ctx.work_stream == 0) {
-            if (!gpu_enc.ensureBuf(&enc_ctx.d_host_wrap_input, &enc_ctx.d_host_wrap_input_size, src.len))
-                return error.DestinationTooSmall;
-            if (!gpu_enc.copyHostToDevice(enc_ctx.d_host_wrap_input, src))
-                return error.DestinationTooSmall;
-            enc_ctx.d_input_override = enc_ctx.d_host_wrap_input;
-        }
+        if (!gpu_enc.ensureBuf(&enc_ctx.d_host_wrap_input, &enc_ctx.d_host_wrap_input_size, src.len))
+            return error.DestinationTooSmall;
+        if (!gpu_enc.copyHostToDevice(enc_ctx.d_host_wrap_input, src))
+            return error.DestinationTooSmall;
+        enc_ctx.d_input_override = enc_ctx.d_host_wrap_input;
     }
     if (owns_wrap_output) {
         const bound = encoder.compressBound(src.len);
@@ -319,33 +271,8 @@ fn gpuEncodeAndAssemble(
 
     if (owns_wrap_output) {
         if (dst.len < frame_size) return error.DestinationTooSmall;
-        // VK adaptation (H2): on the stream path the frame_assemble
-        // kernel is still in flight on enc_ctx.work_stream — record
-        // the D2H into the SAME stream cmdbuf via procs.d2h_async so
-        // the post-launch sync joins both the kernel and the readback
-        // in one fence wait. procs.stream_sync is the single end-of-
-        // frame submit/wait for the entire encode pipeline. The sync
-        // path keeps the original blocking copyDeviceToHost (signature
-        // unchanged per HARD RULES).
-        if (enc_ctx.work_stream != 0) {
-            if (vk_api.procs.d2h_async) |d2h_async_fn| {
-                if (d2h_async_fn(@ptrCast(dst.ptr), enc_ctx.d_host_wrap_output, frame_size, enc_ctx.work_stream) != vk_api.VK_SUCCESS_RC)
-                    return error.DestinationTooSmall;
-                if (vk_api.procs.stream_sync) |stream_sync_fn| {
-                    if (stream_sync_fn(enc_ctx.work_stream) != vk_api.VK_SUCCESS_RC)
-                        return error.DestinationTooSmall;
-                } else {
-                    if (!gpu_enc.copyDeviceToHost(dst[0..frame_size], enc_ctx.d_host_wrap_output))
-                        return error.DestinationTooSmall;
-                }
-            } else {
-                if (!gpu_enc.copyDeviceToHost(dst[0..frame_size], enc_ctx.d_host_wrap_output))
-                    return error.DestinationTooSmall;
-            }
-        } else {
-            if (!gpu_enc.copyDeviceToHost(dst[0..frame_size], enc_ctx.d_host_wrap_output))
-                return error.DestinationTooSmall;
-        }
+        if (!gpu_enc.copyDeviceToHost(dst[0..frame_size], enc_ctx.d_host_wrap_output))
+            return error.DestinationTooSmall;
     }
     return frame_size;
 }
@@ -434,16 +361,7 @@ fn assembleFrame(
             .internal_hdr0 = internal_block_flags,
             .internal_hdr1 = internal_block_codec,
         },
-        // VK adaptation (H2): on the stream path d_input_override was
-        // intentionally left at 0 by gpuEncodeAndAssemble (the host
-        // wrap_input copy is skipped to keep the H2D on the stream's
-        // transfer cmdbuf instead of bouncing through a sync D2D).
-        // The frame_assemble kernel reads the raw source bytes for
-        // any chunks tagged UNCOMPRESSED_CHUNK_MARKER, so wire it to
-        // d_input_persist — gpuCompressImpl already uploaded the
-        // source there via h2d_async on the same stream, ordering is
-        // implicit via cmdbuf sequence.
-        if (enc_ctx.d_input_override != 0) enc_ctx.d_input_override else enc_ctx.d_input_persist,
+        enc_ctx.d_input_override,
         enc_ctx.d_output_override,
     ) orelse return error.DestinationTooSmall;
     enc_ctx.output_written_to_device = true;

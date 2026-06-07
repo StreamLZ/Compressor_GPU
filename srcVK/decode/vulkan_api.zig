@@ -324,24 +324,6 @@ pub const Procs = struct {
     /// VK adaptation: vkWaitForFences on the stream's fence.
     stream_sync: ?*const fn (VkStream) callconv(.c) VkResult = null,
 
-    /// VK adaptation (H2): NEW SLOT (no CUDA analogue). Emit a
-    /// COMPUTE_SHADER_WRITE → COMPUTE_SHADER_READ pipeline barrier
-    /// on the given stream's compute cmdbuf so back-to-back kernel
-    /// dispatches that share SSBO bindings observe each other's
-    /// writes. CUDA's cuLaunchKernel implicitly serializes dispatches
-    /// on the same stream against each other; Vulkan does not, so the
-    /// codec needs to opt in here at every cross-kernel SSBO data
-    /// dependency.
-    ///
-    /// Encode hot path (post-H2) calls this between:
-    ///   - assemble_measure (writes d_asm_sizes) → enc_sizes D2H
-    ///     [already covered by recordComputeToTransferBarrier in procD2HAsync]
-    ///   - assemble_write (writes d_asm_out) → frame_assemble (reads d_asm_out)
-    /// Decode currently relies on stream_sync at every kernel boundary
-    /// so doesn't need this — back-to-back GPU dispatches inside the
-    /// same un-synced batch only happen on the encode side post-H2.
-    stream_compute_barrier: ?*const fn (VkStream) callconv(.c) VkResult = null,
-
     /// VK adaptation: NEW SLOT (no CUDA analogue). End+submit the
     /// stream's transfer cmdbuf EARLY so the dedicated DMA engine can
     /// start the queued H2D copies in parallel with subsequent host-

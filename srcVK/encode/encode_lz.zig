@@ -36,24 +36,11 @@ pub fn gpuCompressImpl(
     // a sibling worker between calls. See lockEncodeDispatcherMutex
     // comment in decode/module_loader.zig.
 
-    // VK adaptation (H2): when `self.work_stream` is non-zero the
-    // EncodeContext has been promoted onto a pipeline_stream by
-    // compressFramedOne; route every H2D/D2H/sync through the stream
-    // variants so the encode pipeline batches into one cmdbuf/submit
-    // instead of the 20 submit+wait round-trips the singleton
-    // g_command_buffer path took (each ~11 ms per nsys trace). The
-    // launch_fn always rides the same stream — when 0 it falls back
-    // to the singleton command buffer.
-    const work_stream = self.work_stream;
-    const use_stream = work_stream != 0;
     const h2d_fn = vk.procs.h2d orelse return false;
-    const h2d_async_fn = vk.procs.h2d_async orelse return false;
     const d2h_fn = vk.procs.d2h orelse return false;
-    const d2h_async_fn = vk.procs.d2h_async orelse return false;
     const d2h_offset_fn = vk.procs.d2h_offset orelse return false;
     const launch_fn = vk.procs.launch_kernel orelse return false;
     const sync_fn = vk.procs.ctx_sync orelse return false;
-    const stream_sync_fn = vk.procs.stream_sync orelse return false;
 
     const num_chunks: u32 = @intCast(chunk_descs.len);
     const desc_bytes = chunk_descs.len * @sizeOf(CompressChunkDesc);
@@ -88,39 +75,16 @@ pub fn gpuCompressImpl(
     // device-resident at `d_input_override`, populate `d_input_persist`
     // via D2D (no host bounce) instead of an H2D from the host `input`
     // slice.
-    //
-    // VK adaptation (H2): on the stream path the descriptor + input
-    // H2D + memset_d8 all queue onto the stream's transfer / compute
-    // cmdbufs. The big enwik8 95 MB input H2D auto-fires the iter-12
-    // VK_EXT_external_memory_host import path inside procH2DAsync
-    // when host_addr is page-aligned and size >= H2D_IMPORT_THRESHOLD
-    // (4 MiB). No procs.stream_sync between H2D + launch — the
-    // semaphore handshake the split-submit emits already orders the
-    // compute submit behind the transfer signal.
     if (self.d_input_override != 0) {
         const d2d = vk.procs.d2d orelse return false;
-        if (d2d(d_input, self.d_input_override, input.len, work_stream) != VK_SUCCESS_RC) return false;
-    } else if (use_stream) {
-        if (h2d_async_fn(d_input, @ptrCast(input.ptr), input.len, work_stream) != VK_SUCCESS_RC) return false;
+        if (d2d(d_input, self.d_input_override, input.len, 0) != VK_SUCCESS_RC) return false;
     } else {
         if (h2d_fn(d_input, @ptrCast(input.ptr), input.len) != VK_SUCCESS_RC) return false;
     }
-    if (use_stream) {
-        if (h2d_async_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes, work_stream) != VK_SUCCESS_RC) return false;
-        if (vk.procs.memset_d8_async) |memset_async_fn| {
-            if (memset_async_fn(d_sizes, 0, sizes_bytes, work_stream) != VK_SUCCESS_RC) return false;
-        } else if (vk.procs.memset_d8) |memset_fn| {
-            // Fallback: sync memset and then nothing — the stream H2Ds
-            // above will still serialize behind it because procs.memset_d8
-            // submits+waits inline.
-            if (memset_fn(d_sizes, 0, sizes_bytes) != VK_SUCCESS_RC) return false;
-        }
-    } else {
-        if (h2d_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes) != VK_SUCCESS_RC) return false;
-        if (vk.procs.memset_d8) |memset_fn|
-            if (memset_fn(d_sizes, 0, sizes_bytes) != VK_SUCCESS_RC) return false;
-        if (sync_fn() != VK_SUCCESS_RC) return false;
-    }
+    if (h2d_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes) != VK_SUCCESS_RC) return false;
+    if (vk.procs.memset_d8) |memset_fn|
+        if (memset_fn(d_sizes, 0, sizes_bytes) != VK_SUCCESS_RC) return false;
+    if (sync_fn() != VK_SUCCESS_RC) return false;
 
     const t_before = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
 
@@ -159,22 +123,14 @@ pub fn gpuCompressImpl(
     var extra = [_]?*anyopaque{null};
 
     const shared_bytes: c_uint = 0;
-    const t_lz = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzEncodeKernel", work_stream);
+    const t_lz = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzEncodeKernel", 0);
     // Defer endKernelTiming so the pending begin event always gets a
     // matching end record - even on launch failure.
-    defer gpu_decode.endKernelTiming(t_lz, work_stream);
-    if (launch_fn(module_loader.kernel_fn, num_chunks, 1, 1, 32, 1, 1, shared_bytes, work_stream, &params, &extra) != VK_SUCCESS_RC)
+    defer gpu_decode.endKernelTiming(t_lz, 0);
+    if (launch_fn(module_loader.kernel_fn, num_chunks, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra) != VK_SUCCESS_RC)
         return false;
 
-    // VK adaptation (H2): the post-LZ D2H of comp_sizes needs to wait
-    // on the LZ kernel. On the stream path it queues into the same
-    // stream cmdbuf as a TRANSFER_READ following the compute write;
-    // the post-loop stream_sync below joins everything. On the sync
-    // path we still need the explicit ctx_sync before the D2H so the
-    // comp_sizes buffer has landed.
-    if (!use_stream) {
-        if (sync_fn() != VK_SUCCESS_RC) return false;
-    }
+    if (sync_fn() != VK_SUCCESS_RC) return false;
 
     if (t_before) |t_start| {
         if (io) |io_val| {
@@ -186,25 +142,7 @@ pub fn gpuCompressImpl(
     }
 
     // Download comp_sizes first, then only the actual compressed bytes per block.
-    //
-    // VK adaptation (H2): on the stream path comp_sizes_out's D2H
-    // queues into the same stream cmdbuf as the LZ kernel; we then
-    // FLUSH with one stream_sync so the CPU can branch on per-chunk
-    // sizes for the loop below. The per-chunk D2H still uses the
-    // sync d2h_offset slot (no async variant currently exists with a
-    // srcOffset arg) — those copies fire after the stream is
-    // already drained so the dependency is implicit.
-    if (use_stream) {
-        if (d2h_async_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes, work_stream) != VK_SUCCESS_RC) return false;
-        // Single submit/wait batching every queued H2D + the LZ
-        // kernel + the comp_sizes D2H — this is the win the H2 plumbing
-        // exists for. Replaces the ~20 ctx_sync round-trips that
-        // procH2D/procD2H/procLaunchKernel paid through the singleton
-        // g_command_buffer.
-        if (stream_sync_fn(work_stream) != VK_SUCCESS_RC) return false;
-    } else {
-        if (d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes) != VK_SUCCESS_RC) return false;
-    }
+    if (d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes) != VK_SUCCESS_RC) return false;
 
     // VK adaptation: mirrors CUDA's per-chunk D2H loop at
     // src/encode/encode_lz.zig:144-150 verbatim. CUDA's

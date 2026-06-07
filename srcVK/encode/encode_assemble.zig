@@ -64,21 +64,10 @@ pub fn gpuAssembleFrameImpl(
     if (huff_lit_offsets.len < n or huff_tok_offsets.len < n or
         huff_off16hi_offsets.len < n or huff_off16lo_offsets.len < n) return false;
 
-    // VK adaptation (H2): stream-promoted entry pulls every H2D/D2H
-    // through the same pipeline_stream as gpuCompressImpl. The two
-    // assemble kernels (measure + write) batch into the same compute
-    // cmdbuf as the LZ kernel; the inter-pass D2H of enc_sizes still
-    // requires an explicit stream_sync because the host needs to
-    // prefix-sum them before Pass B can be queued.
-    const work_stream = self.work_stream;
-    const use_stream = work_stream != 0;
     const h2d = vk.procs.h2d orelse return false;
-    const h2d_async = vk.procs.h2d_async orelse return false;
     const d2h = vk.procs.d2h orelse return false;
-    const d2h_async = vk.procs.d2h_async orelse return false;
     const launch = vk.procs.launch_kernel orelse return false;
     const sync = vk.procs.ctx_sync orelse return false;
-    const stream_sync = vk.procs.stream_sync orelse return false;
 
     // Build per-sub-chunk descriptors (out_offset filled after pass A).
     var descs = allocator.alloc(AssembleDesc, n) catch return false;
@@ -105,12 +94,8 @@ pub fn gpuAssembleFrameImpl(
     const sizes_bytes: usize = @as(usize, n) * 4;
     if (!encode_context.ensureBuf(&self.d_asm_descs, &self.d_asm_descs_size, desc_bytes)) return false;
     if (!encode_context.ensureBuf(&self.d_asm_sizes, &self.d_asm_sizes_size, sizes_bytes)) return false;
-    if (use_stream) {
-        if (h2d_async(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes, work_stream) != VK_SUCCESS_RC) return false;
-    } else {
-        if (h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes) != VK_SUCCESS_RC) return false;
-        if (sync() != VK_SUCCESS_RC) return false;
-    }
+    if (h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes) != VK_SUCCESS_RC) return false;
+    if (sync() != VK_SUCCESS_RC) return false;
 
     // Kernel-arg locals. Each parameter is taken by `&local`, so every
     // value the kernel reads needs its own addressable slot here.
@@ -149,23 +134,14 @@ pub fn gpuAssembleFrameImpl(
         @ptrCast(&arg_scratch),
         @ptrCast(&arg_n),
     };
-    const t_am = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleMeasureKernel", work_stream);
-    defer gpu_decode.endKernelTiming(t_am, work_stream);
-    if (launch(module_loader.assemble_measure_fn, n, 1, 1, 32, 1, 1, 0, work_stream, &measure_params, &extra) != VK_SUCCESS_RC) return false;
+    const t_am = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleMeasureKernel", 0);
+    defer gpu_decode.endKernelTiming(t_am, 0);
+    if (launch(module_loader.assemble_measure_fn, n, 1, 1, 32, 1, 1, 0, 0, &measure_params, &extra) != VK_SUCCESS_RC) return false;
+    if (sync() != VK_SUCCESS_RC) return false;
 
     const enc_sizes = allocator.alloc(u32, n) catch return false;
     defer allocator.free(enc_sizes);
-    // VK adaptation (H2): need the enc_sizes values on the host before
-    // we can compute out_offsets for Pass B — that's the one mandatory
-    // mid-frame sync the encode pipeline can't avoid even on the
-    // stream path.
-    if (use_stream) {
-        if (d2h_async(@ptrCast(enc_sizes.ptr), self.d_asm_sizes, sizes_bytes, work_stream) != VK_SUCCESS_RC) return false;
-        if (stream_sync(work_stream) != VK_SUCCESS_RC) return false;
-    } else {
-        if (sync() != VK_SUCCESS_RC) return false;
-        if (d2h(@ptrCast(enc_sizes.ptr), self.d_asm_sizes, sizes_bytes) != VK_SUCCESS_RC) return false;
-    }
+    if (d2h(@ptrCast(enc_sizes.ptr), self.d_asm_sizes, sizes_bytes) != VK_SUCCESS_RC) return false;
 
     // Prefix-sum: each sub-chunk block is 3 (header) + enc_n bytes.
     var total: u32 = 0;
@@ -180,30 +156,18 @@ pub fn gpuAssembleFrameImpl(
     // Pass B — write [3-byte header][payload] for every sub-chunk.
     // assemble_write: n_bindings=6 (d_raw, d_huff_lit, d_huff_tok,
     // d_huff_off16, descs, d_frame), push_constant_size=4 (n_subchunks).
+    if (h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes) != VK_SUCCESS_RC) return false;
     if (!encode_context.ensureBuf(&self.d_asm_out, &self.d_asm_out_size, @max(total, 1))) return false;
-    if (use_stream) {
-        if (h2d_async(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes, work_stream) != VK_SUCCESS_RC) return false;
-    } else {
-        if (h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes) != VK_SUCCESS_RC) return false;
-    }
     var arg_out = self.d_asm_out;
     var write_params = [_]?*anyopaque{
         @ptrCast(&arg_raw),       @ptrCast(&arg_huff_lit), @ptrCast(&arg_huff_tok),
         @ptrCast(&arg_huff_off16),@ptrCast(&arg_descs),    @ptrCast(&arg_out),
         @ptrCast(&arg_n),
     };
-    const t_aw = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleWriteKernel", work_stream);
-    defer gpu_decode.endKernelTiming(t_aw, work_stream);
-    if (launch(module_loader.assemble_write_fn, n, 1, 1, 32, 1, 1, 0, work_stream, &write_params, &extra) != VK_SUCCESS_RC) return false;
-    // VK adaptation (H2): on the stream path the Pass B kernel's
-    // write into self.d_asm_out is consumed by the subsequent
-    // gpuFrameAssembleImpl launch on the SAME stream — the inter-
-    // kernel ordering is implicit via cmdbuf order, so no
-    // stream_sync needed here. On the sync path the singleton
-    // submit-and-wait keeps the original semantics.
-    if (!use_stream) {
-        if (sync() != VK_SUCCESS_RC) return false;
-    }
+    const t_aw = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleWriteKernel", 0);
+    defer gpu_decode.endKernelTiming(t_aw, 0);
+    if (launch(module_loader.assemble_write_fn, n, 1, 1, 32, 1, 1, 0, 0, &write_params, &extra) != VK_SUCCESS_RC) return false;
+    if (sync() != VK_SUCCESS_RC) return false;
 
     // Publish the per-chunk offset+size index tables; the assembled
     // bytes themselves stay in `self.d_asm_out` for the frame writer
@@ -270,17 +234,7 @@ pub fn gpuFrameAssembleImpl(
     const internal_hdr1 = preamble.internal_hdr1;
     if (n_chunks == 0 or per_chunk_asm_off.len < n_chunks or per_chunk_asm_size.len < n_chunks) return null;
 
-    // VK adaptation (H2): final frame writer on the stream path
-    // queues four small H2Ds (per_chunk_dst, asm_offsets, asm_sizes,
-    // prefix_bytes) onto the transfer cmdbuf, then launches the
-    // frame_assemble kernel into the same compute cmdbuf as the
-    // upstream Pass A/B kernels. The end-of-frame stream_sync (or
-    // d2h_async + stream_sync if the caller owns the wrap_output)
-    // batches everything in one submit/wait.
-    const work_stream = self.work_stream;
-    const use_stream = work_stream != 0;
     const h2d = vk.procs.h2d orelse return null;
-    const h2d_async = vk.procs.h2d_async orelse return null;
     const launch = vk.procs.launch_kernel orelse return null;
     const sync = vk.procs.ctx_sync orelse return null;
 
@@ -311,17 +265,10 @@ pub fn gpuFrameAssembleImpl(
     if (!encode_context.ensureBuf(&self.d_frame_asm_chunk_sz, &self.d_frame_asm_chunk_sz_size, ent_bytes)) return null;
     if (!encode_context.ensureBuf(&self.d_frame_prefix_bytes, &self.d_frame_prefix_bytes_size, prefix_bytes.len)) return null;
 
-    if (use_stream) {
-        if (h2d_async(self.d_frame_chunk_dst, @ptrCast(per_chunk_dst_buf.ptr), ent_bytes, work_stream) != VK_SUCCESS_RC) return null;
-        if (h2d_async(self.d_frame_asm_offsets, @ptrCast(per_chunk_asm_off.ptr), ent_bytes, work_stream) != VK_SUCCESS_RC) return null;
-        if (h2d_async(self.d_frame_asm_chunk_sz, @ptrCast(per_chunk_asm_size.ptr), ent_bytes, work_stream) != VK_SUCCESS_RC) return null;
-        if (h2d_async(self.d_frame_prefix_bytes, @ptrCast(prefix_bytes.ptr), prefix_bytes.len, work_stream) != VK_SUCCESS_RC) return null;
-    } else {
-        if (h2d(self.d_frame_chunk_dst, @ptrCast(per_chunk_dst_buf.ptr), ent_bytes) != VK_SUCCESS_RC) return null;
-        if (h2d(self.d_frame_asm_offsets, @ptrCast(per_chunk_asm_off.ptr), ent_bytes) != VK_SUCCESS_RC) return null;
-        if (h2d(self.d_frame_asm_chunk_sz, @ptrCast(per_chunk_asm_size.ptr), ent_bytes) != VK_SUCCESS_RC) return null;
-        if (h2d(self.d_frame_prefix_bytes, @ptrCast(prefix_bytes.ptr), prefix_bytes.len) != VK_SUCCESS_RC) return null;
-    }
+    if (h2d(self.d_frame_chunk_dst, @ptrCast(per_chunk_dst_buf.ptr), ent_bytes) != VK_SUCCESS_RC) return null;
+    if (h2d(self.d_frame_asm_offsets, @ptrCast(per_chunk_asm_off.ptr), ent_bytes) != VK_SUCCESS_RC) return null;
+    if (h2d(self.d_frame_asm_chunk_sz, @ptrCast(per_chunk_asm_size.ptr), ent_bytes) != VK_SUCCESS_RC) return null;
+    if (h2d(self.d_frame_prefix_bytes, @ptrCast(prefix_bytes.ptr), prefix_bytes.len) != VK_SUCCESS_RC) return null;
 
     var k_input = d_input_dev;
     var k_asm_out = self.d_asm_out;
@@ -372,18 +319,6 @@ pub fn gpuFrameAssembleImpl(
     // work_stream so a stream-sync on it waits for the frame bytes
     // to be in d_output.
     const heavy_stream: usize = self.work_stream;
-    // VK adaptation (H2): COMPUTE→COMPUTE barrier between the
-    // upstream assemble_write (writes d_asm_out) and this frame_assemble
-    // (reads d_asm_out). When work_stream != 0 both kernels live in the
-    // same un-submitted cmdbuf so Vulkan does NOT implicitly order them;
-    // emit an explicit SHADER_WRITE → SHADER_READ barrier. The
-    // work_stream == 0 path inherits inline submit+wait from procLaunchKernel
-    // so no barrier is needed there.
-    if (heavy_stream != 0) {
-        if (vk.procs.stream_compute_barrier) |barrier_fn| {
-            if (barrier_fn(heavy_stream) != VK_SUCCESS_RC) return null;
-        }
-    }
     const t_fa = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzFrameAssembleKernel", heavy_stream);
     defer gpu_decode.endKernelTiming(t_fa, heavy_stream);
     if (launch(module_loader.frame_assemble_fn, grid_x, 1, 1, 128, 1, 1, 0, heavy_stream, &params, &extra) != VK_SUCCESS_RC) return null;
