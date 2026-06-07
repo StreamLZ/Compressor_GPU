@@ -185,6 +185,12 @@ pub const VkProcs = struct {
     launch: FnLaunchKernel,
     sync: FnCtxSync,
     stream_sync: FnStreamSync,
+    // Iter 13: VK adaptation — early-submit the transfer cmdbuf at the
+    // end of uploadInputAndPrefixSum so the dedicated DMA engine starts
+    // the H2D copies in parallel with runBackHalf's host-side prep.
+    // No CUDA analogue (cuMemcpyHtoDAsync auto-issues on the call).
+    // Optional so legacy backends without the slot still resolve.
+    stream_flush_transfer: ?FnStreamSync,
     d2d: ?FnD2D,
 
     fn resolve() GpuError!VkProcs {
@@ -200,6 +206,7 @@ pub const VkProcs = struct {
             .launch = vk.procs.launch_kernel orelse return error.BackendNotAvailable,
             .sync = vk.procs.ctx_sync orelse return error.BackendNotAvailable,
             .stream_sync = vk.procs.stream_sync orelse return error.BackendNotAvailable,
+            .stream_flush_transfer = vk.procs.stream_flush_transfer,
             .d2d = vk.procs.d2d,
         };
     }
@@ -640,6 +647,19 @@ const FrameLayout = struct {
     total_subchunks: u32,
     tok_offset: usize,
     off16_offset: usize,
+    // Iter 13: VK adaptation — uploadInputAndPrefixSum stages the LZ
+    // kernel's self-gate count (the 4 B n_chunks H2D) before the
+    // early-submit of the transfer cmdbuf, so runBackHalf no longer
+    // owns this copy. The resolved device address (either the caller's
+    // `d_n_chunks_dev` or `self.d_n_groups_scratch`) is passed through
+    // on the FrameLayout for the LZ kernel's `total` param.
+    //
+    // Pre-iter-13 runBackHalf did this 4 B H2D inline. Moving it up
+    // ensures all H2D vkCmdCopyBuffers are recorded into the transfer
+    // cmdbuf BEFORE procs.stream_flush_transfer end+submits it, so
+    // the dedicated DMA engine can start the H2D in parallel with the
+    // host-side kernel-record + descriptor-binding work in runBackHalf.
+    lz_total_count_dev: VkDeviceBuffer,
 };
 
 /// CUDA reference: src/decode/decode_dispatch.zig:503-579. Upload
@@ -650,6 +670,12 @@ pub fn uploadInputAndPrefixSum(
     self: *DecodeContext,
     req: DecodeRequest,
     procs: *const VkProcs,
+    /// Iter 13: VK adaptation — when true, after recording all H2Ds
+    /// into the work_stream's transfer cmdbuf, this function end+submits
+    /// it EARLY via procs.stream_flush_transfer so the dedicated DMA
+    /// engine starts the H2D copies in parallel with runBackHalf's host
+    /// prep. Gated on sync mode (mirrors iter-4 batching scope).
+    is_sync_mode: bool,
 ) GpuError!FrameLayout {
     const _t_upload_misc_start = if (g_phase_profile_enabled) vk.qpcNow() else 0;
     const total_output = req.dst_start_off + req.decompressed_size;
@@ -735,12 +761,57 @@ pub fn uploadInputAndPrefixSum(
         }
     }
 
+    // Iter 13: VK adaptation — stage the LZ self-gate count (4 B
+    // n_chunks H2D) HERE rather than in runBackHalf. Combined with the
+    // procs.stream_flush_transfer call below, this gives the dedicated
+    // DMA engine the full H2D batch up-front so it can run in parallel
+    // with the host-side prep work runBackHalf does (kernel record,
+    // descriptor binding, prepareImportedOutputBuffer). The resolved
+    // device address is returned via FrameLayout so runBackHalf doesn't
+    // need to know which path was taken.
+    //
+    // host_total_chunks must outlive the h2dRoute call only until the
+    // procH2DAsync staging-bump memcpy completes (immediately on
+    // return) — local-variable lifetime here is fine because the H2D
+    // either consumes the host bytes synchronously (staging path) or
+    // imports a separate page-aligned buffer (the comp_input import
+    // does not apply at 4 B sizes — below H2D_IMPORT_THRESHOLD).
+    const lz_total_count_dev: VkDeviceBuffer = if (req.d_n_chunks_dev) |dev| dev else blk: {
+        try ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4);
+        var host_total_chunks: u32 = @intCast(req.chunk_descs.len);
+        const _t_h2d_n0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
+        try vkCall(h2dRoute(procs, self.work_stream, self.d_n_groups_scratch, @ptrCast(&host_total_chunks), 4), .copy);
+        if (g_phase_profile_enabled) g_phase_backhalf_h2d_count_ns += qpcDeltaNs(_t_h2d_n0, vk.qpcNow());
+        break :blk self.d_n_groups_scratch;
+    };
+
     if (g_phase_profile_enabled) g_phase_upload_misc_ns += qpcDeltaNs(_t_upload_misc_resume, vk.qpcNow());
+
+    // VK adaptation: end+submit the transfer cmdbuf at end of upload so
+    // the dedicated DMA engine starts H2D in parallel with the host
+    // runBackHalf prep (kernel record + descriptor binding +
+    // prepareImportedOutputBuffer). Mirrors CUDA cuMemcpyHtoD's natural
+    // ordering where the synchronous host call has already drained the
+    // copy engine by the time the back-half stream_sync fires.
+    //
+    // Only fired in sync mode — async callers manage their own stream
+    // and may queue further H2Ds after this point. In sync mode
+    // self.work_stream is the dispatcher-promoted pipeline_stream
+    // (iter 4) and we control every subsequent procs.* call, so the
+    // "no more H2Ds after flush" invariant is preserved (the only
+    // post-upload H2D in the L1 path — the 4 B n_chunks copy — was
+    // moved into this function above).
+    if (is_sync_mode) {
+        if (procs.stream_flush_transfer) |flush| {
+            _ = flush(self.work_stream);
+        }
+    }
 
     return .{
         .total_subchunks = total_subchunks,
         .tok_offset = tok_offset,
         .off16_offset = off16_offset,
+        .lz_total_count_dev = lz_total_count_dev,
     };
 }
 
@@ -781,23 +852,12 @@ pub fn runBackHalf(
     // SLZ_SPLIT_TIMER: separate Huff predecode from LZ decode timing.
     const split_timer = std.c.getenv("SLZ_SPLIT_TIMER") != null;
 
-    // Stage the LZ kernel's self-gate count. D2D path: the caller
-    // supplies `d_n_chunks_dev` (typically `d_walk_meta + offset`).
-    // Else stage `total_chunks` into `d_n_groups_scratch` via 4 B H2D.
-    //
-    // Iter 4: route through h2d_async on heavy_stream so this trailing
-    // 4 B copy batches with the LZ kernel that consumes it instead of
-    // triggering its own submit+wait round-trip. `host_total_chunks`
-    // must outlive h2dRoute's call — h2d_async memcpys into staging
-    // immediately so the local-variable lifetime is fine.
-    const lz_total_count_dev: u64 = if (req.d_n_chunks_dev) |dev| dev else blk: {
-        try ensureDeviceBuf(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size, 4);
-        var host_total_chunks: u32 = total_chunks;
-        const _t_h2d_n0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
-        try vkCall(h2dRoute(procs, heavy_stream, self.d_n_groups_scratch, @ptrCast(&host_total_chunks), 4), .copy);
-        if (g_phase_profile_enabled) g_phase_backhalf_h2d_count_ns += qpcDeltaNs(_t_h2d_n0, vk.qpcNow());
-        break :blk self.d_n_groups_scratch;
-    };
+    // Iter 13: VK adaptation — the LZ self-gate count was staged in
+    // uploadInputAndPrefixSum (see FrameLayout.lz_total_count_dev) so
+    // the 4 B H2D is part of the transfer cmdbuf the early-submit
+    // flush dispatched on the DMA engine. runBackHalf only reads the
+    // resolved device address here.
+    const lz_total_count_dev: u64 = layout.lz_total_count_dev;
 
     // Direct-write-to-output fast path: when the caller supplied a
     // device output target AND there's no host prefix to splice in,
@@ -969,7 +1029,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // Phase 1: upload + prefix sum (always runs — needed for chunk
     // descriptor sizing on L1 and L2+).
     const _t_upload0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
-    const layout = try uploadInputAndPrefixSum(self, req, &procs);
+    const layout = try uploadInputAndPrefixSum(self, req, &procs, is_sync_mode);
     if (g_phase_profile_enabled) g_phase_upload_ns += qpcDeltaNs(_t_upload0, vk.qpcNow());
     if (t_e2e0) |t0| if (io) |io_val| {
         e2e_cum.h2d = nsSince(t0, io_val);

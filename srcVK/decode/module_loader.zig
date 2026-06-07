@@ -1313,6 +1313,20 @@ const StreamEntry = struct {
     // ~0. Bench captures this as "dedicated=false" in the init log.
     transfer_cmdbuf: VkCommandBuffer = null,
     transfer_recording: bool = false,
+    // Iter 13: VK adaptation — flipped true by procStreamFlushTransfer
+    // when the transfer cmdbuf has been End+Submitted EARLY (at the end
+    // of uploadInputAndPrefixSum). streamEndAndWait then skips the
+    // transfer end+submit but PRESERVES the compute submit's semaphore
+    // wait so the h2d_sem the early-flush submit signaled is properly
+    // consumed. Reset to false after the wait completes.
+    //
+    // This early-submit lets the dedicated DMA engine start the H2D
+    // copies in parallel with the host-side runBackHalf prep (kernel
+    // record + descriptor binding + prepareImportedOutputBuffer),
+    // mirroring CUDA cuMemcpyHtoD's natural ordering where the
+    // synchronous host call has already drained the copy engine by the
+    // time the back-half stream_sync fires.
+    transfer_already_submitted: bool = false,
     h2d_sem: VkSemaphore = VK_NULL_HANDLE,
     staging_buffer: vma.VkBuffer = 0,
     staging_alloc: vma.VmaAllocation = null,
@@ -2150,6 +2164,7 @@ pub fn init() bool {
     vulkan_api.procs.malloc_host = procMallocHost;
     vulkan_api.procs.free_host = procFreeHost;
     vulkan_api.procs.stream_sync = procStreamSync;
+    vulkan_api.procs.stream_flush_transfer = procStreamFlushTransfer;
     vulkan_api.procs.ctx_sync = procCtxSync;
     vulkan_api.procs.stream_create = procStreamCreate;
     vulkan_api.procs.stream_destroy = procStreamDestroy;
@@ -2490,7 +2505,7 @@ fn streamBeginTransferIfNeeded(entry: *StreamEntry) VkResult {
 // until then, even with HOST_COHERENT memory — coherence covers
 // CPU↔GPU cache visibility, not pipeline ordering).
 fn streamEndAndWait(entry: *StreamEntry) VkResult {
-    if (!entry.recording and !entry.transfer_recording) {
+    if (!entry.recording and !entry.transfer_recording and !entry.transfer_already_submitted) {
         // Even when no cmdbuf was recorded, reset arena/pending state
         // for symmetry (defensive: caller may have skipped the body).
         entry.staging_used = 0;
@@ -2520,12 +2535,18 @@ fn streamEndAndWait(entry: *StreamEntry) VkResult {
     // single-submit shape so we don't pay for an empty cmdbuf.
 
     // ── 1) End + submit the transfer cmdbuf if it has work ────────────
-    const has_xfer_work = entry.transfer_recording;
-    if (has_xfer_work) {
+    // Iter 13: If procStreamFlushTransfer already End+Submitted the
+    // transfer cmdbuf at the end of uploadInputAndPrefixSum, the
+    // h2d_sem is already in-flight and we skip the end+submit here.
+    // The compute submit below still waits on h2d_sem (has_xfer_work
+    // remains true) so semantics are preserved.
+    const has_xfer_work = entry.transfer_recording or entry.transfer_already_submitted;
+    if (entry.transfer_recording) {
         const rc_end = vkEndCommandBuffer_fn.?(entry.transfer_cmdbuf);
         if (rc_end != VK_SUCCESS_RC) {
             entry.recording = false;
             entry.transfer_recording = false;
+            entry.transfer_already_submitted = false;
             entry.staging_used = 0;
             entry.pending_d2h.clearRetainingCapacity();
             freePendingImportedD2H(entry);
@@ -2543,6 +2564,7 @@ fn streamEndAndWait(entry: *StreamEntry) VkResult {
         if (rc_sub_xfer != VK_SUCCESS_RC) {
             entry.recording = false;
             entry.transfer_recording = false;
+            entry.transfer_already_submitted = false;
             entry.staging_used = 0;
             entry.pending_d2h.clearRetainingCapacity();
             freePendingImportedD2H(entry);
@@ -2563,6 +2585,7 @@ fn streamEndAndWait(entry: *StreamEntry) VkResult {
             // transfer queue so the semaphore consumer is implicit.
             if (vkQueueWaitIdle_fn) |wi| _ = wi(xfer_q);
             entry.transfer_recording = false;
+            entry.transfer_already_submitted = false;
             entry.staging_used = 0;
             entry.pending_d2h.clearRetainingCapacity();
             freePendingImportedD2H(entry);
@@ -2573,6 +2596,7 @@ fn streamEndAndWait(entry: *StreamEntry) VkResult {
     if (rc != VK_SUCCESS_RC) {
         entry.recording = false;
         entry.transfer_recording = false;
+        entry.transfer_already_submitted = false;
         entry.staging_used = 0;
         entry.pending_d2h.clearRetainingCapacity();
         freePendingImportedD2H(entry);
@@ -2593,6 +2617,7 @@ fn streamEndAndWait(entry: *StreamEntry) VkResult {
     if (rc != VK_SUCCESS_RC) {
         entry.recording = false;
         entry.transfer_recording = false;
+        entry.transfer_already_submitted = false;
         entry.staging_used = 0;
         entry.pending_d2h.clearRetainingCapacity();
         freePendingImportedD2H(entry);
@@ -2615,6 +2640,7 @@ fn streamEndAndWait(entry: *StreamEntry) VkResult {
     freePendingImportedD2H(entry);
     entry.recording = false;
     entry.transfer_recording = false;
+    entry.transfer_already_submitted = false;
     entry.staging_used = 0;
     entry.pending_d2h.clearRetainingCapacity();
     return rc;
@@ -3486,6 +3512,57 @@ fn procStreamSync(stream: VkStream) callconv(.c) VkResult {
     }
     // VK adaptation: stream==0 is the shared default stream whose ops
     // submit-and-wait inline (sync semantics already satisfied).
+    return VK_SUCCESS_RC;
+}
+
+// VK adaptation: end+submit the transfer cmdbuf at end of upload so
+// the dedicated DMA engine starts H2D in parallel with the host
+// runBackHalf prep (kernel record + descriptor binding +
+// prepareImportedOutputBuffer). Mirrors CUDA cuMemcpyHtoD's natural
+// ordering where the synchronous host call has already drained the
+// copy engine by the time the back-half stream_sync fires.
+//
+// Pre-iter-13 the transfer queue submit happened inside
+// streamEndAndWait alongside the compute submit, ~39us apart per
+// nsys capture. The compute submit's COMPUTE_SHADER_BIT semaphore
+// wait then serialized the LZ kernel behind the full H2D, so the
+// back-half fence wait = transfer_time + kernel_time = ~5ms + ~3ms.
+//
+// With this early flush, the transfer queue starts the H2D
+// immediately while host code records the LZ kernel + bindings.
+// By the time streamEndAndWait submits compute, transfer is nearly
+// done; the semaphore wait collapses to ~0 and the back-half fence
+// shrinks to ~kernel_time = ~3ms.
+//
+// Subsequent procH2DAsync calls on this stream are NOT supported
+// after a flush — the codec is required to have completed all H2Ds
+// before calling this. Iter-13 moves the 4-byte n_chunks H2D (the
+// only post-upload H2D in the L1 path) into uploadInputAndPrefixSum
+// to satisfy this invariant. If a future codec change introduces a
+// new post-flush H2D, this function should reject it (or fall back
+// to a second-semaphore design).
+fn procStreamFlushTransfer(stream: VkStream) callconv(.c) VkResult {
+    const se = streamEntryFor(stream) orelse return VK_SUCCESS_RC; // stream==0 has no transfer cmdbuf
+    if (!se.transfer_recording) return VK_SUCCESS_RC; // no H2D work — nothing to flush
+    if (se.transfer_already_submitted) return VK_SUCCESS_RC; // idempotent
+
+    const rc_end = vkEndCommandBuffer_fn.?(se.transfer_cmdbuf);
+    if (rc_end != VK_SUCCESS_RC) return rc_end;
+
+    const xfer_cb = se.transfer_cmdbuf;
+    const sem_handle = se.h2d_sem;
+    const xfer_submit = VkSubmitInfo{
+        .commandBufferCount = 1,
+        .pCommandBuffers = @ptrCast(&xfer_cb),
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = @ptrCast(&sem_handle),
+    };
+    const xfer_q: VkQueue = @ptrFromInt(g_transfer_queue);
+    const rc_sub = vkQueueSubmit_fn.?(xfer_q, 1, @ptrCast(&xfer_submit), VK_NULL_HANDLE);
+    if (rc_sub != VK_SUCCESS_RC) return rc_sub;
+
+    se.transfer_recording = false;
+    se.transfer_already_submitted = true;
     return VK_SUCCESS_RC;
 }
 

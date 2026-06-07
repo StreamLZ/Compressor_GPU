@@ -311,6 +311,19 @@ pub const Procs = struct {
     /// VK adaptation: vkWaitForFences on the stream's fence.
     stream_sync: ?*const fn (VkStream) callconv(.c) VkResult = null,
 
+    /// VK adaptation: NEW SLOT (no CUDA analogue). End+submit the
+    /// stream's transfer cmdbuf EARLY so the dedicated DMA engine can
+    /// start the queued H2D copies in parallel with subsequent host-
+    /// side prep (kernel record, descriptor binding, host imports).
+    /// CUDA's cuMemcpyHtoDAsync auto-issues on the call; the VK port
+    /// batches them into a transfer cmdbuf that streamEndAndWait
+    /// usually submits at sync time. This slot lets the dispatcher
+    /// flush the transfer cmdbuf at the end of uploadInputAndPrefixSum
+    /// (iter 13) so its H2D overlaps with runBackHalf's host prep.
+    /// streamEndAndWait then skips the transfer end+submit but still
+    /// makes the compute submit wait on the already-in-flight h2d_sem.
+    stream_flush_transfer: ?*const fn (VkStream) callconv(.c) VkResult = null,
+
     /// CUDA reference: cuCtxSynchronize_fn.
     /// VK adaptation: vkDeviceWaitIdle.
     ctx_sync: ?*const fn () callconv(.c) VkResult = null,
