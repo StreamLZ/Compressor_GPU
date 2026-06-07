@@ -10,6 +10,14 @@ const module_loader = @import("module_loader.zig");
 const encode_context = @import("encode_context.zig");
 const levels = @import("levels.zig");
 const gpu_decode = @import("../decode/driver.zig");
+// VK adaptation: per-phase QPC profile accumulators live on
+// fast_framed.zig (the encode orchestrator). Pulled in for the
+// SLZ_VK_PROFILE_PHASES checkpoints below.
+const enc_phase = @import("fast_framed.zig");
+
+inline fn qpcDeltaNs(start: i64, end: i64) i64 {
+    return @intFromFloat(vk.qpcMs(start, end) * 1e6);
+}
 
 const VkDeviceBuffer = vk.VkDeviceBuffer;
 const VK_SUCCESS_RC = vk.VK_SUCCESS_RC;
@@ -75,16 +83,26 @@ pub fn gpuCompressImpl(
     // device-resident at `d_input_override`, populate `d_input_persist`
     // via D2D (no host bounce) instead of an H2D from the host `input`
     // slice.
+    // VK adaptation: per-phase QPC profile checkpoints (lz.h2d_input /
+    // lz.h2d_descs_init / lz.pre_kernel_sync). Pure measurement; does
+    // NOT change dispatch / descriptor / sync logic.
+    const _prof = enc_phase.g_enc_phase_profile_enabled;
+    const _t_h2d_in0 = if (_prof) vk.qpcNow() else 0;
     if (self.d_input_override != 0) {
         const d2d = vk.procs.d2d orelse return false;
         if (d2d(d_input, self.d_input_override, input.len, 0) != VK_SUCCESS_RC) return false;
     } else {
         if (h2d_fn(d_input, @ptrCast(input.ptr), input.len) != VK_SUCCESS_RC) return false;
     }
+    if (_prof) enc_phase.g_enc_phase_lz_h2d_input_ns += qpcDeltaNs(_t_h2d_in0, vk.qpcNow());
+    const _t_h2d_di0 = if (_prof) vk.qpcNow() else 0;
     if (h2d_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes) != VK_SUCCESS_RC) return false;
     if (vk.procs.memset_d8) |memset_fn|
         if (memset_fn(d_sizes, 0, sizes_bytes) != VK_SUCCESS_RC) return false;
+    if (_prof) enc_phase.g_enc_phase_lz_h2d_descs_init_ns += qpcDeltaNs(_t_h2d_di0, vk.qpcNow());
+    const _t_sync0 = if (_prof) vk.qpcNow() else 0;
     if (sync_fn() != VK_SUCCESS_RC) return false;
+    if (_prof) enc_phase.g_enc_phase_lz_pre_kernel_sync_ns += qpcDeltaNs(_t_sync0, vk.qpcNow());
 
     const t_before = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
 
@@ -123,6 +141,8 @@ pub fn gpuCompressImpl(
     var extra = [_]?*anyopaque{null};
 
     const shared_bytes: c_uint = 0;
+    // VK adaptation: lz.kernel phase = launch + post-kernel ctx_sync.
+    const _t_kern0 = if (_prof) vk.qpcNow() else 0;
     const t_lz = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzEncodeKernel", 0);
     // Defer endKernelTiming so the pending begin event always gets a
     // matching end record - even on launch failure.
@@ -131,6 +151,7 @@ pub fn gpuCompressImpl(
         return false;
 
     if (sync_fn() != VK_SUCCESS_RC) return false;
+    if (_prof) enc_phase.g_enc_phase_lz_kernel_ns += qpcDeltaNs(_t_kern0, vk.qpcNow());
 
     if (t_before) |t_start| {
         if (io) |io_val| {
@@ -142,7 +163,10 @@ pub fn gpuCompressImpl(
     }
 
     // Download comp_sizes first, then only the actual compressed bytes per block.
+    // VK adaptation: lz.d2h_comp_sizes phase = the ~6 KB per-chunk sizes D2H.
+    const _t_dsz0 = if (_prof) vk.qpcNow() else 0;
     if (d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes) != VK_SUCCESS_RC) return false;
+    if (_prof) enc_phase.g_enc_phase_lz_d2h_comp_sizes_ns += qpcDeltaNs(_t_dsz0, vk.qpcNow());
 
     // VK adaptation (encode D2H gather, iter-7+11+15 transferable):
     // The CUDA reference at src/encode/encode_lz.zig:144-150 expresses
@@ -176,6 +200,11 @@ pub fn gpuCompressImpl(
     // wires it unconditionally) or returns failure, the gather impl
     // itself falls through to a per-region procD2HOffset loop, so
     // correctness is preserved on every backend.
+    // VK adaptation: lz.d2h_gather phase = the iter-3 transfer-queue gather
+    // of the actual compressed bytes (~50 MB on enwik8). Includes the
+    // regions-buf build, the gather submit/wait, and the fallback loop
+    // (whichever branch runs).
+    const _t_gather0 = if (_prof) vk.qpcNow() else 0;
     const d2h_offset_gather_fn = vk.procs.d2h_offset_gather;
     if (d2h_offset_gather_fn) |gather_fn| {
         // Build the regions array. Worst case n_regions == chunk_descs.len
@@ -211,6 +240,7 @@ pub fn gpuCompressImpl(
             }
         }
     }
+    if (_prof) enc_phase.g_enc_phase_lz_d2h_gather_ns += qpcDeltaNs(_t_gather0, vk.qpcNow());
 
     return true;
 }

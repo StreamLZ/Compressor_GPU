@@ -21,6 +21,109 @@ const gpu_enc = @import("driver.zig");
 const vk_api = @import("../decode/vulkan_api.zig");
 const decode_module_loader = @import("../decode/module_loader.zig");
 
+// VK adaptation: per-phase QPC profiling for the encode hot path. Mirrors
+// the decode-side SLZ_VK_PROFILE_PHASES machinery (srcVK/decode/decode_dispatch.zig
+// :g_phase_*_ns + phaseProfileInit + printAndResetPhaseProfile). Pure
+// host-side measurement around the existing dispatch / H2D / D2H / sync
+// call sites — adds ~50-200 ns per checkpoint (negligible vs the 332 ms
+// warm encode wall). Used by bench_compress.zig to localize where the
+// residual ~190 ms gap vs CUDA lives. Counters are zeroed by
+// encPhaseProfileInit(); printed + reset by printAndResetEncodePhaseProfile().
+// Reads SLZ_VK_PROFILE_PHASES env var on init() so the toggle matches
+// the decode-side gate.
+pub var g_enc_phase_profile_enabled: bool = false;
+pub var g_enc_phase_count: u64 = 0;
+pub var g_enc_phase_cpu_descs_build_ns: i64 = 0;
+pub var g_enc_phase_wrap_input_h2d_ns: i64 = 0;
+pub var g_enc_phase_ensure_gpu_out_buf_ns: i64 = 0;
+pub var g_enc_phase_lz_h2d_input_ns: i64 = 0;
+pub var g_enc_phase_lz_h2d_descs_init_ns: i64 = 0;
+pub var g_enc_phase_lz_pre_kernel_sync_ns: i64 = 0;
+pub var g_enc_phase_lz_kernel_ns: i64 = 0;
+pub var g_enc_phase_lz_d2h_comp_sizes_ns: i64 = 0;
+pub var g_enc_phase_lz_d2h_gather_ns: i64 = 0;
+pub var g_enc_phase_asm_h2d_descs_ns: i64 = 0;
+pub var g_enc_phase_asm_measure_dispatch_ns: i64 = 0;
+pub var g_enc_phase_asm_d2h_enc_sizes_ns: i64 = 0;
+pub var g_enc_phase_asm_cpu_prefix_sum_ns: i64 = 0;
+pub var g_enc_phase_asm_h2d_descs_second_ns: i64 = 0;
+pub var g_enc_phase_asm_write_dispatch_ns: i64 = 0;
+pub var g_enc_phase_frame_asm_h2ds_ns: i64 = 0;
+pub var g_enc_phase_frame_asm_dispatch_ns: i64 = 0;
+pub var g_enc_phase_d2h_final_ns: i64 = 0;
+pub var g_enc_phase_host_finalize_ns: i64 = 0;
+
+pub fn encPhaseProfileInit() void {
+    g_enc_phase_profile_enabled = std.c.getenv("SLZ_VK_PROFILE_PHASES") != null;
+    g_enc_phase_count = 0;
+    g_enc_phase_cpu_descs_build_ns = 0;
+    g_enc_phase_wrap_input_h2d_ns = 0;
+    g_enc_phase_ensure_gpu_out_buf_ns = 0;
+    g_enc_phase_lz_h2d_input_ns = 0;
+    g_enc_phase_lz_h2d_descs_init_ns = 0;
+    g_enc_phase_lz_pre_kernel_sync_ns = 0;
+    g_enc_phase_lz_kernel_ns = 0;
+    g_enc_phase_lz_d2h_comp_sizes_ns = 0;
+    g_enc_phase_lz_d2h_gather_ns = 0;
+    g_enc_phase_asm_h2d_descs_ns = 0;
+    g_enc_phase_asm_measure_dispatch_ns = 0;
+    g_enc_phase_asm_d2h_enc_sizes_ns = 0;
+    g_enc_phase_asm_cpu_prefix_sum_ns = 0;
+    g_enc_phase_asm_h2d_descs_second_ns = 0;
+    g_enc_phase_asm_write_dispatch_ns = 0;
+    g_enc_phase_frame_asm_h2ds_ns = 0;
+    g_enc_phase_frame_asm_dispatch_ns = 0;
+    g_enc_phase_d2h_final_ns = 0;
+    g_enc_phase_host_finalize_ns = 0;
+}
+
+inline fn qpcDeltaNs(start: i64, end: i64) i64 {
+    return @intFromFloat(vk_api.qpcMs(start, end) * 1e6);
+}
+
+pub fn printAndResetEncodePhaseProfile(w: anytype) void {
+    if (!g_enc_phase_profile_enabled or g_enc_phase_count == 0) return;
+    const n = @as(f64, @floatFromInt(g_enc_phase_count));
+    const ns_to_ms_per = struct {
+        fn f(total_ns: i64, count: f64) f64 {
+            return (@as(f64, @floatFromInt(total_ns)) / 1e6) / count;
+        }
+    }.f;
+    w.print("phase: enc.count                  {d}\n", .{g_enc_phase_count}) catch {};
+    w.print("phase: enc.cpu_descs_build        {d:.4} ms/enc\n", .{ns_to_ms_per(g_enc_phase_cpu_descs_build_ns, n)}) catch {};
+    w.print("phase: enc.wrap_input_h2d         {d:.4} ms/enc  (~95 MB enwik8 wrap-input H2D)\n", .{ns_to_ms_per(g_enc_phase_wrap_input_h2d_ns, n)}) catch {};
+    w.print("phase: enc.ensure_gpu_out_buf     {d:.4} ms/enc\n", .{ns_to_ms_per(g_enc_phase_ensure_gpu_out_buf_ns, n)}) catch {};
+    w.print("phase: enc.lz.h2d_input           {d:.4} ms/enc  (d2d when wrap-input, else H2D)\n", .{ns_to_ms_per(g_enc_phase_lz_h2d_input_ns, n)}) catch {};
+    w.print("phase: enc.lz.h2d_descs_init      {d:.4} ms/enc  (descs H2D + memset d_sizes)\n", .{ns_to_ms_per(g_enc_phase_lz_h2d_descs_init_ns, n)}) catch {};
+    w.print("phase: enc.lz.pre_kernel_sync     {d:.4} ms/enc\n", .{ns_to_ms_per(g_enc_phase_lz_pre_kernel_sync_ns, n)}) catch {};
+    w.print("phase: enc.lz.kernel              {d:.4} ms/enc  (launch + post-kernel sync)\n", .{ns_to_ms_per(g_enc_phase_lz_kernel_ns, n)}) catch {};
+    w.print("phase: enc.lz.d2h_comp_sizes      {d:.4} ms/enc\n", .{ns_to_ms_per(g_enc_phase_lz_d2h_comp_sizes_ns, n)}) catch {};
+    w.print("phase: enc.lz.d2h_gather          {d:.4} ms/enc  (~50 MB iter-3 gather)\n", .{ns_to_ms_per(g_enc_phase_lz_d2h_gather_ns, n)}) catch {};
+    w.print("phase: enc.asm.h2d_descs          {d:.4} ms/enc  (assemble descs H2D + sync)\n", .{ns_to_ms_per(g_enc_phase_asm_h2d_descs_ns, n)}) catch {};
+    w.print("phase: enc.asm.measure_dispatch   {d:.4} ms/enc  (measure launch + sync)\n", .{ns_to_ms_per(g_enc_phase_asm_measure_dispatch_ns, n)}) catch {};
+    w.print("phase: enc.asm.d2h_enc_sizes      {d:.4} ms/enc\n", .{ns_to_ms_per(g_enc_phase_asm_d2h_enc_sizes_ns, n)}) catch {};
+    w.print("phase: enc.asm.cpu_prefix_sum     {d:.4} ms/enc\n", .{ns_to_ms_per(g_enc_phase_asm_cpu_prefix_sum_ns, n)}) catch {};
+    w.print("phase: enc.asm.h2d_descs_2nd      {d:.4} ms/enc  (second descs H2D after prefix)\n", .{ns_to_ms_per(g_enc_phase_asm_h2d_descs_second_ns, n)}) catch {};
+    w.print("phase: enc.asm.write_dispatch     {d:.4} ms/enc  (write launch + sync)\n", .{ns_to_ms_per(g_enc_phase_asm_write_dispatch_ns, n)}) catch {};
+    w.print("phase: enc.frame.h2ds             {d:.4} ms/enc  (4 small H2Ds: chunk_dst+asm_off+asm_sz+prefix)\n", .{ns_to_ms_per(g_enc_phase_frame_asm_h2ds_ns, n)}) catch {};
+    w.print("phase: enc.frame.dispatch         {d:.4} ms/enc  (frame_assemble launch + sync)\n", .{ns_to_ms_per(g_enc_phase_frame_asm_dispatch_ns, n)}) catch {};
+    w.print("phase: enc.d2h_final              {d:.4} ms/enc  (~50 MB compressed frame D2H)\n", .{ns_to_ms_per(g_enc_phase_d2h_final_ns, n)}) catch {};
+    w.print("phase: enc.host_finalize          {d:.4} ms/enc\n", .{ns_to_ms_per(g_enc_phase_host_finalize_ns, n)}) catch {};
+    const totalled =
+        g_enc_phase_cpu_descs_build_ns + g_enc_phase_wrap_input_h2d_ns +
+        g_enc_phase_ensure_gpu_out_buf_ns + g_enc_phase_lz_h2d_input_ns +
+        g_enc_phase_lz_h2d_descs_init_ns + g_enc_phase_lz_pre_kernel_sync_ns +
+        g_enc_phase_lz_kernel_ns + g_enc_phase_lz_d2h_comp_sizes_ns +
+        g_enc_phase_lz_d2h_gather_ns + g_enc_phase_asm_h2d_descs_ns +
+        g_enc_phase_asm_measure_dispatch_ns + g_enc_phase_asm_d2h_enc_sizes_ns +
+        g_enc_phase_asm_cpu_prefix_sum_ns + g_enc_phase_asm_h2d_descs_second_ns +
+        g_enc_phase_asm_write_dispatch_ns + g_enc_phase_frame_asm_h2ds_ns +
+        g_enc_phase_frame_asm_dispatch_ns + g_enc_phase_d2h_final_ns +
+        g_enc_phase_host_finalize_ns;
+    w.print("phase: enc.SUM                    {d:.4} ms/enc\n", .{ns_to_ms_per(totalled, n)}) catch {};
+    encPhaseProfileInit();
+}
+
 /// CUDA reference: src/encode/fast_framed.zig:27. Inputs at or below this
 /// size are too small for the LZ kernel's per-warp setup cost to ever
 /// produce a smaller output; emit them as a whole-frame uncompressed
@@ -176,6 +279,35 @@ fn gpuEncodeAndAssemble(
     sc_grp: f32,
     frame_block_hdr_pos: usize,
 ) CompressError!usize {
+    // VK adaptation: per-phase profile checkpoint (cpu_descs_build /
+    // wrap_input_h2d / ensure_gpu_out_buf). Pure measurement — does not
+    // change any dispatch / H2D / sync logic.
+    const _prof = g_enc_phase_profile_enabled;
+    const _t_wall0 = if (_prof) vk_api.qpcNow() else 0;
+    const _t_setup0 = _t_wall0;
+    // Snapshot the GPU-phase accumulators that nest inside this setup
+    // span so cpu_descs_build (computed at the end of setup) can subtract
+    // them out and remain pure-CPU. Both phases run zero or once per encode.
+    const _snap_wrap_in = if (_prof) g_enc_phase_wrap_input_h2d_ns else 0;
+    const _snap_gob = if (_prof) g_enc_phase_ensure_gpu_out_buf_ns else 0;
+    // Snapshot every other phase accumulator so host_finalize (residual)
+    // can compute wall - all-attributed-phase-deltas at end of function.
+    const _snap_lz_h2d_in = if (_prof) g_enc_phase_lz_h2d_input_ns else 0;
+    const _snap_lz_h2d_di = if (_prof) g_enc_phase_lz_h2d_descs_init_ns else 0;
+    const _snap_lz_presync = if (_prof) g_enc_phase_lz_pre_kernel_sync_ns else 0;
+    const _snap_lz_kern = if (_prof) g_enc_phase_lz_kernel_ns else 0;
+    const _snap_lz_dsz = if (_prof) g_enc_phase_lz_d2h_comp_sizes_ns else 0;
+    const _snap_lz_gather = if (_prof) g_enc_phase_lz_d2h_gather_ns else 0;
+    const _snap_asm_h2d = if (_prof) g_enc_phase_asm_h2d_descs_ns else 0;
+    const _snap_asm_meas = if (_prof) g_enc_phase_asm_measure_dispatch_ns else 0;
+    const _snap_asm_desz = if (_prof) g_enc_phase_asm_d2h_enc_sizes_ns else 0;
+    const _snap_asm_psum = if (_prof) g_enc_phase_asm_cpu_prefix_sum_ns else 0;
+    const _snap_asm_h2d2 = if (_prof) g_enc_phase_asm_h2d_descs_second_ns else 0;
+    const _snap_asm_wr = if (_prof) g_enc_phase_asm_write_dispatch_ns else 0;
+    const _snap_fa_h2ds = if (_prof) g_enc_phase_frame_asm_h2ds_ns else 0;
+    const _snap_fa_disp = if (_prof) g_enc_phase_frame_asm_dispatch_ns else 0;
+    const _snap_d2h_final = if (_prof) g_enc_phase_d2h_final_ns else 0;
+    const _snap_cpu_descs = if (_prof) g_enc_phase_cpu_descs_build_ns else 0;
     const eff_chunk = @min(frame.scGroupSizeToBytes(sc_grp), lz_constants.chunk_size);
     const sub_chunk_cap: usize = lz_constants.sub_chunk_size;
     const gpu_block: usize = @min(eff_chunk, sub_chunk_cap);
@@ -195,8 +327,11 @@ fn gpuEncodeAndAssemble(
     if (owns_wrap_input) {
         if (!gpu_enc.ensureBuf(&enc_ctx.d_host_wrap_input, &enc_ctx.d_host_wrap_input_size, src.len))
             return error.DestinationTooSmall;
+        // VK adaptation: time the ~95 MB enwik8 wrap-input H2D separately.
+        const _t_wrap0 = if (_prof) vk_api.qpcNow() else 0;
         if (!gpu_enc.copyHostToDevice(enc_ctx.d_host_wrap_input, src))
             return error.DestinationTooSmall;
+        if (_prof) g_enc_phase_wrap_input_h2d_ns += qpcDeltaNs(_t_wrap0, vk_api.qpcNow());
         enc_ctx.d_input_override = enc_ctx.d_host_wrap_input;
     }
     if (owns_wrap_output) {
@@ -229,6 +364,10 @@ fn gpuEncodeAndAssemble(
     // when ensureGpuOutBuf returns null (backend unavailable /
     // malloc_host null) — preserves the pre-fix behavior for
     // init-failed contexts.
+    // VK adaptation: time ensureGpuOutBuf separately — first call per
+    // size grows the persistent buffer (ensureBuf destroy+create), warm
+    // calls just check the size.
+    const _t_gob0 = if (_prof) vk_api.qpcNow() else 0;
     var gpu_out_fallback: ?[]u8 = null;
     defer if (gpu_out_fallback) |fb| allocator.free(fb);
     const gpu_out: []u8 = if (gpu_enc.ensureGpuOutBuf(enc_ctx, n_gpu_blocks * per_block_cap)) |buf|
@@ -238,6 +377,7 @@ fn gpuEncodeAndAssemble(
         gpu_out_fallback = fb;
         break :blk fb;
     };
+    if (_prof) g_enc_phase_ensure_gpu_out_buf_ns += qpcDeltaNs(_t_gob0, vk_api.qpcNow());
 
     {
         var bi: usize = 0;
@@ -258,6 +398,17 @@ fn gpuEncodeAndAssemble(
                 bi += 1;
             }
         }
+    }
+    // VK adaptation: cpu_descs_build = total setup span - already-attributed
+    // wrap_input_h2d + ensure_gpu_out_buf (those checkpoints sat inside
+    // this same span and bumped their own accumulators; subtract the
+    // per-encode delta via the entry-snapshot so SUM stays = wall).
+    if (_prof) {
+        const _t_setup_end = vk_api.qpcNow();
+        const setup_total = qpcDeltaNs(_t_setup0, _t_setup_end);
+        const sub_phases = (g_enc_phase_wrap_input_h2d_ns - _snap_wrap_in) +
+            (g_enc_phase_ensure_gpu_out_buf_ns - _snap_gob);
+        g_enc_phase_cpu_descs_build_ns += setup_total - sub_phases;
     }
 
     if (!gpu_enc.gpuCompressImpl(enc_ctx, src, gpu_out, descs, comp_sizes, io, opts.level))
@@ -286,11 +437,45 @@ fn gpuEncodeAndAssemble(
         frame_block_hdr_pos,
     );
 
+    // VK adaptation: d2h_final = the ~50 MB compressed-frame D2H readback.
+    // host_finalize = any post-D2H bookkeeping that runs before the
+    // function returns. The count++ bumps g_enc_phase_count by exactly 1
+    // per encode so per-encode averages are sound (every other accumulator
+    // sums total ns across all encodes since encPhaseProfileInit).
     if (owns_wrap_output) {
         if (dst.len < frame_size) return error.DestinationTooSmall;
+        const _t_d2h0 = if (_prof) vk_api.qpcNow() else 0;
         if (!gpu_enc.copyDeviceToHost(dst[0..frame_size], enc_ctx.d_host_wrap_output))
             return error.DestinationTooSmall;
+        if (_prof) g_enc_phase_d2h_final_ns += qpcDeltaNs(_t_d2h0, vk_api.qpcNow());
     }
+    // VK adaptation: host_finalize = wall - every attributed phase delta.
+    // Captures host stretches not explicitly bracketed (allocator overhead,
+    // assembleFrame CPU prep, defers, etc.) so SUM == wall by construction.
+    if (_prof) {
+        const wall = qpcDeltaNs(_t_wall0, vk_api.qpcNow());
+        const attributed =
+            (g_enc_phase_cpu_descs_build_ns - _snap_cpu_descs) +
+            (g_enc_phase_wrap_input_h2d_ns - _snap_wrap_in) +
+            (g_enc_phase_ensure_gpu_out_buf_ns - _snap_gob) +
+            (g_enc_phase_lz_h2d_input_ns - _snap_lz_h2d_in) +
+            (g_enc_phase_lz_h2d_descs_init_ns - _snap_lz_h2d_di) +
+            (g_enc_phase_lz_pre_kernel_sync_ns - _snap_lz_presync) +
+            (g_enc_phase_lz_kernel_ns - _snap_lz_kern) +
+            (g_enc_phase_lz_d2h_comp_sizes_ns - _snap_lz_dsz) +
+            (g_enc_phase_lz_d2h_gather_ns - _snap_lz_gather) +
+            (g_enc_phase_asm_h2d_descs_ns - _snap_asm_h2d) +
+            (g_enc_phase_asm_measure_dispatch_ns - _snap_asm_meas) +
+            (g_enc_phase_asm_d2h_enc_sizes_ns - _snap_asm_desz) +
+            (g_enc_phase_asm_cpu_prefix_sum_ns - _snap_asm_psum) +
+            (g_enc_phase_asm_h2d_descs_second_ns - _snap_asm_h2d2) +
+            (g_enc_phase_asm_write_dispatch_ns - _snap_asm_wr) +
+            (g_enc_phase_frame_asm_h2ds_ns - _snap_fa_h2ds) +
+            (g_enc_phase_frame_asm_dispatch_ns - _snap_fa_disp) +
+            (g_enc_phase_d2h_final_ns - _snap_d2h_final);
+        g_enc_phase_host_finalize_ns += wall - attributed;
+    }
+    if (_prof) g_enc_phase_count += 1;
     return frame_size;
 }
 

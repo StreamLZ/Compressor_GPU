@@ -16,6 +16,14 @@ const vk = @import("../decode/vulkan_api.zig");
 const module_loader = @import("module_loader.zig");
 const encode_context = @import("encode_context.zig");
 const gpu_decode = @import("../decode/driver.zig");
+// VK adaptation: per-phase QPC profile accumulators live on
+// fast_framed.zig (the encode orchestrator). Pulled in for the
+// SLZ_VK_PROFILE_PHASES checkpoints below.
+const enc_phase = @import("fast_framed.zig");
+
+inline fn qpcDeltaNs(start: i64, end: i64) i64 {
+    return @intFromFloat(vk.qpcMs(start, end) * 1e6);
+}
 
 const VkDeviceBuffer = vk.VkDeviceBuffer;
 const VK_SUCCESS_RC = vk.VK_SUCCESS_RC;
@@ -94,8 +102,13 @@ pub fn gpuAssembleFrameImpl(
     const sizes_bytes: usize = @as(usize, n) * 4;
     if (!encode_context.ensureBuf(&self.d_asm_descs, &self.d_asm_descs_size, desc_bytes)) return false;
     if (!encode_context.ensureBuf(&self.d_asm_sizes, &self.d_asm_sizes_size, sizes_bytes)) return false;
+    // VK adaptation: asm.h2d_descs phase = H2D for the per-sub-chunk
+    // descriptors + the sync that drains it. Pure measurement.
+    const _prof = enc_phase.g_enc_phase_profile_enabled;
+    const _t_h2d_desc0 = if (_prof) vk.qpcNow() else 0;
     if (h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes) != VK_SUCCESS_RC) return false;
     if (sync() != VK_SUCCESS_RC) return false;
+    if (_prof) enc_phase.g_enc_phase_asm_h2d_descs_ns += qpcDeltaNs(_t_h2d_desc0, vk.qpcNow());
 
     // Kernel-arg locals. Each parameter is taken by `&local`, so every
     // value the kernel reads needs its own addressable slot here.
@@ -134,16 +147,25 @@ pub fn gpuAssembleFrameImpl(
         @ptrCast(&arg_scratch),
         @ptrCast(&arg_n),
     };
+    // VK adaptation: asm.measure_dispatch phase = launch + post-launch sync.
+    const _t_meas0 = if (_prof) vk.qpcNow() else 0;
     const t_am = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleMeasureKernel", 0);
     defer gpu_decode.endKernelTiming(t_am, 0);
     if (launch(module_loader.assemble_measure_fn, n, 1, 1, 32, 1, 1, 0, 0, &measure_params, &extra) != VK_SUCCESS_RC) return false;
     if (sync() != VK_SUCCESS_RC) return false;
+    if (_prof) enc_phase.g_enc_phase_asm_measure_dispatch_ns += qpcDeltaNs(_t_meas0, vk.qpcNow());
 
     const enc_sizes = allocator.alloc(u32, n) catch return false;
     defer allocator.free(enc_sizes);
+    // VK adaptation: asm.d2h_enc_sizes phase = ~6 KB measured-sizes D2H.
+    const _t_desz0 = if (_prof) vk.qpcNow() else 0;
     if (d2h(@ptrCast(enc_sizes.ptr), self.d_asm_sizes, sizes_bytes) != VK_SUCCESS_RC) return false;
+    if (_prof) enc_phase.g_enc_phase_asm_d2h_enc_sizes_ns += qpcDeltaNs(_t_desz0, vk.qpcNow());
 
     // Prefix-sum: each sub-chunk block is 3 (header) + enc_n bytes.
+    // VK adaptation: asm.cpu_prefix_sum phase = the CPU loop computing
+    // per-sub-chunk out_offset from enc_sizes.
+    const _t_psum0 = if (_prof) vk.qpcNow() else 0;
     var total: u32 = 0;
     for (0..n) |i| {
         // `enc_sizes[i] == 0` is unambiguously a measure-kernel parse
@@ -152,22 +174,30 @@ pub fn gpuAssembleFrameImpl(
         descs[i].out_offset = total;
         total += 3 + enc_sizes[i];
     }
+    if (_prof) enc_phase.g_enc_phase_asm_cpu_prefix_sum_ns += qpcDeltaNs(_t_psum0, vk.qpcNow());
 
     // Pass B — write [3-byte header][payload] for every sub-chunk.
     // assemble_write: n_bindings=6 (d_raw, d_huff_lit, d_huff_tok,
     // d_huff_off16, descs, d_frame), push_constant_size=4 (n_subchunks).
+    // VK adaptation: asm.h2d_descs_2nd phase = re-upload the now
+    // out_offset-populated descs.
+    const _t_h2d2_0 = if (_prof) vk.qpcNow() else 0;
     if (h2d(self.d_asm_descs, @ptrCast(descs.ptr), desc_bytes) != VK_SUCCESS_RC) return false;
     if (!encode_context.ensureBuf(&self.d_asm_out, &self.d_asm_out_size, @max(total, 1))) return false;
+    if (_prof) enc_phase.g_enc_phase_asm_h2d_descs_second_ns += qpcDeltaNs(_t_h2d2_0, vk.qpcNow());
     var arg_out = self.d_asm_out;
     var write_params = [_]?*anyopaque{
         @ptrCast(&arg_raw),       @ptrCast(&arg_huff_lit), @ptrCast(&arg_huff_tok),
         @ptrCast(&arg_huff_off16),@ptrCast(&arg_descs),    @ptrCast(&arg_out),
         @ptrCast(&arg_n),
     };
+    // VK adaptation: asm.write_dispatch phase = launch + post-launch sync.
+    const _t_wr0 = if (_prof) vk.qpcNow() else 0;
     const t_aw = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleWriteKernel", 0);
     defer gpu_decode.endKernelTiming(t_aw, 0);
     if (launch(module_loader.assemble_write_fn, n, 1, 1, 32, 1, 1, 0, 0, &write_params, &extra) != VK_SUCCESS_RC) return false;
     if (sync() != VK_SUCCESS_RC) return false;
+    if (_prof) enc_phase.g_enc_phase_asm_write_dispatch_ns += qpcDeltaNs(_t_wr0, vk.qpcNow());
 
     // Publish the per-chunk offset+size index tables; the assembled
     // bytes themselves stay in `self.d_asm_out` for the frame writer
@@ -265,10 +295,15 @@ pub fn gpuFrameAssembleImpl(
     if (!encode_context.ensureBuf(&self.d_frame_asm_chunk_sz, &self.d_frame_asm_chunk_sz_size, ent_bytes)) return null;
     if (!encode_context.ensureBuf(&self.d_frame_prefix_bytes, &self.d_frame_prefix_bytes_size, prefix_bytes.len)) return null;
 
+    // VK adaptation: frame.h2ds phase = the four small per-chunk-layout
+    // H2D copies the frame-assemble kernel reads (~80 KB total on enwik8).
+    const _prof_fa = enc_phase.g_enc_phase_profile_enabled;
+    const _t_fh2d0 = if (_prof_fa) vk.qpcNow() else 0;
     if (h2d(self.d_frame_chunk_dst, @ptrCast(per_chunk_dst_buf.ptr), ent_bytes) != VK_SUCCESS_RC) return null;
     if (h2d(self.d_frame_asm_offsets, @ptrCast(per_chunk_asm_off.ptr), ent_bytes) != VK_SUCCESS_RC) return null;
     if (h2d(self.d_frame_asm_chunk_sz, @ptrCast(per_chunk_asm_size.ptr), ent_bytes) != VK_SUCCESS_RC) return null;
     if (h2d(self.d_frame_prefix_bytes, @ptrCast(prefix_bytes.ptr), prefix_bytes.len) != VK_SUCCESS_RC) return null;
+    if (_prof_fa) enc_phase.g_enc_phase_frame_asm_h2ds_ns += qpcDeltaNs(_t_fh2d0, vk.qpcNow());
 
     var k_input = d_input_dev;
     var k_asm_out = self.d_asm_out;
@@ -319,6 +354,11 @@ pub fn gpuFrameAssembleImpl(
     // work_stream so a stream-sync on it waits for the frame bytes
     // to be in d_output.
     const heavy_stream: usize = self.work_stream;
+    // VK adaptation: frame.dispatch phase = launch + (sync only when
+    // heavy_stream == 0, matching the existing branch). Async-mode
+    // callers (work_stream != 0) defer the sync to their stream barrier,
+    // so the timer here records only the launch cost in that path.
+    const _t_fd0 = if (_prof_fa) vk.qpcNow() else 0;
     const t_fa = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzFrameAssembleKernel", heavy_stream);
     defer gpu_decode.endKernelTiming(t_fa, heavy_stream);
     if (launch(module_loader.frame_assemble_fn, grid_x, 1, 1, 128, 1, 1, 0, heavy_stream, &params, &extra) != VK_SUCCESS_RC) return null;
@@ -327,6 +367,7 @@ pub fn gpuFrameAssembleImpl(
     if (heavy_stream == 0) {
         if (sync() != VK_SUCCESS_RC) return null;
     }
+    if (_prof_fa) enc_phase.g_enc_phase_frame_asm_dispatch_ns += qpcDeltaNs(_t_fd0, vk.qpcNow());
 
     return total_frame_size;
 }

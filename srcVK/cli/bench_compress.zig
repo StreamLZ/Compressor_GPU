@@ -10,6 +10,11 @@ const encoder = @import("../encode/streamlz_encoder.zig");
 const decoder = @import("../decode/streamlz_decoder.zig");
 const gpu_enc_driver = @import("../encode/driver.zig");
 const gpu_dec_driver = @import("../decode/driver.zig");
+// VK adaptation: per-phase QPC profile for the encode hot path lives on
+// fast_framed.zig (the encode orchestrator). Wire init + print here so
+// SLZ_VK_PROFILE_PHASES=1 localizes the per-phase breakdown the same
+// way the decode side does (phaseProfileInit / printAndResetPhaseProfile).
+const enc_phase = @import("../encode/fast_framed.zig");
 
 /// CUDA reference: src/cli/bench_compress.zig:12-end. -b mode entry point.
 pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: util.Args) !void {
@@ -64,6 +69,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     // decode/module_loader.zig and are shared by both procH2DAsync paths.
     var comp_size: usize = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_enc_driver.g_default);
     gpu_dec_driver.phaseProfileInit();
+    // VK adaptation: reset the encode-side per-phase accumulators after
+    // the untimed warm-up so only the timed Compress: run accumulates.
+    // Mirrors the decode pattern (phaseProfileInit/printAndResetPhaseProfile).
+    enc_phase.encPhaseProfileInit();
     {
         const t0 = std.Io.Clock.awake.now(io);
         comp_size = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_enc_driver.g_default);
@@ -80,6 +89,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     // g_phase_decode_count which is 0 here — use the encode-only variant.
     try w.flush();
     gpu_dec_driver.printEncodeImportTelemetry(w);
+    // VK adaptation: print + reset the per-phase encode breakdown
+    // (cpu_descs_build / wrap_input_h2d / lz.* / asm.* / frame.* / d2h_final
+    // / host_finalize). Gated on SLZ_VK_PROFILE_PHASES env var by the
+    // printer itself; no-op when unset.
+    enc_phase.printAndResetEncodePhaseProfile(w);
     try w.flush();
     try w.print("Level {d}: {d} -> {d} bytes ({d:.1}%)\n\n", .{
         args.level, src.len, comp_size,
