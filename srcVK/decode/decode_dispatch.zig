@@ -82,6 +82,10 @@ pub fn phaseProfileInit() void {
     module_loader.g_h2d_path_prepared_import = 0;
     module_loader.g_h2d_path_inline_import = 0;
     module_loader.g_h2d_path_staging = 0;
+    // Iter 14 (B): LRU import-cache telemetry counters live in module_loader.
+    module_loader.g_import_cache_hits.store(0, .seq_cst);
+    module_loader.g_import_cache_misses.store(0, .seq_cst);
+    module_loader.g_import_cache_evictions.store(0, .seq_cst);
 }
 
 inline fn qpcNs() i64 {
@@ -130,6 +134,17 @@ pub fn printAndResetPhaseProfile(w: anytype) void {
         module_loader.g_h2d_path_prepared_import,
         module_loader.g_h2d_path_inline_import,
         module_loader.g_h2d_path_staging,
+    }) catch {};
+    // Iter 14 (B): surface whether iter-8's 16-slot LRU import cache is
+    // hitting reliably in steady state. Misses > 0 in steady state
+    // suggest src/dst pointers churn between decodes — caller
+    // re-maps or moves the buffer; worth investigating for the
+    // small-file (web.txt) regime where the 200-500us cache-miss cost
+    // dominates the residual e2e gap vs CUDA.
+    w.print("phase: import_cache            hits={d}, misses={d}, evictions={d}\n", .{
+        module_loader.g_import_cache_hits.load(.seq_cst),
+        module_loader.g_import_cache_misses.load(.seq_cst),
+        module_loader.g_import_cache_evictions.load(.seq_cst),
     }) catch {};
     w.print("phase: other                   {d:.4} ms/decode\n", .{ns_to_ms_per(g_phase_other_ns, n)}) catch {};
     const totalled =

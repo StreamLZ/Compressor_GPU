@@ -1168,6 +1168,18 @@ pub var g_h2d_path_prepared_import: u64 = 0; // hit on se.prepared_h2d_import
 pub var g_h2d_path_inline_import: u64 = 0;   // inline tryImportHostBuffer in procH2DAsync
 pub var g_h2d_path_staging: u64 = 0;         // iter-4 staging fallback
 
+// Iter 14 (B): LRU import-cache telemetry. Atomic counters incremented
+// inside lookupImportedBuffer / insertImportedBuffer to surface whether
+// the iter-8 cache is hitting reliably in steady state. Printed and
+// reset by decode_dispatch.printAndResetPhaseProfile under
+// SLZ_VK_PROFILE_PHASES=1. Pure instrumentation — no behaviour change.
+//   hit:      lookupImportedBuffer found a matching, not-in-flight entry
+//   miss:     lookupImportedBuffer returned null (caller will allocate)
+//   eviction: insertImportedBuffer displaced an LRU slot (vkDestroy/Free)
+pub var g_import_cache_hits: std.atomic.Value(u64) = .{ .raw = 0 };
+pub var g_import_cache_misses: std.atomic.Value(u64) = .{ .raw = 0 };
+pub var g_import_cache_evictions: std.atomic.Value(u64) = .{ .raw = 0 };
+
 // ── Module-private bring-up state ────────────────────────────────────
 // VK adaptation: the shared command pool + per-context staging buffer
 // the procs.h2d / procs.d2h closures funnel work through. Sized at
@@ -1362,6 +1374,17 @@ const StreamEntry = struct {
     prepared_h2d_import: ?PendingImportedD2H = null,
     prepared_h2d_host_addr: usize = 0,
     prepared_h2d_size: usize = 0,
+    // Iter 14 (A): persistent VkDescriptorSet per (StreamEntry × decode
+    // pipeline). Allocated lazily on first procLaunchKernel for each
+    // pipeline kind from g_descriptor_pool. Each stream owns its own
+    // slot so concurrent decodes on distinct VkStreams race-freely; the
+    // descriptor-set write/bind work shrinks from
+    // vkAllocateDescriptorSets + vkUpdateDescriptorSets + vkCmdBind to
+    // just vkUpdateDescriptorSets + vkCmdBind per launch. Slot index
+    // matches the KERNEL_DECLS index for decode kernels; the stream==0
+    // path (encode + sync-mode default) uses KernelMeta.persistent_desc_set_default
+    // instead because no StreamEntry exists there.
+    persistent_desc_sets: [KERNEL_DECLS.len]VkDescriptorSet = @splat(0),
 };
 var g_streams: std.ArrayListUnmanaged(?StreamEntry) = .empty;
 
@@ -1548,6 +1571,14 @@ const KernelMeta = struct {
     pipeline: VkPipeline = 0,
     n_bindings: u32 = 0,
     push_constant_size: u32 = 0,
+    // Iter 14 (A): persistent descriptor set used on the stream==0 (default
+    // / one-shot cmdbuf) path. Allocated lazily on first procLaunchKernel.
+    // The default-stream path is already serialized by g_dispatcher_lock
+    // (sync-mode entry in decode_dispatch.fullGpuLaunchImpl) so a single
+    // shared set per pipeline is race-free; the per-stream path uses
+    // StreamEntry.persistent_desc_sets instead so concurrent decodes on
+    // distinct VkStreams cannot race on the descriptor-set write/bind.
+    persistent_desc_set_default: VkDescriptorSet = 0,
 };
 
 const KernelKind = enum(usize) {
@@ -2078,12 +2109,17 @@ pub fn init() bool {
     // persistently mapped). Grown lazily when a larger copy needs it.
     if (!ensureStaging(STAGING_INITIAL_SIZE)) return false;
 
-    // Per-context descriptor pool. Sized generously enough that each
-    // kernel can allocate one descriptor set per launch without
-    // outrunning the pool — the codec resets between dispatches in
-    // procs.launch_kernel via vkResetDescriptorPool.
-    const max_bindings_per_pool: u32 = 4096;
-    const max_sets: u32 = 1024;
+    // Per-context descriptor pool.
+    //
+    // Iter 14 (A): the pool now backs persistent (stream × pipeline)
+    // descriptor sets (see procLaunchKernel) instead of per-launch
+    // allocations, so the steady-state slot count is bounded by
+    // KERNEL_DECLS.len * g_streams.cap (=11 * 256 = 2816) plus a margin
+    // for encode-registered extras. Bumped maxSets to 8192 to cover
+    // ptest_vk's per-test-context churn without falling back to the
+    // legacy reset+retry path (which would invalidate persistent sets).
+    const max_bindings_per_pool: u32 = 32768;
+    const max_sets: u32 = 8192;
     const pool_size = VkDescriptorPoolSize{
         .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = max_bindings_per_pool,
@@ -2920,10 +2956,12 @@ fn lookupImportedBuffer(host_addr: usize, size: usize, usage_src: bool) ?usize {
         if (maybe) |e| {
             if (e.host_ptr == host_addr and e.size == size and e.usage_src == usage_src and !e.in_flight) {
                 g_import_cache[i].?.last_used_ns = vulkan_api.qpcNow();
+                _ = g_import_cache_hits.fetchAdd(1, .seq_cst);
                 return i;
             }
         }
     }
+    _ = g_import_cache_misses.fetchAdd(1, .seq_cst);
     return null;
 }
 
@@ -2965,6 +3003,7 @@ fn insertImportedBuffer(host_addr: usize, size: usize, vk_buf: VkBuffer, vk_mem:
     const old = g_import_cache[evict].?;
     vkDestroyBuffer_fn.?(dev, old.vk_buf, null);
     vkFreeMemory_fn.?(dev, old.vk_mem, null);
+    _ = g_import_cache_evictions.fetchAdd(1, .seq_cst);
     g_import_cache[evict] = .{
         .host_ptr = host_addr,
         .size = size,
@@ -3881,11 +3920,13 @@ fn procLaunchKernel(
     var cb: VkCommandBuffer = undefined;
     var fence_for_wait: VkFence = 0;
     var inline_submit_wait = true;
+    var se_opt: ?*StreamEntry = null;
     if (streamEntryFor(stream)) |se| {
         const rc = streamBeginIfNeeded(se);
         if (rc != VK_SUCCESS_RC) return rc;
         cb = se.cmdbuf;
         inline_submit_wait = false;
+        se_opt = se;
     } else {
         const rc = beginOneShotCB();
         if (rc != VK_SUCCESS_RC) return rc;
@@ -3893,29 +3934,48 @@ fn procLaunchKernel(
         fence_for_wait = g_fence;
     }
 
-    // Allocate a descriptor set out of the per-context pool if the kernel
-    // declares any bindings. The pool grows under sustained launches —
-    // we reset it lazily when it runs out (best-effort: VK_ERROR_OUT_OF_
-    // POOL_MEMORY triggers a reset + retry).
+    // Iter 14 (A): persistent descriptor sets eliminate the per-decode
+    // vkAllocateDescriptorSets cost. The set is allocated lazily on
+    // first use per (stream × pipeline) and reused for the lifetime of
+    // the StreamEntry (or the loader, for the stream==0 path); per call
+    // we only rewrite the buffer handles via vkUpdateDescriptorSets and
+    // rebind via vkCmdBindDescriptorSets. Race-free because each
+    // StreamEntry owns its own slot and concurrent decodes never share
+    // a stream; the default-stream slot (KernelMeta.persistent_desc_set_default)
+    // is serialised by g_dispatcher_lock + the inline submit+wait below.
+    //
+    // VK adaptation: descriptor sets persist per (stream × pipeline)
+    // for the lifetime of the StreamEntry; per-decode work is just
+    // vkUpdateDescriptorSets + vkCmdBindDescriptorSets instead of
+    // vkAllocateDescriptorSets. Mirrors CUDA where cuLaunchKernel takes
+    // a parameter array directly without per-call descriptor allocation.
     var dset: VkDescriptorSet = 0;
     if (meta.n_bindings > 0) {
-        const layouts_arr = [_]VkDescriptorSetLayout{meta.layout};
-        const ai = VkDescriptorSetAllocateInfo{
-            .descriptorPool = g_descriptor_pool,
-            .descriptorSetCount = 1,
-            .pSetLayouts = layouts_arr[0..1].ptr,
-        };
-        var rc = vkAllocateDescriptorSets_fn.?(dev, &ai, @ptrCast(&dset));
-        if (rc != VK_SUCCESS_RC) {
-            // Pool exhausted: reset and retry once. vkResetDescriptorPool
-            // invalidates every set previously allocated from the pool;
-            // safe here because the codec's launches are submit+wait
-            // serialised (default stream) or serialised through the
-            // stream's fence (deferred path).
-            _ = vkResetDescriptorPool_fn.?(dev, g_descriptor_pool, 0);
-            rc = vkAllocateDescriptorSets_fn.?(dev, &ai, @ptrCast(&dset));
+        // Pick the persistent slot for this (stream × pipeline). For the
+        // per-stream path we index into StreamEntry.persistent_desc_sets
+        // using the KERNEL_DECLS index returned by kindIndexForPipeline;
+        // encode-registered (extra) pipelines fall through to the
+        // default-stream slot since they aren't carved out per-stream.
+        var slot_ptr: *VkDescriptorSet = &meta.persistent_desc_set_default;
+        if (se_opt) |se| {
+            const k_idx = kindIndexForPipeline(pipeline);
+            if (k_idx >= 0 and @as(usize, @intCast(k_idx)) < se.persistent_desc_sets.len) {
+                slot_ptr = &se.persistent_desc_sets[@intCast(k_idx)];
+            }
+        }
+
+        if (slot_ptr.* == 0) {
+            // First touch on this (stream × pipeline) — allocate once.
+            const layouts_arr = [_]VkDescriptorSetLayout{meta.layout};
+            const ai = VkDescriptorSetAllocateInfo{
+                .descriptorPool = g_descriptor_pool,
+                .descriptorSetCount = 1,
+                .pSetLayouts = layouts_arr[0..1].ptr,
+            };
+            const rc = vkAllocateDescriptorSets_fn.?(dev, &ai, @ptrCast(slot_ptr));
             if (rc != VK_SUCCESS_RC) return rc;
         }
+        dset = slot_ptr.*;
 
         // params layout (matches the CUDA call sites verbatim):
         //   [0..n_bindings)         → pointers to VkDeviceBuffer handles
