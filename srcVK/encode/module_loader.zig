@@ -77,8 +77,22 @@ const VK_SHADER_STAGE_COMPUTE_BIT: u32 = 0x00000020;
 // pin, Intel iGPU (supports [8,32]) would silently miscompile while
 // NVIDIA (only supports [32,32]) works by accident. Encode-side mirror
 // of the decode-side pin in decode/module_loader.zig::buildKernel.
-const VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT: u32 = 0x00000008;
-const VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO: c_int = 1000225002;
+// Per vulkan_core.h (1.4.341):
+//   VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT = 0x00000002
+//   VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO = 1000225001
+// Prior values (0x8 / 1000225002) were both wrong: 0x8 is a non-existent
+// VkPipelineShaderStageCreateFlagBits value (silently ignored by the driver),
+// and 1000225002 is VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES
+// (driver therefore interpreted our pNext as the features struct, ignoring
+// the requiredSubgroupSize field). Net effect: on Intel iGPU the encode
+// pipeline ran with the driver's default subgroupSize=16 (two 16-wide
+// subgroups per 32-thread workgroup) and corrupted output. NVIDIA hardware
+// only supports subgroupSize=32 so the broken pin was inert there.
+// Validation layer surfaced both errors as
+// VUID-VkPipelineShaderStageCreateInfo-pNext-pNext (wrong sType) +
+// VUID-VkPipelineShaderStageCreateInfo-flags-parameter (flag 0x8 invalid).
+const VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT: u32 = 0x00000002;
+const VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO: c_int = 1000225001;
 
 const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo = extern struct {
     sType: c_int = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
