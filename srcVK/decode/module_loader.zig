@@ -417,6 +417,31 @@ const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: c_int = 51;
 const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: c_int = 53;
 const VK_TRUE: u32 = 1;
 
+// VK adaptation: subgroup size pinned to 32 via REQUIRE_FULL_SUBGROUPS_BIT
+// + VkPipelineShaderStageRequiredSubgroupSizeCreateInfo. Kernels in
+// gpu_warp.glsl hardcode WARP_SIZE=32 (the warpShuffle/Ballot/Any
+// cooperative ops are correct only at exactly 32 lanes). Without this
+// pin, Intel iGPU (supports [8,32]) would silently miscompile while
+// NVIDIA (only supports [32,32]) works by accident.
+const VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT: u32 = 0x00000008;
+const VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO: c_int = 1000225002;
+const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES: c_int = 1000225000;
+
+const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo = extern struct {
+    sType: c_int = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+    pNext: ?*anyopaque = null,
+    requiredSubgroupSize: u32,
+};
+
+const VkPhysicalDeviceSubgroupSizeControlProperties = extern struct {
+    sType: c_int = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES,
+    pNext: ?*anyopaque = null,
+    minSubgroupSize: u32 = 0,
+    maxSubgroupSize: u32 = 0,
+    maxComputeWorkgroupSubgroups: u32 = 0,
+    requiredSubgroupSizeStages: u32 = 0,
+};
+
 // Minimal subset of VkPhysicalDeviceVulkan12Features — only the fields
 // the codec actually needs to set are named; the rest land in the
 // trailing _filler so the driver's writes never overflow this struct
@@ -1618,20 +1643,34 @@ const KernelKind = enum(usize) {
 
 // Binding counts + push constant sizes per .comp. Values mirror the
 // layout declarations in the corresponding srcVK/decode/*_kernel.comp.
+//
+// VK adaptation: pin_subgroup_32 flags whether vkCreateComputePipelines
+// chains REQUIRE_FULL_SUBGROUPS_BIT + requiredSubgroupSize=32 for this
+// kernel. Only kernels whose local_size_x is a multiple of 32 AND that
+// actually use warpShuffle/Ballot/Any (i.e. include gpu_warp.glsl
+// cooperatively) need the pin. The single-thread guard kernels run with
+// local_size_x=1; pinning them would fail pipeline creation (spec
+// requires workgroup-X be a multiple of subgroupSize when
+// REQUIRE_FULL_SUBGROUPS_BIT is set).
 const KernelDecl = struct {
     kind: KernelKind,
     n_bindings: u32,
     push_constant_size: u32,
+    pin_subgroup_32: bool = false,
 };
 
 const KERNEL_DECLS = [_]KernelDecl{
-    .{ .kind = .kernel_fn, .n_bindings = 6, .push_constant_size = 16 },
+    .{ .kind = .kernel_fn, .n_bindings = 6, .push_constant_size = 16, .pin_subgroup_32 = true },
     // srcVK/decode/lz_decode_raw_kernel.comp:25-50 declares 4 SSBO
     // bindings (CompressedBuf, ChunksBuf, DstBuf, TotalChunksBuf) plus
     // a 2× u32 push-constant block (chunks_per_group, sub_chunk_cap).
-    .{ .kind = .kernel_raw_fn, .n_bindings = 4, .push_constant_size = 8 },
-    .{ .kind = .gather_off16_fn, .n_bindings = 4, .push_constant_size = 4 },
-    .{ .kind = .scan_parse_fn, .n_bindings = 10, .push_constant_size = 8 },
+    .{ .kind = .kernel_raw_fn, .n_bindings = 4, .push_constant_size = 8, .pin_subgroup_32 = true },
+    .{ .kind = .gather_off16_fn, .n_bindings = 4, .push_constant_size = 4, .pin_subgroup_32 = true },
+    .{ .kind = .scan_parse_fn, .n_bindings = 10, .push_constant_size = 8, .pin_subgroup_32 = true },
+    // walk_frame / prefix_sum_chunks / compact_huff / compact_raw /
+    // merge_huff are single-thread guards (local_size_x=1) and do not
+    // call any subgroup cooperative op. Do NOT pin — pipeline creation
+    // would fail on workgroup-X-not-multiple-of-subgroupSize.
     .{ .kind = .walk_frame_fn, .n_bindings = 8, .push_constant_size = 8 },
     // srcVK/decode/prefix_sum_chunks_kernel.comp:16-34 declares 3 SSBO
     // bindings (ChunksBuf, FirstSubIdxBuf, TotalSubchunksBuf) plus a
@@ -1640,8 +1679,8 @@ const KERNEL_DECLS = [_]KernelDecl{
     .{ .kind = .compact_huff_descs_fn, .n_bindings = 4, .push_constant_size = 0 },
     .{ .kind = .compact_raw_descs_fn, .n_bindings = 5, .push_constant_size = 0 },
     .{ .kind = .merge_huff_descs_fn, .n_bindings = 10, .push_constant_size = 8 },
-    .{ .kind = .huff_build_fn, .n_bindings = 4, .push_constant_size = 0 },
-    .{ .kind = .huff_decode_fn, .n_bindings = 5, .push_constant_size = 0 },
+    .{ .kind = .huff_build_fn, .n_bindings = 4, .push_constant_size = 0, .pin_subgroup_32 = true },
+    .{ .kind = .huff_decode_fn, .n_bindings = 5, .push_constant_size = 0, .pin_subgroup_32 = true },
 };
 
 var g_kernel_metas: [KERNEL_DECLS.len]KernelMeta = @splat(.{});
@@ -1856,6 +1895,36 @@ pub fn init() bool {
             g_bound_device_name_buf[n] = props_for_name.deviceName[n];
         }
         g_bound_device_name_len = n;
+    }
+
+    // VK adaptation: subgroup size pinned to 32 via REQUIRE_FULL_SUBGROUPS_BIT
+    // + VkPipelineShaderStageRequiredSubgroupSizeCreateInfo. Kernels in
+    // gpu_warp.glsl hardcode WARP_SIZE=32 (the warpShuffle/Ballot/Any
+    // cooperative ops are correct only at exactly 32 lanes). Without this
+    // pin, Intel iGPU (supports [8,32]) would silently miscompile while
+    // NVIDIA (only supports [32,32]) works by accident. The guard below
+    // makes the gpu_warp.glsl contract real — devices that cannot satisfy
+    // subgroupSize==32 are rejected at init so callers fall back to CPU.
+    if (vkGetPhysicalDeviceProperties2_fn) |gpdp2| {
+        var sg_props: VkPhysicalDeviceSubgroupSizeControlProperties = .{};
+        var props2: VkPhysicalDeviceProperties2 = .{};
+        props2.pNext = @ptrCast(&sg_props);
+        gpdp2(phys, &props2);
+        if (sg_props.maxSubgroupSize < 32 or sg_props.minSubgroupSize > 32) {
+            // Print one clear error message naming the device + its subgroup
+            // constraints + the contract requirement, then fail init so the
+            // dispatcher surfaces error.BackendNotAvailable to the caller.
+            var name_z: [257]u8 = @splat(0);
+            const nlen = g_bound_device_name_len;
+            if (nlen > 0 and nlen <= 256) {
+                @memcpy(name_z[0..nlen], g_bound_device_name_buf[0..nlen]);
+            }
+            std.debug.print(
+                "[VK_INIT] rejected device '{s}': subgroupSize range [{d}, {d}] cannot satisfy WARP_SIZE=32 contract (gpu_warp.glsl). Falling back to CPU.\n",
+                .{ name_z[0..nlen], sg_props.minSubgroupSize, sg_props.maxSubgroupSize },
+            );
+            return false;
+        }
     }
 
     // Find a queue family that supports compute. Mirrors the CUDA driver's
@@ -2423,7 +2492,25 @@ fn buildKernel(kind: KernelKind, spv: []const u8) bool {
     if (meta.pl_layout == 0) return false;
 
     const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
-    const stage = VkPipelineShaderStageCreateInfo{
+    // VK adaptation: subgroup size pinned to 32 via REQUIRE_FULL_SUBGROUPS_BIT
+    // + VkPipelineShaderStageRequiredSubgroupSizeCreateInfo. Kernels in
+    // gpu_warp.glsl hardcode WARP_SIZE=32 (the warpShuffle/Ballot/Any
+    // cooperative ops are correct only at exactly 32 lanes). Without this
+    // pin, Intel iGPU (supports [8,32]) would silently miscompile while
+    // NVIDIA (only supports [32,32]) works by accident. Only kernels with
+    // local_size_x % 32 == 0 that use subgroup ops get the pin (flagged
+    // via KernelDecl.pin_subgroup_32); single-thread guard kernels run
+    // with local_size_x=1 and would fail pipeline creation if pinned.
+    const required_size_info = VkPipelineShaderStageRequiredSubgroupSizeCreateInfo{
+        .requiredSubgroupSize = 32,
+    };
+    const stage = if (decl.pin_subgroup_32) VkPipelineShaderStageCreateInfo{
+        .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT,
+        .pNext = @ptrCast(&required_size_info),
+        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+        .module = sm,
+        .pName = "main",
+    } else VkPipelineShaderStageCreateInfo{
         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
         .module = sm,
         .pName = "main",

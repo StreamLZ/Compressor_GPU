@@ -70,6 +70,22 @@ const VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO: c_int = 18;
 const VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: c_int = 7;
 const VK_SHADER_STAGE_COMPUTE_BIT: u32 = 0x00000020;
 
+// VK adaptation: subgroup size pinned to 32 via REQUIRE_FULL_SUBGROUPS_BIT
+// + VkPipelineShaderStageRequiredSubgroupSizeCreateInfo. Kernels in
+// gpu_warp.glsl hardcode WARP_SIZE=32 (the warpShuffle/Ballot/Any
+// cooperative ops are correct only at exactly 32 lanes). Without this
+// pin, Intel iGPU (supports [8,32]) would silently miscompile while
+// NVIDIA (only supports [32,32]) works by accident. Encode-side mirror
+// of the decode-side pin in decode/module_loader.zig::buildKernel.
+const VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT: u32 = 0x00000008;
+const VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO: c_int = 1000225002;
+
+const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo = extern struct {
+    sType: c_int = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+    pNext: ?*anyopaque = null,
+    requiredSubgroupSize: u32,
+};
+
 const VkShaderModuleCreateInfo = extern struct {
     sType: c_int = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
     pNext: ?*const anyopaque = null,
@@ -400,7 +416,18 @@ fn buildPipeline(
     if (pl == 0) return false;
 
     const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
+    // VK adaptation: subgroup size pinned to 32 via REQUIRE_FULL_SUBGROUPS_BIT
+    // + VkPipelineShaderStageRequiredSubgroupSizeCreateInfo. Kernels in
+    // gpu_warp.glsl hardcode WARP_SIZE=32 (the warpShuffle/Ballot/Any
+    // cooperative ops are correct only at exactly 32 lanes). Without this
+    // pin, Intel iGPU (supports [8,32]) would silently miscompile while
+    // NVIDIA (only supports [32,32]) works by accident.
+    const required_size_info = VkPipelineShaderStageRequiredSubgroupSizeCreateInfo{
+        .requiredSubgroupSize = 32,
+    };
     const stage = VkPipelineShaderStageCreateInfo{
+        .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT,
+        .pNext = @ptrCast(&required_size_info),
         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
         .module = sm,
         .pName = "main",
