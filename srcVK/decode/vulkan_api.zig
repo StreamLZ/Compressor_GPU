@@ -274,6 +274,19 @@ pub const Procs = struct {
     /// memcpy out of the mapped staging buffer.
     d2h: ?*const fn (*anyopaque, VkDeviceBuffer, usize) callconv(.c) VkResult = null,
 
+    /// VK adaptation: NEW SLOT (no direct CUDA fn-ptr analogue). Device →
+    /// host blocking copy starting at `src_offset` bytes into the device
+    /// buffer. CUDA's cuMemcpyDtoH_v2(host, device, size) folds the offset
+    /// into the device pointer arithmetic (`d_output + dst_off`) which
+    /// works because CUdeviceptr is a real device VA. On Vulkan
+    /// VkDeviceBuffer is a handle (g_allocs registry index), not an
+    /// addressable pointer, so the codec needs an explicit srcOffset
+    /// argument that maps straight onto VkBufferCopy.srcOffset. Mirrors
+    /// the H1 per-chunk D2H loop the CUDA encode_lz.zig:144-150 path uses
+    /// to download only the actual compressed bytes per block instead of
+    /// the whole gpu_out capacity.
+    d2h_offset: ?*const fn (*anyopaque, VkDeviceBuffer, usize, usize) callconv(.c) VkResult = null,
+
     /// CUDA reference: src/decode/cuda_api.zig:117 (cuMemcpyHtoDAsync_fn).
     /// Host → device async copy on `stream`.
     /// VK adaptation: vkCmdCopyBuffer from the persistent staging buffer

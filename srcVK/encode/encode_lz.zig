@@ -38,6 +38,7 @@ pub fn gpuCompressImpl(
 
     const h2d_fn = vk.procs.h2d orelse return false;
     const d2h_fn = vk.procs.d2h orelse return false;
+    const d2h_offset_fn = vk.procs.d2h_offset orelse return false;
     const launch_fn = vk.procs.launch_kernel orelse return false;
     const sync_fn = vk.procs.ctx_sync orelse return false;
 
@@ -140,24 +141,25 @@ pub fn gpuCompressImpl(
         }
     }
 
-    // Download comp_sizes first, then the actual compressed bytes per block.
+    // Download comp_sizes first, then only the actual compressed bytes per block.
     if (d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes) != VK_SUCCESS_RC) return false;
 
-    // VK adaptation: CUDA's per-chunk loop below uses `d_output + dst_off`
-    // pointer arithmetic to read a slice starting at a non-zero offset
-    // within the device buffer. On Vulkan VkDeviceBuffer is a handle
-    // (g_allocs index), not an addressable pointer, so the arithmetic
-    // produces a garbage handle that fails lookupAlloc on the very
-    // first non-zero `dst_off` (any chunk index > 0). procs.d2h does
-    // not currently support a srcOffset argument. Until that surface
-    // gains an offset variant, fall back to a single whole-buffer
-    // download: read every byte of d_output into the host `output`
-    // slice (sized at n_gpu_blocks * per_block_cap) and let the
-    // downstream consumers index in via dst_offset on the host side.
-    // This preserves byte semantics; only the wire-cost grows from
-    // sum(comp_sizes) to total output capacity.
-    if (output.len > 0) {
-        if (d2h_fn(@ptrCast(output.ptr), d_output, output.len) != VK_SUCCESS_RC) return false;
+    // VK adaptation: mirrors CUDA's per-chunk D2H loop at
+    // src/encode/encode_lz.zig:144-150 verbatim. CUDA's
+    // cuMemcpyDtoH(host + dst_off, d_output + dst_off, cs) folds the
+    // device-side offset into pointer arithmetic on the real device VA;
+    // on Vulkan VkDeviceBuffer is a registry handle, so the device-side
+    // offset travels through the procs.d2h_offset slot's srcOffset
+    // argument and ends up in VkBufferCopy.srcOffset. Net result: only
+    // sum(comp_sizes) bytes leave the device instead of the full
+    // n_gpu_blocks * per_block_cap output capacity (763 sub-blocks
+    // × 384 KB = ~285 MB on enwik8 fell to ~50 MB compressed).
+    for (0..chunk_descs.len) |i| {
+        const cs = comp_sizes_out[i];
+        if (cs > 0) {
+            const dst_off = chunk_descs[i].dst_offset;
+            if (d2h_offset_fn(@ptrCast(output.ptr + dst_off), d_output, cs, dst_off) != VK_SUCCESS_RC) return false;
+        }
     }
 
     return true;

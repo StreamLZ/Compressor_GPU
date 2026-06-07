@@ -2198,6 +2198,7 @@ pub fn init() bool {
     vulkan_api.procs.free_device = procFreeDevice;
     vulkan_api.procs.h2d = procH2D;
     vulkan_api.procs.d2h = procD2H;
+    vulkan_api.procs.d2h_offset = procD2HOffset;
     vulkan_api.procs.d2d = procD2D;
     vulkan_api.procs.memset_d8 = procMemsetD8;
     vulkan_api.procs.memset_d8_async = procMemsetD8Async;
@@ -2780,6 +2781,27 @@ fn procD2H(dst: *anyopaque, src: VkDeviceBuffer, size: usize) callconv(.c) VkRes
     var rc = beginOneShotCB();
     if (rc != VK_SUCCESS_RC) return rc;
     const region = VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = size };
+    vkCmdCopyBuffer_fn.?(g_command_buffer, entry.buffer, g_staging_buffer, 1, @ptrCast(&region));
+    rc = submitAndWait();
+    if (rc != VK_SUCCESS_RC) return rc;
+    const mapped = g_staging_mapped orelse return -1;
+    @memcpy(@as([*]u8, @ptrCast(dst))[0..size], @as([*]const u8, @ptrCast(mapped))[0..size]);
+    return VK_SUCCESS_RC;
+}
+
+// VK adaptation: device → host blocking copy starting at `src_offset`
+// bytes into the device buffer. CUDA encodes the offset into the
+// CUdeviceptr arithmetic (cuMemcpyDtoH(host, d_output + dst_off, size));
+// on Vulkan we pass it through to VkBufferCopy.srcOffset because the
+// device handle is a registry index, not a real device VA. Backs the H1
+// per-chunk D2H loop in srcVK/encode/encode_lz.zig that mirrors the
+// CUDA per-chunk download at src/encode/encode_lz.zig:144-150.
+fn procD2HOffset(dst: *anyopaque, src: VkDeviceBuffer, size: usize, src_offset: usize) callconv(.c) VkResult {
+    const entry = lookupAlloc(src) orelse return -1;
+    if (!ensureStaging(size)) return -1;
+    var rc = beginOneShotCB();
+    if (rc != VK_SUCCESS_RC) return rc;
+    const region = VkBufferCopy{ .srcOffset = src_offset, .dstOffset = 0, .size = size };
     vkCmdCopyBuffer_fn.?(g_command_buffer, entry.buffer, g_staging_buffer, 1, @ptrCast(&region));
     rc = submitAndWait();
     if (rc != VK_SUCCESS_RC) return rc;
