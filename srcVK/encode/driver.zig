@@ -26,6 +26,9 @@ pub const ensureBuf = encode_context.ensureBuf;
 // host-buffer helper through the facade so fast_framed can call it
 // without reaching into encode_context directly.
 pub const ensureGpuOutBuf = encode_context.ensureGpuOutBuf;
+// VK adaptation (iter-4): expose the d2h_final pinned-buffer helper for
+// the iter-4 transfer-queue + imported-dst final-frame D2H path.
+pub const ensureD2hFinalBuf = encode_context.ensureD2hFinalBuf;
 
 // ── Wire-format constants exposed at the facade ────────────────────────
 pub const SC_TAIL_PER_CHUNK_BYTES = encode_context.SC_TAIL_PER_CHUNK_BYTES;

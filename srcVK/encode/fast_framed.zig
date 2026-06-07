@@ -442,11 +442,48 @@ fn gpuEncodeAndAssemble(
     // function returns. The count++ bumps g_enc_phase_count by exactly 1
     // per encode so per-encode averages are sound (every other accumulator
     // sums total ns across all encodes since encPhaseProfileInit).
+    //
+    // VK adaptation (iter-4): final-frame D2H routed through transfer queue
+    // + VK_EXT_external_memory_host import of dst (iter-7+11+15 pattern from
+    // decode side, already proven on enc.lz.d2h_gather in iter-3). Per the
+    // encode phase profiler (d83ea21), this single call was 71% of warm-mode
+    // encode wallclock at 0.21 GB/s on the main queue. Transfer queue gather
+    // gets ~10 GB/s for the same payload. Strictly downstream of frame_assemble
+    // dispatch — does not touch any kernel sync point.
+    //
+    // The caller-provided `dst` slice comes from a std.heap allocator (see
+    // bench_compress.zig:52) and is NOT page-aligned, so the import path
+    // would refuse it. We gather into the persistent d2h_final_buf
+    // (procMallocHost-backed, page-aligned, stable host_ptr → iter-8 LRU
+    // import cache hits after the first call) and @memcpy to `dst` at the
+    // end. The memcpy cost (~10 ms for 50 MB on DDR5) is ~12x cheaper than
+    // the prior sync staging D2H on the main queue (~245 ms / 0.21 GB/s).
+    // Fallback: if the pinned-buffer alloc fails OR the gather slot is
+    // unbound, take the pre-fix copyDeviceToHost path (preserves correctness
+    // on every backend including init-failed contexts).
     if (owns_wrap_output) {
         if (dst.len < frame_size) return error.DestinationTooSmall;
         const _t_d2h0 = if (_prof) vk_api.qpcNow() else 0;
-        if (!gpu_enc.copyDeviceToHost(dst[0..frame_size], enc_ctx.d_host_wrap_output))
-            return error.DestinationTooSmall;
+
+        var did_fast_path: bool = false;
+        if (vk_api.procs.d2h_offset_gather) |gather_fn| {
+            if (gpu_enc.ensureD2hFinalBuf(enc_ctx, frame_size)) |pinned| {
+                const region = vk_api.VkBufferCopyRegion{
+                    .src_offset = 0,
+                    .dst_offset = 0,
+                    .size = frame_size,
+                };
+                const rc = gather_fn(@ptrCast(pinned.ptr), enc_ctx.d_host_wrap_output, @ptrCast(&region), 1);
+                if (rc == vk_api.VK_SUCCESS_RC) {
+                    @memcpy(dst[0..frame_size], pinned[0..frame_size]);
+                    did_fast_path = true;
+                }
+            }
+        }
+        if (!did_fast_path) {
+            if (!gpu_enc.copyDeviceToHost(dst[0..frame_size], enc_ctx.d_host_wrap_output))
+                return error.DestinationTooSmall;
+        }
         if (_prof) g_enc_phase_d2h_final_ns += qpcDeltaNs(_t_d2h0, vk_api.qpcNow());
     }
     // VK adaptation: host_finalize = wall - every attributed phase delta.

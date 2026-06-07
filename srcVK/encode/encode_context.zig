@@ -160,6 +160,21 @@ pub const EncodeContext = struct {
     gpu_out_buf: ?[]u8 = null,
     gpu_out_buf_size: usize = 0,
 
+    // VK adaptation (iter-4): persistent page-aligned host buffer for the
+    // final-frame D2H readback. Mirrors gpu_out_buf above but is the
+    // destination for the ~50 MB compressed-frame D2H out of
+    // d_host_wrap_output. Backed by gpu_dec_driver.allocHost
+    // (procMallocHost → page-aligned page_allocator alloc) so
+    // VK_EXT_external_memory_host import in procD2HOffsetGather can
+    // succeed and the iter-8 LRU import cache hits on every call after
+    // the first. The caller's `dst` slice (from std.heap allocator at
+    // bench_compress.zig) is NOT page-aligned, so we gather into this
+    // pinned scratch and @memcpy to dst at the end. The memcpy cost
+    // (~10 ms for 50 MB on DDR5) is ~12x cheaper than the prior on-main-
+    // queue staging D2H (~245 ms at 0.21 GB/s).
+    d2h_final_buf: ?[]u8 = null,
+    d2h_final_buf_size: usize = 0,
+
     /// CUDA reference: src/encode/encode_context.zig:223-276. Free every
     /// owned device + host buffer and reset every field to its default.
     pub fn deinit(self: *EncodeContext, allocator: std.mem.Allocator) void {
@@ -222,6 +237,16 @@ pub const EncodeContext = struct {
             self.gpu_out_buf_size = 0;
         }
 
+        // VK adaptation (iter-4): symmetric to gpu_out_buf — release any
+        // LRU import entry that points at these host pages BEFORE freeHost
+        // so a recycled page address can't collide with a stale cache entry.
+        if (self.d2h_final_buf) |buf| {
+            @import("../decode/module_loader.zig").releaseImportsByHostRange(@ptrCast(buf.ptr), buf.len);
+            if (vk.procs.free_host) |free_host_fn| _ = free_host_fn(@ptrCast(buf.ptr));
+            self.d2h_final_buf = null;
+            self.d2h_final_buf_size = 0;
+        }
+
         self.pending_timings.deinit(std.heap.page_allocator);
         self.last_timings.deinit(std.heap.page_allocator);
     }
@@ -249,6 +274,29 @@ pub fn ensureGpuOutBuf(self: *EncodeContext, needed: usize) ?[]u8 {
     const fresh = allocHost(needed) orelse return null;
     self.gpu_out_buf = fresh;
     self.gpu_out_buf_size = fresh.len;
+    return fresh[0..needed];
+}
+
+/// VK adaptation (iter-4): grow-only persistent page-aligned host buffer
+/// for the final-frame D2H readback. Symmetric to ensureGpuOutBuf above
+/// (which serves the LZ-pass D2H gather). On grow the LRU import cache
+/// entry that referenced the old host pages is released BEFORE freeHost
+/// so a future procD2HOffsetGather against this buffer doesn't hit a
+/// stale (vk_buf, vk_mem) pair pointing at recycled memory.
+pub fn ensureD2hFinalBuf(self: *EncodeContext, needed: usize) ?[]u8 {
+    if (self.d2h_final_buf) |existing| {
+        if (existing.len >= needed) return existing[0..needed];
+    }
+    const allocHost = @import("../decode/decode_context.zig").allocHost;
+    if (self.d2h_final_buf) |old| {
+        @import("../decode/module_loader.zig").releaseImportsByHostRange(@ptrCast(old.ptr), old.len);
+        if (vk.procs.free_host) |free_host_fn| _ = free_host_fn(@ptrCast(old.ptr));
+        self.d2h_final_buf = null;
+        self.d2h_final_buf_size = 0;
+    }
+    const fresh = allocHost(needed) orelse return null;
+    self.d2h_final_buf = fresh;
+    self.d2h_final_buf_size = fresh.len;
     return fresh[0..needed];
 }
 
