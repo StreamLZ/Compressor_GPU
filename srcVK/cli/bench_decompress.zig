@@ -87,6 +87,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     var best_huff_ns: i64 = std.math.maxInt(i64);
     var total_huff_ns: i64 = 0;
 
+    // Enable per-kernel VkQueryPool timing so the bench can report pure
+    // GPU kernel execution time (sum of last_timings entries below).
+    // This is the apples-to-apples metric matching CUDA's bench: pure
+    // kernel time, not wall-clock back-half wait which on VK includes
+    // GPU H2D copy engine time the iter-11 batching defers to submit.
+    gpu_dec_driver.g_default.enable_profiling = true;
+
     // Per-kernel profile (SLZ_VK_PROFILE_DECODE=1) — reset after the
     // warm-up decompress above so only the measured runs accumulate.
     module_loader.printAndResetProfile(w);
@@ -103,9 +110,20 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
         const elapsed = @as(u64, @intCast(t0.untilNow(io, .awake).toNanoseconds()));
         if (elapsed < best_ns) best_ns = elapsed;
         total_ns += elapsed;
-        if (gpu_dec_driver.last_kernel_ns > 0) {
-            if (gpu_dec_driver.last_kernel_ns < best_kern_ns) best_kern_ns = gpu_dec_driver.last_kernel_ns;
-            total_kern_ns += gpu_dec_driver.last_kernel_ns;
+        // Sum per-kernel VkQueryPool timestamps from last_timings (drained by
+        // finalizeProfiling). This matches CUDA's bench definition: pure GPU
+        // kernel execution time, NOT wall-clock back-half wait. The wall-clock
+        // last_kernel_ns includes GPU H2D copy-engine time on VK (because
+        // iter-11 batches transfer + compute submits at streamEndAndWait)
+        // whereas CUDA's H2D is already in flight by t_before_kern. The
+        // VkQueryPool sum gives apples-to-apples kernel comparison.
+        var pure_kern_ns: i64 = 0;
+        for (gpu_dec_driver.g_default.last_timings.items) |kt| {
+            pure_kern_ns += @intFromFloat(@as(f64, kt.ms) * 1_000_000.0);
+        }
+        if (pure_kern_ns > 0) {
+            if (pure_kern_ns < best_kern_ns) best_kern_ns = pure_kern_ns;
+            total_kern_ns += pure_kern_ns;
         }
         if (gpu_dec_driver.last_lz_kernel_ns > 0) {
             if (gpu_dec_driver.last_lz_kernel_ns < best_lz_ns) best_lz_ns = gpu_dec_driver.last_lz_kernel_ns;
