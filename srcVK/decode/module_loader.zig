@@ -1464,6 +1464,22 @@ const StreamEntry = struct {
     // gone, so the next test gets fresh slots on its fresh stream.
     // Indexed by external-pipeline position in g_extra_metas.
     persistent_desc_sets_external: std.ArrayListUnmanaged(VkDescriptorSet) = .empty,
+
+    // VK adaptation (valfix B — VUID-vkCmdCopyBuffer-commandBuffer-recording):
+    // staging buffers that were grown mid-recording (ensureStreamStaging
+    // outgrew the current size while the cmdbuf still held vkCmdCopyBuffer
+    // references to the OLD buffer). Deferring their VMA destroy until
+    // streamEndAndWait fires (after fence wait) prevents the cmdbuf from
+    // transitioning to INVALID state per Vulkan spec. Single-element in
+    // virtually every decode (1 MiB → 2 MiB grow on web.txt). Cleared after
+    // each fence wait, growth-amortized — no leak.
+    deferred_staging_destroy: std.ArrayListUnmanaged(StagingHandle) = .empty,
+};
+
+// Companion record for StreamEntry.deferred_staging_destroy.
+const StagingHandle = struct {
+    buffer: vma.VkBuffer,
+    allocation: vma.VmaAllocation,
 };
 var g_streams: std.ArrayListUnmanaged(?StreamEntry) = .empty;
 
@@ -1585,7 +1601,30 @@ const STAGING_BUMP_ALIGN: usize = 64;
 fn ensureStreamStaging(entry: *StreamEntry, needed: usize) bool {
     if (entry.staging_size >= needed) return true;
     if (entry.staging_alloc != null) {
-        vma.destroyBuffer(allocator(), entry.staging_buffer, entry.staging_alloc);
+        // VK adaptation (valfix B — VUID-vkCmdCopyBuffer-commandBuffer-recording):
+        // the OLD staging buffer may be referenced by vkCmdCopyBuffer calls
+        // already recorded into the transfer/compute cmdbuf (the same
+        // per-stream staging is shared between procH2DAsync staging-fallback
+        // copies, and we grow lazily inside streamStagingBump). Destroying
+        // it mid-recording transitions the cmdbuf to INVALID state per
+        // Vulkan spec (VkBuffer destroyed while bound to a recording
+        // cmdbuf), and the validation layer flags every subsequent
+        // vkCmdCopyBuffer + vkEndCommandBuffer call. Defer the actual VMA
+        // destroy until streamEndAndWait fires (after fence wait — at which
+        // point neither the cmdbuf nor the GPU can possibly reference the
+        // old buffer). Empirically this fires once per first decode of
+        // web.txt (1 MiB initial → 2 MiB needed) and rarely thereafter
+        // because the growth is amortized.
+        const gpa = std.heap.page_allocator;
+        entry.deferred_staging_destroy.append(gpa, .{
+            .buffer = entry.staging_buffer,
+            .allocation = entry.staging_alloc,
+        }) catch {
+            // Catastrophic — best effort: destroy immediately and accept
+            // the VUID rather than leak. (page_allocator.append basically
+            // never fails on a freshly-reset stream.)
+            vma.destroyBuffer(allocator(), entry.staging_buffer, entry.staging_alloc);
+        };
         entry.staging_buffer = 0;
         entry.staging_alloc = null;
         entry.staging_mapped = null;
@@ -2834,6 +2873,31 @@ fn streamEndAndWait(entry: *StreamEntry) VkResult {
     // No host @memcpy is needed; the GPU wrote the bytes straight into
     // the caller's pageable buffer.
     freePendingImportedD2H(entry);
+    // VK adaptation (valfix B — VUID-vkCmdCopyBuffer-commandBuffer-recording /
+    // VUID-vkEndCommandBuffer-commandBuffer-00059): reset both cmdbufs to
+    // the INITIAL state now, before relinquishing control. After fence wait
+    // the cmdbufs are in EXECUTABLE state and still hold strong references
+    // to every buffer they recorded against. If the caller subsequently
+    // destroys one of those buffers (e.g. CLI epilog calling
+    // releaseImportsByHostRange before mmap.unmap, or VMA recycling a VMA
+    // block via free_device), the executable cmdbuf transitions to INVALID
+    // state per Vulkan spec, and the validation layer flags it. Resetting
+    // here returns the cmdbufs to INITIAL state so they hold no references
+    // — destroying a previously-recorded buffer is then safe. The next
+    // streamBeginIfNeeded reset becomes a no-op idempotency check.
+    if (entry.cmdbuf != null) _ = vkResetCommandBuffer_fn.?(entry.cmdbuf, 0);
+    if (entry.transfer_cmdbuf != null) _ = vkResetCommandBuffer_fn.?(entry.transfer_cmdbuf, 0);
+
+    // VK adaptation (valfix B): drain any staging buffers that were
+    // deferred-destroyed by mid-recording ensureStreamStaging growths.
+    // Safe now — the fence has signaled, the cmdbufs have been reset to
+    // initial state, and the GPU is no longer referencing them.
+    if (entry.deferred_staging_destroy.items.len > 0) {
+        for (entry.deferred_staging_destroy.items) |h| {
+            vma.destroyBuffer(allocator(), h.buffer, h.allocation);
+        }
+        entry.deferred_staging_destroy.clearRetainingCapacity();
+    }
     entry.recording = false;
     entry.transfer_recording = false;
     entry.transfer_already_submitted = false;
@@ -4184,6 +4248,18 @@ fn procStreamDestroy(stream: VkStream) callconv(.c) VkResult {
     // reverse-creation order for symmetry with the encode side.
     if (slot.staging_alloc != null) {
         vma.destroyBuffer(allocator(), slot.staging_buffer, slot.staging_alloc);
+    }
+    // VK adaptation (valfix B): drain + free any lingering deferred-destroy
+    // staging buffers. Defensive — streamEndAndWait normally drains, but
+    // an early teardown (e.g. test cancel between begin and sync) could
+    // leave entries here.
+    if (slot.deferred_staging_destroy.items.len > 0) {
+        for (slot.deferred_staging_destroy.items) |h| {
+            vma.destroyBuffer(allocator(), h.buffer, h.allocation);
+        }
+        slot.deferred_staging_destroy.deinit(std.heap.page_allocator);
+    } else {
+        slot.deferred_staging_destroy.deinit(std.heap.page_allocator);
     }
     slot.pending_d2h.deinit(std.heap.page_allocator);
     // Iter 7: drain any pending imported-D2H records before tearing the
