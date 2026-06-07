@@ -99,6 +99,28 @@ inline fn qpcDeltaNs(start: i64, end: i64) i64 {
     return @intFromFloat(vk.qpcMs(start, end) * 1e6);
 }
 
+// VK adaptation (H3): encode-side phase printer. Only the h2d_paths /
+// import_cache counters mean anything for the compress hot path — every
+// decode-specific phase accumulator (upload_h2d, backhalf_*, finalize_*)
+// stays at zero because fullGpuLaunchImpl never runs. Called from
+// bench_compress around the timed encode pass to confirm the 95 MB
+// enwik8 input H2D auto-fires the iter-12 VK_EXT_external_memory_host
+// import path inside procH2DAsync. Counters live in module_loader and
+// are shared with the decode path; reset by phaseProfileInit().
+pub fn printEncodeImportTelemetry(w: anytype) void {
+    if (!g_phase_profile_enabled) return;
+    w.print("phase: h2d_paths               prepared_import={d}, inline_import={d}, staging={d}\n", .{
+        module_loader.g_h2d_path_prepared_import,
+        module_loader.g_h2d_path_inline_import,
+        module_loader.g_h2d_path_staging,
+    }) catch {};
+    w.print("phase: import_cache            hits={d}, misses={d}, evictions={d}\n", .{
+        module_loader.g_import_cache_hits.load(.seq_cst),
+        module_loader.g_import_cache_misses.load(.seq_cst),
+        module_loader.g_import_cache_evictions.load(.seq_cst),
+    }) catch {};
+}
+
 pub fn printAndResetPhaseProfile(w: anytype) void {
     if (!g_phase_profile_enabled or g_phase_decode_count == 0) return;
     const n = @as(f64, @floatFromInt(g_phase_decode_count));

@@ -18,8 +18,30 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     util.checkLevel(args.level, w);
     if (runs == 0) util.die(w, "error: runs must be >= 1\n");
 
-    const src = util.readFile(allocator, io, in_path, w);
-    defer allocator.free(src);
+    const src_raw = util.readFile(allocator, io, in_path, w);
+    defer allocator.free(src_raw);
+
+    // VK adaptation (H3): pin the encode input through procMallocHost so
+    // its base address is page-aligned. iter-12's
+    // VK_EXT_external_memory_host import inside procH2DAsync requires the
+    // surrounding page-aligned region be owned by the caller — readFileAlloc
+    // returns a non-page-aligned slice from the general-purpose allocator
+    // (rejected by tryImportHostBuffer). Mirrors bench_decompress.zig
+    // lines 30-43 for the decompress src pin. Falls back to a regular
+    // allocation (and the iter-4 staging path inside procH2DAsync) when
+    // the GPU host-alloc slot is unavailable.
+    const SrcBuf = struct { buf: []u8, pinned: bool };
+    const sh: SrcBuf = blk: {
+        if (gpu_dec_driver.allocHost(src_raw.len)) |p| {
+            @memcpy(p[0..src_raw.len], src_raw);
+            break :blk .{ .buf = p[0..src_raw.len], .pinned = true };
+        }
+        const dup = allocator.alloc(u8, src_raw.len) catch break :blk .{ .buf = @constCast(src_raw), .pinned = false };
+        @memcpy(dup, src_raw);
+        break :blk .{ .buf = dup, .pinned = false };
+    };
+    const src: []const u8 = sh.buf;
+    defer if (sh.pinned) gpu_dec_driver.freeHost(sh.buf) else if (sh.buf.ptr != src_raw.ptr) allocator.free(sh.buf);
 
     const bound = encoder.compressBound(src.len);
     const compressed = try allocator.alloc(u8, bound);
@@ -35,7 +57,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
         .sc_group_size_override = args.sc_group,
     };
 
+    // VK adaptation (H3): reset the phase / import-cache counters after
+    // the warm-up compress so only the measured run accumulates. Mirrors
+    // bench_decompress.zig's phaseProfileInit() pattern; same global
+    // counters (g_h2d_path_* + g_import_cache_*) live in
+    // decode/module_loader.zig and are shared by both procH2DAsync paths.
     var comp_size: usize = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_enc_driver.g_default);
+    gpu_dec_driver.phaseProfileInit();
     {
         const t0 = std.Io.Clock.awake.now(io);
         comp_size = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_enc_driver.g_default);
@@ -43,6 +71,16 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
         const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
         try w.print("  Compress: {d:.0}ms ({d:.1} MB/s)\n", .{ ms, mb * 1000.0 / ms });
     }
+    // VK adaptation (H3): surface h2d_paths + import_cache counters
+    // immediately after the timed compress so SLZ_VK_PROFILE_PHASES=1
+    // confirms the 95 MB input H2D took the inline_import branch (iter-12)
+    // rather than falling back to the iter-4 staging copy. Printed BEFORE
+    // the decode runs below so the encode-side numbers stand alone. The
+    // generic phase printer (printAndResetPhaseProfile) gates on
+    // g_phase_decode_count which is 0 here — use the encode-only variant.
+    try w.flush();
+    gpu_dec_driver.printEncodeImportTelemetry(w);
+    try w.flush();
     try w.print("Level {d}: {d} -> {d} bytes ({d:.1}%)\n\n", .{
         args.level, src.len, comp_size,
         @as(f64, @floatFromInt(comp_size)) / @as(f64, @floatFromInt(src.len)) * 100.0,

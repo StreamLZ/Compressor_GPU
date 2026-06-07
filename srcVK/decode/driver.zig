@@ -50,6 +50,9 @@ pub const fullGpuLaunchImpl = decode_dispatch.fullGpuLaunchImpl;
 // ── Per-phase host-overhead profiling (SLZ_VK_PROFILE_PHASES=1) ───────
 pub const phaseProfileInit = decode_dispatch.phaseProfileInit;
 pub const printAndResetPhaseProfile = decode_dispatch.printAndResetPhaseProfile;
+// VK adaptation (H3): encode-side counters-only printer; see
+// decode_dispatch.printEncodeImportTelemetry for the rationale.
+pub const printEncodeImportTelemetry = decode_dispatch.printEncodeImportTelemetry;
 
 // ── Singletons ─────────────────────────────────────────────────────────
 pub var g_default: DecodeContext = .{};
