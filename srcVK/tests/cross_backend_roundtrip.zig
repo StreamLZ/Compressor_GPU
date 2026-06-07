@@ -22,7 +22,16 @@ const max_corpus_bytes: usize = 1 << 30;
 fn makeIo() std.Io.Threaded {
     // Use the testing allocator so std.process.run + std.Io.Dir.writeFile
     // can satisfy their internal allocations (pipe buffers, etc.).
-    return std.Io.Threaded.init(std.testing.allocator, .{});
+    //
+    // VK adaptation: see cli_smoke.zig::makeIo for the full diagnosis.
+    // TL;DR: default `environ = .empty` makes `createWindowsBlock` hand
+    // the spawned child an EMPTY env block, which stops the Vulkan
+    // loader's PnP/registry ICD discovery from locating the NVIDIA
+    // driver. Passing `.{ .block = .global }` forwards the parent PEB
+    // environment verbatim and restores discrete-GPU visibility.
+    return std.Io.Threaded.init(std.testing.allocator, .{
+        .environ = .{ .block = .global },
+    });
 }
 
 fn fileExists(io: std.Io, rel: []const u8) bool {
