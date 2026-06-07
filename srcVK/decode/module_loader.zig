@@ -763,6 +763,7 @@ const VK_ACCESS_HOST_READ_BIT: u32 = 0x00002000;
 // COMPUTE_SHADER_WRITE → TRANSFER_READ memory barrier between the LZ
 // kernel and the D2H vkCmdCopyBuffer that now share one compute cmdbuf.
 const VK_ACCESS_SHADER_WRITE_BIT: u32 = 0x00000040;
+const VK_ACCESS_SHADER_READ_BIT: u32 = 0x00000020;
 
 // Descriptor / pipeline structs
 
@@ -909,6 +910,7 @@ const FnCreateDescriptorPool = *const fn (VkDevice, *const VkDescriptorPoolCreat
 const FnDestroyDescriptorPool = *const fn (VkDevice, VkDescriptorPool, ?*const anyopaque) callconv(.c) void;
 const FnResetDescriptorPool = *const fn (VkDevice, VkDescriptorPool, u32) callconv(.c) VkResult;
 const FnAllocateDescriptorSets = *const fn (VkDevice, *const VkDescriptorSetAllocateInfo, [*]VkDescriptorSet) callconv(.c) VkResult;
+const FnFreeDescriptorSets = *const fn (VkDevice, VkDescriptorPool, u32, [*]const VkDescriptorSet) callconv(.c) VkResult;
 const FnUpdateDescriptorSets = *const fn (VkDevice, u32, [*]const VkWriteDescriptorSet, u32, ?*const anyopaque) callconv(.c) void;
 const FnCmdBindPipeline = *const fn (VkCommandBuffer, c_int, VkPipeline) callconv(.c) void;
 const FnCmdBindDescriptorSets = *const fn (VkCommandBuffer, c_int, VkPipelineLayout, u32, u32, [*]const VkDescriptorSet, u32, ?*const u32) callconv(.c) void;
@@ -1072,6 +1074,7 @@ var vkCreateDescriptorPool_fn: ?FnCreateDescriptorPool = null;
 var vkDestroyDescriptorPool_fn: ?FnDestroyDescriptorPool = null;
 var vkResetDescriptorPool_fn: ?FnResetDescriptorPool = null;
 var vkAllocateDescriptorSets_fn: ?FnAllocateDescriptorSets = null;
+var vkFreeDescriptorSets_fn: ?FnFreeDescriptorSets = null;
 var vkUpdateDescriptorSets_fn: ?FnUpdateDescriptorSets = null;
 var vkCmdBindPipeline_fn: ?FnCmdBindPipeline = null;
 var vkCmdBindDescriptorSets_fn: ?FnCmdBindDescriptorSets = null;
@@ -1389,6 +1392,20 @@ const StreamEntry = struct {
     // path (encode + sync-mode default) uses KernelMeta.persistent_desc_set_default
     // instead because no StreamEntry exists there.
     persistent_desc_sets: [KERNEL_DECLS.len]VkDescriptorSet = @splat(0),
+
+    // VK adaptation (H2): per-(stream × external-pipeline) descriptor
+    // slots. Encode pipelines (registered via registerExternalPipeline)
+    // pre-H2 fell through to KernelMeta.persistent_desc_set_default which
+    // persists across encodes — so when a per-test EncodeContext destroyed
+    // its device buffers between tests, the cached descriptor set held
+    // dangling references that vkUpdateDescriptorSets could not safely
+    // patch on every driver (Intel UHD reproduced LZ-kernel-sees-zeros
+    // on the second test). Per-stream slots match the lifetime of the
+    // per-test pipeline_stream: when the stream is destroyed
+    // (procStreamDestroy) the per-test allocator's buffers are also
+    // gone, so the next test gets fresh slots on its fresh stream.
+    // Indexed by external-pipeline position in g_extra_metas.
+    persistent_desc_sets_external: std.ArrayListUnmanaged(VkDescriptorSet) = .empty,
 };
 var g_streams: std.ArrayListUnmanaged(?StreamEntry) = .empty;
 
@@ -1703,6 +1720,21 @@ fn kindIndexForPipeline(handle: usize) i32 {
     return -1;
 }
 
+// VK adaptation (H2): position of an external (encode-registered) pipeline
+// within g_extra_metas, or -1 if not external. Used by procLaunchKernel to
+// route external pipelines through the per-stream descriptor slot bank
+// instead of the persistent_desc_set_default (which leaks across encodes
+// when the caller's EncodeContext rebuilds its buffers).
+fn externalIndexForPipeline(handle: usize) i32 {
+    if (handle == 0) return -1;
+    for (g_extra_metas.items, 0..) |entry, i| {
+        if (entry.pipeline != 0 and @as(usize, @intCast(entry.pipeline)) == handle) {
+            return @intCast(i);
+        }
+    }
+    return -1;
+}
+
 /// Test-only accessor exposing the per-kernel binding count + push-constant
 /// size declared in KERNEL_DECLS. Used by srcVK/tests/dispatch_unit.zig to
 /// pin the kernel ABI against the params[] layout in decode_dispatch.zig.
@@ -1971,6 +2003,7 @@ pub fn init() bool {
     vkDestroyDescriptorPool_fn = @ptrCast(gdpa(dev, "vkDestroyDescriptorPool"));
     vkResetDescriptorPool_fn = @ptrCast(gdpa(dev, "vkResetDescriptorPool"));
     vkAllocateDescriptorSets_fn = @ptrCast(gdpa(dev, "vkAllocateDescriptorSets"));
+    vkFreeDescriptorSets_fn = @ptrCast(gdpa(dev, "vkFreeDescriptorSets"));
     vkUpdateDescriptorSets_fn = @ptrCast(gdpa(dev, "vkUpdateDescriptorSets"));
     vkCmdBindPipeline_fn = @ptrCast(gdpa(dev, "vkCmdBindPipeline"));
     vkCmdBindDescriptorSets_fn = @ptrCast(gdpa(dev, "vkCmdBindDescriptorSets"));
@@ -2206,6 +2239,7 @@ pub fn init() bool {
     vulkan_api.procs.free_host = procFreeHost;
     vulkan_api.procs.stream_sync = procStreamSync;
     vulkan_api.procs.stream_flush_transfer = procStreamFlushTransfer;
+    vulkan_api.procs.stream_compute_barrier = procStreamComputeBarrier;
     vulkan_api.procs.ctx_sync = procCtxSync;
     vulkan_api.procs.stream_create = procStreamCreate;
     vulkan_api.procs.stream_destroy = procStreamDestroy;
@@ -2841,6 +2875,32 @@ fn procMemsetD8Async(dst: VkDeviceBuffer, value: u8, size: usize, stream: VkStre
         const rc = streamBeginIfNeeded(se);
         if (rc != VK_SUCCESS_RC) return rc;
         vkCmdFillBuffer_fn.?(se.cmdbuf, entry.buffer, 0, size, v);
+        // VK adaptation (H2): vkCmdFillBuffer is a TRANSFER stage op
+        // (TRANSFER_WRITE access). Encode hot path immediately follows
+        // it with a compute dispatch that reads/writes the same buffer
+        // (slzLzEncodeKernel writes d_sizes after zeroing it). CUDA's
+        // cuMemsetD8Async serializes implicitly with subsequent launches
+        // on the same stream; Vulkan does not, so emit a TRANSFER_WRITE
+        // → SHADER_READ|SHADER_WRITE barrier here so the dispatch
+        // observes the zeroed memory. Pre-H2 the encode path sync'd
+        // after memset_d8 so this hazard never surfaced; H2's batched
+        // compute cmdbuf exposes it.
+        const mb = VkMemoryBarrier{
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        };
+        vkCmdPipelineBarrier_fn.?(
+            se.cmdbuf,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            1,
+            @ptrCast(&mb),
+            0,
+            null,
+            0,
+            null,
+        );
         // VK adaptation: defer submission until procs.stream_sync.
         return VK_SUCCESS_RC;
     }
@@ -3418,6 +3478,42 @@ pub fn releaseImportsByHostRange(base: *const anyopaque, len: usize) void {
 // LZ kernel (COMPUTE_SHADER stage write) inside the device's command
 // processor — undefined behavior per the Vulkan synchronization spec.
 //
+// VK adaptation (H2): COMPUTE_SHADER_WRITE → COMPUTE_SHADER_READ
+// barrier — encode pipeline's assemble_write writes d_asm_out and
+// the immediately-following frame_assemble reads it; without this
+// the two dispatches race because Vulkan does not implicitly
+// serialize back-to-back compute dispatches even when they share
+// SSBO bindings (CUDA does via per-stream sequential semantics).
+inline fn recordComputeToComputeBarrier(cb: VkCommandBuffer) void {
+    const mb = VkMemoryBarrier{
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+    };
+    vkCmdPipelineBarrier_fn.?(
+        cb,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0,
+        1,
+        @ptrCast(&mb),
+        0,
+        null,
+        0,
+        null,
+    );
+}
+
+fn procStreamComputeBarrier(stream: VkStream) callconv(.c) VkResult {
+    if (streamEntryFor(stream)) |se| {
+        const rc = streamBeginIfNeeded(se);
+        if (rc != VK_SUCCESS_RC) return rc;
+        recordComputeToComputeBarrier(se.cmdbuf);
+    }
+    // stream==0 path is already serialized by the singleton
+    // g_command_buffer's per-call submit+wait — no barrier needed.
+    return VK_SUCCESS_RC;
+}
+
 // Emit a single global VkMemoryBarrier on the cmdbuf at the boundary.
 // Cheap (microseconds, no buffer-list traversal); fires once per decode.
 inline fn recordComputeToTransferBarrier(cb: VkCommandBuffer) void {
@@ -3521,26 +3617,54 @@ fn procD2HAsync(dst: *anyopaque, src: VkDeviceBuffer, size: usize, stream: VkStr
         // wait in streamEndAndWait. Mirrors src_vulkan/l1_codec.zig
         // (importHostPointerBuffer) and CUDA's cuMemcpyDtoH_v2 against
         // a pinned destination (src/decode/decode_dispatch.zig:485).
-        if (tryImportHostBuffer(dst, size, false)) |imported| {
-            markImportInFlight(imported.cache_idx);
-            // Iter 9: dstOffset = imported.region_offset accounts for
-            // sub-page offset of caller's dst within imported region.
-            const region = VkBufferCopy{ .srcOffset = 0, .dstOffset = imported.region_offset, .size = size };
-            vkCmdCopyBuffer_fn.?(se.cmdbuf, entry.buffer, imported.buffer, 1, @ptrCast(&region));
-            const gpa = std.heap.page_allocator;
-            se.pending_imported_d2h.append(gpa, imported) catch {
-                // Append failed — for cached entries just clear the
-                // in-flight bit (cache still owns them). For uncached
-                // entries we must free now (streamEndAndWait won't see them).
-                clearImportInFlight(imported.cache_idx);
-                if (imported.cache_idx < 0) {
-                    const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
-                    vkFreeMemory_fn.?(dev, imported.memory, null);
-                    vkDestroyBuffer_fn.?(dev, imported.buffer, null);
-                }
-                return -1;
-            };
-            return VK_SUCCESS_RC;
+        // VK adaptation (H2): D2H_IMPORT_THRESHOLD gate (mirrors
+        // H2D_IMPORT_THRESHOLD). The 16-slot LRU cache in g_import_cache
+        // keys imported entries by (host_ptr, size, usage_src) and
+        // assumes the host memory backing each entry stays mapped to the
+        // SAME physical pages for the cache lifetime. That assumption
+        // holds for the bench's pinned output buffer (one stable host
+        // allocation across all runs) and for procMallocHost-backed
+        // pinned host buffers (the decode dispatcher's prepared imports).
+        //
+        // It does NOT hold for short-lived heap allocations the encode
+        // path uses for comp_sizes / enc_sizes (~4-N×4 bytes per call).
+        // After std.testing.allocator frees and reuses the same heap
+        // slot for a different test's allocation, the cache returns the
+        // PRIOR (vk_buf, vk_mem) pair wrapping memory that may now
+        // resolve to different physical pages — vkCmdCopyBuffer then
+        // writes into the stale physical pages and the caller reads
+        // zeros (or stale garbage) from its newly-mapped pages,
+        // surfacing as comp_sizes=0 in ptest_vk's per-test EncodeContext
+        // tests after the first encode warmed the cache.
+        //
+        // Gate at the same 4 MiB the H2D side uses. Encode's small
+        // D2Hs (comp_sizes/enc_sizes always KB-scale) fall through to
+        // staging — already cheap (one host @memcpy at fence wait).
+        // Decode's large output D2H (always MB-scale on enwik8 +
+        // silesia + web.txt) keeps the iter-7/8 import fast path.
+        const D2H_IMPORT_THRESHOLD: usize = 4 * 1024 * 1024;
+        if (size >= D2H_IMPORT_THRESHOLD) {
+            if (tryImportHostBuffer(dst, size, false)) |imported| {
+                markImportInFlight(imported.cache_idx);
+                // Iter 9: dstOffset = imported.region_offset accounts for
+                // sub-page offset of caller's dst within imported region.
+                const region = VkBufferCopy{ .srcOffset = 0, .dstOffset = imported.region_offset, .size = size };
+                vkCmdCopyBuffer_fn.?(se.cmdbuf, entry.buffer, imported.buffer, 1, @ptrCast(&region));
+                const gpa = std.heap.page_allocator;
+                se.pending_imported_d2h.append(gpa, imported) catch {
+                    // Append failed — for cached entries just clear the
+                    // in-flight bit (cache still owns them). For uncached
+                    // entries we must free now (streamEndAndWait won't see them).
+                    clearImportInFlight(imported.cache_idx);
+                    if (imported.cache_idx < 0) {
+                        const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
+                        vkFreeMemory_fn.?(dev, imported.memory, null);
+                        vkDestroyBuffer_fn.?(dev, imported.buffer, null);
+                    }
+                    return -1;
+                };
+                return VK_SUCCESS_RC;
+            }
         }
 
         // Iter 4 staging path: defer both the cmdbuf record AND the
@@ -3811,6 +3935,17 @@ fn procStreamDestroy(stream: VkStream) callconv(.c) VkResult {
     var cb = slot.cmdbuf;
     vkFreeCommandBuffers_fn.?(dev, g_command_pool, 1, @ptrCast(&cb));
     vkDestroyFence_fn.?(dev, slot.fence, null);
+    // VK adaptation (H2): release the per-stream external descriptor
+    // sets ArrayList backing. The descriptor sets themselves stay
+    // allocated in g_descriptor_pool until pool destruction (the pool
+    // was created without VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+    // so vkFreeDescriptorSets is not permitted). Pool has maxSets = 8192
+    // headroom and procLaunchKernel allocates lazily per pipeline, so
+    // the worst case is a few hundred lingering sets across a long
+    // ptest_vk run — well under the cap.
+    if (slot.persistent_desc_sets_external.items.len > 0) {
+        slot.persistent_desc_sets_external.deinit(std.heap.page_allocator);
+    }
     g_streams.items[idx] = null;
     return VK_SUCCESS_RC;
 }
@@ -4021,14 +4156,45 @@ fn procLaunchKernel(
     if (meta.n_bindings > 0) {
         // Pick the persistent slot for this (stream × pipeline). For the
         // per-stream path we index into StreamEntry.persistent_desc_sets
-        // using the KERNEL_DECLS index returned by kindIndexForPipeline;
-        // encode-registered (extra) pipelines fall through to the
-        // default-stream slot since they aren't carved out per-stream.
+        // using the KERNEL_DECLS index returned by kindIndexForPipeline.
+        //
+        // VK adaptation (H2): externally-registered (encode) pipelines
+        // route into StreamEntry.persistent_desc_sets_external instead
+        // of meta.persistent_desc_set_default — the latter persists across
+        // encodes and on per-test EncodeContext use-cases held dangling
+        // VkBuffer references after the prior test's deinit destroyed
+        // its buffers. Some drivers (Intel UHD) cache descriptor backing
+        // memory aggressively enough that vkUpdateDescriptorSets fails
+        // to re-bind the new VkBuffer on the next launch, surfacing as
+        // the LZ kernel reading zeros. Per-stream slots tie the
+        // descriptor lifetime to the EncodeContext's pipeline_stream
+        // (created/destroyed in lockstep), eliminating the hazard.
         var slot_ptr: *VkDescriptorSet = &meta.persistent_desc_set_default;
         if (se_opt) |se| {
             const k_idx = kindIndexForPipeline(pipeline);
             if (k_idx >= 0 and @as(usize, @intCast(k_idx)) < se.persistent_desc_sets.len) {
                 slot_ptr = &se.persistent_desc_sets[@intCast(k_idx)];
+            } else {
+                // VK adaptation (H2): encode-registered (extra) pipelines
+                // need per-stream descriptor slots so the EncodeContext's
+                // pipeline_stream lifecycle owns the descriptor set
+                // lifecycle in lockstep. Pre-H2 the encode kernels fell
+                // through to meta.persistent_desc_set_default which is
+                // shared across ALL streams + encodes — when a per-test
+                // EncodeContext destroyed its device buffers between
+                // tests, the cached default set held dangling
+                // VkBuffer references and the per-stream update path
+                // failed to fully re-bind on Intel UHD (LZ kernel saw
+                // zeros, test 2 returned comp_sizes=0).
+                const ext_idx = externalIndexForPipeline(pipeline);
+                if (ext_idx >= 0) {
+                    const ext_i: usize = @intCast(ext_idx);
+                    const gpa_ext = std.heap.page_allocator;
+                    while (se.persistent_desc_sets_external.items.len <= ext_i) {
+                        se.persistent_desc_sets_external.append(gpa_ext, 0) catch return -1;
+                    }
+                    slot_ptr = &se.persistent_desc_sets_external.items[ext_i];
+                }
             }
         }
 
