@@ -351,16 +351,106 @@ pub fn ensurePipelineStream(enc_ctx: *@import("encode_context.zig").EncodeContex
 // ── Internal helpers ──────────────────────────────────────────────────
 
 /// Load a SPV blob into a VkShaderModule.
+///
+/// VK adaptation (valfix C — VUID-VkShaderModuleCreateInfo-pCode-08737):
+/// `glslc -O` reliably emits `OpConstant %uchar N` instructions when it
+/// constant-folds expressions that mask a uint down to a single byte
+/// (e.g. `uint8_t(magic & 0xFFu)` collapsing to `uint8_t(0x31)` =
+/// `OpConstant %uchar 49`). The compiler emits the
+/// `StorageBuffer8BitAccess` capability (because the shader's storage
+/// buffer reads/writes uint8_t) but FAILS to emit the `Int8` capability
+/// that 8-bit scalar constants require per SPIR-V spec — surfacing as
+/// VUID-VkShaderModuleCreateInfo-pCode-08737 ("Cannot form constants of
+/// 8- or 16-bit types"). spirv-opt does not rewrite this; -O0 avoids
+/// it but kills perf.
+///
+/// Patch in driver code: if the blob declares any 8-bit storage
+/// capability but is missing Int8, splice in `OpCapability Int8`
+/// right after the last OpCapability instruction. This is the SAME
+/// fix the validation-error suggestion implies and is byte-equal to
+/// what glslc would emit if its optimizer behaved correctly. Cost is
+/// 1 SPIR-V word (8 bytes) per shader, applied at load time only.
 fn loadShaderModule(spv: []const u8) VkShaderModule {
     if (spv.len == 0 or spv.len % 4 != 0) return 0;
     const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
+
+    var patched_buf: ?[]u32 = null;
+    defer if (patched_buf) |p| std.heap.page_allocator.free(p);
+    const patched = spvPatchAddInt8If8BitStorage(spv) catch null;
+    const code_ptr: [*]const u32 = blk: {
+        if (patched) |p| {
+            patched_buf = p;
+            break :blk p.ptr;
+        }
+        break :blk @ptrCast(@alignCast(spv.ptr));
+    };
+    const code_size: usize = if (patched) |p| p.len * 4 else spv.len;
     const ci = VkShaderModuleCreateInfo{
-        .codeSize = spv.len,
-        .pCode = @ptrCast(@alignCast(spv.ptr)),
+        .codeSize = code_size,
+        .pCode = code_ptr,
     };
     var sm: VkShaderModule = 0;
     if (vkCreateShaderModule_fn.?(dev, &ci, null, &sm) != VK_SUCCESS_RC) return 0;
     return sm;
+}
+
+// SPIR-V capability constants (Capability enum, vulkan spec).
+const SPV_CAP_INT16: u32 = 22;
+const SPV_CAP_INT8: u32 = 39;
+const SPV_CAP_STORAGE_BUFFER_8BIT_ACCESS: u32 = 4448;
+const SPV_CAP_UNIFORM_AND_STORAGE_BUFFER_8BIT_ACCESS: u32 = 4449;
+const SPV_CAP_STORAGE_PUSH_CONSTANT_8: u32 = 4450;
+const SPV_OP_CAPABILITY: u32 = 17;
+const SPV_MAGIC: u32 = 0x07230203;
+
+/// Returns a patched copy of `spv` with `OpCapability Int8` inserted
+/// if the blob declares any 8-bit storage capability but lacks Int8.
+/// Returns null if no patch is needed (caller passes original blob to
+/// vkCreateShaderModule untouched).
+fn spvPatchAddInt8If8BitStorage(spv: []const u8) !?[]u32 {
+    if (spv.len < 20) return null; // header is 5 words
+    const words_in: []const u32 = @as([*]const u32, @ptrCast(@alignCast(spv.ptr)))[0 .. spv.len / 4];
+    if (words_in[0] != SPV_MAGIC) return null;
+
+    var has_8bit_storage = false;
+    var has_int8 = false;
+    var last_cap_idx: usize = 5; // after header
+    var i: usize = 5;
+    while (i < words_in.len) {
+        const opcode: u32 = words_in[i] & 0xFFFF;
+        const length: u32 = words_in[i] >> 16;
+        if (length == 0) return null; // malformed
+        if (opcode == SPV_OP_CAPABILITY and length == 2) {
+            const cap = words_in[i + 1];
+            if (cap == SPV_CAP_INT8) has_int8 = true;
+            if (cap == SPV_CAP_STORAGE_BUFFER_8BIT_ACCESS or
+                cap == SPV_CAP_UNIFORM_AND_STORAGE_BUFFER_8BIT_ACCESS or
+                cap == SPV_CAP_STORAGE_PUSH_CONSTANT_8) has_8bit_storage = true;
+            last_cap_idx = i + length;
+        } else if (opcode == SPV_OP_CAPABILITY) {
+            last_cap_idx = i + length;
+        } else if (opcode != 5 and opcode != 14 and opcode != 11) {
+            // OpExtension = 10, OpExtInstImport = 11, OpMemoryModel = 14,
+            // OpSource = 3, OpName = 5 — all may follow capability block.
+            // The capability block ends before the first non-capability/
+            // non-extension instruction; once we pass OpMemoryModel we've
+            // definitively left it. Simpler: stop scanning once we hit
+            // OpMemoryModel (opcode 14) — capabilities must come before.
+            if (opcode == 14) break;
+        }
+        i += length;
+    }
+
+    if (!has_8bit_storage or has_int8) return null;
+
+    // Patch: insert `OpCapability Int8` (2 words: (2<<16)|17, 39) at
+    // last_cap_idx (right after the last OpCapability instruction).
+    const out = try std.heap.page_allocator.alloc(u32, words_in.len + 2);
+    @memcpy(out[0..last_cap_idx], words_in[0..last_cap_idx]);
+    out[last_cap_idx] = (@as(u32, 2) << 16) | SPV_OP_CAPABILITY;
+    out[last_cap_idx + 1] = SPV_CAP_INT8;
+    @memcpy(out[last_cap_idx + 2 ..], words_in[last_cap_idx..]);
+    return out;
 }
 
 fn buildDescriptorSetLayout(n_bindings: u32) VkDescriptorSetLayout {
