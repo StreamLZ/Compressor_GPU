@@ -979,6 +979,9 @@ const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: c_int = 12;
 const VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT: c_int = 1000178000;
 const VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT: c_int = 1000178001;
 const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT: c_int = 1000178002;
+// VK adaptation (valfix A): VkExternalMemoryBufferCreateInfo sType — value
+// verified verbatim against C:/VulkanSDK/1.4.341.1/Include/vulkan/vulkan_core.h:292.
+const VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO: c_int = 1000072000;
 const VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT: u32 = 0x80;
 const VK_SHARING_MODE_EXCLUSIVE: c_int = 0;
 const VK_BUFFER_USAGE_TRANSFER_DST_BIT: u32 = 0x00000002;
@@ -1013,6 +1016,19 @@ const VkImportMemoryHostPointerInfoEXT = extern struct {
     pNext: ?*const anyopaque = null,
     handleType: u32 = 0,
     pHostPointer: ?*anyopaque = null,
+};
+
+// VK adaptation (valfix A): VkExternalMemoryBufferCreateInfo for chaining
+// into VkBufferCreateInfo.pNext on imported-memory-bound buffers. Required
+// by VUID-vkBindBufferMemory-memory-02985 — if memory was imported with
+// handleType H, the buffer must have been created with H listed in
+// handleTypes too. Verified layout against
+// C:/VulkanSDK/1.4.341.1/Include/vulkan/vulkan_core.h:5853 — sType, pNext,
+// VkExternalMemoryHandleTypeFlags handleTypes.
+const VkExternalMemoryBufferCreateInfo = extern struct {
+    sType: c_int = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+    pNext: ?*const anyopaque = null,
+    handleTypes: u32 = 0,
 };
 
 const VkMemoryHostPointerPropertiesEXT = extern struct {
@@ -3301,7 +3317,18 @@ fn tryImportHostBuffer(host_ptr: *anyopaque, size: usize, usage_src: bool) ?Pend
     // input). usage_src=false → TRANSFER_DST (D2H: GPU writes into this
     // buffer from the device-local output). vkCmdCopyBuffer requires
     // matching SRC/DST bits on the source and destination respectively.
+    //
+    // VK adaptation (valfix A — VUID-vkBindBufferMemory-memory-02985):
+    // chain VkExternalMemoryBufferCreateInfo on pNext so the buffer
+    // advertises the same external handle type its memory will be imported
+    // with (VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT). The
+    // VkImportMemoryHostPointerInfoEXT struct chained on the
+    // VkMemoryAllocateInfo below is the symmetric half — both are required.
+    const ext_mem_buf_info = VkExternalMemoryBufferCreateInfo{
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+    };
     const bci = VkBufferCreateInfo{
+        .pNext = @ptrCast(&ext_mem_buf_info),
         .size = aligned_size,
         .usage = if (usage_src) VK_BUFFER_USAGE_TRANSFER_SRC_BIT else VK_BUFFER_USAGE_TRANSFER_DST_BIT,
     };
