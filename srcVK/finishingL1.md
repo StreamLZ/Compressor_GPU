@@ -2,7 +2,7 @@
 
 **Purpose:** Post-compact handoff. Everything you need to know to continue the work without re-discovering context. Read this END-TO-END before doing anything substantive.
 
-**Date frozen:** 2026-06-07 (last commit `7e7d74b`).
+**Date frozen:** 2026-06-07 (last commit `7ae5f3f` — iter-14).
 **Project root:** `c:/Users/james.JAMESWORK2025/Repos/Compressor_GPU`
 
 ---
@@ -32,15 +32,15 @@ Open follow-ups (NOT blocking done-bar):
      NVIDIA GPU (env quirk; affects 7 subprocess tests).
 ```
 
-## Bench numbers at HEAD (`7e7d74b`)
+## Bench numbers at HEAD (`7ae5f3f`)
 
 Fresh-binary verified (M6 protocol), NVIDIA RTX 4060 Ti via `SLZ_VK_DEVICE_INDEX=1`, `-db -r 5`:
 
 | File | VK e2e best | CUDA e2e best | Ratio | VK pure kernel best | CUDA pure kernel |
 |---|---|---|---|---|---|
-| enwik8 (95 MB) | 15.507 ms | 16.18 ms | **0.96×** | 3.02 ms | 3.13 ms |
-| silesia (203 MB) | 29.99 ms | 31.06 ms | **0.97×** | 5.53 ms | — |
-| web.txt (4.3 MB) | 5.239 ms | 2.015 ms | **2.60×** | 1.319 ms | 1.377 ms |
+| enwik8 (95 MB) | 15.809 ms | 16.18 ms | **0.98×** | ~3.0 ms | 3.13 ms |
+| silesia (203 MB) | 30.254 ms | 31.06 ms | **0.97×** | ~5.5 ms | — |
+| web.txt (4.3 MB) | 5.324 ms | 2.015 ms | **2.64×** | 1.319 ms | 1.377 ms |
 
 "Pure kernel best" is sum of per-kernel VkQueryPool timestamps via `last_timings`, post-bench-metric-alignment at commit `d5adeb8`. **Apples-to-apples with CUDA's bench definition.**
 
@@ -49,6 +49,7 @@ Fresh-binary verified (M6 protocol), NVIDIA RTX 4060 Ti via `SLZ_VK_DEVICE_INDEX
 ## Commit history (most recent first — what each one did)
 
 ```
+7ae5f3f  iter 14: persistent descriptor sets per (StreamEntry × pipeline) + LRU import-cache telemetry. (B) RULED OUT cache-miss hypothesis: web 5h/0m/0e, enwik8 10h/0m/0e in steady state. (A) within-noise perf delta but structurally cleaner.
 7e7d74b  iter 13: early-submit transfer cmdbuf (+0.36 ms small gain, structurally cleaner)
 d5adeb8  bench: align "gpu kernel" metric with CUDA (pure VkQueryPool sum, not wall-clock)
 41c4e2c  ptest_vk 74/74 reliably (3-phase runner, per-test contexts, registry lock, env-skip)
@@ -198,41 +199,31 @@ Per-decode API counts (likely reliable):
 
 ### Iter-14 candidates (recommended in priority order)
 
-#### (A) Persistent descriptor sets — **DO THIS FIRST**
-- **Expected gain:** ~250 µs/decode
-- **Risk:** low
-- **Mechanism:** Allocate one VkDescriptorSet per pipeline at `module_loader.init`. Per-call, just `vkUpdateDescriptorSets` to rebind buffer handles + `vkCmdBindDescriptorSets`. Save the `vkAllocateDescriptorSets` cost.
-- **Affects large files too:** yes (small relative gain on enwik8/silesia)
-- **Where:** `srcVK/decode/module_loader.zig::procLaunchKernel` — currently allocates per-call via `vkAllocateDescriptorSets`
+#### (A) Persistent descriptor sets — **DONE at iter-14 (`7ae5f3f`)**
+- **Result:** Implemented per (StreamEntry × pipeline) for async streams + KernelMeta.persistent_desc_set_default for the sync default-stream path. vkUpdateDescriptorSets + vkCmdBindDescriptorSets only per call.
+- **Perf delta:** within noise (web +0.025 ms, enwik8 -0.060 ms, silesia -0.234 ms — silesia improved ~0.8%, others flat). Either the nsys overcounted vkAllocateDescriptorSets, or the cost shifted to vkUpdateDescriptorSets which we still do per call.
+- **Status:** Shipped for structural cleanliness; no perf win on small files.
+- **Race handling:** per-stream persistent_desc_sets are written + bound on the same host thread that owns stream's cmdbuf; default-stream slot protected by existing g_dispatcher_lock.
 
-#### (B) Audit LRU cache hit rate — **DO THIS NEXT**
-- **Expected gain:** ~300 µs/decode IF the cache is missing
-- **Risk:** low (it's just adding telemetry)
-- **Mechanism:** Add a stderr counter under `SLZ_VK_PROFILE_PHASES=1` that emits `phase: import_cache hits=N misses=M evictions=K` per decode. Run web.txt bench, see if misses > 0 in steady state.
-- **If misses > 0:** investigate why bench's repeated `dst` pointer isn't getting cache hits. Maybe the source pointer (web.txt mmap) is the issue — check whether `dec_ctx.decompress(src, dst)` re-mmaps or reuses.
-- **Where:** `srcVK/decode/module_loader.zig` around `lookupImportedBuffer` / `insertImportedBuffer` (iter-8 LRU cache, 16-slot)
+#### (B) LRU cache audit — **DONE at iter-14 (`7ae5f3f`)**
+- **Telemetry added:** atomic counters g_import_cache_hits / misses / evictions, surfaced via SLZ_VK_PROFILE_PHASES=1 as `phase: import_cache hits=N, misses=M, evictions=K`.
+- **Finding (web.txt, 5 measured decodes):** **5 hits / 0 misses / 0 evictions.**
+- **Finding (enwik8, 5 measured decodes):** **10 hits / 0 misses / 0 evictions.** (2 imports/decode: src + dst)
+- **Conclusion:** The iter-8 16-slot LRU import cache is hitting **RELIABLY** in steady state. The nsys "vkAllocateMemory 308 µs amortized" finding was WARM-UP ONLY.
+- **THIS RULES OUT the import path as the residual web.txt gap source.**
+- **Note:** web.txt only does 1 import/decode (the dst) because src is 2.1 MB, below the 4 MiB H2D_IMPORT_THRESHOLD; src takes the iter-4 staging path.
 
-#### (C) Pre-recorded compute cmdbuf reuse
-- **Expected gain:** ~5 µs/decode steady state per iter-14 agent's read (the first-call hot path on `vkBeginCommandBuffer` is 119 µs but drops to ~1 µs by decode 2)
-- **Risk:** medium (descriptor handles change between decodes; need dynamic offsets or push descriptors, or full re-record)
-- **Probably not worth chasing** given the small gain.
+#### (C) Pre-recorded compute cmdbuf reuse — DEFERRED
+- **Expected gain:** ~5 µs/decode steady state. Likely not worth chasing alone.
 
-#### (D) Eliminate the second wait point (consolidate to single submit/wait per decode)
-- **Claimed expected gain:** 2.4 ms (BUT magnitude is suspect — see caveat above; agent's vkWaitForFences number was larger than e2e)
+#### (D) Eliminate the second wait point (consolidate to single submit/wait per decode) — **ONLY REMAINING ATTACK VECTOR**
+- **Claimed expected gain:** 2.4 ms (BUT magnitude is suspect — agent's vkWaitForFences number was larger than e2e)
 - **Risk:** HIGH (substantive architectural change)
 - **Mechanism options:**
   1. GPU-driven indirect dispatch: `vkCmdDispatchIndirect` driven by prefix-sum kernel output, so the LZ dispatch sizing happens GPU-side and the whole decode can record into one cmdbuf, submit once, wait once.
   2. Statically over-allocate threads to max n_chunks bound (cheaper-to-implement variant of 1).
   3. Pre-allocate the second compute cmdbuf + persistent descriptors + persistent imports at init, so the host work between the two waits is minimal (~15 µs).
-- **Recommend deferring until (A) and (B) measured** — the gain estimate is unreliable; do the safe wins first and remeasure.
-
-#### Implementation suggestion
-
-Launch iter-14 as a **combined (A) + (B) workflow**:
-- Add persistent descriptor sets (A) — concrete code change
-- Add LRU cache telemetry (B) — diagnostic addition
-- Rebuild, rebench web.txt + enwik8 + silesia, report numbers
-- Decide whether to chase (D) based on the residual gap
+- **Decision:** After iter-14 confirmed cache + descriptor allocation are NOT the gap, (D) is the only remaining attack vector. Whether to chase it is a judgment call between expected gain (1-3 ms on web.txt, modest on large files) and substantive architectural risk. Recommend ONLY if user wants to push small-file perf below 2× of CUDA.
 
 ---
 
