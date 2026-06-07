@@ -207,6 +207,47 @@ pub const FnMemcpyHtoDAsync = *const fn (VkDeviceBuffer, *const anyopaque, usize
 ///       callconv(.c) CUresult`.
 pub const FnMemcpyDtoHAsync = *const fn (*anyopaque, VkDeviceBuffer, usize, VkStream) callconv(.c) VkResult;
 
+/// VK adaptation: NEW SLOT (no direct CUDA fn-ptr analogue). Pure Vulkan-
+/// native batched D2H gather using vkCmdCopyBuffer's regionCount > 1
+/// parameter. CUDA expresses N per-chunk D2Hs as a host-side loop of N
+/// cuMemcpyDtoH_v2 calls — each one is a cheap (~37 us) round-trip on
+/// the driver because cuMemcpyDtoH already routes to the copy engine and
+/// the per-call submit floor is microscopic. Vulkan-on-WDDM has a
+/// structural per-call submit floor (~137 us per vkWaitForFences/submit
+/// pair) that grows linearly with N — the encode hot path took 1526
+/// per-chunk D2Hs ≈ 210 ms on enwik8.
+///
+/// This slot collapses all N copies into ONE vkCmdCopyBuffer call
+/// (regionCount = N regions, one VkBufferCopy per chunk) recorded on the
+/// stream's transfer cmdbuf, then the next stream_sync issues the one
+/// submit + one wait for the whole batch. Mirrors the encode iter-2
+/// pattern: replace 1526 sync round-trips with one batched record + one
+/// end-of-frame stream_sync.
+///
+/// dst_host: host-pointer destination — when import-eligible (page-
+/// aligned + extension available) the copy lands DIRECTLY in caller's
+/// host buffer via VK_EXT_external_memory_host (zero staging). When not
+/// eligible, falls through to the per-stream staging arena + post-fence
+/// memcpy (iter-4 D2H path).
+pub const FnMemcpyDtoHOffsetGather = *const fn (
+    *anyopaque, // dst_host: imported (page-aligned) host destination
+    VkDeviceBuffer, // src_buf: device source buffer
+    [*]const VkBufferCopyRegion, // regions: srcOffset/dstOffset/size per chunk
+    usize, // n_regions
+    VkStream, // stream (must be non-zero — sync mode keeps procs.d2h_offset)
+) callconv(.c) VkResult;
+
+/// VK adaptation: NEW STRUCT. Mirrors VkBufferCopy (the underlying Vulkan
+/// type vkCmdCopyBuffer consumes) but lives on vulkan_api so callers can
+/// build it without importing the full module_loader. Layout is identical
+/// to VkBufferCopy so `[*]const VkBufferCopyRegion` can be reinterpreted
+/// 1:1 inside the procs impl.
+pub const VkBufferCopyRegion = extern struct {
+    srcOffset: u64,
+    dstOffset: u64,
+    size: u64,
+};
+
 /// VK adaptation: opaque event handle = u64 index into a VkQueryPool slot.
 /// CUDA's CUevent is an opaque driver pointer; the VK port models each
 /// event as a single VK_QUERY_TYPE_TIMESTAMP slot index. 0 is reserved
@@ -298,6 +339,17 @@ pub const Procs = struct {
     /// VK adaptation: vkCmdCopyBuffer to the staging buffer + memcpy
     /// from the persistent mapping after the stream join.
     d2h_async: ?FnMemcpyDtoHAsync = null,
+
+    /// VK adaptation: NEW SLOT (no direct CUDA fn-ptr analogue). Per-
+    /// stream batched D2H gather — see FnMemcpyDtoHOffsetGather doc for
+    /// the rationale (Vulkan submit-floor amortization). Encode hot path
+    /// uses this to collapse the per-chunk D2H loop (1526 sync copies on
+    /// enwik8) into a single vkCmdCopyBuffer(regionCount=N) recorded on
+    /// the transfer cmdbuf + one end-of-frame stream_sync. VMA-precedent
+    /// rule: Vulkan exposes the gather natively via vkCmdCopyBuffer's
+    /// regionCount param; CUDA has no analog because cuMemcpyDtoH's
+    /// per-call cost is already tiny.
+    d2h_offset_gather: ?FnMemcpyDtoHOffsetGather = null,
 
     /// CUDA reference: cuMemcpyDtoDAsync_fn. Device → device async copy
     /// on `stream`. VK adaptation: vkCmdCopyBuffer recorded into the
