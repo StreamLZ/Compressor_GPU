@@ -155,23 +155,6 @@ pub const EncodeContext = struct {
     huff_tok_sizes: ?[]u32 = null,
     huff_tok_offsets: ?[]u32 = null,
 
-    // VK adaptation (encode iter-2): persistent page-aligned host buffer
-    // that backs `gpu_out` in fast_framed.compressFramedOne. Pre-iter-2
-    // gpuEncodeAndAssemble alloc'd ~285 MB via std heap each call (defer
-    // free), which produced a fresh host_ptr per encode — defeating the
-    // iter-8 LRU import cache so procD2HOffsetGather paid a fresh
-    // VK_EXT_external_memory_host import (~1 ms) every encode. Backed by
-    // gpu_dec_driver.allocHost (which routes through procMallocHost ->
-    // page-aligned VMA host alloc) so it satisfies the
-    // VkImportMemoryHostPointerInfoEXT alignment constraint
-    // (minImportedHostPointerAlignment == 4 KiB on every desktop
-    // driver). Grow-only semantics via ensureGpuOutBuf below; on grow
-    // the prior import (if any) is invalidated via
-    // decode_module_loader.releaseImportsByHostRange so the cache slot
-    // for the dead host_ptr does not survive past the freeHost.
-    gpu_out_buf: ?[]u8 = null,
-    gpu_out_buf_size: usize = 0,
-
     /// CUDA reference: src/encode/encode_context.zig:223-276. Free every
     /// owned device + host buffer and reset every field to its default.
     pub fn deinit(self: *EncodeContext, allocator: std.mem.Allocator) void {
@@ -231,54 +214,10 @@ pub const EncodeContext = struct {
             self.pipeline_stream_created = false;
         }
 
-        // VK adaptation (encode iter-2): page-aligned persistent host
-        // gpu_out buffer. Release any LRU import that references this
-        // host pointer BEFORE freeHost so the cache entry doesn't
-        // outlive the underlying allocation (the dangling host_ptr
-        // would otherwise collide with a fresh procMallocHost call that
-        // happens to reuse the address — vkCmdCopyBuffer would then
-        // write to the prior physical pages and the caller would read
-        // zeros).
-        if (self.gpu_out_buf) |buf| {
-            @import("../decode/module_loader.zig").releaseImportsByHostRange(@ptrCast(buf.ptr), buf.len);
-            if (vk.procs.free_host) |free_host_fn| _ = free_host_fn(@ptrCast(buf.ptr));
-            self.gpu_out_buf = null;
-            self.gpu_out_buf_size = 0;
-        }
-
         self.pending_timings.deinit(std.heap.page_allocator);
         self.last_timings.deinit(std.heap.page_allocator);
     }
 };
-
-/// VK adaptation (encode iter-2): grow-only host buffer ensure. Returns
-/// the live slice on success, null on backend failure. Mirrors
-/// `ensureBuf` shape but for the page-aligned host allocation backing
-/// `gpu_out` in fast_framed.compressFramedOne. On grow: invalidates the
-/// LRU import cache entries for the soon-to-be-freed host pages BEFORE
-/// freeHost so a subsequent procD2HOffsetGather doesn't hit a stale
-/// (vk_buf, vk_mem) pair pointing at recycled memory.
-pub fn ensureGpuOutBuf(self: *EncodeContext, needed: usize) ?[]u8 {
-    if (self.gpu_out_buf) |existing| {
-        if (existing.len >= needed) return existing[0..needed];
-    }
-    // Use the decode-driver allocHost helper (which routes through
-    // procs.malloc_host = procMallocHost -> page-aligned page_allocator
-    // alloc). Page alignment is required by the iter-12 import path's
-    // VkImportMemoryHostPointerInfoEXT.allocationSize % alignment == 0
-    // contract — see procMallocHost rounding rationale.
-    const allocHost = @import("../decode/decode_context.zig").allocHost;
-    if (self.gpu_out_buf) |old| {
-        @import("../decode/module_loader.zig").releaseImportsByHostRange(@ptrCast(old.ptr), old.len);
-        if (vk.procs.free_host) |free_host_fn| _ = free_host_fn(@ptrCast(old.ptr));
-        self.gpu_out_buf = null;
-        self.gpu_out_buf_size = 0;
-    }
-    const fresh = allocHost(needed) orelse return null;
-    self.gpu_out_buf = fresh;
-    self.gpu_out_buf_size = fresh.len;
-    return fresh[0..needed];
-}
 
 /// CUDA reference: src/encode/encode_context.zig:284-293. Grow-only:
 /// returns early when `current_size.*` already fits `needed`. Otherwise

@@ -54,11 +54,6 @@ pub fn gpuCompressImpl(
     const launch_fn = vk.procs.launch_kernel orelse return false;
     const sync_fn = vk.procs.ctx_sync orelse return false;
     const stream_sync_fn = vk.procs.stream_sync orelse return false;
-    // VK adaptation (encode iter-2): batched per-chunk D2H gather slot.
-    // Optional; the sync (stream==0) branch keeps the original per-chunk
-    // d2h_offset loop so callers that haven't bound this slot (none in
-    // practice — module_loader.init wires it unconditionally) still work.
-    const d2h_offset_gather_fn = vk.procs.d2h_offset_gather;
 
     const num_chunks: u32 = @intCast(chunk_descs.len);
     const desc_bytes = chunk_descs.len * @sizeOf(CompressChunkDesc);
@@ -211,72 +206,21 @@ pub fn gpuCompressImpl(
         if (d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes) != VK_SUCCESS_RC) return false;
     }
 
-    // VK adaptation (encode iter-2): mirrors CUDA's per-chunk D2H loop
-    // at src/encode/encode_lz.zig:144-150 logically — every non-empty
-    // chunk gets `cs` bytes copied from d_output[dst_off] into
-    // output[dst_off]. The CUDA loop runs N synchronous cuMemcpyDtoH
-    // calls, each ~37 us on the driver — fine on CUDA. Vulkan-on-WDDM
-    // has a structural per-submit/wait floor (~137 us per
-    // vkWaitForFences) so N=1526 round-trips ≈ 210 ms on enwik8.
-    //
-    // The gather slot collapses all N copies into ONE vkCmdCopyBuffer
-    // (regionCount = N) recorded on the stream's transfer cmdbuf; the
-    // immediately-following stream_sync fires the single submit + wait
-    // for the whole batch. Per-call cost on subsequent encodes is
-    // (record N regions) + (one submit-wait pair) — independent of N
-    // structurally.
-    //
-    // Mirrors decode iter-7 (imported host destination → zero staging
-    // memcpy) + iter-11 (transfer queue) + iter-15 (single submit/wait
-    // per encode). When the dst host pointer is page-aligned (gpu_out
-    // is backed by encode_context.ensureGpuOutBuf → procMallocHost) the
-    // import-cache hits on every call after the first.
-    //
-    // Sync (stream==0) path keeps the original per-chunk d2h_offset
-    // loop unchanged — it's used by some ptest_vk tests that bind a
-    // per-test EncodeContext without a stream, and the inner sync
-    // submit-wait is already serialized by the singleton
-    // g_command_buffer there.
-    if (use_stream and d2h_offset_gather_fn != null) {
-        // Build the regions array. Worst case n_regions == chunk_descs.len
-        // (~1526 on enwik8 = 36 KB stack — too large; use page heap).
-        const gpa = std.heap.page_allocator;
-        const regions_buf = gpa.alloc(vk.VkBufferCopyRegion, chunk_descs.len) catch return false;
-        defer gpa.free(regions_buf);
-        var n_regions: usize = 0;
-        for (0..chunk_descs.len) |i| {
-            const cs = comp_sizes_out[i];
-            if (cs > 0) {
-                const dst_off = chunk_descs[i].dst_offset;
-                regions_buf[n_regions] = .{
-                    .srcOffset = dst_off,
-                    .dstOffset = dst_off,
-                    .size = cs,
-                };
-                n_regions += 1;
-            }
-        }
-        if (n_regions > 0) {
-            if (d2h_offset_gather_fn.?(@ptrCast(output.ptr), d_output, regions_buf.ptr, n_regions, work_stream) != VK_SUCCESS_RC) return false;
-            // Flush the transfer cmdbuf. ONE submit + ONE wait drains
-            // all N copies. The caller (fast_framed.compressFramedOne)
-            // does not call stream_sync between gpuCompressImpl and the
-            // assemble passes that follow, so without this flush the
-            // gather would sit in the cmdbuf and the host could not
-            // read output[] for the L1 assemble path.
-            if (stream_sync_fn(work_stream) != VK_SUCCESS_RC) return false;
-        }
-    } else {
-        // Sync (stream==0) fallback OR gather slot unavailable: keep
-        // the original per-chunk d2h_offset loop verbatim. Mirrors
-        // CUDA's src/encode/encode_lz.zig:144-150 exactly. Only used
-        // for the singleton g_command_buffer path (no stream).
-        for (0..chunk_descs.len) |i| {
-            const cs = comp_sizes_out[i];
-            if (cs > 0) {
-                const dst_off = chunk_descs[i].dst_offset;
-                if (d2h_offset_fn(@ptrCast(output.ptr + dst_off), d_output, cs, dst_off) != VK_SUCCESS_RC) return false;
-            }
+    // VK adaptation: mirrors CUDA's per-chunk D2H loop at
+    // src/encode/encode_lz.zig:144-150 verbatim. CUDA's
+    // cuMemcpyDtoH(host + dst_off, d_output + dst_off, cs) folds the
+    // device-side offset into pointer arithmetic on the real device VA;
+    // on Vulkan VkDeviceBuffer is a registry handle, so the device-side
+    // offset travels through the procs.d2h_offset slot's srcOffset
+    // argument and ends up in VkBufferCopy.srcOffset. Net result: only
+    // sum(comp_sizes) bytes leave the device instead of the full
+    // n_gpu_blocks * per_block_cap output capacity (763 sub-blocks
+    // × 384 KB = ~285 MB on enwik8 fell to ~50 MB compressed).
+    for (0..chunk_descs.len) |i| {
+        const cs = comp_sizes_out[i];
+        if (cs > 0) {
+            const dst_off = chunk_descs[i].dst_offset;
+            if (d2h_offset_fn(@ptrCast(output.ptr + dst_off), d_output, cs, dst_off) != VK_SUCCESS_RC) return false;
         }
     }
 
