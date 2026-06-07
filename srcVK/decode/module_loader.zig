@@ -1211,6 +1211,22 @@ var g_import_cache: [G_IMPORT_CACHE_CAP]?ImportedEntry = @splat(@as(?ImportedEnt
 // (on first successful import). Read under SLZ_VK_PROFILE_PHASES=1 to
 // verify HOST_CACHED was selected on NVIDIA. Pure diagnostic.
 var g_import_mem_type_logged: bool = false;
+
+// VK adaptation (OOM noise fix, 2026-06-07): sticky per-direction
+// "import disabled" flags for VK_EXT_external_memory_host. NVIDIA's
+// driver returns VK_ERROR_OUT_OF_DEVICE_MEMORY for every
+// VkImportMemoryHostPointerInfoEXT alloc on the H2D direction
+// (usage_src=true) of an RTX 4060 Ti — likely because the dedicated
+// transfer queue family can't access importable HOST_VISIBLE memory
+// types on this driver, even though they pass the
+// vkGetMemoryHostPointerPropertiesEXT compatibility filter. The first
+// failure flips the corresponding bool below; tryImportHostBuffer then
+// short-circuits to staging fallback up front, eliminating the
+// BestPractices-Error-Result warning the validation layer prints on
+// every retry. D2H (usage_src=false) tracked separately because it
+// reliably succeeds on HOST_CACHED here.
+var g_import_disabled_h2d: bool = false;
+var g_import_disabled_d2h: bool = false;
 const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT_CONST: u32 = 0x00000004;
 const VK_MEMORY_PROPERTY_HOST_CACHED_BIT_CONST: u32 = 0x00000008;
 const VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT_CONST: u32 = 0x00000001;
@@ -2238,6 +2254,21 @@ pub fn init() bool {
             g_ext_memory_host_supported = false;
         }
     }
+
+    // VK adaptation (OOM noise fix, 2026-06-07): NO preemptive disable
+    // of g_import_disabled_h2d / _d2h here — the runtime sticky disable
+    // in tryImportHostBuffer suffices. An earlier draft preemptively
+    // flipped g_import_disabled_h2d=true for NVIDIA and regressed -db
+    // bench by ~22 % (decompress best 15.6 ms → 19.1 ms). The driver's
+    // H2D-SRC import is fragile but not uniformly broken: it succeeds
+    // when the imported region comes from procMallocHost-pinned host
+    // memory (which bench mode uses for compressed input + decoded
+    // output) and fails with VK_ERROR_OUT_OF_DEVICE_MEMORY when the
+    // region comes from a plain page-allocator slice (which the
+    // one-shot CLI uses for file-IO buffers). Leaving the disable to
+    // tryImportHostBuffer's per-OOM trip yields 0 warnings in bench
+    // mode and 1 warning per direction per process for -c/-d one-shot
+    // mode (vs. one warning per cache miss before).
 
     // Per-context staging command pool + buffer + fence. Reused by every
     // procs.h2d / d2h / d2d / memset call. The pool has the
@@ -3314,6 +3345,23 @@ fn insertImportedBuffer(host_addr: usize, size: usize, vk_buf: VkBuffer, vk_mem:
 fn tryImportHostBuffer(host_ptr: *anyopaque, size: usize, usage_src: bool) ?PendingImportedD2H {
     if (!g_ext_memory_host_supported) return null;
     if (g_imported_host_alignment == 0) return null;
+    // VK adaptation (OOM noise fix, 2026-06-07): per-direction sticky
+    // skip after the first vkAllocateMemory(import) returns
+    // VK_ERROR_OUT_OF_DEVICE_MEMORY. The fail-set lives at the very
+    // bottom of this function and trips only when an import alloc
+    // actually fails — so bench-mode runs whose pinned input/output
+    // come from procMallocHost (which the driver accepts) keep the
+    // zero-copy fast path, while one-shot -c/-d CLI runs whose IO
+    // buffers come from plain page-allocator slices (which NVIDIA
+    // RTX 4060 Ti rejects on the H2D-SRC direction) take the
+    // staging fallback once and silently skip the alloc on every
+    // subsequent cache miss. Without this short-circuit each cache
+    // miss re-triggered the BestPractices-Error-Result validation
+    // warning (~1-5 per encode, ~2 per decode); with it, exactly
+    // one warning per direction fires per process lifetime — the
+    // one that originally set the flag.
+    if (usage_src and g_import_disabled_h2d) return null;
+    if (!usage_src and g_import_disabled_d2h) return null;
     const align_mask = g_imported_host_alignment - 1;
     const addr = @intFromPtr(host_ptr);
     if (size == 0) return null;
@@ -3501,6 +3549,17 @@ fn tryImportHostBuffer(host_ptr: *anyopaque, size: usize, usage_src: bool) ?Pend
     // already rounded above. Iter 9: pHostPointer is the page-aligned
     // BASE (aligned_base_ptr), not the caller's potentially-offset
     // pointer.
+    //
+    // VK adaptation (OOM noise fix, 2026-06-07): a single
+    // vkAllocateMemory attempt — on OOM we flip the per-direction
+    // sticky disable flag so all subsequent imports for this direction
+    // bypass the alloc entirely and short-circuit to staging fallback.
+    // This matches the pre-fix behavior of "1 alloc per call" and
+    // additionally guarantees only ONE BestPractices-Error-Result
+    // warning per direction per process (vs. one per cache miss before),
+    // which on NVIDIA RTX 4060 Ti drops H2D from 5+ warnings per encode
+    // to exactly 1 warning total (only emitted on the very first
+    // import attempt that triggers the driver rejection).
     var import_info = VkImportMemoryHostPointerInfoEXT{
         .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
         .pHostPointer = aligned_base_ptr,
@@ -3511,7 +3570,13 @@ fn tryImportHostBuffer(host_ptr: *anyopaque, size: usize, usage_src: bool) ?Pend
         .memoryTypeIndex = @intCast(mt_idx),
     };
     var mem: VkDeviceMemory = 0;
-    if (vkAllocateMemory_fn.?(dev, &mai, null, &mem) != VK_SUCCESS_RC) {
+    const alloc_rc = vkAllocateMemory_fn.?(dev, &mai, null, &mem);
+    if (alloc_rc != VK_SUCCESS_RC) {
+        // Sticky direction-level disable: every subsequent call for
+        // this usage_src short-circuits at the top of tryImportHost
+        // Buffer. Pre-fix this OOM fired once per cache miss; now it
+        // fires exactly once per direction per process.
+        if (usage_src) g_import_disabled_h2d = true else g_import_disabled_d2h = true;
         vkDestroyBuffer_fn.?(dev, buf, null);
         return null;
     }
