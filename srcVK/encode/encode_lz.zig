@@ -144,21 +144,71 @@ pub fn gpuCompressImpl(
     // Download comp_sizes first, then only the actual compressed bytes per block.
     if (d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes) != VK_SUCCESS_RC) return false;
 
-    // VK adaptation: mirrors CUDA's per-chunk D2H loop at
-    // src/encode/encode_lz.zig:144-150 verbatim. CUDA's
-    // cuMemcpyDtoH(host + dst_off, d_output + dst_off, cs) folds the
-    // device-side offset into pointer arithmetic on the real device VA;
-    // on Vulkan VkDeviceBuffer is a registry handle, so the device-side
-    // offset travels through the procs.d2h_offset slot's srcOffset
-    // argument and ends up in VkBufferCopy.srcOffset. Net result: only
-    // sum(comp_sizes) bytes leave the device instead of the full
-    // n_gpu_blocks * per_block_cap output capacity (763 sub-blocks
-    // × 384 KB = ~285 MB on enwik8 fell to ~50 MB compressed).
-    for (0..chunk_descs.len) |i| {
-        const cs = comp_sizes_out[i];
-        if (cs > 0) {
-            const dst_off = chunk_descs[i].dst_offset;
-            if (d2h_offset_fn(@ptrCast(output.ptr + dst_off), d_output, cs, dst_off) != VK_SUCCESS_RC) return false;
+    // VK adaptation (encode D2H gather, iter-7+11+15 transferable):
+    // The CUDA reference at src/encode/encode_lz.zig:144-150 expresses
+    // the per-chunk D2H readback as N synchronous cuMemcpyDtoH calls —
+    // each ~37 us on the CUDA driver (per-call cost is microscopic
+    // because cuMemcpyDtoH already routes to the copy engine). On
+    // Vulkan-on-WDDM the per-submit floor is ~50-150 us, so N=1526
+    // submit+wait pairs on enwik8 sat near ~210 ms.
+    //
+    // This replacement is STRICTLY DOWNSTREAM of the LZ kernel
+    // sync_fn() above (line ~133). The kernel dispatch path, its H2D
+    // inputs (d_input, d_descs, d_hash memset), and the sync_fn that
+    // drains its compute work are all unchanged — only the D2H readback
+    // shape changes. As a result this change cannot affect the
+    // compressed bytes the GPU produces; it only changes how those
+    // bytes travel from d_output to the host `output` slice.
+    //
+    // Net behavior identical to the CUDA per-chunk loop: every
+    // non-empty chunk reads `cs` bytes from d_output[dst_off] into
+    // output[dst_off], so the assembled `output` buffer is byte-
+    // identical to what the per-call procs.d2h_offset loop produced.
+    //
+    // The gather slot collapses all N copies into ONE vkCmdCopyBuffer
+    // with regionCount = N on a one-shot transfer-queue cmdbuf, drained
+    // by ONE submit + ONE wait. When the dst host pointer is page-
+    // aligned (it is — backed by EncodeContext.gpu_out_buf via
+    // procMallocHost in fast_framed) the iter-8 LRU import cache hits
+    // on every call after the first.
+    //
+    // Fallback: if d2h_offset_gather is unbound (defensive — module_loader.init
+    // wires it unconditionally) or returns failure, the gather impl
+    // itself falls through to a per-region procD2HOffset loop, so
+    // correctness is preserved on every backend.
+    const d2h_offset_gather_fn = vk.procs.d2h_offset_gather;
+    if (d2h_offset_gather_fn) |gather_fn| {
+        // Build the regions array. Worst case n_regions == chunk_descs.len
+        // (~1526 on enwik8 = 36 KB). The gather is called once per
+        // encode so the page-heap alloc is negligible.
+        const gpa = std.heap.page_allocator;
+        const regions_buf = gpa.alloc(vk.VkBufferCopyRegion, chunk_descs.len) catch return false;
+        defer gpa.free(regions_buf);
+        var n_regions: usize = 0;
+        for (0..chunk_descs.len) |i| {
+            const cs = comp_sizes_out[i];
+            if (cs > 0) {
+                const dst_off = chunk_descs[i].dst_offset;
+                regions_buf[n_regions] = .{
+                    .src_offset = dst_off,
+                    .dst_offset = dst_off,
+                    .size = cs,
+                };
+                n_regions += 1;
+            }
+        }
+        if (n_regions > 0) {
+            if (gather_fn(@ptrCast(output.ptr), d_output, regions_buf.ptr, n_regions) != VK_SUCCESS_RC) return false;
+        }
+    } else {
+        // Per-chunk fallback. Mirrors CUDA's src/encode/encode_lz.zig:144-150
+        // exactly. Used only if the gather slot is somehow unbound.
+        for (0..chunk_descs.len) |i| {
+            const cs = comp_sizes_out[i];
+            if (cs > 0) {
+                const dst_off = chunk_descs[i].dst_offset;
+                if (d2h_offset_fn(@ptrCast(output.ptr + dst_off), d_output, cs, dst_off) != VK_SUCCESS_RC) return false;
+            }
         }
     }
 

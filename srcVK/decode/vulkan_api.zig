@@ -207,6 +207,55 @@ pub const FnMemcpyHtoDAsync = *const fn (VkDeviceBuffer, *const anyopaque, usize
 ///       callconv(.c) CUresult`.
 pub const FnMemcpyDtoHAsync = *const fn (*anyopaque, VkDeviceBuffer, usize, VkStream) callconv(.c) VkResult;
 
+/// VK adaptation: NEW STRUCT (no CUDA analogue). Mirrors VkBufferCopy
+/// (the underlying Vulkan vkCmdCopyBuffer region type) but exposed
+/// through vulkan_api so encode-side callers can build a regions array
+/// without importing the full module_loader. Layout is identical to
+/// VkBufferCopy so `[*]const VkBufferCopyRegion` reinterprets 1:1 inside
+/// the procs impl.
+pub const VkBufferCopyRegion = extern struct {
+    src_offset: u64,
+    dst_offset: u64,
+    size: u64,
+};
+
+/// VK adaptation: NEW SLOT (no direct CUDA fn-ptr analogue).
+/// Synchronous batched D2H gather built on vkCmdCopyBuffer's native
+/// regionCount > 1 parameter. CUDA expresses N per-chunk D2Hs as a host
+/// loop of N cuMemcpyDtoH_v2 calls — each one is a cheap (~37 us)
+/// round-trip on the CUDA driver because per-call cost is microscopic.
+/// Vulkan-on-WDDM has a structural ~50-150 us per-submit floor (one
+/// vkWaitForFences/submit pair) that grows linearly with N; the encode
+/// hot path's 1526 per-chunk D2Hs sat near ~210 ms on enwik8.
+///
+/// This slot collapses all N copies into ONE vkCmdCopyBuffer call
+/// (regionCount = N regions, one VkBufferCopyRegion per chunk) recorded
+/// on a one-shot transfer-queue cmdbuf and drained by ONE submit + ONE
+/// wait. The transfer queue is the dedicated VK_QUEUE_TRANSFER_BIT DMA
+/// engine on NVIDIA (qf=1), so the bytes move on the copy engine even
+/// though the call is synchronous from the caller's perspective.
+///
+/// The call is SYNC (no stream argument) — the impl internally submits
+/// to g_transfer_queue and blocks on g_xfer_oneshot_fence before
+/// returning, so callers can read `dst_host` immediately. This avoids
+/// any coordination with the per-stream cmdbuf shape; the LZ kernel
+/// path stays on the compute queue / default stream untouched.
+///
+/// dst_host: host destination pointer. When page-aligned and the
+/// span ≥ 4 MiB the VK_EXT_external_memory_host fast path imports the
+/// host buffer (LRU-cached via tryImportHostBuffer) and the gather
+/// vkCmdCopyBuffer writes DIRECTLY into the caller's host pages — zero
+/// staging memcpy. Otherwise impls may fall back to a per-region
+/// procD2HOffset loop (slower but correct). The encode hot path pins
+/// dst_host on EncodeContext.gpu_out_buf via procMallocHost so the
+/// import is page-aligned and cache-hits every call after the first.
+pub const FnMemcpyDtoHOffsetGather = *const fn (
+    *anyopaque, // dst_host
+    VkDeviceBuffer, // src_buf
+    [*]const VkBufferCopyRegion, // regions array
+    usize, // n_regions
+) callconv(.c) VkResult;
+
 /// VK adaptation: opaque event handle = u64 index into a VkQueryPool slot.
 /// CUDA's CUevent is an opaque driver pointer; the VK port models each
 /// event as a single VK_QUERY_TYPE_TIMESTAMP slot index. 0 is reserved
@@ -286,6 +335,17 @@ pub const Procs = struct {
     /// to download only the actual compressed bytes per block instead of
     /// the whole gpu_out capacity.
     d2h_offset: ?*const fn (*anyopaque, VkDeviceBuffer, usize, usize) callconv(.c) VkResult = null,
+
+    /// VK adaptation: NEW SLOT (no direct CUDA fn-ptr analogue).
+    /// Synchronous batched D2H gather using vkCmdCopyBuffer's native
+    /// regionCount > 1 parameter, routed to the dedicated transfer queue
+    /// (one submit + one wait per call, not per region). VMA-precedent:
+    /// Vulkan exposes the gather natively; CUDA has no analog because
+    /// cuMemcpyDtoH per-call cost is already tiny. See doc on
+    /// FnMemcpyDtoHOffsetGather above for the full rationale.
+    /// Replaces the encode hot-path's per-chunk d2h_offset loop on
+    /// Vulkan-on-WDDM where the per-submit floor multiplies by N.
+    d2h_offset_gather: ?FnMemcpyDtoHOffsetGather = null,
 
     /// CUDA reference: src/decode/cuda_api.zig:117 (cuMemcpyHtoDAsync_fn).
     /// Host → device async copy on `stream`.

@@ -219,8 +219,25 @@ fn gpuEncodeAndAssemble(
     const comp_sizes = try allocator.alloc(u32, n_gpu_blocks);
     defer allocator.free(comp_sizes);
     const per_block_cap = gpu_block * gpu_block_capacity_multiplier;
-    const gpu_out = try allocator.alloc(u8, n_gpu_blocks * per_block_cap);
-    defer allocator.free(gpu_out);
+    // VK adaptation (encode D2H gather): use the EncodeContext's
+    // persistent page-aligned host buffer so the iter-8 LRU import
+    // cache in procD2HOffsetGather hits on every call after the first
+    // (same host_ptr across encodes). Pre-fix this was a per-call
+    // allocator.alloc which produced a fresh host_ptr each encode and
+    // paid a fresh ~1 ms VK_EXT_external_memory_host import on top of
+    // the per-region submit-floor cost. Falls back to allocator.alloc
+    // when ensureGpuOutBuf returns null (backend unavailable /
+    // malloc_host null) — preserves the pre-fix behavior for
+    // init-failed contexts.
+    var gpu_out_fallback: ?[]u8 = null;
+    defer if (gpu_out_fallback) |fb| allocator.free(fb);
+    const gpu_out: []u8 = if (gpu_enc.ensureGpuOutBuf(enc_ctx, n_gpu_blocks * per_block_cap)) |buf|
+        buf
+    else blk: {
+        const fb = try allocator.alloc(u8, n_gpu_blocks * per_block_cap);
+        gpu_out_fallback = fb;
+        break :blk fb;
+    };
 
     {
         var bi: usize = 0;

@@ -1279,6 +1279,21 @@ var g_transfer_queue: usize = 0;
 var g_transfer_queue_family: u32 = 0;
 var g_transfer_cmd_pool: VkCommandPool = VK_NULL_HANDLE;
 var g_has_dedicated_transfer: bool = false;
+// VK adaptation (encode D2H gather): one-shot cmdbuf + fence dedicated
+// to procD2HOffsetGather. Sits on g_transfer_cmd_pool so submits land
+// on the dedicated DMA queue (g_transfer_queue, qf=1 on NVIDIA). Reset
+// on every gather call. Allocated lazily on the first gather call so
+// init() stays branch-free. Per-gather lifecycle:
+//   1. vkResetCommandBuffer + vkBeginCommandBuffer
+//   2. vkCmdCopyBuffer (regionCount = N)
+//   3. vkEndCommandBuffer + vkResetFences + vkQueueSubmit + vkWaitForFences
+//   4. Clear in-flight marker on the cached import slot (if any)
+// Single owner (the encode hot path's gather call is wrapped in
+// lockEncodeDispatcherMutex by fast_framed.compressFramedOne), so no
+// external serialization needed.
+var g_xfer_oneshot_cb: VkCommandBuffer = null;
+var g_xfer_oneshot_fence: VkFence = VK_NULL_HANDLE;
+var g_xfer_oneshot_ready: bool = false;
 var g_staging_buffer: vma.VkBuffer = 0;
 var g_staging_alloc: vma.VmaAllocation = null;
 var g_staging_size: usize = 0;
@@ -2371,6 +2386,9 @@ pub fn init() bool {
     vulkan_api.procs.h2d = procH2D;
     vulkan_api.procs.d2h = procD2H;
     vulkan_api.procs.d2h_offset = procD2HOffset;
+    // VK adaptation (encode D2H gather): batched gather slot routed to
+    // the dedicated transfer queue. See procD2HOffsetGather impl below.
+    vulkan_api.procs.d2h_offset_gather = procD2HOffsetGather;
     vulkan_api.procs.d2d = procD2D;
     vulkan_api.procs.memset_d8 = procMemsetD8;
     vulkan_api.procs.memset_d8_async = procMemsetD8Async;
@@ -3023,6 +3041,220 @@ fn procD2HOffset(dst: *anyopaque, src: VkDeviceBuffer, size: usize, src_offset: 
     const mapped = g_staging_mapped orelse return -1;
     @memcpy(@as([*]u8, @ptrCast(dst))[0..size], @as([*]const u8, @ptrCast(mapped))[0..size]);
     return VK_SUCCESS_RC;
+}
+
+// VK adaptation (encode D2H gather, iter-7+11+15 transferable):
+// Lazily allocate the one-shot transfer cmdbuf + fence on the first
+// gather call. Cheaper than baking the alloc into init() — it costs
+// nothing when the slot is never exercised (e.g. ptest_vk subtests
+// that only hit decode).
+fn ensureXferOneshotReady() bool {
+    if (g_xfer_oneshot_ready) return true;
+    const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
+    const cb_alloc = VkCommandBufferAllocateInfo{
+        .commandPool = g_transfer_cmd_pool,
+        .commandBufferCount = 1,
+    };
+    if (vkAllocateCommandBuffers_fn.?(dev, &cb_alloc, @ptrCast(&g_xfer_oneshot_cb)) != VK_SUCCESS_RC) return false;
+    const fence_ci = VkFenceCreateInfo{};
+    if (vkCreateFence_fn.?(dev, &fence_ci, null, &g_xfer_oneshot_fence) != VK_SUCCESS_RC) return false;
+    g_xfer_oneshot_ready = true;
+    return true;
+}
+
+// VK adaptation (encode D2H gather, mirrors decode iter-7+11+15):
+// Synchronous batched D2H. Replaces the encode hot-path's per-chunk
+// procD2HOffset loop (1526 submit+wait pairs on enwik8 ≈ ~210 ms at
+// the Vulkan-on-WDDM ~137 us submit floor) with ONE vkCmdCopyBuffer
+// (regionCount = n_regions) on a one-shot cmdbuf from
+// g_transfer_cmd_pool, submitted to g_transfer_queue (NVIDIA dedicated
+// DMA engine, qf=1) and drained by ONE vkWaitForFences.
+//
+// Pattern derivation:
+//   iter-7 analog: VK_EXT_external_memory_host import wraps dst_host as
+//     a VkBuffer with TRANSFER_DST usage. vkCmdCopyBuffer writes DIRECTLY
+//     into the caller's host pages — zero staging memcpy. The encode hot
+//     path's dst_host is EncodeContext.gpu_out_buf (page-aligned via
+//     procMallocHost), so tryImportHostBuffer hits the iter-8 LRU cache
+//     on every call after the first.
+//   iter-11 analog: submit + wait happen on g_transfer_queue (the
+//     dedicated VK_QUEUE_TRANSFER_BIT queue). NVIDIA RTX 4060 Ti has
+//     this on the dedicated DMA engine (qf=1, flags=0x0c per the init
+//     log); routing the gather here keeps the compute queue free and
+//     lets the DMA engine run unconcurrently with whatever the compute
+//     queue is doing.
+//   iter-15 analog: ONE vkCmdCopyBuffer with regionCount = N folds N
+//     copies into a single GPU command. Per-call cost on subsequent
+//     encodes is one cache-hit lookup + N copyRegion fills + one
+//     submit-wait pair (~137 us) — structurally independent of N.
+//
+// Sync contract: this call DOES NOT take a stream argument. The caller
+// can read dst_host immediately on return. The encode hot path uses it
+// AFTER the LZ kernel sync_fn has already drained the compute queue, so
+// there's no inter-queue ordering concern (the GPU has finished writing
+// d_output before this gather reads it).
+//
+// Fallback: when the import path fails (extension absent, OOM-disabled,
+// span < threshold, or page-alignment mismatch), drop back to a
+// per-region procD2HOffset loop so correctness is preserved at the
+// price of the per-region submit cost (the pre-fix shape).
+fn procD2HOffsetGather(
+    dst_host: *anyopaque,
+    src: VkDeviceBuffer,
+    regions: [*]const vulkan_api.VkBufferCopyRegion,
+    n_regions: usize,
+) callconv(.c) VkResult {
+    if (n_regions == 0) return VK_SUCCESS_RC;
+    const src_entry = lookupAlloc(src) orelse return -1;
+
+    // Compute the host-side span this gather will touch. dstOffset is
+    // caller-buffer-local (encode passes chunk_descs[i].dst_offset for
+    // both src and dst — mirrors CUDA's d_output + dst_off pointer
+    // arithmetic). The import-fast-path needs the worst-case host
+    // address that vkCmdCopyBuffer will write to so it can size the
+    // imported VkBuffer correctly.
+    var span_hi: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < n_regions) : (i += 1) {
+            const end = regions[i].dst_offset + regions[i].size;
+            if (end > span_hi) span_hi = end;
+        }
+    }
+    if (span_hi == 0) return VK_SUCCESS_RC;
+    const span: usize = @intCast(span_hi);
+
+    // Per-region procD2HOffset fallback. Used when the import path is
+    // unavailable or fails. Preserves the pre-fix per-call semantics
+    // exactly (same VkBufferCopy.srcOffset shape), so correctness is
+    // identical — only perf differs.
+    const fallbackLoop = struct {
+        fn run(
+            dst_h: *anyopaque,
+            src_b: VkDeviceBuffer,
+            regs: [*]const vulkan_api.VkBufferCopyRegion,
+            n: usize,
+        ) VkResult {
+            const dst_bytes = @as([*]u8, @ptrCast(dst_h));
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                const r = regs[i];
+                if (r.size == 0) continue;
+                const rc = procD2HOffset(
+                    @as(*anyopaque, @ptrCast(dst_bytes + r.dst_offset)),
+                    src_b,
+                    @intCast(r.size),
+                    @intCast(r.src_offset),
+                );
+                if (rc != VK_SUCCESS_RC) return rc;
+            }
+            return VK_SUCCESS_RC;
+        }
+    }.run;
+
+    // Threshold matches the H2D import gate. Tiny gathers stay on the
+    // staging path (pre-fix loop) where amortization across the
+    // ~200 us alloc cost is poor.
+    const D2H_GATHER_IMPORT_THRESHOLD: usize = 4 * 1024 * 1024;
+    if (span < D2H_GATHER_IMPORT_THRESHOLD) return fallbackLoop(dst_host, src, regions, n_regions);
+
+    // Iter-7 fast path: import dst_host as a TRANSFER_DST VkBuffer.
+    // tryImportHostBuffer returns null on extension absence / OOM-
+    // disabled / misalignment — fall back to the per-region loop.
+    const imported = tryImportHostBuffer(dst_host, span, false) orelse
+        return fallbackLoop(dst_host, src, regions, n_regions);
+
+    // Iter-11 fast path: end-to-end on g_transfer_queue. Lazily set up
+    // the cmdbuf + fence the first time we get here.
+    if (!ensureXferOneshotReady()) return fallbackLoop(dst_host, src, regions, n_regions);
+
+    markImportInFlight(imported.cache_idx);
+
+    const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
+
+    // Reset + Begin the one-shot transfer cmdbuf.
+    _ = vkResetCommandBuffer_fn.?(g_xfer_oneshot_cb, 0);
+    const begin = VkCommandBufferBeginInfo{
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (vkBeginCommandBuffer_fn.?(g_xfer_oneshot_cb, &begin) != VK_SUCCESS_RC) {
+        clearImportInFlight(imported.cache_idx);
+        return fallbackLoop(dst_host, src, regions, n_regions);
+    }
+
+    // Iter-15 fast path: ONE vkCmdCopyBuffer with regionCount = N.
+    // vulkan_api.VkBufferCopyRegion has the SAME field layout as
+    // VkBufferCopy (u64 srcOffset, u64 dstOffset, u64 size in that
+    // order), so the array pointer can be reinterpreted directly.
+    if (imported.region_offset == 0) {
+        const region_ptr = @as([*]const VkBufferCopy, @ptrCast(regions));
+        vkCmdCopyBuffer_fn.?(g_xfer_oneshot_cb, src_entry.buffer, imported.buffer, @intCast(n_regions), region_ptr);
+    } else {
+        // Sub-page-aligned dst_host case: tryImportHostBuffer rounded
+        // down to the surrounding page boundary so the import is legal,
+        // and recorded the byte bias in imported.region_offset. We must
+        // add that bias to every dstOffset so writes land at the
+        // caller's intended bytes. Stack-bounded scratch suffices — the
+        // encode hot path uses procMallocHost-backed dst_host so this
+        // path triggers only in test contexts where dst_host comes from
+        // a plain page_allocator slice that happens to be non-aligned.
+        const gpa = std.heap.page_allocator;
+        const scratch = gpa.alloc(VkBufferCopy, n_regions) catch {
+            clearImportInFlight(imported.cache_idx);
+            // Reset the cmdbuf so a future call doesn't see a half-recorded state.
+            _ = vkResetCommandBuffer_fn.?(g_xfer_oneshot_cb, 0);
+            return fallbackLoop(dst_host, src, regions, n_regions);
+        };
+        defer gpa.free(scratch);
+        var k: usize = 0;
+        while (k < n_regions) : (k += 1) {
+            scratch[k] = .{
+                .srcOffset = regions[k].src_offset,
+                .dstOffset = regions[k].dst_offset + imported.region_offset,
+                .size = regions[k].size,
+            };
+        }
+        vkCmdCopyBuffer_fn.?(g_xfer_oneshot_cb, src_entry.buffer, imported.buffer, @intCast(n_regions), scratch.ptr);
+    }
+
+    var rc = vkEndCommandBuffer_fn.?(g_xfer_oneshot_cb);
+    if (rc != VK_SUCCESS_RC) {
+        clearImportInFlight(imported.cache_idx);
+        // The cmdbuf is now in an undefined state — reset it.
+        _ = vkResetCommandBuffer_fn.?(g_xfer_oneshot_cb, 0);
+        return fallbackLoop(dst_host, src, regions, n_regions);
+    }
+
+    _ = vkResetFences_fn.?(dev, 1, @ptrCast(&g_xfer_oneshot_fence));
+    const cb_local = g_xfer_oneshot_cb;
+    const submit = VkSubmitInfo{
+        .commandBufferCount = 1,
+        .pCommandBuffers = @ptrCast(&cb_local),
+    };
+    const xfer_q: VkQueue = @ptrFromInt(g_transfer_queue);
+    rc = vkQueueSubmit_fn.?(xfer_q, 1, @ptrCast(&submit), g_xfer_oneshot_fence);
+    if (rc != VK_SUCCESS_RC) {
+        clearImportInFlight(imported.cache_idx);
+        return rc;
+    }
+    rc = vkWaitForFences_fn.?(dev, 1, @ptrCast(&g_xfer_oneshot_fence), 1, ~@as(u64, 0));
+
+    // Single in-flight slot drained: clear the marker so a subsequent
+    // gather against the same dst_host can hit the cache. The cached
+    // (vk_buf, vk_mem) pair is still live (LRU-owned), only the
+    // in-flight bit changes.
+    clearImportInFlight(imported.cache_idx);
+
+    // If imported.cache_idx < 0 the entry didn't fit in the LRU cache —
+    // free the standalone (vk_buf, vk_mem) pair to avoid a leak (iter-7
+    // legacy semantics). The cached case (cache_idx >= 0) leaves
+    // ownership with g_import_cache.
+    if (imported.cache_idx < 0) {
+        vkFreeMemory_fn.?(dev, imported.memory, null);
+        vkDestroyBuffer_fn.?(dev, imported.buffer, null);
+    }
+
+    return rc;
 }
 
 fn procD2D(dst: VkDeviceBuffer, src: VkDeviceBuffer, size: usize, stream: VkStream) callconv(.c) VkResult {

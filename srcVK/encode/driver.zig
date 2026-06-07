@@ -22,6 +22,10 @@ pub const EncodeContext = encode_context.EncodeContext;
 pub const copyDeviceToHost = encode_context.copyDeviceToHost;
 pub const copyHostToDevice = encode_context.copyHostToDevice;
 pub const ensureBuf = encode_context.ensureBuf;
+// VK adaptation (encode D2H gather): expose the persistent page-aligned
+// host-buffer helper through the facade so fast_framed can call it
+// without reaching into encode_context directly.
+pub const ensureGpuOutBuf = encode_context.ensureGpuOutBuf;
 
 // ── Wire-format constants exposed at the facade ────────────────────────
 pub const SC_TAIL_PER_CHUNK_BYTES = encode_context.SC_TAIL_PER_CHUNK_BYTES;

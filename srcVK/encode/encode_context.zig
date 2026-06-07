@@ -141,6 +141,25 @@ pub const EncodeContext = struct {
     huff_tok_sizes: ?[]u32 = null,
     huff_tok_offsets: ?[]u32 = null,
 
+    // VK adaptation (encode D2H gather): persistent page-aligned host
+    // buffer that backs `gpu_out` in fast_framed.compressFramedOne. The
+    // pre-fix path alloc'd ~285 MB via std.heap per-encode (`defer
+    // free`), which produced a fresh host_ptr every call — defeating the
+    // iter-8 LRU import cache so procD2HOffsetGather would pay a fresh
+    // ~1 ms VK_EXT_external_memory_host import (vkCreateBuffer +
+    // vkAllocateMemory) on every encode.
+    //
+    // Backed by gpu_dec_driver.allocHost (which routes through
+    // procs.malloc_host = procMallocHost → page-aligned page_allocator
+    // alloc) so the host_ptr satisfies VkImportMemoryHostPointerInfoEXT's
+    // allocation-size + alignment contract (minImportedHostPointerAlignment
+    // == 4 KiB on every desktop driver). Grow-only via ensureGpuOutBuf;
+    // freed in deinit. On grow the prior LRU import cache entry that
+    // pointed at the old host pages is released BEFORE freeHost so a
+    // recycled page address doesn't collide with a stale cache entry.
+    gpu_out_buf: ?[]u8 = null,
+    gpu_out_buf_size: usize = 0,
+
     /// CUDA reference: src/encode/encode_context.zig:223-276. Free every
     /// owned device + host buffer and reset every field to its default.
     pub fn deinit(self: *EncodeContext, allocator: std.mem.Allocator) void {
@@ -189,10 +208,49 @@ pub const EncodeContext = struct {
         if (self.huff_tok_sizes) |s| { allocator.free(s); self.huff_tok_sizes = null; }
         if (self.huff_tok_offsets) |s| { allocator.free(s); self.huff_tok_offsets = null; }
 
+        // VK adaptation (encode D2H gather): release the LRU import
+        // entry that points at these host pages BEFORE freeHost, or the
+        // cache slot would outlive the underlying allocation — a
+        // subsequent procMallocHost happening to reuse the same address
+        // would silently reuse the stale (vk_buf, vk_mem) pair and
+        // vkCmdCopyBuffer would target the prior physical pages
+        // (caller would read zeros).
+        if (self.gpu_out_buf) |buf| {
+            @import("../decode/module_loader.zig").releaseImportsByHostRange(@ptrCast(buf.ptr), buf.len);
+            if (vk.procs.free_host) |free_host_fn| _ = free_host_fn(@ptrCast(buf.ptr));
+            self.gpu_out_buf = null;
+            self.gpu_out_buf_size = 0;
+        }
+
         self.pending_timings.deinit(std.heap.page_allocator);
         self.last_timings.deinit(std.heap.page_allocator);
     }
 };
+
+/// VK adaptation (encode D2H gather): grow-only host buffer ensure.
+/// Returns the live slice (sized to `needed`) on success, null on
+/// backend failure. Mirrors `ensureBuf` shape but for the page-aligned
+/// host allocation backing `gpu_out` in fast_framed.compressFramedOne.
+/// On grow the LRU import cache entry that referenced the old host
+/// pages is released BEFORE freeHost so a future procD2HOffsetGather
+/// against this buffer doesn't hit a stale (vk_buf, vk_mem) pair
+/// pointing at recycled memory.
+pub fn ensureGpuOutBuf(self: *EncodeContext, needed: usize) ?[]u8 {
+    if (self.gpu_out_buf) |existing| {
+        if (existing.len >= needed) return existing[0..needed];
+    }
+    const allocHost = @import("../decode/decode_context.zig").allocHost;
+    if (self.gpu_out_buf) |old| {
+        @import("../decode/module_loader.zig").releaseImportsByHostRange(@ptrCast(old.ptr), old.len);
+        if (vk.procs.free_host) |free_host_fn| _ = free_host_fn(@ptrCast(old.ptr));
+        self.gpu_out_buf = null;
+        self.gpu_out_buf_size = 0;
+    }
+    const fresh = allocHost(needed) orelse return null;
+    self.gpu_out_buf = fresh;
+    self.gpu_out_buf_size = fresh.len;
+    return fresh[0..needed];
+}
 
 /// CUDA reference: src/encode/encode_context.zig:284-293. Grow-only:
 /// returns early when `current_size.*` already fits `needed`. Otherwise
