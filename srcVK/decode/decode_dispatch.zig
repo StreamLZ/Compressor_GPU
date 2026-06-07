@@ -917,23 +917,29 @@ pub fn runBackHalf(
     );
     if (g_phase_profile_enabled) g_phase_backhalf_lz_launch_ns += qpcDeltaNs(_t_lz0, vk.qpcNow());
 
-    // Back-half stream sync: skip in async mode (caller's stream
-    // carries the queued work; they sync themselves).
+    // Iter 15: VK adaptation — back-half stream sync REMOVED. Pre-iter-15
+    // this was a stream_sync_fn(heavy_stream) call that ended+submitted
+    // the compute cmdbuf and vkWaitForFences'd the result, then
+    // finalizeOutput opened a FRESH cmdbuf for the D2H — 2 submits + 2
+    // waits per decode. Iter 15 leaves the compute cmdbuf OPEN here so
+    // finalizeOutput records the D2H into it; fullGpuLaunchImpl's single
+    // post-finalize stream_sync submits + waits once.
     //
-    // Iter 4: gate on the captured `is_sync_mode` instead of the live
-    // `self.work_stream == 0` check — the dispatcher's iter-4 batching
-    // path promotes work_stream to pipeline_stream for the duration of
-    // the call, so the original check would now mis-classify sync-mode
-    // decodes as async and skip the flush.
-    if (is_sync_mode) {
-        const _t_fw0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
-        const sync_rc = stream_sync_fn(heavy_stream);
-        if (g_phase_profile_enabled) g_phase_backhalf_fence_wait_ns += qpcDeltaNs(_t_fw0, vk.qpcNow());
-        if (sync_rc != VK_SUCCESS_RC) {
-            std.debug.print("GPU heavy stream: sync FAILED rc={d}\n", .{sync_rc});
-            return error.SyncFailed;
-        }
-    }
+    // The COMPUTE_SHADER_WRITE (LZ kernel output) → TRANSFER_READ (D2H
+    // vkCmdCopyBuffer) dependency that used to be enforced by the submit
+    // boundary now needs an explicit vkCmdPipelineBarrier on the cmdbuf;
+    // module_loader.procD2HAsync records it as its first cmd before any
+    // vkCmdCopyBuffer (recordComputeToTransferBarrier). The
+    // backhalf_fence_wait phase profile field stays zero — that wait
+    // moves entirely into finalize_sync, which already accounts for it.
+    //
+    // Async-mode (work_stream != 0) callers manage their own cmdbuf
+    // lifecycle, so the iter-15 change only affects the sync path.
+    // `is_sync_mode` and `stream_sync_fn` (captured at function entry)
+    // remain unused on the back-half tail path; they retain their roles
+    // in the front-half cross-stream barrier above and in the split_timer
+    // Huff sync slice.
+    _ = is_sync_mode;
 
     if (t_before_kern) |t_start| {
         if (io) |io_val| {
@@ -1142,19 +1148,28 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // D2D when the LZ kernel already wrote straight to the caller's
     // device buffer — same predicate as the LZ dst-pick in runBackHalf.
     //
-    // Iter 4: finalizeOutput records D2H into the batched cmdbuf via
-    // d2h_async; the runBackHalf stream_sync above already flushed it,
-    // BUT in the L1 path finalize is called AFTER the sync, so the
-    // d2h_async records into a freshly-reset cmdbuf and needs another
-    // flush. Issue an extra stream_sync after finalize to drain it.
+    // Iter 15: VK adaptation — single-submit consolidation. Pre-iter-15
+    // runBackHalf fired stream_sync at the end of the back half (submit
+    // 1 + wait 1), finalizeOutput opened a fresh cmdbuf and recorded its
+    // D2H, then this block fired the second stream_sync (submit 2 + wait
+    // 2). Iter 15 keeps the cmdbuf open through runBackHalf so
+    // finalizeOutput's d2h_async records into the same cmdbuf as the LZ
+    // kernel; the single stream_sync below submits + waits once.
+    //
+    // The sync ALSO has to fire on the writesDirectlyToTarget path:
+    // finalizeOutput is skipped there (LZ writes straight to req.
+    // d_output_target) but the LZ kernel still needs to land before this
+    // call returns to the host caller. Pre-iter-15 the back-half
+    // stream_sync covered it; iter-15 needs the post-finalize sync to
+    // handle it instead.
     const _t_fin0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
     if (!req.writesDirectlyToTarget()) {
         try finalizeOutput(self, &procs, req, heavy_stream);
-        if (is_sync_mode) {
-            const _t_fsync0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
-            try vkCall(procs.stream_sync(heavy_stream), .sync);
-            if (g_phase_profile_enabled) g_phase_finalize_sync_ns += qpcDeltaNs(_t_fsync0, vk.qpcNow());
-        }
+    }
+    if (is_sync_mode) {
+        const _t_fsync0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
+        try vkCall(procs.stream_sync(heavy_stream), .sync);
+        if (g_phase_profile_enabled) g_phase_finalize_sync_ns += qpcDeltaNs(_t_fsync0, vk.qpcNow());
     }
     if (g_phase_profile_enabled) {
         g_phase_finalize_ns += qpcDeltaNs(_t_fin0, vk.qpcNow());

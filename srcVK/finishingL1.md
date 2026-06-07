@@ -49,6 +49,7 @@ Fresh-binary verified (M6 protocol), NVIDIA RTX 4060 Ti via `SLZ_VK_DEVICE_INDEX
 ## Commit history (most recent first — what each one did)
 
 ```
+iter 15: single-submit/single-wait consolidation per decode. Removed runBackHalf-end stream_sync (was submit 1 + wait 1); finalizeOutput now records its D2H into the SAME compute cmdbuf as the LZ kernel; the post-finalize stream_sync is the lone submit+wait per decode. COMPUTE_SHADER_WRITE → TRANSFER_READ pipeline barrier inserted at top of procD2HAsync to enforce the dependency that the submit boundary used to. Per-decode counts: 2 submits (1 transfer + 1 compute), 1 wait — down from 3 submits + 2 waits. Phase profile confirms backhalf_fence_wait=0.0000ms (was where wait 1 lived), finalize_sync=5.2389ms now absorbs both. Perf: enwik8 15.790ms (baseline 15.666 ms, +0.124 within noise), web 5.207ms (baseline 5.249 ms, -0.042 within noise), silesia 30.001ms (baseline 30.469 ms, -0.468 ms small gain). 67/7/0 ptest_vk; byte-equal roundtrip on web+enwik8+silesia.
 7ae5f3f  iter 14: persistent descriptor sets per (StreamEntry × pipeline) + LRU import-cache telemetry. (B) RULED OUT cache-miss hypothesis: web 5h/0m/0e, enwik8 10h/0m/0e in steady state. (A) within-noise perf delta but structurally cleaner.
 7e7d74b  iter 13: early-submit transfer cmdbuf (+0.36 ms small gain, structurally cleaner)
 d5adeb8  bench: align "gpu kernel" metric with CUDA (pure VkQueryPool sum, not wall-clock)

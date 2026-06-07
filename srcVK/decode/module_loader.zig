@@ -759,6 +759,10 @@ const VK_ACCESS_HOST_WRITE_BIT: u32 = 0x00004000;
 const VK_ACCESS_TRANSFER_READ_BIT: u32 = 0x00000800;
 const VK_ACCESS_TRANSFER_WRITE_BIT: u32 = 0x00001000;
 const VK_ACCESS_HOST_READ_BIT: u32 = 0x00002000;
+// Iter 15: VK adaptation — single-submit consolidation needs an explicit
+// COMPUTE_SHADER_WRITE → TRANSFER_READ memory barrier between the LZ
+// kernel and the D2H vkCmdCopyBuffer that now share one compute cmdbuf.
+const VK_ACCESS_SHADER_WRITE_BIT: u32 = 0x00000040;
 
 // Descriptor / pipeline structs
 
@@ -3379,11 +3383,53 @@ pub fn releaseImportsByHostRange(base: *const anyopaque, len: usize) void {
     }
 }
 
+// Iter 15: VK adaptation — single-submit consolidation. Pre-iter-15 the
+// D2H phase recorded into a fresh compute cmdbuf AFTER runBackHalf had
+// already submit+waited the cmdbuf carrying the LZ kernel. The submit
+// boundary itself enforced the COMPUTE_SHADER_WRITE → TRANSFER_READ
+// dependency on the LZ kernel's output buffer.
+//
+// In iter-15 the runBackHalf-end stream_sync is removed; the D2H is
+// recorded into the SAME cmdbuf as the LZ kernel and the cmdbuf is
+// submitted ONCE after finalize. Without an explicit barrier the
+// vkCmdCopyBuffer (TRANSFER stage read) could be reordered against the
+// LZ kernel (COMPUTE_SHADER stage write) inside the device's command
+// processor — undefined behavior per the Vulkan synchronization spec.
+//
+// Emit a single global VkMemoryBarrier on the cmdbuf at the boundary.
+// Cheap (microseconds, no buffer-list traversal); fires once per decode.
+inline fn recordComputeToTransferBarrier(cb: VkCommandBuffer) void {
+    const mb = VkMemoryBarrier{
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+    };
+    vkCmdPipelineBarrier_fn.?(
+        cb,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,
+        1,
+        @ptrCast(&mb),
+        0,
+        null,
+        0,
+        null,
+    );
+}
+
 fn procD2HAsync(dst: *anyopaque, src: VkDeviceBuffer, size: usize, stream: VkStream) callconv(.c) VkResult {
     const entry = lookupAlloc(src) orelse return -1;
     if (streamEntryFor(stream)) |se| {
         const rc_begin = streamBeginIfNeeded(se);
         if (rc_begin != VK_SUCCESS_RC) return rc_begin;
+
+        // Iter 15: emit the COMPUTE_SHADER_WRITE → TRANSFER_READ barrier
+        // before any vkCmdCopyBuffer below. See recordComputeToTransferBarrier
+        // doc-comment for the single-submit rationale. Safe to emit
+        // unconditionally — in the dispatcher's flow procD2HAsync is
+        // always preceded by the LZ kernel's vkCmdDispatch into the same
+        // cmdbuf, and even when it isn't the barrier is a no-op cost-wise.
+        recordComputeToTransferBarrier(se.cmdbuf);
 
         // Iter 8 subfix 3: prefer a pre-prepared import (set by
         // fullGpuLaunchImpl before runBackHalf so the alloc cost
