@@ -131,7 +131,11 @@ pub fn getProc(comptime T: type, name: [*:0]const u8) ?T {
 
 const testing = std.testing;
 
-test "encode FFI slots default to null" {
+// VK adaptation: tagged `[serial_first]` so the parallel test runner
+// (srcVK/test_runner_parallel.zig) runs this BEFORE any worker spins up
+// — once encode module_loader.init() runs (e.g. via a sibling encode
+// roundtrip), these slots are non-null and this assertion would fail.
+test "encode FFI slots default to null [serial_first]" {
     // Module_loader has not run; every encode sub-module that touches
     // these slots before init must see null so the caller can surface
     // BackendNotAvailable. Mirrors CUDA's "cu*_fn is null until init"

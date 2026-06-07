@@ -122,7 +122,13 @@ test "kernel conformance: GPU-decode web.txt.L1.slz round-trips byte-equal vs so
     const dst = try al.alloc(u8, want_size + 64);
     @memset(dst, 0);
 
-    const written = try decoder.decompressFramed(golden, dst, &driver.g_default);
+    // VK adaptation: per-test DecodeContext. The shared dec_driver.g_default
+    // gets clobbered by sibling parallel workers calling ensureDeviceBuf
+    // (destroy+create) on its persistent device buffers.
+    var dec_ctx: driver.DecodeContext = .{};
+    defer dec_ctx.deinit();
+
+    const written = try decoder.decompressFramed(golden, dst, &dec_ctx);
     try testing.expectEqual(original.len, written);
     try testing.expectEqualSlices(u8, original, dst[0..written]);
 }

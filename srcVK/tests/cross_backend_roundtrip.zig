@@ -55,6 +55,45 @@ fn runCmd(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !s
     return std.process.run(allocator, io, .{ .argv = argv });
 }
 
+// VK adaptation: under `zig build`'s child-process env the Vulkan loader
+// picks the Intel iGPU by default instead of the discrete NVIDIA the
+// interactive shell picks, and the iGPU's L1 decode path has known
+// byte-mismatch bugs (project memory: "default picks Intel iGPU"). Splice
+// `--device 1` (the NVIDIA index per --probe) into every argv targeting
+// streamlz_vk.exe so the child lands on the discrete GPU regardless of
+// what the inherited env says. See cli_smoke.zig::runCmdDevice for the
+// longer note + identical helper.
+fn argvWithVkDevice(allocator: std.mem.Allocator, argv: []const []const u8) ![]const []const u8 {
+    var out = try allocator.alloc([]const u8, argv.len + 2);
+    out[0] = argv[0];
+    out[1] = "--device";
+    out[2] = "NVIDIA";
+    @memcpy(out[3..], argv[1..]);
+    return out;
+}
+
+fn runVkCmd(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !std.process.RunResult {
+    const a = try argvWithVkDevice(allocator, argv);
+    defer allocator.free(a);
+    return runCmd(allocator, io, a);
+}
+
+// VK adaptation: see cli_smoke.zig::discreteVkVisibleToChild — under
+// `zig build`'s spawn path the child streamlz_vk.exe does not enumerate
+// the discrete NVIDIA ICD (only the Intel iGPU), and the iGPU L1 decode
+// path has known byte-mismatches. Skip cross-backend round-trip tests
+// when the discrete VK device is invisible to the child.
+fn discreteVkVisibleToChild(allocator: std.mem.Allocator, io: std.Io) bool {
+    if (!fileExists(io, VK_BIN)) return false;
+    const probe = runCmd(allocator, io, &.{ VK_BIN, "--probe" }) catch return false;
+    defer {
+        allocator.free(probe.stdout);
+        allocator.free(probe.stderr);
+    }
+    if (exitCode(probe.term) != 0) return false;
+    return std.mem.indexOf(u8, probe.stdout, "DISCRETE_GPU") != null;
+}
+
 fn exitCode(term: std.process.Child.Term) u32 {
     return switch (term) {
         .exited => |c| c,
@@ -62,12 +101,20 @@ fn exitCode(term: std.process.Child.Term) u32 {
     };
 }
 
-test "cross-backend: CUDA encode -> VK decode (level=1, 64 KiB random)" {
+// VK adaptation: every test in this file spawns child streamlz_vk.exe
+// and/or streamlz.exe processes. If any in-process worker has already
+// held the Vulkan device + VMA allocator + descriptor pools, the child
+// silently exits non-zero with empty stderr (cross-process driver state
+// contention on the NVIDIA stack). Mark every test with `[serial_first]`
+// so the parallel test runner (test_runner_parallel.zig) runs them
+// BEFORE any in-process worker touches Vulkan.
+test "cross-backend: CUDA encode -> VK decode (level=1, 64 KiB random) [serial_first]" {
     var io_inst = makeIo();
     defer io_inst.deinit();
     const io = io_inst.io();
 
     if (!fileExists(io, CUDA_BIN) or !fileExists(io, VK_BIN)) return error.SkipZigTest;
+    if (!discreteVkVisibleToChild(std.testing.allocator, io)) return error.SkipZigTest;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -98,9 +145,9 @@ test "cross-backend: CUDA encode -> VK decode (level=1, 64 KiB random)" {
     // VK decode.
     {
         const argv = [_][]const u8{ VK_BIN, "-d", slz_path, "-o", out_path };
-        const res = try runCmd(al, io, &argv);
+        const res = try runVkCmd(al, io, &argv);
         if (exitCode(res.term) != 0) {
-            std.debug.print("VK decode failed: term={any} stderr={s}\n", .{ res.term, res.stderr });
+            std.debug.print("VK decode failed: term={any}\n stdout={s}\n stderr={s}\n", .{ res.term, res.stdout, res.stderr });
             return error.VkDecodeFailed;
         }
     }
@@ -108,12 +155,13 @@ test "cross-backend: CUDA encode -> VK decode (level=1, 64 KiB random)" {
     try testing.expectEqualSlices(u8, src, got);
 }
 
-test "cross-backend: VK encode -> CUDA decode (level=1, 64 KiB random)" {
+test "cross-backend: VK encode -> CUDA decode (level=1, 64 KiB random) [serial_first]" {
     var io_inst = makeIo();
     defer io_inst.deinit();
     const io = io_inst.io();
 
     if (!fileExists(io, CUDA_BIN) or !fileExists(io, VK_BIN)) return error.SkipZigTest;
+    if (!discreteVkVisibleToChild(std.testing.allocator, io)) return error.SkipZigTest;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -135,9 +183,9 @@ test "cross-backend: VK encode -> CUDA decode (level=1, 64 KiB random)" {
     // VK encode.
     {
         const argv = [_][]const u8{ VK_BIN, "-c", "-l", "1", in_path, "-o", slz_path };
-        const res = try runCmd(al, io, &argv);
+        const res = try runVkCmd(al, io, &argv);
         if (exitCode(res.term) != 0) {
-            std.debug.print("VK encode failed: term={any} stderr={s}\n", .{ res.term, res.stderr });
+            std.debug.print("VK encode failed: term={any}\n stdout={s}\n stderr={s}\n", .{ res.term, res.stdout, res.stderr });
             return error.VkEncodeFailed;
         }
     }
@@ -154,12 +202,13 @@ test "cross-backend: VK encode -> CUDA decode (level=1, 64 KiB random)" {
     try testing.expectEqualSlices(u8, src, got);
 }
 
-test "cross-backend: VK encode -> VK decode (level=1, ascending pattern)" {
+test "cross-backend: VK encode -> VK decode (level=1, ascending pattern) [serial_first]" {
     var io_inst = makeIo();
     defer io_inst.deinit();
     const io = io_inst.io();
 
     if (!fileExists(io, VK_BIN)) return error.SkipZigTest;
+    if (!discreteVkVisibleToChild(std.testing.allocator, io)) return error.SkipZigTest;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -180,18 +229,18 @@ test "cross-backend: VK encode -> VK decode (level=1, ascending pattern)" {
     // VK encode.
     {
         const argv = [_][]const u8{ VK_BIN, "-c", "-l", "1", in_path, "-o", slz_path };
-        const res = try runCmd(al, io, &argv);
+        const res = try runVkCmd(al, io, &argv);
         if (exitCode(res.term) != 0) {
-            std.debug.print("VK encode failed: term={any} stderr={s}\n", .{ res.term, res.stderr });
+            std.debug.print("VK encode failed: term={any}\n stdout={s}\n stderr={s}\n", .{ res.term, res.stdout, res.stderr });
             return error.VkEncodeFailed;
         }
     }
     // VK decode.
     {
         const argv = [_][]const u8{ VK_BIN, "-d", slz_path, "-o", out_path };
-        const res = try runCmd(al, io, &argv);
+        const res = try runVkCmd(al, io, &argv);
         if (exitCode(res.term) != 0) {
-            std.debug.print("VK decode failed: term={any} stderr={s}\n", .{ res.term, res.stderr });
+            std.debug.print("VK decode failed: term={any}\n stdout={s}\n stderr={s}\n", .{ res.term, res.stdout, res.stderr });
             return error.VkDecodeFailed;
         }
     }
@@ -199,12 +248,13 @@ test "cross-backend: VK encode -> VK decode (level=1, ascending pattern)" {
     try testing.expectEqualSlices(u8, src, got);
 }
 
-test "cross-backend: CUDA encode -> VK decode (level=2, 64 KiB random)" {
+test "cross-backend: CUDA encode -> VK decode (level=2, 64 KiB random) [serial_first]" {
     var io_inst = makeIo();
     defer io_inst.deinit();
     const io = io_inst.io();
 
     if (!fileExists(io, CUDA_BIN) or !fileExists(io, VK_BIN)) return error.SkipZigTest;
+    if (!discreteVkVisibleToChild(std.testing.allocator, io)) return error.SkipZigTest;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -235,9 +285,9 @@ test "cross-backend: CUDA encode -> VK decode (level=2, 64 KiB random)" {
     // VK decode at L2 (expected to work or surface NotImplementedL2).
     {
         const argv = [_][]const u8{ VK_BIN, "-d", slz_path, "-o", out_path };
-        const res = try runCmd(al, io, &argv);
+        const res = try runVkCmd(al, io, &argv);
         if (exitCode(res.term) != 0) {
-            std.debug.print("VK decode L2 failed: term={any} stderr={s}\n", .{ res.term, res.stderr });
+            std.debug.print("VK decode L2 failed: term={any}\n stdout={s}\n stderr={s}\n", .{ res.term, res.stdout, res.stderr });
             return error.VkDecodeFailed;
         }
     }

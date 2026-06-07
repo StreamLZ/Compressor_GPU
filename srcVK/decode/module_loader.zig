@@ -1438,6 +1438,25 @@ pub fn unlockEncodeDispatcherMutex() void {
     ReleaseSRWLockExclusive(&g_dispatcher_lock);
 }
 
+// VK adaptation: the alloc registry (g_allocs / g_host_allocs) is touched
+// by every procs.malloc_device / free_device / malloc_host / free_host
+// call. Per-test EncodeContext / DecodeContext use this surface to
+// allocate their own persistent device buffers; without a registry lock,
+// two ptest_vk workers concurrently appending to g_allocs corrupt the
+// ArrayListUnmanaged backing store (segfault, exit code 5). The lock is
+// narrowly scoped to registry mutation — VMA itself is internally
+// thread-safe per its docs (VMA's default VmaAllocator uses an internal
+// CAS on the heap freelist).
+var g_alloc_registry_lock: SRWLOCK = .{};
+
+pub fn lockAllocRegistry() void {
+    AcquireSRWLockExclusive(&g_alloc_registry_lock);
+}
+
+pub fn unlockAllocRegistry() void {
+    ReleaseSRWLockExclusive(&g_alloc_registry_lock);
+}
+
 // Iter 4: nonCoherentAtomSize for staging-arena bump alignment. VK spec
 // requires offset/size of host-visible non-coherent mappings to align to
 // this when flushing/invalidating; we use HOST_COHERENT so flush is
@@ -2101,6 +2120,24 @@ pub fn init() bool {
         g_profile_overflow_count = 0;
     }
 
+    // VK adaptation: pre-reserve the alloc + stream + host-alloc registries
+    // to a generous fixed cap so they never reallocate at runtime. The
+    // streamEntryFor / lookupAlloc readers grab an `&items[idx]` pointer
+    // that would be invalidated by an ArrayList realloc; with the
+    // backing storage stable, concurrent reads from per-test
+    // EncodeContext / DecodeContext (ptest_vk's 16-worker runner) cannot
+    // observe a torn pointer even if a procStreamCreate / procMallocDevice
+    // append happens on a sibling thread. The registry SRWLOCK above
+    // protects against torn slot reads + concurrent append; this reserve
+    // protects against pointer invalidation across the boundary where
+    // the caller already snapshotted the pointer.
+    {
+        const gpa = std.heap.page_allocator;
+        g_allocs.ensureTotalCapacity(gpa, 4096) catch {};
+        g_streams.ensureTotalCapacity(gpa, 256) catch {};
+        g_host_allocs.ensureTotalCapacity(gpa, 256) catch {};
+    }
+
     // Wire up the procs.* surface. All slots use the module-private
     // helpers defined below.
     vulkan_api.procs.malloc_device = procMallocDevice;
@@ -2341,7 +2378,16 @@ fn ensureStaging(needed: usize) bool {
     return true;
 }
 
+// VK adaptation: parallel test workers (per-test DecodeContext /
+// EncodeContext) hit g_allocs through procs.malloc_device + free_device
+// concurrently. The ArrayListUnmanaged backing slice can be reallocated
+// inside append; without the lock a concurrent read sees a torn pointer
+// and segfaults (ptest_vk surfaced this as exit code 5 with no test-fail
+// trace). Hold g_alloc_registry_lock across every g_allocs.* mutation;
+// also held for lookupAlloc to snapshot the value before VMA touches it.
 fn registerAlloc(buffer: vma.VkBuffer, alc: vma.VmaAllocation, size: usize) VkDeviceBuffer {
+    lockAllocRegistry();
+    defer unlockAllocRegistry();
     const gpa = std.heap.page_allocator;
     // Reuse a freed slot if available.
     for (g_allocs.items, 0..) |slot, i| {
@@ -2356,6 +2402,8 @@ fn registerAlloc(buffer: vma.VkBuffer, alc: vma.VmaAllocation, size: usize) VkDe
 
 fn lookupAlloc(handle: VkDeviceBuffer) ?AllocEntry {
     if (handle == 0) return null;
+    lockAllocRegistry();
+    defer unlockAllocRegistry();
     const idx: usize = @intCast(handle - 1);
     if (idx >= g_allocs.items.len) return null;
     return g_allocs.items[idx];
@@ -2363,6 +2411,8 @@ fn lookupAlloc(handle: VkDeviceBuffer) ?AllocEntry {
 
 fn releaseAlloc(handle: VkDeviceBuffer) void {
     if (handle == 0) return;
+    lockAllocRegistry();
+    defer unlockAllocRegistry();
     const idx: usize = @intCast(handle - 1);
     if (idx >= g_allocs.items.len) return;
     g_allocs.items[idx] = null;
@@ -3391,6 +3441,10 @@ fn procMallocHost(out: *?*anyopaque, size: usize) callconv(.c) VkResult {
     // exposes named values up to 64; larger powers-of-two go through
     // @enumFromInt on the log2 exponent.
     const buf = gpa.alignedAlloc(u8, @as(std.mem.Alignment, @enumFromInt(12)), rounded) catch return -1;
+    // VK adaptation: g_host_allocs is shared with procFreeHost; concurrent
+    // mutate without the registry lock corrupts the ArrayList backing.
+    lockAllocRegistry();
+    defer unlockAllocRegistry();
     g_host_allocs.append(gpa, .{ .ptr = buf.ptr, .len = buf.len }) catch {
         gpa.free(buf);
         return -1;
@@ -3402,14 +3456,26 @@ fn procMallocHost(out: *?*anyopaque, size: usize) callconv(.c) VkResult {
 fn procFreeHost(buf: *anyopaque) callconv(.c) VkResult {
     const gpa = std.heap.page_allocator;
     const target: [*]u8 = @ptrCast(buf);
-    for (g_host_allocs.items, 0..) |entry, i| {
-        if (entry.ptr == target) {
-            // Match the procMallocHost alignment bump (iter 7).
-            const slice: []align(4096) u8 = @alignCast(entry.ptr[0..entry.len]);
-            gpa.free(slice);
-            _ = g_host_allocs.swapRemove(i);
-            return VK_SUCCESS_RC;
+    // VK adaptation: hold the registry lock for the lookup+swapRemove so
+    // a concurrent procMallocHost append cannot mutate the underlying
+    // slice mid-walk. The gpa.free is moved out of the locked region —
+    // page_allocator.free is thread-safe and we no longer need the lock
+    // after swapRemove returns.
+    var freed_slice: ?[]align(4096) u8 = null;
+    {
+        lockAllocRegistry();
+        defer unlockAllocRegistry();
+        for (g_host_allocs.items, 0..) |entry, i| {
+            if (entry.ptr == target) {
+                freed_slice = @alignCast(entry.ptr[0..entry.len]);
+                _ = g_host_allocs.swapRemove(i);
+                break;
+            }
         }
+    }
+    if (freed_slice) |slice| {
+        gpa.free(slice);
+        return VK_SUCCESS_RC;
     }
     return -1;
 }
@@ -3438,6 +3504,17 @@ fn procCtxSync() callconv(.c) VkResult {
 
 fn procStreamCreate(out: *VkStream, flags: c_uint) callconv(.c) VkResult {
     _ = flags;
+    // VK adaptation: VkCommandPool external-synchronization rule —
+    // vkAllocateCommandBuffers / vkFreeCommandBuffers on the same
+    // VkCommandPool must be serialized across threads (Vulkan spec
+    // "Host Synchronization"). Acquire the registry lock for the
+    // ENTIRE procStreamCreate body so the cmdbuf allocations from
+    // g_command_pool + g_transfer_cmd_pool can't race with sibling
+    // procStreamCreate / procStreamDestroy / procLaunchKernel calls
+    // on per-test DecodeContexts. Same lock guards g_streams append.
+    lockAllocRegistry();
+    defer unlockAllocRegistry();
+
     const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
     // Allocate a per-stream VkCommandBuffer off the shared pool + its
     // own VkFence. The pool was created with the
@@ -3489,6 +3566,11 @@ fn procStreamCreate(out: *VkStream, flags: c_uint) callconv(.c) VkResult {
         .transfer_recording = false,
         .h2d_sem = h2d_sem,
     };
+    // VK adaptation: g_streams append is already protected by the
+    // outer lockAllocRegistry (covering the full procStreamCreate
+    // body so vkAllocateCommandBuffers honours the VkCommandPool
+    // external-synchronization rule); the SRWLOCK is non-recursive so
+    // we cannot re-acquire here.
     // Reuse a freed slot if available.
     for (g_streams.items, 0..) |slot, i| {
         if (slot == null) {
@@ -3510,6 +3592,12 @@ fn procStreamCreate(out: *VkStream, flags: c_uint) callconv(.c) VkResult {
 
 fn procStreamDestroy(stream: VkStream) callconv(.c) VkResult {
     if (stream == 0) return VK_SUCCESS_RC;
+    // VK adaptation: vkFreeCommandBuffers on g_command_pool /
+    // g_transfer_cmd_pool requires external synchronization (Vulkan
+    // spec) — concurrent per-test DecodeContext deinit() calls would
+    // race here. Same lock guards g_streams slot clear.
+    lockAllocRegistry();
+    defer unlockAllocRegistry();
     const idx: usize = @intCast(stream - 1);
     if (idx >= g_streams.items.len) return VK_SUCCESS_RC;
     var slot = g_streams.items[idx] orelse return VK_SUCCESS_RC;

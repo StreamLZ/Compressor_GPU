@@ -13,7 +13,21 @@ const decoder = @import("../decode/streamlz_decoder.zig");
 const enc_driver = @import("../encode/driver.zig");
 const dec_driver = @import("../decode/driver.zig");
 
+// VK adaptation: ptest_vk's worker pool ran multiple encode/decode tests
+// against the shared enc_driver.g_default + dec_driver.g_default. Between
+// worker A's encode-unlock and decode-lock, a sibling worker can call
+// encode_context.ensureBuf which is destroy+create on the persistent
+// device buffers; the resulting clobber surfaces here as zero-byte
+// decoded output. Per-test EncodeContext + DecodeContext on the stack
+// gives each test an independent set of persistent device buffers, with
+// the registry SRWLOCK in module_loader.zig protecting the underlying
+// VMA handle table from concurrent register/lookup/release calls.
 fn roundtripWithLevel(allocator: std.mem.Allocator, src: []const u8, level: u8) !void {
+    var enc_ctx: enc_driver.EncodeContext = .{};
+    defer enc_ctx.deinit(allocator);
+    var dec_ctx: dec_driver.DecodeContext = .{};
+    defer dec_ctx.deinit();
+
     const opts: encoder.Options = .{ .level = level };
     const bound = encoder.compressBound(src.len);
     const compressed = try allocator.alloc(u8, bound);
@@ -23,7 +37,7 @@ fn roundtripWithLevel(allocator: std.mem.Allocator, src: []const u8, level: u8) 
         src,
         compressed,
         opts,
-        &enc_driver.g_default,
+        &enc_ctx,
     );
     try testing.expect(written > 0);
     try testing.expect(written <= bound);
@@ -35,7 +49,7 @@ fn roundtripWithLevel(allocator: std.mem.Allocator, src: []const u8, level: u8) 
     const out_written = try decoder.decompressFramed(
         compressed[0..written],
         dst,
-        &dec_driver.g_default,
+        &dec_ctx,
     );
     try testing.expectEqual(src.len, out_written);
     try testing.expectEqualSlices(u8, src, dst[0..out_written]);
@@ -82,6 +96,10 @@ test "L1 encode/decode round-trip: random PRNG (1 MiB) at level=2" {
 }
 
 test "L1 encode/decode round-trip: empty payload" {
+    // VK adaptation: per-test EncodeContext (see roundtripWithLevel).
+    var enc_ctx: enc_driver.EncodeContext = .{};
+    defer enc_ctx.deinit(std.testing.allocator);
+
     const src: []const u8 = &[_]u8{};
     const opts: encoder.Options = .{ .level = 1 };
     const bound = encoder.compressBound(src.len);
@@ -92,7 +110,7 @@ test "L1 encode/decode round-trip: empty payload" {
         src,
         compressed,
         opts,
-        &enc_driver.g_default,
+        &enc_ctx,
     );
     // Even for empty input the frame header + end mark must be emitted.
     try testing.expect(written >= 0);

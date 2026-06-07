@@ -405,7 +405,11 @@ pub fn getProc(comptime T: type, name: [*:0]const u8) ?T {
 
 const testing = std.testing;
 
-test "procs slots default to null (rejects unset surface)" {
+// VK adaptation: tagged `[serial_first]` so the parallel test runner
+// (srcVK/test_runner_parallel.zig) runs this BEFORE any worker spins up
+// — once module_loader.init() runs (e.g. via a sibling decode roundtrip),
+// procs.* are non-null and this assertion would fail.
+test "procs slots default to null (rejects unset surface) [serial_first]" {
     // Module_loader has not run; every call site that reaches procs.*
     // before init must see a null slot so vkCall can route to
     // BackendNotAvailable. Mirrors CUDA's "cu*_fn is null until init"
