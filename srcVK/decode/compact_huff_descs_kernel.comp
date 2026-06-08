@@ -1,19 +1,44 @@
 // 1:1 port of src/decode/compact_descs_kernels.cuh, entry point
 // slzCompactHuffDescsKernel.
-// CUDA reference: src/decode/compact_descs_kernels.cuh:39-43.
+// CUDA reference: src/decode/compact_descs_kernels.cuh:39-60.
 // See srcVK/PortInstructions.md.
-//
-// L2 stub. Single-threaded compaction (CUDA uses SLZ_GUARD_SINGLE_THREAD).
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
 
-// CUDA: 1 block × 1 thread.
+#include "slz_wire_format.glsl"
+
+// CUDA: 1 block × 1 thread (SLZ_GUARD_SINGLE_THREAD).
 layout(local_size_x = 1) in;
+
+// VK adaptation: HUFF_LUT_ENTRIES is defined in srcVK/decode/descriptors.zig
+// (= 1024). Mirror the constant locally to match the CUDA compact loop's
+// `k * HUFF_LUT_ENTRIES` lut_offset stamping.
+const uint HUFF_LUT_ENTRIES = 1024u;
+
+// SlzScanHuffDesc layout matches descriptors.zig::ScanHuffDesc — 5 × u32
+// = 20 bytes. {in_offset, in_size, out_offset, out_size, valid}.
+struct SlzScanHuffDescGlsl {
+    uint in_offset;
+    uint in_size;
+    uint out_offset;
+    uint out_size;
+    uint valid;
+};
+
+// SlzHuffDecChunkDesc layout matches descriptors.zig::HuffDecChunkDesc —
+// 5 × u32 = 20 bytes. {in_offset, in_size, out_offset, out_size, lut_offset}.
+struct SlzHuffDecChunkDescGlsl {
+    uint in_offset;
+    uint in_size;
+    uint out_offset;
+    uint out_size;
+    uint lut_offset;
+};
 
 // arg 0: const SlzScanHuffDesc* d_staged
 layout(std430, binding = 0) readonly buffer StagedBuf {
-    uint d_staged[];
+    SlzScanHuffDescGlsl d_staged[];
 };
 
 // arg 1: const uint32_t* d_total_subs
@@ -23,7 +48,7 @@ layout(std430, binding = 1) readonly buffer TotalSubsBuf {
 
 // arg 2: SlzHuffDecChunkDesc* d_out
 layout(std430, binding = 2) buffer OutBuf {
-    uint d_out[];
+    SlzHuffDecChunkDescGlsl d_out[];
 };
 
 // arg 3: uint32_t* d_n_out
@@ -31,4 +56,24 @@ layout(std430, binding = 3) buffer NOutBuf {
     uint d_n_out;
 };
 
-void main() { return; }
+void main() {
+    SLZ_GUARD_SINGLE_THREAD();
+
+    // CUDA reference: src/decode/compact_descs_kernels.cuh:45-59.
+    uint tot = d_total_subs;
+    uint k = 0u;
+    for (uint i = 0u; i < tot; i = i + 1u) {
+        SlzScanHuffDescGlsl s = d_staged[i];
+        if (s.valid != 0u) {
+            SlzHuffDecChunkDescGlsl o;
+            o.in_offset  = s.in_offset;
+            o.in_size    = s.in_size;
+            o.out_offset = s.out_offset;
+            o.out_size   = s.out_size;
+            o.lut_offset = k * HUFF_LUT_ENTRIES;
+            d_out[k] = o;
+            k = k + 1u;
+        }
+    }
+    d_n_out = k;
+}

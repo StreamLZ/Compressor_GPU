@@ -1,23 +1,31 @@
 // 1:1 port of src/decode/walk_frame_kernel.cuh, entry point slzWalkFrameKernel.
-// CUDA reference: src/decode/walk_frame_kernel.cuh:50-60.
+// CUDA reference: src/decode/walk_frame_kernel.cuh:50-200.
 // See srcVK/PortInstructions.md.
 //
-// L2 stub: device-side frame walker (async D2D path). Bindings mirror
-// the CUDA arg list verbatim.
+// Single-threaded device-side frame walker. Reads the entire compressed
+// frame from device memory and produces a device-resident SlzChunkDesc[]
+// array — the CPU never touches the compressed bytes.
 
 #version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "slz_wire_format.glsl"
 
 // CUDA: single-thread launch (1 block × 1 thread).
 layout(local_size_x = 1) in;
 
-// arg 0: const uint8_t* d_frame
+// arg 0: const uint8_t* d_frame. VK adaptation: declared as uint8_t so
+// the kernel can byte-index the compressed frame the same way the CUDA
+// pointer-arithmetic walks `d_frame[pos + k]`.
 layout(std430, binding = 0) readonly buffer FrameBuf {
-    uint d_frame[];
+    uint8_t d_frame[];
 };
 
-// arg 2: SlzChunkDesc* d_chunks
+// arg 2: SlzChunkDesc* d_chunks. Same SlzChunkDesc layout as slz_wire_format.glsl
+// (declared in the included header).
 layout(std430, binding = 1) buffer ChunksBuf {
-    uint d_chunks[];
+    SlzChunkDesc d_chunks[];
 };
 
 // arg 4: uint32_t* d_n_chunks
@@ -56,4 +64,206 @@ layout(push_constant) uniform Push {
     uint max_chunks;
 } pc;
 
-void main() { return; }
+// VK adaptation: CUDA reads u32 little-endian via readU32LE(p) helpers
+// over a pointer; the GLSL form loads the four candidate bytes from the
+// SSBO at (base + 0..3) and reuses readU32LE from gpu_byteio.glsl. Wrap
+// the pattern so the walk code reads close to the CUDA shape.
+uint frameReadU32LE(uint pos) {
+    uint p0 = uint(d_frame[pos + 0u]);
+    uint p1 = uint(d_frame[pos + 1u]);
+    uint p2 = uint(d_frame[pos + 2u]);
+    uint p3 = uint(d_frame[pos + 3u]);
+    return readU32LE(p0, p1, p2, p3);
+}
+
+// CUDA reference: src/decode/walk_frame_kernel.cuh:35-43 walkReadF32LE.
+// VK adaptation: GLSL uintBitsToFloat is the defined bit-cast for u32→f32.
+float walkReadF32LE(uint pos) {
+    return uintBitsToFloat(frameReadU32LE(pos));
+}
+
+void main() {
+    SLZ_GUARD_SINGLE_THREAD();
+
+    // CUDA reference: src/decode/walk_frame_kernel.cuh:62-68. Initialize
+    // every output slot to zero so the host sees a defined state on every
+    // bail-out path.
+    d_n_chunks = 0u;
+    d_decompressed_size = 0u;
+    d_sub_chunk_cap = 0u;
+    d_block_start = 0u;
+    d_block_size = 0u;
+    d_status = 0u;
+
+    uint frame_size = pc.frame_size;
+    uint max_chunks = pc.max_chunks;
+
+    // CUDA reference: src/decode/walk_frame_kernel.cuh:70-77. Frame header
+    // sanity + magic / version / codec gates.
+    if (frame_size < SLZ_FRAME_MIN_HDR_SIZE) { d_status = 12u; return; }
+    if (frameReadU32LE(0u) != SLZ_FRAME_MAGIC) { d_status = 1u; return; }
+
+    uint version = uint(d_frame[4u]);
+    if (version != SLZ_FRAME_VERSION) { d_status = 2u; return; }
+
+    uint flags = uint(d_frame[5u]);
+    uint codec = uint(d_frame[6u]);
+    if (codec != SLZ_CODEC_FAST_LZ) { d_status = 3u; return; }
+
+    // d_frame[7] = level (unused), d_frame[8] = block_size_log2 (unused).
+    float sc_group_size = walkReadF32LE(9u);
+
+    uint pos = SLZ_FRAME_MIN_HDR_SIZE;
+    bool content_size_present = (flags & SLZ_FRAME_FLAG_CONTENT_SIZE_PRESENT) != 0u;
+    bool dict_id_present      = (flags & SLZ_FRAME_FLAG_DICT_ID_PRESENT) != 0u;
+    if (dict_id_present) { d_status = 4u; return; }
+    if (content_size_present) pos = pos + 8u;
+
+    // CUDA reference: src/decode/walk_frame_kernel.cuh:92-97. eff_chunk_size
+    // mirrors decompressOneFrame's logic: clamp to SLZ_CHUNK_SIZE_BYTES,
+    // fall back to DEFAULT_SUB_CHUNK_CAP on zero.
+    uint eff_chunk_size = uint(sc_group_size * float(SLZ_CHUNK_SIZE_BYTES));
+    if (eff_chunk_size > SLZ_CHUNK_SIZE_BYTES) eff_chunk_size = SLZ_CHUNK_SIZE_BYTES;
+    if (eff_chunk_size == 0u) eff_chunk_size = DEFAULT_SUB_CHUNK_CAP;
+    // sub_chunk_cap is the slot stride used by the scan kernel.
+    uint sub_chunk_cap = ENTROPY_SCRATCH_SLOT_BYTES;
+
+    uint dst_off = 0u;
+    uint n_chunks = 0u;
+    uint blocks_seen = 0u;
+
+    // CUDA reference: src/decode/walk_frame_kernel.cuh:103-195. Block-loop:
+    // walk one block per iteration, emit ChunkDesc per inner chunk. Single
+    // block only (status 13 if a second block is encountered).
+    while (pos + 4u <= frame_size) {
+        uint w0 = frameReadU32LE(pos);
+        if (w0 == SLZ_FRAME_END_MARK) { break; }
+        if (pos + 8u > frame_size) { d_status = 6u; return; }
+
+        uint decomp_size = frameReadU32LE(pos + 4u);
+        bool uncompressed_block = (w0 & SLZ_BLOCK_UNCOMP_FLAG) != 0u;
+        bool pdm_block          = (w0 & SLZ_BLOCK_PDM_FLAG) != 0u;
+        uint comp_size = w0 & ~(SLZ_BLOCK_UNCOMP_FLAG | SLZ_BLOCK_PDM_FLAG);
+        pos = pos + 8u;
+        blocks_seen = blocks_seen + 1u;
+        if (blocks_seen > 1u) { d_status = 13u; return; }
+        if (pdm_block) { d_status = 5u; return; }
+
+        uint block_payload_start = pos;
+        d_block_start = block_payload_start;
+        d_block_size = comp_size;
+
+        // CUDA reference: src/decode/walk_frame_kernel.cuh:120-133. Bare
+        // uncompressed block path (whole frame is one raw block).
+        if (uncompressed_block) {
+            if (pos + decomp_size > frame_size) { d_status = 12u; return; }
+            if (n_chunks >= max_chunks) { d_status = 11u; return; }
+            // src_offset is BLOCK-PAYLOAD-RELATIVE (matches the CPU walk).
+            // Initialize all 6 u32 fields including the memset_and_reserved
+            // packed field (= 0).
+            SlzChunkDesc ch;
+            ch.src_offset = 0u;
+            ch.comp_size = decomp_size;
+            ch.decomp_size = decomp_size;
+            ch.dst_offset = dst_off;
+            ch.flags = CHUNK_FLAG_UNCOMPRESSED;
+            ch.memset_and_reserved = 0u;
+            d_chunks[n_chunks] = ch;
+            n_chunks = n_chunks + 1u;
+            dst_off = dst_off + decomp_size;
+            pos = pos + comp_size;
+            continue;
+        }
+
+        // CUDA reference: src/decode/walk_frame_kernel.cuh:135-148. Internal
+        // block header sanity (magic + decoder + checksums).
+        if (pos + 2u > frame_size) { d_status = 12u; return; }
+        uint bh0 = uint(d_frame[pos + 0u]);
+        uint bh1 = uint(d_frame[pos + 1u]);
+        if ((bh0 & SLZ_BLOCK_HDR_MAGIC_MASK) != SLZ_INT_BLOCK_MAGIC) { d_status = 7u; return; }
+        uint decoder = bh1 & SLZ_BLOCK_HDR_DECODER_MASK;
+        if (decoder != SLZ_DECODER_FAST && decoder != SLZ_DECODER_TURBO) { d_status = 8u; return; }
+        bool use_checksums = (bh1 & SLZ_BLOCK_HDR_CHECKSUM_FLAG) != 0u;
+        if (use_checksums) { d_status = 5u; return; }
+        uint block_end = pos + comp_size;
+
+        uint dst_remaining = decomp_size;
+        bool need_internal_hdr = false;
+        pos = pos + 2u;
+
+        // CUDA reference: src/decode/walk_frame_kernel.cuh:149-192. Inner
+        // chunk loop: each iteration consumes one chunk header + payload.
+        while (dst_remaining > 0u && pos < block_end) {
+            if (need_internal_hdr) {
+                if (pos + 2u > block_end) { d_status = 7u; return; }
+                uint b0 = uint(d_frame[pos + 0u]);
+                uint b1 = uint(d_frame[pos + 1u]);
+                if ((b0 & SLZ_BLOCK_HDR_MAGIC_MASK) != SLZ_INT_BLOCK_MAGIC) { d_status = 7u; return; }
+                uint dec2 = b1 & SLZ_BLOCK_HDR_DECODER_MASK;
+                if (dec2 != SLZ_DECODER_FAST && dec2 != SLZ_DECODER_TURBO) { d_status = 8u; return; }
+                if ((b1 & SLZ_BLOCK_HDR_CHECKSUM_FLAG) != 0u) { d_status = 5u; return; }
+                pos = pos + 2u;
+            }
+
+            uint dst_this = (dst_remaining < eff_chunk_size) ? dst_remaining : eff_chunk_size;
+
+            if (pos + 4u > block_end) { d_status = 9u; return; }
+            uint v = frameReadU32LE(pos);
+            uint size_field = v & SLZ_CHUNK_SIZE_MASK;
+            // VK adaptation: SLZ_CHUNK_TYPE_MASK in gpu_wire_format.glsl is
+            // (3u << 18) — a pre-shifted mask. Match CUDA's
+            // `(v >> SLZ_CHUNK_TYPE_SHIFT) & 3u` by shifting first and
+            // masking with literal 3u for the chunk-type extraction (the
+            // mask constant is the post-shift form `3u`).
+            uint chunk_type = (v >> SLZ_CHUNK_TYPE_SHIFT) & 3u;
+
+            if (chunk_type == 0u) {
+                uint comp = size_field + 1u;
+                pos = pos + 4u;
+                if (pos + comp > block_end) { d_status = 12u; return; }
+                if (n_chunks >= max_chunks) { d_status = 11u; return; }
+                uint flg = (comp == dst_this) ? CHUNK_FLAG_UNCOMPRESSED : 0u;
+                // src_offset is BLOCK-PAYLOAD-RELATIVE (matches CPU walk).
+                SlzChunkDesc ch;
+                ch.src_offset = pos - block_payload_start;
+                ch.comp_size = comp;
+                ch.decomp_size = dst_this;
+                ch.dst_offset = dst_off;
+                ch.flags = flg;
+                ch.memset_and_reserved = 0u;
+                d_chunks[n_chunks] = ch;
+                n_chunks = n_chunks + 1u;
+                pos = pos + comp;
+            } else if (chunk_type == 1u) {
+                if (pos + 5u > block_end) { d_status = 9u; return; }
+                uint fill = uint(d_frame[pos + 4u]);
+                pos = pos + 5u;
+                if (n_chunks >= max_chunks) { d_status = 11u; return; }
+                // VK adaptation: SlzChunkDesc in slz_wire_format.glsl packs
+                // CUDA's u8 memset_fill + u8[3] reserved into a single u32
+                // memset_and_reserved; low byte carries the fill value.
+                SlzChunkDesc ch;
+                ch.src_offset = 0u;
+                ch.comp_size = 0u;
+                ch.decomp_size = dst_this;
+                ch.dst_offset = dst_off;
+                ch.flags = CHUNK_FLAG_MEMSET;
+                ch.memset_and_reserved = fill & 0xFFu;
+                d_chunks[n_chunks] = ch;
+                n_chunks = n_chunks + 1u;
+            } else {
+                d_status = 10u; return;
+            }
+
+            dst_off = dst_off + dst_this;
+            dst_remaining = dst_remaining - dst_this;
+            need_internal_hdr = true;
+        }
+
+        pos = block_end;
+    }
+
+    d_n_chunks = n_chunks;
+    d_decompressed_size = dst_off;
+    d_sub_chunk_cap = sub_chunk_cap;
+}

@@ -1,24 +1,41 @@
 // 1:1 port of src/decode/compact_descs_kernels.cuh, entry point
 // slzCompactRawDescsKernel.
-// CUDA reference: src/decode/compact_descs_kernels.cuh:62-67.
+// CUDA reference: src/decode/compact_descs_kernels.cuh:62-89.
 // See srcVK/PortInstructions.md.
-//
-// L2 stub. Single-threaded compaction.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
 
-// CUDA: 1 block × 1 thread.
+#include "slz_wire_format.glsl"
+
+// CUDA: 1 block × 1 thread (SLZ_GUARD_SINGLE_THREAD).
 layout(local_size_x = 1) in;
+
+// SlzScanRawDesc layout matches descriptors.zig::ScanRawDesc — 4 × u32
+// = 16 bytes. {src_offset, size, gpu_offset, valid}.
+struct SlzScanRawDescGlsl {
+    uint src_offset;
+    uint size;
+    uint gpu_offset;
+    uint valid;
+};
+
+// SlzRawOff16Desc layout matches descriptors.zig::RawOff16Desc — 3 × u32
+// = 12 bytes. {src_offset, size, gpu_offset}.
+struct SlzRawOff16DescGlsl {
+    uint src_offset;
+    uint size;
+    uint gpu_offset;
+};
 
 // arg 0: const SlzScanRawDesc* d_staged_hi
 layout(std430, binding = 0) readonly buffer StagedHiBuf {
-    uint d_staged_hi[];
+    SlzScanRawDescGlsl d_staged_hi[];
 };
 
 // arg 1: const SlzScanRawDesc* d_staged_lo
 layout(std430, binding = 1) readonly buffer StagedLoBuf {
-    uint d_staged_lo[];
+    SlzScanRawDescGlsl d_staged_lo[];
 };
 
 // arg 2: const uint32_t* d_total_subs
@@ -28,7 +45,7 @@ layout(std430, binding = 2) readonly buffer TotalSubsBuf {
 
 // arg 3: SlzRawOff16Desc* d_out
 layout(std430, binding = 3) buffer OutBuf {
-    uint d_out[];
+    SlzRawOff16DescGlsl d_out[];
 };
 
 // arg 4: uint32_t* d_n_out
@@ -36,4 +53,31 @@ layout(std430, binding = 4) buffer NOutBuf {
     uint d_n_out;
 };
 
-void main() { return; }
+void main() {
+    SLZ_GUARD_SINGLE_THREAD();
+
+    // CUDA reference: src/decode/compact_descs_kernels.cuh:69-88.
+    uint tot = d_total_subs;
+    uint k = 0u;
+    for (uint i = 0u; i < tot; i = i + 1u) {
+        SlzScanRawDescGlsl hi = d_staged_hi[i];
+        if (hi.valid != 0u) {
+            SlzRawOff16DescGlsl o;
+            o.src_offset = hi.src_offset;
+            o.size       = hi.size;
+            o.gpu_offset = hi.gpu_offset;
+            d_out[k] = o;
+            k = k + 1u;
+        }
+        SlzScanRawDescGlsl lo = d_staged_lo[i];
+        if (lo.valid != 0u) {
+            SlzRawOff16DescGlsl o;
+            o.src_offset = lo.src_offset;
+            o.size       = lo.size;
+            o.gpu_offset = lo.gpu_offset;
+            d_out[k] = o;
+            k = k + 1u;
+        }
+    }
+    d_n_out = k;
+}

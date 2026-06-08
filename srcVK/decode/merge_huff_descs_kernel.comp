@@ -1,34 +1,55 @@
 // 1:1 port of src/decode/merge_huff_descs_kernel.cuh, entry point
 // slzMergeHuffDescsKernel.
-// CUDA reference: src/decode/merge_huff_descs_kernel.cuh:41-53.
+// CUDA reference: src/decode/merge_huff_descs_kernel.cuh:41-62.
 // See srcVK/PortInstructions.md.
 //
-// L2 stub. Single-threaded merge.
+// Single-threaded merge of four per-stream compacted SlzHuffDecChunkDesc
+// arrays into one merged array. Adds per-region out_offset and assigns
+// sequential lut_offsets across the union (lit slots 0..n_lit-1, tok
+// slots n_lit..n_lit+n_tok-1, ...). Mirrors the CPU `append` loop in
+// fullGpuLaunchImpl.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
 
+#include "slz_wire_format.glsl"
+
 // CUDA: 1 block × 1 thread (SLZ_GUARD_SINGLE_THREAD).
 layout(local_size_x = 1) in;
 
+// VK adaptation: HUFF_LUT_ENTRIES is defined in srcVK/decode/descriptors.zig
+// (= 1024). Mirror the constant locally so the merged lut_offset stamp
+// matches the CUDA `lut_slot * HUFF_LUT_ENTRIES` shape.
+const uint HUFF_LUT_ENTRIES = 1024u;
+
+// SlzHuffDecChunkDesc layout matches descriptors.zig::HuffDecChunkDesc —
+// 5 × u32 = 20 bytes. {in_offset, in_size, out_offset, out_size, lut_offset}.
+struct SlzHuffDecChunkDescGlsl {
+    uint in_offset;
+    uint in_size;
+    uint out_offset;
+    uint out_size;
+    uint lut_offset;
+};
+
 // arg 0: const SlzHuffDecChunkDesc* d_lit
 layout(std430, binding = 0) readonly buffer LitBuf {
-    uint d_lit[];
+    SlzHuffDecChunkDescGlsl d_lit[];
 };
 
 // arg 1: const SlzHuffDecChunkDesc* d_tok
 layout(std430, binding = 1) readonly buffer TokBuf {
-    uint d_tok[];
+    SlzHuffDecChunkDescGlsl d_tok[];
 };
 
 // arg 2: const SlzHuffDecChunkDesc* d_hi
 layout(std430, binding = 2) readonly buffer HiBuf {
-    uint d_hi[];
+    SlzHuffDecChunkDescGlsl d_hi[];
 };
 
 // arg 3: const SlzHuffDecChunkDesc* d_lo
 layout(std430, binding = 3) readonly buffer LoBuf {
-    uint d_lo[];
+    SlzHuffDecChunkDescGlsl d_lo[];
 };
 
 // arg 4: const uint32_t* d_n_lit
@@ -53,7 +74,7 @@ layout(std430, binding = 7) readonly buffer NLoBuf {
 
 // arg 10: SlzHuffDecChunkDesc* d_merged
 layout(std430, binding = 8) buffer MergedBuf {
-    uint d_merged[];
+    SlzHuffDecChunkDescGlsl d_merged[];
 };
 
 // arg 11: uint32_t* d_n_merged
@@ -67,4 +88,55 @@ layout(push_constant) uniform Push {
     uint off16_region_off;
 } pc;
 
-void main() { return; }
+void main() {
+    SLZ_GUARD_SINGLE_THREAD();
+
+    // CUDA reference: src/decode/merge_huff_descs_kernel.cuh:25-39
+    // appendRegion + the 4× call below. VK adaptation: GLSL cannot pass
+    // a buffer block by reference to a function, so we inline the four
+    // appendRegion calls instead of factoring out a helper. The body of
+    // each block matches CUDA's appendRegion exactly.
+    uint lut_slot = 0u;
+
+    // appendRegion(d_merged, lut_slot, d_lit, *d_n_lit, 0)
+    uint n_lit = d_n_lit;
+    for (uint i = 0u; i < n_lit; i = i + 1u) {
+        SlzHuffDecChunkDescGlsl d = d_lit[i];
+        d.out_offset = d.out_offset + 0u;
+        d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
+        d_merged[lut_slot] = d;
+        lut_slot = lut_slot + 1u;
+    }
+
+    // appendRegion(d_merged, lut_slot, d_tok, *d_n_tok, tok_region_off)
+    uint n_tok = d_n_tok;
+    for (uint i = 0u; i < n_tok; i = i + 1u) {
+        SlzHuffDecChunkDescGlsl d = d_tok[i];
+        d.out_offset = d.out_offset + pc.tok_region_off;
+        d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
+        d_merged[lut_slot] = d;
+        lut_slot = lut_slot + 1u;
+    }
+
+    // appendRegion(d_merged, lut_slot, d_hi, *d_n_hi, off16_region_off)
+    uint n_hi = d_n_hi;
+    for (uint i = 0u; i < n_hi; i = i + 1u) {
+        SlzHuffDecChunkDescGlsl d = d_hi[i];
+        d.out_offset = d.out_offset + pc.off16_region_off;
+        d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
+        d_merged[lut_slot] = d;
+        lut_slot = lut_slot + 1u;
+    }
+
+    // appendRegion(d_merged, lut_slot, d_lo, *d_n_lo, off16_region_off)
+    uint n_lo = d_n_lo;
+    for (uint i = 0u; i < n_lo; i = i + 1u) {
+        SlzHuffDecChunkDescGlsl d = d_lo[i];
+        d.out_offset = d.out_offset + pc.off16_region_off;
+        d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
+        d_merged[lut_slot] = d;
+        lut_slot = lut_slot + 1u;
+    }
+
+    d_n_merged = lut_slot;
+}

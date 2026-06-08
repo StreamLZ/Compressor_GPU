@@ -18,16 +18,59 @@ const GpuError = descriptors.GpuError;
 const ensureDeviceBuf = decode_context.ensureDeviceBuf;
 const vkCall = descriptors.vkCall;
 
-/// CUDA reference: src/decode/scan_gpu.zig:37-82. L2 stub.
+/// CUDA reference: src/decode/scan_gpu.zig:37-82. GPU frame walk —
+/// device-only output. Launches the walk kernel and returns the device
+/// pointers it wrote to; NO D2H. Used by `decompressFramedFromDevice`
+/// to keep the entire decode pipeline device-resident on the L1 raw
+/// (and future L2+) path.
 pub fn gpuWalkFrameImpl(
     self: *DecodeContext,
     d_frame: u64,
     frame_size: u32,
 ) GpuError!descriptors.WalkFrameResultDev {
-    _ = self;
-    _ = d_frame;
-    _ = frame_size;
-    return error.NotImplementedL2;
+    if (!module_loader.init()) return error.BackendNotAvailable;
+    if (module_loader.walk_frame_fn == 0) return error.KernelMissing;
+    const launch = vk.procs.launch_kernel orelse return error.BackendNotAvailable;
+    const memset = vk.procs.memset_d8 orelse return error.BackendNotAvailable;
+
+    const chunks_bytes: usize = @as(usize, descriptors.WALK_MAX_CHUNKS) * @sizeOf(descriptors.ChunkDesc);
+    try ensureDeviceBuf(&self.d_walk_chunks, &self.d_walk_chunks_size, chunks_bytes);
+    try ensureDeviceBuf(&self.d_walk_meta, &self.d_walk_meta_size, descriptors.walk_meta_offsets.bytes);
+    try vkCall(memset(self.d_walk_meta, 0, descriptors.walk_meta_offsets.bytes), .copy);
+
+    // Launch on caller's `work_stream` (= 0 in sync, caller's stream in
+    // async). No post-kernel sync — any subsequent kernel queued on the
+    // same stream serializes via stream ordering.
+    const stream = self.work_stream;
+    var k_frame: u64 = d_frame;
+    var k_chunks: u64 = self.d_walk_chunks;
+    var k_meta_n: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.n_chunks;
+    var k_meta_decomp: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.decomp_size;
+    var k_meta_sccap: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.sub_chunk_cap;
+    var k_meta_bstart: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.block_start;
+    var k_meta_bsize: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.block_size;
+    var k_meta_status: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.status;
+    var k_size: u32 = frame_size;
+    var k_max: u32 = descriptors.WALK_MAX_CHUNKS;
+    // walk_frame: n_bindings=8 (FrameBuf, ChunksBuf, NChunksBuf,
+    // DecompressedSizeBuf, SubChunkCapBuf, BlockStartBuf, BlockSizeBuf,
+    // StatusBuf), push_constant_size=8 (frame_size, max_chunks).
+    var params = [_]?*anyopaque{
+        @ptrCast(&k_frame),       @ptrCast(&k_chunks),
+        @ptrCast(&k_meta_n),      @ptrCast(&k_meta_decomp),
+        @ptrCast(&k_meta_sccap),  @ptrCast(&k_meta_bstart),
+        @ptrCast(&k_meta_bsize),  @ptrCast(&k_meta_status),
+        @ptrCast(&k_size),        @ptrCast(&k_max),
+    };
+    var extra = [_]?*anyopaque{null};
+    const t_walk = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzWalkFrameKernel", stream);
+    try vkCall(launch(module_loader.walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, stream, &params, &extra), .launch);
+    decode_context.endKernelTiming(t_walk, stream);
+
+    return .{
+        .d_chunk_descs = self.d_walk_chunks,
+        .d_meta = self.d_walk_meta,
+    };
 }
 
 /// CUDA reference: src/decode/scan_gpu.zig:90-129. Per-chunk prefix sum

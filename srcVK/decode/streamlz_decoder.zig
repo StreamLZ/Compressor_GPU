@@ -68,7 +68,9 @@ pub fn decompressFramedThreaded(
 }
 
 /// CUDA reference: src/decode/streamlz_decoder.zig:136-182. True-D2D
-/// decompress for the v3 C ABI.
+/// decompress for the v3 C ABI. Single-block, slzCompress-shape frames
+/// only. Drives the GPU frame-walk kernel + the device-resident dispatch
+/// path so the CPU never touches the compressed bytes.
 pub fn decompressFramedFromDevice(
     io: ?std.Io,
     d_frame: u64,
@@ -77,13 +79,49 @@ pub fn decompressFramedFromDevice(
     dec_ctx: *gpu_driver.DecodeContext,
     decomp_size: u32,
 ) DecompressError!u32 {
-    _ = io;
-    _ = d_frame;
-    _ = frame_size;
-    _ = d_output;
-    _ = dec_ctx;
-    _ = decomp_size;
-    return error.NotImplementedL2;
+    // CUDA reference: src/decode/streamlz_decoder.zig:144-148. Frame
+    // layout: [hdr 14][content_size 8][block_hdr 8][block][end 4].
+    const fixed_overhead: u32 = 14 + 8 + 8 + 4;
+    if (frame_size < fixed_overhead + 1) return error.BadMode;
+    const block_start: u32 = 14 + 8 + 8;
+    const block_size: u32 = frame_size - fixed_overhead;
+
+    // CUDA reference: src/decode/streamlz_decoder.zig:150-155.
+    // sc_group=0.25 → effective chunk size of 64 KB, the smallest the
+    // GPU encoder produces. The walk kernel writes the real chunk count
+    // to d_meta+0; this bound only sizes descriptor + grid space.
+    const min_eff_chunk_size: u32 = 0x10000; // 64 KB
+    const n_chunks_bound: u32 = (decomp_size + min_eff_chunk_size - 1) / min_eff_chunk_size;
+    if (n_chunks_bound == 0 or n_chunks_bound > gpu_driver.WALK_MAX_CHUNKS) return error.BadMode;
+
+    const dev = try gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size);
+
+    // CUDA reference: src/decode/streamlz_decoder.zig:158-164. Stub
+    // host-side slices: the kernel reads from `d_chunk_descs_override`
+    // and `d_compressed_src`; the host slices are length-only and never
+    // dereferenced.
+    const stub_chunks_ptr: [*]const gpu_driver.ChunkDesc = @ptrFromInt(0x10);
+    const chunks_stub: []const gpu_driver.ChunkDesc = stub_chunks_ptr[0..n_chunks_bound];
+    const stub_bytes_ptr: [*]const u8 = @ptrFromInt(0x10);
+    const compressed_block: []const u8 = stub_bytes_ptr[0..block_size];
+
+    var dst_dummy: u8 = 0;
+    try gpu_driver.fullGpuLaunchImpl(dec_ctx, .{
+        .chunk_descs = chunks_stub,
+        .compressed_block = compressed_block,
+        .dst_full = @ptrCast(&dst_dummy),
+        .dst_start_off = 0,
+        .decompressed_size = decomp_size,
+        .chunks_per_group = 1,
+        .sub_chunk_cap = @intCast(gpu_driver.ENTROPY_SCRATCH_SLOT_BYTES),
+        .io = io,
+        .d_output_target = d_output,
+        .d_compressed_src = d_frame + block_start,
+        .d_chunk_descs_override = dev.d_chunk_descs,
+        .d_n_chunks_dev = dev.d_meta + gpu_driver.walk_meta_offsets.n_chunks,
+        .level = 1,
+    });
+    return decomp_size;
 }
 
 /// CUDA reference: src/decode/streamlz_decoder.zig:189-209. Per-call

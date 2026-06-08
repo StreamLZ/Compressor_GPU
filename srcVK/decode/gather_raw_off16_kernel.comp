@@ -1,31 +1,44 @@
 // 1:1 port of src/decode/gather_raw_off16_kernel.cuh, entry point
 // slzGatherRawOff16Kernel.
-// CUDA reference: src/decode/gather_raw_off16_kernel.cuh:23-29.
+// CUDA reference: src/decode/gather_raw_off16_kernel.cuh:23-38.
 // See srcVK/PortInstructions.md.
 //
-// L2 stub. Bindings mirror the CUDA arg list so the compiled SPV emits a
-// descriptor set layout the host can bind without rework when the L2
-// fleshout body lands.
+// Single-launch scatter of raw (type-0) off16 sub-streams from the
+// compressed blob into the off16 scratch. Per-block self-gate on the
+// device-resident counter so the host doesn't need to D2H the count.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "slz_wire_format.glsl"
 
 // CUDA: grid_x blocks × 256 threads per decode_dispatch.zig:177.
 layout(local_size_x = 256) in;
 
-// arg 0: const uint8_t* comp_base
+// SlzRawOff16Desc layout matches descriptors.zig::RawOff16Desc — 3 × u32
+// = 12 bytes. {src_offset, size, gpu_offset}.
+struct SlzRawOff16DescGlsl {
+    uint src_offset;
+    uint size;
+    uint gpu_offset;
+};
+
+// arg 0: const uint8_t* comp_base. VK adaptation: uint8_t so the kernel
+// can byte-index `comp_base[src_offset + j]` matching the CUDA pointer-
+// arithmetic shape.
 layout(std430, binding = 0) readonly buffer CompBaseBuf {
-    uint comp_base[];
+    uint8_t comp_base[];
 };
 
 // arg 2: uint8_t* scratch_base
 layout(std430, binding = 1) buffer ScratchBaseBuf {
-    uint scratch_base[];
+    uint8_t scratch_base[];
 };
 
 // arg 3: const SlzRawOff16Desc* descs
 layout(std430, binding = 2) readonly buffer DescsBuf {
-    uint descs_raw[];
+    SlzRawOff16DescGlsl descs[];
 };
 
 // arg 4: const uint32_t* d_count
@@ -38,4 +51,17 @@ layout(push_constant) uniform Push {
     uint comp_len;
 } pc;
 
-void main() { return; }
+void main() {
+    // CUDA reference: src/decode/gather_raw_off16_kernel.cuh:30-37.
+    // Per-block self-gate on the device counter. Each block copies one
+    // raw off16 sub-stream; lanes stride the byte copy.
+    uint i = gl_WorkGroupID.x;
+    if (i >= d_count) return;
+    SlzRawOff16DescGlsl d = descs[i];
+    if (d.size == 0u || d.src_offset > pc.comp_len || d.size > pc.comp_len - d.src_offset) return;
+    uint blockDim_x = gl_WorkGroupSize.x;
+    uint lane = gl_LocalInvocationID.x;
+    for (uint j = lane; j < d.size; j = j + blockDim_x) {
+        scratch_base[d.gpu_offset + j] = comp_base[d.src_offset + j];
+    }
+}

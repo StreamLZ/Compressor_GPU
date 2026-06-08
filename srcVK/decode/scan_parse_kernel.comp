@@ -1,24 +1,56 @@
 // 1:1 port of src/decode/scan_parse_kernel.cuh, entry point slzScanParseKernel.
-// CUDA reference: src/decode/scan_parse_kernel.cuh:108-120.
+// CUDA reference: src/decode/scan_parse_kernel.cuh:108-234.
 // See srcVK/PortInstructions.md.
 //
-// L2 stub. Bindings reflect the CUDA arg list verbatim; SSBOs for
-// pointer args, push constant for the scalar.
+// One thread per chunk walks every sub-chunk's literal / token / off16
+// stream headers and stages a descriptor per stream type per global
+// sub-chunk index. The driver/compact kernels consume the staged arrays
+// and assign sequential lut_offsets.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "slz_wire_format.glsl"
 
 // CUDA: blocks × 256 threads per scan_gpu.zig:182.
 layout(local_size_x = 256) in;
 
-// arg 0: const uint8_t* block
-layout(std430, binding = 0) readonly buffer BlockBuf {
-    uint block_data[];
+// CUDA reference: src/decode/scan_parse_kernel.cuh:28-29. Scan-local
+// aliases for the wire-format slot offsets.
+const uint SCAN_SUBCHUNK_SLOT = ENTROPY_SCRATCH_SLOT_BYTES;
+const uint SCAN_OFF16_LO_SLOT = OFF16_HILO_SPLIT_OFFSET;
+
+// ── Staged descriptor structs (must match compact_*_descs_kernel.comp) ──
+//
+// SlzScanHuffDesc layout matches descriptors.zig::ScanHuffDesc — 5 × u32
+// = 20 bytes. {in_offset, in_size, out_offset, out_size, valid}.
+struct SlzScanHuffDescGlsl {
+    uint in_offset;
+    uint in_size;
+    uint out_offset;
+    uint out_size;
+    uint valid;
+};
+// SlzScanRawDesc layout matches descriptors.zig::ScanRawDesc — 4 × u32 = 16 bytes.
+struct SlzScanRawDescGlsl {
+    uint src_offset;
+    uint size;
+    uint gpu_offset;
+    uint valid;
 };
 
-// arg 2: const SlzChunkDesc* chunks
+// arg 0: const uint8_t* block. VK adaptation: declare as uint8_t so the
+// scan code can byte-index `block[ch.src_offset + pos]` matching CUDA's
+// pointer arithmetic shape.
+layout(std430, binding = 0) readonly buffer BlockBuf {
+    uint8_t block_data[];
+};
+
+// arg 2: const SlzChunkDesc* chunks. Uses the SlzChunkDesc struct from
+// slz_wire_format.glsl (24 bytes).
 layout(std430, binding = 1) readonly buffer ChunksBuf {
-    uint chunks[];
+    SlzChunkDesc chunks[];
 };
 
 // arg 3: const uint32_t* first_sub_idx
@@ -33,32 +65,32 @@ layout(std430, binding = 3) readonly buffer NChunksBuf {
 
 // arg 6: SlzScanHuffDesc* st_lit
 layout(std430, binding = 4) buffer StLitBuf {
-    uint st_lit[];
+    SlzScanHuffDescGlsl st_lit[];
 };
 
 // arg 7: SlzScanHuffDesc* st_tok
 layout(std430, binding = 5) buffer StTokBuf {
-    uint st_tok[];
+    SlzScanHuffDescGlsl st_tok[];
 };
 
 // arg 8: SlzScanHuffDesc* st_hi
 layout(std430, binding = 6) buffer StHiBuf {
-    uint st_hi[];
+    SlzScanHuffDescGlsl st_hi[];
 };
 
 // arg 9: SlzScanHuffDesc* st_lo
 layout(std430, binding = 7) buffer StLoBuf {
-    uint st_lo[];
+    SlzScanHuffDescGlsl st_lo[];
 };
 
 // arg 10: SlzScanRawDesc* st_raw_hi
 layout(std430, binding = 8) buffer StRawHiBuf {
-    uint st_raw_hi[];
+    SlzScanRawDescGlsl st_raw_hi[];
 };
 
 // arg 11: SlzScanRawDesc* st_raw_lo
 layout(std430, binding = 9) buffer StRawLoBuf {
-    uint st_raw_lo[];
+    SlzScanRawDescGlsl st_raw_lo[];
 };
 
 // Scalar args 1, 5: block_len, sub_chunk_cap.
@@ -67,4 +99,247 @@ layout(push_constant) uniform Push {
     uint sub_chunk_cap;
 } pc;
 
-void main() { return; }
+// VK adaptation: CUDA reads bytes via `chunk_src[pos]` direct pointer
+// arithmetic. GLSL must byte-index the SSBO; wrap the access so the scan
+// code reads close to the CUDA shape. block_off is the chunk's
+// ch.src_offset (block-relative).
+uint loadBlockByte(uint pos) {
+    return uint(block_data[pos]);
+}
+
+uint blockReadU16LE(uint pos) {
+    uint p0 = loadBlockByte(pos + 0u);
+    uint p1 = loadBlockByte(pos + 1u);
+    return readU16LE(p0, p1);
+}
+
+// ── Cursor-free scan parsers ────────────────────────────────────────
+// CUDA reference: src/decode/scan_parse_kernel.cuh:45-78.
+// VK adaptation: CUDA passes a `const uint8_t* chunk_src + pos` pointer;
+// GLSL loads via loadBlockByte(absolute_pos). The absolute_pos for the
+// scan is `ch.src_offset + (offset_within_chunk)` — but the CUDA logic
+// works with chunk-relative `pos` and adds `chunk_src` at every read.
+// Here we keep a chunk-base parameter `block_base = ch.src_offset` and
+// add it inside each helper to mirror the shape.
+
+// Parse a chunk_type=4 Huffman header at chunk-relative `pos` within the
+// chunk. The caller pre-clears out.valid; on any bounds-failure path
+// here we leave it cleared (no callers consume the return value).
+void scanParseHuffHeader(
+    uint block_base,
+    uint chunk_len, uint pos,
+    uint src_offset_base, uint dst_off,
+    inout SlzScanHuffDescGlsl outd) {
+    if (pos >= chunk_len) return;
+    // CUDA: chunk_src[pos] >= HEADER_LONG_FORM_BIT selects SHORT form.
+    bool short_form = loadBlockByte(block_base + pos) >= HEADER_LONG_FORM_BIT;
+    uint need = short_form ? ENTROPY_HEADER_SHORT_BYTES : ENTROPY_HEADER_LONG_BYTES;
+    if (pos + need > chunk_len) return;
+    uint p0 = loadBlockByte(block_base + pos + 0u);
+    uint p1 = loadBlockByte(block_base + pos + 1u);
+    uint p2 = loadBlockByte(block_base + pos + 2u);
+    uint p3 = (need >= 4u) ? loadBlockByte(block_base + pos + 3u) : 0u;
+    uint p4 = (need >= 5u) ? loadBlockByte(block_base + pos + 4u) : 0u;
+    EntropyHdrFields h = parseEntropyHdrFields(p0, p1, p2, p3, p4);
+    outd.in_offset  = src_offset_base + pos + h.header_bytes;
+    outd.in_size    = h.comp_size;
+    outd.out_offset = dst_off;
+    outd.out_size   = h.dst_size;
+    outd.valid      = 1u;
+}
+
+// Parse a type-0 (memcpy) stream header → data offset + size.
+// Returns 1u when parse succeeds, 0u otherwise. Writes (data_off, size).
+uint scanParseType0(
+    uint block_base,
+    uint chunk_len, uint pos,
+    out uint data_off, out uint size_out) {
+    data_off = 0u;
+    size_out = 0u;
+    if (pos >= chunk_len) return 0u;
+    bool short_form = loadBlockByte(block_base + pos) >= HEADER_LONG_FORM_BIT;
+    uint need = short_form ? 2u : 3u;
+    if (pos + need > chunk_len) return 0u;
+    uint p0 = loadBlockByte(block_base + pos + 0u);
+    uint p1 = loadBlockByte(block_base + pos + 1u);
+    uint p2 = (need >= 3u) ? loadBlockByte(block_base + pos + 2u) : 0u;
+    Type0HdrFields h = parseType0HdrFields(p0, p1, p2);
+    size_out = h.size;
+    data_off = pos + h.header_bytes;
+    return (data_off != 0u) ? 1u : 0u;
+}
+
+// Skip an entropy/raw stream header + payload. 0xFFFFFFFF = truncated.
+// Only chunk types 0 (raw) and 4 (Huffman) are emitted by the GPU encoder.
+uint scanSkipStreamHeader(uint block_base, uint chunk_len, uint pos) {
+    if (pos >= chunk_len) return 0xFFFFFFFFu;
+    uint first = loadBlockByte(block_base + pos);
+    uint ct = (first >> CHUNK_TYPE_SHIFT) & CHUNK_TYPE_MASK;
+    if (ct == 0u) {
+        uint need = (first >= HEADER_LONG_FORM_BIT) ? 2u : 3u;
+        if (pos + need > chunk_len) return 0xFFFFFFFFu;
+        uint p0 = loadBlockByte(block_base + pos + 0u);
+        uint p1 = loadBlockByte(block_base + pos + 1u);
+        uint p2 = (need >= 3u) ? loadBlockByte(block_base + pos + 2u) : 0u;
+        Type0HdrFields h = parseType0HdrFields(p0, p1, p2);
+        return pos + h.header_bytes + h.size;
+    } else if (ct == HUFF_CHUNK_TYPE) {
+        uint need = (first >= HEADER_LONG_FORM_BIT)
+            ? ENTROPY_HEADER_SHORT_BYTES : ENTROPY_HEADER_LONG_BYTES;
+        if (pos + need > chunk_len) return 0xFFFFFFFFu;
+        uint p0 = loadBlockByte(block_base + pos + 0u);
+        uint p1 = loadBlockByte(block_base + pos + 1u);
+        uint p2 = loadBlockByte(block_base + pos + 2u);
+        uint p3 = (need >= 4u) ? loadBlockByte(block_base + pos + 3u) : 0u;
+        uint p4 = (need >= 5u) ? loadBlockByte(block_base + pos + 4u) : 0u;
+        EntropyHdrFields h = parseEntropyHdrFields(p0, p1, p2, p3, p4);
+        return pos + h.header_bytes + h.comp_size;
+    }
+    return 0xFFFFFFFFu;
+}
+
+void main() {
+    // CUDA reference: src/decode/scan_parse_kernel.cuh:122-124. Bounds-gate
+    // on `*d_n_chunks` then map (block, thread) → chunk index.
+    uint n_chunks = d_n_chunks;
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= n_chunks) return;
+
+    SlzChunkDesc ch = chunks[i];
+    uint cap_safe = (pc.sub_chunk_cap != 0u) ? pc.sub_chunk_cap : DEFAULT_SUB_CHUNK_CAP;
+    uint chunk_first_sub = first_sub_idx[i];
+
+    // CUDA reference: src/decode/scan_parse_kernel.cuh:130-138. Empty or
+    // non-LZ chunks: clear the per-chunk-first-sub slot and bail.
+    if (ch.flags != 0u || ch.decomp_size == 0u) {
+        st_lit[chunk_first_sub].valid = 0u;
+        st_tok[chunk_first_sub].valid = 0u;
+        st_hi[chunk_first_sub].valid  = 0u;
+        st_lo[chunk_first_sub].valid  = 0u;
+        st_raw_hi[chunk_first_sub].valid = 0u;
+        st_raw_lo[chunk_first_sub].valid = 0u;
+        return;
+    }
+    if (ch.src_offset >= pc.block_len) return;
+
+    uint chunk_end = ch.src_offset + ch.comp_size;
+    if (chunk_end > pc.block_len) chunk_end = pc.block_len;
+    // chunk_src base offset within the block SSBO.
+    uint block_base = ch.src_offset;
+    uint chunk_len = chunk_end - ch.src_offset;
+
+    uint sub_pos = 0u;
+    uint remaining = ch.decomp_size;
+    uint sub_local = 0u;
+    uint n_subs_expected = (ch.decomp_size + cap_safe - 1u) / cap_safe;
+
+    // CUDA reference: src/decode/scan_parse_kernel.cuh:151-233. Per-sub-chunk
+    // walk emitting one staged desc per stream type.
+    while (remaining > 0u && sub_pos + SUBCHUNK_HDR_BYTES <= chunk_len) {
+        uint sub_idx = chunk_first_sub + sub_local;
+        st_lit[sub_idx].valid = 0u;
+        st_tok[sub_idx].valid = 0u;
+        st_hi[sub_idx].valid  = 0u;
+        st_lo[sub_idx].valid  = 0u;
+        st_raw_hi[sub_idx].valid = 0u;
+        st_raw_lo[sub_idx].valid = 0u;
+
+        // 3-byte big-endian sub-chunk header.
+        uint h0 = loadBlockByte(block_base + sub_pos + 0u);
+        uint h1 = loadBlockByte(block_base + sub_pos + 1u);
+        uint h2 = loadBlockByte(block_base + sub_pos + 2u);
+        uint sub_hdr = readBE24(h0, h1, h2);
+        if (!subchunkIsLz(sub_hdr)) break;
+        uint sc_comp = subchunkCompSize(sub_hdr);
+        uint sub_end = sub_pos + SUBCHUNK_HDR_BYTES + sc_comp;
+        if (sub_end > chunk_len) break;
+        uint sub_decomp = (remaining < cap_safe) ? remaining : cap_safe;
+
+        uint sub_dst_off = sub_idx * SCAN_SUBCHUNK_SLOT;
+        uint init_b = (sub_idx == 0u) ? INITIAL_LITERAL_COPY_BYTES : 0u;
+        uint pos = sub_pos + SUBCHUNK_HDR_BYTES + init_b;
+        uint endp = sub_end;
+
+        // CUDA wraps the per-stream-triple in a `do { ... } while (0);`
+        // so any `break` short-circuits the rest. GLSL: replicate via a
+        // single-iteration for-loop or `do {} while (false)`. We use a
+        // gating boolean to skip the rest on early-out.
+        // VK adaptation: GLSL allows `do { } while (false)` but `break`
+        // semantics inside are identical to CUDA.
+        do {
+            if (pos >= endp) break;
+            // Stream 1: literal (lit). CUDA: type-4 → scanParseHuffHeader;
+            // raw → just skip below.
+            uint b_lit0 = loadBlockByte(block_base + pos);
+            if (((b_lit0 >> CHUNK_TYPE_SHIFT) & CHUNK_TYPE_MASK) == HUFF_CHUNK_TYPE)
+                scanParseHuffHeader(block_base, chunk_len, pos, ch.src_offset, sub_dst_off, st_lit[sub_idx]);
+            uint nxt = scanSkipStreamHeader(block_base, chunk_len, pos);
+            if (nxt == 0xFFFFFFFFu) break;
+            pos = nxt;
+            if (pos >= endp) break;
+
+            // Stream 2: token (tok).
+            uint b_tok0 = loadBlockByte(block_base + pos);
+            if (((b_tok0 >> CHUNK_TYPE_SHIFT) & CHUNK_TYPE_MASK) == HUFF_CHUNK_TYPE)
+                scanParseHuffHeader(block_base, chunk_len, pos, ch.src_offset, sub_dst_off, st_tok[sub_idx]);
+            nxt = scanSkipStreamHeader(block_base, chunk_len, pos);
+            if (nxt == 0xFFFFFFFFu) break;
+            pos = nxt;
+            if (pos >= endp) break;
+
+            // CUDA reference: src/decode/scan_parse_kernel.cuh:188-194.
+            // For sub-chunks larger than one LZ block, skip the off32
+            // length-2 field (no entropy in off32 stream).
+            if (sub_decomp > LZ_BLOCK_SIZE) {
+                if (pos + 2u > endp) break;
+                pos = pos + 2u;
+            }
+            if (pos + 2u > endp) break;
+            uint marker = blockReadU16LE(block_base + pos);
+            if (marker != OFF16_ENTROPY_MARKER) break;
+            pos = pos + 2u;
+            if (pos >= endp) break;
+
+            // Stream 3: off16 hi half. Either type-0 raw (store in
+            // st_raw_hi) or type-4 huff (store in st_hi).
+            uint b_hi0 = loadBlockByte(block_base + pos);
+            uint hi_type = (b_hi0 >> CHUNK_TYPE_SHIFT) & CHUNK_TYPE_MASK;
+            if (hi_type == 0u) {
+                uint doff; uint sz;
+                if (scanParseType0(block_base, chunk_len, pos, doff, sz) != 0u) {
+                    st_raw_hi[sub_idx].src_offset = ch.src_offset + doff;
+                    st_raw_hi[sub_idx].size       = sz;
+                    st_raw_hi[sub_idx].gpu_offset = sub_dst_off;
+                    st_raw_hi[sub_idx].valid      = 1u;
+                }
+            } else if (hi_type == HUFF_CHUNK_TYPE) {
+                scanParseHuffHeader(block_base, chunk_len, pos, ch.src_offset, sub_dst_off, st_hi[sub_idx]);
+            }
+            nxt = scanSkipStreamHeader(block_base, chunk_len, pos);
+            if (nxt == 0xFFFFFFFFu) break;
+            pos = nxt;
+            if (pos >= endp) break;
+
+            // Stream 4: off16 lo half. Same dispatch as hi but stored
+            // into st_raw_lo / st_lo with the lo-slot offset.
+            uint b_lo0 = loadBlockByte(block_base + pos);
+            uint lo_type = (b_lo0 >> CHUNK_TYPE_SHIFT) & CHUNK_TYPE_MASK;
+            if (lo_type == 0u) {
+                uint doff; uint sz;
+                if (scanParseType0(block_base, chunk_len, pos, doff, sz) != 0u) {
+                    st_raw_lo[sub_idx].src_offset = ch.src_offset + doff;
+                    st_raw_lo[sub_idx].size       = sz;
+                    st_raw_lo[sub_idx].gpu_offset = sub_dst_off + SCAN_OFF16_LO_SLOT;
+                    st_raw_lo[sub_idx].valid      = 1u;
+                }
+            } else if (lo_type == HUFF_CHUNK_TYPE) {
+                scanParseHuffHeader(block_base, chunk_len, pos, ch.src_offset, sub_dst_off + SCAN_OFF16_LO_SLOT, st_lo[sub_idx]);
+            }
+        } while (false);
+
+        sub_pos = sub_end;
+        remaining = remaining - sub_decomp;
+        sub_local = sub_local + 1u;
+        if (sub_local >= n_subs_expected) break;
+    }
+}
