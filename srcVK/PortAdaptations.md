@@ -54,35 +54,38 @@ verification status. An unverified adaptation is a known risk surface.
 ## Entries
 
 ### A-001: Dispatch fork on `lit_in_scratch || cmd_in_scratch`
-- **File:line**: `srcVK/decode/lz_dispatch.glsl:250` + surrounding
-  routing logic
+- **File:line**: `srcVK/decode/lz_dispatch.glsl:239-322` (resolution)
 - **CUDA reference**: `src/decode/lz_dispatch.cuh:190-214` — CUDA
   dispatches to `decodeSubChunkRawMode<true>` unconditionally when
   `mode==1 && off32-empty`, even with entropy lit/cmd (pointer
   polymorphism lets `lit_ptr` point into entropy_scratch
   transparently)
-- **Class**: design-choice (language-forced underlying constraint, but
-  the chosen workaround is a structural divergence — alternative is
-  raw-body specialization for entropy_scratch SSBOs)
-- **Why**: GLSL has no pointer polymorphism, so the raw-mode body
-  cannot transparently read lit/cmd from either `comp_ssbo` or
-  `entropy_lit_ssbo` / `entropy_tok_ssbo`. VK forks to general mode
-  (which has per-byte SSBO selectors) for the entropy-lit/cmd case
-- **Risk if wrong**: VK executes a code path CUDA never tests
-  (general mode with `mode==1 && off32-empty`). Any latent bug in
-  that path surfaces in VK but not CUDA
+- **Class**: design-choice (language-forced underlying constraint;
+  resolved via macro-textual specialization)
+- **Why**: GLSL has no pointer polymorphism. Pre-fix: VK forked to
+  general mode for entropy-lit/cmd. Post-fix: 8-arm dispatch
+  enumeration over `(off16_split, lit_in_scratch, cmd_in_scratch)`
+  with the right SSBO names baked per arm. Mirrors CUDA's
+  polymorphism through GLSL macro-textual expansion.
+- **Risk if wrong (pre-fix)**: VK executed a code path CUDA never
+  tests → bug surfaced only in VK at byte 65544
 - **Static verification**: Per-line review of general mode body
-  matches CUDA byte-for-byte (8 rounds of agent diffs)
-- **Runtime verification**: NOT DONE at iter 4 review time → hid the
-  byte-65544 bug. Subsequently confirmed CUDA does NOT enter general
-  mode for L3 SC1 (CUDA-side instrumentation, agent `a3233556`)
+  matched CUDA byte-for-byte (8 rounds of agent diffs found nothing
+  because they were checking the wrong file — CUDA never enters
+  general for the failing case)
+- **Runtime verification**: ✅ Phase 2A-decoder iter 4f at `4270ea4`
+  — ptest_vk 98/0/10 → 108/0/0; L3+L4 VK→VK roundtrip byte-identical
+  to source on web + enwik8; verified via direct CLI test on 128 KiB
+  web.txt head (CUDA→VK decode SHA matches)
 - **Discovered**: Iter 4 adversarial review (workflow `wygjxjrvo`)
   flagged + recommended verification; verdict mis-classified as
   `LEGITIMATE_VK_ADAPTATION` / `ship_as_is`; verification dropped.
   Bug surfaced via 10 corpus L3/L4 ptest cases at `first_diff=65544`
-- **Status**: **ACTIVE — open bug**. Fix direction: option 3 from
-  iter 4f assessment — specialize raw-mode body for entropy_scratch
-  SSBOs so VK dispatches to raw mode like CUDA does
+- **Status**: ✅ **RESOLVED at `4270ea4`**. The iter 4f fix was
+  authored mid-investigation but masked for 5+ hours by stale SPV
+  binary (see A-012). Once forced clean rebuild via `rm
+  zig-out/srcvk_shaders/lz_decode_kernel.spv`, the fix proved correct
+  on first run.
 
 ### A-002: `__match_any_sync` → 32-iter shuffle loop
 - **File:line**: `srcVK/decode/huff_build_lut_kernel.comp:133-140`
@@ -239,6 +242,33 @@ verification status. An unverified adaptation is a known risk surface.
 - **Status**: RESOLVED — direct port of CUDA logic
 
 ---
+
+### A-012: Build-graph misses `.glsl` includes as deps of `.comp`
+- **File:line**: `build.zig::addSrcVkShaderSteps` ~1031-1071
+- **CUDA reference**: `build.zig` has a PTX-freshness gate per
+  `tools/build_gpu.bat:11-13` comment — fails the build if any
+  `.cu`/`.cuh` is newer than its `.ptx`. The Vk side has no
+  equivalent gate.
+- **Class**: design-choice (build infrastructure, not runtime code)
+- **Why**: `addFileArg()` declares only the `.comp` file as glslc's
+  input. The `#include`d `.glsl` files are read at glslc-time but
+  not registered as Zig dep-graph inputs. So editing a `.glsl`
+  header doesn't invalidate the cached `.spv`.
+- **Risk if wrong**: catastrophic in debugging — every "verify the
+  fix" test runs stale bytecode. Cost A-001 debugging ~5 hours
+  during iter 4f because nobody noticed the SPV wasn't rebuilding.
+- **Static verification**: N/A — this is a build-system gap
+- **Runtime verification**: empirically confirmed during iter 4f
+  recovery (`rm zig-out/srcvk_shaders/lz_decode_kernel.spv` +
+  rebuild → fix verified working immediately)
+- **Discovered**: iter 4f recovery (workflow `a0d2d6c5`)
+- **Status**: **ACTIVE**. **Workaround**: `tools/build_vk.bat`
+  (commit `db4406c`) does clean-build with explicit cache wipe.
+  **Proper fix** (would close this entry): add the included
+  `.glsl` files as `addFileInput()` to the SPV build step, OR
+  migrate to `glslc -MD` depfile output for automatic dependency
+  tracking. ~30-60 min Zig build-system work, no functional
+  impact on the binary.
 
 ## Process notes
 

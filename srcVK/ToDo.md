@@ -1,7 +1,9 @@
 # srcVK Vulkan Port — L1 Done, L2-L5 Roadmap
 
-**Last updated:** 2026-06-08, HEAD `b3fab31`.
-**Status:** L1 + L2 SHIPPED on decode + encode. Phase 2A encoder SHIPPED (L3 + L4 encode byte-identical to CUDA on 8/9; silesia L3 = 0.02% larger — structural Vulkan 4 GiB SSBO cap). Phase 3 SHIPPED. **Phase 2A-decoder: all 855 LOC of CUDA reference + per-binding offset ABI ported faithfully across iter 1-4d (10 commits); 20 L3/L4 ptest cases added.** ptest now reports **98 passed, 10 failed (108 total)** — the 10 failures reproduce an OPEN BUG in the sub-chunk-N>0 decoder loop in `lz_decode_kernel.comp` (all converge on `first_diff=65544`; **NOT** the originally-hypothesized block-1→block-2 transition; see iter 4d commit body for diagnosis + 3 live hypotheses). L1 + L2 + huff_decode_conformance preserved; L1-L4 encode SHA preserved.
+**Last updated:** 2026-06-08, HEAD `db4406c`.
+**Status:** L1 + L2 + L3 + L4 **SHIPPED on decode + encode** (all 4 levels VK→VK roundtrip MATCH on web + enwik8 + silesia). Phase 2A encoder + Phase 2A-decoder + Phase 3 + Phase 2A.5 + iter 4f all done. **ptest_vk: 108/0/0 on both NVIDIA + Intel iGPU.** Only remaining encoder residual: silesia L3 is 0.019% larger than CUDA L3 (A-008, accepted — Vulkan 4 GiB SSBO cap on hash table forces `hash_bits=18` clamp on inputs > 128 MiB; VK→VK silesia L3 decodes its own output correctly). Remaining work: L5 chain parser, async API, perf parity, BDA workaround. See `srcVK/PortAdaptations.md` for the catalog of CUDA-VK divergences + their resolution status.
+
+**Critical infrastructure note**: The build graph at `build.zig::addSrcVkShaderSteps` (~1031-1071) does NOT track `.glsl` `#include` deps of `.comp` files (entry A-012). This caused a 5+ hour debugging nightmare on iter 4f where the actual fix landed silently but every "verify" run executed stale SPIR-V. **Use `tools/build_vk.bat` (commit `db4406c`) to force clean-build when you've edited any srcVK `.glsl` header** until the build graph is fixed.
 
 This file is the source of truth for "what's left." All of L1 is locked-in
 production code; the meaningful remaining work is L2-L5 to reach full CUDA
@@ -49,8 +51,9 @@ The CUDA encoder supports five levels:
 | **L2** | greedy | 18 | NO | NO | ✅ **DONE** (`7bbcf77`) — byte-identical to CUDA + FASTER; 9 ptest cases added |
 | **L3 encode** | greedy | 19* | YES | NO | ✅ **ENCODER SHIPPED** (`f9e84e3` + `30f36d3`) — byte-identical to CUDA on web/enwik8; silesia 0.02% larger (4 GiB SSBO cap). Decoder blocked on Phase 3. |
 | **L4 encode** | greedy | 17 | YES | YES (`p_l4=1`) | ✅ **ENCODER SHIPPED** (same commits — `p_l4=1` flag already plumbed in encode_lz.zig) |
-| L3/L4 decode | n/a | n/a | YES | n/a | **PARTIAL** — gpuScanChunks ✅, huff_build_lut ✅, huff_decode_4stream ✅ + conformance test ✅; **lz_decode general workhorse PENDING (iter 4)** to close VK→VK roundtrip |
-| L5 | **chain parser** | 17 | YES | YES | needs Phase 2A-decoder iter 4 + 2B chain parser (+ fix broken branch) |
+| **L3 decode** | n/a | n/a | YES | n/a | ✅ **DONE** (`4270ea4` iter 4f) — VK→VK roundtrip MATCH on web/enwik8/silesia |
+| **L4 decode** | n/a | n/a | YES | n/a | ✅ **DONE** (same commit) — VK→VK roundtrip MATCH on web/enwik8/silesia |
+| L5 | **chain parser** | 17 | YES | YES | needs Phase 2B chain parser (+ fix broken branch) |
 
 *L3 hash_bits clamps from 19 → 18 only when single-frame input ≥ 128 MiB at sc=0.25 (Vulkan 4 GiB maxStorageBufferRange cap). Affects only silesia at L3 today; cost is 0.02% larger output. See "Accepted residuals" below.
 
@@ -104,7 +107,11 @@ roundtrip parity across L3+L4 in both directions.
 
 ✅ **Phase 2A decoder iter 4d (`b3fab31`):** 20 L3/L4 ptest cases added (10 synthetic-PASS + 10 real-corpus-FAIL). The 10 corpus tests serve as deterministic reproducer + diagnostic gate. ptest now reports honest 98/0/10 instead of false-positive 88/0/0. All 10 failures converge on `first_diff=65544` with rich diagnostic output (total_diffs, trailing_zeros, hex windows).
 
-⏸️ **OPEN BUG — sub-chunk-N>0 decoder loop in `lz_decode_kernel.comp`:**
+✅ **Phase 2A decoder iter 4f (`4270ea4`):** **RESOLVED the byte-65544 bug.** Replaced `lz_dispatch.glsl`'s `lit_in_scratch || cmd_in_scratch` fork-to-general guard with explicit 8-arm dispatch enumeration over `(off16_split, lit_in_scratch, cmd_in_scratch)`. Each arm dispatches `decodeSubChunkRawMode_{true,false}` with the right SSBO names — matching CUDA's polymorphic pointer semantics via GLSL macro-textual specialization. ptest 98/0/10 → **108/0/0**. L3+L4 VK→VK roundtrip MATCH on web + enwik8 + silesia. Per PortAdaptations.md A-001 (now RESOLVED). The fix was masked for 5+ hours by stale SPIR-V (A-012 build-graph gap); recovery via `rm zig-out/srcvk_shaders/lz_decode_kernel.spv` + rebuild. `tools/build_vk.bat` (`db4406c`) added as workaround.
+
+✅ **Phase 2A-decoder is COMPLETE.** All 4 iters (4 + 4b + 4c + 4d) + 4f shipped. L3 + L4 work end-to-end. ptest_vk: 108/0/0 both backends.
+
+~~⏸️ **OPEN BUG — sub-chunk-N>0 decoder loop in `lz_decode_kernel.comp`:**~~ ✅ RESOLVED at `4270ea4`. The "byte-65544" symptom was the A-001 dispatch fork. The previous diagnosis of "sub-chunk-N>0 outer loop" was correct in narrowing but wrong in localization — fix was in the dispatcher, not the decoder body.
 The byte-65544 failures are at the SUB-CHUNK 0 → SUB-CHUNK N (N>0) boundary in the OUTER dispatch loop, NOT at the block-1 → block-2 transition (which doesn't run for L3 web.txt; sc_group_size=0.25 → eff_chunk=64KB → one chunk = one sub-chunk = one LZ block).
 
 In-shader diagnostic at END of sub-chunk 1's inner-while loop:
@@ -220,13 +227,12 @@ LOC estimate: ~400 Zig. ~1 single agent.
 | ~~2-prep (verify L2)~~ | ✅ DONE | ✅ DONE | ✅ |
 | ~~2A encoder (Huffman, L3 + L4)~~ | ✅ DONE (~700 GLSL + 500 Zig) | | ✅ 1 + 1 review + 1 fix |
 | ~~2A decoder iter 1-3 (gpuScanChunks + huff_build_lut + huff_decode_4stream + conformance test)~~ | ✅ DONE (~1,000 GLSL + 400 Zig) | | ✅ 3 + 3 reviews + 1 fix + 1 test |
-| ~~2A decoder iter 4 + 4b + 4c + 4d (lz_decode general + .level fix + offset ABI + 20 L3/L4 tests)~~ | ✅ DONE (~700 GLSL + 1000 Zig + 868 LOC tests) | | ✅ 4 commits |
-| 2A decoder iter 4e (FIX byte-65544 sub-chunk-N decoder bug + small-input KernelLaunchFailed) | ~10-50 (surgical) | | 1-3 |
+| ~~2A decoder iter 4 + 4b + 4c + 4d + 4f (lz_decode general + .level fix + offset ABI + 20 L3/L4 tests + dispatch fork resolved)~~ | ✅ DONE (~700 GLSL + 1000 Zig + 868 LOC tests + 127 LOC fix) | | ✅ 5 commits + 1 catalog |
 | ~~3 (GPU decode pipeline)~~ | ✅ DONE | | ✅ 1 + 1 review + 1 fix |
 | 2B (L5 chain parser + fix L5 broken branch) | ~800 | ~500 | 2-3 |
 | 4 (D2D + async — note: L1 D2D already opened by Phase 3) | 0 | ~600 | 1-2 |
 | 5 (conformance + perf) | 0 | ~400 | 1 |
-| **REMAINING TOTAL** | **~1,500** | **~1,800** | **5-8** |
+| **REMAINING TOTAL** | **~800** | **~1,500** | **4-6** |
 
 ---
 
@@ -714,6 +720,10 @@ SSBO loads — verify perf doesn't regress.
 ## Recent commit history (last 20)
 
 ```
+db4406c  tools/build_vk.bat — clean-build script (workaround for A-012 stale-SPV)
+4270ea4  Phase 2A-decoder iter 4f — 8-arm raw-mode dispatch resolves A-001 (108/0/0 GREEN; L3+L4 VK→VK MATCH on all 3 goldens)
+b5e11c9  PortAdaptations.md — catalog of CUDA-VK divergences
+8002198  ToDo.md wave update for iter 4 + 4b + 4c + 4d
 b3fab31  Phase 2A-decoder iter 4d — add 20 L3/L4 ptest cases (10 currently failing) as deterministic reproducer for sub-chunk-N>0 decoder bug
 11eb101  Phase 2A-decoder iter 4c — per-binding offset ABI + 5 dispatch site fixes (L3+ decode still broken)
 bcaa1f1  Phase 2A-decoder iter 4b — fix .level defaulting to 1 (silent corruption → loud failure)
