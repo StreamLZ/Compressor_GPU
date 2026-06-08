@@ -31,4 +31,10 @@ test {
     _ = @import("tests/l2_encode_roundtrip.zig");
     _ = @import("tests/cross_backend_roundtrip.zig");
     _ = @import("tests/cli_smoke.zig");
+    // Phase 2A-decoder iter 4 safety net: isolated kernel conformance
+    // test for the Huffman decode chain (huff_build_lut +
+    // huff_decode_4stream). See srcVK/tests/huff_decode_conformance.zig
+    // header for the bug class this guards against (iter 3 bitbufRefill
+    // hi/lo swap, fix at ac6696f).
+    _ = @import("tests/huff_decode_conformance.zig");
 }
