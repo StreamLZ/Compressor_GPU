@@ -55,6 +55,19 @@ pub fn gpuWalkFrameImpl(
     // walk_frame: n_bindings=8 (FrameBuf, ChunksBuf, NChunksBuf,
     // DecompressedSizeBuf, SubChunkCapBuf, BlockStartBuf, BlockSizeBuf,
     // StatusBuf), push_constant_size=8 (frame_size, max_chunks).
+    //
+    // Iter 4c NOTE: this site does `self.d_walk_meta + offset` arithmetic
+    // on a VkDeviceBuffer handle — same broken pattern the iter 4c work
+    // fixed in the scan/compact/merge sites. This site is left as-is
+    // because the only caller (decompressFramedFromDevice / L2 D2D path)
+    // is currently L2-stubbed and has zero ptest_vk coverage. When that
+    // path is enabled, this site must be migrated to per-binding offsets;
+    // the walk_meta_offsets values (0/4/8/12/16/20) also violate
+    // minStorageBufferOffsetAlignment (typically 16) so the meta layout
+    // must be widened to per-field 16/64-byte slots first. Pre-iter-4c
+    // behaviour preserved here (the handle arithmetic was always broken;
+    // adding the iter 4c fix without aligned offsets would just trade
+    // one form of failure for another).
     var params = [_]?*anyopaque{
         @ptrCast(&k_frame),       @ptrCast(&k_chunks),
         @ptrCast(&k_meta_n),      @ptrCast(&k_meta_decomp),
@@ -64,7 +77,7 @@ pub fn gpuWalkFrameImpl(
     };
     var extra = [_]?*anyopaque{null};
     const t_walk = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzWalkFrameKernel", stream);
-    try vkCall(launch(module_loader.walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, stream, &params, &extra), .launch);
+    try vkCall(launch(module_loader.walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, stream, &params, &extra, null), .launch);
     decode_context.endKernelTiming(t_walk, stream);
 
     return .{
@@ -116,7 +129,11 @@ pub fn gpuPrefixSumChunksImpl(
     };
     var extra = [_]?*anyopaque{null};
     const t_prefix = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzPrefixSumChunksKernel", stream);
-    try vkCall(launch(module_loader.prefix_sum_chunks_fn, 1, 1, 1, 1, 1, 1, 0, stream, &params, &extra), .launch);
+    try vkCall(launch(module_loader.prefix_sum_chunks_fn, 1, 1, 1, 1, 1, 1, 0, stream, &params, &extra, null), .launch);
+    // Iter 4c: prefix_sum wrote d_first_sub_idx_persist + d_total_subchunks_buf
+    // that scan_parse / compact_huff read on the same stream. Without
+    // this barrier those downstream kernels can race on the writes.
+    if (vk.procs.compute_to_compute_barrier) |bf| try vkCall(bf(stream), .sync);
     decode_context.endKernelTiming(t_prefix, stream);
 
     return .{
@@ -161,13 +178,39 @@ pub fn gpuScanChunks(
     const h2d = vk.procs.h2d orelse return error.BackendNotAvailable;
     const launch = vk.procs.launch_kernel orelse return error.BackendNotAvailable;
     const memset = vk.procs.memset_d8 orelse return error.BackendNotAvailable;
+    // Iter 4c: COMPUTE→COMPUTE barrier proc — required between consecutive
+    // dispatches on the same cmdbuf that have a read-after-write dep on
+    // the same SSBO. CUDA's per-stream implicit ordering covers this; VK
+    // needs the explicit pipeline barrier. The barrier proc is optional
+    // (legacy backends without the slot still resolve), but compulsory
+    // for the scan→compact→merge chain because each step reads what the
+    // previous step wrote to the staged / compact / counts buffers.
+    const c2c_barrier = vk.procs.compute_to_compute_barrier;
     const stream = self.work_stream;
 
     // CUDA reference: src/decode/scan_gpu.zig:148-155. Staged buffer:
     // [lit][tok][hi][lo] ScanHuffDesc, then [raw_hi][raw_lo] ScanRawDesc
     // — one entry per global sub-chunk index per stream type.
-    const huff_arr_bytes: usize = @as(usize, total_subchunks) * @sizeOf(descriptors.ScanHuffDesc);
-    const raw_arr_bytes: usize = @as(usize, total_subchunks) * @sizeOf(descriptors.ScanRawDesc);
+    //
+    // Iter 4c: each sub-region is bound as a separate VkDescriptorBufferInfo
+    // (one binding per stream type) via procLaunchKernel's binding_offsets
+    // — so each sub-region offset must satisfy VkPhysicalDeviceLimits
+    // .minStorageBufferOffsetAlignment (16 on NVIDIA, 64 on Intel iGPU).
+    // The raw element sizes (ScanHuffDesc=20, ScanRawDesc=16) don't
+    // guarantee 16/64-byte alignment of `huff_arr_bytes` / `raw_arr_bytes`
+    // for arbitrary `total_subchunks`. Round both element-array sizes up
+    // to 256 bytes (safe for every device the codec supports today;
+    // larger than maxStorageBufferOffsetAlignment ever reported on
+    // NVIDIA/Intel/AMD discrete GPUs). The padding bytes between regions
+    // are never read — the kernels visit exactly total_subchunks entries
+    // per region. CUDA has no alignment constraint here, so this is a
+    // pure VK-side adaptation; the staged buffer just grows by at most
+    // 4*256 + 2*256 = 1.5 KB beyond the CUDA layout.
+    const SSBO_ALIGN: usize = 256;
+    const raw_huff_bytes: usize = @as(usize, total_subchunks) * @sizeOf(descriptors.ScanHuffDesc);
+    const raw_raw_bytes: usize = @as(usize, total_subchunks) * @sizeOf(descriptors.ScanRawDesc);
+    const huff_arr_bytes: usize = (raw_huff_bytes + SSBO_ALIGN - 1) & ~(SSBO_ALIGN - 1);
+    const raw_arr_bytes: usize = (raw_raw_bytes + SSBO_ALIGN - 1) & ~(SSBO_ALIGN - 1);
     const staged_bytes: usize = huff_arr_bytes * 4 + raw_arr_bytes * 2;
     try ensureDeviceBuf(&self.d_scan_staged, &self.d_scan_staged_size, staged_bytes);
     // Zero so sub-chunk slots that no thread reaches keep valid=0.
@@ -196,13 +239,22 @@ pub fn gpuScanChunks(
     var k_chunks: u64 = self.d_descs_persist;
     var k_first: u64 = self.d_first_sub_idx_persist;
     var k_n: u64 = self.d_n_chunks_scratch;
-    const base: u64 = self.d_scan_staged;
-    var k_lit: u64 = base;
-    var k_tok: u64 = base + huff_arr_bytes;
-    var k_hi: u64 = base + huff_arr_bytes * 2;
-    var k_lo: u64 = base + huff_arr_bytes * 3;
-    var k_rhi: u64 = base + huff_arr_bytes * 4;
-    var k_rlo: u64 = base + huff_arr_bytes * 4 + raw_arr_bytes;
+    // Iter 4c: six sub-regions of d_scan_staged are bound by the kernel
+    // as separate SSBOs (lit/tok/hi/lo huff arrays + raw_hi/raw_lo raw
+    // arrays). Pre-iter-4c the code packed the per-sub-region offset
+    // into the VkDeviceBuffer handle via `base + offset` arithmetic; that
+    // is meaningless because VkDeviceBuffer is a registry index, not an
+    // addressable VA. Pass the base handle for every binding and route
+    // the per-region offset through procLaunchKernel.binding_offsets,
+    // which becomes VkDescriptorBufferInfo.offset (the native Vulkan
+    // sub-range bind surface). huff_arr_bytes / raw_arr_bytes are padded
+    // above to SSBO_ALIGN so each offset is multi-aligned.
+    var k_lit: u64 = self.d_scan_staged;
+    var k_tok: u64 = self.d_scan_staged;
+    var k_hi: u64 = self.d_scan_staged;
+    var k_lo: u64 = self.d_scan_staged;
+    var k_rhi: u64 = self.d_scan_staged;
+    var k_rlo: u64 = self.d_scan_staged;
     var k_blen: u32 = @intCast(compressed_block.len);
     var k_cap: u32 = sub_chunk_cap;
     var params = [_]?*anyopaque{
@@ -214,11 +266,29 @@ pub fn gpuScanChunks(
         @ptrCast(&k_blen),  @ptrCast(&k_cap),
     };
     var extra = [_]?*anyopaque{null};
+    // One offset per SSBO binding (10 bindings for scan_parse). The first
+    // four (block/chunks/first/n) bind whole buffers at offset 0.
+    const scan_offs = [_]u64{
+        0, 0, 0, 0,
+        0,
+        huff_arr_bytes,
+        huff_arr_bytes * 2,
+        huff_arr_bytes * 3,
+        huff_arr_bytes * 4,
+        huff_arr_bytes * 4 + raw_arr_bytes,
+    };
     const tpb: u32 = 256;
     const blocks: u32 = (n + tpb - 1) / tpb;
     const t_scan = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzScanParseKernel", stream);
-    try vkCall(launch(module_loader.scan_parse_fn, blocks, 1, 1, tpb, 1, 1, 0, stream, &params, &extra), .launch);
+    try vkCall(launch(module_loader.scan_parse_fn, blocks, 1, 1, tpb, 1, 1, 0, stream, &params, &extra, &scan_offs), .launch);
     decode_context.endKernelTiming(t_scan, stream);
+    // Iter 4c: scan_parse wrote the per-sub-chunk valid/desc bytes that
+    // compact_huff + compact_raw read below. Without this VK barrier the
+    // compact kernels can see stale d_scan_staged contents. CUDA's
+    // per-stream implicit ordering on cuLaunchKernel handles this for
+    // free; VK requires the explicit COMPUTE→COMPUTE barrier on the
+    // recording cmdbuf.
+    if (c2c_barrier) |bf| try vkCall(bf(stream), .sync);
     // No post-scan sync: the compact kernels below queue on the same
     // stream and see scan_parse's writes to d_scan_staged via stream
     // ordering. CUDA reference: src/decode/scan_gpu.zig:187-189.
@@ -246,19 +316,32 @@ pub fn gpuScanChunks(
         // 6 u32: [n_lit, n_tok, n_hi, n_lo, n_raw, n_merged]. n_merged
         // is written by slzMergeHuffDescsKernel in step 6c. CUDA reference:
         // src/decode/scan_gpu.zig:209-212.
-        try ensureDeviceBuf(&self.d_compact_counts, &self.d_compact_counts_size, 6 * 4);
-        try vkCall(memset(self.d_compact_counts, 0, 6 * 4), .copy);
+        //
+        // Iter 4c: each per-stream count is bound as its own SSBO via
+        // procLaunchKernel.binding_offsets — Vulkan requires every
+        // VkDescriptorBufferInfo.offset to satisfy
+        // minStorageBufferOffsetAlignment (16/64 typical). With the
+        // packed 6×u32 layout the per-count offsets (4/8/12/16/20) fail
+        // alignment. Widen each slot to COUNTS_STRIDE so every slot
+        // lands on its own aligned boundary; the kernels read exactly
+        // one u32 per slot so the padding is never accessed. Stride 256
+        // matches scan_parse SSBO_ALIGN above (worst-case device limit
+        // we support today).
+        const COUNTS_STRIDE: usize = 256;
+        const counts_bytes: usize = COUNTS_STRIDE * 6;
+        try ensureDeviceBuf(&self.d_compact_counts, &self.d_compact_counts_size, counts_bytes);
+        try vkCall(memset(self.d_compact_counts, 0, counts_bytes), .copy);
 
         // CUDA reference: src/decode/scan_gpu.zig:214-239. 4 launches of
         // slzCompactHuffDescsKernel (one per stream type) — same kernel,
         // different bindings (staged source / dst / count slot).
         // compact_huff_descs_kernel.comp: n_bindings=4 (StagedBuf,
         // TotalSubsBuf, OutBuf, NOutBuf), push_constant_size=0.
-        const huff_streams = [_]struct { staged_off: usize, dst: u64, n_off: u32 }{
-            .{ .staged_off = 0,                  .dst = self.d_compact_lit, .n_off = 0 },
-            .{ .staged_off = huff_arr_bytes,     .dst = self.d_compact_tok, .n_off = 4 },
-            .{ .staged_off = huff_arr_bytes * 2, .dst = self.d_compact_hi,  .n_off = 8 },
-            .{ .staged_off = huff_arr_bytes * 3, .dst = self.d_compact_lo,  .n_off = 12 },
+        const huff_streams = [_]struct { staged_off: usize, dst: u64, n_off: u64 }{
+            .{ .staged_off = 0,                  .dst = self.d_compact_lit, .n_off = COUNTS_STRIDE * 0 },
+            .{ .staged_off = huff_arr_bytes,     .dst = self.d_compact_tok, .n_off = COUNTS_STRIDE * 1 },
+            .{ .staged_off = huff_arr_bytes * 2, .dst = self.d_compact_hi,  .n_off = COUNTS_STRIDE * 2 },
+            .{ .staged_off = huff_arr_bytes * 3, .dst = self.d_compact_lo,  .n_off = COUNTS_STRIDE * 3 },
         };
         const compact_names = [_][*:0]const u8{
             "slzCompactHuffDescsKernel (lit)",
@@ -267,40 +350,60 @@ pub fn gpuScanChunks(
             "slzCompactHuffDescsKernel (lo)",
         };
         for (huff_streams, 0..) |hs, ci| {
-            var k_staged: u64 = base + hs.staged_off;
+            // Iter 4c: base handle + per-binding offset (see scan_parse
+            // above for the rationale). Bindings 0 + 3 are sub-regions
+            // of d_scan_staged + d_compact_counts respectively.
+            var k_staged: u64 = self.d_scan_staged;
             var k_total: u64 = self.d_total_subchunks_buf;
             var k_dst: u64 = hs.dst;
-            var k_count: u64 = self.d_compact_counts + hs.n_off;
+            var k_count: u64 = self.d_compact_counts;
             var c_params = [_]?*anyopaque{
                 @ptrCast(&k_staged), @ptrCast(&k_total),
                 @ptrCast(&k_dst),    @ptrCast(&k_count),
             };
             var c_extra = [_]?*anyopaque{null};
+            const ch_offs = [_]u64{ hs.staged_off, 0, 0, hs.n_off };
             const t_ch = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, compact_names[ci], stream);
-            try vkCall(launch(module_loader.compact_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &c_params, &c_extra), .launch);
+            try vkCall(launch(module_loader.compact_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &c_params, &c_extra, &ch_offs), .launch);
             decode_context.endKernelTiming(t_ch, stream);
         }
         // CUDA reference: src/decode/scan_gpu.zig:241-255. Raw compact —
         // 1 launch of slzCompactRawDescsKernel reading hi+lo staged
-        // arrays into d_compact_raw, count at offset 16 (= 4 u32 slots
-        // for the four Huffman streams).
+        // arrays into d_compact_raw, count at slot 4 (matches the
+        // COUNTS_STRIDE * 4 offset wired below).
         // compact_raw_descs_kernel.comp: n_bindings=5 (StagedHiBuf,
         // StagedLoBuf, TotalSubsBuf, OutBuf, NOutBuf), push_constant_size=0.
         {
-            var cr_hi: u64 = base + huff_arr_bytes * 4;
-            var cr_lo: u64 = base + huff_arr_bytes * 4 + raw_arr_bytes;
+            // Iter 4c: same per-binding-offset pattern as the huff path.
+            var cr_hi: u64 = self.d_scan_staged;
+            var cr_lo: u64 = self.d_scan_staged;
             var cr_total: u64 = self.d_total_subchunks_buf;
             var cr_dst: u64 = self.d_compact_raw;
-            var cr_count: u64 = self.d_compact_counts + 16;
+            var cr_count: u64 = self.d_compact_counts;
             var cr_params = [_]?*anyopaque{
                 @ptrCast(&cr_hi), @ptrCast(&cr_lo), @ptrCast(&cr_total),
                 @ptrCast(&cr_dst), @ptrCast(&cr_count),
             };
             var cr_extra = [_]?*anyopaque{null};
+            const cr_offs = [_]u64{
+                huff_arr_bytes * 4,
+                huff_arr_bytes * 4 + raw_arr_bytes,
+                0,
+                0,
+                COUNTS_STRIDE * 4,
+            };
             const t_cr = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzCompactRawDescsKernel", stream);
-            try vkCall(launch(module_loader.compact_raw_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &cr_params, &cr_extra), .launch);
+            try vkCall(launch(module_loader.compact_raw_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &cr_params, &cr_extra, &cr_offs), .launch);
             decode_context.endKernelTiming(t_cr, stream);
         }
+        // Iter 4c: compact_huff (x4) + compact_raw wrote d_compact_lit
+        // /tok/hi/lo, d_compact_raw, and the per-stream counters in
+        // d_compact_counts that the merge / gather / huff_build /
+        // huff_decode kernels read downstream. Barrier so those reads
+        // can't observe stale data. CUDA reference: implicit stream
+        // ordering between cuLaunchKernel calls (no explicit barrier
+        // needed); the VK port must record it.
+        if (c2c_barrier) |bf| try vkCall(bf(stream), .sync);
     }
 
     // CUDA reference: src/decode/scan_gpu.zig:259-274. Counts stay

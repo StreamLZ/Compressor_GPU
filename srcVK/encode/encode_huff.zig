@@ -160,7 +160,7 @@ pub fn gpuEncodeHuffImpl(
     // launch failure - finalizeProfiling otherwise blocks on the unrecorded
     // end event.
     defer gpu_decode.endKernelTiming(t_htbl, 0);
-    if (launch_fn(module_loader.huff_tables_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &tbl_params, &extra) != VK_SUCCESS_RC)
+    if (launch_fn(module_loader.huff_tables_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &tbl_params, &extra, null) != VK_SUCCESS_RC)
         return false;
 
     // Kernel 2: pack each sub-chunk into a chunk_type=4 body. The
@@ -180,7 +180,7 @@ pub fn gpuEncodeHuffImpl(
     };
     const t_henc = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, profile_names[1], 0);
     defer gpu_decode.endKernelTiming(t_henc, 0);
-    if (launch_fn(module_loader.huff_encode_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &enc_params, &extra) != VK_SUCCESS_RC)
+    if (launch_fn(module_loader.huff_encode_kernel_fn, n, 1, 1, 32, 1, 1, 0, 0, &enc_params, &extra, null) != VK_SUCCESS_RC)
         return false;
     if (sync_fn() != VK_SUCCESS_RC) return false;
 

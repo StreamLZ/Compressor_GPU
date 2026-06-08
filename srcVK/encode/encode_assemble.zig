@@ -151,7 +151,7 @@ pub fn gpuAssembleFrameImpl(
     const _t_meas0 = if (_prof) vk.qpcNow() else 0;
     const t_am = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleMeasureKernel", 0);
     defer gpu_decode.endKernelTiming(t_am, 0);
-    if (launch(module_loader.assemble_measure_fn, n, 1, 1, 32, 1, 1, 0, 0, &measure_params, &extra) != VK_SUCCESS_RC) return false;
+    if (launch(module_loader.assemble_measure_fn, n, 1, 1, 32, 1, 1, 0, 0, &measure_params, &extra, null) != VK_SUCCESS_RC) return false;
     if (sync() != VK_SUCCESS_RC) return false;
     if (_prof) enc_phase.g_enc_phase_asm_measure_dispatch_ns += qpcDeltaNs(_t_meas0, vk.qpcNow());
 
@@ -195,7 +195,7 @@ pub fn gpuAssembleFrameImpl(
     const _t_wr0 = if (_prof) vk.qpcNow() else 0;
     const t_aw = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzAssembleWriteKernel", 0);
     defer gpu_decode.endKernelTiming(t_aw, 0);
-    if (launch(module_loader.assemble_write_fn, n, 1, 1, 32, 1, 1, 0, 0, &write_params, &extra) != VK_SUCCESS_RC) return false;
+    if (launch(module_loader.assemble_write_fn, n, 1, 1, 32, 1, 1, 0, 0, &write_params, &extra, null) != VK_SUCCESS_RC) return false;
     if (sync() != VK_SUCCESS_RC) return false;
     if (_prof) enc_phase.g_enc_phase_asm_write_dispatch_ns += qpcDeltaNs(_t_wr0, vk.qpcNow());
 
@@ -361,7 +361,7 @@ pub fn gpuFrameAssembleImpl(
     const _t_fd0 = if (_prof_fa) vk.qpcNow() else 0;
     const t_fa = gpu_decode.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzFrameAssembleKernel", heavy_stream);
     defer gpu_decode.endKernelTiming(t_fa, heavy_stream);
-    if (launch(module_loader.frame_assemble_fn, grid_x, 1, 1, 128, 1, 1, 0, heavy_stream, &params, &extra) != VK_SUCCESS_RC) return null;
+    if (launch(module_loader.frame_assemble_fn, grid_x, 1, 1, 128, 1, 1, 0, heavy_stream, &params, &extra, null) != VK_SUCCESS_RC) return null;
     // In async mode the kernel stays in flight on the caller's stream
     // (their stream-sync is the sync point); otherwise block here.
     if (heavy_stream == 0) {

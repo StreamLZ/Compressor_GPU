@@ -188,9 +188,15 @@ pub const DecodeContext = struct {
     d_entropy_scratch_size: usize = 0,
 
     // Off16 scratch VIEW (not owned): set in fullGpuLaunchImpl to
-    // `d_entropy_scratch + off16_offset`. Not freed by deinit because
+    // Iter 4c: pre-iter-4c this was `d_entropy_scratch + off16_offset`
+    // — broken handle arithmetic (the codec routed the arithmetic as a
+    // u64 device-address, but VkDeviceBuffer is a registry index). Now
+    // the alias is the BASE handle d_entropy_scratch and the per-bind
+    // byte offset travels through procLaunchKernel.binding_offsets in
+    // d_entropy_off16_offset below. Not freed by deinit because
     // `d_entropy_scratch` owns the allocation.
     d_entropy_off16_scratch: VkDeviceBuffer = 0,
+    d_entropy_off16_offset: u64 = 0,
 
     // Per-chunk first-subchunk-index ALIAS (not owned): the dispatch
     // sets this to `d_first_sub_idx_persist` so the LZ kernel reads the

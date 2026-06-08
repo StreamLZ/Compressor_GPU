@@ -671,9 +671,14 @@ fn encodeLaunchKernel(
     stream: usize,
     params: [*]?*anyopaque,
     extra: [*]?*anyopaque,
+    // Iter 4c: per-binding offset surface (CUDA's `base + offset` pattern;
+    // see srcVK/decode/vulkan_api.zig:::launch_kernel doc). Encoder
+    // kernels currently bind whole buffers, so this proxy threads through
+    // a null and the encode-side callers don't have to opt in.
+    binding_offsets: ?[*]const u64,
 ) callconv(.c) VkResult {
     const proc = vulkan_api.procs.launch_kernel orelse return -1;
-    return proc(pipeline, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_bytes, stream, params, extra);
+    return proc(pipeline, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_bytes, stream, params, extra, binding_offsets);
 }
 
 fn encodeCtxSync() callconv(.c) VkResult {

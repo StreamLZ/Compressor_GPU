@@ -167,7 +167,7 @@ pub fn gpuCompressImpl(
     // Defer endKernelTiming so the pending begin event always gets a
     // matching end record - even on launch failure.
     defer gpu_decode.endKernelTiming(t_lz, 0);
-    if (launch_fn(module_loader.kernel_fn, num_chunks, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra) != VK_SUCCESS_RC)
+    if (launch_fn(module_loader.kernel_fn, num_chunks, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra, null) != VK_SUCCESS_RC)
         return false;
 
     if (sync_fn() != VK_SUCCESS_RC) return false;

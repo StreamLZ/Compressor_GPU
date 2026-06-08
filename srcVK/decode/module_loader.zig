@@ -1360,6 +1360,22 @@ var g_staging_size: usize = 0;
 var g_staging_mapped: ?*anyopaque = null;
 var g_descriptor_pool: VkDescriptorPool = VK_NULL_HANDLE;
 
+// Iter 4c: dedicated pool for per-launch transient descriptor sets used
+// by the sub-region-bind path (procLaunchKernel called with non-null
+// binding_offsets). Separate from g_descriptor_pool so resetting it does
+// not invalidate iter 14's persistent (stream × pipeline) sets. The
+// pool is reset opportunistically when g_transient_set_count crosses
+// g_transient_set_reset_threshold — the reset is gated on
+// vkDeviceWaitIdle (the only point Vulkan guarantees no in-flight
+// cmdbuf still references the sets). Resetting at a coarse threshold
+// rather than per-decode keeps the wait-idle cost off the hot path
+// while still bounding pool memory. (The lock SRWLOCK is declared
+// further down at ~1601; we forward-declare its uses via raw Win32
+// AcquireSRWLockExclusive once SRWLOCK is in scope.)
+var g_transient_descriptor_pool: VkDescriptorPool = VK_NULL_HANDLE;
+var g_transient_set_count: u32 = 0;
+const g_transient_set_reset_threshold: u32 = 3500; // pool cap = 4096; leave headroom
+
 // Timestamp query pool used by procs.event_*. Each VkEvent handle from
 // procs.event_create is an index into this pool's query slots; the free
 // list reclaims slots after procs.event_destroy. Capacity is sized for
@@ -1368,6 +1384,14 @@ var g_timestamp_query_pool: VkQueryPool = VK_NULL_HANDLE;
 const g_query_capacity: u32 = 4096;
 var g_query_index_free: std.ArrayListUnmanaged(u32) = .empty;
 var g_timestamp_period_ns: f32 = 1.0;
+
+// Iter 4c: device limit captured at init so procLaunchKernel can validate
+// per-binding SSBO offsets. CUDA's CUdeviceptr `base + offset` arithmetic
+// has no alignment constraint; Vulkan's VkDescriptorBufferInfo.offset
+// must be a multiple of VkPhysicalDeviceLimits.minStorageBufferOffsetAlignment
+// (16 on NVIDIA, 64 on Intel iGPU is typical). 0 = init has not run yet
+// (or the property query failed); procLaunchKernel treats 0 as "no check".
+var g_min_storage_buffer_offset_alignment: u64 = 0;
 
 // ── Per-kernel GPU profiling (SLZ_VK_PROFILE_DECODE=1) ───────────────
 // Reserves a fixed range of query-pool slots [g_profile_slot_base ..
@@ -1661,6 +1685,18 @@ pub fn lockAllocRegistry() void {
 
 pub fn unlockAllocRegistry() void {
     ReleaseSRWLockExclusive(&g_alloc_registry_lock);
+}
+
+// Iter 4c: lock protecting g_transient_descriptor_pool resets +
+// g_transient_set_count mutation. Held across the check + reset + alloc
+// triple so a concurrent ptest_vk worker can't sneak a fresh alloc into
+// a pool we're about to reset.
+var g_transient_lock: SRWLOCK = .{};
+fn lockTransient() void {
+    AcquireSRWLockExclusive(&g_transient_lock);
+}
+fn unlockTransient() void {
+    ReleaseSRWLockExclusive(&g_transient_lock);
 }
 
 // Iter 4: nonCoherentAtomSize for staging-arena bump alignment. VK spec
@@ -2388,6 +2424,25 @@ pub fn init() bool {
     };
     if (vkCreateDescriptorPool_fn.?(dev, &dp_ci, null, &g_descriptor_pool) != VK_SUCCESS_RC) return false;
 
+    // Iter 4c: separate pool for per-launch transient sets used by the
+    // sub-region binding path (binding_offsets != null in procLaunchKernel).
+    // Sized for the worst case decode: ~6 transient sets per
+    // gpuScanChunks call (scan_parse + 4 compact_huff + compact_raw) +
+    // 3 (merge + gather + huff_build + huff_decode = 4) = ~10 per
+    // decoded block. ptest_vk runs at most ~64 concurrent decodes per
+    // device with up to ~128 blocks per file; cap at 4096 sets and reset
+    // between fullGpuLaunchImpl calls so the pool never fills mid-decode.
+    const tr_pool_size = VkDescriptorPoolSize{
+        .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 4096 * 12, // worst-case bindings * max sets
+    };
+    const tr_dp_ci = VkDescriptorPoolCreateInfo{
+        .maxSets = 4096,
+        .poolSizeCount = 1,
+        .pPoolSizes = @ptrCast(&tr_pool_size),
+    };
+    if (vkCreateDescriptorPool_fn.?(dev, &tr_dp_ci, null, &g_transient_descriptor_pool) != VK_SUCCESS_RC) return false;
+
     // Timestamp query pool for procs.event_*. Sized to g_query_capacity;
     // each slot is one VkEvent handle. The free list seeds with every
     // index 0..g_query_capacity so procEventCreate can pop a slot. The
@@ -2398,6 +2453,10 @@ pub fn init() bool {
         gpdp(phys, &props);
         g_timestamp_period_ns = props.limits.timestampPeriod;
         if (g_timestamp_period_ns <= 0.0) g_timestamp_period_ns = 1.0;
+        // Iter 4c: capture minStorageBufferOffsetAlignment for the
+        // per-binding-offset launch-kernel path. Required by Vulkan spec
+        // VUID-VkDescriptorBufferInfo-offset-00925.
+        g_min_storage_buffer_offset_alignment = props.limits.minStorageBufferOffsetAlignment;
     }
     if (vkCreateQueryPool_fn) |create_qp| {
         const qp_ci = VkQueryPoolCreateInfo{
@@ -4847,6 +4906,19 @@ fn procLaunchKernel(
     stream: VkStream,
     params: [*]?*anyopaque,
     extra: [*]?*anyopaque,
+    // Iter 4c: per-binding byte offset into the bound storage buffer.
+    // CUDA reference: src/decode/scan_gpu.zig:148-155 — CUDA encodes
+    // sub-region binding as `base + offset` pointer arithmetic on a real
+    // CUdeviceptr before passing it as a kernel arg. Vulkan can't fold
+    // offset into the opaque VkDeviceBuffer handle, so the codec passes
+    // the base handle plus a per-binding offset; the offset is wired into
+    // VkDescriptorBufferInfo.offset below. `null` selects legacy behaviour
+    // (all bindings at offset 0). Callers MUST align offsets to
+    // VkPhysicalDeviceLimits.minStorageBufferOffsetAlignment — this fn
+    // asserts in safe builds and rejects with rc=-1 in release builds so
+    // the caller surfaces error.KernelLaunchFailed rather than a silent
+    // VUID hit when the validation layers are absent.
+    binding_offsets: ?[*]const u64,
 ) callconv(.c) VkResult {
     // block_* are baked into the SPV via layout(local_size_x = ...).
     // shared_bytes / extra are CUDA-shaped surfaces with no VK analogue
@@ -4898,13 +4970,26 @@ fn procLaunchKernel(
     // a parameter array directly without per-call descriptor allocation.
     var dset: VkDescriptorSet = 0;
     if (meta.n_bindings > 0) {
-        // Pick the persistent slot for this (stream × pipeline). For the
-        // per-stream path we index into StreamEntry.persistent_desc_sets
-        // using the KERNEL_DECLS index returned by kindIndexForPipeline;
-        // encode-registered (extra) pipelines fall through to the
-        // default-stream slot since they aren't carved out per-stream.
+        // Iter 14 (A): persistent descriptor sets eliminate the per-decode
+        // vkAllocateDescriptorSets cost. Iter 4c: re-using a persistent
+        // set within the SAME cmdbuf across launches with DIFFERENT
+        // bindings violates VUID-vkCmdBindDescriptorSets-pDescriptorSets-00358
+        // (the set must not be updated between record and submit unless
+        // it was created with UPDATE_AFTER_BIND). So when binding_offsets
+        // is non-null (i.e., the caller is binding sub-regions, which is
+        // also exactly the path that repeats launches into one cmdbuf
+        // with different bindings — compact_huff x4, etc.), allocate a
+        // fresh transient set per launch from the dedicated
+        // g_transient_descriptor_pool. The pool is reset at every
+        // streamEndAndWait / submitAndWait boundary (just before the
+        // next decode begins recording). The iter 14 fast path is
+        // preserved for the (binding_offsets == null) common case.
+        const use_transient = binding_offsets != null;
         var slot_ptr: *VkDescriptorSet = &meta.persistent_desc_set_default;
-        if (se_opt) |se| {
+        var transient_storage: VkDescriptorSet = 0;
+        if (use_transient) {
+            slot_ptr = &transient_storage;
+        } else if (se_opt) |se| {
             const k_idx = kindIndexForPipeline(pipeline);
             if (k_idx >= 0 and @as(usize, @intCast(k_idx)) < se.persistent_desc_sets.len) {
                 slot_ptr = &se.persistent_desc_sets[@intCast(k_idx)];
@@ -4912,15 +4997,43 @@ fn procLaunchKernel(
         }
 
         if (slot_ptr.* == 0) {
-            // First touch on this (stream × pipeline) — allocate once.
-            const layouts_arr = [_]VkDescriptorSetLayout{meta.layout};
-            const ai = VkDescriptorSetAllocateInfo{
-                .descriptorPool = g_descriptor_pool,
-                .descriptorSetCount = 1,
-                .pSetLayouts = layouts_arr[0..1].ptr,
-            };
-            const rc = vkAllocateDescriptorSets_fn.?(dev, &ai, @ptrCast(slot_ptr));
-            if (rc != VK_SUCCESS_RC) return rc;
+            if (use_transient) {
+                // Iter 4c: opportunistic transient-pool reset. Tighten
+                // the lock around the count check + the reset itself so
+                // a concurrent ptest_vk worker can't sneak a fresh
+                // alloc into a pool we're about to reset.
+                lockTransient();
+                defer unlockTransient();
+                if (g_transient_set_count >= g_transient_set_reset_threshold) {
+                    // Drain every in-flight cmdbuf so the reset doesn't
+                    // invalidate sets referenced by a not-yet-submitted
+                    // (or in-flight) cmdbuf. vkDeviceWaitIdle is heavy
+                    // but only fires once per ~3500 transient allocs.
+                    if (vkDeviceWaitIdle_fn) |wi| _ = wi(dev);
+                    if (vkResetDescriptorPool_fn) |rp| _ = rp(dev, g_transient_descriptor_pool, 0);
+                    g_transient_set_count = 0;
+                }
+                const layouts_arr = [_]VkDescriptorSetLayout{meta.layout};
+                const ai = VkDescriptorSetAllocateInfo{
+                    .descriptorPool = g_transient_descriptor_pool,
+                    .descriptorSetCount = 1,
+                    .pSetLayouts = layouts_arr[0..1].ptr,
+                };
+                const rc = vkAllocateDescriptorSets_fn.?(dev, &ai, @ptrCast(slot_ptr));
+                if (rc != VK_SUCCESS_RC) return rc;
+                g_transient_set_count += 1;
+            } else {
+                // First touch on this (stream × pipeline) — allocate once
+                // into the persistent pool (iter 14).
+                const layouts_arr = [_]VkDescriptorSetLayout{meta.layout};
+                const ai = VkDescriptorSetAllocateInfo{
+                    .descriptorPool = g_descriptor_pool,
+                    .descriptorSetCount = 1,
+                    .pSetLayouts = layouts_arr[0..1].ptr,
+                };
+                const rc = vkAllocateDescriptorSets_fn.?(dev, &ai, @ptrCast(slot_ptr));
+                if (rc != VK_SUCCESS_RC) return rc;
+            }
         }
         dset = slot_ptr.*;
 
@@ -4935,16 +5048,32 @@ fn procLaunchKernel(
         defer gpa.free(writes);
         const infos = gpa.alloc(VkDescriptorBufferInfo, meta.n_bindings) catch return -1;
         defer gpa.free(infos);
+        // Iter 4c: per-binding byte offset (CUDA's `base + offset` pattern
+        // expressed in Vulkan via VkDescriptorBufferInfo.offset). Offsets
+        // must meet the device's minStorageBufferOffsetAlignment limit;
+        // we assert it in safe builds and reject misaligned offsets in
+        // release with rc=-1 so the caller sees error.KernelLaunchFailed
+        // even when validation layers are off.
+        const ssbo_align: u64 = g_min_storage_buffer_offset_alignment;
         var b: u32 = 0;
         while (b < meta.n_bindings) : (b += 1) {
             const p = params[b] orelse return -1;
             const hp: *const VkDeviceBuffer = @ptrCast(@alignCast(p));
             const handle = hp.*;
             const entry = lookupAlloc(handle) orelse return -1;
+            const off: u64 = if (binding_offsets) |bo| bo[b] else 0;
+            if (off != 0) {
+                if (ssbo_align != 0 and (off % ssbo_align) != 0) {
+                    std.debug.assert(false); // misaligned SSBO offset — violates VUID-VkDescriptorBufferInfo-offset-00925
+                    return -1;
+                }
+                if (off >= entry.size) return -1;
+            }
+            const remaining: u64 = if (off == 0) VK_WHOLE_SIZE else (entry.size - off);
             infos[b] = .{
                 .buffer = entry.buffer,
-                .offset = 0,
-                .range = VK_WHOLE_SIZE,
+                .offset = off,
+                .range = remaining,
             };
             writes[b] = .{
                 .dstSet = dset,

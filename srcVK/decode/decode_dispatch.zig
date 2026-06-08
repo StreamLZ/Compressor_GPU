@@ -196,6 +196,7 @@ const FnLaunchKernel = *const fn (
     VkStream,
     [*]?*anyopaque,
     [*]?*anyopaque,
+    ?[*]const u64, // iter 4c: per-binding byte offsets (null = all-zero)
 ) callconv(.c) VkResult;
 const FnCtxSync = *const fn () callconv(.c) VkResult;
 const FnStreamSync = *const fn (VkStream) callconv(.c) VkResult;
@@ -304,19 +305,27 @@ pub fn mergeHuffDescs(
     off16_offset: usize,
     launch_fn: FnLaunchKernel,
 ) GpuError!void {
+    // Iter 4c: per-binding offsets replace the pre-iter-4c handle
+    // arithmetic on d_compact_counts (each n_* count is at
+    // COUNTS_STRIDE*idx within the same buffer; pre-iter-4c the code
+    // did `self.d_compact_counts + 4/8/12/20` which is meaningless
+    // because VkDeviceBuffer is a registry handle, not a VA). The
+    // four per-stream count slots and the n_merged slot all bind to
+    // the same base handle; their offsets land in binding_offsets[].
+    const COUNTS_STRIDE: u64 = 256;
     var args = MergeHuffParams{
         .lit = self.d_compact_lit,
         .tok = self.d_compact_tok,
         .hi = self.d_compact_hi,
         .lo = self.d_compact_lo,
         .n_lit = self.d_compact_counts,
-        .n_tok = self.d_compact_counts + 4,
-        .n_hi = self.d_compact_counts + 8,
-        .n_lo = self.d_compact_counts + 12,
+        .n_tok = self.d_compact_counts,
+        .n_hi = self.d_compact_counts,
+        .n_lo = self.d_compact_counts,
         .tok_region = @intCast(tok_offset),
         .off16_region = @intCast(off16_offset),
         .merged = self.d_huff_descs,
-        .n_merged = self.d_compact_counts + 20,
+        .n_merged = self.d_compact_counts,
     };
     // VK adaptation: params[] layout per module_loader KERNEL_DECLS contract
     // (see scan_gpu.zig:58-64 and decode_dispatch.zig:597-604 for working
@@ -335,14 +344,30 @@ pub fn mergeHuffDescs(
         @ptrCast(&args.tok_region), @ptrCast(&args.off16_region),
     };
     var m_extra = [_]?*anyopaque{null};
+    // Bindings 0-3 (lit/tok/hi/lo) + 8 (merged) bind whole buffers at
+    // offset 0; bindings 4-7 + 9 are sub-region binds of d_compact_counts
+    // at strided per-stream slots.
+    const m_offs = [_]u64{
+        0, 0, 0, 0,
+        COUNTS_STRIDE * 0,
+        COUNTS_STRIDE * 1,
+        COUNTS_STRIDE * 2,
+        COUNTS_STRIDE * 3,
+        0,
+        COUNTS_STRIDE * 5,
+    };
     const stream = self.work_stream;
     const t_merge = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzMergeHuffDescsKernel", stream);
-    try vkCall(launch_fn(module_loader.merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &m_params, &m_extra), .launch);
+    try vkCall(launch_fn(module_loader.merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &m_params, &m_extra, &m_offs), .launch);
     endKernelTiming(t_merge, stream);
-    // No post-launch sync: downstream kernels (huff_build, huff_decode)
-    // are queued on the same stream and see merge's output via stream
-    // ordering. In sync mode the pre-back-half cross-stream sync in
-    // `fullGpuLaunchImpl` covers it.
+    // Iter 4c: merge wrote d_huff_descs + n_merged. huff_build_lut +
+    // huff_decode_4stream read both downstream. VK requires the explicit
+    // compute→compute barrier here; CUDA's per-stream cuLaunchKernel
+    // ordering covers it implicitly. Pre-iter-4c the merge launch never
+    // actually wrote anything (lookupAlloc on `base + N` returned -1 →
+    // launch returned -1 → KernelLaunchFailed) so the missing barrier
+    // was latent — iter 4c surfaces the dependency.
+    if (vk.procs.compute_to_compute_barrier) |bf| try vkCall(bf(stream), .sync);
 }
 
 /// CUDA reference: src/decode/decode_dispatch.zig:148-180. Scatter the
@@ -368,7 +393,13 @@ pub fn gatherRawOff16(
     var p_comp_len: u32 = comp_len;
     var p_scratch: u64 = self.d_entropy_off16_scratch;
     var p_descs: u64 = self.d_compact_raw;
-    var p_count: u64 = self.d_compact_counts + 16;
+    // Iter 4c: n_raw lives in d_compact_counts slot 4 under the strided
+    // layout (see scan_gpu.zig::gpuScanChunks). Pre-iter-4c the code did
+    // `self.d_compact_counts + 16` arithmetic on the handle — fix by
+    // passing the base + routing the strided offset through
+    // procLaunchKernel.binding_offsets.
+    const COUNTS_STRIDE: u64 = 256;
+    var p_count: u64 = self.d_compact_counts;
     // VK adaptation: params[] layout per module_loader KERNEL_DECLS contract
     // (see scan_gpu.zig:58-64 and decode_dispatch.zig:597-604 for working
     // reference). First n_bindings entries are pointers to VkDeviceBuffer
@@ -383,6 +414,9 @@ pub fn gatherRawOff16(
         @ptrCast(&p_comp_len),
     };
     var extra = [_]?*anyopaque{null};
+    // Binding 1 (ScratchBaseBuf) is the d_entropy_off16 sub-region of
+    // d_entropy_scratch (offset = off16_offset captured at setup).
+    const gather_offs = [_]u64{ 0, self.d_entropy_off16_offset, 0, COUNTS_STRIDE * 4 };
     // Grid size = worst-case sub-chunk count (`num_raw_off16` is the
     // dispatch's upper bound); the kernel self-gates on `*p_count` so
     // over-launching is safe.
@@ -390,9 +424,13 @@ pub fn gatherRawOff16(
     const stream = self.work_stream;
     const t_gather = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzGatherRawOff16Kernel", stream);
     defer endKernelTiming(t_gather, stream);
-    try vkCall(launch_fn(module_loader.gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, stream, &params, &extra), .launch);
-    // No post-launch sync: downstream LZ kernel reads
-    // d_entropy_off16_scratch from the same stream.
+    try vkCall(launch_fn(module_loader.gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, stream, &params, &extra, &gather_offs), .launch);
+    // Iter 4c: gather wrote into d_entropy_off16_scratch (sub-region of
+    // d_entropy_scratch). The downstream LZ general kernel reads from
+    // d_entropy_scratch. CUDA's per-stream implicit ordering covers
+    // this; VK needs the explicit barrier. Without it the LZ kernel
+    // can observe stale entropy_scratch and emit garbage / zeros.
+    if (vk.procs.compute_to_compute_barrier) |bf| try vkCall(bf(stream), .sync);
 }
 
 /// CUDA reference: src/decode/decode_dispatch.zig:185-200. SLZ_E2E_TIMER
@@ -554,9 +592,14 @@ pub fn runHuffBuildAndDecode(
 
     // CUDA reference: src/decode/decode_dispatch.zig:317. The huff
     // kernels self-gate on `*d_n_huff`. The merge kernel wrote
-    // `n_merged` to `d_compact_counts[5]` (offset 20 bytes); the huff
-    // kernels read it from there.
-    const d_n_huff: u64 = self.d_compact_counts + 20;
+    // `n_merged` to `d_compact_counts[5]`; under the iter 4c strided
+    // layout slot 5 lives at COUNTS_STRIDE*5 within the buffer (vs the
+    // packed 5*4=20 offset CUDA uses). Bind the base handle here and
+    // route the strided offset through procLaunchKernel.binding_offsets
+    // below — exactly the pattern mergeHuffDescs / gatherRawOff16 use.
+    const COUNTS_STRIDE: u64 = 256;
+    const N_MERGED_SLOT_OFF: u64 = COUNTS_STRIDE * 5;
+    const d_n_huff: u64 = self.d_compact_counts;
 
     // ── 1. slzHuffBuildLutKernel ────────────────────────────────
     // CUDA reference: src/decode/decode_dispatch.zig:318-331. Builds the
@@ -584,9 +627,16 @@ pub fn runHuffBuildAndDecode(
         };
         var extra = [_]?*anyopaque{null};
         const t_hb = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffBuildLutKernel", huff_stream);
-        try vkCall(launch_fn(module_loader.huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra), .launch);
+        // Iter 4c: binding 3 (NBlocksBuf) is d_compact_counts slot 5.
+        const hb_offs = [_]u64{ 0, 0, 0, N_MERGED_SLOT_OFF };
+        try vkCall(launch_fn(module_loader.huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra, &hb_offs), .launch);
         endKernelTiming(t_hb, huff_stream);
     }
+    // Iter 4c: huff_build wrote d_huff_lut (the per-block LUT) that
+    // huff_decode_4stream reads next. Without the VK barrier the decode
+    // kernel can race on the LUT. CUDA's per-launch stream ordering
+    // covers this implicitly; VK requires the explicit barrier.
+    if (procs.compute_to_compute_barrier) |bf| try vkCall(bf(huff_stream), .sync);
     // CUDA reference: src/decode/decode_dispatch.zig:333-339. Split
     // fence: time the LUT build separately from the decode.
     if (split_timer) {
@@ -623,7 +673,9 @@ pub fn runHuffBuildAndDecode(
         };
         var extra = [_]?*anyopaque{null};
         const t_hd = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffDecode4StreamKernel", huff_stream);
-        try vkCall(launch_fn(module_loader.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra), .launch);
+        // Iter 4c: binding 4 (NBlocksBuf) is d_compact_counts slot 5.
+        const hd_offs = [_]u64{ 0, 0, 0, 0, N_MERGED_SLOT_OFF };
+        try vkCall(launch_fn(module_loader.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra, &hd_offs), .launch);
         endKernelTiming(t_hd, huff_stream);
     }
     return split_huff_build_ns;
@@ -707,7 +759,7 @@ pub fn runLzPipeline(
         };
         var raw_extra = [_]?*anyopaque{null};
         const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", stream);
-        try vkCall(launch_fn(module_loader.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra), .launch);
+        try vkCall(launch_fn(module_loader.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra, null), .launch);
         endKernelTiming(t_lzr, stream);
     } else {
         var p_entropy_scratch: u64 = self.d_entropy_scratch;
@@ -740,7 +792,7 @@ pub fn runLzPipeline(
         var lz_extra = [_]?*anyopaque{null};
 
         const t_lz = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeKernel", stream);
-        try vkCall(launch_fn(module_loader.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra), .launch);
+        try vkCall(launch_fn(module_loader.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra, null), .launch);
         endKernelTiming(t_lz, stream);
     }
 
@@ -889,7 +941,10 @@ pub fn uploadInputAndPrefixSum(
     try ensureDeviceBuf(&self.d_entropy_scratch, &self.d_entropy_scratch_size, entropy_scratch_bytes);
     const tok_offset = @as(usize, total_subchunks) * per_subchunk_scratch;
     const off16_offset = @as(usize, total_subchunks) * per_subchunk_scratch * 2;
-    self.d_entropy_off16_scratch = self.d_entropy_scratch + off16_offset;
+    // Iter 4c: store the base handle + offset; the gather kernel binds
+    // the sub-region via procLaunchKernel.binding_offsets.
+    self.d_entropy_off16_scratch = self.d_entropy_scratch;
+    self.d_entropy_off16_offset = off16_offset;
 
     // Always pass the device prefix-sum to the LZ kernel. When
     // `sub_chunk_cap >= chunk_size` the prefix sum is `[0, 1, 2, ...]`
@@ -1222,7 +1277,11 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
             // Allocate L2-only scratch slots before the scan kernel
             // runs. Each ensureDeviceBuf is a grow-only no-op on
             // subsequent decodes of the same level.
-            try ensureDeviceBuf(&self.d_compact_counts, &self.d_compact_counts_size, 32);
+            // Iter 4c: 6 strided u32 slots (256 B each = SSBO_ALIGN) so
+            // each per-stream count binds at a Vulkan-aligned offset via
+            // procLaunchKernel.binding_offsets. Matches the layout
+            // scan_gpu.zig::gpuScanChunks computes (COUNTS_STRIDE * 6).
+            try ensureDeviceBuf(&self.d_compact_counts, &self.d_compact_counts_size, 256 * 6);
             try ensureDeviceBuf(&self.d_scan_staged, &self.d_scan_staged_size, @as(usize, layout.total_subchunks) * @sizeOf(descriptors.ScanHuffDesc));
             try ensureDeviceBuf(&self.d_first_sub_idx_persist, &self.d_first_sub_idx_persist_size, @as(usize, descriptors.WALK_MAX_CHUNKS) * 4);
 

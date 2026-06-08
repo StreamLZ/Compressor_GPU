@@ -92,6 +92,10 @@ pub const FnLaunchKernel = *const fn (
     usize,
     [*]?*anyopaque,
     [*]?*anyopaque,
+    // Iter 4c: per-binding byte offsets. Encoder kernels currently bind
+    // whole buffers, so encoder callers pass null. See
+    // srcVK/decode/vulkan_api.zig:::launch_kernel doc for the rationale.
+    ?[*]const u64,
 ) callconv(.c) VkResult;
 pub const FnCtxSync = *const fn () callconv(.c) VkResult;
 pub const FnMemsetD8 = *const fn (VkDeviceBuffer, u8, usize) callconv(.c) VkResult;

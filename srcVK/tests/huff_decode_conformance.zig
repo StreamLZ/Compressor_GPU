@@ -224,7 +224,7 @@ fn huffRoundtripOne(allocator: std.mem.Allocator, src: []const u8) !void {
             @ptrCast(&p_stride), @ptrCast(&p_n),
         };
         var extra = [_]?*anyopaque{null};
-        if (launch_fn(enc_module_loader.huff_tables_kernel_fn, 1, 1, 1, 32, 1, 1, 0, 0, &params, &extra) != VK_SUCCESS_RC) {
+        if (launch_fn(enc_module_loader.huff_tables_kernel_fn, 1, 1, 1, 32, 1, 1, 0, 0, &params, &extra, null) != VK_SUCCESS_RC) {
             return error.KernelLaunchFailed;
         }
     }
@@ -254,7 +254,7 @@ fn huffRoundtripOne(allocator: std.mem.Allocator, src: []const u8) !void {
             @ptrCast(&p_n),
         };
         var extra = [_]?*anyopaque{null};
-        if (launch_fn(enc_module_loader.huff_encode_kernel_fn, 1, 1, 1, 32, 1, 1, 0, 0, &params, &extra) != VK_SUCCESS_RC) {
+        if (launch_fn(enc_module_loader.huff_encode_kernel_fn, 1, 1, 1, 32, 1, 1, 0, 0, &params, &extra, null) != VK_SUCCESS_RC) {
             return error.KernelLaunchFailed;
         }
     }
@@ -286,7 +286,7 @@ fn huffRoundtripOne(allocator: std.mem.Allocator, src: []const u8) !void {
             @ptrCast(&p_comp), @ptrCast(&p_descs), @ptrCast(&p_lut), @ptrCast(&p_n),
         };
         var extra = [_]?*anyopaque{null};
-        if (launch_fn(dec_module_loader.huff_build_fn, 1, 1, 1, 32, 1, 1, 0, 0, &params, &extra) != VK_SUCCESS_RC) {
+        if (launch_fn(dec_module_loader.huff_build_fn, 1, 1, 1, 32, 1, 1, 0, 0, &params, &extra, null) != VK_SUCCESS_RC) {
             return error.KernelLaunchFailed;
         }
     }
@@ -307,7 +307,7 @@ fn huffRoundtripOne(allocator: std.mem.Allocator, src: []const u8) !void {
             @ptrCast(&p_out),  @ptrCast(&p_n),
         };
         var extra = [_]?*anyopaque{null};
-        if (launch_fn(dec_module_loader.huff_decode_fn, 1, 1, 1, 32, 1, 1, 0, 0, &params, &extra) != VK_SUCCESS_RC) {
+        if (launch_fn(dec_module_loader.huff_decode_fn, 1, 1, 1, 32, 1, 1, 0, 0, &params, &extra, null) != VK_SUCCESS_RC) {
             return error.KernelLaunchFailed;
         }
     }

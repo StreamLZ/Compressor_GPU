@@ -454,6 +454,21 @@ pub const Procs = struct {
     /// + vkCmdPushConstants + vkCmdDispatch into one slot. The `f`
     /// handle is the VkPipeline cast to usize; module_loader stages
     /// each compiled SPV blob into one of these.
+    ///
+    /// Iter 4c: `binding_offsets` is a NEW trailing parameter (no CUDA
+    /// analogue). CUDA encodes "decode sub-region of a buffer" as plain
+    /// pointer arithmetic on a CUdeviceptr (`base + offset`) before the
+    /// pointer-to-arg array slot is filled. Vulkan's VkDeviceBuffer is
+    /// an opaque registry handle, NOT an addressable VA, so the codec
+    /// cannot fold offset into the handle. Instead the codec passes the
+    /// base handle AND a per-binding byte offset; procLaunchKernel wires
+    /// the offset into VkDescriptorBufferInfo.offset (the native Vulkan
+    /// "bind a sub-range of a buffer" surface). Pass `null` (or a
+    /// zero-filled array) for the legacy behaviour — every binding then
+    /// binds the whole buffer at offset 0. Per-offset entries MUST be
+    /// aligned to VkPhysicalDeviceLimits.minStorageBufferOffsetAlignment
+    /// (16 on NVIDIA, 64 on Intel iGPU); procLaunchKernel debug-asserts
+    /// alignment in safe builds.
     launch_kernel: ?*const fn (
         usize, // pipeline (VkPipeline cast to usize)
         c_uint, // grid_x
@@ -466,6 +481,7 @@ pub const Procs = struct {
         VkStream, // stream
         [*]?*anyopaque, // params
         [*]?*anyopaque, // extra (trailing-null sentinel CUDA uses)
+        ?[*]const u64, // binding_offsets (per-binding byte offset; null = all-zero)
     ) callconv(.c) VkResult = null,
 
     /// VK adaptation: NEW SLOT (no CUDA analogue). Record a
