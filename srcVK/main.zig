@@ -29,6 +29,15 @@ test {
     _ = @import("tests/l1_decode_roundtrip.zig");
     _ = @import("tests/l1_encode_roundtrip.zig");
     _ = @import("tests/l2_encode_roundtrip.zig");
+    // Phase 2A-decoder iter 4c gap fix: L3 + L4 round-trip coverage.
+    // ptest_vk shipped 88/0/0 GREEN after iter 4c yet end-to-end L3/L4
+    // decode is broken in two distinct ways (byte-65544 silent
+    // corruption + small-input KernelLaunchFailed). The new files below
+    // close the coverage gap so the next workflow has a failing signal
+    // to debug against. See each file's header for the bug-shape
+    // catalogue and per-test diagnostics.
+    _ = @import("tests/l3_l4_encode_roundtrip.zig");
+    _ = @import("tests/l3_l4_cross_backend.zig");
     _ = @import("tests/cross_backend_roundtrip.zig");
     _ = @import("tests/cli_smoke.zig");
     // Phase 2A-decoder iter 4 safety net: isolated kernel conformance
