@@ -91,7 +91,7 @@ roundtrip parity across L3+L4 in both directions.
 ⏸️ **Phase 2A decoder (blocked on Phase 3):**
 - `srcVK/decode/huff_build_lut_kernel.comp` — stub; waiting for Phase 3 to enable type-4 desc extraction
 - `srcVK/decode/huff_decode_4stream_kernel.comp` — stub; same blocker
-- Open the L2 gate at `decode_dispatch.zig:~1090` for type-4 path (the gate today returns NotImplementedL2 because the upstream `scan_gpu.gpuScanChunks` is a stub)
+- Open the L2 gate at `decode_dispatch.zig:~1090` for type-4 path (the gate today returns `NotImplementedL2` because the upstream `scan_gpu.gpuScanChunks` is a stub — note this same sentinel is shared with `decompressFramedFromDevice` whose name is misleading; both block on Phase 3 infrastructure)
 
 **Tests pending decoder:**
 - L3 + L4 ptest cases (mirror L2 pattern) — blocked on VK→VK roundtrip
@@ -123,31 +123,50 @@ LOC estimate: ~800 GLSL + ~500 Zig. ~2-3 single agents.
 
 ### Phase 3 — Multi-kernel decode pipeline (L2+ requires this)
 
-L1 decode currently uses CPU `buildChunkDescriptors` (correct per port
-discipline — CUDA does this on CPU for L1 too). L2+ needs the full
-multi-kernel GPU graph that CUDA runs per frame.
+L1 host-input decode currently uses CPU `buildChunkDescriptors` (correct
+per port discipline — CUDA does this on CPU for the host-input L1 path
+too). TWO things need the multi-kernel GPU graph:
+  (a) **L2+ host-input decode** — the entropy-decoded sub-chunks need
+      GPU scan/walk/compact to feed Huffman LUT + decode kernels
+  (b) **D2D entry point at EVERY level** (`decompressFramedFromDevice`)
+      — when input is device-resident, CPU can't walk it; the chain
+      walk runs on GPU via walk_frame_kernel. Used by the v3 C ABI.
+      Applies to L1 D2D as well as L2+ D2D, per CUDA.
 
 **Kernels to port** (CUDA: `src/decode/scan_parse_kernel.cuh`,
 `prefix_sum_chunks_kernel.cuh`, etc.):
 - `srcVK/decode/scan_parse_kernel.comp` — parse compressed-block headers on GPU
-- `srcVK/decode/prefix_sum_chunks_kernel.comp` — running offsets (L1 has this for prefix_sum_chunks_fn already — port for the L2 D2D path)
+- `srcVK/decode/prefix_sum_chunks_kernel.comp` — running offsets (L1 has this for prefix_sum_chunks_fn already — port for the D2D path)
 - `srcVK/decode/compact_huff_descs_kernel.comp` — gather entropy-decoded chunk descs
 - `srcVK/decode/compact_raw_descs_kernel.comp` — gather raw chunk descs
-- `srcVK/decode/walk_frame_kernel.comp` — walk parsed frame (L2 D2D entry)
+- `srcVK/decode/walk_frame_kernel.comp` — walk parsed frame (D2D entry — applies at ALL levels per CUDA, not L2-only)
 - `srcVK/decode/merge_huff_descs_kernel.comp` — merge huff descs
 - `srcVK/decode/gather_raw_off16_kernel.comp` — gather raw off16 stream
 - `srcVK/decode/lz_decode_kernel.comp` — L2 huff-aware LZ workhorse (L1 uses `lz_decode_raw_kernel.comp`)
 
 **Host glue:** generalize `decode_dispatch.zig::fullGpuLaunchImpl` to use the
-GPU chain when L2+ or when the caller supplies device-resident input
-(`decompressFramedFromDevice`, currently `error.NotImplementedL2`).
+GPU chain when L2+ OR when the caller supplies device-resident input via
+the D2D entry point `decompressFramedFromDevice`. The D2D entry point
+applies at EVERY level (L1 through L5) — used by the v3 C ABI for
+device-input, device-output decode where the frame and output never
+leave VRAM. The chunk walk runs on GPU via the new walk_frame_kernel.
+
+Current state: `decompressFramedFromDevice` returns
+`error.NotImplementedL2` (the sentinel name is misleading — it's "D2D
+entry not implemented yet" rather than "L2-specific"). Phase 3 unblocks
+L1 D2D as the first milestone; Phase 2A-decoder + Phase 3 together
+unblock L2+ D2D.
 
 LOC estimate: ~1,500 GLSL + ~600 Zig. ~3-4 single agents.
 
 ### Phase 4 — True D2D + Async API
 
 L1 has stubs for these but not actual implementations:
-- `decompressFramedFromDevice` — returns `error.NotImplementedL2` (L2 D2D entry)
+- `decompressFramedFromDevice` — pure-D2D decode entry point at EVERY
+  level (used by v3 C ABI). Currently returns `error.NotImplementedL2`
+  (misnamed sentinel — actual meaning is "D2D entry not implemented yet").
+  L1 D2D unblocked by Phase 3 (walk_frame_kernel + host glue); L2+ D2D
+  also needs Phase 2A-decoder.
 - Async APIs (`slzCompressAsync_vk`, `slzCompressAsyncPoll_vk`, etc.) — not wired
 
 **The decode/encode procs surface already supports streams** (iter-11 split
@@ -254,10 +273,18 @@ Do NOT rename or restructure:
 dispatches. Skipped entirely on L1. CUDA wastefully dispatches 7 L2 kernels
 on L1 (~388 µs/decode); we don't. **Phase 3 fills the L2 branch.**
 
-### `buildChunkDescriptors` MUST stay CPU walk on L1
+### `buildChunkDescriptors` MUST stay CPU walk on L1 host-input path
 
 In `decode/streamlz_decoder.zig`. The prior `/src_vulkan/` session moved this
-to GPU — **THAT WAS THE CANONICAL PORT VIOLATION.** Keep it CPU for L1.
+to GPU for the host-input path — **THAT WAS THE CANONICAL PORT VIOLATION.**
+Keep it CPU for the L1 host-input decode path.
+
+**Phase 3's GPU `walk_frame_kernel` is for a SEPARATE entry point**:
+the D2D path (`decompressFramedFromDevice`), where the input is
+device-resident and CPU walk isn't possible. CUDA has the same split
+— two entry points, each uses its appropriate walk. The L1 host-input
+path keeps the CPU walk; the D2D path uses the GPU walk. Don't merge
+the two.
 
 ### KERNEL_DECLS (decode + encode module_loader.zig)
 
