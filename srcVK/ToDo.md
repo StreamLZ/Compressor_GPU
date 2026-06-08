@@ -1,7 +1,7 @@
 # srcVK Vulkan Port — L1 Done, L2-L5 Roadmap
 
-**Last updated:** 2026-06-07, HEAD `30f36d3`.
-**Status:** L1 + L2 SHIPPED on decode + encode. Phase 2A encoder SHIPPED (L3 + L4 encode byte-identical to CUDA on 8/9 cases; 1/9 silesia L3 = 0.02% larger due to documented structural Vulkan 4 GiB SSBO cap). Decoder Huffman blocked on Phase 3. ptest_vk 83/0/0 both backends.
+**Last updated:** 2026-06-08, HEAD `de9d7eb`.
+**Status:** L1 + L2 SHIPPED on decode + encode. Phase 2A encoder SHIPPED (L3 + L4 encode byte-identical to CUDA on 8/9 cases; 1/9 silesia L3 = 0.02% larger — structural Vulkan 4 GiB SSBO cap). Phase 3 SHIPPED (decode pipeline kernels 6/7 + L1 D2D entry opened). Phase 2A-decoder partially shipped (`5b438bc` + `6a1da40` + `d5860d1` + `ac6696f` + `de9d7eb`): gpuScanChunks + huff_build_lut + huff_decode_4stream + runHuffBuildAndDecode wiring + 5-case isolated conformance test PROVING the Huffman chain is correct. Remaining blocker for full VK→VK L3+ roundtrip: lz_decode_kernel general workhorse (iter 4 — pending; ~855 LOC). ptest_vk **88/0/0** both backends.
 
 This file is the source of truth for "what's left." All of L1 is locked-in
 production code; the meaningful remaining work is L2-L5 to reach full CUDA
@@ -49,8 +49,8 @@ The CUDA encoder supports five levels:
 | **L2** | greedy | 18 | NO | NO | ✅ **DONE** (`7bbcf77`) — byte-identical to CUDA + FASTER; 9 ptest cases added |
 | **L3 encode** | greedy | 19* | YES | NO | ✅ **ENCODER SHIPPED** (`f9e84e3` + `30f36d3`) — byte-identical to CUDA on web/enwik8; silesia 0.02% larger (4 GiB SSBO cap). Decoder blocked on Phase 3. |
 | **L4 encode** | greedy | 17 | YES | YES (`p_l4=1`) | ✅ **ENCODER SHIPPED** (same commits — `p_l4=1` flag already plumbed in encode_lz.zig) |
-| L3/L4 decode | n/a | n/a | YES | n/a | needs Phase 3 + Phase 2A-decoder |
-| L5 | **chain parser** | 17 | YES | YES | needs Phase 2A-decoder + 2B chain parser (+ fix broken branch) |
+| L3/L4 decode | n/a | n/a | YES | n/a | **PARTIAL** — gpuScanChunks ✅, huff_build_lut ✅, huff_decode_4stream ✅ + conformance test ✅; **lz_decode general workhorse PENDING (iter 4)** to close VK→VK roundtrip |
+| L5 | **chain parser** | 17 | YES | YES | needs Phase 2A-decoder iter 4 + 2B chain parser (+ fix broken branch) |
 
 *L3 hash_bits clamps from 19 → 18 only when single-frame input ≥ 128 MiB at sc=0.25 (Vulkan 4 GiB maxStorageBufferRange cap). Affects only silesia at L3 today; cost is 0.02% larger output. See "Accepted residuals" below.
 
@@ -88,16 +88,27 @@ roundtrip parity across L3+L4 in both directions.
 - ptest_vk 83/0/0 preserved
 - L4 = L3 + `p_l4=1` flag already plumbed in encode_lz.zig
 
-⏸️ **Phase 2A decoder (blocked on Phase 3):**
-- `srcVK/decode/huff_build_lut_kernel.comp` — stub; waiting for Phase 3 to enable type-4 desc extraction
-- `srcVK/decode/huff_decode_4stream_kernel.comp` — stub; same blocker
-- Open the L2 gate at `decode_dispatch.zig:~1090` for type-4 path (the gate today returns `NotImplementedL2` because the upstream `scan_gpu.gpuScanChunks` is a stub — note this same sentinel is shared with `decompressFramedFromDevice` whose name is misleading; both block on Phase 3 infrastructure)
+✅ **Phase 2A decoder iter 1 (`5b438bc`):** `gpuScanChunks` host driver port (~190 LOC Zig) — drives Phase 3 scan/compact kernels end-to-end. Adversarial review FAITHFUL.
 
-**Tests pending decoder:**
-- L3 + L4 ptest cases (mirror L2 pattern) — blocked on VK→VK roundtrip
+✅ **Phase 2A decoder iter 2 (`6a1da40`):** `srcVK/decode/huff_build_lut_kernel.comp` — full 8-pass faithful port (~391 LOC GLSL). All 8 passes present: weights unpack, parallel histogram, canonical bucket starts, parallel LUT zero, fused code-assignment + Pass-1 fan-out (with `__match_any_sync` emulation), Pass-2 dual-symbol, Pass-3 escape entries, cache-streaming bulk dump. Adversarial review verdict: NO simplifications.
+
+✅ **Phase 2A decoder iter 3 + fix (`d5860d1` + `ac6696f`):** `srcVK/decode/huff_decode_4stream_kernel.comp` — full faithful port (~616 LOC GLSL). All 4 phases of `decodeStreamBoundedIL` present (preamble byte-drain + INTERLEAVED X2 hot loop + TAIL X2 hot loop + single-symbol tail finisher). u64 bit-buffer split to uvec2 pair with proven equivalence (top-10-bits-live-in-hi invariant since MAX_CODE_LEN=10 < REFILL_BITS=32). `__byte_perm` emulated via manual shift+mask `bswapU32`. `__shfl_up_sync` → `subgroupShuffleUp`. Plus `runHuffBuildAndDecode` host wiring (~75 LOC). Adversarial review caught a CRITICAL bug in `bitbufRefill` (hi/lo SWAPPED — would have produced garbage decode); fixed at `ac6696f`.
+
+✅ **Conformance test (`de9d7eb`):** `srcVK/tests/huff_decode_conformance.zig` — 5 isolated kernel-level tests (1 KiB random, 8 KiB English, 64 KiB random, 16 KiB skewed alphabet, 4097 B odd-length). Drives encoder + decoder Huffman chain in isolation (bypasses merge/scan/compact). Empirically proven to catch the `bitbufRefill` hi/lo swap bug class (re-introduced bug → all 5 new tests failed while every pre-existing test passed). ptest_vk 83 → **88/0/0** both backends.
+
+⏸️ **Phase 2A decoder iter 4 — REMAINING WORK FOR VK→VK L3+ ROUNDTRIP:**
+- `srcVK/decode/lz_decode_kernel.comp` (general workhorse) — still stub. Needs port of:
+  - `src/decode/lz_decode_kernels.cuh` (231 LOC — kernel entry)
+  - `src/decode/lz_decode_general.cuh` (309 LOC — decodeSubChunkGeneral template, mode-0 delta literal copy, token-parse dispatch for SHORT/LONG_LITERAL/LONG_NEAR/SHORT_FAR/LONG_FAR, off16/off32 readout, recent_offset tracking, per-block trailing literals, MAX_BLOCKS_PER_SUBCHUNK=2 block-2 transition)
+  - `src/decode/lz_dispatch.cuh` (226 LOC — ParsedStreams + parseAndDecodeSubChunk dispatcher)
+  - `src/decode/lz_decode_core.cuh` (89 LOC — warpScanU32 / warpLiteralCopy / warpMatchCopy helpers; some may already exist in srcVK/common via the lz_decode_raw kernel)
+- Open the L2 gate at `decode_dispatch.zig:~1090` — currently the `req.level >= 2` branch runs through gpuScanChunks + runHuffBuildAndDecode successfully but then falls into the stub general kernel
+- LOC estimate: ~855 LOC CUDA → ~1,000+ LOC GLSL+Zig. The biggest single port remaining for L2+ decode. Likely multi-session even with adversarial review.
+- Once iter 4 lands: VK→VK L3 + L4 roundtrip works; can add L3 + L4 ptest cases (mirror L2 pattern)
+
+**Tests pending iter 4:**
+- L3 + L4 ptest cases (mirror L2 pattern) — blocked on iter 4 for VK→VK roundtrip
 - Cross-backend tests for L3/L4
-
-LOC remaining: ~600 GLSL (decoder kernels) + ~300 Zig (decoder host glue + L2 gate). ~1-2 agent runs once Phase 3 lands.
 
 ### Phase 2B — L5 chain parser
 
@@ -195,12 +206,13 @@ LOC estimate: ~400 Zig. ~1 single agent.
 |---|---|---|---|
 | ~~2-prep (verify L2)~~ | ✅ DONE | ✅ DONE | ✅ |
 | ~~2A encoder (Huffman, L3 + L4)~~ | ✅ DONE (~700 GLSL + 500 Zig) | | ✅ 1 + 1 review + 1 fix |
-| 2A decoder (huff_build_lut + huff_decode_4stream + L2 gate) — BLOCKED on Phase 3 | ~600 | ~300 | 1-2 |
+| ~~2A decoder iter 1-3 (gpuScanChunks + huff_build_lut + huff_decode_4stream + conformance test)~~ | ✅ DONE (~1,000 GLSL + 400 Zig) | | ✅ 3 + 3 reviews + 1 fix + 1 test |
+| 2A decoder iter 4 (lz_decode general workhorse + L2 gate open) | ~700 | ~300 | 2-3 |
+| ~~3 (GPU decode pipeline)~~ | ✅ DONE | | ✅ 1 + 1 review + 1 fix |
 | 2B (L5 chain parser + fix L5 broken branch) | ~800 | ~500 | 2-3 |
-| 3 (GPU decode pipeline) | ~1,500 | ~600 | 3-4 |
-| 4 (D2D + async) | 0 | ~600 | 1-2 |
+| 4 (D2D + async — note: L1 D2D already opened by Phase 3) | 0 | ~600 | 1-2 |
 | 5 (conformance + perf) | 0 | ~400 | 1 |
-| **REMAINING TOTAL** | **~3,500** | **~2,400** | **8-12** |
+| **REMAINING TOTAL** | **~1,500** | **~1,800** | **5-8** |
 
 ---
 
@@ -688,6 +700,15 @@ SSBO loads — verify perf doesn't regress.
 ## Recent commit history (last 20)
 
 ```
+de9d7eb  Phase 2A-decoder iter 3 follow-up — huff_decode conformance test (catches bitbufRefill bug class)
+ac6696f  Phase 2A-decoder iter 3 fix — bitbufRefill hi/lo swap
+d5860d1  Phase 2A-decoder iter 3 — port huff_decode_4stream + wire runHuffBuildAndDecode
+6a1da40  Phase 2A-decoder iter 2 — port huff_build_lut faithfully (8 passes)
+5b438bc  Phase 2A-decoder iter 1 — port gpuScanChunks host driver
+1509bee  Phase 3 follow-up — fix latent host param-packing bug in 3 L2-gated dispatch sites
+4ef283b  Phase 3 — port 6/7 decode pipeline kernels + open L1 D2D entry
+b4747ff  ToDo.md — clarify decompressFramedFromDevice is D2D at ALL levels
+148162a  ToDo.md — mark Phase 2A encoder + 2A.5 shipped
 30f36d3  Phase 2A.5 — clamp hash_bits for Vulkan 4 GiB SSBO cap (silesia L3 1.176x → 1.0002x)
 f9e84e3  Phase 2A encoder — full faithful Huffman encoder port (L3 + L4 encode shipped)
 cabf64e  ToDo.md — mark L2 SHIPPED (Phase 2-prep done)
