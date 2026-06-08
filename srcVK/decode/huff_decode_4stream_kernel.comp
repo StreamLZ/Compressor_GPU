@@ -1,39 +1,76 @@
 // 1:1 port of src/decode/huffman_kernel.cu, entry point
 // slzHuffDecode4StreamKernel.
-// CUDA reference: src/decode/huffman_kernel.cu:631-637.
+// CUDA reference: src/decode/huffman_kernel.cu:386-697.
 // See srcVK/PortInstructions.md.
 //
-// L2 stub: Huffman 4-stream decode (kernel decodes HUFF_NUM_STREAMS = 32
-// streams in parallel — one per warp lane). The "4Stream" suffix is the
-// historical CUDA dispatch ABI name; preserved verbatim per audit
-// Section C.5.1 row 180.
+// 32-stream bounded-interleaved (BIL) Huffman decode. One warp (= one
+// 32-wide subgroup) per HuffDecChunkDesc. All 32 lanes decode their own
+// stream in parallel (HUFF_NUM_STREAMS = 32 = WARP_SIZE; legacy
+// "4Stream" name retained for ABI parity per audit Section C.5.1).
+//
+// Four phases (one-to-one with CUDA decodeStreamBoundedIL):
+//   Phase 1 — preamble: byte-drain until (out + written) is 4-aligned
+//             so Phase 2's unconditional u32 store cannot fault.
+//   Phase 2a — INTERLEAVED hot loop (word_idx < K): 2-lookup batches,
+//              4-byte refill, u32 store.
+//   Phase 2b — TAIL hot loop (word_idx >= K): same 2-lookup body,
+//              tail-area refill source.
+//   Phase 3  — single-symbol finisher: drains the last < 2 symbols
+//              with byte-at-a-time stores; dual-source refill.
+//
+// The outer kernel (CUDA 631-697) parses the BIL header, cooperatively
+// loads the 4 KB LUT into shared mem, does a per-lane exclusive prefix
+// sum of tail bytes, carves the output into 32 contiguous slices, and
+// calls the inner decode body.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "gpu_warp.glsl"
+#include "gpu_huffman.glsl"
+#include "gpu_byteio.glsl"
 
 // CUDA: __launch_bounds__(32, 8) — one warp per block, eight resident
 // blocks per SM. Local size matches the 32-lane warp.
-layout(local_size_x = 32) in;
+// CUDA reference: src/decode/huffman_kernel.cu:631.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// CUDA reference: src/decode/huffman_kernel.cu:43-44.
+const int MAX_CODE_LEN = HUFF_LUT_INDEX_BITS;     // 10
+const int LUT_SIZE     = int(HUFF_LUT_ENTRIES);   // 1024
+
+// CUDA reference: src/decode/huffman_kernel.cu:51-52. Bit-buffer width
+// constants. BITBUF_BITS = 64 is the logical width of the bit accumulator;
+// the VK port splits it across two uint32_t halves (see below).
+const int BITBUF_BITS = 64;
+const int REFILL_BITS = 32;
+
+// ── SSBO bindings (mirror CUDA kernel arg order) ────────────────────
+// CUDA reference: src/decode/huffman_kernel.cu:631-637.
 
 // arg 0: const uint8_t* comp
 layout(std430, binding = 0) readonly buffer CompBuf {
-    uint comp[];
+    uint8_t comp[];
 };
 
-// arg 1: const HuffDecChunkDesc* descs
+// arg 1: const HuffDecChunkDesc* descs (5 u32 per block, 20 bytes:
+//   in_offset, in_size, out_offset, out_size, lut_offset)
 layout(std430, binding = 1) readonly buffer DescsBuf {
-    uint descs[];
+    uint descs_raw[];
 };
 
-// arg 2: const uint32_t* luts
+// arg 2: const uint32_t* luts (LUT_SIZE entries per block)
 layout(std430, binding = 2) readonly buffer LutsBuf {
     uint luts[];
 };
 
-// arg 3: uint8_t* output
+// arg 3: uint8_t* output  (decoded literal scratch)
 layout(std430, binding = 3) buffer OutputBuf {
-    uint output_data[];
+    uint8_t output_buf[];
 };
 
 // arg 4: const uint32_t* d_n_blocks
@@ -41,4 +78,539 @@ layout(std430, binding = 4) readonly buffer NBlocksBuf {
     uint d_n_blocks;
 };
 
-void main() { return; }
+// ── Shared LUT ──────────────────────────────────────────────────────
+// CUDA reference: src/decode/huffman_kernel.cu:644-649. CUDA uses
+// `extern __shared__ uint32_t shared_lut[]` sized by the launch's
+// shared_bytes (= LUT_SIZE * 4 = 4096 B). VK has no dynamic shared mem
+// at .comp level — we statically allocate the exact same amount.
+shared uint shared_lut[LUT_SIZE];
+
+// ── 64-bit bit-buffer adaptation ────────────────────────────────────
+// VK adaptation: CUDA's decoder uses `uint64_t bit_buf` with bits stored
+// MSB-first: a refill OR's the 32 new bits at position
+// (BITBUF_BITS - bit_count - REFILL_BITS), and the LUT index is read
+// from `bit_buf >> (BITBUF_BITS - MAX_CODE_LEN)`. shaderInt64 is not
+// enabled in this port (decoder pipeline uses Vulkan-1.2-features only;
+// see srcVK/decode/module_loader.zig). We split the u64 into a uvec2
+// pair (hi = bit_buf[63:32], lo = bit_buf[31:0]) and implement the
+// three operations we actually need:
+//
+//   • LUT index (top MAX_CODE_LEN bits): always lives in `hi`, no carry
+//     from `lo` (MAX_CODE_LEN = 10 < 32). Read directly as
+//       `hi >> (REFILL_BITS - MAX_CODE_LEN)`.
+//   • Phase-3 escape bit (bit 11 from the MSB, i.e. one position past
+//     the LUT index): position MAX_CODE_LEN within `hi`. Read as
+//       `(hi >> (REFILL_BITS - 1 - MAX_CODE_LEN)) & 1u`.
+//   • Refill OR: the 32 new bits are placed at MSB offset
+//     `BITBUF_BITS - bit_count - REFILL_BITS = REFILL_BITS - bit_count`
+//     within the logical u64. With bit_count in [0, REFILL_BITS] (the
+//     loops only refill when bit_count is below the lookup threshold,
+//     which is well under REFILL_BITS):
+//       new_chunk_high = v << (REFILL_BITS - bit_count)
+//       new_chunk_low  = (bit_count == 0) ? 0
+//                                          : v >> bit_count
+//     guarded against shift-by-32 UB on GLSL (`v >> 32u` is undefined).
+//   • Left shift by total_len (1..MAX_CODE_LEN+1 = 1..11, never > 31
+//     and never zero): `hi = (hi << n) | (lo >> (32 - n)); lo <<= n`.
+//
+// Equivalence proof: every place CUDA reads or writes `bit_buf` we
+// either read the high half (LUT index, escape bit) or apply a shift
+// that's structurally identical to the u64 expansion above; the
+// invariants on `bit_count` (≤ REFILL_BITS at refill time, ≤ 11 per
+// decode step) keep all shifts within the well-defined u32 range.
+struct BitBuf {
+    uint hi;
+    uint lo;
+};
+
+// CUDA reference: src/decode/huffman_kernel.cu:431, 482, 528, 581.
+// __byte_perm(word, 0, 0x0123) reverses byte order — the four output
+// bytes are word.byte0|word.byte1|word.byte2|word.byte3, picking input
+// byte indices 0,1,2,3 (the 0x0123 selector). With `word` loaded as a
+// little-endian uint32 from the bit-stream's first four bytes, this
+// produces the big-endian bit-stream ordering the LUT consumes.
+// GLSL has no __byte_perm; emulate via shifts + masks.
+uint bswapU32(uint w) {
+    return ((w >> 24) & 0x000000FFu)
+         | ((w >> 8)  & 0x0000FF00u)
+         | ((w << 8)  & 0x00FF0000u)
+         | ((w << 24) & 0xFF000000u);
+}
+
+// CUDA reference: src/decode/huffman_kernel.cu:429-431 (and 481, 527-528,
+// 580-581 — all four refill sites). CUDA does
+//   uint32_t word;
+//   memcpy(&word, w_ptr, sizeof(uint32_t));
+// to safely load 4 bytes from an unaligned byte pointer (the entropy
+// body sits at chunk_offset + 5; misalignment-safe per CUDA comment).
+// GLSL has no memcpy; we issue four uint8_t SSBO loads at the byte
+// pointer and reassemble in LE order — matching what x86 memcpy of an
+// LE u32 produces. The follow-up bswapU32 then converts to BE
+// bit-stream order. See gpu_byteio.glsl::readU32LE for the canonical
+// per-byte LE assembly used elsewhere in srcVK.
+uint loadWordUnaligned(uint p_abs) {
+    uint b0 = uint(comp[p_abs + 0u]);
+    uint b1 = uint(comp[p_abs + 1u]);
+    uint b2 = uint(comp[p_abs + 2u]);
+    uint b3 = uint(comp[p_abs + 3u]);
+    return readU32LE(b0, b1, b2, b3);
+}
+
+// CUDA reference: src/decode/huffman_kernel.cu:432 (etc).
+// `bit_buf |= ((uint64_t)v) << (REFILL_BITS - bit_count)`
+// VK split into uvec2 pair: the new 32 bits are placed at bit-offset
+// (REFILL_BITS - bit_count) within the logical u64. With `n =
+// REFILL_BITS - bit_count` in [0, REFILL_BITS]:
+//   logical bits [n+REFILL_BITS-1 .. n] receive `v`
+//   → top portion of `v` lands in `hi` (shifted left by n)
+//   → bottom portion of `v` lands in `lo` (shifted right by REFILL_BITS - n
+//     = bit_count). When n == REFILL_BITS (bit_count == 0), nothing
+//     wraps into `lo` and (v >> REFILL_BITS) would be UB on GLSL;
+//     short-circuit that case explicitly.
+void bitbufRefill(inout BitBuf b, uint v, uint bit_count) {
+    uint n = uint(REFILL_BITS) - bit_count;  // 0..32
+    // hi-half deposit: (v << n) is well-defined for n in [0,31];
+    // when n == 32 the full 32 new bits go into `lo` and `hi` gets
+    // zero. Guard the boundary.
+    if (n == uint(REFILL_BITS)) {
+        // bit_count == 0: load lands entirely in low half.
+        b.lo = b.lo | v;
+    } else {
+        b.hi = b.hi | (v << n);
+        b.lo = b.lo | (v >> bit_count);  // bit_count in [1,32], well-defined for [1,31]; when bit_count==32 the `if` branch fires instead
+    }
+}
+
+// CUDA reference: src/decode/huffman_kernel.cu:451-452 etc.
+// `bit_buf <<= total_len` with total_len in [1, MAX_CODE_LEN+1] = [1,11].
+// Pure left shift across the u64 split; total_len never reaches 32, so
+// the `lo >> (32 - total_len)` carry is always well-defined.
+void bitbufShiftLeft(inout BitBuf b, int total_len) {
+    uint n = uint(total_len);
+    b.hi = (b.hi << n) | (b.lo >> (uint(REFILL_BITS) - n));
+    b.lo = b.lo << n;
+}
+
+// CUDA: `lut[bit_buf >> (BITBUF_BITS - MAX_CODE_LEN)]`. The top
+// MAX_CODE_LEN bits of the logical u64 live entirely in `hi` (since
+// MAX_CODE_LEN < REFILL_BITS), so this is just `hi >> (32 - 10)`.
+uint bitbufLutIndex(BitBuf b) {
+    return b.hi >> uint(REFILL_BITS - MAX_CODE_LEN);
+}
+
+// CUDA: `(bit_buf >> (BITBUF_BITS - 1 - MAX_CODE_LEN)) & 1u`. The
+// position is one bit past the LUT index, still inside `hi`.
+uint bitbufEscapeBit(BitBuf b) {
+    return (b.hi >> uint(REFILL_BITS - 1 - MAX_CODE_LEN)) & 1u;
+}
+
+// ── LUT accessor inlines (mirror CUDA gpu_huffman.cuh) ──────────────
+// CUDA reference: src/common/gpu_huffman.cuh:162-166.
+int lutTotalLen(uint entry) { return int((entry >> uint(LUT_LEN_SHIFT))  & 0xFFu); }
+int lutNumSyms(uint entry)  { return int((entry >> uint(LUT_NSYM_SHIFT)) & 0xFFu); }
+uint lutSym1(uint entry)    { return (entry >> uint(LUT_SYM1_SHIFT)) & 0xFFu; }
+uint lutSym2(uint entry)    { return (entry >> uint(LUT_SYM2_SHIFT)) & 0xFFu; }
+// `lutSymPair` returns the low 16 bits — sym1 in low byte, sym2 in high
+// byte — used as the dual-symbol fast-path store payload.
+uint lutSymPair(uint entry) { return entry & 0xFFFFu; }
+
+// ── Inner decoder body (per-lane) ───────────────────────────────────
+// CUDA reference: src/decode/huffman_kernel.cu:386-610, decodeStreamBoundedIL.
+// All 4 phases preserved verbatim; the only adaptations are the u64
+// bit-buffer split + the unaligned-load shim + the byte-swap emulation.
+//
+// Signature: takes the four per-lane base offsets (il_base, tail_start
+// as absolute byte offsets into `comp`; out_base as an absolute byte
+// offset into `output_buf`) plus the lane number, K, my_n_words, and
+// my_out_size. Returns nothing (CUDA returns out_pos but the outer
+// kernel discards via (void)).
+//
+// `il_base_abs` is the absolute byte offset (within `comp`) of the
+// interleaved area's first byte. `tail_start_abs` is the absolute byte
+// offset of THIS lane's tail.
+void decodeStreamBoundedIL(uint il_base_abs, uint tail_start_abs,
+                           uint lane, uint K, uint my_n_words,
+                           uint out_base_abs, uint my_out_size) {
+    BitBuf bit_buf;
+    bit_buf.hi = 0u;
+    bit_buf.lo = 0u;
+    uint bit_count = 0u;
+    uint word_idx  = 0u;
+    uint out_pos   = 0u;
+    uint written   = 0u;
+    // `acc` holds up to 8 decoded bytes pending flush. The Phase 2 hot
+    // store writes 4 bytes at once; Phase 1 + Phase 2's drain go
+    // byte-by-byte. CUDA uses a uint64_t acc; the same uvec2 trick as
+    // for bit_buf applies — `acc_hi` holds bytes 4..7 and `acc_lo`
+    // holds bytes 0..3, with byte k packed into bits [8k+7..8k] of the
+    // logical u64. Pending byte count stays ≤ 7 (we flush when ≥ 4).
+    // CUDA reference: src/decode/huffman_kernel.cu:400.
+    uint acc_hi = 0u;
+    uint acc_lo = 0u;
+    uint pending = 0u;
+
+    // ── Phase 1: preamble — byte-drain until aligned ───────────────
+    // CUDA reference: src/decode/huffman_kernel.cu:414-460.
+    // At most ~3 iterations (each decode emits 1-2 bytes; we exit as
+    // soon as the destination is 4-aligned).
+    //
+    // VK adaptation: CUDA tests `((uintptr_t)(out + written) & 3) != 0`
+    // against a host pointer's low bits. We track the destination offset
+    // explicitly via `out_base_abs + written`; the alignment of the
+    // SSBO-backed `output_buf` SSBO is std430-guaranteed 4-byte aligned
+    // (every uint8_t array binding starts at a 16-byte aligned base in
+    // VMA-allocated memory), so checking `(out_base_abs + written) & 3`
+    // reproduces CUDA's pointer-alignment semantics exactly.
+    while (out_pos < my_out_size && ((out_base_abs + written) & 3u) != 0u) {
+        if (bit_count < uint(MAX_CODE_LEN + 1)) {
+            if (word_idx >= my_n_words) break;
+            // CUDA reference: src/decode/huffman_kernel.cu:417-419.
+            uint w_ptr;
+            if (word_idx < K) {
+                w_ptr = il_base_abs + word_idx * uint(HUFF_BIL_ROW_BYTES) + lane * 4u;
+            } else {
+                w_ptr = tail_start_abs + (word_idx - K) * 4u;
+            }
+            // CUDA reference: src/decode/huffman_kernel.cu:429-431.
+            // Misalignment-safe refill: 4 sequential uint8 loads
+            // assembled LE, then byte-swapped to BE bit-stream order.
+            uint word = loadWordUnaligned(w_ptr);
+            uint v = bswapU32(word);
+            bitbufRefill(bit_buf, v, bit_count);
+            bit_count += uint(REFILL_BITS);
+            word_idx += 1u;
+        }
+        // CUDA reference: src/decode/huffman_kernel.cu:436.
+        uint entry = shared_lut[bitbufLutIndex(bit_buf)];
+        int total_len = lutTotalLen(entry);
+        int num_syms  = lutNumSyms(entry);
+        if (total_len == 0) return;
+        if (num_syms == int(LUT_NUM_SYMS_ESCAPE)) {
+            // CUDA reference: src/decode/huffman_kernel.cu:441-445.
+            uint b11 = bitbufEscapeBit(bit_buf);
+            uint sym = (b11 != 0u) ? lutSym2(entry) : lutSym1(entry);
+            // acc |= (uint64_t)sym << (pending * 8). The 8-bit shift
+            // fits inside a single half whenever `pending < 4` (lands
+            // in acc_lo) or `pending in [4,7]` (lands in acc_hi).
+            if (pending < 4u) {
+                acc_lo = acc_lo | (sym << (pending * 8u));
+            } else {
+                acc_hi = acc_hi | (sym << ((pending - 4u) * 8u));
+            }
+            pending += 1u;
+            out_pos += 1u;
+        } else {
+            // CUDA reference: src/decode/huffman_kernel.cu:447-449.
+            uint pair = lutSymPair(entry); // sym1 in byte 0, sym2 in byte 1
+            if (pending < 3u) {
+                // Both bytes land in acc_lo (pair occupies 16 bits).
+                acc_lo = acc_lo | (pair << (pending * 8u));
+            } else if (pending == 3u) {
+                // sym1 (byte 0 of pair) goes into acc_lo's byte 3;
+                // sym2 (byte 1 of pair) goes into acc_hi's byte 0.
+                acc_lo = acc_lo | ((pair & 0xFFu) << 24);
+                acc_hi = acc_hi | ((pair >> 8) & 0xFFu);
+            } else {
+                // pending >= 4: both bytes land in acc_hi.
+                uint hi_off = (pending - 4u) * 8u;
+                acc_hi = acc_hi | (pair << hi_off);
+            }
+            pending += uint(num_syms);
+            out_pos += uint(num_syms);
+        }
+        bitbufShiftLeft(bit_buf, total_len);
+        bit_count -= uint(total_len);
+        // CUDA reference: src/decode/huffman_kernel.cu:455-459. Drain
+        // pending byte-by-byte until 4-aligned.
+        while (pending > 0u && ((out_base_abs + written) & 3u) != 0u) {
+            uint byte_val = acc_lo & 0xFFu;
+            output_buf[out_base_abs + written] = uint8_t(byte_val);
+            written += 1u;
+            // acc >>= 8. Shift the uvec2 right by 8 bits.
+            acc_lo = (acc_lo >> 8) | ((acc_hi & 0xFFu) << 24);
+            acc_hi = acc_hi >> 8;
+            pending -= 1u;
+        }
+    }
+
+    // ── Phase 2a: INTERLEAVED hot loop (word_idx < K) ──────────────
+    // CUDA reference: src/decode/huffman_kernel.cu:475-513. 2-lookup
+    // batches with one refill; unconditional u32 store on 4-aligned
+    // dest. The hot loop is hard-wired to LUT_MAX_SYMS_PER_STEP == 2.
+    while (out_pos + 2u * uint(LUT_MAX_SYMS_PER_STEP) <= my_out_size && word_idx < K) {
+        if (bit_count < 2u * uint(MAX_CODE_LEN + 1)) {
+            // CUDA reference: src/decode/huffman_kernel.cu:477-485.
+            uint w_ptr = il_base_abs + word_idx * uint(HUFF_BIL_ROW_BYTES) + lane * 4u;
+            uint word = loadWordUnaligned(w_ptr);
+            uint v = bswapU32(word);
+            bitbufRefill(bit_buf, v, bit_count);
+            bit_count += uint(REFILL_BITS);
+            word_idx += 1u;
+        }
+        // CUDA #pragma unroll 2 — GLSL compiler handles small const
+        // loops; we keep the explicit unroll for clarity / parity.
+        for (int k = 0; k < 2; k++) {
+            // CUDA reference: src/decode/huffman_kernel.cu:489.
+            uint entry = shared_lut[bitbufLutIndex(bit_buf)];
+            int total_len = lutTotalLen(entry);
+            int num_syms  = lutNumSyms(entry);
+            if (total_len == 0) return;
+            if (num_syms == int(LUT_NUM_SYMS_ESCAPE)) {
+                // CUDA reference: src/decode/huffman_kernel.cu:494-498.
+                uint b11 = bitbufEscapeBit(bit_buf);
+                uint sym = (b11 != 0u) ? lutSym2(entry) : lutSym1(entry);
+                if (pending < 4u) {
+                    acc_lo = acc_lo | (sym << (pending * 8u));
+                } else {
+                    acc_hi = acc_hi | (sym << ((pending - 4u) * 8u));
+                }
+                pending += 1u;
+                out_pos += 1u;
+            } else {
+                // CUDA reference: src/decode/huffman_kernel.cu:500-502.
+                uint pair = lutSymPair(entry);
+                if (pending < 3u) {
+                    acc_lo = acc_lo | (pair << (pending * 8u));
+                } else if (pending == 3u) {
+                    acc_lo = acc_lo | ((pair & 0xFFu) << 24);
+                    acc_hi = acc_hi | ((pair >> 8) & 0xFFu);
+                } else {
+                    uint hi_off = (pending - 4u) * 8u;
+                    acc_hi = acc_hi | (pair << hi_off);
+                }
+                pending += uint(num_syms);
+                out_pos += uint(num_syms);
+            }
+            bitbufShiftLeft(bit_buf, total_len);
+            bit_count -= uint(total_len);
+            // CUDA reference: src/decode/huffman_kernel.cu:506-511.
+            // u32-aligned store of 4 bytes from acc_lo.
+            // VK adaptation: CUDA does `*reinterpret_cast<uint32_t*>(out + written) = acc`.
+            // GLSL has no reinterpret cast across SSBO byte arrays; we
+            // emit four sequential uint8 stores. The byte ordering
+            // matches CUDA's LE u32 store (byte 0 of `acc` → lowest
+            // address) — bit-identical to the CUDA store on LE GPUs.
+            if (pending >= 4u) {
+                output_buf[out_base_abs + written + 0u] = uint8_t( acc_lo        & 0xFFu);
+                output_buf[out_base_abs + written + 1u] = uint8_t((acc_lo >> 8)  & 0xFFu);
+                output_buf[out_base_abs + written + 2u] = uint8_t((acc_lo >> 16) & 0xFFu);
+                output_buf[out_base_abs + written + 3u] = uint8_t((acc_lo >> 24) & 0xFFu);
+                // acc >>= 32. After flushing the low 4 bytes, the
+                // remaining bytes shift down by 4.
+                acc_lo = acc_hi;
+                acc_hi = 0u;
+                written += 4u;
+                pending -= 4u;
+            }
+        }
+    }
+
+    // ── Phase 2b: TAIL hot loop (word_idx >= K) ────────────────────
+    // CUDA reference: src/decode/huffman_kernel.cu:522-559. Same
+    // 2-lookup body as 2a, only the refill source changes.
+    while (out_pos + 2u * uint(LUT_MAX_SYMS_PER_STEP) <= my_out_size) {
+        if (bit_count < 2u * uint(MAX_CODE_LEN + 1)) {
+            if (word_idx >= my_n_words) break;
+            // CUDA reference: src/decode/huffman_kernel.cu:525-531.
+            uint w_ptr = tail_start_abs + (word_idx - K) * 4u;
+            uint word = loadWordUnaligned(w_ptr);
+            uint v = bswapU32(word);
+            bitbufRefill(bit_buf, v, bit_count);
+            bit_count += uint(REFILL_BITS);
+            word_idx += 1u;
+        }
+        for (int k = 0; k < 2; k++) {
+            // CUDA reference: src/decode/huffman_kernel.cu:535.
+            uint entry = shared_lut[bitbufLutIndex(bit_buf)];
+            int total_len = lutTotalLen(entry);
+            int num_syms  = lutNumSyms(entry);
+            if (total_len == 0) return;
+            if (num_syms == int(LUT_NUM_SYMS_ESCAPE)) {
+                uint b11 = bitbufEscapeBit(bit_buf);
+                uint sym = (b11 != 0u) ? lutSym2(entry) : lutSym1(entry);
+                if (pending < 4u) {
+                    acc_lo = acc_lo | (sym << (pending * 8u));
+                } else {
+                    acc_hi = acc_hi | (sym << ((pending - 4u) * 8u));
+                }
+                pending += 1u;
+                out_pos += 1u;
+            } else {
+                uint pair = lutSymPair(entry);
+                if (pending < 3u) {
+                    acc_lo = acc_lo | (pair << (pending * 8u));
+                } else if (pending == 3u) {
+                    acc_lo = acc_lo | ((pair & 0xFFu) << 24);
+                    acc_hi = acc_hi | ((pair >> 8) & 0xFFu);
+                } else {
+                    uint hi_off = (pending - 4u) * 8u;
+                    acc_hi = acc_hi | (pair << hi_off);
+                }
+                pending += uint(num_syms);
+                out_pos += uint(num_syms);
+            }
+            bitbufShiftLeft(bit_buf, total_len);
+            bit_count -= uint(total_len);
+            if (pending >= 4u) {
+                // CUDA reference: src/decode/huffman_kernel.cu:552-557.
+                output_buf[out_base_abs + written + 0u] = uint8_t( acc_lo        & 0xFFu);
+                output_buf[out_base_abs + written + 1u] = uint8_t((acc_lo >> 8)  & 0xFFu);
+                output_buf[out_base_abs + written + 2u] = uint8_t((acc_lo >> 16) & 0xFFu);
+                output_buf[out_base_abs + written + 3u] = uint8_t((acc_lo >> 24) & 0xFFu);
+                acc_lo = acc_hi;
+                acc_hi = 0u;
+                written += 4u;
+                pending -= 4u;
+            }
+        }
+    }
+
+    // ── Drain pending bytes; `written` catches up to `out_pos` ────
+    // CUDA reference: src/decode/huffman_kernel.cu:562-566.
+    while (pending > 0u) {
+        uint byte_val = acc_lo & 0xFFu;
+        output_buf[out_base_abs + written] = uint8_t(byte_val);
+        written += 1u;
+        acc_lo = (acc_lo >> 8) | ((acc_hi & 0xFFu) << 24);
+        acc_hi = acc_hi >> 8;
+        pending -= 1u;
+    }
+
+    // ── Phase 3: single-symbol tail finisher ──────────────────────
+    // CUDA reference: src/decode/huffman_kernel.cu:574-608. Handles
+    // the trailing 1-2 bytes the X2 hot loop leaves; clamps dual
+    // entries to single. Dual-source refill (interleaved area while
+    // word_idx < K, tail area otherwise).
+    while (out_pos < my_out_size) {
+        if (bit_count <= uint(REFILL_BITS) && word_idx < my_n_words) {
+            // CUDA reference: src/decode/huffman_kernel.cu:576-584.
+            uint w_ptr;
+            if (word_idx < K) {
+                w_ptr = il_base_abs + word_idx * uint(HUFF_BIL_ROW_BYTES) + lane * 4u;
+            } else {
+                w_ptr = tail_start_abs + (word_idx - K) * 4u;
+            }
+            uint word = loadWordUnaligned(w_ptr);
+            uint v = bswapU32(word);
+            bitbufRefill(bit_buf, v, bit_count);
+            bit_count += uint(REFILL_BITS);
+            word_idx += 1u;
+        }
+        // CUDA reference: src/decode/huffman_kernel.cu:592. Out-of-input
+        // clamp: if we drained the bit-stream mid-symbol, force
+        // bit_count up so the LUT shift below stays well-defined.
+        if (bit_count < uint(MAX_CODE_LEN + 1)) bit_count = uint(MAX_CODE_LEN + 1);
+        // CUDA reference: src/decode/huffman_kernel.cu:593.
+        uint entry = shared_lut[bitbufLutIndex(bit_buf)];
+        int total_len = lutTotalLen(entry);
+        int num_syms  = lutNumSyms(entry);
+        if (total_len == 0) return;
+        if (num_syms == int(LUT_NUM_SYMS_ESCAPE)) {
+            // CUDA reference: src/decode/huffman_kernel.cu:597-599.
+            uint b11 = bitbufEscapeBit(bit_buf);
+            uint sym = (b11 != 0u) ? lutSym2(entry) : lutSym1(entry);
+            output_buf[out_base_abs + out_pos] = uint8_t(sym);
+            out_pos += 1u;
+        } else {
+            // CUDA reference: src/decode/huffman_kernel.cu:600-604.
+            output_buf[out_base_abs + out_pos] = uint8_t(lutSym1(entry));
+            out_pos += 1u;
+            if (num_syms == int(LUT_NUM_SYMS_DUAL) && out_pos < my_out_size) {
+                output_buf[out_base_abs + out_pos] = uint8_t(lutSym2(entry));
+                out_pos += 1u;
+            }
+        }
+        bitbufShiftLeft(bit_buf, total_len);
+        bit_count -= uint(total_len);
+    }
+}
+
+void main() {
+    // CUDA reference: src/decode/huffman_kernel.cu:639-640.
+    uint block_id = gl_WorkGroupID.x;
+    if (block_id >= d_n_blocks) return;
+    uint lane = gl_LocalInvocationID.x & LANE_MASK;
+
+    // CUDA reference: src/decode/huffman_kernel.cu:643. Parse the 5×u32
+    // HuffDecChunkDesc (in_offset, in_size, out_offset, out_size,
+    // lut_offset). Every lane reads the same descriptor (cached).
+    uint desc_base = block_id * 5u;
+    uint in_offset  = descs_raw[desc_base + 0u];
+    // in_size = descs_raw[desc_base + 1u]; // unused in decode kernel
+    uint out_offset = descs_raw[desc_base + 2u];
+    uint out_size   = descs_raw[desc_base + 3u];
+    uint lut_offset = descs_raw[desc_base + 4u];
+
+    // ── Cooperative LUT load into shared memory ───────────────────
+    // CUDA reference: src/decode/huffman_kernel.cu:644-649. LUT_SIZE
+    // = 1024 entries; 32 lanes copy 32 entries each (LUT_SIZE/WARP_SIZE
+    // = 32 iters per lane).
+    for (uint i = lane; i < uint(LUT_SIZE); i += WARP_SIZE) {
+        shared_lut[i] = luts[lut_offset + i];
+    }
+    // VK adaptation: subgroupBarrier replaces CUDA __syncwarp.
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+
+    // ── BIL header parse ─────────────────────────────────────────
+    // CUDA reference: src/decode/huffman_kernel.cu:651-655.
+    // Every lane reads its own per-stream u24 LE size.
+    uint hdr_abs = in_offset + uint(HUFF_WEIGHTS_BYTES);
+    uint my_size_off = hdr_abs + lane * uint(HUFF_STREAM_SIZE_BYTES);
+    uint my_size = readLE24(
+        uint(comp[my_size_off + 0u]),
+        uint(comp[my_size_off + 1u]),
+        uint(comp[my_size_off + 2u])
+    );
+
+    // CUDA reference: src/decode/huffman_kernel.cu:657-662. K
+    // immediately after the sub-header (u32 LE). All lanes read it.
+    uint k_off = hdr_abs + uint(HUFF_SUBHEADER_BYTES);
+    uint K = readU32LE(
+        uint(comp[k_off + 0u]),
+        uint(comp[k_off + 1u]),
+        uint(comp[k_off + 2u]),
+        uint(comp[k_off + 3u])
+    );
+
+    // CUDA reference: src/decode/huffman_kernel.cu:666-667.
+    uint il_base_abs = hdr_abs + uint(HUFF_SUBHEADER_BYTES) + uint(HUFF_BIL_K_BYTES);
+    uint tail_area_abs = il_base_abs + K * uint(HUFF_BIL_ROW_BYTES);
+
+    // CUDA reference: src/decode/huffman_kernel.cu:670-671.
+    uint my_n_words = (my_size + 3u) / 4u;
+    uint my_tail_bytes = (my_n_words > K) ? (my_n_words - K) * 4u : 0u;
+
+    // ── Exclusive prefix sum of per-lane tail bytes ───────────────
+    // CUDA reference: src/decode/huffman_kernel.cu:672-680.
+    // CUDA: butterfly __shfl_up_sync. VK: subgroupShuffleUp mirrors it
+    // exactly (lane k reads lane (k - off)'s value; lanes with k < off
+    // get an undefined value, which we mask out via the `lane >= off`
+    // guard). The pattern (inclusive then subtract own) yields the
+    // exclusive prefix.
+    uint tail_off = my_tail_bytes;
+    for (uint off = 1u; off < uint(HUFF_NUM_STREAMS); off <<= 1u) {
+        uint v = subgroupShuffleUp(tail_off, off);
+        if (lane >= off) tail_off += v;
+    }
+    tail_off -= my_tail_bytes;  // exclusive
+    uint my_tail_start_abs = tail_area_abs + tail_off;
+
+    // ── Per-lane output slice carve-up ────────────────────────────
+    // CUDA reference: src/decode/huffman_kernel.cu:683-692. 32
+    // contiguous slices; lane (N-1) absorbs the remainder when
+    // out_size isn't divisible by HUFF_NUM_STREAMS.
+    uint q = out_size / uint(HUFF_NUM_STREAMS);
+    uint my_out_start = (lane < uint(HUFF_NUM_STREAMS - 1))
+                        ? (lane * q)
+                        : ((uint(HUFF_NUM_STREAMS) - 1u) * q);
+    uint my_out_size  = (lane < uint(HUFF_NUM_STREAMS - 1))
+                        ? q
+                        : (out_size - (uint(HUFF_NUM_STREAMS) - 1u) * q);
+    uint my_out_base_abs = out_offset + my_out_start;
+
+    // CUDA reference: src/decode/huffman_kernel.cu:694-696.
+    decodeStreamBoundedIL(
+        il_base_abs, my_tail_start_abs, lane, K, my_n_words,
+        my_out_base_abs, my_out_size);
+}

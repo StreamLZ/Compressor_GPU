@@ -522,10 +522,13 @@ pub const DecodeRequest = struct {
 /// to launch them with the worst-case chunk count even if some chunks
 /// have no Huffman streams.
 ///
-/// L2 stub: Phase 7 mirrors the CUDA orchestration but the underlying
-/// huff-build / huff-decode kernels are L2-only (Phase 9). Returns
-/// `error.NotImplementedL2`; never invoked on the L1 path because the
-/// caller gates on `have_huff` which is false when `huff_build_fn == 0`.
+/// CUDA orchestration mirrored verbatim: launch
+/// `slzHuffBuildLutKernel` (writes the per-block LUT into
+/// `self.d_huff_lut`), optionally split-fence for telemetry, then
+/// launch `slzHuffDecode4StreamKernel` (consumes the LUT + descriptors,
+/// writes decoded literal bytes to `self.d_entropy_scratch`). Both
+/// dispatches use the merge kernel's output count at
+/// `self.d_compact_counts + 20` as the per-kernel self-gate.
 pub fn runHuffBuildAndDecode(
     self: *DecodeContext,
     procs: *const VkProcs,
@@ -535,14 +538,85 @@ pub fn runHuffBuildAndDecode(
     t_huff_start: anytype,
     io: ?std.Io,
 ) GpuError!i64 {
-    _ = self;
-    _ = procs;
-    _ = n_huff;
-    _ = heavy_stream;
-    _ = split_timer;
-    _ = t_huff_start;
-    _ = io;
-    return error.NotImplementedL2;
+    const launch_fn = procs.launch;
+    const huff_stream = heavy_stream;
+    var split_huff_build_ns: i64 = 0;
+
+    // CUDA reference: src/decode/decode_dispatch.zig:317. The huff
+    // kernels self-gate on `*d_n_huff`. The merge kernel wrote
+    // `n_merged` to `d_compact_counts[5]` (offset 20 bytes); the huff
+    // kernels read it from there.
+    const d_n_huff: u64 = self.d_compact_counts + 20;
+
+    // ── 1. slzHuffBuildLutKernel ────────────────────────────────
+    // CUDA reference: src/decode/decode_dispatch.zig:318-331. Builds the
+    // per-block 1024-entry LUT from the 128 B weights at the head of
+    // each Huffman body.
+    {
+        var p_comp: u64 = self.d_comp_persist;
+        var p_descs: u64 = self.d_huff_descs;
+        var p_lut: u64 = self.d_huff_lut;
+        var p_n: u64 = d_n_huff;
+        // VK adaptation: params[] layout per module_loader KERNEL_DECLS
+        // contract (see scan_gpu.zig:58-64 and decode_dispatch.zig
+        // lz_decode_raw at :616-624 for working reference). First
+        // n_bindings entries are pointers to VkDeviceBuffer handles
+        // populating descriptor set bindings 0..n_bindings-1; remaining
+        // entries pack into push_constant_size bytes in declaration
+        // order. huff_build_lut_kernel.comp: n_bindings=4 (CompBuf,
+        // DescsBuf, LutsBuf, NBlocksBuf), push_constant_size=0.
+        // CUDA's kernel argument list is unchanged; only the VK host
+        // packing order changes — buffer-pointer params first (no
+        // scalar push consts here, but the convention still applies).
+        var params = [_]?*anyopaque{
+            @ptrCast(&p_comp), @ptrCast(&p_descs),
+            @ptrCast(&p_lut),  @ptrCast(&p_n),
+        };
+        var extra = [_]?*anyopaque{null};
+        const t_hb = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffBuildLutKernel", huff_stream);
+        try vkCall(launch_fn(module_loader.huff_build_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra), .launch);
+        endKernelTiming(t_hb, huff_stream);
+    }
+    // CUDA reference: src/decode/decode_dispatch.zig:333-339. Split
+    // fence: time the LUT build separately from the decode.
+    if (split_timer) {
+        try vkCall(procs.stream_sync(huff_stream), .sync);
+        if (t_huff_start) |hs| {
+            if (io) |io_val|
+                split_huff_build_ns = nsSince(hs, io_val);
+        }
+    }
+    // ── 2. slzHuffDecode4StreamKernel ───────────────────────────
+    // CUDA reference: src/decode/decode_dispatch.zig:340-356. 32-stream
+    // parallel decode; consumes the LUT + descriptors, writes decoded
+    // literal bytes into the per-chunk entropy scratch slots.
+    {
+        var p_comp: u64 = self.d_comp_persist;
+        var p_descs: u64 = self.d_huff_descs;
+        var p_lut: u64 = self.d_huff_lut;
+        var p_out: u64 = self.d_entropy_scratch;
+        var p_n: u64 = d_n_huff;
+        // VK adaptation: params[] layout per module_loader KERNEL_DECLS
+        // contract (see above). huff_decode_4stream_kernel.comp:
+        // n_bindings=5 (CompBuf, DescsBuf, LutsBuf, OutputBuf,
+        // NBlocksBuf), push_constant_size=0. The shared-memory
+        // allocation CUDA passes as the 8th launch arg (LUT_ENTRIES *
+        // 4 = 4096 bytes) is replaced by the static
+        // `shared uint shared_lut[LUT_SIZE]` declared inside the .comp
+        // — Vulkan has no dynamic shared-mem at compute-shader scope
+        // so the size is fixed at compile time and the launch passes 0
+        // for the shared-bytes arg.
+        var params = [_]?*anyopaque{
+            @ptrCast(&p_comp), @ptrCast(&p_descs),
+            @ptrCast(&p_lut),  @ptrCast(&p_out),
+            @ptrCast(&p_n),
+        };
+        var extra = [_]?*anyopaque{null};
+        const t_hd = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffDecode4StreamKernel", huff_stream);
+        try vkCall(launch_fn(module_loader.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra), .launch);
+        endKernelTiming(t_hd, huff_stream);
+    }
+    return split_huff_build_ns;
 }
 
 /// CUDA reference: src/decode/decode_dispatch.zig:366-465. Launches the
