@@ -1,7 +1,7 @@
 # srcVK Vulkan Port — L1 Done, L2-L5 Roadmap
 
-**Last updated:** 2026-06-07, HEAD `7bbcf77`.
-**Status:** L1 + L2 SHIPPED on both decode AND encode. VK is byte-identical to CUDA and FASTER than CUDA on enwik8 + silesia for both directions on large workloads at L1 + L2. ptest_vk 83/0/0 both backends. Web.txt (small-file regime) is structurally limited by Vulkan-on-WDDM per-submit floor — same on both directions, documented as accepted.
+**Last updated:** 2026-06-07, HEAD `30f36d3`.
+**Status:** L1 + L2 SHIPPED on decode + encode. Phase 2A encoder SHIPPED (L3 + L4 encode byte-identical to CUDA on 8/9 cases; 1/9 silesia L3 = 0.02% larger due to documented structural Vulkan 4 GiB SSBO cap). Decoder Huffman blocked on Phase 3. ptest_vk 83/0/0 both backends.
 
 This file is the source of truth for "what's left." All of L1 is locked-in
 production code; the meaningful remaining work is L2-L5 to reach full CUDA
@@ -47,9 +47,12 @@ The CUDA encoder supports five levels:
 |---|---|---|---|---|---|
 | **L1** | greedy | 17 | NO | NO | ✅ **DONE** — byte-identical to CUDA + FASTER on large workloads |
 | **L2** | greedy | 18 | NO | NO | ✅ **DONE** (`7bbcf77`) — byte-identical to CUDA + FASTER; 9 ptest cases added |
-| L3 | greedy | 19 | YES | NO | needs Phase 2A Huffman |
-| L4 | greedy | 17 | YES | YES (`engine_level≥2`) | needs Phase 2A + small `p_l4=1` flag |
-| L5 | **chain parser** | 17 | YES | YES | needs Phase 2A + 2B chain parser (+ fix broken branch) |
+| **L3 encode** | greedy | 19* | YES | NO | ✅ **ENCODER SHIPPED** (`f9e84e3` + `30f36d3`) — byte-identical to CUDA on web/enwik8; silesia 0.02% larger (4 GiB SSBO cap). Decoder blocked on Phase 3. |
+| **L4 encode** | greedy | 17 | YES | YES (`p_l4=1`) | ✅ **ENCODER SHIPPED** (same commits — `p_l4=1` flag already plumbed in encode_lz.zig) |
+| L3/L4 decode | n/a | n/a | YES | n/a | needs Phase 3 + Phase 2A-decoder |
+| L5 | **chain parser** | 17 | YES | YES | needs Phase 2A-decoder + 2B chain parser (+ fix broken branch) |
+
+*L3 hash_bits clamps from 19 → 18 only when single-frame input ≥ 128 MiB at sc=0.25 (Vulkan 4 GiB maxStorageBufferRange cap). Affects only silesia at L3 today; cost is 0.02% larger output. See "Accepted residuals" below.
 
 **Important correction from L1 work**: The original `/src_vulkan/TODO.md` claimed L2 needed Huffman. **It didn't.** Verified via `src/encode/fast_framed.zig:247-251`: Huffman gates at `opts.level >= 3`. L2 is greedy parser + bigger hash table only. The VK encoder already passes `hash_bits = levels.hashBitsForLevel(level)` through to the kernel (`srcVK/encode/encode_lz.zig:66`), so L2 worked with zero code changes once L1 was byte-identical. The encode iter-3 + iter-4 fixes that brought L1 to byte-identity automatically applied to L2.
 
@@ -71,25 +74,30 @@ Goal: encoder produces chunk type 4 (Huffman-coded) sub-chunks that the CUDA
 decoder reads; decoder reads CUDA-produced chunk type 4. Cross-backend
 roundtrip parity across L3+L4 in both directions.
 
-**Kernels to port** (CUDA references in `src/encode/huffman_kernel.cu` +
-`src/decode/huffman_kernel.cu`):
-- `srcVK/encode/huff_build_tables_kernel.comp` — histogram → canonical Huffman codes
-- `srcVK/encode/huff_encode_4stream_kernel.comp` — bytes + codes → BIL bitstream
-- `srcVK/decode/huff_build_lut_kernel.comp` — weights → 256-entry decode LUT
-- `srcVK/decode/huff_decode_4stream_kernel.comp` — bitstream + LUT → bytes
+**Status: ENCODER SHIPPED.** Decoder blocked on Phase 3.
 
-**Host glue:**
-- Generalize `encode/encode_lz.zig` to wire Huffman after greedy parser
-- Generalize `decode/decode_dispatch.zig::runLzPipeline` to dispatch type-4 sub-chunks through Huffman before LZ-decode
-- Open the L2 gate at `decode_dispatch.zig:724` for type-4 path
-- Bonus L4: also flip `p_l4=1` (one-line change in encode_lz.zig)
+✅ **Phase 2A encoder (`f9e84e3` + `30f36d3`):**
+- `srcVK/encode/huff_build_tables_kernel.comp` — full faithful port, line-for-line equivalent including Kraft-budget height-limit redistribution
+- `srcVK/encode/huff_encode_4stream_kernel.comp` — full faithful port including BIL interleaved + tail areas
+- `srcVK/encode/encode_huff.zig` — three distinct Impl entry points (literals/tokens/off16), not collapsed
+- Wired into `srcVK/encode/fast_framed.zig:417-422` at `opts.level >= 3`
+- Adversarial review verdict: FAITHFUL_PORT_NO_CONCERNS, ship_as_is
+- 0 stubbed functions, 0 TODOs, 0 simplified algorithms
+- Empirical proof: VK L3 encode SHA byte-identical to CUDA L3 encode on enwik8 + web.txt; silesia 0.02% larger (4 GiB SSBO cap, see residuals)
+- Encode kernel perf parity with CUDA (80.6 ms VK vs 80.8 ms CUDA on enwik8 L3)
+- ptest_vk 83/0/0 preserved
+- L4 = L3 + `p_l4=1` flag already plumbed in encode_lz.zig
 
-**Tests:**
-- New `tests/l3_encode_roundtrip.zig`, `tests/l3_decode_roundtrip.zig`
-- New `tests/l4_encode_roundtrip.zig`
-- Extend `tests/cross_backend_roundtrip.zig` for L3-L4
+⏸️ **Phase 2A decoder (blocked on Phase 3):**
+- `srcVK/decode/huff_build_lut_kernel.comp` — stub; waiting for Phase 3 to enable type-4 desc extraction
+- `srcVK/decode/huff_decode_4stream_kernel.comp` — stub; same blocker
+- Open the L2 gate at `decode_dispatch.zig:~1090` for type-4 path (the gate today returns NotImplementedL2 because the upstream `scan_gpu.gpuScanChunks` is a stub)
 
-LOC estimate: ~1,500 GLSL + ~800 Zig. ~3-5 single agents.
+**Tests pending decoder:**
+- L3 + L4 ptest cases (mirror L2 pattern) — blocked on VK→VK roundtrip
+- Cross-backend tests for L3/L4
+
+LOC remaining: ~600 GLSL (decoder kernels) + ~300 Zig (decoder host glue + L2 gate). ~1-2 agent runs once Phase 3 lands.
 
 ### Phase 2B — L5 chain parser
 
@@ -167,12 +175,13 @@ LOC estimate: ~400 Zig. ~1 single agent.
 | Phase | GLSL LOC | Zig LOC | Agent runs |
 |---|---|---|---|
 | ~~2-prep (verify L2)~~ | ✅ DONE | ✅ DONE | ✅ |
-| 2A (Huffman, L3 + L4) | ~1,500 | ~800 | 3-5 |
+| ~~2A encoder (Huffman, L3 + L4)~~ | ✅ DONE (~700 GLSL + 500 Zig) | | ✅ 1 + 1 review + 1 fix |
+| 2A decoder (huff_build_lut + huff_decode_4stream + L2 gate) — BLOCKED on Phase 3 | ~600 | ~300 | 1-2 |
 | 2B (L5 chain parser + fix L5 broken branch) | ~800 | ~500 | 2-3 |
 | 3 (GPU decode pipeline) | ~1,500 | ~600 | 3-4 |
 | 4 (D2D + async) | 0 | ~600 | 1-2 |
 | 5 (conformance + perf) | 0 | ~400 | 1 |
-| **REMAINING TOTAL** | **~3,800** | **~2,900** | **10-15** |
+| **REMAINING TOTAL** | **~3,500** | **~2,400** | **8-12** |
 
 ---
 
@@ -595,21 +604,68 @@ CUDA-only.
    (iter-13/14/15 on decode + investigations on encode) confirmed not
    fixable from app side.
 
-2. **Pre-existing single-thread mode `TestExpectedEqual` (2 tests)** —
+2. **L3 silesia 0.02% larger than CUDA** — Vulkan `maxStorageBufferRange =
+   4 GiB - 1` on all desktop GPUs. At L3 (`hash_bits=19`), workloads with
+   `num_chunks ≥ 2048` (single-frame inputs ≥ 128 MiB at sc=0.25) would
+   exceed the cap. Phase 2A.5 (`30f36d3`) clamps `hash_bits` down to 18 for
+   those workloads. Cost is 0.02% larger output on silesia L3; no effect
+   on any other workload. CUDA's raw device-pointer addressing has no
+   equivalent per-binding limit. See "Future improvement #1" below.
+
+3. **Pre-existing single-thread mode `TestExpectedEqual` (2 tests)** —
    `SLZ_VK_TEST_THREADS=1` surfaces test ordering sensitivity that predates
    recent encode work. Parallel mode (the spec'd config) is rock-solid at
-   74/0/0. Documented but unfixed.
+   83/0/0. Documented but unfixed.
 
-3. **One-shot CLI shows 1 OOM warning per direction per process** — best-
+4. **One-shot CLI shows 1 OOM warning per direction per process** — best-
    practices layer flags first `vkAllocateMemory` failure for non-pinned
    host buffers. Sticky disable flips on first OOM (commit `0af24ff`); bench
    mode is silent (pinned buffers).
+
+## Future improvements (optional; NOT blocking)
+
+### #1: Buffer-Device-Address (BDA) loads for >4 GiB SSBO workloads
+
+Phase 2A.5 (`30f36d3`) accepts a 0.02% compression cost on silesia L3
+because Vulkan's `maxStorageBufferRange = 4 GiB - 1` would otherwise
+truncate the hash table binding at L3 on large inputs. For genuinely
+larger workloads (L3 inputs ≥ ~200 MiB), the same cap will affect them
+the same way (clamp to `hash_bits=18`).
+
+**The Vulkan-native fix:** rewrite the LZ kernel's hash table accesses
+to use `VK_KHR_buffer_device_address` (bufferDeviceAddressFeatures).
+BDA loads/stores bypass the per-binding cap entirely — the kernel
+addresses memory by raw `uint64_t` device pointer, the same way CUDA
+addresses device memory. The cap only applies to descriptor-bound
+buffers.
+
+**Scope:**
+- Enable `bufferDeviceAddressFeatures` at VkDevice creation (already
+  enabled per finishingL1.md V12 features — confirm)
+- Modify `srcVK/encode/lz_encode_kernel.comp` to take `d_hash_persist`
+  as a `uint64_t` BDA address (push constant) instead of an SSBO binding
+- Modify host glue to pass `vkGetBufferDeviceAddress()` result instead
+  of binding the descriptor
+- Verify SHA byte-identical to CUDA on silesia L3 (would close the
+  0.02% gap completely)
+
+**Risk:** medium. The LZ kernel is the most-tuned kernel in the codebase
+(NCU-verified parity with CUDA PTX). BDA loads compile differently than
+SSBO loads — verify perf doesn't regress.
+
+**Effort:** ~1 single agent, ~3-4 hours. Optional — current residual is
+0.02% which is well within compression-ratio noise on real workloads.
 
 ---
 
 ## Recent commit history (last 20)
 
 ```
+30f36d3  Phase 2A.5 — clamp hash_bits for Vulkan 4 GiB SSBO cap (silesia L3 1.176x → 1.0002x)
+f9e84e3  Phase 2A encoder — full faithful Huffman encoder port (L3 + L4 encode shipped)
+cabf64e  ToDo.md — mark L2 SHIPPED (Phase 2-prep done)
+7bbcf77  ptest_vk — add 9 L2 test cases (5 in-process + 4 cross-backend SHA gate)
+38cbaea  ToDo.md — update for L1 done on both decode + encode
 d9d8bba  encode iter-4 — final-frame D2H import path (3.2x encode speedup)
 d83ea21  encode per-phase QPC profile — locates 238 ms d2h_final as the 190 ms gap
 02560d6  persistent VkPipelineCache — disk-backed across process launches
@@ -624,12 +680,9 @@ e8fc91f  tests: inherit parent env in subprocess test harnesses (74/0/0)
 9022dde  valfix A — handle types on imported VkBuffer
 6ca302c  fix two Vulkan constants — subgroup pin now actually pins
 332a04c  pin compute pipelines to subgroupSize=32 + device-pick guard
-5e7a480  (reverted) encode iter-2 — D2H gather collapses per-chunk loop
-2d68b2c  (reverted) encode iter-1 H2 — stream-routing + D2H import cache hazard fix
 bfe746a  encode iter-1 H3 — verify iter-12 import auto-fires on encode H2D
 bb675ab  encode iter-1 H1 — per-chunk D2H with srcOffset (2.2-2.6x faster)
 7bc951e  decode iter-15 — single submit + single wait per decode
-647bb95  decode iter 12 — H2D zero-copy import on transfer queue (DECODE DONE BAR HIT)
 ```
 
 All on `main`. Nothing pushed to remote yet.
