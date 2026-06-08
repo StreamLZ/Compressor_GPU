@@ -1,7 +1,7 @@
 # srcVK Vulkan Port — L1 Done, L2-L5 Roadmap
 
-**Last updated:** 2026-06-07, HEAD `d9d8bba`.
-**Status:** L1 done-bar exceeded on BOTH decode AND encode. VK is FASTER than CUDA on enwik8 + silesia for both directions on large workloads. Web.txt (small-file regime) is structurally limited by Vulkan-on-WDDM per-submit floor — same on both directions, documented as accepted.
+**Last updated:** 2026-06-07, HEAD `7bbcf77`.
+**Status:** L1 + L2 SHIPPED on both decode AND encode. VK is byte-identical to CUDA and FASTER than CUDA on enwik8 + silesia for both directions on large workloads at L1 + L2. ptest_vk 83/0/0 both backends. Web.txt (small-file regime) is structurally limited by Vulkan-on-WDDM per-submit floor — same on both directions, documented as accepted.
 
 This file is the source of truth for "what's left." All of L1 is locked-in
 production code; the meaningful remaining work is L2-L5 to reach full CUDA
@@ -43,28 +43,27 @@ Encoder reference: CUDA enwik8 125 ms / silesia 241 ms / web 11 ms.
 
 The CUDA encoder supports five levels:
 
-| Level | Parser | Hash bits | Huffman | LZ rehash | Notes |
+| Level | Parser | Hash bits | Huffman | LZ rehash | Status |
 |---|---|---|---|---|---|
-| **L1** | greedy | 17 | NO | NO | **DONE** — byte-identical to CUDA + FASTER on large workloads |
-| **L2** | greedy | 18 | NO | NO | **Likely already works** on VK — same kernel takes `hash_bits` as param. Needs verification + ptest case. |
+| **L1** | greedy | 17 | NO | NO | ✅ **DONE** — byte-identical to CUDA + FASTER on large workloads |
+| **L2** | greedy | 18 | NO | NO | ✅ **DONE** (`7bbcf77`) — byte-identical to CUDA + FASTER; 9 ptest cases added |
 | L3 | greedy | 19 | YES | NO | needs Phase 2A Huffman |
 | L4 | greedy | 17 | YES | YES (`engine_level≥2`) | needs Phase 2A + small `p_l4=1` flag |
-| L5 | **chain parser** | 17 | YES | YES | needs Phase 2A + 2B chain parser |
+| L5 | **chain parser** | 17 | YES | YES | needs Phase 2A + 2B chain parser (+ fix broken branch) |
 
-**Important correction from L1 work**: The original `/src_vulkan/TODO.md` claimed L2 needed Huffman. **It doesn't.** Verified via `src/encode/fast_framed.zig:247-251`: Huffman gates at `opts.level >= 3`. L2 is greedy parser + bigger hash table only. The VK encoder already passes `hash_bits = levels.hashBitsForLevel(level)` through to the kernel (`srcVK/encode/encode_lz.zig:66`), so L2 may work today with zero code changes.
+**Important correction from L1 work**: The original `/src_vulkan/TODO.md` claimed L2 needed Huffman. **It didn't.** Verified via `src/encode/fast_framed.zig:247-251`: Huffman gates at `opts.level >= 3`. L2 is greedy parser + bigger hash table only. The VK encoder already passes `hash_bits = levels.hashBitsForLevel(level)` through to the kernel (`srcVK/encode/encode_lz.zig:66`), so L2 worked with zero code changes once L1 was byte-identical. The encode iter-3 + iter-4 fixes that brought L1 to byte-identity automatically applied to L2.
 
-### Phase 2-prep (low-hanging): verify L2 works
+### Phase 2-prep — VERIFY L2 WORKS — **DONE** (`7bbcf77`)
 
-VK encode at L2 (just hash_bits=18) likely already roundtrips byte-identical to CUDA L2. Quick verification:
+L2 SHIPPED with zero new code. Quick verification + ptest cases added:
 
-```powershell
-$env:SLZ_VK_DEVICE_INDEX = "1"
-./zig-out/bin/streamlz_vk.exe -c -l 2 -o c:/tmp/vk_l2.slz assets/enwik8.txt
-./zig-out/bin/streamlz.exe -c -l 2 -o c:/tmp/cu_l2.slz assets/enwik8.txt
-# SHA256 should match
-```
+| File | VK L2 SHA | CUDA L2 SHA | VK encode ms | CUDA encode ms | Ratio |
+|---|---|---|---|---|---|
+| web.txt | match | match | 24 | 12 | 2.0× (WDDM floor) |
+| enwik8 | match | match | **112** | 130 | **0.86× — FASTER** |
+| silesia | match | match | **223** | 249 | **0.90× — FASTER** |
 
-If it works on web.txt + enwik8 + silesia: add a ptest case + declare L2 done. Effort: 1 single agent run, ~30 min.
+9 new ptest cases (5 in-process + 4 cross-backend SHA gate). ptest_vk 74/0/0 → **83/0/0** both backends.
 
 ### Phase 2A — Huffman codec (unlocks L3 + L4)
 
@@ -167,13 +166,13 @@ LOC estimate: ~400 Zig. ~1 single agent.
 
 | Phase | GLSL LOC | Zig LOC | Agent runs |
 |---|---|---|---|
-| 2-prep (verify L2) | 0 | ~100 | 1 |
+| ~~2-prep (verify L2)~~ | ✅ DONE | ✅ DONE | ✅ |
 | 2A (Huffman, L3 + L4) | ~1,500 | ~800 | 3-5 |
 | 2B (L5 chain parser + fix L5 broken branch) | ~800 | ~500 | 2-3 |
 | 3 (GPU decode pipeline) | ~1,500 | ~600 | 3-4 |
 | 4 (D2D + async) | 0 | ~600 | 1-2 |
 | 5 (conformance + perf) | 0 | ~400 | 1 |
-| **TOTAL** | **~3,800** | **~3,000** | **11-16** |
+| **REMAINING TOTAL** | **~3,800** | **~2,900** | **10-15** |
 
 ---
 
