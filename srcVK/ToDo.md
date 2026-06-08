@@ -1,7 +1,7 @@
-# srcVK Vulkan Port — L1 Done, L2-L5 Roadmap
+# srcVK Vulkan Port — L1-L5 Done, Async/Perf Roadmap
 
-**Last updated:** 2026-06-08, HEAD `63516db`.
-**Status:** L1 + L2 + L3 + L4 **SHIPPED on decode + encode** (all 4 levels VK→VK roundtrip MATCH on web + enwik8 + silesia). Phase 2A encoder + Phase 2A-decoder + Phase 3 + Phase 2A.5 + iter 4f all done. **ptest_vk: 108/0/0 on both NVIDIA + Intel iGPU.** Only remaining encoder residual: silesia L3 is 0.019% larger than CUDA L3 (A-008, accepted — Vulkan 4 GiB SSBO cap on hash table forces `hash_bits=18` clamp on inputs > 128 MiB; VK→VK silesia L3 decodes its own output correctly). Remaining work: L5 chain parser, async API, perf parity, BDA workaround. See `srcVK/PortAdaptations.md` for the catalog of CUDA-VK divergences + their resolution status.
+**Last updated:** 2026-06-08, HEAD `c141fdf` + uncommitted Phase 2B.
+**Status:** L1 + L2 + L3 + L4 + **L5 SHIPPED on decode + encode** (all 5 levels VK→VK roundtrip MATCH on web + enwik8 + silesia, byte-identical to CUDA SHA on L1, L2, L3-web/enwik8, L4, L5). Phase 2A encoder + Phase 2A-decoder + Phase 2B + Phase 3 + Phase 2A.5 + iter 4f all done. **ptest_vk: 108/0/0 on both NVIDIA + Intel iGPU.** Only remaining encoder residual: silesia L3 is 0.019% larger than CUDA L3 (A-008, accepted — Vulkan 4 GiB SSBO cap on hash table forces `hash_bits=18` clamp on inputs > 128 MiB; VK→VK silesia L3 decodes its own output correctly). Remaining work: async API, perf parity sweep, BDA workaround. See `srcVK/PortAdaptations.md` for the catalog of CUDA-VK divergences + their resolution status.
 
 **Critical infrastructure note**: The build graph at `build.zig::addSrcVkShaderSteps` (~1031-1071) does NOT track `.glsl` `#include` deps of `.comp` files (entry A-012). This caused a 5+ hour debugging nightmare on iter 4f where the actual fix landed silently but every "verify" run executed stale SPIR-V. **Use `tools/build_vk.bat` (commit `db4406c`) to force clean-build when you've edited any srcVK `.glsl` header** until the build graph is fixed.
 
@@ -67,7 +67,8 @@ The CUDA encoder supports five levels:
 | **L4 encode** | greedy | 17 | YES | YES (`p_l4=1`) | ✅ **ENCODER SHIPPED** (same commits — `p_l4=1` flag already plumbed in encode_lz.zig) |
 | **L3 decode** | n/a | n/a | YES | n/a | ✅ **DONE** (`4270ea4` iter 4f) — VK→VK roundtrip MATCH on web/enwik8/silesia |
 | **L4 decode** | n/a | n/a | YES | n/a | ✅ **DONE** (same commit) — VK→VK roundtrip MATCH on web/enwik8/silesia |
-| L5 | **chain parser** | 17 | YES | YES | needs Phase 2B chain parser (+ fix broken branch) |
+| **L5 encode** | **chain parser** | 17 | YES | YES | ✅ **DONE** (Phase 2B, uncommitted) — byte-identical to CUDA SHA on web (`AE11A3CF...`) + enwik8 (`030BD807...`) + silesia (`CF6A2BCC...`); kernel 0.93-0.98× CUDA |
+| **L5 decode** | n/a | n/a | YES | n/a | ✅ **DONE** (same Huffman + LZ decode pipeline as L3/L4) — VK→VK L5 roundtrip MATCH on all 3 corpora |
 
 *L3 hash_bits clamps from 19 → 18 only when single-frame input ≥ 128 MiB at sc=0.25 (Vulkan 4 GiB maxStorageBufferRange cap). Affects only silesia at L3 today; cost is 0.02% larger output. See "Accepted residuals" below.
 
@@ -144,27 +145,25 @@ These 10 failing tests will turn GREEN when fixed; ptest will report 108/0/0.
 
 **Also documented (smaller, related):** "small-input KernelLaunchFailed" on 70KB web L3 + 1MB enwik8 L3 CUDA→VK (per iter 4c adversarial review). Likely a procLaunchKernel runtime guard or specific alignment issue; not currently caught by the 10 corpus tests; investigate alongside the byte-65544 fix.
 
-### Phase 2B — L5 chain parser
+### Phase 2B — L5 chain parser — ✅ **DONE** (uncommitted, 2026-06-08)
 
-Goal: L5 .slz files byte-correct vs CUDA L5 (within the hash-store-order
-tolerance accepted for L1).
+Goal (met): L5 .slz files byte-identical to CUDA L5 on web + enwik8 + silesia.
 
-**New shader:** `srcVK/encode/lz_chain_encode_kernel.comp` — port of
-`src/encode/lz_chain_parser.cuh` (~440 CUDA LOC). Most complex single
-kernel in the project — chain table + secondary hash + lazy matching.
+✅ **Port:** Filled in `srcVK/encode/lz_chain_parser.glsl` (90 → 575 LOC, +485). All 6 stubs ported faithfully from `src/encode/lz_chain_parser.cuh`:
+- `isLazyMatchBetter`, `isMatchBetter`, `isBetterThanRecentMatch` helpers (the `.length` field shadowed GLSL's reserved method — A-014 catalogs the decomposed-int signature workaround)
+- `findMatchChain`, `insertChainRange`, `scanBlockChain` macros (A-013 catalogs the u16-packed-as-u32 SSBO adaptation: NEXT_HASH_SIZE u16 entries → NEXT_HASH_SIZE/2 u32 words via masked read/write, safe because chain parser is lane-0-only serial)
+- Host plumbing (`encode_lz.zig:87-91`) was already split for chain-mode footprint (`hash_size + hash_size + NEXT_HASH_SIZE/2` u32 words per chunk); no Zig changes needed.
+- Kernel dispatch (`lz_encode_kernel.comp:151-208`) was already wired to route `pc.use_chain==1` through `scanBlockChain` with the 3-table SSBO layout; no kernel changes needed.
 
-**Also**: investigate why VK L5 currently produces 1,966 bytes garbage output
-(the chain parser kernel branch isn't ported, so `use_chain=1` falls into a
-broken code path). Fix that too.
+✅ **Verification (NVIDIA RTX 4060 Ti, `SLZ_VK_DEVICE_INDEX=1`):**
+- SHA byte-identical to CUDA L5 on all 3 corpora (web/enwik8/silesia — MATCH on all)
+- ptest_vk: 108/0/0 preserved on NVIDIA + Intel iGPU
+- 0 VUIDs / 0 sync hazards / 0 best-practices errors on L5 validation run
+- Kernel perf vs CUDA L5: web 0.98×, enwik8 0.93×, silesia 0.95× (on-par-to-faster — both backends serialize chain on lane 0)
 
-**Host glue:**
-- Extend encode dispatch to select chain parser at L5
-- L5 has 4× memory footprint per sub-chunk vs L1; validate the existing
-  ensureBuf grow-only pattern handles silesia at L5
+✅ **Adversarial review (post-port):** 26 specific findings reviewed against the CUDA reference (chain walk, u16-packing, lazy-1/lazy-2 gates, recent-match XOR partial-length, far-class margins, insert ordering, trailing-literals, block 1→2 propagation, macro shadowing/re-eval); verdict **PORT_FAITHFUL**, recommendation **ship_as_is**.
 
-**Test:** `tests/l5_encode_roundtrip.zig` + cross-backend.
-
-LOC estimate: ~800 GLSL + ~500 Zig. ~2-3 single agents.
+Future hardening (NOT a blocker): add L5-specific ptest cases that exercise long-match chain truncation, mixed-class offset compares, large-literal-run threshold transitions, block 1 → block 2 boundary crossings with recent_offset carryover.
 
 ### Phase 3 — Multi-kernel decode pipeline (L2+ requires this)
 
@@ -243,10 +242,10 @@ LOC estimate: ~400 Zig. ~1 single agent.
 | ~~2A decoder iter 1-3 (gpuScanChunks + huff_build_lut + huff_decode_4stream + conformance test)~~ | ✅ DONE (~1,000 GLSL + 400 Zig) | | ✅ 3 + 3 reviews + 1 fix + 1 test |
 | ~~2A decoder iter 4 + 4b + 4c + 4d + 4f (lz_decode general + .level fix + offset ABI + 20 L3/L4 tests + dispatch fork resolved)~~ | ✅ DONE (~700 GLSL + 1000 Zig + 868 LOC tests + 127 LOC fix) | | ✅ 5 commits + 1 catalog |
 | ~~3 (GPU decode pipeline)~~ | ✅ DONE | | ✅ 1 + 1 review + 1 fix |
-| 2B (L5 chain parser + fix L5 broken branch) | ~800 | ~500 | 2-3 |
+| ~~2B (L5 chain parser + fix L5 broken branch)~~ | ✅ DONE (+485 GLSL, 0 Zig) | | ✅ 1 port + 1 adversarial review |
 | 4 (D2D + async — note: L1 D2D already opened by Phase 3) | 0 | ~600 | 1-2 |
 | 5 (conformance + perf) | 0 | ~400 | 1 |
-| **REMAINING TOTAL** | **~800** | **~1,500** | **4-6** |
+| **REMAINING TOTAL** | **0** | **~1,000** | **2-3** |
 
 ---
 

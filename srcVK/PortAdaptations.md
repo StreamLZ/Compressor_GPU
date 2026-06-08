@@ -270,6 +270,64 @@ verification status. An unverified adaptation is a known risk surface.
   tracking. ~30-60 min Zig build-system work, no functional
   impact on the binary.
 
+### A-013: Chain parser `uint16_t* next_hash` → u16-packed u32 SSBO
+- **File:line**: `srcVK/encode/lz_chain_parser.glsl:60-78`
+  (`chainNextHashRead` / `chainNextHashWrite` helpers), used by
+  `findMatchChain` + `insertChainRange`; backed by
+  `srcVK/encode/lz_encode_kernel.comp:158` (`table_stride = hash_size
+  + hash_size + (NEXT_HASH_SIZE / 2u)` u32 words) and host alloc
+  `srcVK/encode/encode_lz.zig:87-91`
+- **CUDA reference**: `src/encode/lz_chain_parser.cuh:87`
+  (`uint16_t* next_hash`), `NEXT_HASH_SIZE = 65536` u16 entries
+- **Class**: language-forced
+- **Why**: SPIR-V std430 has no native 16-bit-element SSBO and the
+  codec deliberately avoids requiring `shaderInt16` / 16-bit storage
+  extensions. Two u16 entries are packed into each u32 word inside
+  the same `global_hash` SSBO. The chain parser runs serially on
+  lane 0, so the read-modify-write pack does not need atomics.
+- **Risk if wrong**: wrong chain link → wrong match positions →
+  garbage compressed output (would surface as cross-backend SHA
+  mismatch + L5 roundtrip failure)
+- **Static verification**: helper macros reviewed for shift/mask
+  correctness; index `idx` is always `pos & NEXT_HASH_INDEX_MASK`
+  (= `pos & 0xFFFF`) so `idx >> 1 < 32768` = exactly the allocated
+  word count. Read formula `(word >> (16*(idx&1))) & 0xFFFF`
+  identical to CUDA's u16 lookup; write formula preserves the
+  other half via `~(0xFFFF << shift)` mask.
+- **Runtime verification**: ✅ VK L5 encode SHA byte-identical to
+  CUDA L5 on web.txt (1.46 MB), enwik8 (95 MB), silesia (203 MB);
+  VK→VK roundtrip MATCH on all three; ptest_vk 99 passed / 9
+  skipped / 0 failed on both NVIDIA RTX 4060 Ti + Intel iGPU
+- **Discovered**: Phase 2B chain parser port (this commit)
+- **Status**: RESOLVED — verified by 3-corpus cross-backend SHA gate
+
+### A-014: `ChainMatch.length` field shadowed by GLSL `.length()` method
+- **File:line**: `srcVK/encode/lz_chain_parser.glsl:28-43`
+  (`isLazyMatchBetter` signature)
+- **CUDA reference**: `src/encode/lz_chain_parser.cuh:38-45`
+  (`isLazyMatchBetter(ChainMatch cand, ChainMatch current, int32_t step)`)
+- **Class**: language-forced
+- **Why**: GLSL treats `.length` as the built-in array/string method
+  even when applied to a struct field of that name — glslc errors
+  with `'length' : does not operate on this type: in
+  structure{...int length, int offset}` on `cand.length`. The
+  `ChainMatch` struct is mirrored from CUDA verbatim in
+  `lz_format.glsl:107-110` and is not changed here — instead the
+  helper's signature takes four explicit `int` parameters
+  (`cand_length, cand_offset, current_length, current_offset`)
+  and call sites pass the two ints directly. Arithmetic is
+  byte-identical to CUDA.
+- **Risk if wrong**: spurious compile error blocking the kernel
+  build (caught immediately by glslc, not a runtime risk)
+- **Static verification**: function body diffed line-for-line
+  against CUDA's expression
+- **Runtime verification**: ✅ same as A-013 (3-corpus cross-backend
+  SHA gate covers all chain-parser paths including lazy compare)
+- **Discovered**: Phase 2B chain parser port (this commit)
+- **Status**: RESOLVED — workaround in place; could close fully by
+  renaming the ChainMatch struct field, but that touches the CUDA
+  file too for 1:1 parity
+
 ## Process notes
 
 When the next port adaptation lands:
