@@ -53,9 +53,29 @@ pub fn gpuCompressImpl(
     const num_chunks: u32 = @intCast(chunk_descs.len);
     const desc_bytes = chunk_descs.len * @sizeOf(CompressChunkDesc);
     const sizes_bytes = @as(usize, num_chunks) * 4;
-    const hash_bits: u32 = levels.hashBitsForLevel(level);
-    const hash_size: usize = @as(usize, 1) << @intCast(hash_bits);
     const chain = levels.useChainParser(level);
+    // VK adaptation: Vulkan's `maxStorageBufferRange` caps a single SSBO
+    // binding range at 4 GiB - 1 on every NVIDIA / AMD / Intel desktop
+    // class GPU. CUDA cuMemAlloc has no such limit, so the CUDA reference
+    // (src/encode/encode_lz.zig:43) never has to cap the per-chunk hash
+    // table. Here we shrink `hash_bits` enough that
+    // `num_chunks * (1<<hash_bits) * 4` fits under 4 GiB. Only L3 with
+    // num_chunks >= 2048 (~128 MiB silesia at sc=0.25) hits the cap;
+    // L1 / L2 / L4 / L5 already stay below the limit at every workload.
+    // Effect on compression: at most halves the per-chunk hash table for
+    // the largest inputs, which costs <1% on silesia (the match-finder
+    // still converges on long matches; smaller table just means more
+    // collisions on the cold lit-rich head of each chunk).
+    var hash_bits: u32 = levels.hashBitsForLevel(level);
+    if (!chain) {
+        const max_bytes: usize = 0x100000000 - 4; // 4 GiB - 4 (one u32 of margin)
+        while (hash_bits > 1) {
+            const trial_bytes: usize = @as(usize, num_chunks) * (@as(usize, 1) << @intCast(hash_bits)) * 4;
+            if (trial_bytes <= max_bytes) break;
+            hash_bits -= 1;
+        }
+    }
+    const hash_size: usize = @as(usize, 1) << @intCast(hash_bits);
 
     if (!encode_context.ensureBuf(&self.d_input_persist, &self.d_input_size, input.len)) return false;
     if (!encode_context.ensureBuf(&self.d_output_persist, &self.d_output_size, output.len)) return false;
