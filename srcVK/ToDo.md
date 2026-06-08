@@ -1,7 +1,7 @@
 # srcVK Vulkan Port — L1 Done, L2-L5 Roadmap
 
-**Last updated:** 2026-06-08, HEAD `de9d7eb`.
-**Status:** L1 + L2 SHIPPED on decode + encode. Phase 2A encoder SHIPPED (L3 + L4 encode byte-identical to CUDA on 8/9 cases; 1/9 silesia L3 = 0.02% larger — structural Vulkan 4 GiB SSBO cap). Phase 3 SHIPPED (decode pipeline kernels 6/7 + L1 D2D entry opened). Phase 2A-decoder partially shipped (`5b438bc` + `6a1da40` + `d5860d1` + `ac6696f` + `de9d7eb`): gpuScanChunks + huff_build_lut + huff_decode_4stream + runHuffBuildAndDecode wiring + 5-case isolated conformance test PROVING the Huffman chain is correct. Remaining blocker for full VK→VK L3+ roundtrip: lz_decode_kernel general workhorse (iter 4 — pending; ~855 LOC). ptest_vk **88/0/0** both backends.
+**Last updated:** 2026-06-08, HEAD `b3fab31`.
+**Status:** L1 + L2 SHIPPED on decode + encode. Phase 2A encoder SHIPPED (L3 + L4 encode byte-identical to CUDA on 8/9; silesia L3 = 0.02% larger — structural Vulkan 4 GiB SSBO cap). Phase 3 SHIPPED. **Phase 2A-decoder: all 855 LOC of CUDA reference + per-binding offset ABI ported faithfully across iter 1-4d (10 commits); 20 L3/L4 ptest cases added.** ptest now reports **98 passed, 10 failed (108 total)** — the 10 failures reproduce an OPEN BUG in the sub-chunk-N>0 decoder loop in `lz_decode_kernel.comp` (all converge on `first_diff=65544`; **NOT** the originally-hypothesized block-1→block-2 transition; see iter 4d commit body for diagnosis + 3 live hypotheses). L1 + L2 + huff_decode_conformance preserved; L1-L4 encode SHA preserved.
 
 This file is the source of truth for "what's left." All of L1 is locked-in
 production code; the meaningful remaining work is L2-L5 to reach full CUDA
@@ -96,19 +96,32 @@ roundtrip parity across L3+L4 in both directions.
 
 ✅ **Conformance test (`de9d7eb`):** `srcVK/tests/huff_decode_conformance.zig` — 5 isolated kernel-level tests (1 KiB random, 8 KiB English, 64 KiB random, 16 KiB skewed alphabet, 4097 B odd-length). Drives encoder + decoder Huffman chain in isolation (bypasses merge/scan/compact). Empirically proven to catch the `bitbufRefill` hi/lo swap bug class (re-introduced bug → all 5 new tests failed while every pre-existing test passed). ptest_vk 83 → **88/0/0** both backends.
 
-⏸️ **Phase 2A decoder iter 4 — REMAINING WORK FOR VK→VK L3+ ROUNDTRIP:**
-- `srcVK/decode/lz_decode_kernel.comp` (general workhorse) — still stub. Needs port of:
-  - `src/decode/lz_decode_kernels.cuh` (231 LOC — kernel entry)
-  - `src/decode/lz_decode_general.cuh` (309 LOC — decodeSubChunkGeneral template, mode-0 delta literal copy, token-parse dispatch for SHORT/LONG_LITERAL/LONG_NEAR/SHORT_FAR/LONG_FAR, off16/off32 readout, recent_offset tracking, per-block trailing literals, MAX_BLOCKS_PER_SUBCHUNK=2 block-2 transition)
-  - `src/decode/lz_dispatch.cuh` (226 LOC — ParsedStreams + parseAndDecodeSubChunk dispatcher)
-  - `src/decode/lz_decode_core.cuh` (89 LOC — warpScanU32 / warpLiteralCopy / warpMatchCopy helpers; some may already exist in srcVK/common via the lz_decode_raw kernel)
-- Open the L2 gate at `decode_dispatch.zig:~1090` — currently the `req.level >= 2` branch runs through gpuScanChunks + runHuffBuildAndDecode successfully but then falls into the stub general kernel
-- LOC estimate: ~855 LOC CUDA → ~1,000+ LOC GLSL+Zig. The biggest single port remaining for L2+ decode. Likely multi-session even with adversarial review.
-- Once iter 4 lands: VK→VK L3 + L4 roundtrip works; can add L3 + L4 ptest cases (mirror L2 pattern)
+✅ **Phase 2A decoder iter 4 (`ac013b5`):** lz_decode general workhorse port — 855 LOC of CUDA reference faithfully ported across 4 GLSL files (lz_decode_kernel.comp + lz_decode_general.glsl + lz_header_parse.glsl + lz_dispatch.glsl + slz_wire_format.glsl). All 5 token types (SHORT/LONG_LITERAL/LONG_NEAR/SHORT_FAR/LONG_FAR), MAX_BLOCKS_PER_SUBCHUNK=2 transition, CHUNK_FLAG_UNCOMPRESSED + CHUNK_FLAG_MEMSET fast paths, recent_offset tracking, per-block + final trailing literals, mode-0 delta literal copy all present. New `compute_to_compute_barrier` proc added (CUDA's per-launch implicit ordering doesn't carry to VK). Adversarial review: structurally faithful but L3+ empirically broken at byte 65544 (deferred to iter 4b).
 
-**Tests pending iter 4:**
-- L3 + L4 ptest cases (mirror L2 pattern) — blocked on iter 4 for VK→VK roundtrip
-- Cross-backend tests for L3/L4
+✅ **Phase 2A decoder iter 4b (`bcaa1f1`):** `.level` field defaulted to 1 in `dispatchCompressedBlock` → L2 gate never fired → raw kernel ran on Huffman-coded streams → silent wrong output. Fix: thread `hdr.level` from frame header through `DecodeRequest.level`. State change: silent corruption → loud `error.KernelLaunchFailed` (exposed iter 4c blocker).
+
+✅ **Phase 2A decoder iter 4c (`11eb101`):** per-binding offset support in `procLaunchKernel` ABI + 5+ dispatch site fixes (scan_parse / 4× compact_huff / compact_raw / mergeHuffDescs / gatherRawOff16 / runHuffBuildAndDecode). 14 launch_kernel call sites audited; backward-compat preserved via `binding_offsets: ?[*]const u64` null default. `minStorageBufferOffsetAlignment` captured + enforced. `d_compact_counts` layout widened from packed 6×u32 → strided 6×256 B slots. 401 LOC across 11 files. State change after iter 4c: small inputs → still `KernelLaunchFailed`; large inputs → silent corruption at byte 65544.
+
+✅ **Phase 2A decoder iter 4d (`b3fab31`):** 20 L3/L4 ptest cases added (10 synthetic-PASS + 10 real-corpus-FAIL). The 10 corpus tests serve as deterministic reproducer + diagnostic gate. ptest now reports honest 98/0/10 instead of false-positive 88/0/0. All 10 failures converge on `first_diff=65544` with rich diagnostic output (total_diffs, trailing_zeros, hex windows).
+
+⏸️ **OPEN BUG — sub-chunk-N>0 decoder loop in `lz_decode_kernel.comp`:**
+The byte-65544 failures are at the SUB-CHUNK 0 → SUB-CHUNK N (N>0) boundary in the OUTER dispatch loop, NOT at the block-1 → block-2 transition (which doesn't run for L3 web.txt; sc_group_size=0.25 → eff_chunk=64KB → one chunk = one sub-chunk = one LZ block).
+
+In-shader diagnostic at END of sub-chunk 1's inner-while loop:
+  - `dst_pos = 131072` (decoder thinks it wrote all 65 KB of sub-chunk 1)
+  - `lit_pos = lit_size`, `cmd_pos = cmd_size` (all consumption complete)
+  - But output bytes 65544..131071 are zeros (CUDA→VK) or garbage (VK→VK)
+
+Three live hypotheses (iter 4d root-cause-analyst agent — 180 min didn't isolate):
+  1. Cooperative literal/match copy loops only execute for lane 0 in sub-chunks N>0 (warp divergence)
+  2. Memory barrier semantics between sub-chunk iterations (missing subgroupMemoryBarrierBuffer)
+  3. Huffman-decoded scratch is all-zeros for sub-chunks 1+ (decoder dutifully writes zeros — would mean Huffman or scan/merge bug, not LZ)
+
+**Suggested first investigation step:** dump entropy_scratch contents at sub-chunk 1 offset. If all zeros → hypothesis 3 (upstream bug); if non-zero → hypothesis 1 or 2 (LZ decoder bug).
+
+These 10 failing tests will turn GREEN when fixed; ptest will report 108/0/0.
+
+**Also documented (smaller, related):** "small-input KernelLaunchFailed" on 70KB web L3 + 1MB enwik8 L3 CUDA→VK (per iter 4c adversarial review). Likely a procLaunchKernel runtime guard or specific alignment issue; not currently caught by the 10 corpus tests; investigate alongside the byte-65544 fix.
 
 ### Phase 2B — L5 chain parser
 
@@ -207,7 +220,8 @@ LOC estimate: ~400 Zig. ~1 single agent.
 | ~~2-prep (verify L2)~~ | ✅ DONE | ✅ DONE | ✅ |
 | ~~2A encoder (Huffman, L3 + L4)~~ | ✅ DONE (~700 GLSL + 500 Zig) | | ✅ 1 + 1 review + 1 fix |
 | ~~2A decoder iter 1-3 (gpuScanChunks + huff_build_lut + huff_decode_4stream + conformance test)~~ | ✅ DONE (~1,000 GLSL + 400 Zig) | | ✅ 3 + 3 reviews + 1 fix + 1 test |
-| 2A decoder iter 4 (lz_decode general workhorse + L2 gate open) | ~700 | ~300 | 2-3 |
+| ~~2A decoder iter 4 + 4b + 4c + 4d (lz_decode general + .level fix + offset ABI + 20 L3/L4 tests)~~ | ✅ DONE (~700 GLSL + 1000 Zig + 868 LOC tests) | | ✅ 4 commits |
+| 2A decoder iter 4e (FIX byte-65544 sub-chunk-N decoder bug + small-input KernelLaunchFailed) | ~10-50 (surgical) | | 1-3 |
 | ~~3 (GPU decode pipeline)~~ | ✅ DONE | | ✅ 1 + 1 review + 1 fix |
 | 2B (L5 chain parser + fix L5 broken branch) | ~800 | ~500 | 2-3 |
 | 4 (D2D + async — note: L1 D2D already opened by Phase 3) | 0 | ~600 | 1-2 |
@@ -700,6 +714,10 @@ SSBO loads — verify perf doesn't regress.
 ## Recent commit history (last 20)
 
 ```
+b3fab31  Phase 2A-decoder iter 4d — add 20 L3/L4 ptest cases (10 currently failing) as deterministic reproducer for sub-chunk-N>0 decoder bug
+11eb101  Phase 2A-decoder iter 4c — per-binding offset ABI + 5 dispatch site fixes (L3+ decode still broken)
+bcaa1f1  Phase 2A-decoder iter 4b — fix .level defaulting to 1 (silent corruption → loud failure)
+ac013b5  Phase 2A-decoder iter 4 — port LZ general workhorse + L2 gate (partial; 855 LOC)
 de9d7eb  Phase 2A-decoder iter 3 follow-up — huff_decode conformance test (catches bitbufRefill bug class)
 ac6696f  Phase 2A-decoder iter 3 fix — bitbufRefill hi/lo swap
 d5860d1  Phase 2A-decoder iter 3 — port huff_decode_4stream + wire runHuffBuildAndDecode
