@@ -203,12 +203,22 @@ pub fn decompressFrameInner(
         }
 
         const block_src = src[pos .. pos + block_hdr.compressed_size];
+        // VK adaptation: only thread level>=3 to trigger fullGpuLaunchImpl's
+        // L2 gate (the Huffman pre-decode chain + general LZ kernel). L2
+        // frames have no Huffman streams, and the upstream scan/compact/
+        // merge kernel host bindings still use offset-on-handle arithmetic
+        // that the VK launcher doesn't support — forcing level>=2 there
+        // would regress the currently-passing L2 path (which decodes via
+        // the L1 raw kernel). Once the launcher gains per-binding offset
+        // support, this can become `hdr.level` unconditionally.
+        const dispatch_level: u8 = if (hdr.level >= 3) hdr.level else 1;
         try dispatchCompressedBlock(
             block_src,
             dst,
             dst_off,
             block_hdr.decompressed_size,
             hdr.sc_group_size,
+            dispatch_level,
             dec_ctx,
             d_output_target,
             io,
@@ -248,12 +258,19 @@ pub fn decompressFrameInner(
 /// GPU dispatch. Parses the internal block header on the CPU, builds the
 /// chunk descriptors on the CPU, and hands the descriptor slice to the
 /// GPU pipeline.
+///
+/// VK adaptation: `level` is threaded from the parsed FrameHeader so
+/// fullGpuLaunchImpl's L2 gate (req.level >= 2) fires for L3+ frames
+/// that contain Huffman-coded streams. Without it, n_huff stays 0 and
+/// runLzPipeline routes to the L1 raw kernel, which produces wrong
+/// output on huff-coded inputs (the L3+ wrong-output bug fixed here).
 pub fn dispatchCompressedBlock(
     block_src: []const u8,
     dst: []u8,
     dst_start_off: usize,
     decompressed_size: usize,
     sc_group_size: f32,
+    level: u8,
     dec_ctx: *gpu_driver.DecodeContext,
     d_output_target: ?u64,
     io: ?std.Io,
@@ -302,6 +319,11 @@ pub fn dispatchCompressedBlock(
         .io = io,
         .d_output_target = d_output_target,
         .d_compressed_src = null,
+        // VK adaptation: thread the frame's level so fullGpuLaunchImpl's
+        // L2 gate fires for L3+ frames with Huffman-coded streams. Without
+        // this the default level=1 keeps n_huff=0 and the dispatcher
+        // routes to the L1 raw kernel — produces wrong output past byte 8.
+        .level = level,
     });
 }
 
