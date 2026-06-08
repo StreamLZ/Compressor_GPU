@@ -805,6 +805,10 @@ const VK_ACCESS_HOST_READ_BIT: u32 = 0x00002000;
 // COMPUTE_SHADER_WRITE → TRANSFER_READ memory barrier between the LZ
 // kernel and the D2H vkCmdCopyBuffer that now share one compute cmdbuf.
 const VK_ACCESS_SHADER_WRITE_BIT: u32 = 0x00000040;
+// Iter 4 (this iteration): COMPUTE_SHADER_WRITE → COMPUTE_SHADER_READ
+// memory barrier between the Huffman decode kernel (writes entropy_scratch)
+// and the LZ general decoder (reads it).
+const VK_ACCESS_SHADER_READ_BIT: u32 = 0x00000020;
 
 // Descriptor / pipeline structs
 
@@ -2462,6 +2466,7 @@ pub fn init() bool {
     vulkan_api.procs.stream_create = procStreamCreate;
     vulkan_api.procs.stream_destroy = procStreamDestroy;
     vulkan_api.procs.launch_kernel = procLaunchKernel;
+    vulkan_api.procs.compute_to_compute_barrier = procComputeToComputeBarrier;
     vulkan_api.procs.h2d_async = procH2DAsync;
     vulkan_api.procs.d2h_async = procD2HAsync;
     vulkan_api.procs.event_create = procEventCreate;
@@ -4259,6 +4264,46 @@ inline fn recordComputeToTransferBarrier(cb: VkCommandBuffer) void {
         0,
         null,
     );
+}
+
+// Iter 4: COMPUTE_SHADER_WRITE → COMPUTE_SHADER_READ pipeline barrier.
+// Vulkan does NOT insert any synchronization between consecutive
+// vkCmdDispatch calls on the same cmdbuf — even on the same buffer the
+// second dispatch can run concurrently with the first per the spec. The
+// general LZ decoder reads entropy_scratch that huff_decode_4stream
+// writes; without this barrier the LZ kernel can observe stale data.
+// CUDA hides the same RAW behind cuLaunchKernel's per-stream ordering;
+// the VK port must do it by hand.
+inline fn recordComputeToComputeBarrier(cb: VkCommandBuffer) void {
+    const mb = VkMemoryBarrier{
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+    };
+    vkCmdPipelineBarrier_fn.?(
+        cb,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0,
+        1,
+        @ptrCast(&mb),
+        0,
+        null,
+        0,
+        null,
+    );
+}
+
+fn procComputeToComputeBarrier(stream: VkStream) callconv(.c) VkResult {
+    // On per-stream paths the cmdbuf is already recording; on the
+    // default-stream path each launch_kernel submits inline so there is
+    // no open cmdbuf to record into — the inline submit+wait already
+    // provides the strict ordering, making the barrier redundant.
+    if (streamEntryFor(stream)) |se| {
+        const rc = streamBeginIfNeeded(se);
+        if (rc != VK_SUCCESS_RC) return rc;
+        recordComputeToComputeBarrier(se.cmdbuf);
+    }
+    return VK_SUCCESS_RC;
 }
 
 fn procD2HAsync(dst: *anyopaque, src: VkDeviceBuffer, size: usize, stream: VkStream) callconv(.c) VkResult {

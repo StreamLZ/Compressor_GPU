@@ -467,6 +467,17 @@ pub const Procs = struct {
         [*]?*anyopaque, // params
         [*]?*anyopaque, // extra (trailing-null sentinel CUDA uses)
     ) callconv(.c) VkResult = null,
+
+    /// VK adaptation: NEW SLOT (no CUDA analogue). Record a
+    /// compute-to-compute pipeline barrier on the stream's open cmdbuf
+    /// so a later vkCmdDispatch sees writes from an earlier vkCmdDispatch
+    /// to the same buffer. CUDA's per-launch implicit ordering covers
+    /// the RAW dependency between two cuLaunchKernel calls on the same
+    /// stream; Vulkan requires the explicit barrier because vkCmdDispatch
+    /// does not introduce one. Used at the Huffman-decode → LZ-decode
+    /// boundary in runBackHalf where huff_decode_4stream writes the
+    /// entropy scratch slots that the general LZ kernel reads.
+    compute_to_compute_barrier: ?*const fn (VkStream) callconv(.c) VkResult = null,
 };
 
 /// Single global procs table the codec call sites read from. Module_loader

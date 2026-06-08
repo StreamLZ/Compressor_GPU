@@ -229,6 +229,15 @@ pub const VkProcs = struct {
     // Optional so legacy backends without the slot still resolve.
     stream_flush_transfer: ?FnStreamSync,
     d2d: ?FnD2D,
+    // VK adaptation: COMPUTE_SHADER_WRITE → COMPUTE_SHADER_READ pipeline
+    // barrier on the stream's open cmdbuf. Required at the Huffman-decode
+    // → LZ-decode boundary where the LZ general kernel reads the
+    // entropy_scratch slots that huff_decode_4stream just wrote. CUDA
+    // collapses this dependency into cuLaunchKernel's per-stream
+    // implicit ordering; VK has no such auto-ordering between
+    // consecutive vkCmdDispatch calls. Optional so legacy backends still
+    // resolve.
+    compute_to_compute_barrier: ?FnStreamSync,
 
     fn resolve() GpuError!VkProcs {
         return .{
@@ -245,6 +254,7 @@ pub const VkProcs = struct {
             .stream_sync = vk.procs.stream_sync orelse return error.BackendNotAvailable,
             .stream_flush_transfer = vk.procs.stream_flush_transfer,
             .d2d = vk.procs.d2d,
+            .compute_to_compute_barrier = vk.procs.compute_to_compute_barrier,
         };
     }
 };
@@ -1014,6 +1024,16 @@ pub fn runBackHalf(
     var split_huff_build_ns: i64 = 0;
     if (have_huff) {
         split_huff_build_ns = try runHuffBuildAndDecode(self, procs, n_huff, heavy_stream, split_timer, t_huff_start, io);
+        // VK adaptation: Vulkan needs an explicit COMPUTE→COMPUTE pipeline
+        // barrier between the Huffman decode kernel (which writes
+        // entropy_scratch) and the LZ general decoder kernel below
+        // (which reads from it). CUDA's per-launch implicit ordering on
+        // the same stream covers this dependency invisibly; the VK port
+        // must record it on the cmdbuf. Without it the LZ kernel can
+        // observe stale entropy_scratch and emit garbage output.
+        if (procs.compute_to_compute_barrier) |barrier_fn| {
+            try vkCall(barrier_fn(heavy_stream), .sync);
+        }
     }
 
     var split_huff_ns: i64 = 0;

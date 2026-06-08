@@ -174,6 +174,9 @@
             /* CUDA reference: src/decode/lz_dispatch.cuh:144-164. */                  \
             /* off32 non-empty → general decoder via positional brace-init of */       \
             /* ParsedStreams (OFF16_SPLIT=false; raw L1/L2 has no entropy off16). */   \
+            /* VK adaptation: lit/cmd are ALWAYS in compressed on the raw path */      \
+            /* (no Huffman scratch present); pass comp_ssbo as the scratch slot */     \
+            /* placeholder + 0u as the in-scratch flag. */                              \
             decodeSubChunkGeneral_false(                                               \
                 comp_ssbo,                                                             \
                 _pd_lit_ptr, _pd_lit_size,                                             \
@@ -186,6 +189,8 @@
                 _pd_len_stream, _pd_len_avail,                                         \
                 /*off16_split=*/0u,                                                    \
                 _pd_block2_cmd_offset, _pd_initial_copy,                               \
+                /*lit_scratch_ssbo=*/comp_ssbo, /*lit_in_scratch=*/0u,                  \
+                /*cmd_scratch_ssbo=*/comp_ssbo, /*cmd_in_scratch=*/0u,                  \
                 dst_ssbo, sc_decomp_size, dst_offset,                                  \
                 /*mode=*/1u, lane);                                                    \
         }                                                                              \
@@ -213,7 +218,8 @@
                                 dst_ssbo, dst_offset, base_offset, mode,               \
                                 entropy_lit_ssbo, entropy_lit_base,                    \
                                 entropy_tok_ssbo, entropy_tok_base,                    \
-                                entropy_off16_ssbo, entropy_off16_base, lane)          \
+                                entropy_off16_ssbo, entropy_off16_base,                \
+                                has_entropy, lane)                                     \
     do {                                                                                \
         ParsedStreams _pdg_ps;                                                          \
         parseSubChunkHeaders(comp_ssbo, sc_src_off, sc_comp_size, sc_decomp_size,       \
@@ -221,12 +227,63 @@
                               entropy_lit_ssbo, entropy_lit_base,                       \
                               entropy_tok_ssbo, entropy_tok_base,                       \
                               entropy_off16_ssbo, entropy_off16_base,                   \
+                              has_entropy,                                              \
                               _pdg_ps, lane);                                           \
                                                                                         \
+        /* VK adaptation: when literals or tokens are Huffman-coded the */              \
+        /* corresponding ParsedStreams.lit/cmd_ptr is a byte offset into */             \
+        /* `entropy_lit_ssbo` / `entropy_tok_ssbo` (NOT compressed). The */             \
+        /* dispatcher hands both SSBOs + the per-stream flag to the decoder; */         \
+        /* the decoder selects per-byte. CUDA collapses this transparently */           \
+        /* via pointer typing. */                                                        \
         if (uint(mode) == 1u && _pdg_ps.off32_count1 == 0u && _pdg_ps.off32_count2 == 0u) { \
             /* CUDA reference: src/decode/lz_dispatch.cuh:190-214. mode==1 +  */        \
-            /* off32 empty → raw-mode hot loop. Dispatch on off16_split.      */        \
-            if (_pdg_ps.off16_split != 0u) {                                            \
+            /* off32 empty → raw-mode hot loop. The raw-mode hot loop doesn't */        \
+            /* handle in-scratch lit/cmd at the L1/L2 callers (the only path */         \
+            /* that reaches it is parseAndDecodeSubChunkRaw via the L1 raw */            \
+            /* kernel; lz_decode_kernel.comp's L2+ general path enters this */          \
+            /* branch only when the encoder emitted off32-empty + mode==1 + */          \
+            /* off16_split, which the L3 encoder still does for some chunks). */        \
+            /* When the L3 path takes this branch with in-scratch lit/cmd, */           \
+            /* dispatch the general decoder instead so the per-byte selectors */        \
+            /* are honored. */                                                           \
+            if (_pdg_ps.lit_in_scratch != 0u || _pdg_ps.cmd_in_scratch != 0u) {         \
+                if (_pdg_ps.off16_split != 0u) {                                        \
+                    decodeSubChunkGeneral_true(                                         \
+                        comp_ssbo,                                                      \
+                        _pdg_ps.lit_ptr, _pdg_ps.lit_size,                              \
+                        _pdg_ps.cmd_ptr, _pdg_ps.cmd_size,                              \
+                        _pdg_ps.off16_raw, _pdg_ps.off16_count,                         \
+                        entropy_off16_ssbo, _pdg_ps.off16_hi,                           \
+                        entropy_off16_ssbo, _pdg_ps.off16_lo,                           \
+                        _pdg_ps.off32_raw1, _pdg_ps.off32_count1,                       \
+                        _pdg_ps.off32_raw2, _pdg_ps.off32_count2,                       \
+                        _pdg_ps.len_stream, _pdg_ps.len_avail,                          \
+                        _pdg_ps.off16_split,                                            \
+                        _pdg_ps.cmd_stream2_offset, _pdg_ps.initial_copy,               \
+                        entropy_lit_ssbo, _pdg_ps.lit_in_scratch,                       \
+                        entropy_tok_ssbo, _pdg_ps.cmd_in_scratch,                       \
+                        dst_ssbo, sc_decomp_size, dst_offset,                           \
+                        /*mode=*/1u, lane);                                             \
+                } else {                                                                \
+                    decodeSubChunkGeneral_false(                                        \
+                        comp_ssbo,                                                      \
+                        _pdg_ps.lit_ptr, _pdg_ps.lit_size,                              \
+                        _pdg_ps.cmd_ptr, _pdg_ps.cmd_size,                              \
+                        _pdg_ps.off16_raw, _pdg_ps.off16_count,                         \
+                        entropy_off16_ssbo, _pdg_ps.off16_hi,                           \
+                        entropy_off16_ssbo, _pdg_ps.off16_lo,                           \
+                        _pdg_ps.off32_raw1, _pdg_ps.off32_count1,                       \
+                        _pdg_ps.off32_raw2, _pdg_ps.off32_count2,                       \
+                        _pdg_ps.len_stream, _pdg_ps.len_avail,                          \
+                        _pdg_ps.off16_split,                                            \
+                        _pdg_ps.cmd_stream2_offset, _pdg_ps.initial_copy,               \
+                        entropy_lit_ssbo, _pdg_ps.lit_in_scratch,                       \
+                        entropy_tok_ssbo, _pdg_ps.cmd_in_scratch,                       \
+                        dst_ssbo, sc_decomp_size, dst_offset,                           \
+                        /*mode=*/1u, lane);                                             \
+                }                                                                       \
+            } else if (_pdg_ps.off16_split != 0u) {                                     \
                 decodeSubChunkRawMode_true(                                             \
                     comp_ssbo, _pdg_ps.cmd_ptr, _pdg_ps.cmd_size,                       \
                     comp_ssbo, _pdg_ps.lit_ptr, _pdg_ps.lit_size,                       \
@@ -258,6 +315,8 @@
                     _pdg_ps.len_stream, _pdg_ps.len_avail,                              \
                     _pdg_ps.off16_split,                                                \
                     _pdg_ps.cmd_stream2_offset, _pdg_ps.initial_copy,                   \
+                    entropy_lit_ssbo, _pdg_ps.lit_in_scratch,                           \
+                    entropy_tok_ssbo, _pdg_ps.cmd_in_scratch,                           \
                     dst_ssbo, sc_decomp_size, dst_offset,                               \
                     mode, lane);                                                        \
             } else {                                                                    \
@@ -273,6 +332,8 @@
                     _pdg_ps.len_stream, _pdg_ps.len_avail,                              \
                     _pdg_ps.off16_split,                                                \
                     _pdg_ps.cmd_stream2_offset, _pdg_ps.initial_copy,                   \
+                    entropy_lit_ssbo, _pdg_ps.lit_in_scratch,                           \
+                    entropy_tok_ssbo, _pdg_ps.cmd_in_scratch,                           \
                     dst_ssbo, sc_decomp_size, dst_offset,                               \
                     mode, lane);                                                        \
             }                                                                           \

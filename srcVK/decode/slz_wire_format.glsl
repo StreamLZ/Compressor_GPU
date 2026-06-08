@@ -218,6 +218,14 @@ struct ParsedStreams {
     uint len_avail;       // bytes available in len_stream
     uint cmd_stream2_offset; // byte offset in cmd stream where block 1 begins
     uint initial_copy;    // 8 if this sub-chunk did the initial copy, else 0
+    // VK adaptation: GLSL cannot store SSBO references inside a struct, so
+    // we need explicit per-stream flags to pick the right SSBO at consume
+    // time. CUDA collapses these into pointer typing (lit_ptr / cmd_ptr
+    // either point into the compressed blob or into entropy scratch). The
+    // flags are written by parseLiteralStreamHeader / parseCommandStreamHeader
+    // and consumed by the dispatch macro in lz_dispatch.glsl.
+    uint lit_in_scratch;  // 1 if lit_ptr indexes entropy_lit_ssbo, else compressed
+    uint cmd_in_scratch;  // 1 if cmd_ptr indexes entropy_tok_ssbo, else compressed
 };
 
 // CUDA reference: src/decode/slz_wire_format.cuh:242-246. Cursor-

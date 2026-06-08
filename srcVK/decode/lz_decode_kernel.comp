@@ -1,54 +1,217 @@
 // 1:1 port of src/decode/lz_decode_kernels.cuh, entry point slzLzDecodeKernel.
-// CUDA reference: src/decode/lz_decode_kernels.cuh:31-44 (general entry).
+// CUDA reference: src/decode/lz_decode_kernels.cuh:31-144 (general entry).
+// Phase 2A-decoder iter 4: full general decoder body + lit/cmd in-scratch path.
 // See srcVK/PortInstructions.md.
 //
-// L2 stub: general entropy-capable decoder; main() returns immediately
-// until the L2 fleshout lands. Bindings reflect the CUDA arg order so
-// vkCreateComputePipelines builds a descriptor set layout matching the
-// host-side layout module_loader stages.
+// L2+ general entropy-capable LZ decoder. Iterates sub-chunks per warp
+// and hands off to parseAndDecodeSubChunk (general decoder) or copies
+// uncompressed sub-chunks verbatim. The huff_build / huff_decode kernels
+// (huff_build_lut_kernel.comp + huff_decode_4stream_kernel.comp) run
+// before this kernel and pre-decode entropy chunks into the per-sub-chunk
+// slots of `entropy_scratch` that this kernel reads via parseSubChunkHeaders.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "slz_wire_format.glsl"
+#include "lz_decode_core.glsl"
+#include "lz_decode_general.glsl"
+#include "lz_decode_raw.glsl"
+#include "lz_header_parse.glsl"
+#include "lz_dispatch.glsl"
 
 // CUDA: lz_grid_x blocks × (32, 2, 1) threads per decode_dispatch.zig:451.
+// 32 lanes × 2 warps = 64 threads per block, matching CUDA
+// LZ_KERNEL_BLOCK_THREADS.
 layout(local_size_x = 32, local_size_y = 2, local_size_z = 1) in;
 
-// arg 0: const uint8_t* compressed
+// arg 0: const uint8_t* compressed.
+//
+// VK adaptation: typed as `uint8_t` to match lz_decode_raw_kernel.comp
+// (the per-byte read pattern the parseAndDecodeSubChunk macros expect).
+// The L2 stub had this declared as `uint` — every byte access through
+// the new macros would have aliased 4-byte words and decoded garbage.
 layout(std430, binding = 0) readonly buffer CompressedBuf {
-    uint compressed[];
+    uint8_t compressed[];
 };
 
-// arg 1: const SlzChunkDesc* chunks
+// arg 1: const SlzChunkDesc* chunks.
 layout(std430, binding = 1) readonly buffer ChunksBuf {
-    uint chunks_raw[];
+    SlzChunkDesc chunks[];
 };
 
-// arg 2: uint8_t* dst
+// arg 2: uint8_t* dst.
 layout(std430, binding = 2) buffer DstBuf {
-    uint dst[];
+    uint8_t dst[];
 };
 
-// arg 4: const uint32_t* d_total_chunks
+// arg 4: const uint32_t* d_total_chunks. CUDA reads `*d_total_chunks` at
+// kernel entry so the self-gate count flows D2D rather than via
+// push-constant scalar.
 layout(std430, binding = 3) readonly buffer TotalChunksBuf {
     uint d_total_chunks;
 };
 
-// arg 6: uint8_t* entropy_scratch
+// arg 6: uint8_t* entropy_scratch (3 sub-slots per sub-chunk: lit/tok/off16,
+// each ENTROPY_SCRATCH_SLOT_BYTES wide; layout matches host-side
+// runHuffBuildAndDecode at decode_dispatch.zig).
+//
+// VK adaptation: typed as `uint8_t` for parity with the per-byte reads
+// the parseSubChunkHeaders / decodeSubChunkGeneral macros emit when they
+// pull entropy-decoded bytes back into the LZ token loop.
 layout(std430, binding = 4) buffer EntropyScratchBuf {
-    uint entropy_scratch[];
+    uint8_t entropy_scratch[];
 };
 
-// arg 8: const uint32_t* first_subchunk_idx
+// arg 8: const uint32_t* first_subchunk_idx (per-chunk global sub-chunk
+// base index, written by runHuffBuildAndDecode's prefix sum).
 layout(std430, binding = 5) readonly buffer FirstSubChunkIdxBuf {
     uint first_subchunk_idx[];
 };
 
 // Scalar args 3, 5, 7 ride in via push constants. Layout matches the
 // CUDA arg list order (chunks_per_group, sub_chunk_cap, entropy_slot_stride).
+//
+// VK adaptation: CUDA's u64 entropy_slot_stride is split into uvec2 (lo,
+// hi) for std430 push-constant compat. Both halves are loaded as u32
+// in the kernel and combined via packUint2x32 below.
 layout(push_constant) uniform Push {
     uint chunks_per_group;
     uint sub_chunk_cap;
-    uvec2 entropy_slot_stride; // u64 split lo/hi for std430 push-constant compat
+    uvec2 entropy_slot_stride; // u64 split lo/hi
 } pc;
 
-void main() { return; }
+void main() {
+    // CUDA reference: src/decode/lz_decode_kernels.cuh:43-50.
+    uint total_chunks = d_total_chunks;
+    uint warp_id = gl_LocalInvocationID.y;
+    uint group_id = gl_WorkGroupID.x * WARPS_PER_BLOCK + warp_id;
+    int  lane = int(gl_LocalInvocationID.x & LANE_MASK);
+    if (group_id >= (total_chunks + pc.chunks_per_group - 1u) / pc.chunks_per_group) return;
+    uint base_chunk = group_id * pc.chunks_per_group;
+
+    // VK adaptation: collapse u64 stride to u32 for the offset arithmetic
+    // below. ENTROPY_SCRATCH_SLOT_BYTES * total_subchunks fits in u32 for
+    // every supported workload (sub-chunk count caps at WALK_MAX_CHUNKS *
+    // 4 per chunk = ~1M slots, each 128 KB, = 128 GiB worst case theoretical
+    // but the kernel is dispatched with total_subchunks limited by the
+    // host's `chunk_count * ceil(chunk_size / sub_chunk_cap)` bound which
+    // fits in u32 byte ranges for every shipped scenario). The .y half is
+    // asserted zero on the host before launch (host-side TODO follow-up
+    // mirrors CUDA's silent assumption); for now the kernel reads .x.
+    uint entropy_slot_stride_u32 = pc.entropy_slot_stride.x;
+
+    // CUDA reference: src/decode/lz_decode_kernels.cuh:52-143.
+    // Outer chunk loop.
+    for (uint c = 0u; c < pc.chunks_per_group; c = c + 1u) {
+        uint chunk_idx = base_chunk + c;
+        if (chunk_idx >= total_chunks) return;
+
+        SlzChunkDesc ch = chunks[chunk_idx];
+        if (ch.decomp_size == 0u) continue;
+
+        // CUDA reference: src/decode/lz_decode_kernels.cuh:60-66. Uncompressed
+        // chunk: warp-cooperative copy of raw input bytes.
+        if ((ch.flags & CHUNK_FLAG_UNCOMPRESSED) != 0u) {
+            for (uint i = uint(lane); i < ch.decomp_size; i = i + WARP_SIZE)
+                dst[ch.dst_offset + i] = compressed[ch.src_offset + i];
+            subgroupBarrier();
+            subgroupMemoryBarrierBuffer();
+            continue;
+        }
+
+        // CUDA reference: src/decode/lz_decode_kernels.cuh:69-74. Memset
+        // chunk: fill output with the per-chunk memset byte.
+        if ((ch.flags & CHUNK_FLAG_MEMSET) != 0u) {
+            uint8_t fill_byte = uint8_t(chunkMemsetFill(ch));
+            for (uint i = uint(lane); i < ch.decomp_size; i = i + WARP_SIZE)
+                dst[ch.dst_offset + i] = fill_byte;
+            subgroupBarrier();
+            subgroupMemoryBarrierBuffer();
+            continue;
+        }
+
+        // CUDA reference: src/decode/lz_decode_kernels.cuh:76-93.
+        // LZ-compressed chunk: iterate sub-chunks. Each sub-chunk gets its
+        // own slot in the entropy scratch buffers (indexed by global
+        // sub-chunk index).
+        uint chunk_src = ch.src_offset;
+        uint sc_dst_off = ch.dst_offset;
+        uint sc_remaining = ch.decomp_size;
+
+        uint global_subchunk_index = first_subchunk_idx[chunk_idx];
+        // CUDA passes `entropy_scratch ? base : nullptr`. In the VK port
+        // the kernel is only launched when n_huff > 0 (the L1 raw path
+        // uses lz_decode_raw_kernel instead), so entropy_scratch is
+        // always non-null. The has_entropy bit fed into parseSubChunkHeaders
+        // below mirrors the CUDA `entropy_scratch != nullptr` guard.
+        uint subchunk_scratch_base =
+            global_subchunk_index * ENTROPY_SCRATCH_SLOT_BYTES;
+
+        while (sc_remaining > 0u) {
+            uint sc_size = sc_remaining;
+            if (sc_size > pc.sub_chunk_cap) sc_size = pc.sub_chunk_cap;
+
+            // CUDA reference: src/decode/lz_decode_kernels.cuh:99-102.
+            // 3-byte big-endian sub-chunk header, parsed on lane 0 and
+            // broadcast across the warp.
+            uint sub_chunk_header = 0u;
+            if (lane == 0) {
+                uint h0 = uint(compressed[chunk_src + 0u]);
+                uint h1 = uint(compressed[chunk_src + 1u]);
+                uint h2 = uint(compressed[chunk_src + 2u]);
+                sub_chunk_header = readBE24(h0, h1, h2);
+            }
+            sub_chunk_header = subgroupShuffle(sub_chunk_header, 0u);
+
+            if (!subchunkIsLz(sub_chunk_header)) {
+                // CUDA reference: src/decode/lz_decode_kernels.cuh:104-107.
+                // Non-LZ sub-chunk (entropy-only) — skip for now.
+                break;
+            }
+
+            uint sc_comp_size = subchunkCompSize(sub_chunk_header);
+            uint sc_mode = subchunkMode(sub_chunk_header);
+            uint sc_payload = chunk_src + 3u;
+
+            if (sc_comp_size < sc_size) {
+                // CUDA reference: src/decode/lz_decode_kernels.cuh:115-128.
+                // Derive tok/off16 sub-slots on demand from base + stride.
+                // tok at +stride, off16 at +2*stride from the lit slot.
+                uint tok_slot = subchunk_scratch_base + entropy_slot_stride_u32;
+                uint off16_slot = subchunk_scratch_base + 2u * entropy_slot_stride_u32;
+
+                // Pass the absolute sc_dst_off as base_offset; only the
+                // sub-chunk at output offset 0 (the very first sub-chunk
+                // in the frame) triggers the 8-byte initial copy. CUDA's
+                // host-side SC prefix table post-pass restores per-chunk
+                // init copies separately.
+                parseAndDecodeSubChunk(
+                    compressed, sc_payload, sc_comp_size, sc_size,
+                    dst, sc_dst_off, sc_dst_off, sc_mode,
+                    entropy_scratch, subchunk_scratch_base,
+                    entropy_scratch, tok_slot,
+                    entropy_scratch, off16_slot,
+                    /*has_entropy=*/1u, lane);
+            } else {
+                // CUDA reference: src/decode/lz_decode_kernels.cuh:130-133.
+                // Uncompressed sub-chunk: copy raw bytes.
+                for (uint i = uint(lane); i < sc_size; i = i + WARP_SIZE)
+                    dst[sc_dst_off + i] = compressed[sc_payload + i];
+            }
+            subgroupBarrier();
+            subgroupMemoryBarrierBuffer();
+
+            // CUDA reference: src/decode/lz_decode_kernels.cuh:136-141.
+            chunk_src += 3u + sc_comp_size;
+            sc_dst_off += sc_size;
+            sc_remaining -= sc_size;
+            subchunk_scratch_base += ENTROPY_SCRATCH_SLOT_BYTES;
+        }
+    }
+}
