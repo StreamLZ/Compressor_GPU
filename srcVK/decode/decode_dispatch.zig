@@ -308,11 +308,21 @@ pub fn mergeHuffDescs(
         .merged = self.d_huff_descs,
         .n_merged = self.d_compact_counts + 20,
     };
+    // VK adaptation: params[] layout per module_loader KERNEL_DECLS contract
+    // (see scan_gpu.zig:58-64 and decode_dispatch.zig:597-604 for working
+    // reference). First n_bindings entries are pointers to VkDeviceBuffer
+    // handles populating descriptor set bindings 0..n_bindings-1; remaining
+    // entries pack into push_constant_size bytes in declaration order.
+    // merge_huff_descs_kernel.comp: n_bindings=10 (LitBuf, TokBuf, HiBuf,
+    // LoBuf, NLitBuf, NTokBuf, NHiBuf, NLoBuf, MergedBuf, NMergedBuf),
+    // push_constant_size=8 (tok_region_off, off16_region_off as 2× u32).
+    // CUDA's kernel argument list is unchanged; only the VK host packing
+    // order changes — buffer-pointer params first, then push-constant scalars.
     var m_params = [_]?*anyopaque{
         @ptrCast(&args.lit),        @ptrCast(&args.tok),          @ptrCast(&args.hi),       @ptrCast(&args.lo),
         @ptrCast(&args.n_lit),      @ptrCast(&args.n_tok),        @ptrCast(&args.n_hi),     @ptrCast(&args.n_lo),
-        @ptrCast(&args.tok_region), @ptrCast(&args.off16_region),
         @ptrCast(&args.merged),     @ptrCast(&args.n_merged),
+        @ptrCast(&args.tok_region), @ptrCast(&args.off16_region),
     };
     var m_extra = [_]?*anyopaque{null};
     const stream = self.work_stream;
@@ -349,9 +359,18 @@ pub fn gatherRawOff16(
     var p_scratch: u64 = self.d_entropy_off16_scratch;
     var p_descs: u64 = self.d_compact_raw;
     var p_count: u64 = self.d_compact_counts + 16;
+    // VK adaptation: params[] layout per module_loader KERNEL_DECLS contract
+    // (see scan_gpu.zig:58-64 and decode_dispatch.zig:597-604 for working
+    // reference). First n_bindings entries are pointers to VkDeviceBuffer
+    // handles populating descriptor set bindings 0..n_bindings-1; remaining
+    // entries pack into push_constant_size bytes in declaration order.
+    // gather_raw_off16_kernel.comp: n_bindings=4 (CompBaseBuf, ScratchBaseBuf,
+    // DescsBuf, CountBuf), push_constant_size=4 (comp_len as u32).
+    // CUDA's kernel argument list is unchanged; only the VK host packing
+    // order changes — buffer-pointer params first, then push-constant scalars.
     var params = [_]?*anyopaque{
-        @ptrCast(&p_comp), @ptrCast(&p_comp_len), @ptrCast(&p_scratch),
-        @ptrCast(&p_descs), @ptrCast(&p_count),
+        @ptrCast(&p_comp), @ptrCast(&p_scratch), @ptrCast(&p_descs), @ptrCast(&p_count),
+        @ptrCast(&p_comp_len),
     };
     var extra = [_]?*anyopaque{null};
     // Grid size = worst-case sub-chunk count (`num_raw_off16` is the
@@ -611,16 +630,28 @@ pub fn runLzPipeline(
         var p_entropy_slot_stride: u64 = @as(u64, total_subchunks) * descriptors.ENTROPY_SCRATCH_SLOT_BYTES;
         var p_first_sub_idx: VkDeviceBuffer = self.d_first_subchunk_idx;
 
+        // VK adaptation: params[] layout per module_loader KERNEL_DECLS contract
+        // (see scan_gpu.zig:58-64 and the lz_decode_raw_kernel sibling at
+        // decode_dispatch.zig:597-604 for working reference). First n_bindings
+        // entries are pointers to VkDeviceBuffer handles populating descriptor
+        // set bindings 0..n_bindings-1; remaining entries pack into
+        // push_constant_size bytes in declaration order. lz_decode_kernel.comp:
+        // n_bindings=6 (CompressedBuf, ChunksBuf, DstBuf, TotalChunksBuf,
+        // EntropyScratchBuf, FirstSubChunkIdxBuf), push_constant_size=16
+        // (chunks_per_group as u32, sub_chunk_cap as u32, entropy_slot_stride
+        // as uvec2/u64). CUDA's kernel argument list is unchanged; only the
+        // VK host packing order changes — buffer-pointer params first, then
+        // push-constant scalars.
         var lz_params = [_]?*anyopaque{
             @ptrCast(&common.comp),
             @ptrCast(&common.descs_dev),
             @ptrCast(&common.dst),
-            @ptrCast(&common.chunks_per_group),
             @ptrCast(&common.total),
-            @ptrCast(&common.sub_chunk_cap),
             @ptrCast(&p_entropy_scratch),
-            @ptrCast(&p_entropy_slot_stride),
             @ptrCast(&p_first_sub_idx),
+            @ptrCast(&common.chunks_per_group),
+            @ptrCast(&common.sub_chunk_cap),
+            @ptrCast(&p_entropy_slot_stride),
         };
         var lz_extra = [_]?*anyopaque{null};
 
