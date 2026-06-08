@@ -1,0 +1,15 @@
+851a08a57df9c727a70c4843ca7ffef68a5de788441217593b6ab5b126b931b5  *tests/goldens/enwik8.txt.L1.slz
+68b01da255b5f3aacca23281e15de57a0d8ef39c5dff68e2ae271d5151e001d1  *tests/goldens/enwik8.txt.L2.slz
+182b4eef5d26ec95fea89aa37d0f0ae68f57b9a48d382b4bc8915b11a382df78  *tests/goldens/enwik8.txt.L3.slz
+34052874c480e94b451a5831a3ed34e04fe7eb467af0b37f7eb49b2fb0b41d04  *tests/goldens/enwik8.txt.L4.slz
+030bd807f1af82302cf3fa9aa78a9e9534dd75df1d1a3786e684566ac07f34d6  *tests/goldens/enwik8.txt.L5.slz
+04f12b08403d545db914b4e7c629bd8aea4b6b3bbc803467f621e08b454b0872  *tests/goldens/silesia_all.tar.L1.slz
+15fd9280bda622741e411835a2a0f171ae04446679a3a14d5c15dce23949e515  *tests/goldens/silesia_all.tar.L2.slz
+fcc1f9352ac5c7d321897f1e6f51e7e5d010ca87aa3a58a2d1fec6c84422322e  *tests/goldens/silesia_all.tar.L3.slz
+7e6e4d54293b3af718af8d44ed4dc5985c69bb3130c7e60a2c223d0d33efa93b  *tests/goldens/silesia_all.tar.L4.slz
+cf6a2bccbff9e1eb2cb6afb808d4424082fbdb462b27ecc7d6f7094179f49928  *tests/goldens/silesia_all.tar.L5.slz
+9bb544f68f140c642f728ad009a94bfe22f11a8d3ed0254c02d5346771cc891f  *tests/goldens/web.txt.L1.slz
+f98434ea93f5d798fba57f686c4a4d95169ca2037d40cc69f83e654fff15a2ac  *tests/goldens/web.txt.L2.slz
+05f20d300d951c5dff09089b9426f71ead686e7df3e4121322e2915772eed692  *tests/goldens/web.txt.L3.slz
+c5f06c28b497b623b0b3095baf497702bd3024449a7aa219125c9a77e05a350e  *tests/goldens/web.txt.L4.slz
+ae11a3cf55358921f1a03246cc0c58f0ca404f70c9fe1b1904798daf06c74e5b  *tests/goldens/web.txt.L5.slz

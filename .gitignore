@@ -17,3 +17,20 @@ assets/zstd.exe
 
 # Scratch
 b3.txt
+
+# Agent / debugging scratch files in repo root.  Agents have a habit of
+# spraying these around during build-capture + temp-data work.  Pattern
+# list reflects recurring offenders.
+tmp_*
+build_*.txt
+build_*.log
+build_*.out
+ptest_*.txt
+cu_dbg_*.txt
+NUL
+*.obj
+
+# Alternate cache + output dirs from build experiments (different
+# -Doptimize settings sometimes get redirected here by agent scripts).
+.zig-cache-*/
+zig-out-*/

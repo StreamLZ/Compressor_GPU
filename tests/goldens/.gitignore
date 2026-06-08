@@ -1,0 +1,16 @@
+# Goldens are derived from assets/* by gen_goldens.bat — too large
+# for plain git (silesia .slz files exceed GitHub's 100 MB per-file
+# limit; total ~2.4 GiB across web/enwik8/silesia × L1-L5).
+#
+# Mirrors the existing assets/* gitignore pattern: source data is
+# user-provided locally, derived artifacts are user-regenerated.
+
+# Ignore everything in this dir by default.
+*
+
+# Track the regeneration script + expected-hash manifest + this
+# .gitignore itself + any documentation we add.
+!.gitignore
+!gen_goldens.bat
+!manifest.sha256
+!README.md
