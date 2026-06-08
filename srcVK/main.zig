@@ -28,6 +28,7 @@ test {
     _ = @import("tests/kernel_conformance.zig");
     _ = @import("tests/l1_decode_roundtrip.zig");
     _ = @import("tests/l1_encode_roundtrip.zig");
+    _ = @import("tests/l2_encode_roundtrip.zig");
     _ = @import("tests/cross_backend_roundtrip.zig");
     _ = @import("tests/cli_smoke.zig");
 }
