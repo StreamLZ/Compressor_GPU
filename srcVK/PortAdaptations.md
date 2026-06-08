@@ -262,13 +262,16 @@ verification status. An unverified adaptation is a known risk surface.
   recovery (`rm zig-out/srcvk_shaders/lz_decode_kernel.spv` +
   rebuild → fix verified working immediately)
 - **Discovered**: iter 4f recovery (workflow `a0d2d6c5`)
-- **Status**: **ACTIVE**. **Workaround**: `tools/build_vk.bat`
-  (commit `db4406c`) does clean-build with explicit cache wipe.
-  **Proper fix** (would close this entry): add the included
-  `.glsl` files as `addFileInput()` to the SPV build step, OR
-  migrate to `glslc -MD` depfile output for automatic dependency
-  tracking. ~30-60 min Zig build-system work, no functional
-  impact on the binary.
+- **Status**: ✅ **RESOLVED 2026-06-08.** `build.zig::addSrcVkShaderSteps`
+  now passes `-MD -MF <depfile>` to glslc and registers the depfile via
+  `addDepFileOutputArg`, so Zig parses the Make-style dependency list
+  glslc emits and adds every `#include`d `.glsl` to the cache hash.
+  Verified empirically: editing `srcVK/encode/lz_format.glsl` triggers
+  `lz_encode_kernel.spv` rebuild on plain `zig build streamlz_vk`;
+  `scan_parse_kernel.spv` (which doesn't include lz_format.glsl) does
+  NOT rebuild, confirming the depfile is selective per-kernel.
+  `tools/build_vk.bat` is kept as a force-clean utility for other
+  cache-busting scenarios but is no longer required after `.glsl` edits.
 
 ### A-013: Chain parser `uint16_t* next_hash` → u16-packed u32 SSBO
 - **File:line**: `srcVK/encode/lz_chain_parser.glsl:60-78`

@@ -1,22 +1,20 @@
 @echo off
-REM Clean-build streamlz_vk.exe. Forces full recompilation of GLSL .comp
-REM kernels into SPIR-V, then the Zig binary that embeds them.
+REM Force-clean rebuild of streamlz_vk.exe. Wipes cached binaries +
+REM .spv blobs + the entire .zig-cache, then rebuilds from scratch.
 REM
-REM WHY THIS EXISTS:
-REM build.zig at addSrcVkShaderSteps (around line 1031-1071) declares the
-REM `.comp` file as glslc's addFileArg() input but does NOT declare the
-REM `.glsl` files it #include's as dependencies. So editing any shared
-REM GLSL header (lz_dispatch.glsl, lz_decode_general.glsl, etc.) leaves
-REM the cached .spv stale and the SPV is silently re-embedded into the
-REM binary with no recompilation. This caused a ~5-hour debugging
-REM nightmare on iter 4f (commit 4270ea4) where the fix worked but ran
-REM as stale bytecode through every "verify" run.
+REM A-012 (the underlying stale-SPV trap that originally motivated this
+REM script) was RESOLVED on 2026-06-08: build.zig now wires glslc -MD
+REM depfile output through addDepFileOutputArg, so editing any .glsl
+REM #include header correctly invalidates the dependent .spv blobs.
+REM Plain `zig build streamlz_vk` after a .glsl edit now Does The
+REM Right Thing.
 REM
-REM Until build.zig is fixed to track .glsl #include deps via
-REM `addFileInput()` or glslc -MD depfile output, USE THIS SCRIPT when
-REM you've edited any .glsl shared header.
+REM This script is kept as a force-clean utility for other cache-
+REM busting scenarios — debugging suspected cache corruption, verifying
+REM a fix isn't masked by stale state, etc. ~30-60 seconds of rebuild
+REM cost vs the immediate confidence that nothing is stale.
 REM
-REM See srcVK/PortAdaptations.md A-012 for the upstream tracking entry.
+REM See srcVK/PortAdaptations.md A-012 for the tracking entry.
 
 setlocal
 

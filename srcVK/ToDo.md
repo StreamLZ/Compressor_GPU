@@ -3,21 +3,23 @@
 **Last updated:** 2026-06-08, HEAD `c141fdf` + uncommitted Phase 2B.
 **Status:** L1 + L2 + L3 + L4 + **L5 SHIPPED on decode + encode** (all 5 levels VK→VK roundtrip MATCH on web + enwik8 + silesia, byte-identical to CUDA SHA on L1, L2, L3-web/enwik8, L4, L5). Phase 2A encoder + Phase 2A-decoder + Phase 2B + Phase 3 + Phase 2A.5 + iter 4f all done. **ptest_vk: 108/0/0 on both NVIDIA + Intel iGPU.** Only remaining encoder residual: silesia L3 is 0.019% larger than CUDA L3 (A-008, accepted — Vulkan 4 GiB SSBO cap on hash table forces `hash_bits=18` clamp on inputs > 128 MiB; VK→VK silesia L3 decodes its own output correctly). Remaining work: async API, perf parity sweep, BDA workaround. See `srcVK/PortAdaptations.md` for the catalog of CUDA-VK divergences + their resolution status.
 
-**Critical infrastructure note**: The build graph at `build.zig::addSrcVkShaderSteps` (~1031-1071) does NOT track `.glsl` `#include` deps of `.comp` files (entry A-012). This caused a 5+ hour debugging nightmare on iter 4f where the actual fix landed silently but every "verify" run executed stale SPIR-V. **Use `tools/build_vk.bat` (commit `db4406c`) to force clean-build when you've edited any srcVK `.glsl` header** until the build graph is fixed.
+**Build-graph note**: As of 2026-06-08 the build graph at `build.zig::addSrcVkShaderSteps` correctly tracks `.glsl` `#include` deps via glslc's `-MD` depfile output (A-012 RESOLVED). Plain `zig build streamlz_vk` after editing any srcVK `.glsl` header now invalidates the right SPIR-V blobs. `tools/build_vk.bat` is kept as a force-clean utility but is no longer required after `.glsl` edits.
 
 ---
 
 ## CRITICAL HYGIENE RULES (read first if you're a new agent on this codebase)
 
-1. **After editing ANY srcVK `.glsl` header → run `cmd.exe //c "tools\\build_vk.bat"` to clean-build.** Plain `zig build streamlz_vk` does NOT rebuild SPIR-V when only the `.glsl` files (not the `.comp`) changed. This is A-012 in PortAdaptations.md and has bitten us multiple times. If a "fix" appears not to work, the FIRST thing to check is whether the SPV actually rebuilt (`ls -la zig-out/srcvk_shaders/*.spv` — modification time should be post-edit).
+1. **Read `srcVK/PortAdaptations.md` BEFORE making any new VK-vs-CUDA divergence**, and ADD a new A-NNN entry if you introduce one. Each entry must declare both **static** AND **runtime** verification status. "NOT DONE" on runtime verification is a known risk surface and should block ship unless explicitly approved.
 
-2. **Read `srcVK/PortAdaptations.md` BEFORE making any new VK-vs-CUDA divergence**, and ADD a new A-NNN entry if you introduce one. Each entry must declare both **static** AND **runtime** verification status. "NOT DONE" on runtime verification is a known risk surface and should block ship unless explicitly approved.
+2. **Adversarial reviews must verify runtime code-path matching, not just per-line static matching.** 8 rounds of static diffs missed A-001 because they asked "do these lines match?" not "does VK reach the same line CUDA reaches for this input?" Use CUDA as runtime oracle: dump variable values from both backends + diff. ~30-60 min single agent run vs hours of static cycle.
 
-3. **Adversarial reviews must verify runtime code-path matching, not just per-line static matching.** 8 rounds of static diffs missed A-001 because they asked "do these lines match?" not "does VK reach the same line CUDA reaches for this input?" Use CUDA as runtime oracle: dump variable values from both backends + diff. ~30-60 min single agent run vs hours of static cycle.
+3. **5-min static-diff probes hit diminishing returns fast.** If 3 rounds haven't found the bug, switch to runtime instrumentation (dump VK + CUDA values to JSONL, side-by-side diff). The setup is ~30-60 min one-time but produces the answer.
 
-4. **5-min static-diff probes hit diminishing returns fast.** If 3 rounds haven't found the bug, switch to runtime instrumentation (dump VK + CUDA values to JSONL, side-by-side diff). The setup is ~30-60 min one-time but produces the answer.
+4. **"Legitimate VK adaptation"** is a high-risk classification. Most ARE legitimate (GLSL really lacks the CUDA feature), but each one creates a code path CUDA never exercises — meaning CUDA can't be the test oracle for that path. Add to PortAdaptations.md + verify the divergent path explicitly.
 
-5. **"Legitimate VK adaptation"** is a high-risk classification. Most ARE legitimate (GLSL really lacks the CUDA feature), but each one creates a code path CUDA never exercises — meaning CUDA can't be the test oracle for that path. Add to PortAdaptations.md + verify the divergent path explicitly.
+5. **GPU benchmarks must run serially.** Never parallelize VK + CUDA bench runs (or VK + VK) — they contend for GPU/WDDM resources and produce biased numbers. Run one bench, wait for completion, then the next.
+
+(Retired 2026-06-08: the "always use tools/build_vk.bat after editing .glsl" rule — A-012 is resolved; plain `zig build` now invalidates correctly. The script is kept for force-clean scenarios but is no longer mandatory.)
 
 This file is the source of truth for "what's left." All of L1 is locked-in
 production code; the meaningful remaining work is L2-L5 to reach full CUDA

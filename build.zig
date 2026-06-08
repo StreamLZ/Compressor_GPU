@@ -1038,7 +1038,9 @@ fn addSrcVkShaderSteps(b: *std.Build) SrcVkShaders {
 
     for (srcvk_kernels) |kernel| {
         const src_path = b.fmt("srcVK/{s}.comp", .{kernel});
-        const out_name = b.fmt("{s}.spv", .{std.fs.path.basename(kernel)});
+        const basename = std.fs.path.basename(kernel);
+        const out_name = b.fmt("{s}.spv", .{basename});
+        const dep_name = b.fmt("{s}.d", .{basename});
 
         const cmd = b.addSystemCommand(&.{glslc});
         cmd.addArg("-fshader-stage=compute");
@@ -1047,6 +1049,13 @@ fn addSrcVkShaderSteps(b: *std.Build) SrcVkShaders {
         cmd.addArg(b.fmt("-I{s}", .{b.pathFromRoot("srcVK/common")}));
         cmd.addArg(b.fmt("-I{s}", .{b.pathFromRoot("srcVK/decode")}));
         cmd.addArg(b.fmt("-I{s}", .{b.pathFromRoot("srcVK/encode")}));
+        // Closes A-012: glslc -MD writes a Make-style depfile listing every
+        // .glsl included by the .comp; addDepFileOutputArg has Zig parse it
+        // after the run so editing any included header invalidates the cache
+        // and forces a SPV rebuild. Retires the tools/build_vk.bat workaround.
+        cmd.addArg("-MD");
+        cmd.addArg("-MF");
+        _ = cmd.addDepFileOutputArg(dep_name);
         cmd.addArg("-o");
         const spv_lp = cmd.addOutputFileArg(out_name);
         cmd.addFileArg(b.path(src_path));
