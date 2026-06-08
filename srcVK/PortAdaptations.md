@@ -301,6 +301,59 @@ verification status. An unverified adaptation is a known risk surface.
 - **Discovered**: Phase 2B chain parser port (this commit)
 - **Status**: RESOLVED — verified by 3-corpus cross-backend SHA gate
 
+### A-015: CLI decompress writes via heap buffer instead of mmap'd output (Intel iGPU file-handle survival)
+- **File:line**: `srcVK/cli/decompress.zig:69-118` (heap-allocate +
+  decode-into-heap + write-to-disk path)
+- **CUDA reference**: `src/cli/decompress.zig:11-end` — CUDA CLI
+  mmap's the output file, decodes straight into the mmap, then
+  `setLength` truncates the pre-sized file down to the actual written
+  bytes. CUDA has no notion of host-memory import (cuMemAlloc /
+  cuMemcpyDtoH operate on a separate GPU heap), so the mmap pages
+  are never referenced by any GPU-side kernel object — `setLength`
+  always succeeds.
+- **Class**: structural-limit (Intel/WDDM-specific kernel-mode lock
+  on `VK_EXT_external_memory_host`-imported pages)
+- **Why**: The VK decoder's iter-7 fast path imports the user dst
+  pointer as a VkDeviceMemory via `VK_EXT_external_memory_host` so
+  the GPU writes the decoded bytes straight into the caller's pages
+  (zero-copy D2H). On NVIDIA discrete `vkFreeMemory` synchronously
+  drops the kernel-mode `MmProbeAndLockPages` reference and the
+  subsequent `SetEndOfFile` on the mmap'd file succeeds. On Intel
+  iGPU the WDDM 2.x driver defers the actual `MmUnlockPages` to a
+  kernel-mode worker that does not run until process exit; the file's
+  clusters stay "in use" and `SetEndOfFile` returns
+  ERROR_ACCESS_DENIED. Verified empirically (2026-06-08): inserting
+  `vkDeviceWaitIdle` before AND after `vkFreeMemory`, evicting all
+  LRU cache entries, closing the original file handle and reopening
+  a fresh one with read_write access, and combinations thereof all
+  still fail with `AccessDenied` on Intel — the lock is on the FILE
+  object, not on any user-mode handle. The encoder CLI doesn't hit
+  this because it imports `allocHost`-anonymous heap buffers (not
+  file-backed mmap pages) for its D2H gather, then host-memcpys the
+  result into the mmap; the file is never the import target.
+- **Risk if wrong**: regression to AccessDenied on Intel iGPU at the
+  end of every `-d` run, with the output file 64 bytes too large
+  (the `decoder.safe_space` pad) and exit code 1
+- **Static verification**: traced all `prepareImportHostBuffer` /
+  `tryImportHostBuffer` callers; confirmed decode path is the only
+  one that imports a CLI-owned `dst` pointer (encode imports its
+  internal `gpu_out_buf` / `d2h_final_buf` only)
+- **Runtime verification**: ✅ Intel iGPU: L1 web (4.5 MB) + L1 enwik8
+  (100 MB) + L5 web + L5 silesia (~212 MB) all decode with exit 0,
+  size exactly `content_size` (no 64-B overshoot), SHA256 matches
+  source. NVIDIA RTX 4060 Ti: L5 web decode unaffected (exit 0,
+  correct size + SHA). `ptest_vk` 99 passed / 9 skipped / 0 failed
+  on both backends.
+- **Discovered**: 2026-06-08 root-cause investigation of the
+  pre-existing `streamlz_vk -d` Intel iGPU AccessDenied bug
+- **Status**: RESOLVED — heap buffer + writeAll path in place. The
+  one-time `~content_size` memcpy on CLI exit is small (<50 ms for
+  100 MB) and does not affect `-db` benchmark or library callers
+  (decoder API is unchanged; only the CLI driver moved off the
+  mmap'd-output shape). Could be revisited if WDDM ever ships a
+  synchronous unlock for imported pages, but the current shape
+  matches what the encoder CLI has always done.
+
 ### A-014: `ChainMatch.length` field shadowed by GLSL `.length()` method
 - **File:line**: `srcVK/encode/lz_chain_parser.glsl:28-43`
   (`isLazyMatchBetter` signature)
