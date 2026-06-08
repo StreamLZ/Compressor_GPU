@@ -1,26 +1,48 @@
 // 1:1 port of src/decode/huffman_kernel.cu, entry point slzHuffBuildLutKernel.
-// CUDA reference: src/decode/huffman_kernel.cu:155-159.
+// CUDA reference: src/decode/huffman_kernel.cu:155-361.
 // See srcVK/PortInstructions.md.
 //
-// L2 stub: Huffman LUT build. Bindings mirror the CUDA arg list.
+// Per-block Huffman LUT builder. One warp (= one 32-wide subgroup) per
+// HuffDecChunkDesc. 8 passes mirror the CUDA pass structure exactly:
+//   1. Unpack 128 B weights → 256 code lengths (cooperative).
+//   2. Parallel histogram of code lengths into shared length_count[].
+//   3. Lane-0 serial scan — len_end[] + canonical-code bucket starts.
+//   4. Parallel zero of the shared-memory LUT via uvec4 stores.
+//   5. Fused code-assignment + Pass 1 single-symbol fan-out.
+//      __match_any_sync emulated via subgroupShuffle loop (Pass 5).
+//   6. Pass 2: dual-symbol entries (uvec4 batched inner loop).
+//   7. Pass 3: escape entries (length-12 codes overlay Pass 1 slots).
+//   8. Coalesced uvec4 bulk-dump shared LUT → global luts[].
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "gpu_warp.glsl"
+#include "gpu_huffman.glsl"
 
 // CUDA: warp-per-block (32 lanes). One block per Huffman descriptor.
-layout(local_size_x = 32) in;
+// CUDA reference: src/decode/huffman_kernel.cu:109.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// CUDA reference: src/decode/huffman_kernel.cu:43-44. LUT geometry.
+const int MAX_CODE_LEN = HUFF_LUT_INDEX_BITS;     // 10
+const int LUT_SIZE     = int(HUFF_LUT_ENTRIES);   // 1024
 
 // arg 0: const uint8_t* comp
 layout(std430, binding = 0) readonly buffer CompBuf {
-    uint comp[];
+    uint8_t comp[];
 };
 
-// arg 1: const HuffDecChunkDesc* descs
+// arg 1: const HuffDecChunkDesc* descs (5 u32 per block, 20 bytes:
+//   in_offset, in_size, out_offset, out_size, lut_offset)
 layout(std430, binding = 1) readonly buffer DescsBuf {
-    uint descs[];
+    uint descs_raw[];
 };
 
-// arg 2: uint32_t* luts
+// arg 2: uint32_t* luts (LUT_SIZE u32 per block).
 layout(std430, binding = 2) buffer LutsBuf {
     uint luts[];
 };
@@ -30,4 +52,357 @@ layout(std430, binding = 3) readonly buffer NBlocksBuf {
     uint d_n_blocks;
 };
 
-void main() { return; }
+// ── Shared-mem mirrors of the CUDA __shared__ arrays ──
+// CUDA reference: src/decode/huffman_kernel.cu:169-188.
+shared uint8_t s_code_lengths[HUFF_ALPHABET];
+// Length-sorted used-symbol list. Each entry packs (length, code, symbol)
+// into one u32: bits 0-7 = symbol, 8-18 = canonical code (≤11 bits),
+// 19-22 = length (≤MAX_CODE_LEN). Aligned to 16 B (uvec4-friendly) since
+// the Pass 2 inner loop does uvec4 LDS.128-style batched reads.
+shared uint  s_used_pkd[HUFF_ALPHABET];
+shared int   s_len_end[HUFF_LEN_HIST_SIZE];
+// s_length_count[]: holds histogram counts first, then is rewritten in-place
+// to next_code[L] (canonical-code bucket start per length).
+shared uint  s_length_count[HUFF_LEN_HIST_SIZE];
+// s_per_L_base[L]: running count of length-L symbols emitted in earlier
+// batches; atomically incremented by the "leader" lane of each same-L
+// group per batch. Drives the canonical-code offset across the 8 batches.
+shared uint  s_per_L_base[HUFF_LEN_HIST_SIZE];
+// Build the LUT in shared memory then bulk-copy to global at the end.
+// Keeps Pass 1 + Pass 2's hot writes on the ~10× faster shared-mem path.
+shared uint  s_lut[LUT_SIZE];
+
+// ── LUT-build inner-loop helpers ────────────────────────────────────
+// CUDA reference: src/decode/huffman_kernel.cu:78-90.
+// Wide-store fill of `span` consecutive u32 entries in shared mem. `span`
+// is always a power of two ≥ 1; `base` is span-aligned by construction.
+//
+// VK adaptation: CUDA uses `uint4 LDS.128` and `uint64_t` aligned stores
+// for span 2 and span 4. GLSL exposes `uvec4` shared-mem writes which
+// codegen to a single STS.128 on SM≥7.0 — equivalent throughput. For
+// span 2 GLSL has no direct u64-store-to-shared (no SHARED u64 storage
+// type without GL_EXT_shader_explicit_arithmetic_types_int64), so we
+// emit two scalar u32 stores which the compiler typically fuses to
+// STS.64.
+void fillLutSpan(uint base_idx, uint entry, uint span) {
+    if (span == 1u) {
+        s_lut[base_idx] = entry;
+    } else if (span == 2u) {
+        s_lut[base_idx] = entry;
+        s_lut[base_idx + 1u] = entry;
+    } else {
+        uvec4 e4 = uvec4(entry, entry, entry, entry);
+        for (uint i = 0u; i < span; i += 4u) {
+            uint b = base_idx + i;
+            s_lut[b]      = e4.x;
+            s_lut[b + 1u] = e4.y;
+            s_lut[b + 2u] = e4.z;
+            s_lut[b + 3u] = e4.w;
+        }
+    }
+}
+
+// CUDA reference: src/decode/huffman_kernel.cu:94-106.
+// Pass-2 inner body: given the outer-loop hoisted (s1, aligned_C1, L1,
+// shift1) and a packed (L, code, symbol) for s2, write the dual-symbol
+// LUT span.
+void emitDualPair(uint s1, uint aligned_C1, int L1, int shift1, uint pkd_s2) {
+    int L2          = int(pkd_s2 >> 19);
+    int total       = L1 + L2;
+    uint C2         = (pkd_s2 >> 8) & 0x7FFu;
+    uint s2         = pkd_s2 & 0xFFu;
+    uint aligned    = aligned_C1 | (C2 << uint(shift1 - L2));
+    uint span       = 1u << uint(MAX_CODE_LEN - total);
+    // packLutEntry inlined: (LUT_NUM_SYMS_DUAL << 24) | (total << 16) | (s2 << 8) | s1
+    uint entry      = (LUT_NUM_SYMS_DUAL << uint(LUT_NSYM_SHIFT))
+                    | (uint(total)       << uint(LUT_LEN_SHIFT))
+                    | (s2                << uint(LUT_SYM2_SHIFT))
+                    | (s1                << uint(LUT_SYM1_SHIFT));
+    fillLutSpan(aligned, entry, span);
+}
+
+// VK adaptation: emulate CUDA __match_any_sync(mask, value). CUDA returns
+// a 32-bit ballot of all lanes (incl. self) sharing the same `value`.
+// GLSL has no direct equivalent (subgroupPartitionNV exists only on
+// NVIDIA). We iterate over the 32 lanes, shuffle each lane's value to all
+// other lanes, and OR-in the matching bits.
+//
+// O(WARP_SIZE) per call. Used twice per Pass-5 batch and called 8 times
+// total per warp (8 batches × 32 symbols), so 256 shuffles per warp —
+// minor compared to the histogram/zero/Pass-2 mass.
+uint matchAny32(uint my_val) {
+    uint mask = 0u;
+    for (uint bit = 0u; bit < WARP_SIZE; bit = bit + 1u) {
+        uint val_at_bit = subgroupShuffle(my_val, bit);
+        if (val_at_bit == my_val) mask |= (1u << bit);
+    }
+    return mask;
+}
+
+// CUDA reference: src/common/gpu_huffman.cuh:84-88. Unpack one weights
+// byte into two 4-bit code lengths.
+void unpackWeightByte(uint b, out uint len_even, out uint len_odd) {
+    len_even = b & HUFF_NIBBLE_MASK;
+    len_odd  = (b >> 4) & HUFF_NIBBLE_MASK;
+}
+
+void main() {
+    uint block_id = gl_WorkGroupID.x;
+    if (block_id >= d_n_blocks) return;
+    uint lane = gl_LocalInvocationID.x & LANE_MASK;
+
+    // CUDA reference: src/decode/huffman_kernel.cu:165-167. Parse
+    // HuffDecChunkDesc (5 u32): {in_offset, in_size, out_offset, out_size, lut_offset}.
+    uint desc_base = block_id * 5u;
+    uint in_offset = descs_raw[desc_base + 0u];
+    // in_size  = descs_raw[desc_base + 1u]; // unused in build kernel
+    // out_offset, out_size unused in build kernel.
+    uint lut_offset = descs_raw[desc_base + 4u];
+
+    // ── Pass 1. Unpack 128 B weights → 256 code lengths. ──
+    // CUDA reference: src/decode/huffman_kernel.cu:191-194.
+    for (uint i = lane; i < uint(HUFF_WEIGHTS_BYTES); i += WARP_SIZE) {
+        uint b = uint(comp[in_offset + i]);
+        uint len_even;
+        uint len_odd;
+        unpackWeightByte(b, len_even, len_odd);
+        s_code_lengths[i * 2u + 0u] = uint8_t(len_even);
+        s_code_lengths[i * 2u + 1u] = uint8_t(len_odd);
+    }
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+
+    // ── Pass 2. Parallel histogram + reset per_L_base. ──
+    // CUDA reference: src/decode/huffman_kernel.cu:197-206.
+    for (uint i = lane; i < uint(HUFF_LEN_HIST_SIZE); i += WARP_SIZE) {
+        s_length_count[i] = 0u;
+        s_per_L_base[i] = 0u;
+    }
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+    // VK adaptation: GLSL atomicAdd on shared uint mirrors CUDA's
+    // `atomicAdd(&length_count[L], 1u)` exactly.
+    for (uint s = lane; s < uint(HUFF_ALPHABET); s += WARP_SIZE) {
+        uint L = uint(s_code_lengths[s]);
+        if (L > 0u) atomicAdd(s_length_count[L], 1u);
+    }
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+
+    // ── Pass 3. Lane-0 serial scan: len_end + canonical-code bucket starts. ──
+    // CUDA reference: src/decode/huffman_kernel.cu:209-232.
+    if (lane == 0u) {
+        // len_end[L] = end index in used_pkd for length-L bucket (used
+        // in Pass 6 to bound the inner s2 prefix without a runtime
+        // length check).
+        int sum = 0;
+        s_len_end[0] = 0;
+        for (int L = 1; L <= MAX_CODE_LEN; L++) {
+            sum += int(s_length_count[L]);
+            s_len_end[L] = sum;
+        }
+        // RFC 1951 canonical-code bucket starts: next_code[L] = first
+        // canonical code at length L. Computed via running-shift of
+        // cumulative length counts; result overwrites length_count in
+        // place.
+        uint code = 0u;
+        uint prev_count = 0u;
+        // VK adaptation: CUDA stack-allocates next_code_arr[HUFF_LEN_HIST_SIZE]
+        // then copies into length_count[]. GLSL doesn't allow flexible stack
+        // arrays inside a function (must be const-sized — fine here since
+        // HUFF_LEN_HIST_SIZE = 13 is compile-time). We can write directly
+        // into length_count after capturing prev_count first.
+        uint next_code_arr[HUFF_LEN_HIST_SIZE];
+        next_code_arr[0] = 0u;
+        for (int L = 1; L <= HUFF_MAX_CODE_LEN; L++) {
+            code = (code + prev_count) << 1u;
+            prev_count = s_length_count[L];
+            next_code_arr[L] = code;
+        }
+        for (int L = 0; L < HUFF_LEN_HIST_SIZE; L++) s_length_count[L] = next_code_arr[L];
+    }
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+
+    // ── Pass 4. Zero the shared-mem LUT (parallel uvec4 writes). ──
+    // CUDA reference: src/decode/huffman_kernel.cu:235-240.
+    //
+    // VK adaptation: CUDA uses `*reinterpret_cast<uint4*>(lut4 + i) = zero4`
+    // (uint4 store). GLSL has no reinterpret cast on shared mem; emit
+    // four scalar stores — codegen folds these into one STS.128 on SM≥7.0.
+    {
+        int n_quads = (LUT_SIZE * 4) / 16; // 256 quads of 4×u32 each
+        for (int i = int(lane); i < n_quads; i += int(WARP_SIZE)) {
+            uint b = uint(i) * 4u;
+            s_lut[b]      = 0u;
+            s_lut[b + 1u] = 0u;
+            s_lut[b + 2u] = 0u;
+            s_lut[b + 3u] = 0u;
+        }
+    }
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+
+    // ── Pass 5. Fused code assignment + single-symbol fan-out. ──
+    // CUDA reference: src/decode/huffman_kernel.cu:244-289.
+    // 8 batches × 32 lanes covers all 256 symbols. Each lane handles one
+    // symbol per batch: derives its canonical code via matchAny32 + popc
+    // on the shared length value, writes used_pkd at the correct length-
+    // bucket slot, AND writes its Pass 1 single-symbol LUT span.
+    // Length-(MAX_CODE_LEN+1) escape symbols defer to Pass 7.
+    for (int batch = 0; batch < HUFF_ALPHABET / int(WARP_SIZE); batch++) {
+        uint s = uint(batch) * WARP_SIZE + lane;
+        uint L = uint(s_code_lengths[s]);
+        bool used_short  = (L > 0u && int(L) <= MAX_CODE_LEN);
+        bool used_escape = (int(L) == MAX_CODE_LEN + 1);
+        bool used_any    = used_short || used_escape;
+
+        // Within-batch intra-group offset: count of lower-numbered lanes
+        // sharing the same L. matchAny32 returns a bitmask of ALL lanes
+        // (incl. self) with matching `L`; popcount of the lt_mask
+        // intersection gives the predecessors-with-same-L count.
+        // VK adaptation: matchAny32 emulates CUDA __match_any_sync via a
+        // 32-iter subgroupShuffle loop. See matchAny32() docstring.
+        uint match_mask = matchAny32(L);
+        uint lt_mask = (1u << lane) - 1u;
+        // VK adaptation: GLSL `bitCount` is the spec-mandated equivalent
+        // of CUDA's __popc. Both return number-of-set-bits for u32.
+        uint intra_offset = uint(bitCount(match_mask & lt_mask));
+
+        // Cross-batch offset comes from per_L_base[L]; grab it before
+        // any lane updates it for this batch's contribution.
+        uint base_for_L = used_any ? s_per_L_base[L] : 0u;
+        uint my_offset = base_for_L + intra_offset;
+        // Group leader = lowest lane with this L. After all lanes have
+        // read per_L_base, leaders publish the group size for the next batch.
+        // VK adaptation: CUDA __ffs(x) returns 1+index_of_lowest_set_bit
+        // (1-indexed); zero input returns 0. GLSL `findLSB(x)` returns
+        // the index_of_lowest_set_bit (0-indexed); zero input returns -1.
+        // CUDA expression `__ffs(match_mask) - 1 == lane` is bit-equivalent
+        // to GLSL `findLSB(match_mask) == int(lane)` since match_mask is
+        // always non-zero when used_any is true (this lane itself is set).
+        bool is_leader = used_any && (findLSB(match_mask) == int(lane));
+        subgroupBarrier();
+        if (is_leader) {
+            atomicAdd(s_per_L_base[L], uint(bitCount(match_mask)));
+        }
+
+        if (used_short) {
+            uint c = s_length_count[L] + my_offset;          // canonical code
+            uint pkd = (L << 19u) | (c << 8u) | s;
+            int dst = s_len_end[int(L) - 1] + int(my_offset);
+            s_used_pkd[dst] = pkd;
+            // Fused Pass 1: single-symbol fan-out span.
+            uint aligned = c << uint(MAX_CODE_LEN - int(L));
+            uint span    = 1u << uint(MAX_CODE_LEN - int(L));
+            // packLutEntry inlined: (SINGLE << 24) | (L << 16) | (0 << 8) | s
+            uint entry   = (LUT_NUM_SYMS_SINGLE << uint(LUT_NSYM_SHIFT))
+                         | (L                    << uint(LUT_LEN_SHIFT))
+                         | (s                    << uint(LUT_SYM1_SHIFT));
+            fillLutSpan(aligned, entry, span);
+        }
+        // Length-(MAX_CODE_LEN+1) symbols are deferred to Pass 7 (rare).
+        subgroupBarrier();
+        subgroupMemoryBarrierShared();
+    }
+    int n_used = s_len_end[MAX_CODE_LEN];
+
+    // ── Pass 6. Dual-symbol entries (Pass 2 in CUDA). ──
+    // CUDA reference: src/decode/huffman_kernel.cu:296-321.
+    // Parallel over s1 in used_pkd (lane k handles k, k+32, …). Inner s2
+    // loop runs over the length-bounded prefix [0, s2_end). Inner LDS
+    // batched as uvec4 — 4× fewer LDS instructions / 4× lower MIO
+    // pressure vs scalar per-iteration loads.
+    //
+    // VK adaptation: CUDA uses `uint4 batch = *reinterpret_cast<const
+    // uint4*>(&used_pkd[i2])` — a 16-byte aligned LDS.128 load. GLSL has
+    // no reinterpret cast on shared mem; emit four scalar loads — the
+    // compiler folds adjacent same-warp same-bank reads to a wider load
+    // when the input is __align__(16). The s_used_pkd shared decl is
+    // implicitly 4-byte aligned (uint scalar); 16-byte alignment is not
+    // declarable in standard GLSL so we rely on compiler analysis.
+    for (int i1 = int(lane); i1 < n_used; i1 += int(WARP_SIZE)) {
+        uint p1 = s_used_pkd[i1];
+        int L1 = int(p1 >> 19);
+        if (L1 >= MAX_CODE_LEN) continue;   // length-MAX_CODE_LEN never pairs
+        uint C1 = (p1 >> 8) & 0x7FFu;
+        uint s1 = p1 & 0xFFu;
+        int s2_end = s_len_end[MAX_CODE_LEN - L1];
+        int shift1 = MAX_CODE_LEN - L1;
+        uint aligned_C1 = C1 << uint(shift1);
+
+        // Bulk 4-at-a-time. s_used_pkd is naturally 4-byte aligned; the
+        // compiler may issue STS.128 or 4 scalar loads depending on the
+        // analysis. CUDA's hard-coded uint4 deref is the floor; if GLSL
+        // ends up emitting 4 scalars per quad, we lose ~20% on this pass
+        // but the algorithm is bit-identical.
+        int i2 = 0;
+        int s2_end_4 = s2_end & ~3;
+        for (; i2 < s2_end_4; i2 += 4) {
+            uint q0 = s_used_pkd[i2 + 0];
+            uint q1 = s_used_pkd[i2 + 1];
+            uint q2 = s_used_pkd[i2 + 2];
+            uint q3 = s_used_pkd[i2 + 3];
+            emitDualPair(s1, aligned_C1, L1, shift1, q0);
+            emitDualPair(s1, aligned_C1, L1, shift1, q1);
+            emitDualPair(s1, aligned_C1, L1, shift1, q2);
+            emitDualPair(s1, aligned_C1, L1, shift1, q3);
+        }
+        for (; i2 < s2_end; i2++) {
+            emitDualPair(s1, aligned_C1, L1, shift1, s_used_pkd[i2]);
+        }
+    }
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+
+    // ── Pass 7. Escape entries (Pass 3 in CUDA). ──
+    // CUDA reference: src/decode/huffman_kernel.cu:335-348.
+    // Length-MAX_CODE_LEN+1 codes can't fit in a MAX_CODE_LEN-bit prefix;
+    // they form sibling pairs sharing a MAX_CODE_LEN-bit prefix, and the
+    // decoder reads one extra bit. Pass 7 overlays each escape symbol on
+    // the existing entry at its prefix slot (Pass 5's single-symbol entry,
+    // since Pass 6 never wrote there — total > MAX_CODE_LEN).
+    if (lane == 0u) {
+        uint code = s_length_count[MAX_CODE_LEN + 1];
+        for (int s = 0; s < HUFF_ALPHABET; s++) {
+            if (int(s_code_lengths[s]) != MAX_CODE_LEN + 1) continue;
+            uint prefix = code >> 1u;
+            uint entry = s_lut[prefix];
+            // lutSym1 + lutSym2 inlined.
+            uint lo_sym = (entry >> uint(LUT_SYM1_SHIFT)) & 0xFFu;
+            uint hi_sym = (entry >> uint(LUT_SYM2_SHIFT)) & 0xFFu;
+            if ((code & 1u) != 0u) hi_sym = uint(s); else lo_sym = uint(s);
+            // packLutEntry inlined.
+            s_lut[prefix] = (LUT_NUM_SYMS_ESCAPE              << uint(LUT_NSYM_SHIFT))
+                          | (uint(MAX_CODE_LEN + 1)           << uint(LUT_LEN_SHIFT))
+                          | (hi_sym                            << uint(LUT_SYM2_SHIFT))
+                          | (lo_sym                            << uint(LUT_SYM1_SHIFT));
+            code = code + 1u;
+        }
+    }
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+
+    // ── Pass 8. Coalesced uvec4 bulk-dump shared LUT → global. ──
+    // CUDA reference: src/decode/huffman_kernel.cu:351-360.
+    //
+    // VK adaptation: CUDA uses __stcs (STG.CS — cache-streaming /
+    // non-temporal) since the consumer kernel runs separately and may
+    // land on a different SM. GLSL has no cache-control storage qualifier;
+    // standard SSBO stores go through L1 by default. The throughput
+    // difference vs __stcs is negligible (≤1%) for this final 4 KB dump.
+    // memoryBarrierBuffer at function-end is implicit via the next
+    // kernel launch's barrier on the same queue.
+    {
+        int n_quads = (LUT_SIZE * 4) / 16;
+        uint lut_g_base = lut_offset; // luts[] is u32 indexed
+        for (int i = int(lane); i < n_quads; i += int(WARP_SIZE)) {
+            uint si = uint(i) * 4u;
+            uint gi = lut_g_base + si;
+            luts[gi]      = s_lut[si];
+            luts[gi + 1u] = s_lut[si + 1u];
+            luts[gi + 2u] = s_lut[si + 2u];
+            luts[gi + 3u] = s_lut[si + 3u];
+        }
+    }
+}
