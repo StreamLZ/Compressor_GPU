@@ -2,13 +2,18 @@
 // CUDA reference: src/encode/huffman_kernel.cu:111-227.
 // See srcVK/PortInstructions.md.
 //
-// L2 stub: Huffman tables build (L3+). Histogram + canonical code-length
-// build, one block per sub-chunk, WARP_SIZE lanes. Bindings match the
-// CUDA arg list verbatim; the body is empty per the L2 stub pattern.
+// Per-sub-chunk Huffman table builder. Histograms the input via shared
+// atomicAdd, then lane 0 builds a sibling-merge tree, applies the
+// Kraft-budget height-limit redistribution, and assigns canonical codes.
+// Writes code_lengths[256] (u8) + codes[256] (u32) per block strided by
+// tables_stride (= HUFF_ALPHABET).
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "gpu_warp.glsl"
+#include "gpu_huffman.glsl"
 
 // CUDA: n_blocks blocks × (32, 1, 1) threads per encode_huff.zig:153.
 // One warp (= one subgroup of width 32) per sub-chunk.
@@ -42,4 +47,196 @@ layout(push_constant) uniform Push {
     uint n_blocks;
 } pc;
 
-void main() { return; }
+// CUDA reference: src/encode/huffman_kernel.cu:35-40. Encode-side table
+// sizes + Kraft fixed-point precision.
+const int HUFF_TREE_NODES = 2 * HUFF_ALPHABET;      // 512
+const int KRAFT_PRECISION_BITS = 30;
+const int ENC_MAX_CODE_LEN = HUFF_MAX_CODE_LEN;     // 11
+
+// Shared-mem mirrors of the CUDA __shared__ arrays. CUDA reference:
+// src/encode/huffman_kernel.cu:124-130.
+shared uint  s_hist[HUFF_ALPHABET];
+shared uint  s_weights[HUFF_TREE_NODES];        // leaves 0..255, internals 256..510
+shared int   s_parents[HUFF_TREE_NODES];
+shared int   s_active[HUFF_TREE_NODES];
+shared int   s_used_symbols[HUFF_ALPHABET];
+shared uint  s_code_lengths[HUFF_ALPHABET];     // CUDA u8, kept as uint for shared arith
+shared uint  s_codes[HUFF_ALPHABET];
+
+void main() {
+    const uint block_id = gl_WorkGroupID.x;
+    if (block_id >= pc.n_blocks) return;
+    const uint lane = gl_LocalInvocationID.x & LANE_MASK;
+
+    // Parse HuffEncDesc (5 u32). CUDA: src/encode/huffman_kernel.cu:122.
+    const uint desc_base = block_id * 5u;
+    const uint src_offset = descs_raw[desc_base + 0u];
+    const uint src_size   = descs_raw[desc_base + 1u];
+    const uint src_stride = descs_raw[desc_base + 2u];
+
+    // ── Histogram (32 lanes → shared atomics) ──
+    // CUDA reference: src/encode/huffman_kernel.cu:132-138.
+    for (uint i = lane; i < uint(HUFF_ALPHABET); i += WARP_SIZE) {
+        s_hist[i] = 0u;
+    }
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+    // VK adaptation: GLSL atomicAdd on shared uint mirrors CUDA's
+    // `atomicAdd(&hist[in[i*stride]], 1u)` exactly.
+    for (uint i = lane; i < src_size; i += WARP_SIZE) {
+        uint sym = uint(input_buf[src_offset + i * src_stride]);
+        atomicAdd(s_hist[sym], 1u);
+    }
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+
+    // ── Lane 0: serial tree-build + height-limit + canonical codes ──
+    if (lane == 0u) {
+        // CUDA reference: src/encode/huffman_kernel.cu:142-143.
+        for (int i = 0; i < HUFF_TREE_NODES; i++) {
+            s_weights[i] = 0u;
+            s_parents[i] = -1;
+        }
+        for (int s = 0; s < HUFF_ALPHABET; s++) {
+            s_code_lengths[s] = 0u;
+            s_codes[s] = 0u;
+        }
+
+        int symbols_used = 0;
+        for (int s = 0; s < HUFF_ALPHABET; s++) {
+            if (s_hist[s] > 0u) {
+                s_weights[s] = s_hist[s];
+                s_used_symbols[symbols_used] = s;
+                symbols_used++;
+            }
+        }
+
+        if (symbols_used == 1) {
+            // CUDA reference: src/encode/huffman_kernel.cu:150-154.
+            // Degenerate single-symbol alphabet: a 1-bit code.
+            s_code_lengths[s_used_symbols[0]] = 1u;
+        } else if (symbols_used >= 2) {
+            // CUDA reference: src/encode/huffman_kernel.cu:155-185.
+            // Sibling-merge tree build via an "active" frontier list.
+            int n_active = symbols_used;
+            int next_node = HUFF_ALPHABET;
+            for (int i = 0; i < n_active; i++) s_active[i] = s_used_symbols[i];
+            while (n_active > 1) {
+                int a_pos = 0;
+                int b_pos = 1;
+                if (s_weights[s_active[a_pos]] > s_weights[s_active[b_pos]]) {
+                    int t = a_pos; a_pos = b_pos; b_pos = t;
+                }
+                for (int i = 2; i < n_active; i++) {
+                    uint w = s_weights[s_active[i]];
+                    if (w < s_weights[s_active[a_pos]]) {
+                        b_pos = a_pos;
+                        a_pos = i;
+                    } else if (w < s_weights[s_active[b_pos]]) {
+                        b_pos = i;
+                    }
+                }
+                int a = s_active[a_pos];
+                int b = s_active[b_pos];
+                s_weights[next_node] = s_weights[a] + s_weights[b];
+                s_parents[a] = next_node;
+                s_parents[b] = next_node;
+                int new_pos = (a_pos < b_pos) ? a_pos : b_pos;
+                int old_pos = (a_pos < b_pos) ? b_pos : a_pos;
+                s_active[new_pos] = next_node;
+                s_active[old_pos] = s_active[n_active - 1];
+                n_active--;
+                next_node++;
+            }
+            // Walk each symbol up to its root to record code length.
+            for (int i = 0; i < symbols_used; i++) {
+                int s = s_used_symbols[i];
+                int depth = 0;
+                int n = s;
+                while (s_parents[n] != -1) {
+                    depth++;
+                    n = s_parents[n];
+                }
+                s_code_lengths[s] = uint(depth);
+            }
+        }
+
+        // ── Kraft-budget height limit (CUDA ref: huffman_kernel.cu:191-211) ──
+        // Clamp BEFORE summing: a raw tree depth > KRAFT_PRECISION_BITS
+        // would underflow the shift count. Post-clamp, every length is in
+        // [1, max_len] and the shift is well-defined.
+        {
+            const uint kraft_budget = 1u << KRAFT_PRECISION_BITS;
+            const int max_len = ENC_MAX_CODE_LEN;
+            for (int s = 0; s < HUFF_ALPHABET; s++) {
+                if (int(s_code_lengths[s]) > max_len) {
+                    s_code_lengths[s] = uint(max_len);
+                }
+            }
+            uint sum = 0u;
+            for (int s = 0; s < HUFF_ALPHABET; s++) {
+                if (s_code_lengths[s] > 0u) {
+                    sum += (1u << (uint(KRAFT_PRECISION_BITS) - s_code_lengths[s]));
+                }
+            }
+            // Redistribute: lengthen the symbol with the smallest histogram
+            // count that still has slack (length < max_len), repeatedly
+            // until the Kraft sum fits the budget.
+            while (sum > kraft_budget) {
+                int best = -1;
+                uint best_w = 0xFFFFFFFFu;
+                for (int s = 0; s < HUFF_ALPHABET; s++) {
+                    if (s_code_lengths[s] > 0u && int(s_code_lengths[s]) < max_len && s_hist[s] < best_w) {
+                        best_w = s_hist[s];
+                        best = s;
+                    }
+                }
+                if (best < 0) break;
+                sum -= (1u << (uint(KRAFT_PRECISION_BITS) - s_code_lengths[best]));
+                s_code_lengths[best] = s_code_lengths[best] + 1u;
+                sum += (1u << (uint(KRAFT_PRECISION_BITS) - s_code_lengths[best]));
+            }
+        }
+
+        // ── Canonical code assignment (RFC-1951 canonical codes) ──
+        // CUDA reference: src/encode/huffman_kernel.cu:216 → buildCanonicalCodes()
+        // in src/common/gpu_huffman.cuh:102-122.
+        {
+            uint length_count[HUFF_LEN_HIST_SIZE];
+            for (int L = 0; L < HUFF_LEN_HIST_SIZE; L++) length_count[L] = 0u;
+            for (int s = 0; s < HUFF_ALPHABET; s++) {
+                uint L = s_code_lengths[s];
+                if (L > 0u) length_count[L] = length_count[L] + 1u;
+            }
+            length_count[0] = 0u;
+
+            uint next_code[HUFF_LEN_HIST_SIZE];
+            for (int L = 0; L < HUFF_LEN_HIST_SIZE; L++) next_code[L] = 0u;
+            uint code = 0u;
+            for (int L = 1; L <= HUFF_MAX_CODE_LEN; L++) {
+                code = (code + length_count[L - 1]) << 1;
+                next_code[L] = code;
+            }
+            for (int s = 0; s < HUFF_ALPHABET; s++) {
+                uint L = s_code_lengths[s];
+                if (L != 0u) {
+                    s_codes[s] = next_code[L];
+                    next_code[L] = next_code[L] + 1u;
+                } else {
+                    s_codes[s] = 0u;
+                }
+            }
+        }
+    }
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+
+    // ── Write tables (warp-cooperative) ──
+    // CUDA reference: src/encode/huffman_kernel.cu:221-226.
+    const uint cl_base = block_id * pc.tables_stride;
+    const uint codes_base = block_id * pc.tables_stride;
+    for (uint i = lane; i < uint(HUFF_ALPHABET); i += WARP_SIZE) {
+        code_lengths_out[cl_base + i] = uint8_t(s_code_lengths[i] & 0xFFu);
+        codes_out[codes_base + i] = s_codes[i];
+    }
+}

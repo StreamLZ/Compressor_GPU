@@ -2,17 +2,23 @@
 // CUDA reference: src/encode/huffman_kernel.cu:246-395.
 // See srcVK/PortInstructions.md.
 //
-// L2 stub: Huffman HUFF_NUM_STREAMS-way parallel encode (L3+). One block
-// per sub-chunk, WARP_SIZE lanes; each lane encodes one input slice into
-// per-stream scratch, then the warp cooperatively writes the BIL body.
-// Bindings match the CUDA arg list verbatim; the body is empty per the
-// L2 stub pattern.
+// HUFF_NUM_STREAMS-way parallel encode. One workgroup per sub-chunk; the
+// 32 warp lanes each encode one input slice into per-stream scratch, then
+// the warp cooperatively writes the BIL body at
+//   output + descs[block_id].dst_offset.
+// BIL layout: [HUFF_WEIGHTS_BYTES weights | HUFF_SUBHEADER_BYTES (32 × u24 LE
+// per-stream sizes) | HUFF_BIL_K_BYTES (u32 LE K) | K rows × 128B interleaved
+// area | tail area].
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "gpu_warp.glsl"
+#include "gpu_huffman.glsl"
 
 // CUDA: n_blocks blocks × (32, 1, 1) threads per encode_huff.zig:171.
 // One warp (= one subgroup of width 32) per sub-chunk.
@@ -31,17 +37,19 @@ layout(std430, binding = 1) readonly buffer DescsBuf {
 
 // arg 2: const uint8_t* code_lengths  (HUFF_ALPHABET × n_blocks)
 layout(std430, binding = 2) readonly buffer CodeLengthsBuf {
-    uint8_t code_lengths[];
+    uint8_t code_lengths_buf[];
 };
 
 // arg 3: const uint32_t* codes  (HUFF_ALPHABET × n_blocks)
 layout(std430, binding = 3) readonly buffer CodesBuf {
-    uint codes[];
+    uint codes_buf[];
 };
 
-// arg 4: uint8_t* scratch  (per-stream scratch slab)
+// arg 4: uint8_t* scratch  (per-stream scratch slab; per-lane stride
+// `scratch_per_stream` bytes, per-block stride
+// HUFF_NUM_STREAMS * scratch_per_stream).
 layout(std430, binding = 4) buffer ScratchBuf {
-    uint8_t scratch[];
+    uint8_t scratch_buf[];
 };
 
 // arg 5: uint8_t* output  (packed BIL bodies)
@@ -62,4 +70,227 @@ layout(push_constant) uniform Push {
     uint n_blocks;
 } pc;
 
-void main() { return; }
+// CUDA reference: src/common/gpu_huffman.cuh:79-82. Pack two 4-bit
+// lengths into one byte.
+uint packWeightByte(uint len_even, uint len_odd) {
+    return (len_even & HUFF_NIBBLE_MASK) | ((len_odd & HUFF_NIBBLE_MASK) << 4);
+}
+
+// ── Single-stream encode core (per-lane) ────────────────────────────
+// CUDA reference: src/encode/huffman_kernel.cu:67-100, encodeStreamOneLane.
+// Packs codewords MSB-first into the per-lane scratch slot. Returns the
+// total bytes written (including the trailing partial byte).
+//
+// VK adaptation: CUDA uses a uint64_t bit buffer; GLSL core 460 does not
+// have uint64. The buffer's invariant is `pre-enqueue bit_count < 8` and
+// `len <= HUFF_MAX_CODE_LEN = 11`, so post-enqueue `bit_count <= 18` and
+// at most 18 bits are ever live in the buffer. We therefore use a single
+// `uint bit_buf` (32 bits) — the algorithm only ever shifts within the
+// low 18 bits and the byte extraction never crosses the 32-bit boundary.
+// The OUTPUT scratch slot is the same per-lane scratch the BIL writer
+// reads from. Note that we write into `scratch_buf` here (NOT
+// `output_buf`); CUDA writes to `my_scratch` which is the scratch slab,
+// not the final output.
+uint encodeStreamOneLane(uint in_offset, uint in_size, uint stride,
+                          uint cl_base, uint codes_base,
+                          uint scratch_off) {
+    uint bit_buf = 0u;
+    int bit_count = 0;
+    uint out_pos = 0u;
+
+    for (uint i = 0u; i < in_size; i++) {
+        uint sym = uint(input_buf[in_offset + i * stride]);
+        uint code = codes_buf[codes_base + sym];
+        uint len = uint(code_lengths_buf[cl_base + sym]);
+        // Contract (CUDA assert(len > 0)): every used symbol has a non-zero
+        // canonical code length. buildCanonicalCodes preserves this; the
+        // histogram path in slzHuffBuildTablesKernel only assigns lengths
+        // to symbols with hist[s] > 0, and the same symbols are the only
+        // ones the encoder ever loads from `in`. Skip when len==0 to
+        // protect against the malformed-table case (CUDA assert is debug-
+        // only; GPU compute has no equivalent runtime trap, so we treat
+        // it as a no-op which matches CUDA -DNDEBUG behavior — silently
+        // dropping the symbol — rather than producing garbage bits).
+        if (len == 0u) continue;
+        // bit_buf = (bit_buf << len) | code. After this enqueue, bit_count
+        // is at most prev_bit_count(<8) + 11 = 18, so the buffer occupies
+        // only the low 18 bits — well within 32. CUDA's uint64_t buffer
+        // is over-provisioned; the algorithm only ever needs 19 bits of
+        // headroom.
+        bit_buf = (bit_buf << len) | code;
+        bit_count += int(len);
+
+        // Flush whole bytes MSB-first. CUDA reference:
+        // src/encode/huffman_kernel.cu:91-94.
+        while (bit_count >= int(BITS_PER_BYTE)) {
+            bit_count -= int(BITS_PER_BYTE);
+            uint byte_val = (bit_buf >> uint(bit_count)) & 0xFFu;
+            scratch_buf[scratch_off + out_pos] = uint8_t(byte_val);
+            out_pos++;
+        }
+    }
+    // Trailing partial byte: pad on the right.
+    // CUDA reference: src/encode/huffman_kernel.cu:96-98.
+    if (bit_count > 0) {
+        uint shift = uint(int(BITS_PER_BYTE) - bit_count);
+        uint byte_val = (bit_buf << shift) & 0xFFu;
+        scratch_buf[scratch_off + out_pos] = uint8_t(byte_val);
+        out_pos++;
+    }
+    return out_pos;
+}
+
+// CUDA reference: src/common/gpu_byteio.cuh writeLE24. Emit a 24-bit
+// little-endian value into output_buf at the given absolute byte offset.
+void emitLE24(uint dst_abs, uint value) {
+    output_buf[dst_abs + 0u] = uint8_t(value & 0xFFu);
+    output_buf[dst_abs + 1u] = uint8_t((value >> 8) & 0xFFu);
+    output_buf[dst_abs + 2u] = uint8_t((value >> 16) & 0xFFu);
+}
+
+void main() {
+    const uint block_id = gl_WorkGroupID.x;
+    if (block_id >= pc.n_blocks) return;
+    const uint lane = gl_LocalInvocationID.x & LANE_MASK;
+
+    // Parse HuffEncDesc (5 u32). CUDA: src/encode/huffman_kernel.cu:262.
+    const uint desc_base = block_id * 5u;
+    const uint src_offset = descs_raw[desc_base + 0u];
+    const uint src_size   = descs_raw[desc_base + 1u];
+    const uint src_stride = descs_raw[desc_base + 2u];
+    const uint dst_offset = descs_raw[desc_base + 3u];
+    // dst_capacity unused (CUDA does not bounds-check; the caller pre-sizes).
+
+    // Empty descriptor → no Huffman body. CUDA reference:
+    // src/encode/huffman_kernel.cu:267-270.
+    if (src_size == 0u) {
+        if (lane == 0u) out_sizes[block_id] = 0u;
+        return;
+    }
+
+    // Per-block table base. CUDA reference: src/encode/huffman_kernel.cu:274.
+    const uint cl_base = block_id * pc.tables_stride;
+    const uint codes_base = block_id * pc.tables_stride;
+
+    // All 32 lanes encode one slice into per-lane scratch.
+    // CUDA reference: src/encode/huffman_kernel.cu:281-295.
+    uint bytes = 0u;
+    {
+        uint q = src_size / uint(HUFF_NUM_STREAMS);
+        uint my_in_start = (lane < uint(HUFF_NUM_STREAMS - 1)) ? (lane * q)
+                                                                : ((uint(HUFF_NUM_STREAMS) - 1u) * q);
+        uint my_in_size  = (lane < uint(HUFF_NUM_STREAMS - 1)) ? q
+                                                                : (src_size - (uint(HUFF_NUM_STREAMS) - 1u) * q);
+        uint my_in_off = src_offset + my_in_start * src_stride;
+        uint my_scratch_off = (block_id * uint(HUFF_NUM_STREAMS) + lane) * pc.scratch_per_stream;
+        bytes = encodeStreamOneLane(my_in_off, my_in_size, src_stride,
+                                    cl_base, codes_base,
+                                    my_scratch_off);
+    }
+    // (No subgroupBarrier needed before the BIL writes: each lane only
+    //  references its OWN scratch slot and `bytes` register. Mirrors
+    //  CUDA's no-publication comment on huffman_kernel.cu:296-301.)
+
+    const uint out_base = dst_offset;
+
+    // ── HUFF_WEIGHTS_BYTES weights: warp-cooperative pack ──
+    // CUDA reference: src/encode/huffman_kernel.cu:306-308. Each of the 32
+    // lanes packs 4 bytes (HUFF_WEIGHTS_BYTES / WARP_SIZE = 4).
+    for (uint i = lane; i < uint(HUFF_WEIGHTS_BYTES); i += WARP_SIZE) {
+        uint even = uint(code_lengths_buf[cl_base + 2u * i + 0u]);
+        uint odd  = uint(code_lengths_buf[cl_base + 2u * i + 1u]);
+        output_buf[out_base + i] = uint8_t(packWeightByte(even, odd));
+    }
+
+    // ── BIL sub-header: N × u24 LE ──
+    // CUDA reference: src/encode/huffman_kernel.cu:316-318. Every lane
+    // writes its own stream's encoded byte count (vs the prior format that
+    // dropped the last and derived it).
+    {
+        uint sh_off = out_base + uint(HUFF_WEIGHTS_BYTES) + lane * uint(HUFF_STREAM_SIZE_BYTES);
+        emitLE24(sh_off, bytes);
+    }
+
+    // Zero-pad each lane's trailing partial word so the interleaved write
+    // can do an aligned 4-byte store from offset w*4 without picking up
+    // uninitialized scratch bytes past `bytes`.
+    // CUDA reference: src/encode/huffman_kernel.cu:323-326.
+    uint my_scratch_off = (block_id * uint(HUFF_NUM_STREAMS) + lane) * pc.scratch_per_stream;
+    uint my_words = (bytes + 3u) / 4u;
+    for (uint p = bytes; p < my_words * 4u; p++) {
+        scratch_buf[my_scratch_off + p] = uint8_t(0);
+    }
+
+    // K = min(words[s]) across the warp. CUDA reference:
+    // src/encode/huffman_kernel.cu:330-335 — __shfl_xor_sync butterfly min.
+    // VK adaptation: subgroupShuffleXor maps directly onto __shfl_xor_sync
+    // with FULL_WARP_MASK (every lane in the subgroup participates).
+    uint K = my_words;
+    for (uint off = 16u; off > 0u; off >>= 1u) {
+        uint v = subgroupShuffleXor(K, off);
+        K = (v < K) ? v : K;
+    }
+
+    // K (u32 LE) immediately after the sub-header. Lane 0 only.
+    // CUDA reference: src/encode/huffman_kernel.cu:338-344.
+    if (lane == 0u) {
+        uint k_dst = out_base + uint(HUFF_WEIGHTS_BYTES) + uint(HUFF_SUBHEADER_BYTES);
+        output_buf[k_dst + 0u] = uint8_t(K & 0xFFu);
+        output_buf[k_dst + 1u] = uint8_t((K >> 8)  & 0xFFu);
+        output_buf[k_dst + 2u] = uint8_t((K >> 16) & 0xFFu);
+        output_buf[k_dst + 3u] = uint8_t((K >> 24) & 0xFFu);
+    }
+
+    // ── Interleaved area: K rows × HUFF_BIL_ROW_BYTES (=128) per row ──
+    // CUDA reference: src/encode/huffman_kernel.cu:351-358. All 32 lanes
+    // write to adjacent 4-byte slots in the same row; the loop iterates
+    // once per word, and across the warp each row materializes as a fully
+    // coalesced 128-byte sector store.
+    uint il_base = out_base + uint(HUFF_BODY_HEADER_BYTES);
+    for (uint w = 0u; w < K; w++) {
+        uint dst_word = il_base + w * uint(HUFF_BIL_ROW_BYTES) + lane * 4u;
+        uint sb = my_scratch_off + w * 4u;
+        // Reassemble the 4-byte word from per-byte scratch loads. GLSL
+        // does not let us reinterpret-cast a uint8_t SSBO range as a
+        // uint32_t pointer (no aliased blocks in std430 without explicit
+        // type-pun layouts), so we emit four byte stores per lane per
+        // row. Each lane writes 4 consecutive bytes; across the 32 lanes
+        // the row is fully covered exactly once.
+        output_buf[dst_word + 0u] = scratch_buf[sb + 0u];
+        output_buf[dst_word + 1u] = scratch_buf[sb + 1u];
+        output_buf[dst_word + 2u] = scratch_buf[sb + 2u];
+        output_buf[dst_word + 3u] = scratch_buf[sb + 3u];
+    }
+
+    // ── Tail area: per-stream bytes from word K onward ──
+    // CUDA reference: src/encode/huffman_kernel.cu:364-381.
+    // Each lane has `(my_words - K) * 4` tail bytes; per-lane offset
+    // within the tail area is the exclusive prefix sum of those counts.
+    uint my_tail_bytes = (my_words > K) ? (my_words - K) * 4u : 0u;
+    uint tail_off = my_tail_bytes;
+    // VK adaptation: subgroupShuffleUp mirrors __shfl_up_sync. The CUDA
+    // pattern (inclusive prefix sum, then subtract own value for the
+    // exclusive value) is preserved verbatim.
+    for (uint off = 1u; off < 32u; off <<= 1u) {
+        uint v = subgroupShuffleUp(tail_off, off);
+        if (lane >= off) tail_off += v;
+    }
+    tail_off -= my_tail_bytes;  // exclusive
+
+    uint tail_area = il_base + K * uint(HUFF_BIL_ROW_BYTES);
+    uint my_tail_dst = tail_area + tail_off;
+    uint my_tail_src = my_scratch_off + K * 4u;
+    for (uint i = 0u; i < my_tail_bytes; i++) {
+        output_buf[my_tail_dst + i] = scratch_buf[my_tail_src + i];
+    }
+
+    // Total body size: K × row_bytes + sum-of-tail-bytes across the warp.
+    // CUDA reference: src/encode/huffman_kernel.cu:384-394.
+    uint total_tail = my_tail_bytes;
+    for (uint off = 16u; off > 0u; off >>= 1u) {
+        total_tail += subgroupShuffleXor(total_tail, off);
+    }
+    if (lane == 0u) {
+        out_sizes[block_id] = uint(HUFF_BODY_HEADER_BYTES) + K * uint(HUFF_BIL_ROW_BYTES) + total_tail;
+    }
+}
