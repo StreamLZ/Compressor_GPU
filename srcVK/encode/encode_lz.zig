@@ -7,6 +7,11 @@
 const std = @import("std");
 const vk = @import("../decode/vulkan_api.zig");
 const module_loader = @import("module_loader.zig");
+// A-008 (BDA): pulled in for `getBufferDeviceAddress` — wraps
+// vkGetBufferDeviceAddress to retrieve the raw u64 device address of
+// the per-chunk hash buffer so the LZ encode kernel can dereference it
+// through a buffer_reference (bypassing the 4 GiB SSBO range cap).
+const decode_module_loader = @import("../decode/module_loader.zig");
 const encode_context = @import("encode_context.zig");
 const levels = @import("levels.zig");
 const gpu_decode = @import("../decode/driver.zig");
@@ -54,27 +59,18 @@ pub fn gpuCompressImpl(
     const desc_bytes = chunk_descs.len * @sizeOf(CompressChunkDesc);
     const sizes_bytes = @as(usize, num_chunks) * 4;
     const chain = levels.useChainParser(level);
-    // VK adaptation: Vulkan's `maxStorageBufferRange` caps a single SSBO
-    // binding range at 4 GiB - 1 on every NVIDIA / AMD / Intel desktop
-    // class GPU. CUDA cuMemAlloc has no such limit, so the CUDA reference
-    // (src/encode/encode_lz.zig:43) never has to cap the per-chunk hash
-    // table. Here we shrink `hash_bits` enough that
-    // `num_chunks * (1<<hash_bits) * 4` fits under 4 GiB. Only L3 with
-    // num_chunks >= 2048 (~128 MiB silesia at sc=0.25) hits the cap;
-    // L1 / L2 / L4 / L5 already stay below the limit at every workload.
-    // Effect on compression: at most halves the per-chunk hash table for
-    // the largest inputs, which costs <1% on silesia (the match-finder
-    // still converges on long matches; smaller table just means more
-    // collisions on the cold lit-rich head of each chunk).
-    var hash_bits: u32 = levels.hashBitsForLevel(level);
-    if (!chain) {
-        const max_bytes: usize = 0x100000000 - 4; // 4 GiB - 4 (one u32 of margin)
-        while (hash_bits > 1) {
-            const trial_bytes: usize = @as(usize, num_chunks) * (@as(usize, 1) << @intCast(hash_bits)) * 4;
-            if (trial_bytes <= max_bytes) break;
-            hash_bits -= 1;
-        }
-    }
+    // A-008 RESOLVED via BDA (`5d8b4d3`+). Previously this site clamped
+    // `hash_bits` down so `num_chunks * (1<<hash_bits) * 4` fit under
+    // Vulkan's per-SSBO-binding `maxStorageBufferRange = 4 GiB - 1` cap
+    // (the cap silesia L3 was hitting at sc=0.25). The kernel now
+    // addresses the global hash table via VK_KHR_buffer_device_address
+    // — a raw `uint64_t` device pointer dereferenced through a
+    // `buffer_reference` SSBO — which has no per-binding cap, so the
+    // hash table is allowed to exceed 4 GiB and we use the full
+    // `levels.hashBitsForLevel(level)` value matching CUDA at every
+    // workload size. CUDA reference: src/encode/encode_lz.zig:43
+    // (allocates full `num_chunks × (1<<hash_bits) × 4` bytes with no cap).
+    const hash_bits: u32 = levels.hashBitsForLevel(level);
     const hash_size: usize = @as(usize, 1) << @intCast(hash_bits);
 
     if (!encode_context.ensureBuf(&self.d_input_persist, &self.d_input_size, input.len)) return false;
@@ -129,7 +125,6 @@ pub fn gpuCompressImpl(
     var p_input = d_input;
     var p_output = d_output;
     var p_descs = d_descs;
-    var p_global_hash: VkDeviceBuffer = self.d_hash_persist;
     var p_sizes = d_sizes;
     var p_total = num_chunks;
     var p_hash_bits = hash_bits;
@@ -139,24 +134,46 @@ pub fn gpuCompressImpl(
     // parser so the flag is inert there.
     var p_l4: u32 = if (level >= 4) 1 else 0;
 
+    // A-008 (BDA): query the raw device address of the per-chunk hash
+    // table buffer and pack it as two trailing u32 push-constant slots
+    // (low, high). The kernel reconstructs a `HashU32Ref`
+    // buffer_reference at entry from `pc.hash_addr` and dereferences
+    // every hash load/store through it — bypassing the per-binding
+    // `maxStorageBufferRange = 4 GiB - 1` cap that previously forced
+    // the L3 hash_bits clamp. Hash buffer is allocated with
+    // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT in procMallocDevice
+    // (srcVK/decode/module_loader.zig:3368) and the device feature
+    // `bufferDeviceAddress = VK_TRUE` is enabled at vkCreateDevice
+    // (srcVK/decode/module_loader.zig:2187 — shared device with
+    // decode side).
+    const hash_addr: u64 = decode_module_loader.getBufferDeviceAddress(self.d_hash_persist);
+    if (hash_addr == 0) return false;
+    var p_hash_addr_lo: u32 = @truncate(hash_addr);
+    var p_hash_addr_hi: u32 = @truncate(hash_addr >> 32);
+
     // params layout per procs.launch_kernel contract: the first
     // n_bindings entries are pointers to VkDeviceBuffer handles
     // (the shader's std430 buffer bindings 0..n_bindings-1), the
     // remaining entries are pointers to push-constant scalars packed
     // into the push_constant_size byte buffer in declaration order.
-    // lz_encode: n_bindings=5 (Input, Output, Descs, GlobalHash,
-    // CompSizes), push_constant_size=16 (total_chunks, hash_bits,
-    // use_chain, l4_features).
+    // lz_encode: n_bindings=4 (Input, Output, Descs, CompSizes —
+    // GlobalHash was dropped at A-008 BDA), push_constant_size=24
+    // (total_chunks, hash_bits, use_chain, l4_features, hash_addr_lo,
+    // hash_addr_hi). procLaunchKernel's push-constant copy loop writes
+    // 4 bytes per slot, so the uint64_t hash_addr requires two trailing
+    // slots (low u32 then high u32) to match the std430 push_constant
+    // layout the kernel declares.
     var params = [_]?*anyopaque{
         @ptrCast(&p_input),
         @ptrCast(&p_output),
         @ptrCast(&p_descs),
-        @ptrCast(&p_global_hash),
         @ptrCast(&p_sizes),
         @ptrCast(&p_total),
         @ptrCast(&p_hash_bits),
         @ptrCast(&p_use_chain),
         @ptrCast(&p_l4),
+        @ptrCast(&p_hash_addr_lo),
+        @ptrCast(&p_hash_addr_hi),
     };
     var extra = [_]?*anyopaque{null};
 

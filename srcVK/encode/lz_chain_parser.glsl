@@ -69,17 +69,22 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
 // helpers below pack/unpack a single 16-bit slot at `idx` in the lane-
 // 0-only chain parser; no atomics because the parser is serial on
 // lane 0 (no other invocation touches these words).
+//
+// A-008 (BDA): `ht_buf` is now a HashU32Ref (buffer_reference) carrying
+// the raw device address of the per-chunk hash region; the helpers
+// below dereference via `(ht_buf).e[idx]` instead of `(ht_buf)[idx]`.
+// The 2x u16-into-u32 pack/unpack arithmetic is otherwise unchanged.
 #define chainNextHashRead(ht_buf, next_hash_base, idx)                                              \
-    (((ht_buf)[uint(next_hash_base) + (uint(idx) >> 1u)] >> ((uint(idx) & 1u) * 16u)) & 0xFFFFu)
+    (((ht_buf).e[uint(next_hash_base) + (uint(idx) >> 1u)] >> ((uint(idx) & 1u) * 16u)) & 0xFFFFu)
 
 #define chainNextHashWrite(ht_buf, next_hash_base, idx, value)                                      \
     do {                                                                                            \
         uint _cnh_widx = uint(next_hash_base) + (uint(idx) >> 1u);                                  \
         uint _cnh_shift = (uint(idx) & 1u) * 16u;                                                   \
-        uint _cnh_old = (ht_buf)[_cnh_widx];                                                        \
+        uint _cnh_old = (ht_buf).e[_cnh_widx];                                                        \
         uint _cnh_keep = _cnh_old & ~(0xFFFFu << _cnh_shift);                                       \
         uint _cnh_new  = _cnh_keep | ((uint(value) & 0xFFFFu) << _cnh_shift);                       \
-        (ht_buf)[_cnh_widx] = _cnh_new;                                                             \
+        (ht_buf).e[_cnh_widx] = _cnh_new;                                                             \
     } while (false)
 
 // VK adaptation: helper to load 4 src bytes as a U32 LE word at a
@@ -122,6 +127,13 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
 // remain visible at the call site; GLSL cannot pass SSBOs as function
 // arguments. Writes its (length, offset) result into the in-scope
 // `out_match_length` + `out_match_offset` int identifiers.
+//
+// A-008 (BDA): `ht_buf` is a HashU32Ref (buffer_reference) carrying the
+// raw device address of the per-chunk hash region. The 3 sub-table bases
+// (first_hash_base, long_hash_base, next_hash_base) are byte-word
+// offsets within that BDA region — pointer arithmetic preserved
+// verbatim from the SSBO version; only the dereference primitive
+// changed from `(ht_buf)[i]` to `(ht_buf).e[i]`.
 #define findMatchChain(src_buf, src_base, src_size_in,                                              \
                        pos_in, recent_offset_in,                                                    \
                        ht_buf, first_hash_base, long_hash_base, next_hash_base,                     \
@@ -167,12 +179,12 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
                     }                                                                               \
                                                                                                     \
                     /* Insert current position into hash tables. */                                 \
-                    uint _fmc_prev_head = (ht_buf)[uint(first_hash_base) + _fmc_ha];                \
+                    uint _fmc_prev_head = (ht_buf).e[uint(first_hash_base) + _fmc_ha];                \
                     chainNextHashWrite(ht_buf, next_hash_base,                                      \
                                        _fmc_pos & NEXT_HASH_INDEX_MASK,                             \
                                        _fmc_prev_head & NEXT_HASH_INDEX_MASK);                      \
-                    (ht_buf)[uint(first_hash_base) + _fmc_ha] = _fmc_pos;                           \
-                    (ht_buf)[uint(long_hash_base) + _fmc_hb] =                                      \
+                    (ht_buf).e[uint(first_hash_base) + _fmc_ha] = _fmc_pos;                           \
+                    (ht_buf).e[uint(long_hash_base) + _fmc_hb] =                                      \
                         (_fmc_hb_tag & LONG_HASH_TAG_MASK) |                                        \
                         (_fmc_pos << LONG_HASH_TAG_BITS);                                           \
                                                                                                     \
@@ -201,7 +213,7 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
                                                                                                     \
             /* (b) Walk first_hash chain (max CHAIN_MAX_STEPS steps) */                             \
             {                                                                                       \
-                uint _fmc_head = (ht_buf)[uint(first_hash_base) + _fmc_ha];                         \
+                uint _fmc_head = (ht_buf).e[uint(first_hash_base) + _fmc_ha];                         \
                 uint _fmc_candidate_offset = _fmc_pos - _fmc_head;                                  \
                                                                                                     \
                 if (_fmc_candidate_offset <= NEAR_OFFSET_MAX) {                                     \
@@ -259,7 +271,7 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
                                                                                                     \
             /* (c) Check long_hash secondary table */                                               \
             {                                                                                       \
-                uint _fmc_lh_value = (ht_buf)[uint(long_hash_base) + _fmc_hb];                      \
+                uint _fmc_lh_value = (ht_buf).e[uint(long_hash_base) + _fmc_hb];                      \
                 if (((_fmc_hb_tag ^ _fmc_lh_value) & LONG_HASH_TAG_MASK) == 0u) {                   \
                     uint _fmc_cand_pos = _fmc_lh_value >> LONG_HASH_TAG_BITS;                       \
                     if (_fmc_cand_pos < _fmc_pos) {                                                 \
@@ -324,12 +336,12 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
                                                                                                     \
             /* (e) Insert current position into all three hash tables */                            \
             {                                                                                       \
-                uint _fmc_prev_head2 = (ht_buf)[uint(first_hash_base) + _fmc_ha];                   \
+                uint _fmc_prev_head2 = (ht_buf).e[uint(first_hash_base) + _fmc_ha];                   \
                 chainNextHashWrite(ht_buf, next_hash_base,                                          \
                                    _fmc_pos & NEXT_HASH_INDEX_MASK,                                 \
                                    _fmc_prev_head2 & NEXT_HASH_INDEX_MASK);                         \
-                (ht_buf)[uint(first_hash_base) + _fmc_ha] = _fmc_pos;                               \
-                (ht_buf)[uint(long_hash_base) + _fmc_hb] =                                          \
+                (ht_buf).e[uint(first_hash_base) + _fmc_ha] = _fmc_pos;                               \
+                (ht_buf).e[uint(long_hash_base) + _fmc_hb] =                                          \
                     (_fmc_hb_tag & LONG_HASH_TAG_MASK) |                                            \
                     (_fmc_pos << LONG_HASH_TAG_BITS);                                               \
             }                                                                                       \
@@ -373,7 +385,7 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
                 _slzRead8Safe(src_buf, src_base, _icr_p, _icr_src_size, _icr_at);                   \
                 uint _icr_hb = hashTableB(_icr_hash_bits, _icr_hash_mask, _icr_at);                 \
                 uint _icr_hb_tag = hashTagB(_icr_at);                                               \
-                (ht_buf)[uint(long_hash_base) + _icr_hb] =                                          \
+                (ht_buf).e[uint(long_hash_base) + _icr_hb] =                                          \
                     (_icr_hb_tag & LONG_HASH_TAG_MASK) |                                            \
                     (_icr_p << LONG_HASH_TAG_BITS);                                                 \
                 _icr_i = 2u * _icr_i + 1u;                                                          \
@@ -385,11 +397,11 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
             uvec2 _icr_at2;                                                                         \
             _slzRead8Safe(src_buf, src_base, _icr_p, _icr_src_size, _icr_at2);                      \
             uint _icr_ha = hashTableA(_icr_hash_bits, _icr_hash_mask, _icr_at2);                    \
-            uint _icr_prev_head = (ht_buf)[uint(first_hash_base) + _icr_ha];                        \
+            uint _icr_prev_head = (ht_buf).e[uint(first_hash_base) + _icr_ha];                        \
             chainNextHashWrite(ht_buf, next_hash_base,                                              \
                                _icr_p & NEXT_HASH_INDEX_MASK,                                       \
                                _icr_prev_head & NEXT_HASH_INDEX_MASK);                              \
-            (ht_buf)[uint(first_hash_base) + _icr_ha] = _icr_p;                                     \
+            (ht_buf).e[uint(first_hash_base) + _icr_ha] = _icr_p;                                     \
         }                                                                                           \
     } while (false)
 

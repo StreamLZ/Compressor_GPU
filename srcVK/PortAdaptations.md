@@ -193,8 +193,14 @@ verification status. An unverified adaptation is a known risk surface.
 - **Status**: RESOLVED
 
 ### A-008: `hash_bits` clamp 19→18 at L3 for >128 MiB single-frame
-- **File:line**: `srcVK/encode/encode_lz.zig` (24 LOC added in
-  `30f36d3`)
+- **File:line**: previously `srcVK/encode/encode_lz.zig` (24 LOC added in
+  `30f36d3`, removed 2026-06-09 in the BDA workaround commit). The
+  clamp is GONE. Hash table addressing now goes through BDA in
+  `srcVK/encode/lz_encode_kernel.comp` (declares
+  `HashU32Ref` via `buffer_reference`) +
+  `srcVK/encode/encode_lz.zig:gpuCompressImpl` (queries
+  `decode_module_loader.getBufferDeviceAddress(self.d_hash_persist)`
+  and passes the u64 address through the push constant).
 - **CUDA reference**: `src/encode/encode_lz.zig:43` — CUDA allocates
   full `num_chunks × (1<<hash_bits) × 4` bytes with no cap
 - **Class**: structural-limit
@@ -202,12 +208,48 @@ verification status. An unverified adaptation is a known risk surface.
   desktop GPU; at L3 + sufficient input size, hash table exceeds cap
 - **Risk if wrong**: silent silesia L3 0.02% size delta; would be
   worse on inputs >200 MiB
-- **Static verification**: Documented in Phase 2A.5 commit `30f36d3`
-- **Runtime verification**: Empirically verified silesia L3 ratio
-  drops from 1.176× to 1.0002× CUDA
+- **Static verification**: Documented in Phase 2A.5 commit `30f36d3`;
+  BDA closure documented in the 2026-06-09 commit (this entry).
+- **Runtime verification**:
+  - Pre-BDA: silesia L3 ratio drops from 1.176× to 1.0002× CUDA
+  - **Post-BDA (2026-06-09)**: silesia L3 SHA byte-identical to CUDA
+    (`EFC224C1F18BFA4EA96D913CF28FC04B0FC46661804A31EB55A2C668222802F4`,
+    80,967,993 B on both VK + CUDA); enwik8 + web L3 still
+    byte-identical to CUDA (regression check ✓); ptest_vk 144/9/0 on
+    both NVIDIA RTX 4060 Ti + Intel iGPU (unchanged from pre-BDA
+    baseline); enwik8 L1 encode median 102 ms (range 100-105) —
+    within the 99-103 ms baseline so no codegen regression from the
+    BDA dereference; silesia L3 encode median 271 ms VK vs 311 ms
+    CUDA = 0.87× CUDA (encoder FASTER than CUDA at this workload).
 - **Discovered**: Phase 2A.5 (`30f36d3`)
-- **Status**: ACTIVE — documented accepted residual; future BDA work
-  would close it
+- **Status**: ✅ **RESOLVED 2026-06-09 via BDA**. The hash table is now
+  addressed by raw device pointer (queried with
+  `vkGetBufferDeviceAddress` on a buffer created with
+  `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT`) and dereferenced inside
+  the kernel through a `buffer_reference` SSBO type. The descriptor-
+  binding cap no longer applies (no descriptor binding for the hash
+  table at all — n_bindings dropped 5 → 4 for lz_encode;
+  push_constant_size grew 16 → 24 for the new `uvec2 hash_addr` slot
+  carrying the device address as a low/high u32 pair).
+  BDA precondition `bufferDeviceAddress = VK_TRUE` was already
+  enabled at vkCreateDevice (srcVK/decode/module_loader.zig:2187, shared
+  device with decode side). Both the greedy parser (L1-L4) and chain
+  parser (L5) macro families now dereference via `(ht_buf).e[idx]`
+  instead of `(ht_buf)[idx]` (see srcVK/encode/lz_greedy_parser.glsl
+  scanBlock comment + srcVK/encode/lz_chain_parser.glsl macro
+  comments).
+  
+  **uvec2-vs-int64 note (2026-06-09 mid-iter):** the first BDA cut
+  used `uint64_t hash_addr` in the push constant, which triggered
+  `VUID-VkShaderModuleCreateInfo-pCode-08740` ("SPIR-V Capability
+  Int64 was declared, but VkPhysicalDeviceFeatures::shaderInt64 is
+  required") on validation-layer-enabled runs. The codec deliberately
+  doesn't enable `shaderInt64` (per A-004/A-005 discipline — keeps
+  hardware support broader). Fix: switch the push constant to `uvec2`
+  and use `GL_EXT_buffer_reference_uvec2`'s `HashU32Ref(uvec2)`
+  constructor, which produces the same device-address dereference
+  without pulling in the Int64 capability. Re-validated clean
+  (zero VUIDs on encode + decode after the uvec2 switch).
 
 ### A-009: 256-byte hardcoded `SSBO_ALIGN`
 - **File:line**: `srcVK/decode/scan_gpu.zig:215, 333` (constant)

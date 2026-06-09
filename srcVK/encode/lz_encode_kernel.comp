@@ -13,11 +13,42 @@
 #extension GL_KHR_shader_subgroup_vote : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+// A-008 (BDA): GL_EXT_buffer_reference + _uvec2 unlock buffer_reference
+// addressing without requiring shaderInt64. The encode hash table is
+// addressed by a raw device address (queried with vkGetBufferDeviceAddress
+// on the host, passed as a `uvec2` push constant lo/hi pair) and
+// dereferenced via a `buffer_reference` SSBO type — bypassing the
+// per-binding `maxStorageBufferRange = 4 GiB - 1` cap that previously
+// forced the L3 hash_bits clamp on inputs >= 128 MiB (see
+// PortAdaptations.md A-008). CUDA reference: src/encode/lz_kernel.cu
+// passes the hash table as a raw `uint32_t*` device pointer; BDA is
+// the closest Vulkan analog.
+//
+// VK adaptation: we deliberately avoid `GL_EXT_..._int64` (and the
+// SPIR-V `Int64` capability it pulls in) because the codec doesn't
+// enable `shaderInt64` at vkCreateDevice — keeping with A-004/A-005's
+// existing "split u64s to uvec2" discipline. The `_uvec2` extension
+// provides a `HashU32Ref(uvec2)` constructor that lets us reconstruct
+// the typed buffer reference from a (lo, hi) u32 pair without needing
+// a native `uint64_t` in the shader.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
 
 #include "lz_format.glsl"
 #include "lz_token_emit.glsl"
 #include "lz_greedy_parser.glsl"
 #include "lz_chain_parser.glsl"
+
+// A-008 (BDA): runtime-sized SSBO accessed by raw u64 device address.
+// `buffer_reference_align = 4` matches the u32 element alignment; the
+// hash buffer is created with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+// in procMallocDevice (srcVK/decode/module_loader.zig:3368) so the
+// device address returned by vkGetBufferDeviceAddress is naturally
+// aligned to the buffer's full allocation alignment (typically 256 B
+// on NVIDIA / 64 B on Intel — both >> 4 B).
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer HashU32Ref {
+    uint e[];
+};
 
 // CUDA: num_chunks blocks × (32, 1, 1) threads per encode_lz.zig:127.
 // One warp (= one subgroup of width 32) per chunk.
@@ -38,23 +69,36 @@ layout(std430, binding = 2) readonly buffer DescsBuf {
     uint descs_raw[];
 };
 
-// arg 3: uint32_t* global_hash
-layout(std430, binding = 3) buffer GlobalHashBuf {
-    uint global_hash[];
-};
+// A-008 (BDA): the global_hash table is NO LONGER bound as an SSBO.
+// Instead the host passes its raw device address (`uint64_t`, queried
+// via vkGetBufferDeviceAddress) through the `hash_addr` push constant
+// below and the kernel reconstructs a `HashU32Ref` handle at entry.
+// This sidesteps the per-binding `maxStorageBufferRange` cap (4 GiB - 1
+// on every desktop GPU), letting L3 keep `hash_bits = 19` even when
+// `num_chunks * (1<<19) * 4 > 4 GiB` (silesia @ sc=0.25 hits this).
+// Binding index 3 is intentionally left unused so subsequent SSBO
+// indices (CompSizesBuf at 4) stay aligned with the historical layout.
 
-// arg 4: uint32_t* comp_sizes
-layout(std430, binding = 4) buffer CompSizesBuf {
+// arg 3 (was SSBO binding 4): uint32_t* comp_sizes. Now at binding 3
+// because GlobalHashBuf was removed. n_bindings drops 5 -> 4.
+layout(std430, binding = 3) buffer CompSizesBuf {
     uint comp_sizes[];
 };
 
-// Scalar args 5..8 ride in via push constants. Layout matches the CUDA
-// arg-list order.
+// Scalar args ride in via push constants. Layout matches the CUDA
+// arg-list order. A-008 (BDA): added `hash_addr` (uvec2 lo/hi) at the
+// tail — host packs the u64 device address as two trailing u32 slots
+// (low, high) on the params[] array (see procLaunchKernel's push-
+// constant copy loop which always writes 4 bytes per slot). Reads as
+// `uvec2` here so we don't pull in the SPIR-V `Int64` capability that
+// would require `shaderInt64 = VK_TRUE` at vkCreateDevice (the codec
+// deliberately avoids that feature — see header comment).
 layout(push_constant) uniform Push {
     uint total_chunks;
     uint hash_bits;
     uint use_chain;
     uint l4_features;
+    uvec2 hash_addr;
 } pc;
 
 void main() {
@@ -64,6 +108,14 @@ void main() {
 
     const uint hash_size = 1u << pc.hash_bits;
     const uint hash_mask = hash_size - 1u;
+
+    // A-008 (BDA): materialise the hash-table reference from the raw
+    // device address (passed as uvec2 lo/hi to avoid the Int64 SPIR-V
+    // capability). Every subsequent hash load/store goes through
+    // `global_hash.e[idx]` (BDA dereference) instead of an SSBO
+    // descriptor lookup, removing the 4 GiB per-binding cap on the
+    // total hash allocation (which at L3+num_chunks=2048 exceeds it).
+    HashU32Ref global_hash = HashU32Ref(pc.hash_addr);
 
     // CUDA reference: src/encode/lz_kernel.cu:82-86. Parse the per-chunk
     // descriptor (5 u32 fields = 20 bytes) out of the descs SSBO.
@@ -110,7 +162,7 @@ void main() {
         //   ht[chunk_id] = global_hash + chunk_id * hash_size  (u32 stride)
         const uint ht_base = chunk_id * hash_size;
         for (uint i = lane; i < hash_size; i += WARP_SIZE) {
-            global_hash[ht_base + i] = HASH_EMPTY;
+            global_hash.e[ht_base + i] = HASH_EMPTY;
         }
         subgroupBarrier();
         subgroupMemoryBarrierBuffer();
@@ -163,7 +215,7 @@ void main() {
 
         // Initialize all three tables to 0
         for (uint i = lane; i < table_stride; i += WARP_SIZE) {
-            global_hash[chain_base + i] = 0u;
+            global_hash.e[chain_base + i] = 0u;
         }
         subgroupBarrier();
         subgroupMemoryBarrierBuffer();

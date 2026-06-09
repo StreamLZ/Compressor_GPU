@@ -1117,6 +1117,20 @@ const FnBindBufferMemory = *const fn (VkDevice, VkBuffer, VkDeviceMemory, VkDevi
 const FnGetBufferMemoryRequirements = *const fn (VkDevice, VkBuffer, *VkMemoryRequirements) callconv(.c) void;
 const FnGetMemoryHostPointerPropertiesEXT = *const fn (VkDevice, u32, *const anyopaque, *VkMemoryHostPointerPropertiesEXT) callconv(.c) VkResult;
 
+// A-008 (BDA): vkGetBufferDeviceAddress returns a u64 VkDeviceAddress for a
+// VkBuffer that was created with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT.
+// The address is stable for the lifetime of the VkBuffer; we cache it on
+// the AllocEntry when first queried so the encode hot path does not pay
+// the FFI cost on every dispatch. The struct layout is the one-field
+// VkBufferDeviceAddressInfo (sType=PHYS_DEV_VULKAN_1_2 const below + buffer).
+const VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO: c_int = 1000244001;
+const VkBufferDeviceAddressInfo = extern struct {
+    sType: c_int = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+    pNext: ?*const anyopaque = null,
+    buffer: VkBuffer,
+};
+const FnGetBufferDeviceAddress = *const fn (VkDevice, *const VkBufferDeviceAddressInfo) callconv(.c) u64;
+
 // Resolved Vulkan entry points. Populated by init() after bring-up.
 var vkGetInstanceProcAddr_fn: ?FnGetInstanceProcAddr = null;
 var vkGetDeviceProcAddr_fn: ?FnGetDeviceProcAddr = null;
@@ -1195,6 +1209,12 @@ var vkFreeMemory_fn: ?FnFreeMemory = null;
 var vkBindBufferMemory_fn: ?FnBindBufferMemory = null;
 var vkGetBufferMemoryRequirements_fn: ?FnGetBufferMemoryRequirements = null;
 var vkGetMemoryHostPointerPropertiesEXT_fn: ?FnGetMemoryHostPointerPropertiesEXT = null;
+
+// A-008 (BDA): vkGetBufferDeviceAddress slot. Resolved at init() once the
+// VkDevice exists; bufferDeviceAddress is already enabled at vkCreateDevice
+// (Vulkan 1.2 features struct at line 2187). Used by the encode LZ kernel
+// to bypass the per-binding 4 GiB SSBO range cap on the hash table.
+var vkGetBufferDeviceAddress_fn: ?FnGetBufferDeviceAddress = null;
 
 // VK_EXT_external_memory_host gate. Set at init() to true iff the
 // device advertises the extension AND the loader resolved every
@@ -1882,6 +1902,27 @@ var g_shader_modules: [KERNEL_DECLS.len]VkShaderModule = @splat(0);
 // KERNEL_DECLS provides for its kernels.
 var g_extra_metas: std.ArrayListUnmanaged(KernelMeta) = .empty;
 
+/// A-008 (BDA): query the device address of a registered VkDeviceBuffer
+/// handle. Returns 0 on lookup miss or when the BDA entry point was not
+/// resolved (which only happens if bufferDeviceAddress somehow failed to
+/// enable at vkCreateDevice). Hot-callable; the underlying
+/// vkGetBufferDeviceAddress is cheap (driver typically returns a cached
+/// u64) but the encode path queries this once per encode at most so we
+/// do not bother memoising on the AllocEntry itself.
+///
+/// Used by srcVK/encode/encode_lz.zig to pass the global hash table as a
+/// raw `uint64_t` push constant to lz_encode_kernel.comp, bypassing the
+/// per-binding `maxStorageBufferRange = 4 GiB - 1` cap that previously
+/// forced the L3 hash_bits clamp on inputs >= 128 MiB (see A-008).
+pub fn getBufferDeviceAddress(handle: VkDeviceBuffer) u64 {
+    if (handle == 0) return 0;
+    const getter = vkGetBufferDeviceAddress_fn orelse return 0;
+    const entry = lookupAlloc(handle) orelse return 0;
+    const dev: VkDevice = @ptrFromInt(vulkan_api.ctx);
+    const info = VkBufferDeviceAddressInfo{ .buffer = entry.buffer };
+    return getter(dev, &info);
+}
+
 /// Register a pipeline + its layout metadata so procs.launch_kernel can
 /// dispatch it. The encode-side module_loader uses this to publish its
 /// kernels to the shared procs.launch_kernel slot. The caller owns the
@@ -2270,6 +2311,18 @@ pub fn init() bool {
     vkFreeMemory_fn = @ptrCast(gdpa(dev, "vkFreeMemory"));
     vkBindBufferMemory_fn = @ptrCast(gdpa(dev, "vkBindBufferMemory"));
     vkGetBufferMemoryRequirements_fn = @ptrCast(gdpa(dev, "vkGetBufferMemoryRequirements"));
+    // A-008 (BDA): resolve vkGetBufferDeviceAddress. bufferDeviceAddress is
+    // already enabled at vkCreateDevice (Vulkan 1.2 features struct above),
+    // so the entry point is guaranteed present. The encode LZ kernel uses
+    // BDA to address the global hash table (binding-3 cap escape; see
+    // A-008 in srcVK/PortAdaptations.md).
+    vkGetBufferDeviceAddress_fn = @ptrCast(gdpa(dev, "vkGetBufferDeviceAddress"));
+    if (vkGetBufferDeviceAddress_fn == null) {
+        // Fall back to KHR alias used by 1.1 + extension setups. We don't
+        // enable VK_KHR_buffer_device_address explicitly because we use the
+        // core 1.2 feature, but some loaders only export the KHR symbol.
+        vkGetBufferDeviceAddress_fn = @ptrCast(gdpa(dev, "vkGetBufferDeviceAddressKHR"));
+    }
     if (ext_mem_host_available) {
         vkGetMemoryHostPointerPropertiesEXT_fn = @ptrCast(gdpa(dev, "vkGetMemoryHostPointerPropertiesEXT"));
     }

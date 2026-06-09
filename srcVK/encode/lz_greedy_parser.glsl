@@ -66,6 +66,12 @@ uint slzClz(uint x) {
 // VK adaptation: macro form so the SSBOs are visible. Local-state
 // variables are uniquely prefixed `_sb_` to avoid name collisions with
 // caller scope.
+//
+// A-008 (BDA): `ht_buf` is a HashU32Ref (buffer_reference) carrying the
+// raw device address of the per-chunk hash region. `ht_base` is a u32-
+// word offset within that region; the macro dereferences via
+// `(ht_buf).e[ht_base + h]` — bypassing the per-SSBO-binding 4 GiB cap
+// that would otherwise force `hash_bits=18` on inputs >= 128 MiB at L3.
 #define scanBlock(src_buf, src_base, src_size_in,                                                   \
                   ht_buf, ht_base, hash_bits_in, hash_mask_in,                                      \
                   lit_buf, lit_base, lit_count,                                                     \
@@ -142,7 +148,11 @@ uint slzClz(uint x) {
                         _sb_hash_ref = _sb_their_pos;                                               \
                     }                                                                               \
                 } else {                                                                            \
-                    uint _sb_ref_val = (ht_buf)[uint(ht_base) + _sb_h];                             \
+                    /* A-008 (BDA): ht_buf is a HashU32Ref (buffer_reference), */                   \
+                    /* not an SSBO; index via the runtime-sized array field .e[] */                 \
+                    /* instead of the raw [] operator. Macro shape preserved 1:1 */                 \
+                    /* with CUDA — only the addressing primitive changes. */                        \
+                    uint _sb_ref_val = (ht_buf).e[uint(ht_base) + _sb_h];                           \
                     if (_sb_ref_val != HASH_EMPTY && _sb_ref_val + 8u <= _sb_my_pos) {              \
                         uint _sb_p0 = uint((src_buf)[uint(src_base) + _sb_ref_val + 0u]);           \
                         uint _sb_p1 = uint((src_buf)[uint(src_base) + _sb_ref_val + 1u]);           \
@@ -223,7 +233,8 @@ uint slzClz(uint x) {
                 int _sb_top_lane = (_sb_group_mask != 0u)                                           \
                     ? int((WARP_SIZE - 1u) - slzClz(_sb_group_mask)) : -1;                          \
                 if (_sb_is_writer && _sb_lane == _sb_top_lane) {                                    \
-                    (ht_buf)[uint(ht_base) + _sb_h] = _sb_my_pos;                                   \
+                    /* A-008 (BDA): see comment above on `.e[]` indexing. */                        \
+                    (ht_buf).e[uint(ht_base) + _sb_h] = _sb_my_pos;                                 \
                 }                                                                                   \
             }                                                                                       \
                                                                                                     \
@@ -372,7 +383,8 @@ uint slzClz(uint x) {
                 int  _sb_top_lane = (_sb_group_mask != 0u)                                          \
                     ? int((WARP_SIZE - 1u) - slzClz(_sb_group_mask)) : -1;                          \
                 if (_sb_rehash_active && _sb_lane == _sb_top_lane) {                                \
-                    (ht_buf)[uint(ht_base) + _sb_h_rehash] = _sb_rp;                                \
+                    /* A-008 (BDA): see comment above on `.e[]` indexing. */                        \
+                    (ht_buf).e[uint(ht_base) + _sb_h_rehash] = _sb_rp;                              \
                 }                                                                                   \
             }                                                                                       \
                                                                                                     \
