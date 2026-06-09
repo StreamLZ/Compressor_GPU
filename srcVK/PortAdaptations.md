@@ -622,6 +622,78 @@ verification status. An unverified adaptation is a known risk surface.
   for any caller (CLI, C ABI, future bindings) that owns the host
   buffer lifecycle.
 
+### A-021: L3/L4/L5 decode kernel-time gap (1.20x-1.37x VK vs CUDA) on large workloads
+- **File:line**: `srcVK/decode/lz_decode_kernel.comp` (huff-aware LZ
+  workhorse, called for L3+), plus the merge/compact dispatch chain
+  in `srcVK/decode/scan_gpu.zig:300-450` and the dispatch ABI at
+  `srcVK/decode/module_loader.zig::procLaunchKernel` (A-007).
+- **CUDA reference**: `src/decode/lz_decode_kernels.cuh` (huff path) +
+  `src/decode/scan_gpu.zig` dispatch loop. CUDA's per-stream implicit
+  ordering and raw pointer arithmetic eliminate two classes of
+  per-launch overhead VK pays.
+- **Class**: structural-limit (combination of A-006 explicit
+  compute-to-compute barriers + A-007 per-binding offset descriptor
+  cost + unfused merge/gather sub-dispatches — see "Attribution
+  unverified" note below)
+- **Why**: Phase 5 perf sweep (2026-06-08, `srcVK/PerfSweep.md`)
+  measured `gpu kernel best` ratios of 1.20x-1.37x VK/CUDA on
+  L3/L4/L5 enwik8 + silesia decode. Per-kernel `SLZ_VK_PROFILE_DECODE=1`
+  on L3 silesia (representative cell):
+
+  ```
+  kper: kernel_fn (LZ decode)        5152 us   <-- LARGEST single kernel
+  kper: huff_decode_fn               1959 us
+  kper: merge_huff_descs_fn           954 us
+  kper: compact_huff_descs_fn         498 us
+  kper: compact_raw_descs_fn          430 us
+  kper: huff_build_fn                 428 us
+  kper: prefix_sum_chunks_fn          384 us
+  kper: gather_off16_fn                65 us
+  kper: scan_parse_fn                  13 us
+                                    ------
+                                     9881 us (sum) vs CUDA 7162 us = +2.13 ms gap
+  ```
+
+  Three POSSIBLE additive contributors (per Phase 5 reviewer F-002,
+  not all confirmed — see below):
+  1. A-006: explicit `vkCmdPipelineBarrier` between Huffman + LZ
+     compute passes (CUDA gets free per-stream ordering)
+  2. A-007: per-binding `VkDescriptorBufferInfo.offset` ABI work per
+     sub-launch (CUDA's pointer arithmetic is free)
+  3. Unfused `compact_raw_descs` + `gather_raw_off16` +
+     `merge_huff_descs` dispatches (A-017 fused only `compact_huff_descs`
+     — a parallel fusion of these three would mirror the same pattern;
+     these three sum to ~1.45 ms, so even full fusion would close only
+     ~68% of the 2.13 ms gap)
+
+  **Attribution unverified (Phase 5 review F-002):** The named
+  contributors above account for at most ~1.45 ms of the ~2.13 ms gap.
+  The remaining ~0.68 ms (and possibly more) likely lives in
+  `kernel_fn` (the huff-aware LZ decode workhorse, 5.15 ms VK vs
+  unknown CUDA per-kernel time). To confirm, a matching CUDA per-kernel
+  breakdown (NCU `--kernel-name slzLzDecodeKernel` or CUDA event
+  instrumentation) is needed and HAS NOT been captured. Treat this
+  attribution as "where to look next," not "demonstrated root cause."
+- **Risk if wrong**: none for correctness (kernel-time gap is a
+  perf-only measurement). Risk is reputational: shipping a port that
+  is documented "within 10% of CUDA" while one slice of the matrix is
+  1.20-1.37x.
+- **Static verification**: dispatch chain diffed against CUDA's
+  reference — every kernel runs the same algorithm; only the launch
+  shapes differ.
+- **Runtime verification**: ✅ Phase 5 perf sweep covers 60 cells
+  (5 levels x 3 corpora x 2 directions x 2 backends). All
+  large-workload **e2e** decode timings inside the 10% bar
+  (0.96x-1.03x). The kernel-time gap is real but does not propagate
+  to e2e because host overhead amortizes it at 95-203 MB inputs.
+  Captured raw under `c:/tmp/perfsweep/dec_{vk,cu}_{e,s}_l{3,4,5}.txt`.
+- **Discovered**: 2026-06-08, Phase 5 perf parity sweep
+- **Status**: ACTIVE — accepted residual. e2e is the user-visible
+  metric and is inside the bar. Potential future close path:
+  apply the A-017 fusion pattern to `compact_raw_descs` +
+  `gather_raw_off16` + `merge_huff_descs` (separate optimization
+  todo; explicitly out of Phase 5 scope per the assignment brief).
+
 ## Process notes
 
 When the next port adaptation lands:

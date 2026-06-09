@@ -704,6 +704,33 @@ CUDA-only.
    host buffers. Sticky disable flips on first OOM (commit `0af24ff`); bench
    mode is silent (pinned buffers).
 
+5. **L3/L4/L5 decode `gpu kernel best` time 1.20x-1.37x CUDA on large
+   workloads** — Phase 5 perf sweep (2026-06-08, see `srcVK/PerfSweep.md`)
+   measured this as a residual structural cost driven by A-006 (explicit
+   compute-to-compute barriers), A-007 (per-binding offset descriptor
+   ABI), and unfused `compact_raw_descs` / `gather_raw_off16` /
+   `merge_huff_descs` dispatches (A-017 only fused `compact_huff_descs`).
+   **e2e** decode timings stay inside the 10% bar at every (level, corpus)
+   large-workload cell (0.96x-1.03x) because host overhead amortizes the
+   kernel-time gap at 95-203 MB inputs. Catalogued as **A-021** in
+   `srcVK/PortAdaptations.md`. Future close path: apply A-017's fusion
+   pattern to the remaining three dispatches.
+
+## Phase 5 — Conformance + perf parity (2026-06-08, DONE)
+
+- Cross-backend test coverage extended in `srcVK/tests/l3_l4_cross_backend.zig`:
+  added VK->CUDA reverse direction for L3/L4 (8 tests), plus L5 in both
+  directions, L5 SHA byte-identity, L5 VK->VK pattern, and L5 real-corpus
+  (10 tests). Total +18 tests. ptest_vk: 122/9/0 -> **140/9/0** on both
+  NVIDIA RTX 4060 Ti and Intel iGPU.
+- Full perf sweep across L1-L5 x web/enwik8/silesia x decode/encode x VK/CUDA
+  (60 cells) — see `srcVK/PerfSweep.md` for the formatted tables. Verdict:
+  **e2e parity within 10% bar on every large-workload cell** at every
+  level; encoder kernel times 0.81x-1.01x CUDA (multiple FASTER cells).
+  Two residuals catalogued: A-008 (already known; silesia L3 0.019% size
+  delta confirmed unchanged) + **A-021** (new; L3/L4/L5 decode kernel-time
+  gap on large workloads, e2e still inside bar).
+
 ## Future improvements (optional; NOT blocking)
 
 ### #1: Buffer-Device-Address (BDA) loads for >4 GiB SSBO workloads
