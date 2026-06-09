@@ -175,6 +175,18 @@ pub const EncodeContext = struct {
     d2h_final_buf: ?[]u8 = null,
     d2h_final_buf_size: usize = 0,
 
+    // VK adaptation (Gemini Risk A, 2026-06-08): persistent scratch for
+    // the d2h_offset_gather regions array built once per encode in
+    // encode_lz.zig::gpuCompressImpl. Sized to chunk_descs.len worst-case
+    // (~1526 regions × 24 B = ~36 KB on enwik8 L1, ~3.7 MB at the silesia
+    // L1 ceiling). Previously allocated per encode via std.heap.page_allocator
+    // — that's one VirtualAlloc + VirtualFree per encode call, microseconds
+    // of host-side jitter. Grow-only via ensureRegionsScratch; freed in
+    // deinit. Not page-aligned (no Vulkan import — pure host-side scratch
+    // that the gather impl reads from on the calling thread).
+    regions_scratch: ?[]vk.VkBufferCopyRegion = null,
+    regions_scratch_cap: usize = 0,
+
     /// CUDA reference: src/encode/encode_context.zig:223-276. Free every
     /// owned device + host buffer and reset every field to its default.
     pub fn deinit(self: *EncodeContext, allocator: std.mem.Allocator) void {
@@ -247,8 +259,34 @@ pub const EncodeContext = struct {
             self.d2h_final_buf_size = 0;
         }
 
+        // Free the per-encode regions scratch. No Vulkan import to release
+        // (host-side scratch only).
+        if (self.regions_scratch) |buf| {
+            std.heap.page_allocator.free(buf);
+            self.regions_scratch = null;
+            self.regions_scratch_cap = 0;
+        }
+
         self.pending_timings.deinit(std.heap.page_allocator);
         self.last_timings.deinit(std.heap.page_allocator);
+    }
+
+    /// VK adaptation (Gemini Risk A, 2026-06-08): grow-only ensure for the
+    /// d2h_offset_gather regions scratch. Single VirtualAlloc on first call;
+    /// every subsequent encode reuses the same buffer (sized to the largest
+    /// chunk_descs.len yet seen). Returns the slice sized to `n`, or null
+    /// on allocation failure.
+    pub fn ensureRegionsScratch(self: *EncodeContext, n: usize) ?[]vk.VkBufferCopyRegion {
+        if (self.regions_scratch) |existing| {
+            if (n <= self.regions_scratch_cap) return existing[0..n];
+            std.heap.page_allocator.free(existing);
+            self.regions_scratch = null;
+            self.regions_scratch_cap = 0;
+        }
+        const fresh = std.heap.page_allocator.alloc(vk.VkBufferCopyRegion, n) catch return null;
+        self.regions_scratch = fresh;
+        self.regions_scratch_cap = n;
+        return fresh;
     }
 };
 

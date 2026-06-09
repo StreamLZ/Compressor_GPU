@@ -227,12 +227,12 @@ pub fn gpuCompressImpl(
     const _t_gather0 = if (_prof) vk.qpcNow() else 0;
     const d2h_offset_gather_fn = vk.procs.d2h_offset_gather;
     if (d2h_offset_gather_fn) |gather_fn| {
-        // Build the regions array. Worst case n_regions == chunk_descs.len
-        // (~1526 on enwik8 = 36 KB). The gather is called once per
-        // encode so the page-heap alloc is negligible.
-        const gpa = std.heap.page_allocator;
-        const regions_buf = gpa.alloc(vk.VkBufferCopyRegion, chunk_descs.len) catch return false;
-        defer gpa.free(regions_buf);
+        // VK adaptation (Gemini Risk A, 2026-06-08): persistent scratch
+        // on EncodeContext instead of per-call page_allocator.alloc — one
+        // VirtualAlloc lifetime-of-encoder vs one-per-encode. Worst-case
+        // size is chunk_descs.len (~1526 on enwik8 L1, up to ~150K at
+        // silesia L1 ceiling). See encode_context.zig::ensureRegionsScratch.
+        const regions_buf = self.ensureRegionsScratch(chunk_descs.len) orelse return false;
         var n_regions: usize = 0;
         for (0..chunk_descs.len) |i| {
             const cs = comp_sizes_out[i];
