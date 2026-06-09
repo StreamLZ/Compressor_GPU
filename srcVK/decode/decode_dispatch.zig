@@ -656,25 +656,32 @@ pub fn runHuffBuildAndDecode(
         var p_lut: u64 = self.d_huff_lut;
         var p_out: u64 = self.d_entropy_scratch;
         var p_n: u64 = d_n_huff;
+        // Binding 5: u32-aliased view of the same VkBuffer as binding 3
+        // (OutputBuf). Used by the Phase 2 hot loop's 4-byte store path
+        // to issue a single 32-bit transaction instead of four 8-bit
+        // ones — the SPIR-V→NVIDIA driver does not coalesce sequential
+        // uint8_t stores so the byte path costs ~4× the memory traffic.
+        // See srcVK/decode/huff_decode_4stream_kernel.comp:79-93.
+        var p_out_u32: u64 = self.d_entropy_scratch;
         // VK adaptation: params[] layout per module_loader KERNEL_DECLS
         // contract (see above). huff_decode_4stream_kernel.comp:
-        // n_bindings=5 (CompBuf, DescsBuf, LutsBuf, OutputBuf,
-        // NBlocksBuf), push_constant_size=0. The shared-memory
-        // allocation CUDA passes as the 8th launch arg (LUT_ENTRIES *
-        // 4 = 4096 bytes) is replaced by the static
+        // n_bindings=6 (CompBuf, DescsBuf, LutsBuf, OutputBuf,
+        // NBlocksBuf, OutputBufU32), push_constant_size=0. The shared-
+        // memory allocation CUDA passes as the 8th launch arg
+        // (LUT_ENTRIES * 4 = 4096 bytes) is replaced by the static
         // `shared uint shared_lut[LUT_SIZE]` declared inside the .comp
         // — Vulkan has no dynamic shared-mem at compute-shader scope
         // so the size is fixed at compile time and the launch passes 0
         // for the shared-bytes arg.
         var params = [_]?*anyopaque{
-            @ptrCast(&p_comp), @ptrCast(&p_descs),
-            @ptrCast(&p_lut),  @ptrCast(&p_out),
-            @ptrCast(&p_n),
+            @ptrCast(&p_comp),   @ptrCast(&p_descs),
+            @ptrCast(&p_lut),    @ptrCast(&p_out),
+            @ptrCast(&p_n),      @ptrCast(&p_out_u32),
         };
         var extra = [_]?*anyopaque{null};
         const t_hd = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffDecode4StreamKernel", huff_stream);
         // Iter 4c: binding 4 (NBlocksBuf) is d_compact_counts slot 5.
-        const hd_offs = [_]u64{ 0, 0, 0, 0, N_MERGED_SLOT_OFF };
+        const hd_offs = [_]u64{ 0, 0, 0, 0, N_MERGED_SLOT_OFF, 0 };
         try vkCall(launch_fn(module_loader.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra, &hd_offs), .launch);
         endKernelTiming(t_hd, huff_stream);
     }

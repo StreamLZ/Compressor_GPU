@@ -357,6 +357,53 @@ verification status. An unverified adaptation is a known risk surface.
   synchronous unlock for imported pages, but the current shape
   matches what the encoder CLI has always done.
 
+### A-016: u32-aliased SSBO view for the Phase 2 hot-loop store (Huffman decode)
+- **File:line**: `srcVK/decode/huff_decode_4stream_kernel.comp:79-93`
+  (extra binding 5 `OutputBufU32`); usage at lines 405 (Phase 2a) and
+  464 (Phase 2b). Host wiring at `srcVK/decode/decode_dispatch.zig:669-686`
+  and `srcVK/tests/huff_decode_conformance.zig:299-318`. KERNEL_DECLS
+  entry at `srcVK/decode/module_loader.zig:1865`
+  (`huff_decode_fn n_bindings=6`).
+- **CUDA reference**: `src/decode/huffman_kernel.cu:506` (Phase 2a),
+  `:552` (Phase 2b) — `*reinterpret_cast<uint32_t*>(out + written) = acc;`
+  A single 32-bit aligned store of the bit-buffer accumulator.
+- **Class**: language-forced (with significant perf consequences)
+- **Why**: GLSL has no reinterpret cast across a byte-typed SSBO. The
+  naive port emits four sequential `uint8_t` stores per inner-k iteration
+  (the Phase 2 unroll runs the body 2× per outer iter, so 8 byte stores
+  per word decoded). Empirical bisection on 2026-06-08 showed those 8
+  byte stores cost **1.77 ms of the 2.46 ms huff_decode_fn kernel time**
+  on enwik8 L5 — the SPIR-V→NVIDIA driver does not coalesce sequential
+  uint8_t stores into a single u32 transaction even when they are
+  4-aligned and consecutive. Fix: bind the SAME `VkBuffer` at two
+  descriptor slots — binding 3 as `uint8_t output_buf[]` for the
+  byte-granular accesses (Phase 1 preamble, Phase 2 drain, Phase 3
+  finisher, lz_decode kernel) and binding 5 as `uint output_buf_u32[]`
+  for the Phase 2 hot loop's 4-aligned store. Phase 1 guarantees
+  `(out_base_abs + written) & 3 == 0` before Phase 2a starts, so the
+  u32-aligned write is safe by construction.
+- **Risk if wrong**: garbage decoded output (since the byte path was
+  the correctness oracle); caught by ptest_vk's
+  `huff_decode_conformance.zig` 5 isolated kernel tests.
+- **Static verification**: byte layout: u32 store of `acc_lo` at
+  offset `(out_base_abs + written)` writes bytes 0..3 of that word in
+  LE order (low byte at lowest address) — identical to the four
+  `output_buf[written + N] = uint8_t((acc_lo >> 8*N) & 0xFF)` writes
+  it replaces. Alignment: Phase 1 byte-drain loop runs until
+  `(out_base_abs + written) & 3 == 0`, after which Phase 2a/2b increment
+  `written` by exactly 4 per store, preserving alignment.
+- **Runtime verification**: ✅ **2026-06-08.** ptest_vk 99 passed / 9
+  skipped / 0 failed on both NVIDIA RTX 4060 Ti + Intel iGPU. Empirical
+  perf: VK huff_decode_fn 2466 µs → 772 µs (**3.19× faster**, now at
+  parity with CUDA's 715 µs = 1.08×). L5 enwik8 e2e 18.60 → 17.07 ms
+  (1.15× CUDA → **1.05× CUDA**, inside the 10% bar). L5 silesia e2e
+  36.99 → 33.12 ms (1.17× CUDA → **1.04× CUDA**, inside the bar).
+- **Discovered**: 2026-06-08 perf-gap investigation. Localized via
+  bisection (early-`return` at end of each phase), then sub-bisected
+  Phase 2a (skipping just the 4-byte store dropped huff_decode to 0.70 ms,
+  confirming the store accounted for ~92% of Phase 2a).
+- **Status**: RESOLVED.
+
 ### A-014: `ChainMatch.length` field shadowed by GLSL `.length()` method
 - **File:line**: `srcVK/encode/lz_chain_parser.glsl:28-43`
   (`isLazyMatchBetter` signature)

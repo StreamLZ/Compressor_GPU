@@ -78,6 +78,22 @@ layout(std430, binding = 4) readonly buffer NBlocksBuf {
     uint d_n_blocks;
 };
 
+// VK adaptation: u32-aliased view of the OutputBuf at binding 3. CUDA's
+// reference (huffman_kernel.cu:506) issues a single 32-bit store
+// `*reinterpret_cast<uint32_t*>(out + written) = acc` in the Phase 2
+// hot loop. GLSL has no reinterpret cast across a byte-typed SSBO; the
+// naive port emits four sequential uint8_t stores per inner-k iteration
+// which the SPIR-V→NVIDIA-driver pipeline does not coalesce into a
+// single u32 transaction, costing ~1.77 ms of the 2.46 ms kernel time
+// on enwik8 L5 (72% of huff_decode_fn). The host binds the SAME VkBuffer
+// at binding 3 (uint8_t view) and binding 5 (uint32_t view); Phase 1
+// guarantees (out_base_abs + written) & 3 == 0 before Phase 2a starts,
+// so writes through this view are 4-aligned by construction. Phase 1
+// preamble + Phase 2's pending drain + Phase 3 keep the byte view.
+layout(std430, binding = 5) buffer OutputBufU32 {
+    uint output_buf_u32[];
+};
+
 // ── Shared LUT ──────────────────────────────────────────────────────
 // CUDA reference: src/decode/huffman_kernel.cu:644-649. CUDA uses
 // `extern __shared__ uint32_t shared_lut[]` sized by the launch's
@@ -400,10 +416,11 @@ void decodeStreamBoundedIL(uint il_base_abs, uint tail_start_abs,
             // matches CUDA's LE u32 store (byte 0 of `acc` → lowest
             // address) — bit-identical to the CUDA store on LE GPUs.
             if (pending >= 4u) {
-                output_buf[out_base_abs + written + 0u] = uint8_t( acc_lo        & 0xFFu);
-                output_buf[out_base_abs + written + 1u] = uint8_t((acc_lo >> 8)  & 0xFFu);
-                output_buf[out_base_abs + written + 2u] = uint8_t((acc_lo >> 16) & 0xFFu);
-                output_buf[out_base_abs + written + 3u] = uint8_t((acc_lo >> 24) & 0xFFu);
+                // VK adaptation: u32-aligned store via aliased binding 5
+                // (CUDA reference: `*reinterpret_cast<uint32_t*>(out + written) = acc`).
+                // Single 32-bit store replaces four 8-bit stores; ~10× faster
+                // because driver actually coalesces 32-bit aligned stores.
+                output_buf_u32[(out_base_abs + written) >> 2u] = acc_lo;
                 // acc >>= 32. After flushing the low 4 bytes, the
                 // remaining bytes shift down by 4.
                 acc_lo = acc_hi;
@@ -462,10 +479,8 @@ void decodeStreamBoundedIL(uint il_base_abs, uint tail_start_abs,
             bit_count -= uint(total_len);
             if (pending >= 4u) {
                 // CUDA reference: src/decode/huffman_kernel.cu:552-557.
-                output_buf[out_base_abs + written + 0u] = uint8_t( acc_lo        & 0xFFu);
-                output_buf[out_base_abs + written + 1u] = uint8_t((acc_lo >> 8)  & 0xFFu);
-                output_buf[out_base_abs + written + 2u] = uint8_t((acc_lo >> 16) & 0xFFu);
-                output_buf[out_base_abs + written + 3u] = uint8_t((acc_lo >> 24) & 0xFFu);
+                // VK adaptation: u32-aligned store via aliased binding 5.
+                output_buf_u32[(out_base_abs + written) >> 2u] = acc_lo;
                 acc_lo = acc_hi;
                 acc_hi = 0u;
                 written += 4u;

@@ -46,14 +46,22 @@ this roadmap.
 
 Current bench numbers (NVIDIA, `SLZ_VK_DEVICE_INDEX=1`, `-db -r 5` or `-b -r 5`, post-warmup):
 
+**L1 decode + encode:**
 | File | Decode e2e | Decode kernel | Encode | vs CUDA decode | vs CUDA encode |
 |---|---|---|---|---|---|
 | enwik8 (95 MB) | 15.7 ms | 3.0 ms | **103 ms** | 0.97× | **0.82×** |
 | silesia (203 MB) | 30.0 ms | 5.5 ms | **209 ms** | 0.97× | **0.87×** |
 | web.txt (4.3 MB) | 5.3 ms | 1.3 ms | 19 ms | 2.6× (WDDM floor) | 1.73× (WDDM floor) |
 
-Decoder reference: CUDA enwik8 16.2 ms / silesia 31.1 ms / web 2.0 ms.
+**L5 decode (post-A-016 — u32-aliased huff_decode store fix, 2026-06-08):**
+| File | Decode e2e | huff_decode | lz_decode | vs CUDA decode |
+|---|---|---|---|---|
+| enwik8 L5 (95 MB) | 17.1 ms | 0.77 ms | 3.34 ms | **1.05×** (was 1.15× pre-fix) |
+| silesia L5 (203 MB) | 33.1 ms | TBD | TBD | **1.04×** (was 1.17× pre-fix) |
+
+Decoder reference: CUDA enwik8 L1 16.2 ms / silesia L1 31.1 ms / web L1 2.0 ms / enwik8 L5 16.2 ms / silesia L5 31.7 ms.
 Encoder reference: CUDA enwik8 125 ms / silesia 241 ms / web 11 ms.
+Huffman decode kernel parity: VK 0.77 ms ≈ CUDA 0.71 ms (1.08×).
 
 ---
 

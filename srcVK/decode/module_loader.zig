@@ -1862,7 +1862,8 @@ const KERNEL_DECLS = [_]KernelDecl{
     .{ .kind = .compact_raw_descs_fn, .n_bindings = 5, .push_constant_size = 0 },
     .{ .kind = .merge_huff_descs_fn, .n_bindings = 10, .push_constant_size = 8 },
     .{ .kind = .huff_build_fn, .n_bindings = 4, .push_constant_size = 0, .pin_subgroup_32 = true },
-    .{ .kind = .huff_decode_fn, .n_bindings = 5, .push_constant_size = 0, .pin_subgroup_32 = true },
+    // huff_decode binding 5 is a u32 alias of binding 3 (OutputBuf) — see kernel comment.
+    .{ .kind = .huff_decode_fn, .n_bindings = 6, .push_constant_size = 0, .pin_subgroup_32 = true },
 };
 
 var g_kernel_metas: [KERNEL_DECLS.len]KernelMeta = @splat(.{});
