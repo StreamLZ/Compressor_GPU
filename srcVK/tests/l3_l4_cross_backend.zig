@@ -904,3 +904,223 @@ test "cross-backend: CUDA encode -> VK decode (L5, enwik8.txt 256 KiB head, real
     defer arena.deinit();
     try cudaEncodeVkDecodeCorpus(arena.allocator(), io_inst.io(), "enwik256k", "assets/enwik8.txt", 256 * 1024, 5);
 }
+
+// =====================================================================
+// L5 chain-parser edge-case hardening (2026-06-08)
+//
+// The shaByteIdentityL5 tests above use a 1 KiB random block repeated to
+// fill the buffer — degenerate self-referencing pattern (every block past
+// the first is one big LZ match). That exercises far less of the chain
+// parser than real text. These tests construct synthetic inputs that
+// specifically target the chain parser's threshold branches:
+//
+//   1. LONG_LIT_RUN_THRESHOLD (=64) — bumps minimum_match_length and
+//      zeros recent_match_length when a literal run crosses 64 bytes.
+//   2. CHAIN_MAX_STEPS (=8) — truncates the first_hash chain walk after
+//      8 candidates; if VK and CUDA pick different "best" matches when
+//      the chain is deeper than 8, output diverges.
+//   3. Mixed near/far offsets — isMatchBetter's OFFSET_CLASS_LEN_MARGIN
+//      logic decides between a near match and a longer far match.
+//   4. Block 1 → Block 2 boundary — recent_offset must survive the
+//      block transition; if either backend resets it, output diverges.
+//
+// Each test ASSERTS VK encode SHA == CUDA encode SHA on a constructed
+// input. Both backends must take the same code-path through the chain
+// parser to produce byte-identical output. Acts as a regression guard
+// against future chain-parser changes that might subtly mis-handle one
+// of these branches.
+
+/// SHA byte-identity test taking a caller-supplied buffer (vs the
+/// seeded-RNG generator in shaByteIdentityL5). Used by the chain-parser
+/// edge-case hardening tests below.
+fn shaByteIdentityL5WithSrc(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    tag: []const u8,
+    src: []const u8,
+) !void {
+    if (!fileExists(io, CUDA_BIN) or !fileExists(io, VK_BIN)) return error.SkipZigTest;
+    if (!discreteVkVisibleToChild(allocator, io)) return error.SkipZigTest;
+
+    var in_path_buf: [128]u8 = undefined;
+    var cu_slz_buf: [128]u8 = undefined;
+    var vk_slz_buf: [128]u8 = undefined;
+    const in_path = try std.fmt.bufPrint(&in_path_buf, "tmp_cb_l5harden_{s}_in.bin", .{tag});
+    const cu_slz = try std.fmt.bufPrint(&cu_slz_buf, "tmp_cb_l5harden_{s}_cu.slz", .{tag});
+    const vk_slz = try std.fmt.bufPrint(&vk_slz_buf, "tmp_cb_l5harden_{s}_vk.slz", .{tag});
+    defer rmIfExists(io, in_path);
+    defer rmIfExists(io, cu_slz);
+    defer rmIfExists(io, vk_slz);
+
+    try writeBytes(io, in_path, src);
+
+    {
+        const argv = [_][]const u8{ CUDA_BIN, "-c", "-l", "5", in_path, "-o", cu_slz };
+        const res = try runCmd(allocator, io, &argv);
+        defer {
+            allocator.free(res.stdout);
+            allocator.free(res.stderr);
+        }
+        if (exitCode(res.term) != 0) {
+            std.debug.print("CUDA L5 harden encode failed ({s}): term={any} stderr={s}\n", .{ tag, res.term, res.stderr });
+            return error.CudaEncodeFailed;
+        }
+    }
+    {
+        const argv = [_][]const u8{ VK_BIN, "-c", "-l", "5", in_path, "-o", vk_slz };
+        const res = try runVkCmd(allocator, io, &argv);
+        defer {
+            allocator.free(res.stdout);
+            allocator.free(res.stderr);
+        }
+        if (exitCode(res.term) != 0) {
+            std.debug.print("VK L5 harden encode failed ({s}): term={any} stdout={s} stderr={s}\n", .{ tag, res.term, res.stdout, res.stderr });
+            return error.VkEncodeFailed;
+        }
+    }
+
+    var cu_hex: [64]u8 = undefined;
+    var vk_hex: [64]u8 = undefined;
+    try sha256OfFileLocal(allocator, io, cu_slz, &cu_hex);
+    try sha256OfFileLocal(allocator, io, vk_slz, &vk_hex);
+    if (!std.mem.eql(u8, &cu_hex, &vk_hex)) {
+        std.debug.print(
+            "L5 harden SHA byte-identity FAIL ({s}, size={d}): CUDA={s} VK={s}\n",
+            .{ tag, src.len, cu_hex, vk_hex },
+        );
+        return error.L5HardenByteIdentityMismatch;
+    }
+}
+
+test "cross-backend: L5 chain-parser edge — long-literal-run threshold (LONG_LIT_RUN_THRESHOLD=64) [serial_first]" {
+    var io_inst = makeIo();
+    defer io_inst.deinit();
+    const io = io_inst.io();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    // Pattern: 128 KiB. Recurring "ABCD" markers separated by exactly 70
+    // non-matching bytes — every match candidate is gated by a literal
+    // run crossing the 64-byte threshold. Each "ABCD" at offset O has a
+    // potential 4-byte recent-match against the previous "ABCD" at O-74.
+    // The threshold bump changes whether the encoder takes the match or
+    // continues as literals; VK and CUDA must agree.
+    const total: usize = 128 * 1024;
+    const stride: usize = 74; // 4 marker bytes + 70 literal bytes
+    const src = try al.alloc(u8, total);
+    var rng = std.Random.DefaultPrng.init(0xA1B1_C1D1_E1F1_0011);
+    rng.random().bytes(src);
+    var off: usize = 0;
+    while (off + 4 <= total) : (off += stride) {
+        src[off + 0] = 'A';
+        src[off + 1] = 'B';
+        src[off + 2] = 'C';
+        src[off + 3] = 'D';
+    }
+    try shaByteIdentityL5WithSrc(io, al, "longlitrun", src);
+}
+
+test "cross-backend: L5 chain-parser edge — chain walk truncation (CHAIN_MAX_STEPS=8) [serial_first]" {
+    var io_inst = makeIo();
+    defer io_inst.deinit();
+    const io = io_inst.io();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    // Pattern: 64 KiB. Same 4-byte prefix "WXYZ" repeated at 32 positions
+    // densely packed (every 16 bytes), each followed by 12 unique bytes
+    // so the extension is different at every candidate. The 33rd "WXYZ"
+    // sees a hash chain of length 32 → walks at most CHAIN_MAX_STEPS=8
+    // before truncating → picks the best of the first 8 candidates,
+    // which may not be the globally best match. VK and CUDA must walk
+    // the chain in the same order to pick the same candidate.
+    const total: usize = 64 * 1024;
+    const stride: usize = 16;
+    const src = try al.alloc(u8, total);
+    var rng = std.Random.DefaultPrng.init(0xB2C2_D2E2_F200_2233);
+    rng.random().bytes(src);
+    var off: usize = 0;
+    while (off + stride <= total) : (off += stride) {
+        src[off + 0] = 'W';
+        src[off + 1] = 'X';
+        src[off + 2] = 'Y';
+        src[off + 3] = 'Z';
+    }
+    try shaByteIdentityL5WithSrc(io, al, "chaintrunc", src);
+}
+
+test "cross-backend: L5 chain-parser edge — mixed near/far offset classes [serial_first]" {
+    var io_inst = makeIo();
+    defer io_inst.deinit();
+    const io = io_inst.io();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    // Pattern: 256 KiB (4 LZ blocks). Recurring 8-byte signature
+    // "FEDCBA09" placed at positions chosen so the same signature
+    // appears at both near (<64 KiB) and far (>=64 KiB) offsets from
+    // the third copy. Exercises isMatchBetter's near-vs-far class
+    // comparison + OFFSET_CLASS_LEN_MARGIN logic.
+    //
+    // Positions: 100, 200 (near, +100 from first), 70000 (far, +69900
+    // from first; near 70000-200=69800 from second), 70200 (near
+    // +200 from 70000, far +70100 from first), 200100 (far from
+    // every prior copy), 200200 (near +100 from 200100, far from rest).
+    const total: usize = 256 * 1024;
+    const src = try al.alloc(u8, total);
+    var rng = std.Random.DefaultPrng.init(0xC3D3_E3F3_0033_4455);
+    rng.random().bytes(src);
+    const sig = [8]u8{ 0xFE, 0xDC, 0xBA, 0x09, 0x87, 0x65, 0x43, 0x21 };
+    const positions = [_]usize{ 100, 200, 70000, 70200, 200100, 200200 };
+    for (positions) |p| {
+        if (p + sig.len <= total) {
+            @memcpy(src[p..][0..sig.len], &sig);
+        }
+    }
+    try shaByteIdentityL5WithSrc(io, al, "mixedoffset", src);
+}
+
+test "cross-backend: L5 chain-parser edge — block1→block2 boundary recent_offset carryover [serial_first]" {
+    var io_inst = makeIo();
+    defer io_inst.deinit();
+    const io = io_inst.io();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    // Pattern: 128 KiB (spans LZ_BLOCK_SIZE=64 KiB boundary). 8-byte
+    // signature placed at four positions that establish a recent_offset
+    // in block 1 and then exercise it across the block boundary in
+    // block 2:
+    //   - pos 100: first occurrence (no recent_offset yet)
+    //   - pos 200: second occurrence (sets recent_offset = -100)
+    //   - pos 65540: 4 bytes past block boundary; pos-100 = 65440 (also
+    //     in block 2) is where recent_offset would point. If the
+    //     encoder PRESERVES recent_offset across the boundary, the
+    //     recent-match candidate at pos 65540 against pos 65440 is
+    //     considered. We also place the signature at pos 65440 to make
+    //     the recent-match valid.
+    //   - pos 65440: companion to pos 65540
+    //
+    // VK and CUDA must make the same decision about whether to carry
+    // recent_offset across the boundary.
+    const total: usize = 128 * 1024;
+    const src = try al.alloc(u8, total);
+    var rng = std.Random.DefaultPrng.init(0xD4E4_F400_4455_66AA);
+    rng.random().bytes(src);
+    const sig = [8]u8{ 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0 };
+    const positions = [_]usize{ 100, 200, 65440, 65540 };
+    for (positions) |p| {
+        if (p + sig.len <= total) {
+            @memcpy(src[p..][0..sig.len], &sig);
+        }
+    }
+    try shaByteIdentityL5WithSrc(io, al, "blockboundary", src);
+}

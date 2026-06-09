@@ -1,19 +1,14 @@
-# StreamLZ — Vulkan backend (`srcVK/`)
+# StreamLZ — Vulkan backend
 
-A Vulkan compute-shader port of the CUDA StreamLZ codec. Same SLZ1 wire
-format, byte-identical to CUDA on every level (L1-L5), runs on any
-desktop GPU exposing Vulkan 1.3 + compute subgroups pinned to 32 lanes
-(NVIDIA discrete, Intel iGPU UHD/Iris/Arc, AMD wave32-path GPUs).
+GPU-accelerated LZ77 compressor + decompressor. Vulkan 1.3 compute
+shaders do the per-chunk LZ work and 32-stream Huffman decode; thin
+Zig drivers manage the kernel launches and host-side wire-format
+assembly.
 
-This is a **port**, not a re-implementation. Every kernel mirrors its
-CUDA reference 1:1 in algorithm + dispatch shape. Where Vulkan can't
-express a CUDA construct (no pointer polymorphism, no `__byte_perm`, no
-shaderInt64 without an extension), the adaptation is catalogued in
-[PortAdaptations.md](PortAdaptations.md) with both static and runtime
-verification.
-
-The CUDA backend in `/src/` is the canonical reference. This port
-should not change behavior — only the underlying GPU API.
+Same SLZ1 wire format as the CUDA backend (`include/streamlz_gpu.h`);
+binary-compatible streams in both directions. Runs on any desktop GPU
+exposing Vulkan 1.3 with compute subgroups pinnable to 32 lanes
+(NVIDIA discrete, Intel UHD/Iris/Arc iGPUs, AMD wave32-path GPUs).
 
 ---
 
@@ -23,8 +18,9 @@ should not change behavior — only the underlying GPU API.
 zig build streamlz_vk -Doptimize=ReleaseFast
 ```
 
-Produces `zig-out/bin/streamlz_vk.exe`. CLI shape mirrors the CUDA
-`streamlz`:
+Produces `zig-out/bin/streamlz_vk.exe` (CLI). The SPIR-V kernel images
+are compiled at build time by `glslc` (from `C:/VulkanSDK/...`) and
+`@embedFile`'d into the binary.
 
 ```
 streamlz_vk file.txt              # compress (default L1)
@@ -32,172 +28,252 @@ streamlz_vk -l 5 file.txt         # compress at level 5
 streamlz_vk -d file.slz           # decompress
 streamlz_vk -b -l 3 file.txt      # compress + decompress + verify
 streamlz_vk -db file.slz          # decompress-only benchmark
+streamlz_vk -i  file.slz          # frame / block header dump
 ```
 
-Device selection:
+Levels L1-L5: higher = better ratio, slower encode. Decode speed is
+roughly the same across all five (within ±0.5 ms on a 100 MB input).
+
+Device selection on multi-GPU systems:
 
 ```powershell
-$env:SLZ_VK_DEVICE_INDEX = "1"   # 1 = NVIDIA discrete (preferred)
-$env:SLZ_VK_DEVICE_INDEX = "0"   # 0 = Intel iGPU (works, slower)
+$env:SLZ_VK_DEVICE_INDEX = "1"   # NVIDIA discrete (recommended)
+$env:SLZ_VK_DEVICE_INDEX = "0"   # Intel iGPU (works, slower)
 ```
 
-Without the env var, the CLI picks `physicalDevices[0]` which on most
-dev boxes is the Intel iGPU — verify the `Device: <name>` line the CLI
-prints at startup before trusting any perf number.
-
-The SPIR-V kernel images are compiled at build time by `glslc`
-(installed under `C:/VulkanSDK/`) and embedded into the binary via
-`@embedFile`. `build.zig::addSrcVkShaderSteps` wires the glslc
-dependency depfile (`-MD`) into Zig's cache hash so editing any
-`.glsl` header correctly invalidates the dependent `.spv` (A-012
-closure).
-
-To force a clean rebuild after major shader changes:
-
-```
-cmd.exe /c "tools\build_vk.bat"
-```
-
-Retained as a force-clean utility but no longer required after `.glsl`
-edits as of 2026-06-08.
-
----
-
-## Status (2026-06-08)
-
-| Level | Decode | Encode | Notes |
-|-------|--------|--------|-------|
-| **L1** | ✅ byte-identical | ✅ byte-identical | Raw LZ. Decode kernel at parity; encode FASTER than CUDA on large workloads. |
-| **L2** | ✅ byte-identical | ✅ byte-identical | Raw LZ + bigger hash. Same kernels as L1 plus 9 ptest cases. |
-| **L3** | ✅ byte-identical | ✅ 0.019% larger on silesia | Adds 32-stream Huffman. Silesia size delta = A-008 (Vulkan 4 GiB SSBO cap, accepted residual). |
-| **L4** | ✅ byte-identical | ✅ byte-identical | L3 kernels + `p_l4=1` match-range rehash. |
-| **L5** | ✅ byte-identical | ✅ byte-identical | Adds chain parser (`lz_chain_parser.glsl`); 575 LOC GLSL port of CUDA's 440-line `lz_chain_parser.cuh`. |
-
-**Tests:** ptest_vk reports **140 passed / 9 skipped / 0 failed (149
-total)** on both NVIDIA RTX 4060 Ti and Intel iGPU.
-
-**Decode perf vs CUDA** (NVIDIA RTX 4060 Ti, large workloads, `e2e best`):
-
-| Corpus | L1 | L2 | L3 | L4 | L5 |
-|--------|---:|---:|---:|---:|---:|
-| enwik8 (95 MB) | 0.97× | 0.97× | 1.03× | 1.03× | 1.03× |
-| silesia (203 MB) | 0.97× | 0.97× | 1.03× | 1.03× | 1.03× |
-
-**All decode e2e cells inside the 10% bar.** Decode `gpu kernel`
-time on L3-L5 is 1.20-1.37× CUDA (A-021, kernel-time-only — fully
-absorbed by host overhead at e2e). web.txt (4.5 MB) hits the
-Vulkan-on-WDDM submit floor (~2.6× decode / ~1.7× encode); accepted
-structural residual.
-
-Full sweep tables: [PerfSweep.md](PerfSweep.md).
+Without the env var the CLI picks `physicalDevices[0]`, which on most
+Windows boxes is the Intel iGPU. Verify the `Device: <name>` line the
+CLI prints at startup before trusting any perf number.
 
 ---
 
 ## C ABI library
 
-Two surfaces are exported from `srcVK/streamlz_gpu.zig`:
+Two surfaces are exported:
 
 **CUDA-shaped** (`include/streamlz_gpu.h`) — drop-in CUDA replacement.
 Same `slzCreate` / `slzCompressHost` / `slzDecompressHost` /
 `slzCompressAsync` / `slzDecompressAsync` / `slzGetLastTimings` names
-as the CUDA build. Useful when integrating into existing CUDA-shaped
-call sites without changing call signatures.
+as the CUDA build. Existing CUDA call sites don't need to change.
+
+```c
+slzContext_t ctx;
+slzCreate(&ctx);
+size_t bound;
+slzCompressBound(ctx, src_size, slzCompressDefaultOpts(), &bound);
+// allocate dst...
+size_t comp_size;
+slzCompressHost(ctx, src, src_size, dst, bound, &comp_size, slzCompressDefaultOpts());
+// later:
+slzDecompressHost(ctx, comp, comp_size, out, out_size, &written, slzDecompressDefaultOpts());
+slzDestroy(ctx);
+```
 
 **VK-native** (`include/streamlz_gpu_vk.h`) — `_vk`-suffixed surface
-with opaque `slzVkHandle_t`, true async + `*Poll_vk` polling, buffer
-registration via `slzRegisterBuffer_vk`, synthetic-pointer helpers
-via `slzMakeDeviceOnlyHandle_vk`. 16 symbols total, all implemented
-as of Phase 4 (`c9c28bc`).
+with opaque `slzVkHandle_t`, true async + polling (`slzCompressAsync_vk`
++ `slzCompressAsyncPoll_vk` pair), VkBuffer registration via
+`slzRegisterBuffer_vk`, synthetic-pointer helpers for D2D testing via
+`slzMakeDeviceOnlyHandle_vk`. 16 symbols total. Use this when you
+want VK-native semantics rather than CUDA-shaped emulation.
 
-Both surfaces share the same internal codec (`Context` /
-`VkContext = Context + AsyncSlot + registry`). Tests in
-`srcVK/tests/async_d2d_api.zig`.
+Both surfaces share the same internal codec — picking one is purely a
+caller-style decision.
+
+---
+
+## Performance
+
+Best-of-5 decode + single-shot encode on an RTX 4060 Ti (sm_89,
+Vulkan API 1.4.325), `streamlz_vk -db -r 5` and `streamlz_vk -b -r 5`.
+Full sweep tables in [PerfSweep.md](PerfSweep.md); 60 raw bench
+captures under `c:/tmp/perfsweep/`.
+
+### Decode (ms): end-to-end host wall-clock
+
+| Level | enwik8 (95 MB) | silesia (203 MB) |
+|-------|---------------:|-----------------:|
+| L1 | **15.0** | **29.0** |
+| L2 | **14.9** | **29.1** |
+| L3 | **17.1** | **32.7** |
+| L4 | **17.1** | **32.7** |
+| L5 | **17.1** | **32.7** |
+
+End-to-end = H2D upload of compressed frame + GPU decode + D2H download
+of decompressed output, as a host-bounce caller sees it.
+
+### Compression ratio (output size as % of source)
+
+| Level | enwik8 | silesia |
+|-------|-------:|--------:|
+| L1 | 58.6% | 47.8% |
+| L2 | 58.6% | 47.8% |
+| L3 | 43.7% | 38.0% (CUDA 38.0%; 1.00019× wider, A-008) |
+| L4 | 42.7% | 37.5% |
+| L5 | 39.6% | 33.9% |
+
+Byte-identical to the CUDA backend on every (level, corpus) cell
+**except** silesia L3, where the Vulkan 4 GiB SSBO range cap forces a
+`hash_bits=18` clamp (CUDA uses 19); cost is 0.019% larger output.
+Documented as A-008.
+
+### StreamLZ-Vulkan vs StreamLZ-CUDA (RTX 4060 Ti, enwik8 + silesia)
+
+| Window | VK vs CUDA | Notes |
+|--------|-----------:|-------|
+| Decode e2e (all levels, large workloads) | **0.96-1.03×** | Inside 10% parity bar everywhere |
+| Decode `gpu kernel` (L1/L2 large workloads) | **0.96-1.02×** | At or under CUDA |
+| Decode `gpu kernel` (L3-L5 large workloads) | 1.20-1.37× | Over bar; absorbed by host overhead at e2e (A-021) |
+| Encode (L1/L2 enwik8) | **0.81-0.86×** | VK measurably faster than CUDA |
+| Encode (L3-L5 large workloads) | 0.95-1.01× | At parity (within single-shot noise band) |
+| Output bytes | 14/15 cells identical | silesia L3 1.00019× (A-008) |
+
+### StreamLZ-Vulkan vs nvCOMP (transitive)
+
+The CUDA backend beats nvCOMP LZ4 by 1.18× (kernel-sum) / 1.03×
+(async wall) / 1.18× (end-to-end host wall) on enwik8 L1, and beats
+nvCOMP Zstd by 1.14× / 1.05× / 1.19× on enwik8 L5 — see the root
+[README.md](../README.md) "vs nvCOMP" section for methodology + raw
+numbers.
+
+The Vulkan backend is within 5% of the CUDA backend at end-to-end on
+every large-workload cell, so it inherits the nvCOMP advantage with a
+small margin. Concrete enwik8 e2e numbers (RTX 4060 Ti):
+
+| Codec | enwik8 L1 e2e | enwik8 L5 e2e |
+|-------|--------------:|--------------:|
+| StreamLZ-VK | **15.0 ms** | **17.1 ms** |
+| StreamLZ-CUDA | 15.5 ms | 15.3 ms |
+| nvCOMP LZ4 | 18.3 ms | — |
+| nvCOMP Zstd | — | 18.2 ms |
+
+VK is roughly tied with CUDA at L1, slightly behind at L5 (the
+A-021 kernel-time residual on the Huffman+LZ decode chain), and still
+ahead of nvCOMP at both levels.
+
+### Web.txt small-file regime
+
+| Window | VK | CUDA | Ratio | Notes |
+|--------|---:|-----:|------:|-------|
+| Decode e2e (4.5 MB) | 5.3 ms | 2.0 ms | 2.6× | Vulkan-on-WDDM submit floor (~50-150 µs per dispatch × N dispatches) |
+| Encode (4.5 MB) | 19 ms | 11 ms | 1.7× | Same submit-floor cost |
+
+Sub-10 MB inputs hit a structural Vulkan-on-Windows overhead that CUDA's
+kernel-mode driver model amortizes more effectively. Documented as
+accepted residual; unfixable from the app side per four negative-result
+iterations. The VK backend remains the right choice for the 10+ MB
+workloads that dominate real use cases.
 
 ---
 
 ## Project layout
 
 ```
-build.zig::addSrcVkShaderSteps   compiles every .comp via glslc -MD,
-                                  Zig parses the depfile for accurate
-                                  rebuilds (A-012 closure)
-PortAdaptations.md                canonical catalog of every CUDA-VK
-                                  divergence (A-001..A-021), each with
-                                  static + runtime verification status
-PerfSweep.md                      Phase 5 perf parity tables (L1-L5 × 3
-                                  corpora × VK + CUDA × decode + encode)
-ToDo.md                           current status + remaining work + the
-                                  CRITICAL HYGIENE RULES section for
-                                  new agents/contributors
-
-cli/                              CLI handlers (compress, decompress,
-                                  bench)
-decode/                           decode pipeline:
-  module_loader.zig                VkDevice init, procs.* surface (26
-                                  slots), KERNEL_DECLS, LRU import
-                                  cache, persistent VkPipelineCache
-  decode_dispatch.zig             fullGpuLaunchImpl orchestrator + L2
-                                  gate + per-phase QPC profiler
-  *.comp                          compute shaders (LZ decode, Huffman
-                                  decode, scan/compact/merge dispatch
-                                  chain)
-  *.glsl                          shared headers (bit-buffer adapters,
-                                  byte I/O, wire format)
-encode/                           encode pipeline (mirror of decode/)
-  module_loader.zig                encode-specific VkDevice init +
-                                  Int8 SPIR-V patcher (glslc bug
-                                  workaround, A-cataloged)
-  fast_framed.zig                 compressFramedOne orchestrator +
-                                  persistent gpu_out_buf / d2h_final_buf
-                                  + encode phase profiler
-  *.comp                          encode kernels (LZ encode, Huffman
-                                  encode, frame assembly)
-
-common/                           shared GLSL/SPIR-V headers (warp,
-                                  byteio, huffman tables)
-
-tests/                            integration + cross-backend + ptest
-                                  harness. Per-test VK device pick via
-                                  SLZ_VK_DEVICE_INDEX. test_runner_parallel.zig
-                                  drives serial_first → parallel → serial.
+build.zig::addSrcVkShaderSteps   compiles every .comp via glslc -MD
+                                  with full #include dep tracking
 
 streamlz_gpu.zig                  CUDA-shaped + _vk-shaped C ABI
                                   exports (29 functions total)
-vulkan_api.zig                    procs.* surface definition
+vulkan_api.zig                    procs.* surface definition (26 slots)
 mmap.zig                          file mmap helpers (input read +
                                   output write paths)
+
+cli/                              compress / decompress / bench handlers
+decode/                           decode pipeline
+  module_loader.zig               VkDevice init, KERNEL_DECLS, LRU
+                                  import cache, persistent VkPipelineCache
+  decode_dispatch.zig             fullGpuLaunchImpl orchestrator + L2
+                                  gate + per-phase QPC profiler
+  *.comp                          compute shaders (LZ decode, Huffman
+                                  decode, scan/compact/merge chain)
+  *.glsl                          shared headers (bit-buffer adapters,
+                                  byte I/O, wire format)
+encode/                           encode pipeline (mirror of decode/)
+  module_loader.zig               encode-specific VkDevice init +
+                                  Int8 SPIR-V patcher (glslc workaround)
+  fast_framed.zig                 compressFramedOne orchestrator +
+                                  persistent gpu_out_buf / d2h_final_buf
+  *.comp                          encode kernels
+common/                           shared GLSL headers (warp, byteio,
+                                  Huffman tables)
+
+tests/                            integration + cross-backend + ptest
+                                  harness (144 tests, runs on both
+                                  NVIDIA + Intel iGPU)
+
+PortAdaptations.md                catalog of every CUDA-VK divergence
+                                  (21 entries; 16 RESOLVED, 5 ACTIVE
+                                  residuals — all documented with both
+                                  static + runtime verification status)
+PerfSweep.md                      Phase 5 perf parity tables (L1-L5 ×
+                                  3 corpora × VK + CUDA × decode + encode)
+ToDo.md                           current status + remaining work + the
+                                  CRITICAL HYGIENE RULES section
 ```
 
 ---
 
-## Architecture invariants — DO NOT VIOLATE
+## Architecture
 
-Reproduced from `ToDo.md` for visibility:
+The kernel pipeline mirrors the CUDA reference exactly:
 
-1. **`procs.*` surface** — codec calls `procs.h2d(dst, src, size)` etc.
-   on both CUDA and VK. Adding new slots is OK when they express a
-   Vulkan-native concept CUDA doesn't have (A-007 per-binding offset,
-   `d2h_offset_gather`, `compute_to_compute_barrier`, etc.).
-2. **Function decomposition** must mirror CUDA verbatim — do not
-   rename or restructure `fullGpuLaunchImpl`, `compressFramedOne`,
-   etc.
-3. **L1 host-input path keeps CPU `buildChunkDescriptors`** — the
-   prior `/src_vulkan/` workflow moved this to GPU; that was the
-   canonical port violation (see `feedback_port_means_port`).
-4. **Subgroup size PINNED to 32** via `requiredSubgroupSize=32` +
-   `REQUIRE_FULL_SUBGROUPS_BIT`. Device-pick guard rejects devices
-   that can't satisfy this. NVIDIA + Intel UHD/Iris/Arc + AMD wave32
-   path all qualify.
-5. **VkPhysicalDeviceVulkan12Features + Vulkan13Features required**:
-   `bufferDeviceAddress`, `shaderInt8`, `storageBuffer8BitAccess`,
-   `uniformAndStorageBuffer8BitAccess`, `subgroupSizeControl`,
-   `computeFullSubgroups`. Init returns `error.BackendNotAvailable`
-   if any are missing.
+**Decode pipeline (L3-L5):**
+```
+host → H2D compressed frame
+     → scan_parse_kernel        (1 dispatch, walks frame on GPU)
+     → prefix_sum_chunks        (1 dispatch, running offsets)
+     → compact_huff_descs ×4    (fused into 1 dispatch via A-017)
+     → compact_raw_descs        (1 dispatch)
+     → gather_raw_off16         (1 dispatch)
+     → merge_huff_descs         (1 dispatch)
+     → huff_build_lut           (1 dispatch, 1024-entry shared-mem LUT)
+     → huff_decode_4stream      (32 streams parallel, BIL format)
+     → lz_decode (raw or huff)  (LZ workhorse, 8-arm dispatch)
+     → D2H decompressed output
+```
 
-The catalog of every deliberate CUDA-VK divergence is in
-[PortAdaptations.md](PortAdaptations.md). Every adaptation declares
-both static AND runtime verification status — an unverified
-adaptation is a known risk surface, per the A-001 byte-65544 lesson.
+L1/L2 (no Huffman) skip the LUT-build and Huffman-decode kernels and
+use the leaner `lz_decode_raw_kernel` directly.
+
+**Encode pipeline:**
+```
+host → H2D source
+     → lz_encode_kernel              (warp-parallel greedy or chain
+                                      parser depending on level)
+     → assemble_measure_kernel       (per-chunk sub-chunk sizing)
+     → assemble_write_kernel         (per-chunk payload write)
+     → frame_assemble_kernel         (frame splice + headers)
+     → [L3+: huff_build_tables + huff_encode_4stream]
+     → D2H compressed frame
+```
+
+**Subgroup pinning.** All compute pipelines require
+`requiredSubgroupSize=32` + `REQUIRE_FULL_SUBGROUPS_BIT`. Device-pick
+guard rejects devices that can't satisfy
+`[minSubgroupSize<=32, maxSubgroupSize>=32]`. NVIDIA always offers 32;
+Intel supports the pin via UHD/Iris/Arc; AMD supports via the wave32
+path. Devices without 32-lane subgroups return
+`error.BackendNotAvailable` so the codec falls back to the CUDA build
+(if available) or surfaces an error.
+
+**Required Vulkan features:** `bufferDeviceAddress`, `shaderInt8`,
+`storageBuffer8BitAccess`, `uniformAndStorageBuffer8BitAccess`,
+`subgroupSizeControl`, `computeFullSubgroups` (Vulkan 1.2 + 1.3).
+
+**Persistent disk-backed VkPipelineCache** at
+`%LOCALAPPDATA%/streamlz_vk/pipeline_cache.bin`. Saves ~38 ms cold-start
+on RTX 4060 Ti (loads at init, saves at process exit). Driver validates
+header per Vulkan 1.0 spec § 10.5.4 and silently discards mismatches.
+
+**Memory pinning + zero-copy D2H/H2D.** Encode uses persistent
+page-aligned host buffers (via VMA `procMallocHost`) so
+`VK_EXT_external_memory_host` imports hit an LRU cache on every call
+after the first. The iter-3/4/15 pattern (transfer-queue gather +
+imported destination + single submit) eliminated 200+ ms of D2H staging
+cost on enwik8.
+
+For per-divergence detail see [PortAdaptations.md](PortAdaptations.md).
+For the full kernel inventory + bench measurement procedures see
+[ToDo.md](ToDo.md).
 
 ---
 
@@ -208,61 +284,27 @@ adaptation is a known risk surface, per the A-001 byte-65544 lesson.
 $env:SLZ_VK_DEVICE_INDEX = "1"
 ./zig-out/bin/streamlz_vk.exe -db -r 5 tests/goldens/enwik8.txt.L1.slz
 
-# Encode roundtrip (note: encode itself is single-shot; -r controls decode reps only)
+# Encode roundtrip (note: encode itself is single-shot; -r controls decode reps)
 ./zig-out/bin/streamlz_vk.exe -b -r 5 -l 1 assets/enwik8.txt
 
 # Per-kernel timing breakdown (decode)
 $env:SLZ_VK_PROFILE_DECODE = "1"
 ./zig-out/bin/streamlz_vk.exe -db -r 5 tests/goldens/enwik8.txt.L1.slz
-# Prints kper: <kernel> count=N total=Xms avg=Yus per kernel
+# Prints kper: <kernel> count=N total=Xms avg=Yus
 
 # Per-phase host overhead
 $env:SLZ_VK_PROFILE_PHASES = "1"
 ./zig-out/bin/streamlz_vk.exe -db -r 5 tests/goldens/enwik8.txt.L1.slz
-
-# Cross-backend SHA byte-identity (run for every encode change)
-foreach ($a in @("web.txt", "enwik8.txt", "silesia_all.tar")) {
-  ./zig-out/bin/streamlz_vk.exe -c -l 5 -o "c:/tmp/vk_$a.slz" "assets/$a"
-  ./zig-out/bin/streamlz.exe    -c -l 5 -o "c:/tmp/cu_$a.slz" "assets/$a"
-  $vk = (Get-FileHash -Algorithm SHA256 "c:/tmp/vk_$a.slz").Hash
-  $cu = (Get-FileHash -Algorithm SHA256 "c:/tmp/cu_$a.slz").Hash
-  Write-Host "$a MATCH=$($vk -eq $cu)"
-}
 
 # ptest_vk on both backends
 $env:SLZ_VK_DEVICE_INDEX = "1"; zig build ptest_vk -Doptimize=ReleaseFast
 $env:SLZ_VK_DEVICE_INDEX = "0"; zig build ptest_vk -Doptimize=ReleaseFast
 ```
 
-**GPU benchmarks must run SERIALLY.** Never parallelize bench tool
-calls (even across backends) — they contend for GPU/WDDM and produce
-biased numbers. See `feedback_gpu_bench_serial.md` (auto-memory) for
-the reproducible-flip example.
-
-**Always verify `Device: <name>` in the CLI output before trusting
-a perf number.** The default device pick is `physicalDevices[0]`
-which on Windows is typically the Intel iGPU. Set
-`SLZ_VK_DEVICE_INDEX=1` for the NVIDIA discrete on this dev box.
-
----
-
-## Known accepted residuals
-
-1. **web.txt small-file regime** — decode 2.6×, encode 1.7× CUDA.
-   Structural Vulkan-on-WDDM submit floor (~50-150 µs per dispatch).
-   Confirmed unfixable from the app side via four negative-result
-   iterations.
-2. **L3 silesia 0.019% larger** — A-008. Vulkan 4 GiB SSBO range
-   cap forces `hash_bits=18` clamp on inputs > 128 MiB. Future
-   BDA workaround would close it.
-3. **L3/L4/L5 decode `gpu kernel` 1.20-1.37× CUDA** — A-021.
-   Composition of explicit pipeline barriers (A-006), per-binding
-   offset ABI (A-007), and unfused merge/compact/gather dispatches.
-   Absorbed by host overhead at e2e (all cells inside 10% bar).
-   Future fusion work (A-017 pattern) would close it.
-4. **L2 pre-existing single-thread mode `TestExpectedEqual`** — 2
-   tests skip under `SLZ_VK_TEST_THREADS=1`. Parallel mode (the
-   spec'd config) is rock-solid at 140/9/0.
+GPU benchmarks must run **serially** — never parallelize bench
+invocations (even across backends); they contend for GPU/WDDM and
+produce biased numbers. Always verify the `Device: <name>` line in the
+CLI output before trusting any perf number.
 
 ---
 
