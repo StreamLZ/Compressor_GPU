@@ -1858,7 +1858,9 @@ const KERNEL_DECLS = [_]KernelDecl{
     // bindings (ChunksBuf, FirstSubIdxBuf, TotalSubchunksBuf) plus a
     // 2× u32 push-constant block (n_chunks, sub_chunk_cap).
     .{ .kind = .prefix_sum_chunks_fn, .n_bindings = 3, .push_constant_size = 8 },
-    .{ .kind = .compact_huff_descs_fn, .n_bindings = 4, .push_constant_size = 0 },
+    // A-017: fused 4-way compact (was 4 separate dispatches × 4 bindings each).
+    // 10 bindings = 4× staged + total + 4× dst + counts. Dispatched with grid_x=4.
+    .{ .kind = .compact_huff_descs_fn, .n_bindings = 10, .push_constant_size = 0 },
     .{ .kind = .compact_raw_descs_fn, .n_bindings = 5, .push_constant_size = 0 },
     .{ .kind = .merge_huff_descs_fn, .n_bindings = 10, .push_constant_size = 8 },
     .{ .kind = .huff_build_fn, .n_bindings = 4, .push_constant_size = 0, .pin_subgroup_32 = true },

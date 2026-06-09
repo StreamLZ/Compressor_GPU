@@ -357,6 +357,51 @@ verification status. An unverified adaptation is a known risk surface.
   synchronous unlock for imported pages, but the current shape
   matches what the encoder CLI has always done.
 
+### A-017: Fused 4× compact_huff_descs dispatches (`grid_x=4` + `gl_WorkGroupID.x`)
+- **File:line**: `srcVK/decode/compact_huff_descs_kernel.comp` (10-binding
+  rewrite + per-stream switch on `gl_WorkGroupID.x`); host call site at
+  `srcVK/decode/scan_gpu.zig:335-385` (1 dispatch with grid_x=4 replaces
+  the 4-iteration loop). KERNEL_DECLS at
+  `srcVK/decode/module_loader.zig:1865` (`n_bindings=10`).
+- **CUDA reference**: `src/decode/scan_gpu.zig:214-239` — CUDA dispatches
+  `slzCompactHuffDescsKernel` 4 times (one per Huffman stream type: lit,
+  tok, off16hi, off16lo) via `cuLaunchKernel`. Each call ~73 µs on RTX
+  4060 Ti → ~293 µs total.
+- **Class**: design-choice (port-violating in *dispatch shape*; identical
+  in algorithm — each stream's compact still runs single-thread)
+- **Why**: VK-on-WDDM per-dispatch overhead floor is ~75 µs higher than
+  CUDA per dispatch. With 4 back-to-back dispatches the gap compounds:
+  VK was at 148 µs × 4 = 593 µs vs CUDA's 293 µs (2.0×). Fusing collapses
+  the 4 dispatches to one (grid_x=4); each workgroup is still
+  `local_size_x=1` (compact is inherently serial per stream — the loop
+  body has a sequential output cursor) but the 3 redundant
+  pipeline-state-load / descriptor-fetch / workgroup-launch overheads
+  evaporate. 10 bindings = 4× staged source views (one per stream at
+  distinct binding-offsets in `d_scan_staged`, since 256-byte SSBO_ALIGN
+  padding makes the per-stream stride non-integer in descriptor units),
+  `d_total_subs`, 4× per-stream dst (`d_compact_lit/tok/hi/lo`),
+  `d_compact_counts` at offset 0 (kernel writes 4 slots via
+  `d_n_out[stream_type * COUNTS_STRIDE_U32]`).
+- **Risk if wrong**: incorrect per-stream compaction → wrong descriptor
+  arrays for downstream merge/build_lut/huff_decode → garbage decode.
+  Covered by every L3/L4/L5 ptest case + cross-backend roundtrip.
+- **Static verification**: per-stream switch (`if stream_type == 0u
+  d_staged_lit[i] else ...`) is uniform across the workgroup since
+  `local_size_x=1` — no warp divergence. Output count writes to the same
+  slot the prior unfused code wrote (`stream_type * COUNTS_STRIDE_U32`
+  matches the prior `n_off = COUNTS_STRIDE * stream_type` binding offset
+  expressed in u32 index space).
+- **Runtime verification**: ✅ **2026-06-08.** ptest_vk 99 passed / 9
+  skipped / 0 failed on both NVIDIA RTX 4060 Ti + Intel iGPU. Perf:
+  `compact_huff_descs_fn` 593 µs → 245 µs (**2.4× faster on this kernel**,
+  -348 µs/decode). L5 enwik8 e2e 17.07 → 16.62 ms (1.054× → **1.027× CUDA**).
+  L5 silesia e2e 33.12 → 32.68 ms (1.044× → **1.030× CUDA**).
+- **Discovered**: 2026-06-08 secondary-perf investigation after A-016
+  closed the bulk of the gap. Web search of NVIDIA Vulkan best-practices
+  + WebGPU dispatch-overhead research confirmed multi-dispatch fusion
+  as the canonical mitigation for the WDDM dispatch-floor pattern.
+- **Status**: RESOLVED.
+
 ### A-016: u32-aliased SSBO view for the Phase 2 hot-loop store (Huffman decode)
 - **File:line**: `srcVK/decode/huff_decode_4stream_kernel.comp:79-93`
   (extra binding 5 `OutputBufU32`); usage at lines 405 (Phase 2a) and

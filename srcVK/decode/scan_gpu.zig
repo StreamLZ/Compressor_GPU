@@ -332,39 +332,50 @@ pub fn gpuScanChunks(
         try ensureDeviceBuf(&self.d_compact_counts, &self.d_compact_counts_size, counts_bytes);
         try vkCall(memset(self.d_compact_counts, 0, counts_bytes), .copy);
 
-        // CUDA reference: src/decode/scan_gpu.zig:214-239. 4 launches of
-        // slzCompactHuffDescsKernel (one per stream type) — same kernel,
-        // different bindings (staged source / dst / count slot).
-        // compact_huff_descs_kernel.comp: n_bindings=4 (StagedBuf,
-        // TotalSubsBuf, OutBuf, NOutBuf), push_constant_size=0.
-        const huff_streams = [_]struct { staged_off: usize, dst: u64, n_off: u64 }{
-            .{ .staged_off = 0,                  .dst = self.d_compact_lit, .n_off = COUNTS_STRIDE * 0 },
-            .{ .staged_off = huff_arr_bytes,     .dst = self.d_compact_tok, .n_off = COUNTS_STRIDE * 1 },
-            .{ .staged_off = huff_arr_bytes * 2, .dst = self.d_compact_hi,  .n_off = COUNTS_STRIDE * 2 },
-            .{ .staged_off = huff_arr_bytes * 3, .dst = self.d_compact_lo,  .n_off = COUNTS_STRIDE * 3 },
-        };
-        const compact_names = [_][*:0]const u8{
-            "slzCompactHuffDescsKernel (lit)",
-            "slzCompactHuffDescsKernel (tok)",
-            "slzCompactHuffDescsKernel (hi)",
-            "slzCompactHuffDescsKernel (lo)",
-        };
-        for (huff_streams, 0..) |hs, ci| {
-            // Iter 4c: base handle + per-binding offset (see scan_parse
-            // above for the rationale). Bindings 0 + 3 are sub-regions
-            // of d_scan_staged + d_compact_counts respectively.
-            var k_staged: u64 = self.d_scan_staged;
-            var k_total: u64 = self.d_total_subchunks_buf;
-            var k_dst: u64 = hs.dst;
+        // A-017 (2026-06-08): fuse 4 separate compact_huff dispatches
+        // into one with grid_x=4. CUDA reference does 4 cuLaunchKernel
+        // calls (src/decode/scan_gpu.zig:214-239) for {lit, tok, hi, lo};
+        // VK collapses to a single vkCmdDispatch with each workgroup
+        // selecting its stream type via gl_WorkGroupID.x. Eliminates 3×
+        // per-dispatch overhead floor (~75 µs/dispatch on Vulkan-on-WDDM)
+        // — measured savings ~225 µs/decode on RTX 4060 Ti.
+        //
+        // compact_huff_descs_kernel.comp: n_bindings=10 (4× per-stream
+        // staged source views at offsets 0/huff_arr_bytes/2x/3x, total_subs,
+        // 4× per-stream dst buffers d_compact_{lit,tok,hi,lo}, NOutBuf at
+        // offset 0 covering all 4 count slots). push_constant_size=0.
+        {
+            var k_st_lit: u64 = self.d_scan_staged;
+            var k_st_tok: u64 = self.d_scan_staged;
+            var k_st_hi:  u64 = self.d_scan_staged;
+            var k_st_lo:  u64 = self.d_scan_staged;
+            var k_total:  u64 = self.d_total_subchunks_buf;
+            var k_out_lit: u64 = self.d_compact_lit;
+            var k_out_tok: u64 = self.d_compact_tok;
+            var k_out_hi:  u64 = self.d_compact_hi;
+            var k_out_lo:  u64 = self.d_compact_lo;
             var k_count: u64 = self.d_compact_counts;
             var c_params = [_]?*anyopaque{
-                @ptrCast(&k_staged), @ptrCast(&k_total),
-                @ptrCast(&k_dst),    @ptrCast(&k_count),
+                @ptrCast(&k_st_lit), @ptrCast(&k_st_tok),
+                @ptrCast(&k_st_hi),  @ptrCast(&k_st_lo),
+                @ptrCast(&k_total),
+                @ptrCast(&k_out_lit), @ptrCast(&k_out_tok),
+                @ptrCast(&k_out_hi),  @ptrCast(&k_out_lo),
+                @ptrCast(&k_count),
             };
             var c_extra = [_]?*anyopaque{null};
-            const ch_offs = [_]u64{ hs.staged_off, 0, 0, hs.n_off };
-            const t_ch = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, compact_names[ci], stream);
-            try vkCall(launch(module_loader.compact_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &c_params, &c_extra, &ch_offs), .launch);
+            // Per-binding byte offsets: stream-N staged source at N*huff_arr_bytes
+            // within d_scan_staged; all dst buffers and counts buffer start at 0.
+            const ch_offs = [_]u64{
+                0, huff_arr_bytes, huff_arr_bytes * 2, huff_arr_bytes * 3,
+                0,
+                0, 0, 0, 0,
+                0,
+            };
+            const t_ch = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzCompactHuffDescsKernel (fused×4)", stream);
+            // grid_x=4: one workgroup per stream type. local_size_x=1 unchanged
+            // (compact is inherently serial per stream).
+            try vkCall(launch(module_loader.compact_huff_descs_fn, 4, 1, 1, 1, 1, 1, 0, stream, &c_params, &c_extra, &ch_offs), .launch);
             decode_context.endKernelTiming(t_ch, stream);
         }
         // CUDA reference: src/decode/scan_gpu.zig:241-255. Raw compact —

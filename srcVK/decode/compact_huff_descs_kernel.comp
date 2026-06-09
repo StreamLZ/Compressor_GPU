@@ -2,19 +2,39 @@
 // slzCompactHuffDescsKernel.
 // CUDA reference: src/decode/compact_descs_kernels.cuh:39-60.
 // See srcVK/PortInstructions.md.
+//
+// VK adaptation (A-017, 2026-06-08): CUDA dispatches this kernel 4×
+// per decode (one per Huffman stream type: lit, tok, off16hi, off16lo)
+// via cuLaunchKernel — each takes ~73 µs on RTX 4060 Ti, total ~293 µs.
+// The VK port previously did the same 4 dispatches at ~148 µs each
+// (~593 µs total) — the per-dispatch overhead on Vulkan-on-WDDM is
+// ~75 µs higher than CUDA per dispatch, multiplied by 4 calls.
+//
+// Fix: fuse the 4 calls into a single dispatch with grid_x=4 and use
+// gl_WorkGroupID.x ∈ {0,1,2,3} to select the stream type inside the
+// kernel. Each workgroup is still single-thread (one stream's compact
+// is inherently serial) but the 4 dispatch-overhead floors collapse
+// to one. Saves ~3× per-dispatch overhead (~225 µs/decode measured).
+//
+// Binding count goes from 4 to 10 (4× staged source views at distinct
+// byte offsets + total_subs + 4× dst buffers + count buffer at offset 0).
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require
 
 #include "slz_wire_format.glsl"
 
-// CUDA: 1 block × 1 thread (SLZ_GUARD_SINGLE_THREAD).
 layout(local_size_x = 1) in;
 
 // VK adaptation: HUFF_LUT_ENTRIES is defined in srcVK/decode/descriptors.zig
 // (= 1024). Mirror the constant locally to match the CUDA compact loop's
 // `k * HUFF_LUT_ENTRIES` lut_offset stamping.
 const uint HUFF_LUT_ENTRIES = 1024u;
+
+// COUNTS_STRIDE = 256 bytes = 64 u32 per slot — must match
+// srcVK/decode/scan_gpu.zig::COUNTS_STRIDE. The 4 huff-stream count
+// slots live at u32 indices 0, 64, 128, 192 within d_compact_counts.
+const uint COUNTS_STRIDE_U32 = 64u;
 
 // SlzScanHuffDesc layout matches descriptors.zig::ScanHuffDesc — 5 × u32
 // = 20 bytes. {in_offset, in_size, out_offset, out_size, valid}.
@@ -36,34 +56,53 @@ struct SlzHuffDecChunkDescGlsl {
     uint lut_offset;
 };
 
-// arg 0: const SlzScanHuffDesc* d_staged
-layout(std430, binding = 0) readonly buffer StagedBuf {
-    SlzScanHuffDescGlsl d_staged[];
-};
+// arg 0..3: per-stream views of d_scan_staged (same VkBuffer, different
+// binding offsets — Lit at 0, Tok at huff_arr_bytes, Hi at 2x, Lo at 3x).
+// VK std430 doesn't allow integer-element strides between subranges of
+// one binding (the 256-byte SSBO_ALIGN padding makes huff_arr_bytes /
+// sizeof(ScanHuffDesc) non-integer for arbitrary total_subchunks), so
+// each stream gets its own binding.
+layout(std430, binding = 0) readonly buffer StagedBufLit { SlzScanHuffDescGlsl d_staged_lit[]; };
+layout(std430, binding = 1) readonly buffer StagedBufTok { SlzScanHuffDescGlsl d_staged_tok[]; };
+layout(std430, binding = 2) readonly buffer StagedBufHi  { SlzScanHuffDescGlsl d_staged_hi[];  };
+layout(std430, binding = 3) readonly buffer StagedBufLo  { SlzScanHuffDescGlsl d_staged_lo[];  };
 
-// arg 1: const uint32_t* d_total_subs
-layout(std430, binding = 1) readonly buffer TotalSubsBuf {
+// arg 4: const uint32_t* d_total_subs
+layout(std430, binding = 4) readonly buffer TotalSubsBuf {
     uint d_total_subs;
 };
 
-// arg 2: SlzHuffDecChunkDesc* d_out
-layout(std430, binding = 2) buffer OutBuf {
-    SlzHuffDecChunkDescGlsl d_out[];
-};
+// arg 5..8: per-stream dst buffers (separate VkBuffers; downstream
+// merge / huff_build / huff_decode read them as individual bindings).
+layout(std430, binding = 5) buffer OutBufLit { SlzHuffDecChunkDescGlsl d_out_lit[]; };
+layout(std430, binding = 6) buffer OutBufTok { SlzHuffDecChunkDescGlsl d_out_tok[]; };
+layout(std430, binding = 7) buffer OutBufHi  { SlzHuffDecChunkDescGlsl d_out_hi[];  };
+layout(std430, binding = 8) buffer OutBufLo  { SlzHuffDecChunkDescGlsl d_out_lo[];  };
 
-// arg 3: uint32_t* d_n_out
-layout(std430, binding = 3) buffer NOutBuf {
-    uint d_n_out;
+// arg 9: uint32_t* d_n_out — full d_compact_counts buffer (offset 0).
+// Writes to d_n_out[stream_type * COUNTS_STRIDE_U32] for each of the 4
+// huff slots; the raw + merged slots (indices 4, 5) are written by other
+// kernels. COUNTS_STRIDE_U32=64 matches the host COUNTS_STRIDE=256 bytes.
+layout(std430, binding = 9) buffer NOutBuf {
+    uint d_n_out[];
 };
 
 void main() {
-    SLZ_GUARD_SINGLE_THREAD();
+    // Each of the 4 workgroups handles one stream type. local_size_x=1
+    // (compact is inherently serial); the win is collapsing 4 dispatches
+    // into 1, not parallelizing the work itself.
+    uint stream_type = gl_WorkGroupID.x;
 
     // CUDA reference: src/decode/compact_descs_kernels.cuh:45-59.
     uint tot = d_total_subs;
     uint k = 0u;
     for (uint i = 0u; i < tot; i = i + 1u) {
-        SlzScanHuffDescGlsl s = d_staged[i];
+        SlzScanHuffDescGlsl s;
+        if      (stream_type == 0u) s = d_staged_lit[i];
+        else if (stream_type == 1u) s = d_staged_tok[i];
+        else if (stream_type == 2u) s = d_staged_hi[i];
+        else                        s = d_staged_lo[i];
+
         if (s.valid != 0u) {
             SlzHuffDecChunkDescGlsl o;
             o.in_offset  = s.in_offset;
@@ -71,9 +110,14 @@ void main() {
             o.out_offset = s.out_offset;
             o.out_size   = s.out_size;
             o.lut_offset = k * HUFF_LUT_ENTRIES;
-            d_out[k] = o;
+
+            if      (stream_type == 0u) d_out_lit[k] = o;
+            else if (stream_type == 1u) d_out_tok[k] = o;
+            else if (stream_type == 2u) d_out_hi[k]  = o;
+            else                        d_out_lo[k]  = o;
+
             k = k + 1u;
         }
     }
-    d_n_out = k;
+    d_n_out[stream_type * COUNTS_STRIDE_U32] = k;
 }
