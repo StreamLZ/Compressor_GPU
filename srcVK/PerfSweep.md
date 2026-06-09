@@ -156,15 +156,92 @@ structural cost of Vulkan-on-WDDM per-dispatch overhead floor). The
 sweep numbers track the prior bench numbers in the ToDo.md (decode
 2.6x, encode 1.73x). No regression.
 
-### Open gap: silesia L3 0.019% larger output (A-008)
+### Closed gap: silesia L3 0.019% larger output (A-008 RESOLVED 2026-06-09)
 
-Reproduced verbatim: VK 80,983,294 bytes vs CUDA 80,967,993 bytes = 1.00019x
-(0.019% larger). Caused by `hash_bits` clamp 19->18 at L3 for >128 MiB
-single-frame inputs (Vulkan `maxStorageBufferRange = 4 GiB - 1`). Already
-catalogued as **A-008**, status ACTIVE / accepted. Bench confirms the
-clamp is the only encode-output divergence in the entire 15-cell encode
-matrix; every other (level, corpus) pair is **byte-identical** to CUDA's
-output.
+At Phase 5 measurement time (2026-06-08) silesia L3 VK encode was
+80,983,294 bytes vs CUDA 80,967,993 = 1.00019× wider, catalogued as
+A-008 ACTIVE. The next day (commit `8c8964d`) the BDA workaround landed:
+the hash table is now addressed via `VK_KHR_buffer_device_address`
+(raw device pointer through a `buffer_reference` SSBO) instead of a
+descriptor-bound SSBO, bypassing the per-binding `maxStorageBufferRange`
+cap that previously forced the `hash_bits=18` clamp. Silesia L3 VK
+output is now **80,967,993 bytes — byte-identical to CUDA SHA**. Every
+(level, corpus) cell in the 15-cell encode matrix is byte-identical
+to CUDA. A-008 entry status: ✅ **RESOLVED**.
+
+## Intel iGPU performance characterization (2026-06-09)
+
+The bench sweep above is NVIDIA RTX 4060 Ti — the discrete-target
+device. The codec also runs on Intel iGPU as a fallback (Intel UHD,
+Iris, Arc) and ptest_vk passes 144/9/0 on Intel. Performance there is
+**hardware-explained**, not a port bug: Intel UHD/Iris has roughly
+5.7× less memory bandwidth and 22× less peak FP32 compute than the
+RTX 4060 Ti, and the measured per-kernel ratios sit within those
+bounds.
+
+### Intel iGPU decode bench (NVIDIA reference column for context)
+
+| Workload | Intel kernel best | NVIDIA kernel best | Ratio | Class |
+|---|---:|---:|---:|---|
+| L1 enwik8 decode | 25.6 ms | 3.0 ms | 8.5× | bandwidth-bound (matches BW ratio + cache delta) |
+| L5 enwik8 decode | 38.7 ms | 5.5 ms | 7.0× | bandwidth-bound |
+| L5 silesia decode | 72.9 ms | 9.8 ms | 7.4× | bandwidth-bound |
+
+### Intel L5 enwik8 per-kernel breakdown (`SLZ_VK_PROFILE_DECODE=1`)
+
+| Kernel | Intel (µs) | NVIDIA (µs) | Ratio | Notes |
+|---|---:|---:|---:|---|
+| `kernel_fn` (LZ decode) | 30,331 | 3,345 | 9.1× | bandwidth-bound |
+| `huff_decode_fn` | 6,047 | 772 | 7.8× | bandwidth-bound |
+| `huff_build_fn` | 3,439 | 207 | 16.6× | compute-bound (32-lane cooperative LUT build, 8 passes) |
+| `gather_off16_fn` | 1,239 | 76 | 16.3× | compute-bound (256-thread WG) |
+| `merge_huff_descs_fn` | 642 | 440 | 1.5× | dispatch-overhead-bound (single-WG) |
+| `compact_huff_descs_fn` (fused 4×) | 584 | 245 | 2.4× | dispatch-overhead-bound (1 fused WG) |
+| `prefix_sum_chunks_fn` | 421 | 184 | 2.3× | dispatch-overhead-bound |
+| `compact_raw_descs_fn` | 285 | 211 | 1.4× | dispatch-overhead-bound |
+| `scan_parse_fn` | 47 | 10 | 4.7× | dispatch-overhead-bound |
+
+### Interpretation: hardware-explained, not port bugs
+
+The ratios cluster into three classes that match the underlying
+hardware ceilings:
+
+- **Bandwidth-bound kernels (LZ decode, Huffman decode)** run at
+  7-9× NVIDIA. Intel UHD has ~50 GB/s shared LPDDR vs the RTX 4060
+  Ti's 288 GB/s GDDR6 = 5.7× ratio. The extra ~2× comes from Intel's
+  smaller / less-effective cache hierarchy. The kernels are doing
+  approximately what the hardware allows.
+- **Compute-bound kernels (Huff build LUT, off16 gather)** run at
+  ~16× NVIDIA. Intel UHD peak ~1 TFLOPS vs RTX 4060 Ti ~22 TFLOPS
+  = 22× ratio. Again the kernels are within hardware bounds.
+- **Single-WG / dispatch-overhead-bound kernels** run at 1.5-4.7×
+  NVIDIA — the Windows WDDM per-dispatch overhead floor dominates
+  these on both devices, and Intel's floor is only modestly higher
+  than NVIDIA's.
+
+### Why we don't pursue Intel-specific tuning
+
+The codec hardcodes `WARP_SIZE=32` and pins `requiredSubgroupSize=32`
+on every compute pipeline (mirroring CUDA's warp semantics). Each
+warp-cooperative kernel runs as 1 subgroup × 32 lanes per workgroup;
+many such workgroups run in parallel (e.g., ~48K WGs for huff_build
+on enwik8 L5). Intel UHD has fewer EUs to schedule those WGs in
+parallel than NVIDIA's 18 SMs × 4 schedulers, so the queue depth
+runs longer — which is exactly what the ratios show.
+
+Speculative Intel-only changes considered + ruled out:
+
+- **Bigger `local_size_x`** would leave the extra lanes idle (the
+  algorithm only uses the first warp's worth) — WORSE on Intel.
+- **`requiredSubgroupSize=16` on Intel** would break every
+  `subgroupShuffle(v, lane)` call with `lane >= 16` — wrong output.
+- **Splitting the 8-pass work across 2 WGs** would be a 4+ hour
+  kernel rewrite for a single-digit-percent improvement at best.
+
+The honest measurement above is what Intel iGPU can deliver on this
+codec; the codec's design choice to optimize for dGPU warp semantics
+is paying off on dGPU (1.03× CUDA at e2e) and Intel iGPU runs as a
+correctness-validated fallback rather than a perf-tuned target.
 
 ## L5 encode kernel time (informational)
 
