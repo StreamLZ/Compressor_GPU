@@ -476,6 +476,152 @@ verification status. An unverified adaptation is a known risk surface.
   renaming the ChainMatch struct field, but that touches the CUDA
   file too for 1:1 parity
 
+### A-018: `_vk` async/poll = worker-thread + atomic-done flag (no VkFence)
+- **File:line**: `srcVK/streamlz_gpu.zig` — `AsyncSlotVk`,
+  `asyncCompressWorkerVk`, `asyncDecompressWorkerVk`, `pollSlotVk`
+- **CUDA reference**: `src/streamlz_gpu.zig::slzCompressAsync` runs
+  inline on the caller's thread + queues GPU work on the caller's
+  `CUstream`; the caller's `cudaStreamSynchronize` is the only sync
+- **Class**: design-choice
+- **Why**: The Vulkan codec is many submits + many fences internally
+  (per-chunk gather, transfer-queue split, single-submit, final D2H
+  import). A single top-level VkFence cannot span all of them; the
+  natural VK analog to CUDA's "fire-and-poll" would be a VkSemaphore
+  with timeline values, but that requires plumbing the timeline
+  values through every internal submit. The simpler shape that
+  matches the C ABI contract: spawn a worker thread that runs the
+  full sync codec, atomic-store `done = true` after it commits its
+  result. The Poll export checks the atomic (blocking=0) or joins
+  the thread (blocking=1). One std.Thread per async call (~ms
+  spawn cost on Windows + Linux; dominated by the GPU work in
+  every workload our async callers care about).
+- **Risk if wrong**: subtle ordering bugs across the worker → poller
+  result handoff. Mitigated by `release` store on `done` + `acquire`
+  load in pollSlotVk so the rest of the slot (`result`, `written`)
+  is visible the instant the caller observes `done == true`. Also
+  mitigated by busy-flag guard in `slzCompressAsync_vk` /
+  `slzDecompressAsync_vk` (returns UNSUPPORTED rather than
+  stomping an in-flight slot).
+- **Static verification**: Pattern mirrored verbatim from the prior
+  `src_vulkan/streamlz_gpu_vk.zig::pollSlot` (same atomic ordering,
+  same slot-reset semantics, same error mapping). The src_vulkan
+  version shipped in the M4 wave + has been covered by
+  `vk-abi-async-test` since.
+- **Runtime verification**: ✅ 6 tests in
+  `srcVK/tests/async_d2d_api.zig` exercise both poll modes
+  (blocking + non-blocking) on both encode + decode async paths.
+  Phase-4-fix iter (2026-06-08): added F-002 regression tests
+  exercising back-to-back decompress on the same dst slice; these
+  failed RED on the agent's first cut (F-001: missing
+  `releaseImportsByHostRange` after decode through the C ABI) and
+  pass GREEN after the fix landed in `decompressCore`. F-003 thread-
+  join-before-slot-overwrite fix also landed in
+  `slzCompressAsync_vk` / `slzDecompressAsync_vk`. All pass GREEN
+  on NVIDIA RTX 4060 Ti + Intel iGPU at 122/9/0.
+- **Discovered**: Phase 4 (this commit). The CUDA backend's inline-
+  spawn pattern doesn't fit Vulkan's submit floor + multi-fence
+  internals, but a worker-thread wrap of the same sync codec is a
+  faithful behavioural mirror at the C ABI layer.
+- **Status**: ACTIVE — could revisit with timeline-semaphore
+  plumbing in Phase 5 if profiling shows the per-async thread
+  spawn dominates real-world latency. Today the GPU work is ~ms
+  and the thread spawn is ~10s of µs, so the spawn is in the noise.
+
+### A-019: `slzMakeDeviceOnlyHandle_vk` hands back a synthetic sentinel pointer (Tier-1 D2D-test stub)
+- **File:line**: `srcVK/streamlz_gpu.zig` —
+  `slzMakeDeviceOnlyHandle_vk`, `g_device_only_next`,
+  `isDeviceOnlySentinel`
+- **CUDA reference**: NONE — the CUDA backend doesn't export
+  `slzMakeDeviceOnlyHandle`. `src/streamlz_gpu.zig:44` defines an
+  internal-only `device_only_host_stub_addr = 0x10` used by
+  `slzCompressAsync` to mark the `src` slice as "device-resident,
+  consult `d_src` for the real address". That sentinel is NOT
+  exposed in the CUDA C ABI surface.
+- **Class**: design-choice
+- **Why**: The Vulkan header (`include/streamlz_gpu_vk.h:62`)
+  reserves the symbol. The prior `src_vulkan/streamlz_gpu_vk.zig`
+  stubbed it to `SLZ_ERROR_UNSUPPORTED`; this Phase-4 implementation
+  hands back a monotonically-increasing non-dereferenceable pointer
+  in the `[device_only_sentinel_base, +1 TiB)` range, then
+  recognises addresses in that range inside `slzCompress_vk` /
+  `slzDecompress_vk` and returns `SLZ_ERROR_UNSUPPORTED` (since the
+  codec can't dereference a sentinel through the Tier-1 host
+  bounce). This lets test code construct a non-null "device
+  pointer" without owning real device memory, and asserts the
+  expected D2D-not-yet-wired error path.
+- **Risk if wrong**: A real device pointer accidentally falling
+  into the sentinel range would be misclassified as
+  "non-dereferenceable" and the call would fail with UNSUPPORTED.
+  Mitigation (post-F-005, 2026-06-08): the sentinel range now starts
+  at `1 << 62` (upper-half of the 64-bit address space, well outside
+  any realistic `vkGetBufferDeviceAddress` return — the Vulkan spec
+  places no upper bound on `VkDeviceAddress` so we cannot rely on
+  driver convention). Window stays at `1 << 40` = 1 TiB.
+- **Static verification**: Range check is a single mask compare.
+  `1 << 62` base + 1 TiB window = `(1 << 62) + (1 << 40)`, well within
+  the 64-bit address space and safely above all driver BDA returns.
+  The bump stride is `@max(bytes, 4096)` page-aligned (F-006); the
+  counter wraps after ~`(1 << 40) / 4096 = 256M` calls of arbitrary
+  size, which we reject.
+- **Runtime verification**: ✅ 2 tests in
+  `srcVK/tests/async_d2d_api.zig`: "sentinels distinct" + "compress
+  on sentinel returns UNSUPPORTED" — both pass GREEN on both
+  backends.
+- **Discovered**: Phase 4 (this commit)
+- **Status**: ACTIVE — useful for D2D path testing today; Tier-2
+  BDA wiring (Phase 5) will replace the sentinel with real device
+  addresses queried via `vkGetBufferDeviceAddress`, at which point
+  this synthetic range can retire.
+
+### A-020: C ABI decompress releases `g_import_cache` entries on caller buffers
+- **File:line**: `srcVK/streamlz_gpu.zig` — `decompressCore` (post-fix
+  scope brackets the entire decode call), mirroring the
+  `srcVK/cli/decompress.zig:115,120` release pattern around
+  `decompressFramedThreaded`.
+- **CUDA reference**: `src/streamlz_gpu.zig::decompressCore` — CUDA has
+  no import cache; the decoder does plain `cudaMemcpyAsync` H2D/D2H
+  against the caller's buffers and never holds a reference past the
+  stream sync.
+- **Class**: runtime-forced
+- **Why**: The VK decoder's `VK_EXT_external_memory_host` fast path
+  imports the caller's input AND output buffers into an LRU
+  `g_import_cache` keyed by `(host_addr, size, usage_src)` (see
+  `srcVK/decode/module_loader.zig:1244` and `releaseImportsByHostRange`
+  at line 4280). Cache entries outlive any single decode so back-to-
+  back decodes on the same host pages amortize the ~1 ms
+  vkCreateBuffer + vkAllocateMemory + vkMapMemory import. The CLI
+  already releases imports on the caller's `out_buf` (iter-8 subfix
+  1, Intel iGPU file-truncate fix at `cli/decompress.zig:115,120`).
+  Pre-fix, the C ABI surface (`slzDecompressHost`,
+  `slzDecompressHost_vk`, `slzDecompressAsync_vk`) did NOT — and
+  callers who freed-and-reallocated a same-sized `dst` between
+  decodes (common allocator pattern) hit a stale (vk_buf, vk_mem)
+  pair whose VkDeviceMemory imported the OLD physical pages. GPU
+  writes went to the stale mapping; the caller's `dst` was never
+  touched and the decoder reported `SLZ_SUCCESS`. Silent corruption.
+- **Risk if wrong**: silent decompress corruption when the same dst
+  address is reused with fresh physical pages — exactly the failure
+  mode F-002 regression tests catch. Class is runtime-forced because
+  the import cache is a Vulkan-execution-model artifact (CUDA's
+  cuMemcpyAsync has no equivalent need for it).
+- **Static verification**: Pattern mirrors the CLI's iter-8 subfix 1
+  release calls byte-for-byte. The release is idempotent (linear
+  walk over the LRU; misses are no-ops) so the belt-and-suspenders
+  pre-decode release is free of correctness risk.
+- **Runtime verification**: ✅ 4 F-002 regression tests in
+  `srcVK/tests/async_d2d_api.zig` exercise back-to-back decompress
+  on the same dst slice (sync + async, _vk + CUDA-shaped). All
+  failed RED on the pre-fix code (`TestExpectedEqual`) and pass
+  GREEN after the fix — confirmed on both NVIDIA RTX 4060 Ti and
+  Intel iGPU at 122/9/0.
+- **Discovered**: Phase 4 fix iteration (2026-06-08) — adversarial
+  reviewer flagged F-001 after running the Phase 4 tests and noting
+  the absent release pattern by comparison with the CLI.
+- **Status**: ACTIVE — the import cache itself is a deliberate
+  performance feature; the release-on-exit invariant is mandatory
+  for any caller (CLI, C ABI, future bindings) that owns the host
+  buffer lifecycle.
+
 ## Process notes
 
 When the next port adaptation lands:

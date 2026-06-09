@@ -21,6 +21,10 @@ test {
     _ = @import("encode/streamlz_encoder.zig");
     _ = @import("encode/fast_framed.zig");
     _ = @import("encode/gpu_roundtrip_tests.zig");
+    // Phase 4: pull the C ABI module into the test build so the
+    // CUDA-shaped + `_vk`-suffixed exports get codegen'd and the
+    // async/D2D ABI tests below can call them.
+    _ = @import("streamlz_gpu.zig");
     // Phase 13 fleshout: 8 NEW test files under srcVK/tests/.
     _ = @import("tests/decoder_unit.zig");
     _ = @import("tests/encoder_unit.zig");
@@ -46,4 +50,6 @@ test {
     // header for the bug class this guards against (iter 3 bitbufRefill
     // hi/lo swap, fix at ac6696f).
     _ = @import("tests/huff_decode_conformance.zig");
+    // Phase 4: C ABI async + D2D + `_vk`-suffixed surface tests.
+    _ = @import("tests/async_d2d_api.zig");
 }

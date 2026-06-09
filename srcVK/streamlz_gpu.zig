@@ -13,6 +13,7 @@ const gpu_driver = @import("decode/driver.zig");
 const frame = @import("format/frame_format.zig");
 const version = @import("version.zig");
 const vk_api = @import("decode/vulkan_api.zig");
+const dec_module_loader = @import("decode/module_loader.zig");
 
 const allocator = std.heap.c_allocator;
 
@@ -183,9 +184,44 @@ fn compressCore(h: *Context, input: []const u8, output: []u8, opts: CompressOpts
 }
 
 /// CUDA reference: src/streamlz_gpu.zig:271-282.
+///
+/// VK adaptation (F-001 fix, 2026-06-08): Mirror of
+/// `srcVK/cli/decompress.zig:115,120` — the decoder's H2D fast path
+/// imports the caller's `frame_bytes` and the D2H fast path imports
+/// the caller's `output` into the LRU `g_import_cache` keyed by
+/// `(host_addr, size, usage_src)`. Without an explicit release on the
+/// way OUT, a subsequent decode whose caller-supplied slice happens to
+/// land at the same virtual address (allocator reuse is common with
+/// the same-sized alloc pattern) would hit a stale cache entry whose
+/// `VkDeviceMemory` still imports the OLD physical pages — GPU writes
+/// would go to the stale mapping and the caller's buffer would never
+/// be touched. The CLI handled this by calling
+/// `releaseImportsByHostRange` after every decode (see iter-8 subfix
+/// 1 commentary at module_loader.zig:4272). The C ABI must do the
+/// same. We release on success AND on error (the import was already
+/// created by the time the error fired) so the cache invariant holds
+/// regardless of decode outcome.
+///
+/// Release BEFORE the decode too (belt-and-suspenders): if the caller
+/// somehow re-used a `frame_bytes` / `output` address whose prior
+/// import entry survived an earlier decode that bypassed this path
+/// (e.g. an older library version, a foreign caller), we drop the
+/// stale entry up front and force a fresh import on first H2D / D2H.
 fn decompressCore(h: *Context, frame_bytes: []const u8, output: []u8, opts: DecompressOpts) c_int {
     h.dec.enable_profiling = opts.enable_profiling != 0;
-    defer h.dec.enable_profiling = false;
+    // Pre-release: drop any prior cache entries that reference the
+    // caller's input or output buffers. Cheap (linear walk over a
+    // fixed-size LRU array).
+    if (frame_bytes.len > 0) dec_module_loader.releaseImportsByHostRange(@ptrCast(frame_bytes.ptr), frame_bytes.len);
+    if (output.len > 0) dec_module_loader.releaseImportsByHostRange(@ptrCast(output.ptr), output.len);
+    defer {
+        h.dec.enable_profiling = false;
+        // Post-release: drop the entries the decoder just created so
+        // the next decode against the same addresses imports fresh
+        // physical pages.
+        if (frame_bytes.len > 0) dec_module_loader.releaseImportsByHostRange(@ptrCast(frame_bytes.ptr), frame_bytes.len);
+        if (output.len > 0) dec_module_loader.releaseImportsByHostRange(@ptrCast(output.ptr), output.len);
+    }
     const r = decoder.decompressFramedThreaded(
         allocator,
         null,
@@ -580,4 +616,627 @@ export fn slzWaitAndGetLastTimings(
         if (sync_fn(@intFromPtr(s)) != vk_api.VK_SUCCESS_RC) return SLZ_ERROR_CUDA;
     }
     return slzGetLastTimings(handle, timings, capacity, count_out);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 4: `_vk`-suffixed C ABI sibling (include/streamlz_gpu_vk.h).
+//
+// The `_vk` surface is the Vulkan-native counterpart to the CUDA-shaped
+// exports above. Per the port-don't-reinvent rule, every `_vk` symbol
+// delegates to the same internal codec logic — the only differences are:
+//   - return codes (some use slzStatus_t directly instead of a byte
+//     count packed in c_int)
+//   - the async/poll pattern (slzCompressAsync_vk submits + returns
+//     immediately; slzCompressAsyncPoll_vk waits / peeks for completion)
+//   - the registration registry tracks (BDA address, VkBuffer, size)
+//     for true D2D paths (Tier-1 records the mapping; Tier-2 wires it
+//     into the codec descriptor binding)
+//   - slzMakeDeviceOnlyHandle_vk returns a synthetic non-dereferenceable
+//     sentinel that test code can hand to slzCompress_vk for D2D smoke
+//
+// Handle type: slzVkHandle_t is opaque per the header. We back it with
+// VkContext, which wraps the same Context the CUDA-shaped exports use
+// plus the Phase-4 async slots + registration registry. This satisfies
+// "the _vk handle is distinct from slzHandle_t to prevent accidentally
+// feeding a CUDA handle into a Vulkan entry point" while reusing the
+// existing EncodeContext / DecodeContext machinery.
+
+// F-007: derived from `version.string` at comptime so version bumps don't
+// silently leave the `_vk` ABI string stale.
+const vk_version_string: [:0]const u8 = version.string ++ "+vk";
+
+/// Cap on registered D2D buffers per handle. 16 covers every realistic
+/// pattern (input + output + a couple of frame staging buffers per
+/// outstanding decode). Mirror of src_vulkan/streamlz_gpu_vk.zig.
+///
+/// F-004: At Tier-1 the registry is INTENTIONALLY INERT — callers can
+/// register/unregister (`slzRegisterBuffer_vk`/`slzUnregisterBuffer_vk`)
+/// and we track the (BDA, VkBuffer, size) tuples on the handle, but the
+/// codec entry points do not consult the registry to short-circuit the
+/// host-bounce path with a real D2D submit (that is Tier-2 BDA work).
+/// `lookupRegisteredVk` is retained as a placeholder so the Tier-2
+/// wiring needs only to fill in the call sites, not re-add the lookup.
+/// `_ = lookupRegisteredVk(...)` discards at the call sites mark exactly
+/// where the Tier-2 binding will plug in.
+///
+/// Thread-safety note (Tier-2 prerequisite): the registry is currently
+/// touched only from the calling thread (slzRegisterBuffer_vk runs
+/// inline; the async workers don't consult it). When Tier-2 lands, the
+/// async worker will read the registry concurrently with the caller's
+/// register/unregister — add an `std.Thread.Mutex` field to VkContext
+/// at that point.
+pub const MAX_REGISTERED_VK: usize = 16;
+
+pub const RegisteredBufferVk = struct {
+    address: u64 = 0,
+    vk_buffer: ?*anyopaque = null,
+    size: usize = 0,
+};
+
+/// Per-direction async slot. Owns the worker thread + the result it
+/// committed before flipping `done`. Mirrors src_vulkan/streamlz_gpu_vk.zig
+/// — the rationale for the worker-thread + atomic-done pattern over a
+/// raw VkFence is documented there: the codec is many submits + waits
+/// internally (per-chunk gather, transfer-queue split, final D2H), so
+/// a single VkFence at the top isn't a fit — wrapping the entire sync
+/// call on a worker thread + atomic-done is the closest VK analog to
+/// CUDA's "submit on stream, return; caller's sync is the only sync".
+pub const AsyncSlotVk = struct {
+    thread: ?std.Thread = null,
+    done: bool = false,
+    result: c_int = SLZ_SUCCESS,
+    written: usize = 0,
+    compressed_size_out: ?*usize = null,
+
+    fn isBusy(self: *const AsyncSlotVk) bool {
+        return self.thread != null and !self.done;
+    }
+};
+
+/// Async worker stack — mirror of `worker_stack_size` above (32 MiB).
+const async_worker_stack_vk: usize = worker_stack_size;
+
+/// VkContext = Context + Phase-4 async + registration.
+/// Aliased to slzVkHandle_t at the C ABI surface.
+pub const VkContext = struct {
+    inner: Context = .{},
+    async_enc: AsyncSlotVk = .{},
+    async_dec: AsyncSlotVk = .{},
+    registry: [MAX_REGISTERED_VK]RegisteredBufferVk = @splat(.{}),
+    registry_count: u32 = 0,
+};
+
+const AsyncCompressArgsVk = struct {
+    h: *VkContext,
+    d_input: ?*const anyopaque,
+    input_size: usize,
+    d_output: ?*anyopaque,
+    output_capacity: usize,
+    opts: CompressOpts,
+};
+
+const AsyncDecompressArgsVk = struct {
+    h: *VkContext,
+    d_input: ?*const anyopaque,
+    input_size: usize,
+    d_output: ?*anyopaque,
+    output_capacity: usize,
+    opts: DecompressOpts,
+};
+
+fn asyncCompressWorkerVk(args_ptr: *AsyncCompressArgsVk) void {
+    defer allocator.destroy(args_ptr);
+    const h = args_ptr.h;
+    const rc = compressHostVkImpl(
+        h,
+        args_ptr.d_input,
+        args_ptr.input_size,
+        args_ptr.d_output,
+        args_ptr.output_capacity,
+        args_ptr.opts,
+    );
+    h.async_enc.result = rc;
+    if (rc >= 0) {
+        h.async_enc.written = @intCast(rc);
+        if (h.async_enc.compressed_size_out) |slot| slot.* = @intCast(rc);
+    }
+    @atomicStore(bool, &h.async_enc.done, true, .release);
+}
+
+fn asyncDecompressWorkerVk(args_ptr: *AsyncDecompressArgsVk) void {
+    defer allocator.destroy(args_ptr);
+    const h = args_ptr.h;
+    const rc = decompressHostVkImpl(
+        h,
+        args_ptr.d_input,
+        args_ptr.input_size,
+        args_ptr.d_output,
+        args_ptr.output_capacity,
+        args_ptr.opts,
+    );
+    h.async_dec.result = rc;
+    if (rc >= 0) h.async_dec.written = @intCast(rc);
+    @atomicStore(bool, &h.async_dec.done, true, .release);
+}
+
+/// Map a std.Thread.SpawnError to the C ABI status. The error set is
+/// stable across Windows + Linux on Zig 0.16; OutOfMemory is the only
+/// one with an obvious mapping — every other variant is "the OS won't
+/// give us another thread right now," which we surface as DEVICE_LOST
+/// (the closest "transient system resource pressure" code).
+fn mapThreadSpawnErrorVk(err: std.Thread.SpawnError) c_int {
+    return switch (err) {
+        error.OutOfMemory => SLZ_ERROR_OUT_OF_MEMORY,
+        else => SLZ_ERROR_DEVICE_LOST,
+    };
+}
+
+fn lookupRegisteredVk(h: *VkContext, addr: u64) ?RegisteredBufferVk {
+    if (addr == 0) return null;
+    var i: u32 = 0;
+    while (i < h.registry_count) : (i += 1) {
+        if (h.registry[i].address == addr) return h.registry[i];
+    }
+    return null;
+}
+
+/// Synthetic device-only sentinel base. Tier-1 hands callers
+/// monotonically-increasing pseudo-addresses starting here so test code
+/// can pass a non-null "device pointer" to slzCompress_vk / etc. without
+/// owning an actual VkBuffer. Callers MUST NOT dereference it; the
+/// codec recognises addresses in this range and routes them through the
+/// host-bounce path (the registered VkBuffer is null, so there's no D2D
+/// to perform — the call falls back to the host shape).
+///
+/// Tier-2 work (true BDA D2D) will give registered buffers real device
+/// addresses via vkGetBufferDeviceAddress and this synthetic range will
+/// stop being needed for those.
+///
+/// F-005: Range chosen in the UPPER HALF of the 64-bit address space
+/// (`1 << 62 .. 1 << 62 + 1 << 40`) so it cannot collide with any
+/// `vkGetBufferDeviceAddress` return on any current driver. The Vulkan
+/// spec places no upper bound on `VkDeviceAddress`, so a sentinel in
+/// the typical 4-256 GiB BDA range is theoretically unsafe even though
+/// no shipping driver returns BDAs there today.
+const device_only_sentinel_base: usize = 1 << 62;
+const device_only_sentinel_window: usize = 1 << 40;
+var g_device_only_next: std.atomic.Value(usize) = .init(device_only_sentinel_base);
+
+fn isDeviceOnlySentinel(addr: usize) bool {
+    return addr >= device_only_sentinel_base and addr < device_only_sentinel_base + device_only_sentinel_window;
+}
+
+// ── Diagnostics (_vk) ──────────────────────────────────────────────────
+export fn slzGetVersionString_vk() [*:0]const u8 {
+    return vk_version_string.ptr;
+}
+
+// ── Handle lifecycle (_vk) ─────────────────────────────────────────────
+export fn slzCreate_vk(out_handle: ?*?*VkContext) c_int {
+    const slot = out_handle orelse return SLZ_ERROR_INVALID_ARG;
+    if (!gpu_encoder.isAvailable()) return SLZ_ERROR_VK_FEATURE_MISSING;
+    const ctx = allocator.create(VkContext) catch return SLZ_ERROR_OUT_OF_MEMORY;
+    ctx.* = .{};
+    slot.* = ctx;
+    return SLZ_SUCCESS;
+}
+
+export fn slzDestroy_vk(handle: ?*VkContext) void {
+    if (handle) |h| {
+        // Best-effort: join any in-flight async workers. If a poll
+        // already drained the slot, `thread` is null and this is a
+        // no-op. If the caller didn't drain, we must not leak the
+        // thread — block until the worker returns. Encode first, then
+        // decode (matches the order timings are reported in).
+        if (h.async_enc.thread) |t| {
+            t.join();
+            h.async_enc.thread = null;
+        }
+        if (h.async_dec.thread) |t| {
+            t.join();
+            h.async_dec.thread = null;
+        }
+        h.inner.enc.deinit(allocator);
+        h.inner.dec.deinit();
+        allocator.destroy(h);
+    }
+}
+
+// ── Buffer registration (_vk) ──────────────────────────────────────────
+// Tier-1 records (BDA address, VkBuffer, size) on the handle's registry
+// but the codec does NOT yet bind the VkBuffer through the descriptor
+// set — the slzCompress_vk / slzDecompress_vk fast path detects a
+// registered address and currently falls through to the host bounce
+// (with a courtesy memcpy from the device-bound region if the caller
+// passed a real device pointer). True BDA-bound D2D is Tier-2 work
+// (Phase 5 perf).
+//
+// `d_base_address` semantics:
+//   - non-null: caller already queried vkGetBufferDeviceAddress, we
+//               trust the address as-is
+//   - null:     the BDA query lives in srcVK and Tier-1 doesn't wire
+//               it; reject with INVALID_ARG. (Mirror of src_vulkan's
+//               behaviour minus the auto-query — added when Tier-2
+//               lands.)
+export fn slzRegisterBuffer_vk(
+    handle: ?*VkContext,
+    vk_buffer_handle: ?*anyopaque,
+    d_base_address: ?*const anyopaque,
+    buffer_size: usize,
+) c_int {
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    // vk_buffer_handle is accepted as nullable — Tier-1 records the
+    // handle but doesn't bind it (Tier-2 wires the descriptor).
+    if (buffer_size == 0) return SLZ_ERROR_INVALID_ARG;
+    if (h.registry_count >= MAX_REGISTERED_VK) return SLZ_ERROR_OUT_OF_MEMORY;
+    const addr_raw = d_base_address orelse return SLZ_ERROR_INVALID_ARG;
+    const addr: u64 = @intFromPtr(addr_raw);
+    h.registry[h.registry_count] = .{
+        .address = addr,
+        .vk_buffer = vk_buffer_handle,
+        .size = buffer_size,
+    };
+    h.registry_count += 1;
+    return SLZ_SUCCESS;
+}
+
+export fn slzUnregisterBuffer_vk(
+    handle: ?*VkContext,
+    d_base_address: ?*const anyopaque,
+) c_int {
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    const addr_raw = d_base_address orelse return SLZ_SUCCESS;
+    const addr: u64 = @intFromPtr(addr_raw);
+    var i: u32 = 0;
+    while (i < h.registry_count) : (i += 1) {
+        if (h.registry[i].address == addr) {
+            const last = h.registry_count - 1;
+            if (i != last) h.registry[i] = h.registry[last];
+            h.registry[last] = .{};
+            h.registry_count = last;
+            return SLZ_SUCCESS;
+        }
+    }
+    return SLZ_SUCCESS;
+}
+
+// ── Sizing helpers (_vk) ───────────────────────────────────────────────
+export fn slzCompressBound_vk(input_size: usize) usize {
+    return encoder.compressBound(input_size);
+}
+
+/// Hand the caller a synthetic non-dereferenceable "device pointer"
+/// that the _vk codec entry points recognise. Test code uses this for
+/// D2D smoke without owning real device memory. The pointer is never
+/// dereferenced by the codec — its only role is to satisfy the
+/// caller-visible "this looks like a device address" contract and
+/// route control to the device-only path (which Tier-1 falls back to
+/// the host shape for).
+export fn slzMakeDeviceOnlyHandle_vk(
+    out_handle: ?*?*const anyopaque,
+    bytes: usize,
+) c_int {
+    const slot = out_handle orelse return SLZ_ERROR_INVALID_ARG;
+    // F-006: bump by the caller's requested size (page-aligned), so two
+    // sentinels handed out in sequence don't overlap when the caller
+    // treats them as N-byte ranges. Minimum stride 4 KiB keeps the
+    // sentinels well-separated for tiny `bytes` values.
+    const stride_raw = if (bytes < 4096) 4096 else bytes;
+    const page_mask: usize = 4095;
+    const stride = (stride_raw + page_mask) & ~page_mask;
+    // Wrap-protect: if the bump counter wraps past the sentinel range,
+    // refuse. 1 TiB of distinct sentinels covers every realistic test.
+    const next = g_device_only_next.fetchAdd(stride, .monotonic);
+    if (!isDeviceOnlySentinel(next)) {
+        return SLZ_ERROR_OUT_OF_MEMORY;
+    }
+    const ptr: ?*const anyopaque = @ptrFromInt(next);
+    slot.* = ptr;
+    return SLZ_SUCCESS;
+}
+
+// ── Sync compress / decompress (_vk) ───────────────────────────────────
+// _vk return shape: int = byte count when >= 0, slzStatus_t value when < 0.
+// Identical to the CUDA-shaped exports above; only the registration
+// + sentinel handling differs.
+
+fn compressHostVkImpl(
+    h: *VkContext,
+    input: ?*const anyopaque,
+    input_size: usize,
+    output: ?*anyopaque,
+    output_capacity: usize,
+    opts: CompressOpts,
+) c_int {
+    if (input == null and input_size != 0) return SLZ_ERROR_INVALID_ARG;
+    if (output == null) return SLZ_ERROR_INVALID_ARG;
+    const in_ptr: [*]const u8 = @ptrCast(input.?);
+    const out_ptr: [*]u8 = @ptrCast(output.?);
+    var job = CompressJob{
+        .h = &h.inner,
+        .src = in_ptr[0..input_size],
+        .dst = out_ptr[0..output_capacity],
+        .opts = opts,
+    };
+    return runOnWorker(CompressJob, &job);
+}
+
+fn decompressHostVkImpl(
+    h: *VkContext,
+    input: ?*const anyopaque,
+    input_size: usize,
+    output: ?*anyopaque,
+    output_capacity: usize,
+    opts: DecompressOpts,
+) c_int {
+    if (input == null and input_size != 0) return SLZ_ERROR_INVALID_ARG;
+    // F-008: symmetric with compressHostVkImpl + CUDA-shaped surface — reject
+    // output==null unconditionally rather than only when output_capacity!=0.
+    if (output == null) return SLZ_ERROR_INVALID_ARG;
+    const in_ptr: [*]const u8 = @ptrCast(input.?);
+    const out_ptr: [*]u8 = @ptrCast(output.?);
+    var job = DecompressJob{
+        .h = &h.inner,
+        .src = in_ptr[0..input_size],
+        .dst = out_ptr[0..output_capacity],
+        .opts = opts,
+    };
+    return runOnWorker(DecompressJob, &job);
+}
+
+export fn slzCompressHost_vk(
+    handle: ?*VkContext,
+    input: ?*const anyopaque,
+    input_size: usize,
+    output: ?*anyopaque,
+    output_capacity: usize,
+    opts: CompressOpts,
+) c_int {
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    return compressHostVkImpl(h, input, input_size, output, output_capacity, opts);
+}
+
+export fn slzDecompressHost_vk(
+    handle: ?*VkContext,
+    input: ?*const anyopaque,
+    input_size: usize,
+    output: ?*anyopaque,
+    output_capacity: usize,
+    opts: DecompressOpts,
+) c_int {
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    return decompressHostVkImpl(h, input, input_size, output, output_capacity, opts);
+}
+
+/// Device-pointer variant of compress. Tier-1 semantics:
+///   - if `d_input` is a registered BDA address, fall back to the
+///     host shape (Tier-1 doesn't wire the descriptor binding yet)
+///   - if `d_input` is a synthetic device-only sentinel from
+///     slzMakeDeviceOnlyHandle_vk, route to the host bounce with
+///     output going wherever d_output points (caller's
+///     responsibility to allocate a real host buffer for output in
+///     that case — same as the CUDA-shaped slzCompressAsync_vk pre-
+///     existing pattern)
+///   - otherwise treat as a host pointer and call compressHostVkImpl
+export fn slzCompress_vk(
+    handle: ?*VkContext,
+    d_input: ?*const anyopaque,
+    input_size: usize,
+    d_output: ?*anyopaque,
+    output_capacity: usize,
+    opts: CompressOpts,
+) c_int {
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    if (d_input == null and input_size != 0) return SLZ_ERROR_INVALID_ARG;
+    if (d_output == null) return SLZ_ERROR_INVALID_ARG;
+
+    // Synthetic device-only sentinel for testing: the codec can't
+    // dereference it; the only viable Tier-1 path is to surface an
+    // UNSUPPORTED so the test can route through the host shape
+    // explicitly.
+    const in_addr: usize = @intFromPtr(d_input);
+    if (isDeviceOnlySentinel(in_addr)) return SLZ_ERROR_UNSUPPORTED;
+
+    // Registered-address fast path: Tier-2 binds the registered
+    // VkBuffer; Tier-1 records it but doesn't bind, so we treat a
+    // registered hit identically to a host pointer for the purposes
+    // of the encode call (the caller's address IS a valid host
+    // address — we just have richer metadata about it).
+    _ = lookupRegisteredVk(h, in_addr);
+    return compressHostVkImpl(h, d_input, input_size, d_output, output_capacity, opts);
+}
+
+export fn slzDecompress_vk(
+    handle: ?*VkContext,
+    d_input: ?*const anyopaque,
+    input_size: usize,
+    d_output: ?*anyopaque,
+    output_capacity: usize,
+    opts: DecompressOpts,
+) c_int {
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    if (d_input == null and input_size != 0) return SLZ_ERROR_INVALID_ARG;
+    // F-008: symmetric with slzCompress_vk + CUDA-shaped surface.
+    if (d_output == null) return SLZ_ERROR_INVALID_ARG;
+
+    const in_addr: usize = @intFromPtr(d_input);
+    if (isDeviceOnlySentinel(in_addr)) return SLZ_ERROR_UNSUPPORTED;
+    _ = lookupRegisteredVk(h, in_addr);
+    return decompressHostVkImpl(h, d_input, input_size, d_output, output_capacity, opts);
+}
+
+// ── Async + polling (_vk) ──────────────────────────────────────────────
+// VK-native submit-and-poll pattern: slzCompressAsync_vk spawns a
+// worker, returns SLZ_SUCCESS immediately. slzCompressAsyncPoll_vk
+// peeks (`blocking == 0`) or waits (`blocking != 0`) for the worker
+// to commit its result. Mirror of src_vulkan/streamlz_gpu_vk.zig
+// — see that file's header for the design rationale.
+//
+// Return shape of the Poll exports (mirror src_vulkan):
+//   SLZ_SUCCESS                if the slot was idle or the op completed
+//                              successfully (slot is reset; the
+//                              committed byte count is in the previous
+//                              non-poll call's `compressed_size_out` or
+//                              reflected in subsequent
+//                              slzGetLastTimings_vk drain).
+//   SLZ_ERROR_UNSUPPORTED      blocking==0 and the op is in flight —
+//                              nvCOMP's "not ready" sentinel.
+//   negative status            op completed with an error; slot reset.
+//
+// NOTE: this departs slightly from the header's slzStatus_t return
+// type contract — the header says SLZ_SUCCESS on completion regardless
+// of byte count. We carry the byte count via the original async call's
+// `compressed_size` out-pointer (which the worker writes synchronously
+// before flipping `done`).
+export fn slzCompressAsync_vk(
+    handle: ?*VkContext,
+    d_input: ?*const anyopaque,
+    input_size: usize,
+    d_output: ?*anyopaque,
+    output_capacity: usize,
+    compressed_size: ?*usize,
+    opts: CompressOpts,
+) c_int {
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    if (d_input == null and input_size != 0) return SLZ_ERROR_INVALID_ARG;
+    if (d_output == null) return SLZ_ERROR_INVALID_ARG;
+    if (h.async_enc.isBusy()) return SLZ_ERROR_UNSUPPORTED;
+    // F-003 fix (2026-06-08): `isBusy()` returns false when
+    // `thread != null && done == true` — i.e. a prior async call
+    // committed but the caller never polled the slot. If we
+    // overwrote `h.async_enc` here with a fresh default the still-
+    // joinable `std.Thread` handle would leak (OS handle leak on
+    // Windows + Linux) and a subsequent slzDestroy_vk would no
+    // longer have a `thread` to join. Drain the stale slot first.
+    if (h.async_enc.thread) |t| {
+        t.join();
+        h.async_enc.thread = null;
+    }
+    // Reset slot; if a previous op left it in done-state, the caller
+    // missed their drain — Poll is idempotent so we don't surface that
+    // here.
+    h.async_enc = .{ .compressed_size_out = compressed_size };
+
+    const args = allocator.create(AsyncCompressArgsVk) catch return SLZ_ERROR_OUT_OF_MEMORY;
+    args.* = .{
+        .h = h,
+        .d_input = d_input,
+        .input_size = input_size,
+        .d_output = d_output,
+        .output_capacity = output_capacity,
+        .opts = opts,
+    };
+    const t = std.Thread.spawn(
+        .{ .stack_size = async_worker_stack_vk },
+        asyncCompressWorkerVk,
+        .{args},
+    ) catch |err| {
+        allocator.destroy(args);
+        h.async_enc = .{};
+        return mapThreadSpawnErrorVk(err);
+    };
+    h.async_enc.thread = t;
+    return SLZ_SUCCESS;
+}
+
+export fn slzCompressAsyncPoll_vk(handle: ?*VkContext, blocking: c_int) c_int {
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    return pollSlotVk(&h.async_enc, blocking);
+}
+
+export fn slzDecompressAsync_vk(
+    handle: ?*VkContext,
+    d_input: ?*const anyopaque,
+    input_size: usize,
+    d_output: ?*anyopaque,
+    output_capacity: usize,
+    opts: DecompressOpts,
+) c_int {
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    if (d_input == null and input_size != 0) return SLZ_ERROR_INVALID_ARG;
+    if (d_output == null and output_capacity != 0) return SLZ_ERROR_INVALID_ARG;
+    if (h.async_dec.isBusy()) return SLZ_ERROR_UNSUPPORTED;
+    // F-003 fix (2026-06-08): see slzCompressAsync_vk for rationale.
+    // Drain any stale thread handle from a prior un-polled completion
+    // before stomping the slot.
+    if (h.async_dec.thread) |t| {
+        t.join();
+        h.async_dec.thread = null;
+    }
+    h.async_dec = .{};
+
+    const args = allocator.create(AsyncDecompressArgsVk) catch return SLZ_ERROR_OUT_OF_MEMORY;
+    args.* = .{
+        .h = h,
+        .d_input = d_input,
+        .input_size = input_size,
+        .d_output = d_output,
+        .output_capacity = output_capacity,
+        .opts = opts,
+    };
+    const t = std.Thread.spawn(
+        .{ .stack_size = async_worker_stack_vk },
+        asyncDecompressWorkerVk,
+        .{args},
+    ) catch |err| {
+        allocator.destroy(args);
+        h.async_dec = .{};
+        return mapThreadSpawnErrorVk(err);
+    };
+    h.async_dec.thread = t;
+    return SLZ_SUCCESS;
+}
+
+export fn slzDecompressAsyncPoll_vk(handle: ?*VkContext, blocking: c_int) c_int {
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    return pollSlotVk(&h.async_dec, blocking);
+}
+
+fn pollSlotVk(slot: *AsyncSlotVk, blocking: c_int) c_int {
+    if (slot.thread == null) {
+        // No op in flight — idempotent success.
+        return SLZ_SUCCESS;
+    }
+    if (blocking == 0) {
+        if (!@atomicLoad(bool, &slot.done, .acquire)) return SLZ_ERROR_UNSUPPORTED;
+    }
+    if (slot.thread) |t| {
+        t.join();
+        slot.thread = null;
+    }
+    const rc = slot.result;
+    slot.* = .{};
+    return rc;
+}
+
+// ── Per-kernel timings drain (_vk) ─────────────────────────────────────
+// Returns the count of timings written. The CUDA-shaped
+// slzGetLastTimings packs encode + decode timings into one array; the
+// _vk shape returns the count directly (no separate out-pointer) and
+// otherwise behaves identically.
+export fn slzGetLastTimings_vk(
+    handle: ?*VkContext,
+    out: ?[*]KernelTimingC,
+    capacity: usize,
+) usize {
+    const h = handle orelse return 0;
+    gpu_driver.finalizeProfiling(&h.inner.enc.pending_timings, &h.inner.enc.last_timings);
+    gpu_driver.finalizeProfiling(&h.inner.dec.pending_timings, &h.inner.dec.last_timings);
+    const enc_list = h.inner.enc.last_timings.items;
+    const dec_list = h.inner.dec.last_timings.items;
+    const total = enc_list.len + dec_list.len;
+    if (out) |buf| {
+        var i: usize = 0;
+        for (enc_list) |kt| {
+            if (i >= capacity) break;
+            buf[i] = .{ .name = kt.name, .ms = kt.ms };
+            i += 1;
+        }
+        for (dec_list) |kt| {
+            if (i >= capacity) break;
+            buf[i] = .{ .name = kt.name, .ms = kt.ms };
+            i += 1;
+        }
+    }
+    return total;
 }
