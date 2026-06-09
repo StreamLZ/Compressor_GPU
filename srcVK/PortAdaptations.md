@@ -792,6 +792,122 @@ verification status. An unverified adaptation is a known risk surface.
   `gather_raw_off16` + `merge_huff_descs` (separate optimization
   todo; explicitly out of Phase 5 scope per the assignment brief).
 
+### A-023: Batched LZ dispatch + skip the wrap_input H2D when VK can't satisfy CUDA's full-hash allocation on enwik9 L3/L5
+- **File:line**:
+  - `srcVK/encode/encode_lz.zig::gpuCompressImpl` — VRAM-probe loop
+    (lines after `hash_stride` computation) tries the full
+    `num_chunks × hash_stride × 4` allocation, halves `batch_count` on
+    failure until `ensureBuf` accepts, then dispatches the LZ kernel in
+    back-to-back batches that each re-upload the batch's descs, clear
+    `d_sizes[0..bc*4]`, launch with `num_chunks = bc`, D2H comp_sizes
+    at the global index, and gather the batch's compressed bytes. End
+    of function frees `d_hash_persist` when `batched_dispatch == true`
+    so the downstream `gpuAssembleFrameImpl` + `gpuFrameAssembleImpl`
+    have room to grow `d_asm_out` / `d_frame_assemble` outputs.
+  - `srcVK/encode/fast_framed.zig::gpuEncodeAndAssemble` — skips the
+    historical CUDA-mirror `d_host_wrap_input` device buffer + H2D
+    on the `owns_wrap_input` path; instead lets `gpuCompressImpl` H2D
+    the source directly into `d_input_persist` via its
+    `d_input_override == 0` branch, then points
+    `enc_ctx.d_input_override` at `d_input_persist` BEFORE the
+    `gpuFrameAssembleImpl` call so the frame writer reads source bytes
+    for uncompressed chunks. Net VRAM savings: 1 GB on enwik9, scaling
+    with `src.len`.
+- **CUDA reference**:
+  - `src/encode/encode_lz.zig:66-67` — CUDA allocates the full
+    `num_chunks × hash_size × 4` hash buffer in one shot (no batch
+    loop)
+  - `src/encode/fast_framed.zig:193-199` — CUDA allocates
+    `d_host_wrap_input` device buffer, H2Ds the source, then
+    `gpuCompressImpl` D2Ds from override into `d_input_persist` (2×
+    input residency)
+- **Class**: structural-limit (combination of VRAM cap + VMA strictness)
+- **Why**: CUDA's WDDM2 paging tolerates oversubscription past
+  physical VRAM (enwik9 L3 needs 14.9 GiB hash on a 16 GiB device,
+  sitting alongside ~5 GiB of other persistent buffers — CUDA peak
+  measured at 15962 MiB used / 16380 MiB total via `nvidia-smi`
+  polling during the 7.4 s encode). VMA on Vulkan strictly requires
+  `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT` (no host fallback) and
+  `vmaCreateBuffer` returns `VK_ERROR_OUT_OF_DEVICE_MEMORY` when no
+  contiguous block can satisfy the request. The kernel already uses a
+  per-chunk hash region (`ht_base = chunk_id * hash_size`, kernel line
+  163) so batching the dispatch is byte-equivalence-preserving — each
+  chunk reinitialises its own hash to `HASH_EMPTY` at entry (kernel
+  lines 162-165), so a chunk in batch N never sees state left by a
+  chunk in batch N-1. The wrap_input elimination is the second-largest
+  freeable buffer (1 GB at enwik9) and is invisible from CUDA's
+  perspective (CUDA can over-commit, so it doesn't matter that the
+  same bytes are pinned twice) but mandatory on VK to free room for
+  the downstream `d_asm_out` / `d_asm_huff_lit/tok/off16` allocations
+  the Huffman + assemble passes need.
+- **Risk if wrong**:
+  - Without batching: `error.DestinationTooSmall` on enwik9 L3/L5 from
+    `ensureBuf` failing inside `gpuCompressImpl` (was Bug B in this
+    workflow's brief). Also fires at L4 — but Bug C is tracked
+    separately because L4 produces a malformed `.slz` even when the
+    encode "succeeds"; A-023 just stops L4 enwik9 from crashing during
+    encode, it does NOT fix L4's malformed-`.slz` shape.
+  - Without wrap_input elimination: batching alone lands at the
+    downstream `d_asm_out` alloc fail (`total=337921908` was the
+    measured size at L5 enwik9 — fails because peak persistent
+    residency is ~15.9 GiB with `d_host_wrap_input` still pinned).
+  - Either alone is insufficient; both are needed for enwik9 L5 to
+    succeed.
+- **Static verification**: Side-by-side check vs the CUDA kernel
+  contract: `srcVK/encode/lz_encode_kernel.comp:105-118` reads
+  `chunk_id = gl_WorkGroupID.x` and indexes descs / hash table with
+  it, so passing `num_chunks = batch_count` and supplying only the
+  batch's descs at offset 0 of `d_descs_persist` makes the kernel
+  treat batch-local chunk_id == 0..bc-1 — which is exactly the shape
+  the per-chunk hash isolation needs. Pre-fix instrumentation pinned
+  the failing site: `[LZ#90] ensureBuf d_hash_persist failed
+  hash_bytes=16001269760` at L3 enwik9, then
+  `[ASM186] d_asm_out alloc fail total=337921908` after batching alone.
+  Post-fix both sites succeed.
+- **Runtime verification**:
+  - ✅ enwik9 L3 SHA byte-identical to CUDA
+    (`50FBDACCA6CBC8E5F2F83E0509EC23B73FE5DB7FCA44EE73EE60C3A257AFD667`,
+    378,789,927 B on both VK + CUDA)
+  - ✅ enwik9 L5 SHA byte-identical to CUDA
+    (`FF99526D8AC9EB7CF4303AA89B9439ABE9B2B48BBA1D4EA43D98739867859EBB`,
+    338,028,754 B on both VK + CUDA)
+  - ✅ enwik9 L1 + L2 SHA still byte-identical to CUDA (A-022 fix
+    survives the wrap_input rewiring — `d_input_persist` carries the
+    same bytes `d_host_wrap_input` used to)
+  - ✅ enwik8 L3 + L5 with `g_force_batch_count_for_test = {2, 4}`
+    produce byte-identical output to single-shot path AND match CUDA
+    reference (validated in
+    `srcVK/tests/a023_batched_lz_dispatch.zig`)
+  - ✅ ptest_vk 146 → 149 on both NVIDIA RTX 4060 Ti + Intel iGPU
+    (3 new A-023 regression tests GREEN; all pre-existing tests
+    unchanged: 146 → 146 GREEN + 9 → 9 SKIPPED + 0 → 0 FAILED)
+  - GPU kernel timing at enwik9 L3: 1173 ms VK (vs CUDA 7164 ms);
+    enwik9 L5: 2540 ms VK (vs CUDA — not measured this session, prior
+    workloads show CUDA ~2x slower at L5 enwik9 too)
+- **Discovered**: 2026-06-09 enwik9 1 GB stress-test root-cause hunt
+  (Bug B in workflow brief). Found via the runtime-oracle methodology
+  (per `feedback_runtime_oracle.md`): added `std.debug.print` next to
+  every `DestinationTooSmall` + `return false` site in
+  `srcVK/encode/{fast_framed, streamlz_encoder, encode_lz, encode_assemble}.zig`
+  and re-ran the failing command. First fired
+  `[LZ#90] ensureBuf d_hash_persist failed`; after batching fix, the
+  second fired `[ASM186] d_asm_out alloc fail total=337921908`;
+  resolved both with the combined batching + wrap_input elimination.
+- **Status**: ✅ **RESOLVED 2026-06-09**. The `g_force_batch_count_for_test`
+  global on `srcVK/encode/encode_lz.zig` (and the mirroring
+  `SLZ_VK_FORCE_BATCH` env var) is a permanent test hook — letting
+  in-process tests drive the batched path without needing an enwik9-
+  sized input. Default is 0 (inactive). When the hook is set, the cap
+  still passes the same `ensureBuf` retry loop, so the runtime
+  behaviour is identical to the organic VRAM-pressure trigger except
+  for which batch size gets picked.
+
+  **Future close path**: when VMA grows a `VK_KHR_external_memory_host`
+  or `VMA_MEMORY_USAGE_AUTO_PREFER_HOST` opt-in that lets the hash
+  buffer spill to system RAM (with the obvious perf hit), the batching
+  could be removed and the larger hash budget would just be slower
+  instead of failing. Out-of-scope for this workflow.
+
 ## Process notes
 
 When the next port adaptation lands:

@@ -324,16 +324,21 @@ fn gpuEncodeAndAssemble(
 
     const owns_wrap_input = enc_ctx.d_input_override == 0;
     const owns_wrap_output = enc_ctx.d_output_override == 0;
-    if (owns_wrap_input) {
-        if (!gpu_enc.ensureBuf(&enc_ctx.d_host_wrap_input, &enc_ctx.d_host_wrap_input_size, src.len))
-            return error.DestinationTooSmall;
-        // VK adaptation: time the ~95 MB enwik8 wrap-input H2D separately.
-        const _t_wrap0 = if (_prof) vk_api.qpcNow() else 0;
-        if (!gpu_enc.copyHostToDevice(enc_ctx.d_host_wrap_input, src))
-            return error.DestinationTooSmall;
-        if (_prof) g_enc_phase_wrap_input_h2d_ns += qpcDeltaNs(_t_wrap0, vk_api.qpcNow());
-        enc_ctx.d_input_override = enc_ctx.d_host_wrap_input;
-    }
+    // VK adaptation A-023 (companion): when the CLI invoked this path
+    // (override == 0 → owns_wrap_*) we historically allocated a
+    // d_host_wrap_input device buffer and H2D'd src into it, then let
+    // gpuCompressImpl D2D from d_input_override (= d_host_wrap_input)
+    // into d_input_persist (CUDA-mirror src/encode/fast_framed.zig:191-
+    // 199). On enwik9 L5 that doubles input residency (2 × 1 GB) on top
+    // of the already-tight hash + d_output_persist + huff_* allocations,
+    // and the downstream d_asm_out alloc fails. The two-buffer pattern
+    // is a CUDA-allocator concession (paged WDDM2 memory hides the
+    // duplication); on VK we instead let gpuCompressImpl H2D directly
+    // into d_input_persist (its `d_input_override == 0` branch already
+    // handles that), then point d_input_override at d_input_persist
+    // BEFORE the frame_assemble call so it can read source bytes for
+    // uncompressed chunks. Net VRAM savings: 1 GB for enwik9, scales
+    // with src.len.
     if (owns_wrap_output) {
         const bound = encoder.compressBound(src.len);
         if (!gpu_enc.ensureBuf(&enc_ctx.d_host_wrap_output, &enc_ctx.d_host_wrap_output_size, bound))
@@ -413,6 +418,14 @@ fn gpuEncodeAndAssemble(
 
     if (!gpu_enc.gpuCompressImpl(enc_ctx, src, gpu_out, descs, comp_sizes, io, opts.level))
         return error.DestinationTooSmall;
+    // VK adaptation A-023 (companion): now that d_input_persist holds
+    // the H2D'd source (gpuCompressImpl's `override == 0` branch did
+    // that for us), expose it via d_input_override so the downstream
+    // frame_assemble dispatch (line 642 below) reads the same source
+    // bytes from there. Same bytes, no second device buffer.
+    if (owns_wrap_input) {
+        enc_ctx.d_input_override = enc_ctx.d_input_persist;
+    }
 
     const did_huff_lit = opts.level >= 3 and gpu_enc.gpuEncodeLiteralsHuffImpl(enc_ctx, allocator, gpu_out, descs, comp_sizes);
     defer if (did_huff_lit) freeHuffLit(allocator, enc_ctx);

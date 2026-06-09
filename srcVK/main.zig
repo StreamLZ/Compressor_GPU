@@ -44,6 +44,11 @@ test {
     _ = @import("tests/l3_l4_cross_backend.zig");
     _ = @import("tests/cross_backend_roundtrip.zig");
     _ = @import("tests/cli_smoke.zig");
+    // VK adaptation A-023: batched LZ dispatch byte-identity regression.
+    // Forces the per-batch hash/H2D/D2H/gather path via the test hook on
+    // encode_lz.g_force_batch_count_for_test and asserts the result is
+    // byte-identical to the single-shot path. See file header.
+    _ = @import("tests/a023_batched_lz_dispatch.zig");
     // Phase 2A-decoder iter 4 safety net: isolated kernel conformance
     // test for the Huffman decode chain (huff_build_lut +
     // huff_decode_4stream). See srcVK/tests/huff_decode_conformance.zig

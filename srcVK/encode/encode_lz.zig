@@ -24,6 +24,13 @@ inline fn qpcDeltaNs(start: i64, end: i64) i64 {
     return @intFromFloat(vk.qpcMs(start, end) * 1e6);
 }
 
+/// VK adaptation A-023 (testing hook). Set to a positive value before
+/// calling `gpuCompressImpl` to cap `batch_count` and force the
+/// batched-dispatch path. Default 0 = inactive (production behavior).
+/// Mirrored by the SLZ_VK_FORCE_BATCH env var so command-line runs
+/// can exercise the same path. See A-023 entry in srcVK/PortAdaptations.md.
+pub var g_force_batch_count_for_test: u32 = 0;
+
 const VkDeviceBuffer = vk.VkDeviceBuffer;
 const VK_SUCCESS_RC = vk.VK_SUCCESS_RC;
 const EncodeContext = encode_context.EncodeContext;
@@ -80,15 +87,51 @@ pub fn gpuCompressImpl(
 
     // Global hash tables. Chain mode uses 3 tables per block (first_hash +
     // long_hash + next_hash); non-chain modes use a single hash table.
-    if (chain) {
-        const next_hash_words: usize = encode_context.NEXT_HASH_ENTRIES / 2;
-        const table_stride = hash_size + hash_size + next_hash_words;
-        const hash_bytes = @as(usize, num_chunks) * table_stride * 4;
-        if (!encode_context.ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) return false;
-    } else {
-        const hash_bytes = @as(usize, num_chunks) * hash_size * 4;
-        if (!encode_context.ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) return false;
+    //
+    // VK adaptation A-023 (2026-06-09): per-batch hash sizing. CUDA's
+    // allocator with WDDM2 paging tolerates oversubscription past
+    // physical VRAM (enwik9 L3 needs 14.9 GiB hash on a 16 GiB device,
+    // sitting alongside ~5 GiB of other persistent buffers). VMA on
+    // Vulkan strictly requires DEVICE_LOCAL_BIT and fails fast when no
+    // contiguous VRAM block can satisfy the request. The kernel
+    // already uses a per-chunk hash region (ht_base = chunk_id *
+    // hash_size); batching the dispatch reduces the hash buffer to
+    // batch_count * hash_size * 4 and produces BYTE-IDENTICAL output
+    // because each chunk reinitialises its hash to HASH_EMPTY at entry
+    // (kernel lines 162-165). Try the full CUDA-mirror allocation
+    // first; on failure, halve batch_count until ensureBuf accepts the
+    // smaller request.
+    const hash_stride: usize = if (chain)
+        hash_size + hash_size + (encode_context.NEXT_HASH_ENTRIES / 2)
+    else
+        hash_size;
+    // VK adaptation A-023 (testing hook): force_batch_count_for_test
+    // caps the initial batch_count regardless of how much VRAM the
+    // device has. Lets in-process regression tests drive the batched-
+    // dispatch path on inputs that would otherwise fit in a single
+    // dispatch (the L3 batched path needs ~14 GiB of hash to organically
+    // trigger, well beyond CI hardware). When the global stays at 0
+    // (production default), the cap is inactive and the regular VRAM-
+    // probe loop runs unmodified. The SLZ_VK_FORCE_BATCH env var
+    // mirrors the global for command-line driven verification (see
+    // tools/build_vk.bat or PowerShell snippets in PortAdaptations.md
+    // A-023).
+    var batch_count: u32 = num_chunks;
+    if (g_force_batch_count_for_test != 0 and g_force_batch_count_for_test < batch_count)
+        batch_count = g_force_batch_count_for_test;
+    if (std.c.getenv("SLZ_VK_FORCE_BATCH")) |raw| {
+        const span = std.mem.span(raw);
+        if (std.fmt.parseInt(u32, span, 10) catch null) |forced| {
+            if (forced > 0 and forced < batch_count) batch_count = forced;
+        }
     }
+    while (true) {
+        const hash_bytes = @as(usize, batch_count) * hash_stride * 4;
+        if (encode_context.ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) break;
+        if (batch_count <= 1) return false;
+        batch_count = (batch_count + 1) / 2;
+    }
+    const batched_dispatch = batch_count < num_chunks;
 
     const d_input = self.d_input_persist;
     const d_output = self.d_output_persist;
@@ -112,9 +155,16 @@ pub fn gpuCompressImpl(
     }
     if (_prof) enc_phase.g_enc_phase_lz_h2d_input_ns += qpcDeltaNs(_t_h2d_in0, vk.qpcNow());
     const _t_h2d_di0 = if (_prof) vk.qpcNow() else 0;
-    if (h2d_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes) != VK_SUCCESS_RC) return false;
-    if (vk.procs.memset_d8) |memset_fn|
-        if (memset_fn(d_sizes, 0, sizes_bytes) != VK_SUCCESS_RC) return false;
+    // VK adaptation A-023: when not batching, upload the full descs / clear
+    // the full sizes array up-front (CUDA-mirror). When batching, the
+    // per-batch loop below uploads only the active batch's descs and
+    // clears only the active batch's sizes slot — keeps the per-batch
+    // device traffic proportional to the batch.
+    if (!batched_dispatch) {
+        if (h2d_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes) != VK_SUCCESS_RC) return false;
+        if (vk.procs.memset_d8) |memset_fn|
+            if (memset_fn(d_sizes, 0, sizes_bytes) != VK_SUCCESS_RC) return false;
+    }
     if (_prof) enc_phase.g_enc_phase_lz_h2d_descs_init_ns += qpcDeltaNs(_t_h2d_di0, vk.qpcNow());
     const _t_sync0 = if (_prof) vk.qpcNow() else 0;
     if (sync_fn() != VK_SUCCESS_RC) return false;
@@ -184,10 +234,104 @@ pub fn gpuCompressImpl(
     // Defer endKernelTiming so the pending begin event always gets a
     // matching end record - even on launch failure.
     defer gpu_decode.endKernelTiming(t_lz, 0);
-    if (launch_fn(module_loader.kernel_fn, num_chunks, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra, null) != VK_SUCCESS_RC)
-        return false;
 
-    if (sync_fn() != VK_SUCCESS_RC) return false;
+    // VK adaptation A-023: batched kernel dispatch loop. When
+    // batch_count == num_chunks (the common case), this runs ONCE and
+    // is semantically equivalent to the unbatched CUDA-mirror dispatch.
+    // When batch_count < num_chunks (VRAM-pressure fallback), the loop
+    // splits the work into back-to-back dispatches that each reuse the
+    // smaller hash buffer; per-chunk results stay BYTE-IDENTICAL because
+    // each chunk reinitialises its own hash table region to HASH_EMPTY
+    // at entry (kernel lines 162-165, srcVK/encode/lz_encode_kernel.comp),
+    // so a chunk does not see any state left by a chunk from the previous
+    // batch. The per-batch comp_sizes D2H and compressed-bytes gather also
+    // run inside the loop so the host receives data in chunk-index order,
+    // identical to the unbatched path.
+    //
+    // Gather rationale (preserved from the iter-3 single-shot
+    // implementation): the gather slot collapses per-chunk D2H copies
+    // into ONE vkCmdCopyBuffer with regionCount = n_regions on a
+    // one-shot transfer-queue cmdbuf, drained by ONE submit + ONE wait.
+    // The page-aligned host pointer (EncodeContext.gpu_out_buf via
+    // procMallocHost in fast_framed) hits the iter-8 LRU import cache on
+    // every call after the first. Per-batch dispatch keeps this property
+    // — each batch submits one gather covering its regions.
+    var batch_start: u32 = 0;
+    while (batch_start < num_chunks) {
+        const batch_end = @min(batch_start + batch_count, num_chunks);
+        const bc: u32 = batch_end - batch_start;
+
+        if (batched_dispatch) {
+            // Per-batch descs H2D + sizes memset; both write to offset 0
+            // of the persistent buffers so the kernel reads them with
+            // local chunk_id = 0..bc. The chunk descs already carry
+            // GLOBAL src_offset / dst_offset values, so output lands at
+            // the right place in d_output without further translation.
+            const batch_desc_bytes = @as(usize, bc) * @sizeOf(CompressChunkDesc);
+            const batch_sizes_bytes_h2d = @as(usize, bc) * 4;
+            if (h2d_fn(d_descs, @ptrCast(&chunk_descs[batch_start]), batch_desc_bytes) != VK_SUCCESS_RC) return false;
+            if (vk.procs.memset_d8) |memset_fn|
+                if (memset_fn(d_sizes, 0, batch_sizes_bytes_h2d) != VK_SUCCESS_RC) return false;
+            if (sync_fn() != VK_SUCCESS_RC) return false;
+        }
+
+        p_total = bc;
+        if (launch_fn(module_loader.kernel_fn, bc, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra, null) != VK_SUCCESS_RC)
+            return false;
+        if (sync_fn() != VK_SUCCESS_RC) return false;
+
+        // Per-batch comp_sizes D2H. The kernel writes to d_sizes[0..bc]
+        // (local chunk_id); we stash them at the GLOBAL position
+        // [batch_start..batch_end) so subsequent gather + downstream
+        // passes (Huffman / assemble) read them at the same index they
+        // would have in the unbatched path.
+        const _t_dsz0 = if (_prof) vk.qpcNow() else 0;
+        const batch_sizes_bytes = @as(usize, bc) * 4;
+        if (d2h_fn(@ptrCast(&comp_sizes_out[batch_start]), d_sizes, batch_sizes_bytes) != VK_SUCCESS_RC) return false;
+        if (_prof) enc_phase.g_enc_phase_lz_d2h_comp_sizes_ns += qpcDeltaNs(_t_dsz0, vk.qpcNow());
+
+        // Per-batch gather of compressed bytes.
+        const _t_gather0 = if (_prof) vk.qpcNow() else 0;
+        if (vk.procs.d2h_offset_gather) |gather_fn| {
+            // VK adaptation (Gemini Risk A, 2026-06-08): persistent
+            // scratch on EncodeContext instead of per-call
+            // page_allocator.alloc — one VirtualAlloc lifetime-of-encoder
+            // vs one-per-encode. ensureRegionsScratch sizes for the worst
+            // case of the whole dispatch; per-batch use is a subslice.
+            const regions_buf = self.ensureRegionsScratch(chunk_descs.len) orelse return false;
+            var n_regions: usize = 0;
+            for (batch_start..batch_end) |i| {
+                const cs = comp_sizes_out[i];
+                if (cs > 0) {
+                    const dst_off = chunk_descs[i].dst_offset;
+                    regions_buf[n_regions] = .{
+                        .src_offset = dst_off,
+                        .dst_offset = dst_off,
+                        .size = cs,
+                    };
+                    n_regions += 1;
+                }
+            }
+            if (n_regions > 0) {
+                if (gather_fn(@ptrCast(output.ptr), d_output, regions_buf.ptr, n_regions) != VK_SUCCESS_RC) return false;
+            }
+        } else {
+            // Per-chunk fallback. Mirrors CUDA's src/encode/encode_lz.zig
+            // :144-150 exactly. Used only if the gather slot is somehow
+            // unbound.
+            for (batch_start..batch_end) |i| {
+                const cs = comp_sizes_out[i];
+                if (cs > 0) {
+                    const dst_off = chunk_descs[i].dst_offset;
+                    if (d2h_offset_fn(@ptrCast(output.ptr + dst_off), d_output, cs, dst_off) != VK_SUCCESS_RC) return false;
+                }
+            }
+        }
+        if (_prof) enc_phase.g_enc_phase_lz_d2h_gather_ns += qpcDeltaNs(_t_gather0, vk.qpcNow());
+
+        batch_start = batch_end;
+    }
+
     if (_prof) enc_phase.g_enc_phase_lz_kernel_ns += qpcDeltaNs(_t_kern0, vk.qpcNow());
 
     if (t_before) |t_start| {
@@ -199,85 +343,25 @@ pub fn gpuCompressImpl(
         }
     }
 
-    // Download comp_sizes first, then only the actual compressed bytes per block.
-    // VK adaptation: lz.d2h_comp_sizes phase = the ~6 KB per-chunk sizes D2H.
-    const _t_dsz0 = if (_prof) vk.qpcNow() else 0;
-    if (d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes) != VK_SUCCESS_RC) return false;
-    if (_prof) enc_phase.g_enc_phase_lz_d2h_comp_sizes_ns += qpcDeltaNs(_t_dsz0, vk.qpcNow());
-
-    // VK adaptation (encode D2H gather, iter-7+11+15 transferable):
-    // The CUDA reference at src/encode/encode_lz.zig:144-150 expresses
-    // the per-chunk D2H readback as N synchronous cuMemcpyDtoH calls —
-    // each ~37 us on the CUDA driver (per-call cost is microscopic
-    // because cuMemcpyDtoH already routes to the copy engine). On
-    // Vulkan-on-WDDM the per-submit floor is ~50-150 us, so N=1526
-    // submit+wait pairs on enwik8 sat near ~210 ms.
-    //
-    // This replacement is STRICTLY DOWNSTREAM of the LZ kernel
-    // sync_fn() above (line ~133). The kernel dispatch path, its H2D
-    // inputs (d_input, d_descs, d_hash memset), and the sync_fn that
-    // drains its compute work are all unchanged — only the D2H readback
-    // shape changes. As a result this change cannot affect the
-    // compressed bytes the GPU produces; it only changes how those
-    // bytes travel from d_output to the host `output` slice.
-    //
-    // Net behavior identical to the CUDA per-chunk loop: every
-    // non-empty chunk reads `cs` bytes from d_output[dst_off] into
-    // output[dst_off], so the assembled `output` buffer is byte-
-    // identical to what the per-call procs.d2h_offset loop produced.
-    //
-    // The gather slot collapses all N copies into ONE vkCmdCopyBuffer
-    // with regionCount = N on a one-shot transfer-queue cmdbuf, drained
-    // by ONE submit + ONE wait. When the dst host pointer is page-
-    // aligned (it is — backed by EncodeContext.gpu_out_buf via
-    // procMallocHost in fast_framed) the iter-8 LRU import cache hits
-    // on every call after the first.
-    //
-    // Fallback: if d2h_offset_gather is unbound (defensive — module_loader.init
-    // wires it unconditionally) or returns failure, the gather impl
-    // itself falls through to a per-region procD2HOffset loop, so
-    // correctness is preserved on every backend.
-    // VK adaptation: lz.d2h_gather phase = the iter-3 transfer-queue gather
-    // of the actual compressed bytes (~50 MB on enwik8). Includes the
-    // regions-buf build, the gather submit/wait, and the fallback loop
-    // (whichever branch runs).
-    const _t_gather0 = if (_prof) vk.qpcNow() else 0;
-    const d2h_offset_gather_fn = vk.procs.d2h_offset_gather;
-    if (d2h_offset_gather_fn) |gather_fn| {
-        // VK adaptation (Gemini Risk A, 2026-06-08): persistent scratch
-        // on EncodeContext instead of per-call page_allocator.alloc — one
-        // VirtualAlloc lifetime-of-encoder vs one-per-encode. Worst-case
-        // size is chunk_descs.len (~1526 on enwik8 L1, up to ~150K at
-        // silesia L1 ceiling). See encode_context.zig::ensureRegionsScratch.
-        const regions_buf = self.ensureRegionsScratch(chunk_descs.len) orelse return false;
-        var n_regions: usize = 0;
-        for (0..chunk_descs.len) |i| {
-            const cs = comp_sizes_out[i];
-            if (cs > 0) {
-                const dst_off = chunk_descs[i].dst_offset;
-                regions_buf[n_regions] = .{
-                    .src_offset = dst_off,
-                    .dst_offset = dst_off,
-                    .size = cs,
-                };
-                n_regions += 1;
-            }
-        }
-        if (n_regions > 0) {
-            if (gather_fn(@ptrCast(output.ptr), d_output, regions_buf.ptr, n_regions) != VK_SUCCESS_RC) return false;
-        }
-    } else {
-        // Per-chunk fallback. Mirrors CUDA's src/encode/encode_lz.zig:144-150
-        // exactly. Used only if the gather slot is somehow unbound.
-        for (0..chunk_descs.len) |i| {
-            const cs = comp_sizes_out[i];
-            if (cs > 0) {
-                const dst_off = chunk_descs[i].dst_offset;
-                if (d2h_offset_fn(@ptrCast(output.ptr + dst_off), d_output, cs, dst_off) != VK_SUCCESS_RC) return false;
+    // VK adaptation A-023 (companion): when the dispatch was batched
+    // (VRAM-pressure path), release the hash buffer here so the
+    // downstream assembleFrame + frameAssemble passes — which need to
+    // grow `d_asm_out` to roughly the assembled-payload size (~330 MB at
+    // 1 GB L5) — have room. Without this, the LZ kernel succeeds in
+    // batches that fit but `d_asm_out` then fails to allocate because
+    // the persistent hash buffer is still holding multi-GB of VRAM. The
+    // hash buffer will be re-allocated on the next gpuCompressImpl call;
+    // for non-batched dispatches (the common case) the buffer stays
+    // persistent across calls so warm encodes pay zero alloc overhead.
+    if (batched_dispatch) {
+        if (vk.procs.free_device) |free_fn| {
+            if (self.d_hash_persist != 0) {
+                _ = free_fn(self.d_hash_persist);
+                self.d_hash_persist = 0;
+                self.d_hash_size = 0;
             }
         }
     }
-    if (_prof) enc_phase.g_enc_phase_lz_d2h_gather_ns += qpcDeltaNs(_t_gather0, vk.qpcNow());
 
     return true;
 }
