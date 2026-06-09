@@ -1124,3 +1124,119 @@ test "cross-backend: L5 chain-parser edge — block1→block2 boundary recent_of
     }
     try shaByteIdentityL5WithSrc(io, al, "blockboundary", src);
 }
+
+// =====================================================================
+// A-022 regression: sc=0.5 path on L1/L2 raw decode (2026-06-09)
+//
+// The Phase 5 perf-sweep + ptest matrix capped at enwik8 (95 MB) and
+// silesia (203 MB), both BELOW the saturation_bytes threshold
+// (`resolveScGroupSize`, ~208 MB on RTX 4060 Ti) that flips
+// sc_group_size from 0.25 → 0.5. With sc=0.25 each sub-chunk is 64 KiB
+// = LZ_BLOCK_SIZE so off32 stays empty and the raw decode kernel takes
+// the lean `decodeSubChunkRawMode` path. With sc=0.5 the sub-chunk
+// decomp_size becomes 128 KiB and the dispatcher routes to
+// `decodeSubChunkGeneral_false` — where A-022 (3 sites in
+// lz_decode_general.glsl that compared an absolute byte offset against
+// a relative stream size) silently dropped every bounded literal write.
+//
+// Repro on enwik9 (1 GB, > 200 MB) showed deterministic 2-byte zeros
+// at every `[[xx:LANG]]` wiki-link token past the first sub-chunk
+// boundary (byte 130906 = ~128 KiB). CUDA decoded the same .slz
+// correctly; only VK was wrong. Catalogued + fixed at A-022.
+//
+// This regression test forces sc=0.5 via the CLI `--sc 0.5` flag on a
+// 4 MiB enwik8 head (text-like content, plenty of off32 entries) at L1
+// and L2 — both routes through `decodeSubChunkGeneral_false`.
+
+fn vkRoundtripWithScOverride(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tag: []const u8,
+    corpus_rel: []const u8,
+    head_bytes: usize,
+    level: u8,
+    sc_override: []const u8,
+) !void {
+    if (!fileExists(io, VK_BIN)) return error.SkipZigTest;
+    if (!discreteVkVisibleToChild(allocator, io)) return error.SkipZigTest;
+
+    const full = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        corpus_rel,
+        allocator,
+        @enumFromInt(max_corpus_bytes),
+    ) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    };
+    defer allocator.free(full);
+    const take = @min(head_bytes, full.len);
+    const src = full[0..take];
+
+    var in_path_buf: [128]u8 = undefined;
+    var slz_path_buf: [128]u8 = undefined;
+    var out_path_buf: [128]u8 = undefined;
+    const in_path = try std.fmt.bufPrint(&in_path_buf, "tmp_cb_a022_{s}_in.bin", .{tag});
+    const slz_path = try std.fmt.bufPrint(&slz_path_buf, "tmp_cb_a022_{s}.slz", .{tag});
+    const out_path = try std.fmt.bufPrint(&out_path_buf, "tmp_cb_a022_{s}_out.bin", .{tag});
+    defer rmIfExists(io, in_path);
+    defer rmIfExists(io, slz_path);
+    defer rmIfExists(io, out_path);
+
+    try writeBytes(io, in_path, src);
+
+    var lvl_buf: [4]u8 = undefined;
+    const lvl_str = try std.fmt.bufPrint(&lvl_buf, "{d}", .{level});
+    {
+        const argv = [_][]const u8{ VK_BIN, "-c", "-l", lvl_str, "--sc", sc_override, in_path, "-o", slz_path };
+        const res = try runVkCmd(allocator, io, &argv);
+        defer {
+            allocator.free(res.stdout);
+            allocator.free(res.stderr);
+        }
+        if (exitCode(res.term) != 0) {
+            std.debug.print("VK A-022 encode failed ({s}): term={any} stdout={s} stderr={s}\n", .{ tag, res.term, res.stdout, res.stderr });
+            return error.VkEncodeFailed;
+        }
+    }
+    {
+        const argv = [_][]const u8{ VK_BIN, "-d", slz_path, "-o", out_path };
+        const res = try runVkCmd(allocator, io, &argv);
+        defer {
+            allocator.free(res.stdout);
+            allocator.free(res.stderr);
+        }
+        if (exitCode(res.term) != 0) {
+            std.debug.print("VK A-022 decode failed ({s}): term={any} stdout={s} stderr={s}\n", .{ tag, res.term, res.stdout, res.stderr });
+            return error.VkDecodeFailed;
+        }
+    }
+    const got = std.Io.Dir.cwd().readFileAlloc(io, out_path, allocator, @enumFromInt(max_corpus_bytes)) catch return error.ReadOutputFailed;
+    defer allocator.free(got);
+    if (got.len != src.len) {
+        std.debug.print("A-022 size mismatch ({s}): got={d} want={d}\n", .{ tag, got.len, src.len });
+        return error.A022SizeMismatch;
+    }
+    if (!std.mem.eql(u8, src, got)) {
+        var first_diff: usize = 0;
+        while (first_diff < src.len and src[first_diff] == got[first_diff]) : (first_diff += 1) {}
+        std.debug.print("A-022 byte mismatch ({s}): first_diff={d} (=0x{X})\n", .{ tag, first_diff, first_diff });
+        return error.A022ByteMismatch;
+    }
+}
+
+test "A-022 regression: VK L1 enwik8 4 MiB head with --sc 0.5 (sc=0.5 raw decode path) [serial_first]" {
+    var io_inst = makeIo();
+    defer io_inst.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try vkRoundtripWithScOverride(arena.allocator(), io_inst.io(), "enwik8_4m_l1_sc05", "assets/enwik8.txt", 4 * 1024 * 1024, 1, "0.5");
+}
+
+test "A-022 regression: VK L2 enwik8 4 MiB head with --sc 0.5 (sc=0.5 raw decode path) [serial_first]" {
+    var io_inst = makeIo();
+    defer io_inst.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try vkRoundtripWithScOverride(arena.allocator(), io_inst.io(), "enwik8_4m_l2_sc05", "assets/enwik8.txt", 4 * 1024 * 1024, 2, "0.5");
+}

@@ -664,6 +664,62 @@ verification status. An unverified adaptation is a known risk surface.
   for any caller (CLI, C ABI, future bindings) that owns the host
   buffer lifecycle.
 
+### A-022: Bounded literal copy compared absolute SSBO offset against relative stream size
+- **File:line**: `srcVK/decode/lz_decode_general.glsl` — macros
+  `warpLiteralCopyBoundedSel` and `deltaLiteralCopyBounded` + 3 call
+  sites in `_SLZ_DECODE_GENERAL_BODY` (token-loop literal copy,
+  per-block trailing literals, final trailing literals)
+- **CUDA reference**: `src/decode/lz_decode_general.cuh:222-235, 256-276, 291-308`
+  — bound check is `lit_pos + i < lit_size` where both are RELATIVE to
+  the stream base; CUDA's `lit[lit_pos + i]` uses pointer-relative
+  indexing
+- **Class**: bug (not adaptation) — VK port miscompiled CUDA's
+  pointer-relative semantics into SSBO byte-offset semantics, applying
+  the relative→absolute conversion to `lit_pos` but leaving `lit_size`
+  relative. The bound check then compared an ABSOLUTE byte offset
+  (`lit_ptr + _dg_lit_pos + i`) against a RELATIVE size (`lit_size`)
+  and failed for any sub-chunk with `lit_ptr ≥ lit_size`.
+- **Why**: GLSL SSBOs can't be passed as function parameters; the port
+  collapsed CUDA's `(lit_ptr, lit_pos, lit_size)` triple into
+  `(absolute_byte_offset, lit_len, lit_size)`. The absolute conversion
+  was applied to the pointer dereference path but the bound-check
+  parameter was not updated to absolute units. Hidden by chunked input:
+  any sub-chunk past chunk 0 has `lit_ptr ≥ lit_size`, so the bound
+  check evaluates `<absolute> + 0 < <relative>` → false → every literal
+  byte write silently dropped.
+- **Risk if wrong**: silent corruption of every L1/L2 sub-chunk whose
+  literal stream starts past byte `lit_size` in the source SSBO. Fires
+  specifically when any sub-chunk routes through
+  `decodeSubChunkGeneral_false` (off32 non-empty, i.e. sub-chunk
+  decomp_size > LZ_BLOCK_SIZE = 64 KiB). That happens when
+  `sc_group_size ≥ 0.5`, which `resolveScGroupSize` picks at input
+  ≥ saturation_bytes (~208 MB on RTX 4060 Ti). At sc=0.25 (web/enwik8
+  and silesia ≤ 200 MB) sub-chunks are 64 KiB = LZ_BLOCK_SIZE so off32
+  stays empty and the bug path is not reached.
+- **Static verification**: side-by-side `decodeSubChunkGeneral` diff —
+  CUDA's `lit_pos + i < lit_size` is unit-consistent (both relative);
+  VK port broke unit consistency at the 3 call sites by feeding
+  `uint(ps_lit_ptr) + _dg_lit_pos` as `lit_pos` (absolute) without
+  also converting `lit_size`. Fix passes
+  `uint(ps_lit_ptr) + uint(ps_lit_size)` as a new `lit_end_abs`
+  parameter and changes the macro check to `lit_pos + i < lit_end_abs`.
+- **Runtime verification**: ✅ CUDA-as-oracle runtime instrumentation
+  on enwik9-h208 → chunk 1 had `lit_ptr=69626, lit_size=37409`; the
+  check `69626 + 0 < 37409` evaluates false on iteration 0, suppressing
+  every literal write. After fix: enwik9 1 GB L1+L2 roundtrip BYTE-IDENTICAL
+  to source; silesia L1 still BYTE-IDENTICAL (regression check); ptest_vk
+  144 → 146 (2 new A-022 regression tests both GREEN on both backends).
+- **Discovered**: 2026-06-09 enwik9 1 GB stress-test root-cause hunt.
+  Found via the runtime-oracle methodology (per `feedback_runtime_oracle.md`)
+  on the second attempt — the user explicitly redirected the first
+  agent's static-only approach.
+- **Status**: ✅ **RESOLVED 2026-06-09**. Why ptest missed it: enwik8
+  (95 MB) and silesia (203 MB) both sit BELOW the saturation_bytes
+  threshold (~208 MB on this hardware) that flips sc from 0.25 → 0.5,
+  so neither ever triggered `decodeSubChunkGeneral_false`. New regression
+  tests at `srcVK/tests/l3_l4_cross_backend.zig` force `--sc 0.5`
+  explicitly on a 4 MiB enwik8 head at L1 and L2.
+
 ### A-021: L3/L4/L5 decode kernel-time gap (1.20x-1.37x VK vs CUDA) on large workloads
 - **File:line**: `srcVK/decode/lz_decode_kernel.comp` (huff-aware LZ
   workhorse, called for L3+), plus the merge/compact dispatch chain

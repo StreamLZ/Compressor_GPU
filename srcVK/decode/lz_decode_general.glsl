@@ -46,14 +46,16 @@ struct DecodeOutput {
 // stream in compressed blob) or `lit_scratch_ssbo` (Huffman-decoded
 // literals in entropy scratch), selected by lit_in_scratch — the same
 // flag the CUDA pointer trick collapses transparently.
+// `lit_pos` is the ABSOLUTE byte offset into the source SSBO; `lit_end_abs` is the
+// ABSOLUTE end of the literal stream. See note on warpLiteralCopyBoundedSel.
 #define deltaLiteralCopyBounded(dst_ssbo, dst_pos,                                    \
                                 comp_ssbo, lit_scratch_ssbo, lit_in_scratch, lit_pos, \
-                                count, dst_end_abs, lit_size,                        \
+                                count, dst_end_abs, lit_end_abs,                     \
                                 recent_offset, lane)                                  \
     do {                                                                              \
         for (uint _dlc_i = uint(lane); _dlc_i < uint(count); _dlc_i += WARP_SIZE) {   \
             if (uint(dst_pos) + _dlc_i < uint(dst_end_abs) &&                         \
-                uint(lit_pos) + _dlc_i < uint(lit_size)) {                            \
+                uint(lit_pos) + _dlc_i < uint(lit_end_abs)) {                         \
                 uint _dlc_match_src = uint(int(uint(dst_pos) + _dlc_i) +              \
                                             int(recent_offset));                       \
                 uint _dlc_litb = (uint(lit_in_scratch) != 0u)                          \
@@ -70,13 +72,17 @@ struct DecodeOutput {
 // inside the compressed blob or inside entropy scratch); in GLSL the
 // SSBO can't be selected by a runtime value, so this wrapper does the
 // per-byte branch.
+// `lit_pos` is the ABSOLUTE byte offset into the source SSBO; `lit_end_abs` is the
+// ABSOLUTE end of the literal stream within that same SSBO. The CUDA original uses
+// a relative offset + relative size and compares them, so VK must convert one side
+// to match — we pass both as absolute here to mirror the CUDA semantics exactly.
 #define warpLiteralCopyBoundedSel(dst_ssbo, dst_pos,                                  \
                                    comp_ssbo, lit_scratch_ssbo, lit_in_scratch,      \
-                                   lit_pos, lit_len, dst_end_abs, lit_size, lane)    \
+                                   lit_pos, lit_len, dst_end_abs, lit_end_abs, lane) \
     do {                                                                              \
         for (uint _wls_i = uint(lane); _wls_i < uint(lit_len); _wls_i += WARP_SIZE) { \
             if (uint(dst_pos) + _wls_i < uint(dst_end_abs) &&                         \
-                uint(lit_pos) + _wls_i < uint(lit_size)) {                            \
+                uint(lit_pos) + _wls_i < uint(lit_end_abs)) {                         \
                 uint _wls_b = (uint(lit_in_scratch) != 0u)                            \
                     ? uint((lit_scratch_ssbo)[uint(lit_pos) + _wls_i])                \
                     : uint((comp_ssbo)[uint(lit_pos) + _wls_i]);                      \
@@ -340,14 +346,14 @@ struct DecodeOutput {
                                                 ps_lit_in_scratch,                     \
                                                 uint(ps_lit_ptr) + _dg_lit_pos,        \
                                                 _dg_lit_len, _dg_dst_end_abs,         \
-                                                uint(ps_lit_size), _dg_recent_offset, lane); \
+                                                uint(ps_lit_ptr) + uint(ps_lit_size), _dg_recent_offset, lane); \
                     } else {                                                           \
                         warpLiteralCopyBoundedSel(dst_ssbo, _dg_dst_pos,               \
                                                 comp_ssbo, lit_scratch_ssbo,           \
                                                 ps_lit_in_scratch,                     \
                                                 uint(ps_lit_ptr) + _dg_lit_pos,        \
                                                 _dg_lit_len, _dg_dst_end_abs,         \
-                                                uint(ps_lit_size), lane);             \
+                                                uint(ps_lit_ptr) + uint(ps_lit_size), lane);             \
                     }                                                                  \
                     subgroupBarrier();                                                 \
                     subgroupMemoryBarrierBuffer();                                     \
@@ -397,14 +403,14 @@ struct DecodeOutput {
                                             ps_lit_in_scratch,                         \
                                             uint(ps_lit_ptr) + _dg_lit_pos,            \
                                             _dg_block_trailing, _dg_dst_end_abs,      \
-                                            uint(ps_lit_size), _dg_recent_offset, lane); \
+                                            uint(ps_lit_ptr) + uint(ps_lit_size), _dg_recent_offset, lane); \
                 } else {                                                               \
                     warpLiteralCopyBoundedSel(dst_ssbo, _dg_dst_pos,                   \
                                             comp_ssbo, lit_scratch_ssbo,               \
                                             ps_lit_in_scratch,                         \
                                             uint(ps_lit_ptr) + _dg_lit_pos,            \
                                             _dg_block_trailing, _dg_dst_end_abs,      \
-                                            uint(ps_lit_size), lane);                 \
+                                            uint(ps_lit_ptr) + uint(ps_lit_size), lane);                 \
                 }                                                                      \
                 subgroupBarrier();                                                     \
                 subgroupMemoryBarrierBuffer();                                         \
@@ -447,7 +453,7 @@ struct DecodeOutput {
                                         ps_lit_in_scratch,                             \
                                         uint(ps_lit_ptr) + _dg_lit_pos,                \
                                         _dg_trailing, _dg_dst_end_abs,                \
-                                        uint(ps_lit_size), _dg_recent_offset, lane);   \
+                                        uint(ps_lit_ptr) + uint(ps_lit_size), _dg_recent_offset, lane);   \
             } else {                                                                   \
                 /* CUDA reference: src/decode/lz_decode_general.cuh:304-307. */        \
                 /* Final-trailing lacks the lit_pos<lit_size guard CUDA's */            \
