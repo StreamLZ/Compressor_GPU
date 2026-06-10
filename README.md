@@ -133,10 +133,10 @@ L1-L2 are LZ-only (no entropy stage). L3-L5 add 32-stream GPU Huffman.
 | Async call wall     | 5.94 ms | 6.25 ms | 1.05× |
 | End-to-end host wall | 15.27 ms | 18.16 ms | 1.19× |
 
-See [docs/GPU_README.md](docs/GPU_README.md) "vs nvCOMP" for the
-methodology behind each measurement window — the pipeline / async /
-end-to-end columns answer different questions and confusing them is
-easy.
+See [docs/cudaOptimize.md](docs/cudaOptimize.md) "vs nvCOMP -
+measurement methodology" for what each window measures - the
+pipeline / async / end-to-end columns answer different questions and
+confusing them is easy.
 
 ### vs nvCOMP (enwik9 1 GB, RTX 4060 Ti, 2026-06-09)
 
@@ -174,7 +174,7 @@ src/                   All Zig + CUDA source. See CodeWiki.md for the
   format/, io/, platform/  Host-side helpers shared by encode + decode
   encode/              GPU encode driver + kernels + entropy helpers
   decode/              GPU decode driver + kernels
-docs/                  GPU_ARCHITECTURE.md, GPU_README.md, GPU_IDEAS.md
+docs/                  GPU_ARCHITECTURE.md, GPU_IDEAS.md, cudaOptimize.md
 tools/                 Build scripts + bench harnesses
 CodeWiki.md            Source tree map + invariants
 FORMAT.md              SLZ1 wire format specification

@@ -98,9 +98,11 @@ src/
       gather_raw_off16_kernel.cuh
   *.ptx                   committed kernel images (@embedFile'd)
 srcVK/                    Vulkan backend — see srcVK/README.md
-docs/                     GPU_ARCHITECTURE, GPU_README, GPU_IDEAS,
+docs/                     GPU_ARCHITECTURE (incl. kernel inventory),
+                          GPU_IDEAS (kernel-level idea annex),
                           nvcomp_lz4_architecture, how_to_debug_cuda,
-                          cudaOptimize, ngram
+                          cudaOptimize (incl. vs-nvCOMP methodology),
+                          ngram
 tools/
   build_gpu.bat           full nvcc rebuild + cuobjdump res-usage
   sanitize.bat            compute-sanitizer gate (memcheck/racecheck)

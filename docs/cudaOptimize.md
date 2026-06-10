@@ -106,3 +106,48 @@ Data center GPUs need ≥340 MB input to fully saturate all SMs at sc_group=0.25
 - nvCOMP LZ4 SASS analysis: `c:\tmp\nvcomp_test\cuda.md`
 - ncu profiles: `c:\tmp\slz_profile.ncu-rep`, `c:\tmp\nvcomp_profile.ncu-rep`
 - Profiling scripts: `c:\tmp\ncu_profile.bat`, `c:\tmp\ncu_profile_nvcomp.bat`
+
+## vs nvCOMP — measurement methodology
+
+(Migrated from the retired docs/GPU_README.md, 2026-06-10. The number
+tables that accompanied this section were 2026-05-27 / sc=0.5-era and
+are retired with it — the current headline is enwik9 1 GB:
+L1 52.6% @ 24.3 ms d2d vs nvCOMP LZ4 53.6% @ 33 ms; L5 35.50% @
+34.2 ms vs nvCOMP Zstd 35.75% @ 50.8 ms. Regenerate per-window
+numbers rather than quoting old tables.)
+
+Three measurement windows answer different questions; confusing them
+is easy (an early revision compared StreamLZ's narrow inner-kernel
+timer against nvCOMP's whole-call event bracket, inflating the win):
+
+| Window | What it measures | StreamLZ source | nvCOMP source |
+|--------|------------------|-----------------|---------------|
+| **Pipeline kernel-sum** | Σ `cudaEventElapsedTime` across every kernel in the decode pipeline. Excludes memcpys, scheduler gaps, event overhead. | `bench_d2d` "kernel active best" | `nsys stats --report=cuda_gpu_kern_sum` over the timing iterations |
+| **Async call wall** | cuEvent pair on the caller's stream around the whole decompress API call. What an async caller actually waits for. | `bench_d2d` "gpu kernel best" | `nvcomp_bench3` "decode kernel best" |
+| **End-to-end host wall** | wall around `H2D(compressed) + decompress + D2H(output)` with host input/output. | `streamlz.exe -db` "e2e best" | `nvcomp_bench3` "decode e2e best" |
+
+Ground truth for per-kernel breakdowns: Nsight Systems —
+
+```
+nsys profile --trace=cuda --sample=none --output=<rep> <bench.exe> [args]
+nsys stats --report=cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_api_sum <rep>.nsys-rep
+```
+
+nvCOMP LZ4 surfaces one kernel per decompress
+(`lz4DecompressBatchKernel`) — its time IS the kernel sum. nvCOMP
+Zstd surfaces five; their sum matches nvCOMP's reported "decode
+kernel" bracket to within noise, confirming that bracket is
+effectively a kernel-sum with no hidden memcpys. StreamLZ surfaces
+~8 kernels per L3+ call (walk, prefix-sum, scan, fused compact,
+gather, parallel merge, LUT-build + huff-decode, LZ decode); its
+async-call wall exceeds its kernel-sum by the front-half D2D of the
+compressed block plus per-kernel cuEvent overhead — on-stream but
+not in the kernel-sum. (StreamLZ's CLI now prints the per-kernel
+table directly via `SLZ_PROFILE_DECODE=1`, so nsys is only needed
+for cross-library comparisons.)
+
+Where the wins come from (structure unchanged since 2026-05-27):
+the 32-stream Huffman decode with BIL coalesced 128-byte refills
+keeps the kernel-sum ahead; the async wall is closer because
+StreamLZ runs a longer pipeline; the end-to-end gap is dominated by
+StreamLZ's pinned-buffer D2H vs nvCOMP's pageable-host copy.

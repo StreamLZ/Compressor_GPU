@@ -435,3 +435,15 @@ coverage, WALK_MAX_CHUNKS, size cross-checks) so tier 1 starts from a
 documented contract of what "graceful rejection" means per corruption
 class. Effort: tier 1 ~a day; tier 3 ~a day on top (mostly harness
 plumbing — both CLIs already exist).
+
+## 14. Kernel-level optimization backlog (annex: docs/GPU_IDEAS.md)
+
+Six NCU-grounded kernel optimization proposals (MATCH.ANY encode
+match-finder, strided LUT fill, multi-warp-per-chunk LZ decode,
+Hillis-Steele canonical-code scan, LOP3 verification, butterfly
+reduction) live in `docs/GPU_IDEAS.md` with full analysis, expected
+gains, and a ruled-out list. All six remain unimplemented as of
+2026-06-10 and their baseline is still representative (production LZ
++ Huffman kernels unchanged since it was measured). That file is the
+home for NEW kernel-level ideas; this list stays structural/feature
+level.

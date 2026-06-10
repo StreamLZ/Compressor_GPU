@@ -93,9 +93,9 @@ next kernel's grid.
    slzPrefixSumChunksKernel
             |
             v
-   slzScanParseKernel  ->  slzCompactHuffDescsKernel
-                       ->  slzCompactRawDescsKernel
-                       ->  slzMergeHuffDescsKernel
+   slzScanParseKernel  ->  slzCompactAllDescsKernel  (ONE launch, 5 blocks:
+                            4 huff streams + raw pair, 2026-06-10 fusion)
+                       ->  slzMergeHuffDescsParKernel (4-block parallel merge)
             |
             v
    slzGatherRawOff16Kernel
@@ -112,9 +112,12 @@ descriptor for every chunk. The prefix-sum gives every chunk its
 starting sub-chunk index so later kernels can compute scratch
 offsets without a second pass. The scan kernel inspects every
 sub-chunk's stream headers and emits a tentative descriptor per
-entropy-coded or raw stream. The compact and merge kernels filter
-those tentative descriptors into the final per-stream-type arrays
-the entropy kernel will consume. The gather kernel copies raw
+entropy-coded or raw stream. The fused compact kernel (one
+launch, five single-thread blocks running concurrently on five SMs;
+formerly five sequential launches summing ~0.4 ms) and the 4-block
+parallel merge filter those tentative descriptors into the final
+per-stream-type arrays the entropy kernel will consume. The unfused
+legacy kernels remain in the PTX as reference/fallback. The gather kernel copies raw
 sixteen-bit-offset bytes from the compressed input into the entropy
 scratch region (these are not entropy-coded but they live in the
 same scratch buffer to keep the LZ kernel's read pattern uniform).
@@ -132,9 +135,10 @@ goes straight into the caller's destination buffer.
 The Huffman pre-decode and the LZ decode share a CUDA stream, so the
 LZ launch is queued immediately after the Huffman launch and the
 two run back to back without a host-side wait. The CUDA runtime
-treats both launches as one timing window. In practice the Huffman
-pre-decode and the LZ decode each take roughly half the GPU wall
-clock at L3 and above.
+treats both launches as one timing window. In practice (2026-06-10,
+enwik8 L5) the LZ decode dominates at ~3.2 ms vs ~0.9 ms for the
+Huffman LUT-build + pre-decode pair; run with SLZ_PROFILE_DECODE=1
+for the live per-kernel table.
 
 ## The parallel-parse rewrite of the decode hot loop
 
@@ -754,3 +758,39 @@ launch that exits when its work is done. There is no thread-pool
 or work-stealing layer. The grid-of-blocks model is sufficient.
 Every chunk maps to exactly one block, and the GPU's hardware
 scheduler handles the assignment.
+
+## Kernel inventory
+
+(Migrated from the retired docs/GPU_README.md, 2026-06-10.) Every
+kernel is resolved by the Zig drivers via `cuModuleGetFunction`; all
+symbols carry the `slz` prefix.
+
+| Direction | Kernel | Source TU |
+|-----------|--------|-----------|
+| encode | `slzLzEncodeKernel` | `encode/lz_kernel.cu` |
+| encode | `slzHuffBuildTablesKernel` | `encode/huffman_kernel.cu` |
+| encode | `slzHuffEncode4StreamKernel` | `encode/huffman_kernel.cu` |
+| encode | `slzAssembleMeasureKernel` | `encode/assemble_kernel.cu` |
+| encode | `slzAssembleWriteKernel` | `encode/assemble_kernel.cu` |
+| encode | `slzFrameAssembleKernel` | `encode/assemble_kernel.cu` |
+| decode | `slzLzDecodeKernel` | `decode/lz_kernel.cu` |
+| decode | `slzLzDecodeRawKernel` | `decode/lz_kernel.cu` |
+| decode | `slzWalkFrameKernel` | `decode/lz_kernel.cu` |
+| decode | `slzPrefixSumChunksKernel` | `decode/lz_kernel.cu` |
+| decode | `slzScanParseKernel` | `decode/lz_kernel.cu` |
+| decode | `slzCompactAllDescsKernel` (hot path: fused ×5) | `decode/lz_kernel.cu` |
+| decode | `slzCompactHuffDescsKernel` (legacy/fallback) | `decode/lz_kernel.cu` |
+| decode | `slzCompactRawDescsKernel` (legacy/fallback) | `decode/lz_kernel.cu` |
+| decode | `slzMergeHuffDescsParKernel` (hot path: 4-block) | `decode/lz_kernel.cu` |
+| decode | `slzMergeHuffDescsKernel` (legacy/fallback) | `decode/lz_kernel.cu` |
+| decode | `slzGatherRawOff16Kernel` | `decode/lz_kernel.cu` |
+| decode | `slzHuffBuildLutKernel` | `decode/huffman_kernel.cu` |
+| decode | `slzHuffDecode4StreamKernel` | `decode/huffman_kernel.cu` |
+
+The `4Stream` suffix on the Huffman kernels is retained for the Zig
+dispatch ABI; both sides actually operate on `HUFF_NUM_STREAMS = 32`
+streams (one per warp lane). The `.cuh` files are a size-only split,
+`#include`d into the single per-direction aggregator `.cu` — only the
+`.cu` emits a `.ptx`. Per-kernel REG/STACK/SHARED numbers come from
+`tools\build_gpu.bat`'s cuobjdump res-usage printout; live per-kernel
+timings from `SLZ_PROFILE_DECODE=1` / `SLZ_PROFILE_PHASES=1`.

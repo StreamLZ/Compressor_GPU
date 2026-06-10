@@ -1,4 +1,16 @@
-# StreamLZ-GPU Optimization Ideas
+# StreamLZ-GPU Optimization Ideas (kernel-level annex to /v4_ideas.md)
+
+> **Status 2026-06-10**: still live. The baseline below (HEAD 4f49093)
+> remains representative for the kernels these ideas target - the LZ
+> decode and Huffman production kernels are unchanged since; only the
+> decode BOOKKEEPING kernels changed (fused slzCompactAllDescsKernel +
+> parallel slzMergeHuffDescsParKernel, 2026-06-10), which none of the
+> six ideas touch. Ideas 1-6 are ALL still unimplemented in production.
+> Related: tools/huff_test explored idea-2/5-adjacent LUT-build and
+> decode upgrades on the tANS side (v4_ideas #11). This file is indexed
+> from v4_ideas.md - new kernel-level ideas go HERE, new structural/
+> feature ideas go in v4_ideas.md.
+
 
 Forward-looking optimization candidates for the GPU compress and decode
 paths. Each entry is self-contained: where to apply, what the change is,
