@@ -47,9 +47,27 @@ pub var assemble_write_fn: cuda_ffi.CUfunction = 0;
 pub var frame_assemble_fn: cuda_ffi.CUfunction = 0;
 pub var initialized: bool = false;
 
+// 2026-06-10 (VK lesson backport — srcVK uses g_encode_init_lock):
+// the latch was set BEFORE the bring-up work, so a concurrent caller
+// saw initialized=true with kernel_fn still 0 and concluded the
+// encoder is unavailable. Late arrivals now block on the mutex until
+// the winner finishes, then read the settled kernel_fn.
+// Separate encode-init lock so chaining into decode's init() (which
+// takes its own g_init_lock) never recursively acquires the same
+// non-recursive SRWLOCK — mirrors srcVK's g_encode_init_lock split.
+const SRWLOCK = extern struct { ptr: ?*anyopaque = null };
+extern "kernel32" fn AcquireSRWLockExclusive(lock: *SRWLOCK) callconv(.c) void;
+extern "kernel32" fn ReleaseSRWLockExclusive(lock: *SRWLOCK) callconv(.c) void;
+var g_encode_init_lock: SRWLOCK = .{};
+
 pub fn init() bool {
+    if (initialized) return kernel_fn != 0; // fast path once settled
+    AcquireSRWLockExclusive(&g_encode_init_lock);
+    defer ReleaseSRWLockExclusive(&g_encode_init_lock);
     if (initialized) return kernel_fn != 0;
-    initialized = true;
+    // Latch on exit (success or failure) — AFTER kernel_fn has settled,
+    // so the unlocked fast path above can never observe a torn state.
+    defer initialized = true;
 
     // Reuse the CUDA context the decode driver creates - see the
     // file-level doc on why encode does not own context creation.

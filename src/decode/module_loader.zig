@@ -46,10 +46,28 @@ pub var huff_module: usize = 0;
 pub var huff_build_fn: usize = 0;
 pub var huff_decode_fn: usize = 0;
 
+// 2026-06-10 (VK lesson backport — srcVK uses g_init_lock for exactly
+// this): init() was not thread-safe. A second thread arriving while the
+// first was mid-bring-up saw `.in_progress` and returned FALSE, i.e.
+// reported CUDA unavailable on a working machine. Under the parallel
+// test runner that made all but the first GPU test silently skip.
+// The mutex makes late arrivals BLOCK until the winner settles the
+// state, then read the real result.
+const SRWLOCK = extern struct { ptr: ?*anyopaque = null };
+extern "kernel32" fn AcquireSRWLockExclusive(lock: *SRWLOCK) callconv(.c) void;
+extern "kernel32" fn ReleaseSRWLockExclusive(lock: *SRWLOCK) callconv(.c) void;
+var g_init_lock: SRWLOCK = .{};
+
 pub fn init() bool {
+    // Fast path once settled (benign unsynchronized read — the state
+    // only ever moves monotonically to .ready or .failed).
+    if (cuda.init_state == .ready) return true;
+    if (cuda.init_state == .failed) return false;
+    AcquireSRWLockExclusive(&g_init_lock);
+    defer ReleaseSRWLockExclusive(&g_init_lock);
     switch (cuda.init_state) {
         .ready => return true,
-        .failed, .in_progress => return false, // .in_progress catches re-entry
+        .failed, .in_progress => return false, // .in_progress catches same-thread re-entry
         .uninit => {},
     }
     cuda.init_state = .in_progress;

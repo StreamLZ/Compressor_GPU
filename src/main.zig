@@ -15,4 +15,5 @@ test {
     _ = @import("encode/streamlz_encoder.zig");
     _ = @import("encode/fast_framed.zig");
     _ = @import("encode/gpu_roundtrip_tests.zig");
+    _ = @import("encode/gpu_regression_tests.zig");
 }

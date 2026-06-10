@@ -140,16 +140,34 @@ instead of thrashing.
 **Why**: a level that duplicates another is API noise; (b) is the
 most honest mapping of the real tradeoff surface we measured.
 
-## 7. CUDA regression test for the A-023 batched dispatch
+## 7. Backport the srcVK test suite to CUDA — ✅ first wave DONE 2026-06-10
 
-**What**: ptest case that sets
-`encode_lz.g_force_batch_count_for_test` (e.g. batch=7 over a
-64-chunk input), encodes, and asserts byte-identity against the
-unbatched encode — mirroring `srcVK/tests/a023_batched_lz_dispatch.zig`.
+The VK port accumulated 158 tests vs CUDA's 22; nothing flowed back
+(port discipline ran one-way). First wave landed in
+`src/encode/gpu_regression_tests.zig`:
+- ✅ **A-023 forced-batch byte-identity** (batch=7 and batch=1 over a
+  48-chunk input, L1 greedy + L5 chain, byte-identical to unbatched
+  plus roundtrip) — was this entry's original ask.
+- ✅ **Real-corpus roundtrips** (assets/web.txt full × L1-L5 + 4 odd
+  offset/length slices) — the test class that caught VK's byte-65544
+  while every synthetic shape passed.
+- ✅ Two latent infra bugs found and fixed by writing them: BOTH
+  module_loader `init()`s were thread-unsafe (latch set before the
+  work / `.in_progress` returned false to concurrent callers — the
+  exact race srcVK fixed with g_init_lock; all but one GPU test fn
+  had been silently SKIPPING in every ptest run), and once init was
+  locked, the GPU test fns raced each other on the shared g_default
+  contexts — now serialized behind `lockGpuTests()`. ptest went
+  19 pass/4 skip → **25 pass/0 skip/0 fail**.
 
-**Why**: the CUDA batched path only triggers organically above ~8 GB
-of hash demand; CI never exercises it today. Hours of work, closes a
-real coverage hole introduced by the backport.
+**Remaining backlog** (in priority order):
+- Huffman kernel conformance (CUDA entropy kernels have zero isolated
+  tests; CPU oracle exists in tools/huff_test/huff_ref.c; the VK
+  version empirically catches bitbufRefill-class bugs). ~A day.
+- C ABI tests: `slzCompressAsync`/D2D on CUDA currently has NO test
+  (the old ABI tests were src_vulkan's). Medium.
+- Host-unit mirrors of srcVK decoder_unit/encoder_unit where the
+  logic is shared. Low.
 
 ## 8. v4 wire format: self-describing tokens (remove the serial parse)
 

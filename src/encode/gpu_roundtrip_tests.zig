@@ -14,6 +14,26 @@ const decoder = @import("../decode/streamlz_decoder.zig");
 const gpu_encoder = @import("driver.zig");
 const gpu_driver = @import("../decode/driver.zig");
 
+// 2026-06-10: the module_loader init() race used to make all but the
+// first GPU test fn skip — which accidentally serialized GPU work.
+// With init properly locked, every GPU test fn RUNS, and the parallel
+// runner would fire them concurrently onto the shared g_default
+// encode/decode contexts (persistent-buffer races → bogus
+// DestinationTooSmall and worse). Serialize every GPU test fn body
+// behind one process-wide lock; host-only tests stay parallel.
+const SRWLOCK = extern struct { ptr: ?*anyopaque = null };
+extern "kernel32" fn AcquireSRWLockExclusive(lock: *SRWLOCK) callconv(.c) void;
+extern "kernel32" fn ReleaseSRWLockExclusive(lock: *SRWLOCK) callconv(.c) void;
+var g_gpu_test_lock: SRWLOCK = .{};
+
+pub fn lockGpuTests() void {
+    AcquireSRWLockExclusive(&g_gpu_test_lock);
+}
+
+pub fn unlockGpuTests() void {
+    ReleaseSRWLockExclusive(&g_gpu_test_lock);
+}
+
 const Case = struct {
     label: []const u8,
     bytes: []const u8,
@@ -57,6 +77,8 @@ fn roundtripOne(allocator: std.mem.Allocator, case: Case) !void {
 }
 
 test "GPU roundtrip: every shape and level" {
+    lockGpuTests();
+    defer unlockGpuTests();
     const allocator = testing.allocator;
 
     if (!gpu_encoder.isAvailable()) {
@@ -118,6 +140,8 @@ test "GPU roundtrip: every shape and level" {
 }
 
 test "GPU roundtrip: empty input at every level" {
+    lockGpuTests();
+    defer unlockGpuTests();
     if (!gpu_encoder.isAvailable()) return error.SkipZigTest;
     if (!gpu_driver.isAvailable()) return error.SkipZigTest;
     if (!gpu_driver.bindContextToCallingThread()) return error.SkipZigTest;
@@ -129,6 +153,8 @@ test "GPU roundtrip: empty input at every level" {
 }
 
 test "compressBound is a strict upper bound on real frames" {
+    lockGpuTests();
+    defer unlockGpuTests();
     if (!gpu_encoder.isAvailable()) return error.SkipZigTest;
     if (!gpu_driver.isAvailable()) return error.SkipZigTest;
     if (!gpu_driver.bindContextToCallingThread()) return error.SkipZigTest;
@@ -147,6 +173,8 @@ test "compressBound is a strict upper bound on real frames" {
 }
 
 test "compressFramed rejects level outside 1..5" {
+    lockGpuTests();
+    defer unlockGpuTests();
     if (!gpu_encoder.isAvailable()) return error.SkipZigTest;
     if (!gpu_driver.isAvailable()) return error.SkipZigTest;
     if (!gpu_driver.bindContextToCallingThread()) return error.SkipZigTest;
@@ -159,6 +187,8 @@ test "compressFramed rejects level outside 1..5" {
 }
 
 test "compressFramed rejects undersized destination" {
+    lockGpuTests();
+    defer unlockGpuTests();
     if (!gpu_encoder.isAvailable()) return error.SkipZigTest;
     if (!gpu_driver.isAvailable()) return error.SkipZigTest;
     if (!gpu_driver.bindContextToCallingThread()) return error.SkipZigTest;
