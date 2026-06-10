@@ -16,7 +16,7 @@ per-warp serial chain length. Every speed idea below is that class.
 
 ---
 
-## 1. Flat batched literal copy (token-ownership binary search)
+## 1. Flat batched literal copy (token-ownership binary search) — ✅ DONE 2026-06-10, won less than projected
 
 **What**: In the PP fast path (`lz_decode_raw.cuh`), replace the 32
 serialized per-token `warpLiteralCopy` calls with ONE warp-wide pass
@@ -46,6 +46,25 @@ read-after-write hazard inside the batch.
 **Cost/risk**: days; rewrites the correctness core of both decode
 kernels; needs full level/scale re-verification. Do this FIRST and
 measure before deciding on #2.
+
+**DONE 2026-06-10** (both backends, `decodeSubChunkRawMode` /
+`_SLZ_DECODE_RAW_BODY` — the PP path lives only in the raw-mode
+decoder; the general decoder is serial per-token and untouched).
+Implementation as specced: prefix sums staged to 512 B shared,
+one flat warp-wide pass with the 5-step ownership search, then a
+ballot-driven match loop (lit-only tokens now cost zero iterations).
+**Measured: real but ~3× less than projected.** CUDA enwik9 L1
+24.3 → 22.9 ms (−5.8%), L5 34.0 → 33.1 ms (−2.8%); enwik8 L1
+2.85 → 2.64 ms. VK enwik9 L5 43.4 → 40.9 ms (−5.9% — VK gains more
+because each eliminated copy call also drops two subgroup barriers).
+vs nvCOMP margins: L1 1.36× → 1.44×, L5 1.49× → 1.54×; VK-vs-CUDA
+gap 1.31× → 1.24×. Why short of ~1.2×: the literal-side overhead was
+only part of the batch cost — the serial per-token MATCH loop (45%
+of bytes, still one warpMatchCopy + sync per token) now dominates,
+which is exactly #2's target. Verification: ptest 49/0/0, ptest_vk
+150/9/0, both D2D sweeps all-verify-OK, enwik9 L3 1 GB SHA MATCH on
+both backends. #2's projection should be re-derived from the
+post-#1 profile before committing to it.
 
 ## 2. Flat independent-match copy + ordered fallback
 

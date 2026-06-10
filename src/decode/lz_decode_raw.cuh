@@ -38,6 +38,13 @@ __device__ __noinline__ void decodeSubChunkRawMode(
     int32_t recent_offset = INITIAL_RECENT_OFFSET;
     uint32_t length_offset = 0;
 
+    // v4 #1: per-warp staging for the flat batched literal copy in the
+    // PP fast path below (one slice per warp; the kernels launch
+    // WARPS_PER_BLOCK warps with warp id = threadIdx.y). 512 B per
+    // instantiation — the kernels used 0 B shared, so no occupancy cost.
+    __shared__ uint32_t s_lit_prefix[WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ uint32_t s_dst_adj[WARPS_PER_BLOCK][WARP_SIZE];
+
     while (cmd_pos < cmd_size) {
         // Parallel-parse fast path. 32 tokens per outer iter: coalesced
         // cmd LDG, per-lane decode, prefix-scan side-stream offsets,
@@ -112,28 +119,65 @@ __device__ __noinline__ void decodeSubChunkRawMode(
                 uint32_t my_lit_local, total_lit;
                 warpScanU32(my_lit_len, my_lit_local, total_lit);
 
-                #pragma unroll 1
-                for (uint32_t k = 0; k < batch_size; k++) {
+                // ── Flat batched literal copy (v4 #1, 2026-06-10) ──
+                // The old per-token loop ran warpLiteralCopy once per
+                // token: a typical token carries ~5-8 literal bytes, so
+                // each copy iteration used ~20% of the warp plus ~10
+                // instructions of shuffle/sync overhead, 64 __syncwarp()s
+                // per batch. Instead: stage the two prefix sums to shared
+                // memory and copy the batch's WHOLE concatenated literal
+                // run in one warp-wide pass — every lane owns flat
+                // literal byte i, finds its owning token k (largest k
+                // with lit_prefix[k] <= i, 5-step binary search over the
+                // staged prefixes), and writes dst at the token's output
+                // slot. Source is contiguous (lit[lit_pos + i]); dst is
+                // piecewise-contiguous. nvCOMP's LZ4 decode ships this
+                // exact design (docs/nvcomp_lz4_architecture.md §8).
+                //
+                // Ordering safety: every byte a match copy reads sits
+                // strictly BELOW its own write position (off16 offsets
+                // are negative; the overlap path self-feeds in order),
+                // and the batch's literal slots are disjoint from all
+                // match write ranges — so writing ALL the batch's
+                // literals first, then running the matches in token
+                // order, produces byte-identical output to the strict
+                // interleaved order. One __syncwarp() fences the flat
+                // pass before the first match read.
+                s_lit_prefix[threadIdx.y][lane] = my_lit_local;
+                // dst byte for flat lit i owned by token k:
+                //   dst_pos + dst_local[k] + (i - lit_prefix[k])
+                // = dst_pos + (dst_local[k] - lit_prefix[k]) + i
+                s_dst_adj[threadIdx.y][lane] = my_dst_local - my_lit_local;
+                __syncwarp();
+
+                for (uint32_t i = lane; i < total_lit; i += WARP_SIZE) {
+                    uint32_t k = 0;
+                    #pragma unroll
+                    for (uint32_t step = 16; step >= 1; step >>= 1) {
+                        uint32_t cand = k + step;
+                        if (cand < batch_size && s_lit_prefix[threadIdx.y][cand] <= i)
+                            k = cand;
+                    }
+                    dst[dst_pos + s_dst_adj[threadIdx.y][k] + i] = lit[lit_pos + i];
+                }
+                __syncwarp();
+
+                // ── Match copies, token order, lit-free ──
+                // Ballot the lanes that actually carry a match and walk
+                // only those (lit-only tokens cost zero iterations now).
+                uint32_t match_mask = __ballot_sync(FULL_WARP_MASK, my_match_len > 0);
+                while (match_mask != 0) {
+                    uint32_t k = (uint32_t)(__ffs(match_mask) - 1);
+                    match_mask &= match_mask - 1;
                     uint32_t k_lit_len   = __shfl_sync(FULL_WARP_MASK, my_lit_len, k);
                     uint32_t k_match_len = __shfl_sync(FULL_WARP_MASK, my_match_len, k);
                     int32_t  k_match_off = __shfl_sync(FULL_WARP_MASK, my_match_offset, k);
                     uint32_t k_dst_local = __shfl_sync(FULL_WARP_MASK, my_dst_local, k);
-                    uint32_t k_lit_local = __shfl_sync(FULL_WARP_MASK, my_lit_local, k);
 
-                    uint32_t this_dst_pos = dst_pos + k_dst_local;
-                    uint32_t this_lit_pos = lit_pos + k_lit_local;
-
-                    if (k_lit_len > 0) {
-                        warpLiteralCopy(dst, this_dst_pos, lit, this_lit_pos, k_lit_len, lane);
-                        __syncwarp();
-                    }
-                    uint32_t copy_dst = this_dst_pos + k_lit_len;
-
-                    if (k_match_len > 0) {
-                        uint32_t match_src = (uint32_t)((int32_t)copy_dst + k_match_off);
-                        warpMatchCopy(dst, copy_dst, match_src, k_match_len, -k_match_off, lane);
-                        __syncwarp();
-                    }
+                    uint32_t copy_dst = dst_pos + k_dst_local + k_lit_len;
+                    uint32_t match_src = (uint32_t)((int32_t)copy_dst + k_match_off);
+                    warpMatchCopy(dst, copy_dst, match_src, k_match_len, -k_match_off, lane);
+                    __syncwarp();
                 }
 
                 cmd_pos   += batch_size;

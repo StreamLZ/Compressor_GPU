@@ -53,6 +53,22 @@ Wire format unchanged from 2026-06-09; all frames byte-identical.
   L3/L4 cells were flattered by the stale out-copy): L1 5.07 /
   L2 5.05 / L3 7.13 / L4 7.04 / L5 6.86 ms, all byte-verified;
   ptest_vk 150/9/0. Catalog: PortAdaptations A-026.
+- **Flat batched literal copy** (v4 #1, both backends): the PP fast
+  path in the raw-mode LZ decoder no longer runs one warpLiteralCopy
+  per token (64 syncs/batch at ~20% lane efficiency). The two
+  existing prefix sums are staged to 512 B shared memory and the
+  batch's whole concatenated literal run is copied in ONE warp-wide
+  pass - each lane binary-searches its byte's owning token (5 steps)
+  and writes to that token's output slot; matches then run in token
+  order via a ballot that skips lit-only tokens. Byte-identical by
+  the ordering argument in the kernel comment (every match read sits
+  below its own write position). Measured: CUDA enwik9 L1 24.3 ->
+  22.9 ms, L5 34.0 -> 33.1; enwik8 L1 2.85 -> 2.64; VK enwik9 L5
+  43.4 -> 40.9 (VK-vs-CUDA gap 1.31x -> 1.24x). nvCOMP margins: L1
+  1.36x -> 1.44x, L5 1.49x -> 1.54x. Short of the projected ~1.2x -
+  the serial per-token match loop now dominates (v4 #2's target).
+  ptest 49/0/0, ptest_vk 150/9/0, both D2D sweeps verify-OK, 1 GB
+  SHA MATCH both backends. README tables refreshed.
 - **VK bookkeeping-dispatch fusion** (v4 #10 / A-021 close path): the
   two CUDA reference kernels mirrored back to GLSL -
   `compact_all_descs_kernel.comp` (5-way fused compact incl. the raw

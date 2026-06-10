@@ -9,6 +9,14 @@
 
 #include "lz_decode_core.glsl"
 
+// v4 #1 (2026-06-10), CUDA reference: src/decode/lz_decode_raw.cuh
+// s_lit_prefix/s_dst_adj. Per-warp staging for the flat batched
+// literal copy in the PP fast path (one slice per warp; both
+// including kernels run local_size 32x2 with warp id =
+// gl_LocalInvocationID.y). 512 B - the kernels used 0 B shared.
+shared uint s_lz_lit_prefix[WARPS_PER_BLOCK][WARP_SIZE];
+shared uint s_lz_dst_adj[WARPS_PER_BLOCK][WARP_SIZE];
+
 // CUDA reference: src/decode/lz_decode_raw.cuh:24-211.
 // Templated `decodeSubChunkRawMode<OFF16_SPLIT>` in CUDA. Both
 // instantiations are live: <false> for interleaved-u16 off16 (the
@@ -151,33 +159,55 @@
                     warpScanU32(_ds_my_lit_len, int(lane),                                \
                                 _ds_my_lit_local, _ds_total_lit);                         \
                                                                                           \
-                    for (uint _ds_k = 0u; _ds_k < _ds_batch_size; _ds_k += 1u) {          \
+                    /* v4 #1 (2026-06-10), CUDA ref: src/decode/lz_decode_raw.cuh         \
+                       flat batched literal copy. Stage the two prefix sums to            \
+                       shared, copy the batch's WHOLE concatenated literal run in         \
+                       one warp-wide pass (5-step ownership binary search per             \
+                       byte), then run the matches in token order via ballot.            \
+                       Safe because every match-copy read sits strictly below its         \
+                       own write position and literal slots are disjoint from all         \
+                       match write ranges - see the CUDA comment block. */                \
+                    s_lz_lit_prefix[gl_LocalInvocationID.y][uint(lane)] =                 \
+                        _ds_my_lit_local;                                                 \
+                    s_lz_dst_adj[gl_LocalInvocationID.y][uint(lane)] =                    \
+                        _ds_my_dst_local - _ds_my_lit_local;                              \
+                    subgroupBarrier();                                                    \
+                                                                                          \
+                    for (uint _ds_i = uint(lane); _ds_i < _ds_total_lit;                  \
+                         _ds_i += WARP_SIZE) {                                            \
+                        uint _ds_own = 0u;                                                \
+                        for (uint _ds_step = 16u; _ds_step >= 1u; _ds_step >>= 1) {       \
+                            uint _ds_cand = _ds_own + _ds_step;                           \
+                            if (_ds_cand < _ds_batch_size &&                              \
+                                s_lz_lit_prefix[gl_LocalInvocationID.y][_ds_cand] <= _ds_i) \
+                                _ds_own = _ds_cand;                                       \
+                        }                                                                 \
+                        (dst_ssbo)[_ds_dst_pos +                                          \
+                                   s_lz_dst_adj[gl_LocalInvocationID.y][_ds_own] + _ds_i] = \
+                            (lit_ssbo)[uint(lit_base) + _ds_lit_pos + _ds_i];             \
+                    }                                                                     \
+                    subgroupBarrier();                                                    \
+                    subgroupMemoryBarrierBuffer();                                        \
+                                                                                          \
+                    /* Match copies, token order, lit-free; ballot skips                  \
+                       lit-only tokens entirely. */                                       \
+                    uvec4 _ds_mm_ballot = subgroupBallot(_ds_my_match_len > 0u);          \
+                    uint _ds_match_mask = _ds_mm_ballot.x;                                \
+                    while (_ds_match_mask != 0u) {                                        \
+                        uint _ds_k = uint(findLSB(_ds_match_mask));                       \
+                        _ds_match_mask &= _ds_match_mask - 1u;                            \
                         uint _ds_k_lit_len   = subgroupShuffle(_ds_my_lit_len, _ds_k);    \
                         uint _ds_k_match_len = subgroupShuffle(_ds_my_match_len, _ds_k);  \
                         int  _ds_k_match_off = subgroupShuffle(_ds_my_match_offset, _ds_k); \
                         uint _ds_k_dst_local = subgroupShuffle(_ds_my_dst_local, _ds_k);  \
-                        uint _ds_k_lit_local = subgroupShuffle(_ds_my_lit_local, _ds_k);  \
                                                                                           \
-                        uint _ds_this_dst_pos = _ds_dst_pos + _ds_k_dst_local;            \
-                        uint _ds_this_lit_pos = _ds_lit_pos + _ds_k_lit_local;            \
-                                                                                          \
-                        if (_ds_k_lit_len > 0u) {                                         \
-                            warpLiteralCopy(dst_ssbo, _ds_this_dst_pos,                   \
-                                            lit_ssbo, uint(lit_base) + _ds_this_lit_pos,  \
-                                            _ds_k_lit_len, lane);                         \
-                            subgroupBarrier();                                            \
-                            subgroupMemoryBarrierBuffer();                                \
-                        }                                                                 \
-                        uint _ds_copy_dst = _ds_this_dst_pos + _ds_k_lit_len;             \
-                                                                                          \
-                        if (_ds_k_match_len > 0u) {                                       \
-                            uint _ds_match_src = uint(int(_ds_copy_dst) + _ds_k_match_off); \
-                            warpMatchCopy(dst_ssbo, _ds_copy_dst,                         \
-                                          _ds_match_src, _ds_k_match_len,                 \
-                                          -_ds_k_match_off, lane);                        \
-                            subgroupBarrier();                                            \
-                            subgroupMemoryBarrierBuffer();                                \
-                        }                                                                 \
+                        uint _ds_copy_dst = _ds_dst_pos + _ds_k_dst_local + _ds_k_lit_len; \
+                        uint _ds_match_src = uint(int(_ds_copy_dst) + _ds_k_match_off);   \
+                        warpMatchCopy(dst_ssbo, _ds_copy_dst,                             \
+                                      _ds_match_src, _ds_k_match_len,                     \
+                                      -_ds_k_match_off, lane);                            \
+                        subgroupBarrier();                                                \
+                        subgroupMemoryBarrierBuffer();                                    \
                     }                                                                     \
                                                                                           \
                     _ds_cmd_pos   += _ds_batch_size;                                      \
