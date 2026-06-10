@@ -276,6 +276,15 @@ pub const DecodeRequest = struct {
     /// host round-trip. Null preserves the CLI / host-bounce behavior
     /// (`total_chunks` H2D'd into `d_n_groups_scratch`).
     d_n_chunks_dev: ?u64 = null,
+    /// L1 gate (backported from VK, audit Section C.5.1): for `level == 1`
+    /// frames the dispatcher skips the entire scan/compact/merge/gather
+    /// pipeline + the Huffman pre-decode kernels (which all self-gate but
+    /// still launch with worst-case grid sizes ≈ 4× total_subchunks). L1
+    /// has no entropy streams, so none of that work is needed; the LZ
+    /// kernel's lean raw path (`slzLzDecodeRawKernel`) reads off16 etc.
+    /// directly from the compressed buffer. Default `1` keeps existing
+    /// callers behavioral on raw-input paths that don't know the level.
+    level: u8 = 1,
 
     /// True when the LZ kernel can write decompressed bytes straight
     /// into the caller's device buffer (no `dst_start_off` prefix to
@@ -343,10 +352,20 @@ fn runHuffBuildAndDecode(
         var p_lut: u64 = self.d_huff_lut;
         var p_out: u64 = self.d_entropy_scratch;
         var p_n: u64 = d_n_huff;
+        // A-024: pass region offsets as u64 + d_compact_counts pointer so
+        // each block reads its slot's region from there. The merge kernel
+        // no longer folds these into desc.out_offset (which is u32 and
+        // overflowed at ~6553 sub-chunks).
+        var p_counts: u64 = self.d_compact_counts;
+        var p_tok_off: u64 = self.last_tok_offset;
+        var p_off16_off: u64 = self.last_off16_offset;
         var params = [_]?*anyopaque{
             @ptrCast(&p_comp), @ptrCast(&p_descs),
             @ptrCast(&p_lut),  @ptrCast(&p_out),
             @ptrCast(&p_n),
+            @ptrCast(&p_counts),
+            @ptrCast(&p_tok_off),
+            @ptrCast(&p_off16_off),
         };
         var extra = [_]?*anyopaque{null};
         const shared_bytes: c_uint = HUFF_LUT_ENTRIES * @sizeOf(u32);
@@ -546,10 +565,23 @@ fn uploadInputAndPrefixSum(
     // within each slot. Layout: [lit: total*slot] [tok: total*slot] [off16: total*slot].
     const per_subchunk_scratch: usize = @intCast(descriptors.ENTROPY_SCRATCH_SLOT_BYTES);
     const entropy_scratch_bytes = @as(usize, total_subchunks) * per_subchunk_scratch * 3;
-    try ensureDeviceBuf(&self.d_entropy_scratch, &self.d_entropy_scratch_size, entropy_scratch_bytes);
     const tok_offset = @as(usize, total_subchunks) * per_subchunk_scratch;
     const off16_offset = @as(usize, total_subchunks) * per_subchunk_scratch * 2;
-    self.d_entropy_off16_scratch = self.d_entropy_scratch + off16_offset;
+    // L1/L2 gate: entropy_scratch is consumed only by the Huffman
+    // predecode → gather → LZ-general chain (level >= 3). L1/L2 decode
+    // through the raw kernel and never dereference it, but the previous
+    // unconditional allocation still cost real VRAM from the BOUND-based
+    // sizing: 3 GB at 1 GB sc=0.5, 12 GB(!) at 1 GB sc=0.25. Skip it.
+    // The raw/general kernels treat a null scratch pointer as "no
+    // entropy" (L1/L2 frames contain no type-4 chunks, so the pointer
+    // is never dereferenced even on the general-kernel fallback path).
+    if (req.level >= 3) {
+        try ensureDeviceBuf(&self.d_entropy_scratch, &self.d_entropy_scratch_size, entropy_scratch_bytes);
+        self.d_entropy_off16_scratch = self.d_entropy_scratch + off16_offset;
+    }
+    // A-024: stash region offsets as u64 for slzHuffDecode4StreamKernel.
+    self.last_tok_offset = @intCast(tok_offset);
+    self.last_off16_offset = @intCast(off16_offset);
 
     // Always pass the device prefix-sum to the LZ kernel. When
     // `sub_chunk_cap >= chunk_size` the prefix sum is `[0, 1, 2, ...]`
@@ -713,11 +745,20 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         e2e_cum.postscan = e2e_cum.h2d;
     };
 
-    // Phase 2: scan + raw-off16 gather. The GPU scan kernel reads from
-    // `d_comp_persist` (filled by the prior H2D / D2D), so the same
-    // code path handles both decode entry points.
+    // Phase 2-3: scan + raw-off16 gather + Huffman descriptor merge.
+    //
+    // L1/L2 gate (tightened from the VK port's `level >= 2`): L1 AND L2
+    // frames have no entropy streams — the encoder front-door
+    // (`fast_framed.zig:247`) only runs the Huffman pass at `level >= 3`.
+    // The LZ raw kernel reads everything directly from the compressed
+    // buffer. The scan + compact + gather + merge + huff_build +
+    // huff_decode kernels all run as expensive no-ops on L1/L2 (each
+    // launches with worst-case grid ≈ 4 × total_subchunks and returns
+    // immediately via its self-gate). Skip them outright. The VK port
+    // currently gates on `level >= 2`; the L2 path there has the same
+    // wasteful launches and should be tightened in step.
     var scan: ScanResult = .{ .num_raw_off16 = 0 };
-    if (module_loader.huff_build_fn != 0) {
+    if (req.level >= 3 and module_loader.huff_build_fn != 0) {
         if (req.chunk_descs.len > descriptors.WALK_MAX_CHUNKS) return error.BadMode;
         scan = scan_gpu.gpuScanChunks(
             self,
@@ -738,7 +779,7 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // Phase 3: Huffman descriptor merge (LUT + descriptor allocations).
     const n_huff: u32 = scan.num_huff_lit + scan.num_huff_tok +
         scan.num_huff_off16hi + scan.num_huff_off16lo;
-    const have_huff = n_huff > 0 and module_loader.huff_build_fn != 0 and module_loader.huff_decode_fn != 0;
+    const have_huff = req.level >= 3 and n_huff > 0 and module_loader.huff_build_fn != 0 and module_loader.huff_decode_fn != 0;
     if (have_huff) {
         const huff_desc_bytes = @as(usize, n_huff) * @sizeOf(HuffDecChunkDesc);
         const huff_lut_bytes = @as(usize, n_huff) * HUFF_LUT_ENTRIES * @sizeOf(u32);

@@ -20,24 +20,29 @@
 // Stream regions (4 entries): each {src, n, region_off}. Each block
 // handles one region in its lane-0; per-block prefix is computed via a
 // pre-pass on lane 0.
-// Append one region's compacted descs into d_merged, adding region_off
-// to each desc's out_offset and assigning sequential lut_offsets.
+// Append one region's compacted descs into d_merged, assigning sequential
+// lut_offsets. A-024 fix: out_offset is NOT touched here. The per-region
+// offset (0 for lit, tok_region_off for tok, off16_region_off for hi+lo)
+// is applied as uint64_t inside slzHuffDecode4StreamKernel; the old u32
+// `d.out_offset += region_off` truncated silently at ~6553 sub-chunks and
+// corrupted lit slots near offset 0 in entropy_scratch.
 static __device__ inline void appendRegion(
     SlzHuffDecChunkDesc* __restrict__       d_merged,
     uint32_t&                               lut_slot,
     const SlzHuffDecChunkDesc* __restrict__ src,
-    uint32_t                                n,
-    uint32_t                                region_off
+    uint32_t                                n
 ) {
     for (uint32_t i = 0; i < n; i++) {
         SlzHuffDecChunkDesc d = src[i];
-        d.out_offset += region_off;
         d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
         d_merged[lut_slot] = d;
         lut_slot++;
     }
 }
 
+// A-024 fix: tok_region_off / off16_region_off params kept for ABI
+// compatibility (host still passes them) but IGNORED here. The region
+// offsets are now applied as uint64_t inside slzHuffDecode4StreamKernel.
 extern "C" __global__ void slzMergeHuffDescsKernel(
     const SlzHuffDecChunkDesc* __restrict__ d_lit,
     const SlzHuffDecChunkDesc* __restrict__ d_tok,
@@ -47,16 +52,16 @@ extern "C" __global__ void slzMergeHuffDescsKernel(
     const uint32_t* __restrict__            d_n_tok,
     const uint32_t* __restrict__            d_n_hi,
     const uint32_t* __restrict__            d_n_lo,
-    uint32_t                                tok_region_off,
-    uint32_t                                off16_region_off,
+    uint32_t                                /*tok_region_off (ignored)*/,
+    uint32_t                                /*off16_region_off (ignored)*/,
     SlzHuffDecChunkDesc* __restrict__       d_merged,
     uint32_t* __restrict__                  d_n_merged)
 {
     SLZ_GUARD_SINGLE_THREAD();
     uint32_t lut_slot = 0;
-    appendRegion(d_merged, lut_slot, d_lit, *d_n_lit, 0);
-    appendRegion(d_merged, lut_slot, d_tok, *d_n_tok, tok_region_off);
-    appendRegion(d_merged, lut_slot, d_hi,  *d_n_hi,  off16_region_off);
-    appendRegion(d_merged, lut_slot, d_lo,  *d_n_lo,  off16_region_off);
+    appendRegion(d_merged, lut_slot, d_lit, *d_n_lit);
+    appendRegion(d_merged, lut_slot, d_tok, *d_n_tok);
+    appendRegion(d_merged, lut_slot, d_hi,  *d_n_hi);
+    appendRegion(d_merged, lut_slot, d_lo,  *d_n_lo);
     *d_n_merged = lut_slot;
 }

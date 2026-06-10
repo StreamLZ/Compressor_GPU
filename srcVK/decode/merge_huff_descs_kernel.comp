@@ -98,41 +98,46 @@ void main() {
     // each block matches CUDA's appendRegion exactly.
     uint lut_slot = 0u;
 
-    // appendRegion(d_merged, lut_slot, d_lit, *d_n_lit, 0)
+    // A-024: out_offset is NOT folded with region_off here. The CUDA
+    // reference (src/decode/merge_huff_descs_kernel.cuh:34) used to do
+    // `d.out_offset += region_off` with both fields as u32, which silently
+    // overflowed at ~6553 sub-chunks under L3 enwik9 (off16_region_off ≈
+    // 4 GB) and corrupted lit slots near offset 0. The fix moves the
+    // region_off application into slzHuffDecode4StreamKernel where it is
+    // done as uint64_t. The push-constant fields are kept for ABI
+    // compatibility with the host launch but are NOT consumed here.
+
+    // appendRegion(d_merged, lut_slot, d_lit, *d_n_lit)
     uint n_lit = d_n_lit;
     for (uint i = 0u; i < n_lit; i = i + 1u) {
         SlzHuffDecChunkDescGlsl d = d_lit[i];
-        d.out_offset = d.out_offset + 0u;
         d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
         d_merged[lut_slot] = d;
         lut_slot = lut_slot + 1u;
     }
 
-    // appendRegion(d_merged, lut_slot, d_tok, *d_n_tok, tok_region_off)
+    // appendRegion(d_merged, lut_slot, d_tok, *d_n_tok)
     uint n_tok = d_n_tok;
     for (uint i = 0u; i < n_tok; i = i + 1u) {
         SlzHuffDecChunkDescGlsl d = d_tok[i];
-        d.out_offset = d.out_offset + pc.tok_region_off;
         d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
         d_merged[lut_slot] = d;
         lut_slot = lut_slot + 1u;
     }
 
-    // appendRegion(d_merged, lut_slot, d_hi, *d_n_hi, off16_region_off)
+    // appendRegion(d_merged, lut_slot, d_hi, *d_n_hi)
     uint n_hi = d_n_hi;
     for (uint i = 0u; i < n_hi; i = i + 1u) {
         SlzHuffDecChunkDescGlsl d = d_hi[i];
-        d.out_offset = d.out_offset + pc.off16_region_off;
         d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
         d_merged[lut_slot] = d;
         lut_slot = lut_slot + 1u;
     }
 
-    // appendRegion(d_merged, lut_slot, d_lo, *d_n_lo, off16_region_off)
+    // appendRegion(d_merged, lut_slot, d_lo, *d_n_lo)
     uint n_lo = d_n_lo;
     for (uint i = 0u; i < n_lo; i = i + 1u) {
         SlzHuffDecChunkDescGlsl d = d_lo[i];
-        d.out_offset = d.out_offset + pc.off16_region_off;
         d.lut_offset = lut_slot * HUFF_LUT_ENTRIES;
         d_merged[lut_slot] = d;
         lut_slot = lut_slot + 1u;

@@ -94,6 +94,39 @@ layout(std430, binding = 5) buffer OutputBufU32 {
     uint output_buf_u32[];
 };
 
+// A-024: d_compact_counts gives n_lit/n_tok/n_hi/n_lo so each block can
+// figure out which region (lit | tok | off16) its block_id falls into.
+// The merge kernel writes the descriptors as lit | tok | hi | lo
+// contiguously, so the [n_lit, n_lit+n_tok, n_lit+n_tok+n_hi] boundaries
+// partition the merged-descs block-id range across the three regions.
+//
+// VK adaptation: the d_compact_counts SSBO is laid out with 256-byte
+// stride between fields (`COUNTS_STRIDE = 256` in decode_dispatch.zig),
+// NOT as a tight u32 array. The merge kernel binds NLitBuf/NTokBuf/etc.
+// at separate offsets (0, 256, 512, ...) and declares each as a single
+// `uint` member. Here we bind the whole buffer at offset 0 and index
+// into the strided layout: u32-index = byte_offset / 4 = COUNTS_STRIDE
+// (256) / 4 = 64 per field.
+layout(std430, binding = 6) readonly buffer CompactCountsBuf {
+    uint d_compact_counts[];
+};
+const uint COMPACT_COUNTS_STRIDE_U32 = 64u;  // 256 bytes / 4 = 64 u32s
+
+// A-024: per-region byte offsets. Host computes from the same BOUND it
+// uses to lay out entropy_scratch (worst-case total_subchunks ×
+// ENTROPY_SCRATCH_SLOT_BYTES), so writes here land at the same slots the
+// LZ kernel reads from. Passed as u32 — fits u32 for every input where
+// `BOUND × ENTROPY_SCRATCH_SLOT_BYTES × 2 < 2^32`, i.e. roughly inputs
+// under ~819 MB at sc=0.5 L3. Beyond that, the final write index
+// `off16_region_off + sub_idx × ENTROPY_SCRATCH_SLOT_BYTES + ...`
+// overflows u32 — same fundamental cap as the LZ kernel's
+// `entropy_slot_stride.x` u32 truncation (see lz_decode_kernel.comp's
+// A-005 comment). Proper fix is shaderInt64 or BDA; both are deferred.
+layout(push_constant) uniform Push {
+    uint tok_region_off;
+    uint off16_region_off;
+} pc;
+
 // ── Shared LUT ──────────────────────────────────────────────────────
 // CUDA reference: src/decode/huffman_kernel.cu:644-649. CUDA uses
 // `extern __shared__ uint32_t shared_lut[]` sized by the launch's
@@ -555,6 +588,35 @@ void main() {
     if (block_id >= d_n_blocks) return;
     uint lane = gl_LocalInvocationID.x & LANE_MASK;
 
+    // A-024 fix: pick this block's region offset by where block_id falls
+    // in the merged-descs partition (lit | tok | hi | lo). The merge
+    // kernel writes them contiguously in that order, so n_lit and
+    // n_lit+n_tok are the per-region boundaries; n_hi separates hi vs
+    // lo but they share the off16 region_off. CUDA reference:
+    // src/decode/huffman_kernel.cu:643-660 ("Pick this block's region
+    // offset" block) — porting that pattern verbatim. The merge kernel
+    // (merge_huff_descs_kernel.comp) used to fold region_off into
+    // desc.out_offset with u32 arithmetic; that silently truncated at
+    // ~6553 sub-chunks and corrupted lit slot 0. Doing the add here
+    // separates the desc field (small, never overflows u32) from the
+    // region-base (large, can approach 4 GB), so we only need the
+    // single u32 add to fit — the per-sub-chunk slot offset.
+    uint n_lit = d_compact_counts[0u * COMPACT_COUNTS_STRIDE_U32];
+    uint n_tok = d_compact_counts[1u * COMPACT_COUNTS_STRIDE_U32];
+    uint region_off;
+    if (block_id < n_lit) {
+        region_off = 0u;
+    } else if (block_id < n_lit + n_tok) {
+        region_off = pc.tok_region_off;
+    } else {
+        // hi and lo both live in the off16 region; their per-slot
+        // OFF16_HILO_SPLIT_OFFSET difference is already baked into
+        // desc.out_offset by scan_parse_kernel.comp (see line 221 in
+        // src/decode/scan_parse_kernel.cuh: lo descs add SCAN_OFF16_LO_SLOT
+        // to sub_dst_off before the merge sees them).
+        region_off = pc.off16_region_off;
+    }
+
     // CUDA reference: src/decode/huffman_kernel.cu:643. Parse the 5×u32
     // HuffDecChunkDesc (in_offset, in_size, out_offset, out_size,
     // lut_offset). Every lane reads the same descriptor (cached).
@@ -631,7 +693,10 @@ void main() {
     uint my_out_size  = (lane < uint(HUFF_NUM_STREAMS - 1))
                         ? q
                         : (out_size - (uint(HUFF_NUM_STREAMS) - 1u) * q);
-    uint my_out_base_abs = out_offset + my_out_start;
+    // A-024: add region_off to the per-sub-chunk slot offset here, using
+    // the actual-count-based bound (kept under u32 so SSBO indexing
+    // stays valid).
+    uint my_out_base_abs = region_off + out_offset + my_out_start;
 
     // CUDA reference: src/decode/huffman_kernel.cu:694-696.
     decodeStreamBoundedIL(

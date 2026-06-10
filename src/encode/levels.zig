@@ -19,10 +19,19 @@
 /// 4419 ms → 415 ms at +0.07% pre-Huffman ratio (≈0 after Huffman);
 /// enwik8 also gets a smaller win from better L1/L2 cache hit rate.
 pub fn hashBitsForLevel(level: u8) u32 {
+    // 2026-06-09: L2 18→17 and L3 19→17, completing the hb=17 cap at
+    // every level. With the sc=0.25 default (15,259 chunks at 1 GB),
+    // L2's hb=18 hash was 16 GB — past physical VRAM on consumer
+    // hardware, collapsing encode to 159 MB/s via WDDM paging. L3's
+    // hb=19 was worse (silently broken + 10× slow at 1 GB before the
+    // A-024 fix). Measured ratio cost of 17 vs the old values:
+    // ≈ 0.0-0.1 pp on enwik8/enwik9 — sub-chunks are ≤ 128 KB, so hash
+    // tables beyond 2^17 entries add collisions-free slots the 64 KB
+    // match window can never exploit.
     return switch (level) {
         1 => 17,
-        2 => 18,
-        3 => 19,
+        2 => 17,
+        3 => 17,
         4 => 17,
         5 => 17,
         else => unreachable,

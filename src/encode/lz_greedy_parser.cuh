@@ -80,9 +80,32 @@ __device__ void scanBlock(
         // All warp-wide intrinsics here are unconditional with the
         // FULL_WARP_MASK; per-lane logic uses purely-local mask arithmetic.
         uint32_t bucket_same = __match_any_sync(FULL_WARP_MASK, h);
-        uint32_t key_same    = __match_any_sync(FULL_WARP_MASK, key4);
         uint32_t active_mask = __ballot_sync(FULL_WARP_MASK, is_active);
         uint32_t lower_same_bucket = bucket_same & active_mask & ((1u << lane) - 1);
+
+        // VULKAN_PORTABILITY: explicit shuffle-and-compare rewrite for site #2
+        // (the key4 __match_any_sync that the W3 plan calls for eliminating).
+        // The original code computed `key_same = __match_any_sync(FULL_WARP_MASK, key4)`
+        // and tested `(key_same & (1u << highest_lower)) != 0`. That tested whether
+        // the specific `highest_lower` lane's key4 equals mine. A direct shuffle-
+        // and-compare gives the same answer with no warp-wide bitmask and is the
+        // byte-identical pattern the Vulkan port uses (subgroupShuffle == key4).
+        // Byte-identity on NVIDIA proven in docs/vulkan_port_architecture.md
+        // Appendix A (bucket-coherence invariant: when `lower_same_bucket != 0`,
+        // the highest-lower bit is the highest *active* lower lane regardless of
+        // key4, and the shuffle-and-compare promotes that to the same-key4 test
+        // exactly as the original __match_any_sync mask test did).
+        // See docs/vulkan_port_milestones.md M0 site #2.
+        //
+        // The shuffle is issued at warp scope (all 32 lanes converged on
+        // FULL_WARP_MASK), then the result is consumed only inside the divergent
+        // `is_active && lower_same_bucket != 0` branch. Lanes with
+        // `lower_same_bucket == 0` use a self-shuffle (their own lane id) so the
+        // intrinsic is well-defined for all 32 lanes; their result is discarded.
+        uint32_t key_src_lane = (lower_same_bucket != 0u)
+            ? ((WARP_SIZE - 1) - __clz(lower_same_bucket))
+            : lane;
+        uint32_t their_key4_warp = __shfl_sync(FULL_WARP_MASK, key4, key_src_lane);
 
         bool hash_match = false;
         uint32_t hash_ref = 0;
@@ -90,9 +113,12 @@ __device__ void scanBlock(
         if (is_active) {
             if (lower_same_bucket != 0) {
                 // CPU would see the highest lower same-bucket lane's pos.
-                // That lane's key4 is "same as me" iff its bit is in key_same.
-                uint32_t highest_lower = (WARP_SIZE - 1) - __clz(lower_same_bucket);
-                bool same_key = (key_same & (1u << highest_lower)) != 0;
+                // Test whether that lane's key4 equals mine via the warp-scope
+                // shuffle issued above (replaces the prior
+                // `(key_same & (1u << highest_lower)) != 0` bitmask test — see
+                // VULKAN_PORTABILITY comment above).
+                uint32_t highest_lower = key_src_lane;
+                bool same_key = (their_key4_warp == key4);
                 uint32_t their_pos = pos + highest_lower;
                 if (same_key && their_pos + 8 <= my_pos) {
                     hash_match = true;
@@ -179,11 +205,25 @@ __device__ void scanBlock(
         // Hash-table writes mirror CPU: write the bucket for every position
         // CPU would have visited (= lane positions up to and including the
         // first-match lane, or up to no_match_step-1 if no match).
+        //
+        // VULKAN_PORTABILITY: explicit highest-lane-winner rewrite for
+        // cross-backend byte-identity (Vulkan port prereq). See
+        // docs/vulkan_port_milestones.md M0 site A.
+        // The previous unguarded `ht[h] = my_pos` relied on NVIDIA's de-facto
+        // "highest-indexed lane wins" warp-store serialization for stores to
+        // the same address. Vulkan/AMD/Intel/Mali make no such guarantee.
+        // Compute the bucket-group within the active writers and gate the
+        // store to the highest-indexed lane in that group.
         {
             uint32_t write_limit = (match_ballot != 0)
                 ? (uint32_t)(__ffs(match_ballot) - 1)
                 : (no_match_step - 1);
-            if (is_active && lane <= write_limit) {
+            bool is_writer = is_active && (lane <= write_limit);
+            uint32_t write_mask  = __ballot_sync(FULL_WARP_MASK, is_writer);
+            uint32_t bucket_grp  = __match_any_sync(FULL_WARP_MASK, h);
+            uint32_t group_mask  = bucket_grp & write_mask;
+            int top_lane = (group_mask != 0u) ? (int)((WARP_SIZE - 1) - __clz(group_mask)) : -1;
+            if (is_writer && (int)lane == top_lane) {
                 ht[h] = my_pos;
             }
         }
@@ -302,14 +342,31 @@ __device__ void scanBlock(
         // exponentially spaced offsets, so later positions can
         // reference mid-match. Port of the CPU greedy parser's
         // level>=2 match rehash.
+        //
+        // VULKAN_PORTABILITY: explicit highest-lane-winner rewrite for
+        // cross-backend byte-identity (Vulkan port prereq). See
+        // docs/vulkan_port_milestones.md M0 site B.
+        // Same rationale as site A: the prior unguarded
+        // `ht[hashKey6(...)] = rp` relied on NVIDIA's de-facto
+        // "highest-indexed lane wins" warp-store serialization. Compute the
+        // bucket-group across the active rehash writers and gate the store
+        // to the highest-indexed lane in that group.
         if (enable_match_rehash) {
             uint32_t ri = 1u << lane;
-            if (ri < match_len) {
-                uint32_t rp = match_pos + ri;
-                if (rp + 8 <= src_size) {
-                    uint64_t rk = readU64LE(src + rp);
-                    ht[hashKey6(rk, hash_bits, hash_mask)] = rp;
-                }
+            uint32_t rp = match_pos + ri;
+            bool rehash_active = (ri < match_len) && (rp + 8 <= src_size);
+            // Only active lanes touch src[]; inactive lanes feed zero to keep
+            // hashKey6 inputs well-defined for the warp-wide __match_any_sync
+            // call. Inactive lanes' grouping is irrelevant — write_mask removes
+            // them from group_mask before top-lane election.
+            uint64_t rk = rehash_active ? readU64LE(src + rp) : (uint64_t)0;
+            uint32_t h_rehash = hashKey6(rk, hash_bits, hash_mask);
+            uint32_t write_mask = __ballot_sync(FULL_WARP_MASK, rehash_active);
+            uint32_t bucket_grp = __match_any_sync(FULL_WARP_MASK, h_rehash);
+            uint32_t group_mask = bucket_grp & write_mask;
+            int top_lane = (group_mask != 0u) ? (int)((WARP_SIZE - 1) - __clz(group_mask)) : -1;
+            if (rehash_active && (int)lane == top_lane) {
+                ht[h_rehash] = rp;
             }
         }
 

@@ -61,16 +61,23 @@ const sm_count_fallback: usize = 34;
 const assembly_chunk_cap: usize = 16384;
 
 /// Pick the `sc_group_size` to advertise in the frame header. Honors a
-/// caller override; otherwise picks 0.25 (64 KB sub-chunks) below the
-/// GPU saturation threshold and 0.5 (128 KB) at or above it.
+/// caller override; otherwise always 0.25 (64 KB sub-chunks).
+///
+/// 2026-06-09: was "0.25 below the GPU saturation threshold, 0.5 at or
+/// above it" on the theory that once the GPU is saturated, bigger
+/// sub-chunks buy ratio for free. Measurement on 1 GB enwik9 (RTX 4060
+/// Ti) disproved the "free": sc=0.5 halves the warp count and doubles
+/// every warp's serial decode chain, costing 1.8× decode wall-clock
+/// (L1 44.2 ms → 24.3 ms at sc=0.25; L3-L5 ~2×). The ratio cost of
+/// 0.25 is ~2.3 pp at L1 / ~1.4 pp at L3 on enwik9 — and 0.25 is the
+/// configuration that beats nvCOMP LZ4 (L1) and nvCOMP Zstd (L5) on
+/// BOTH ratio and decode speed simultaneously. Callers that want
+/// maximum ratio pass `--sc 0.5` (the decoder handles any sc value;
+/// it's stamped in the frame header).
 fn resolveScGroupSize(src_len: usize, override: ?f32) f32 {
+    _ = src_len;
     if (override) |ov| return ov;
-    const sm_count: usize = if (cuda_api.sm_count > 0)
-        @intCast(cuda_api.sm_count)
-    else
-        sm_count_fallback;
-    const saturation_bytes = sm_count * decoder_warps_per_sm * sc05_bytes_per_warp;
-    return if (src_len >= saturation_bytes) 0.5 else 0.25;
+    return 0.25;
 }
 
 /// Map the unified L1-L5 user level to the codec level written in the

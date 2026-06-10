@@ -908,6 +908,67 @@ verification status. An unverified adaptation is a known risk surface.
   could be removed and the larger hash budget would just be slower
   instead of failing. Out-of-scope for this workflow.
 
+  **2026-06-09 update: backported to CUDA** (`src/encode/encode_lz.zig`
+  + `cuMemGetInfo` budget in `cuda_ffi.zig` / `module_loader.zig`).
+  CUDA's WDDM allocator never fails the oversized alloc — it silently
+  pages over PCIe (L5 enwik9 encode collapsed to 52 MB/s) — so the
+  CUDA port derives the cap from a cuMemGetInfo budget (3/4 of free
+  VRAM) instead of VK's allocation-failure probe, keeping the VK
+  halving loop as a backstop. Verified: L5 enwik9 encode 52 → 387 MB/s
+  with byte-identical output, SHA-256 round-trip match. The dispatch
+  shape is no longer a CUDA↔VK divergence; only the cap-discovery
+  mechanism differs (budget vs probe), forced by allocator semantics.
+
+### A-024: Huffman-decode region offsets applied in-kernel instead of folded into `desc.out_offset`
+- **File:line**: `srcVK/decode/huff_decode_4stream_kernel.comp` (binding 6
+  `CompactCountsBuf` + 2 × u32 push constants),
+  `srcVK/decode/merge_huff_descs_kernel.comp` (appendRegion no longer
+  adds region_off), `srcVK/decode/decode_dispatch.zig` (stashes
+  `last_tok_offset` / `last_off16_offset`)
+- **CUDA reference**: `src/decode/huffman_kernel.cu::slzHuffDecode4StreamKernel`
+  (two `uint64_t` region-offset params + `d_compact_counts` pointer) and
+  `src/decode/merge_huff_descs_kernel.cuh` (region params now ignored) —
+  **the CUDA side changed first**: this entry documents a CUDA BUG FIX
+  (2026-06-09) that both backends then mirrored.
+- **Class**: bug-fix (shared u32 overflow) + language-forced residual
+- **Why**: `slzMergeHuffDescsKernel` used to fold the per-region byte
+  offset (lit=0 / tok / off16) into the u32 `desc.out_offset`. The
+  off16 region offset is `2 × total_subchunks_bound × 131072` bytes —
+  at ≥ 6,554 sub-chunks (≈ 820 MB at sc=0.5) the add exceeds 2^32 and
+  silently wraps, making the Huffman predecoder write off16 bytes over
+  chunk 0's literal slot. Symptom: L3+ round-trip FAIL at byte 8 on
+  enwik9-scale inputs, on BOTH backends. Fix: the merge leaves
+  `out_offset` region-relative; the decode kernel picks its region from
+  its block_id position in the merged array (boundaries = n_lit,
+  n_lit + n_tok from `d_compact_counts`) and applies the region offset
+  at full width.
+- **Residual divergence**: CUDA applies the offsets as `uint64_t`
+  kernel params (exact at any scale). VK passes them as u32 push
+  constants (shaderInt64 not enabled, A-004/A-005 discipline), so VK
+  still truncates when the BOUND-based scratch layout exceeds 4 GiB —
+  ≈ 820 MB inputs at sc=0.5, ≈ 1 GB+ at sc=0.25. Close paths: tighten
+  the host-side total_subchunks bound from the 256 KB-chunk worst case
+  to the actual per-chunk sub-chunk count (halves the layout, putting
+  1 GB sc=0.25 back under 4 GiB), or move entropy_scratch addressing
+  to BDA like A-008.
+- **Static verification**: side-by-side review of the region-pick
+  logic on both backends; VK `COMPACT_COUNTS_STRIDE_U32 = 64` matches
+  the iter-4c 256-byte-strided counts layout (a first draft read the
+  counts as a tight u32 array and broke every L3 round-trip at byte
+  59 — caught by the enwik8 L3 regression check).
+- **Runtime verification**: CUDA — enwik9 L3/L4/L5 1 GB round-trip
+  PASS + SHA-256 match at sc=0.5 and sc=0.25; the 819 MB / 820 MB
+  threshold pair both PASS (pre-fix: 820 MB failed at byte 8,
+  bisection pinned the 2^32 wrap between 6,552 and 6,560 sub-chunks).
+  VK — enwik8 L3/L5 round-trip PASS, byte-identical to CUDA; 1 GB
+  sc=0.5 still fails per the residual above (pre-existing, now
+  documented rather than silent).
+- **Discovered**: 2026-06-09 enwik9 stress session (CUDA-as-oracle
+  runtime bisection)
+- **Status**: ✅ RESOLVED on CUDA; ⚠️ PARTIAL on VK (u32 push-constant
+  truncation above ~4 GiB scratch bound — close via bound tightening,
+  BDA, or shaderInt64)
+
 ## Process notes
 
 When the next port adaptation lands:

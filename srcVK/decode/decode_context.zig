@@ -222,6 +222,14 @@ pub const DecodeContext = struct {
     d_total_subchunks_buf: VkDeviceBuffer = 0,
     d_total_subchunks_buf_size: usize = 0,
 
+    // A-024: per-region byte offsets into d_entropy_scratch (BOUND-based,
+    // matching the layout uploadInputAndPrefixSum sets up). Stashed for
+    // the Huff decode kernel push constants so the kernel can apply
+    // region_off as u32 — the merge kernel used to fold them into
+    // desc.out_offset but that u32 add overflowed at ~6553 sub-chunks.
+    last_tok_offset: u64 = 0,
+    last_off16_offset: u64 = 0,
+
     // Pure-D2D compaction outputs.
     d_compact_lit: VkDeviceBuffer = 0,
     d_compact_lit_size: usize = 0,

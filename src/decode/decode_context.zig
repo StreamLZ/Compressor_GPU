@@ -214,6 +214,14 @@ pub const DecodeContext = struct {
     d_entropy_scratch: CUdeviceptr = 0,
     d_entropy_scratch_size: usize = 0,
 
+    // A-024: per-region byte offsets into d_entropy_scratch — recorded
+    // by uploadInputAndPrefixSum and consumed by runHuffBuildAndDecode,
+    // which forwards them as uint64_t to slzHuffDecode4StreamKernel.
+    // The merge kernel no longer folds these into desc.out_offset (which
+    // is u32 and overflowed at ~6553 sub-chunks under L3 enwik9).
+    last_tok_offset: u64 = 0,
+    last_off16_offset: u64 = 0,
+
     // Off16 scratch VIEW (not owned): set in fullGpuLaunchImpl to
     // `d_entropy_scratch + off16_offset`. The raw-off16 gather kernel
     // scatters compressed raw bytes here. Not freed by deinit because

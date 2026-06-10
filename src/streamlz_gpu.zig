@@ -68,6 +68,10 @@ const SLZ_ERROR_CORRUPT_FRAME: c_int = 4;
 const SLZ_ERROR_UNSUPPORTED: c_int = 5;
 const SLZ_ERROR_CUDA: c_int = 6;
 const SLZ_ERROR_OUT_OF_MEMORY: c_int = 7;
+// Vulkan-port additions (shared ABI; CUDA backend never returns
+// these but the slot reservation prevents future renumbering).
+const SLZ_ERROR_DEVICE_LOST: c_int = 8;
+const SLZ_ERROR_VK_FEATURE_MISSING: c_int = 9;
 
 comptime {
     // If the C enum's numeric values ever change, the explicit
@@ -75,16 +79,34 @@ comptime {
     // updated together. Pin the values here.
     std.debug.assert(SLZ_SUCCESS == 0);
     std.debug.assert(SLZ_ERROR_OUT_OF_MEMORY == 7);
+    std.debug.assert(SLZ_ERROR_DEVICE_LOST == 8);
+    std.debug.assert(SLZ_ERROR_VK_FEATURE_MISSING == 9);
 }
+
+/// Pseudo-kernel timing slot names. The library emits these into the
+/// timings array when `enable_profiling` is set on the call; the `ms`
+/// field carries a `uint32_t` byte count via `@bitCast`, not a wall-
+/// clock duration. See the slzKernelTiming_t docs in
+/// `include/streamlz_gpu.h`.
+pub const pseudo_kernel_compressed_size: [*:0]const u8 = "__compressed_size__";
+pub const pseudo_kernel_decompressed_size: [*:0]const u8 = "__decompressed_size__";
 
 /// Mirror of `slzCompressOpts_t`. Default `level = 5` matches the C
 /// header doc; the Zig-side encoder `Options.level` defaults to 1
 /// because the Zig CLI prioritizes speed. Both surfaces are public; the
 /// difference is intentional and the per-call value carries through.
+///
+/// `effective_level_out` is an OUT slot the CUDA path writes with
+/// `opts.level` (CUDA never clamps); the Vulkan Tier-2 path will
+/// write the post-clamp level when mobile-VRAM forces L5->L3. See
+/// `include/streamlz_gpu.h` slzCompressOpts_t docs. Struct size is
+/// still 32 B (8 * c_int) — the slot reuses the first `reserved`
+/// entry; the trailing `reserved` array shrinks to [5]c_int.
 const CompressOpts = extern struct {
     level: c_int = 5,
     enable_profiling: c_int = 0,
-    reserved: [6]c_int = @splat(0),
+    effective_level_out: c_int = 0,
+    reserved: [5]c_int = @splat(0),
 };
 
 /// Mirror of `slzDecompressOpts_t`.
@@ -108,7 +130,8 @@ comptime {
     std.debug.assert(@sizeOf(DecompressOpts) == 8 * @sizeOf(c_int));
     std.debug.assert(@offsetOf(CompressOpts, "level") == 0);
     std.debug.assert(@offsetOf(CompressOpts, "enable_profiling") == @sizeOf(c_int));
-    std.debug.assert(@offsetOf(CompressOpts, "reserved") == 2 * @sizeOf(c_int));
+    std.debug.assert(@offsetOf(CompressOpts, "effective_level_out") == 2 * @sizeOf(c_int));
+    std.debug.assert(@offsetOf(CompressOpts, "reserved") == 3 * @sizeOf(c_int));
     std.debug.assert(@offsetOf(DecompressOpts, "enable_profiling") == 0);
     std.debug.assert(@offsetOf(DecompressOpts, "reserved") == @sizeOf(c_int));
     // `slzKernelTiming_t` is `const char* + float` with trailing pad to
@@ -410,6 +433,8 @@ export fn slzStatusString(status: c_int) [*:0]const u8 {
         SLZ_ERROR_UNSUPPORTED => "unsupported level or option",
         SLZ_ERROR_CUDA => "underlying CUDA call failed",
         SLZ_ERROR_OUT_OF_MEMORY => "out of memory",
+        SLZ_ERROR_DEVICE_LOST => "device lost",
+        SLZ_ERROR_VK_FEATURE_MISSING => "required Vulkan feature missing",
         else => "unknown status",
     };
 }

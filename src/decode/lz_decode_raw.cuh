@@ -50,7 +50,22 @@ __device__ __noinline__ void decodeSubChunkRawMode(
             bool my_is_long = ((uint32_t)lane < batch_size) && (my_cmd < TOKEN_SHORT_MIN);
             uint32_t any_long = __ballot_sync(FULL_WARP_MASK, my_is_long);
 
-            if (any_long == 0) {
+            // PP-prefix truncation: a long token at lane j used to force
+            // tokens 0..j-1 through the serial path one at a time — the
+            // ballot saw the long token in every shifted window until it
+            // was finally consumed, so a single long token serialized up
+            // to 32 short tokens ahead of it. Truncate the batch to the
+            // all-short prefix and PP-process it; the next window then
+            // starts AT the long token and takes the serial path exactly
+            // once. Inputs with deep redundancy (enwik9-class: longer
+            // matches → more TOKEN_LONG_NEAR) hit this constantly;
+            // enwik8/silesia rarely. The PP body already handles
+            // batch_size < 32 via the `my_valid = lane < batch_size`
+            // guards, so the truncated batch needs no other change.
+            if (any_long != 0)
+                batch_size = (uint32_t)(__ffs(any_long) - 1);
+
+            if (batch_size > 0) {
                 bool my_valid = (uint32_t)lane < batch_size;
                 uint32_t my_lit_len   = my_valid ? (uint32_t)(my_cmd & TOKEN_LIT_MASK) : 0u;
                 uint32_t my_match_len = my_valid ? (uint32_t)((my_cmd >> TOKEN_MATCH_SHIFT) & TOKEN_MATCH_MASK) : 0u;

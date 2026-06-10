@@ -280,6 +280,7 @@ fn decompressFrameInner(
             dst_off,
             block_hdr.decompressed_size,
             hdr.sc_group_size,
+            hdr.level,
             dec_ctx,
             d_output_target,
             io,
@@ -326,6 +327,7 @@ fn dispatchCompressedBlock(
     dst_start_off: usize,
     decompressed_size: usize,
     sc_group_size: f32,
+    level: u8,
     dec_ctx: *gpu_driver.DecodeContext,
     d_output_target: ?u64,
     io: ?std.Io,
@@ -376,6 +378,7 @@ fn dispatchCompressedBlock(
         .io = io,
         .d_output_target = d_output_target,
         .d_compressed_src = null,
+        .level = level,
     });
 }
 

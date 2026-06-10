@@ -3133,3 +3133,166 @@ shaved a handful of microseconds per call).
 The two-codebase phase produced the best CPU and GPU LZ77 decoders
 the author has measured. Maintaining both was the limiting factor on
 further work; the strip restores that bandwidth.
+
+## Software-pipelined cmd LDG in slzLzDecodeRawKernel (2026-06-09)
+
+**Context**: An NCU profile of `slzLzDecodeRawKernel` on 1 GB enwik9 L1
+(post the L1 gate backport that finally routed L1 to the raw kernel)
+shows the same shape as the 2026-05-24 profile referenced above:
+~92 % SM throughput, 91 % achieved occupancy, 17.9 average active
+threads per warp, and "Warp Cycles per Issued Instruction = 16.64".
+NCU's stall histogram blamed Long Scoreboard on per-byte `STG.E.U8` /
+`LDG.E.U8` instructions in the cooperative copy loops, and the
+"Estimated Speedup" panel quoted 43 %.
+
+The 2026-05-19 nvCOMP LZ4 architecture reverse-engineering
+(`docs/nvcomp_lz4_architecture.md`) showed nvCOMP overlapping its own
+serial token parse with cooperative copy work — phrased as a
+"software-pipelined" parse where token N's copy hides token N+1's
+parse-side LDG behind it. Predicted 10–20 % gain in the
+"What the five experiments didn't try" list of the 2026-05-24
+meta-entry above.
+
+**What was tried**: Move the `cmd[cmd_pos + lane]` LDG that opens each
+PP fast-path iteration out of the per-iteration scope and into a
+prologue + a pipeline-shift block. Issue the LDG for batch N+1 as the
+first instruction of batch N's PP branch — the cooperative copy loop
+(~thousands of cycles, lines 100–122 of `lz_decode_raw.cuh`) was
+expected to retire the LDG before the bottom of the iteration. After
+the LONG-token serial fallback (which advances `cmd_pos` by 1, so the
+prefetched values are stale), re-prime the pipeline at full latency.
+The structural change is ~30 LOC in
+`src/decode/lz_decode_raw.cuh`. SASS verified: the `LDG.E.U8` for
+batch N+1 moves above the cooperative copy loop in the pipelined
+build.
+
+**Result** (1 GB enwik9 L1, RTX 4060 Ti, `-db -r 5`, best-of-3 runs):
+
+| Run | Pipeline ON | Pipeline OFF |
+|-----|------------:|-------------:|
+| 1   | 44.21 ms    | 44.35 ms     |
+| 2   | 44.03 ms    | 44.66 ms     |
+| 3   | 44.49 ms    | 44.29 ms     |
+| Median | 44.21    | 44.35        |
+| Δ   | —           | +0.14 ms (~0.3 %, well under run-to-run noise) |
+
+Roundtrip enwik8 100 MB L1 verified byte-exact. The change is
+correctness-preserving but moves no wall-clock.
+
+**Why it didn't work — the 2026-05-24 prediction applies cleanly**:
+
+Per the meta-entry above: "Long Scoreboard 50 % is a property of the
+instruction mix, not a single shortenable bottleneck." On a kernel
+already at 91 % achieved occupancy, reducing one warp's critical
+chain by ~300 cycles is invisible because the warp scheduler is
+already swapping to other resident warps during that warp's stall.
+The shortened chain only matters if the warp scheduler had no other
+work to issue, and at 91 % occupancy it always does.
+
+The 2026-05-24 meta-entry's specific prediction:
+
+> A change that reduces *one* warp's load latency by 15 ns doesn't
+> help unless it also reduces the *correlated* stalls across the
+> other 37 warps. None of these five changes did — they all reduced
+> one type of stall per warp, with the per-SM throughput unaffected.
+
+Software-pipelined parse is the same shape: one warp's chain shrinks,
+the per-SM aggregate doesn't move. The compiler's instruction
+scheduler may have already been hoisting the `LDG.E.U8` somewhat (we
+did not diff the SASS to confirm), but even if it hadn't, the
+scheduler-level overlap at 91 % occupancy is the binding ceiling.
+
+**What the 2026-05-24 meta-entry predicted would work** still applies:
+format change to remove the serial parse entirely (each lane parses
+its own token from a self-describing token layout), or Tensor-core
+bulk copy for very long matches. Both are weeks-to-months of work
+and require wire-format changes. Out of scope for the 2026-06-09
+session.
+
+**Reverted**: `src/decode/lz_decode_raw.cuh` restored to HEAD. See
+also the separate u32 copy vectorization entry below — both
+experiments from this session reverted for the same scheduler-ceiling
+reason.
+
+**Lesson reinforced**: When the FAILED_EXPERIMENTS file says "the
+kernel is at its structural ceiling for this kind of optimization",
+believe it. Re-check before running another per-instruction or
+per-load-latency experiment on this same hot loop. The ceiling is
+real and the warp scheduler is the binding constraint.
+
+## u32 vectorized warp literal/match copy (2026-06-09)
+
+**Context**: NCU source-view of `slzLzDecodeRawKernel` (post the L1
+gate backport) showed the top stall hot-spots concentrated on
+per-byte `STG.E.U8` / `LDG.E.U8` instructions inside `warpLiteralCopy`
+and `warpMatchCopy` (in `src/decode/lz_decode_core.cuh`). 1.7M+ stall
+samples across the top four `STG.E.U8` instances, with mostly
+`stall_long_sb` (long scoreboard memory waits). The byte loop:
+
+```cpp
+for (uint32_t i = lane; i < lit_len; i += WARP_SIZE)
+    dst[dst_pos + i] = lit[lit_pos + i];   // 32 bytes/iter across warp
+```
+
+This is the same shape as 2026-05-24 experiment #1 (memcpy 4-byte
+load) and #2 (inline-PTX `ld.global.b32`), both of which had been
+tried on the same code and resulted in 0 % wall-clock change. The
+nvCOMP LZ4 reverse-engineering doc (`docs/nvcomp_lz4_architecture.md`
+§6 step 3) shows nvCOMP using a 4-byte LDG + `PRMT` byte-extract + 4×
+`ST.E.U8`, motivating one more attempt with an explicit u32 fast path
+that protects against misalignment.
+
+**What was tried**: Added a u32 fast path to `warpLiteralCopy` and
+`warpMatchCopy` (CUDA) in `src/decode/lz_decode_core.cuh`. When both
+the ABSOLUTE addresses `(dst + dst_pos)` and `(lit + lit_pos)` are
+4-byte aligned and the copy length is ≥ 128 bytes, the warp issues
+one `STG.E.U32` per lane per iteration (4 bytes/lane/iter) instead of
+four `STG.E.U8`s. Tail bytes (< 4 across the warp) fall back to the
+byte loop. The same shape was added to `warpMatchCopy` with the
+additional `match_dist >= 4` guard (so lanes don't read their own
+writes within a single u32). Alignment is checked on absolute
+addresses, not just offsets — the original check
+`((dst_pos | lit_pos) & 3) == 0` triggered
+`CUDA_ERROR_MISALIGNED_ADDRESS / rc=716` on L1 because `lit` itself
+points into the compressed buffer at arbitrary byte offsets, so the
+relative-offset check missed the base misalignment.
+
+**Result** (1 GB enwik9, RTX 4060 Ti, `-db -r 5`, best-of-3 runs):
+
+| Workload | u32 path ON | u32 path OFF | Δ |
+|---|---:|---:|---:|
+| L1 1 GB enwik9 d2d | 44.0–44.5 ms | 44.0 ms | within noise (+1 %) |
+| L3 1 GB enwik9 hb=14 d2d | 65.1 ms | 69.2 ms | ~6 % faster |
+
+L1 stayed flat because the L1 fast path's `lit` pointer is into the
+compressed buffer at unaligned offsets — the alignment guard
+short-circuits to the byte loop most of the time. L3 saw a measurable
+~6 % improvement because L3's `lit` pointer (in the
+entropy_lit_scratch sub-region of `d_entropy_scratch`, allocated via
+`cuMemAlloc` and 256-byte aligned) is reliably 4-byte aligned, so the
+fast path actually fires.
+
+**Why not committed**: The L3 ~6 % is real and reproducible, but it is
+small enough that it could plausibly drift with PTX rebuild noise on
+a different driver / kernel version. The L1 0 % outcome is exactly
+the 2026-05-24 pattern: high-occupancy kernel + load-latency-style
+fix = no wall-clock change. Both copy helpers are shared between
+`slzLzDecodeRawKernel` (L1) and `slzLzDecodeKernel` (L3/L5), and
+adding an alignment-guarded fast path increases register pressure
+slightly on both. Given the unproven L3 win and the L1 no-op, the
+right thing is to revert and leave the byte loop, matching the
+2026-05-24 verdict that this shape of experiment will not move the
+needle.
+
+**Reverted**: `src/decode/lz_decode_core.cuh` restored to HEAD via
+file backup at `c:/tmp/lz_decode_core.cuh.bak`. The L1 1 GB enwik9
+kernel re-measured at 43.96 ms post-revert (vs 43.96–44.5 ms with the
+u32 path enabled — same to within noise).
+
+**Lesson — re-stated for the 2026-06-09 file-skimmer**: the 2026-05-24
+meta-entry's verdict on `slzLzDecodeRawKernel` ("at its structural
+ceiling for per-instruction optimization") was tested again in the
+2026-06-09 session by two independent experiments (u32 copy vec,
+software-pipelined cmd LDG). Both passed correctness; both moved
+nothing. The structural ceiling is real and survives multiple
+independent attacks.

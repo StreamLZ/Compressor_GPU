@@ -18,6 +18,13 @@ const CUdeviceptr = cuda_ffi.CUdeviceptr;
 const EncodeContext = encode_context.EncodeContext;
 const CompressChunkDesc = encode_context.CompressChunkDesc;
 
+/// A-023 (backported from srcVK, 2026-06-09) testing hook: caps the
+/// initial batch_count regardless of how much VRAM the device has, so
+/// regression tests can drive the batched-dispatch path on inputs that
+/// would otherwise fit in a single dispatch. 0 = inactive (production).
+/// The SLZ_FORCE_BATCH env var mirrors this for command-line runs.
+pub var g_force_batch_count_for_test: u32 = 0;
+
 pub fn gpuCompressImpl(
     self: *EncodeContext,
     input: []const u8,
@@ -57,15 +64,53 @@ pub fn gpuCompressImpl(
     // long_hash + next_hash); non-chain modes use a single hash table
     // (L1 needs more than CUDA shared-mem allows, and global also dodges
     // the shared-mem-hash corruption seen at L2 sc>=0.5).
-    if (chain) {
-        const next_hash_words: usize = encode_context.NEXT_HASH_ENTRIES / 2; // u16 entries packed into u32 words
-        const table_stride = hash_size + hash_size + next_hash_words;
-        const hash_bytes = @as(usize, num_chunks) * table_stride * 4;
-        if (!encode_context.ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) return false;
-    } else {
-        const hash_bytes = @as(usize, num_chunks) * hash_size * 4;
-        if (!encode_context.ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) return false;
+    //
+    // A-023 (backported from srcVK/encode/encode_lz.zig, 2026-06-09):
+    // batched dispatch when the full per-chunk hash does not fit VRAM.
+    // At sc=0.25 a 1 GB input is 15,259 chunks; the L5 chain-parser
+    // tables then total ~18 GB — cuMemAlloc under WDDM accepts that and
+    // silently pages over PCIe, collapsing encode to ~50 MB/s. The
+    // kernel already addresses a per-chunk hash region (base = chunk_id
+    // × stride) and re-initialises it at entry, so dispatching the grid
+    // in batches over a smaller hash buffer produces BYTE-IDENTICAL
+    // output. VK discovers the cap by VMA allocation failure (strict
+    // DEVICE_LOCAL); CUDA never fails the alloc, so the cap comes from
+    // a cuMemGetInfo budget (3/4 of free VRAM — the remainder is
+    // headroom for the downstream Huffman + assemble buffers), with the
+    // VK-style ensureBuf-halving loop kept as a backstop.
+    const next_hash_words: usize = encode_context.NEXT_HASH_ENTRIES / 2; // u16 entries packed into u32 words
+    const hash_stride: usize = if (chain)
+        hash_size + hash_size + next_hash_words
+    else
+        hash_size;
+
+    var batch_count: u32 = num_chunks;
+    if (g_force_batch_count_for_test != 0 and g_force_batch_count_for_test < batch_count)
+        batch_count = g_force_batch_count_for_test;
+    if (std.c.getenv("SLZ_FORCE_BATCH")) |raw| {
+        const span = std.mem.span(raw);
+        if (std.fmt.parseInt(u32, span, 10) catch null) |forced| {
+            if (forced > 0 and forced < batch_count) batch_count = forced;
+        }
     }
+    if (cuda_ffi.cuMemGetInfo_fn) |getinfo_fn| {
+        var free_b: usize = 0;
+        var total_b: usize = 0;
+        if (getinfo_fn(&free_b, &total_b) == cuda_ffi.CUDA_SUCCESS) {
+            const budget = free_b - (free_b / 4);
+            const per_chunk_bytes = hash_stride * 4;
+            const fit_usize = @max(@as(usize, 1), budget / per_chunk_bytes);
+            const fit: u32 = @intCast(@min(fit_usize, @as(usize, num_chunks)));
+            if (fit < batch_count) batch_count = fit;
+        }
+    }
+    while (true) {
+        const hash_bytes = @as(usize, batch_count) * hash_stride * 4;
+        if (encode_context.ensureBuf(&self.d_hash_persist, &self.d_hash_size, hash_bytes)) break;
+        if (batch_count <= 1) return false;
+        batch_count = (batch_count + 1) / 2;
+    }
+    const batched_dispatch = batch_count < num_chunks;
 
     const d_input = self.d_input_persist;
     const d_output = self.d_output_persist;
@@ -84,9 +129,15 @@ pub fn gpuCompressImpl(
     } else {
         if (h2d_fn(d_input, @ptrCast(input.ptr), input.len) != cuda_ffi.CUDA_SUCCESS) return false;
     }
-    if (h2d_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes) != cuda_ffi.CUDA_SUCCESS) return false;
-    if (cuda_ffi.cuMemsetD8_fn) |memset_fn|
-        if (memset_fn(d_sizes, 0, sizes_bytes) != cuda_ffi.CUDA_SUCCESS) return false;
+    // A-023: when not batching, upload the full descs / clear the full
+    // sizes array up-front (the historical shape). When batching, the
+    // per-batch loop below uploads only the active batch's descs and
+    // clears only the active batch's sizes slots.
+    if (!batched_dispatch) {
+        if (h2d_fn(d_descs, @ptrCast(chunk_descs.ptr), desc_bytes) != cuda_ffi.CUDA_SUCCESS) return false;
+        if (cuda_ffi.cuMemsetD8_fn) |memset_fn|
+            if (memset_fn(d_sizes, 0, sizes_bytes) != cuda_ffi.CUDA_SUCCESS) return false;
+    }
     if (sync_fn() != cuda_ffi.CUDA_SUCCESS) return false;
 
     const t_before = if (io) |io_val| std.Io.Clock.awake.now(io_val) else null;
@@ -124,10 +175,53 @@ pub fn gpuCompressImpl(
     // matching end record - even on launch failure. Otherwise
     // finalizeProfiling would block on an unrecorded end event.
     defer gpu_decode.endKernelTiming(t_lz, 0);
-    if (launch_fn(module_loader.kernel_fn, num_chunks, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra) != cuda_ffi.CUDA_SUCCESS)
-        return false;
 
-    if (sync_fn() != cuda_ffi.CUDA_SUCCESS) return false;
+    // A-023: batched kernel dispatch loop. When batch_count ==
+    // num_chunks (the common case), this runs ONCE with the exact
+    // historical launch shape. When batch_count < num_chunks (the
+    // VRAM-pressure fallback), each iteration uploads the batch's descs
+    // to offset 0 of the persistent buffers — the kernel then reads
+    // them with local chunk_id = 0..bc, and its hash region index
+    // (chunk_id × stride) stays inside the smaller hash buffer. The
+    // descs carry GLOBAL src_offset / dst_offset values, so input reads
+    // and output writes land at the right absolute positions without
+    // further translation. Per-chunk results are BYTE-IDENTICAL to the
+    // unbatched dispatch because every chunk re-initialises its own
+    // hash region at kernel entry.
+    var batch_start: u32 = 0;
+    while (batch_start < num_chunks) {
+        const batch_end = @min(batch_start + batch_count, num_chunks);
+        const bc: u32 = batch_end - batch_start;
+
+        if (batched_dispatch) {
+            const batch_desc_bytes = @as(usize, bc) * @sizeOf(CompressChunkDesc);
+            if (h2d_fn(d_descs, @ptrCast(&chunk_descs[batch_start]), batch_desc_bytes) != cuda_ffi.CUDA_SUCCESS) return false;
+            if (cuda_ffi.cuMemsetD8_fn) |memset_fn|
+                if (memset_fn(d_sizes, 0, @as(usize, bc) * 4) != cuda_ffi.CUDA_SUCCESS) return false;
+            if (sync_fn() != cuda_ffi.CUDA_SUCCESS) return false;
+        }
+
+        p_total = bc;
+        if (launch_fn(module_loader.kernel_fn, bc, 1, 1, 32, 1, 1, shared_bytes, 0, &params, &extra) != cuda_ffi.CUDA_SUCCESS)
+            return false;
+        if (sync_fn() != cuda_ffi.CUDA_SUCCESS) return false;
+
+        if (batched_dispatch) {
+            // Per-batch D2H: comp_sizes land at their GLOBAL positions
+            // so downstream passes (Huffman / assemble) read them at
+            // the same index they would have in the unbatched path.
+            if (d2h_fn(@ptrCast(comp_sizes_out.ptr + batch_start), d_sizes, @as(usize, bc) * 4) != cuda_ffi.CUDA_SUCCESS) return false;
+            for (batch_start..batch_end) |i| {
+                const cs = comp_sizes_out[i];
+                if (cs > 0) {
+                    const dst_off = chunk_descs[i].dst_offset;
+                    if (d2h_fn(@ptrCast(output.ptr + dst_off), d_output + dst_off, cs) != cuda_ffi.CUDA_SUCCESS) return false;
+                }
+            }
+        }
+
+        batch_start = batch_end;
+    }
 
     if (t_before) |t_start| {
         if (io) |io_val| {
@@ -138,14 +232,33 @@ pub fn gpuCompressImpl(
         }
     }
 
-    // Download comp_sizes first, then only the actual compressed bytes per block
-    if (d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes) != cuda_ffi.CUDA_SUCCESS) return false;
+    // Unbatched path: download comp_sizes first, then only the actual
+    // compressed bytes per block (the historical post-kernel shape,
+    // kept outside the kernel-time capture above).
+    if (!batched_dispatch) {
+        if (d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes) != cuda_ffi.CUDA_SUCCESS) return false;
 
-    for (0..chunk_descs.len) |i| {
-        const cs = comp_sizes_out[i];
-        if (cs > 0) {
-            const dst_off = chunk_descs[i].dst_offset;
-            if (d2h_fn(@ptrCast(output.ptr + dst_off), d_output + dst_off, cs) != cuda_ffi.CUDA_SUCCESS) return false;
+        for (0..chunk_descs.len) |i| {
+            const cs = comp_sizes_out[i];
+            if (cs > 0) {
+                const dst_off = chunk_descs[i].dst_offset;
+                if (d2h_fn(@ptrCast(output.ptr + dst_off), d_output + dst_off, cs) != cuda_ffi.CUDA_SUCCESS) return false;
+            }
+        }
+    }
+
+    // A-023 companion: when the dispatch was batched, release the hash
+    // buffer so the downstream Huffman + assemble passes have VRAM room
+    // (~multi-GB at 1 GB inputs). It re-allocates on the next call; for
+    // unbatched dispatches the buffer stays persistent so warm encodes
+    // pay zero alloc overhead.
+    if (batched_dispatch) {
+        if (cuda_ffi.cuMemFree_fn) |free_fn| {
+            if (self.d_hash_persist != 0) {
+                _ = free_fn(self.d_hash_persist);
+                self.d_hash_persist = 0;
+                self.d_hash_size = 0;
+            }
         }
     }
 

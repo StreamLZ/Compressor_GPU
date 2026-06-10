@@ -3,14 +3,16 @@
 //! Level-to-parser-shape mappings. Drives hash-table sizing in the
 //! greedy parser and the L5 chain-parser opt-in. Pure host code.
 
-/// CUDA reference: src/encode/levels.zig:21-30. Hash-bit width per level.
-/// L1-L3 grow the hash table; L4/L5 cap at 17 to keep the chain parser's
-/// per-chunk hash in VRAM.
+/// CUDA reference: src/encode/levels.zig (updated 2026-06-09): hb=17
+/// at every level (L2 was 18, L3 was 19). At sub-chunk sizes ≤ 128 KB
+/// hash tables beyond 2^17 entries add nothing the 64 KB match window
+/// can exploit, and the larger tables blow VRAM at 1 GB × sc=0.25
+/// chunk counts. Ported in step to keep encode output byte-identical.
 pub fn hashBitsForLevel(level: u8) u32 {
     return switch (level) {
         1 => 17,
-        2 => 18,
-        3 => 19,
+        2 => 17,
+        3 => 17,
         4 => 17,
         5 => 17,
         else => unreachable,

@@ -96,11 +96,11 @@ Re-run by `tools\bench_all.bat`.
 
 | Level | enwik8 D2D / e2e | silesia D2D / e2e |
 |-------|------------------|-------------------|
-| L1 | **2.92** / 15.49 | **5.08** / 29.89 |
-| L2 | **2.93** / 15.48 | **5.08** / 29.88 |
-| L3 | **4.10** / 15.54 | **7.15** / 30.53 |
-| L4 | **3.94** / 15.30 | **6.97** / 30.30 |
-| L5 | **4.12** / 15.24 | **7.71** / 30.38 |
+| L1 | **2.85** / 15.50 | **4.95** / 29.99 |
+| L2 | **2.85** / 15.51 | **4.94** / 30.00 |
+| L3 | **4.00** / 16.08 | **6.99** / 31.56 |
+| L4 | **3.87** / 15.84 | **6.86** / 31.38 |
+| L5 | **4.07** / 15.84 | **7.46** / 31.41 |
 
 D2D wall-clock = the time a device-resident caller of
 `slzDecompressAsync` sees on the wire. End-to-end adds the host-to-
@@ -113,7 +113,7 @@ the decompressed output for the host-bounce path.
 |-------|-------:|--------:|
 | L1 | 58.6% | 47.8% |
 | L2 | 58.6% | 47.8% |
-| L3 | 43.7% | 38.0% |
+| L3 | 43.7% | 38.1% |
 | L4 | 42.7% | 37.5% |
 | L5 | 39.6% | 33.9% |
 
@@ -137,6 +137,29 @@ See [docs/GPU_README.md](docs/GPU_README.md) "vs nvCOMP" for the
 methodology behind each measurement window — the pipeline / async /
 end-to-end columns answer different questions and confusing them is
 easy.
+
+### vs nvCOMP (enwik9 1 GB, RTX 4060 Ti, 2026-06-09)
+
+At 1 GB scale StreamLZ wins ratio AND decode speed simultaneously at
+both ends of the level range (decode kernel = cuEvent best-of-30 for
+StreamLZ, best-of-20 for nvCOMP; e2e = host wall incl. PCIe both ways):
+
+| | StreamLZ L1 | nvCOMP LZ4 | margin |
+|--------|------------:|-----------:|-------:|
+| Ratio | **52.6%** | 53.6% | 10 MB smaller |
+| Decode kernel | **24.3 ms** (39.3 GB/s) | 33.0 ms (30.3 GB/s) | 1.36× |
+| Decode e2e | **149.3 ms** | 162.0 ms | 1.09× |
+
+| | StreamLZ L5 | nvCOMP Zstd | margin |
+|--------|------------:|------------:|-------:|
+| Ratio | **35.50%** | 35.75% | 2.5 MB smaller |
+| Decode kernel | **34.2 ms** (27.9 GB/s) | 50.8 ms (19.7 GB/s) | 1.49× |
+| Decode e2e | **151.5 ms** | 164.4 ms | 1.09× |
+
+These numbers use the 2026-06-09 defaults: `sc_group_size = 0.25` at
+every input size (64 KB sub-chunks — more decode warps, shorter
+per-warp serial chains) and `hash_bits = 17` at every level. Pass
+`--sc 0.5` for ~2 pp better ratio at ~1.8× slower 1 GB-scale decode.
 
 ---
 

@@ -628,17 +628,45 @@ __device__ __forceinline__ uint32_t decodeStreamBoundedIL(
 // Name retained (slzHuffDecode4StreamKernel) for ABI compatibility with
 // the existing Zig dispatch — it now decodes HUFF_NUM_STREAMS streams
 // in the BIL format, not literally 4 streams concatenated.
+// A-024 fix: tok_region_off and off16_region_off are passed in as uint64_t
+// here instead of being added to desc.out_offset by slzMergeHuffDescsKernel.
+// The merge kernel used uint32_t for those region offsets, which overflowed
+// at ~6553 sub-chunks (off16 region offset ≈ 4 GB) and silently truncated
+// the output address, corrupting earlier slots in entropy_scratch. The
+// region offsets are now applied here with explicit uint64_t arithmetic.
+// d_compact_counts is the 6-u32 array [n_lit, n_tok, n_hi, n_lo, n_raw,
+// n_merged]; each block reads n_lit, n_tok, n_hi to decide which region
+// its block_id falls in (the merged descriptor array is laid out
+// lit | tok | hi | lo contiguously by slzMergeHuffDescsKernel).
 extern "C" __launch_bounds__(32, 8) __global__
 void slzHuffDecode4StreamKernel(
     const uint8_t* __restrict__ comp,
     const HuffDecChunkDesc* __restrict__ descs,
     const uint32_t* __restrict__ luts,
     uint8_t* __restrict__ output,
-    const uint32_t* __restrict__ d_n_blocks)
+    const uint32_t* __restrict__ d_n_blocks,
+    const uint32_t* __restrict__ d_compact_counts,
+    uint64_t tok_region_off,
+    uint64_t off16_region_off)
 {
     const uint32_t block_id = blockIdx.x;
     if (block_id >= *d_n_blocks) return;
     const int lane = threadIdx.x & (WARP_SIZE - 1);
+
+    // Pick this block's region offset from its merged-array position.
+    const uint32_t n_lit = d_compact_counts[0];
+    const uint32_t n_tok = d_compact_counts[1];
+    const uint32_t n_hi  = d_compact_counts[2];
+    uint64_t region_off;
+    if (block_id < n_lit) {
+        region_off = 0;
+    } else if (block_id < n_lit + n_tok) {
+        region_off = tok_region_off;
+    } else if (block_id < n_lit + n_tok + n_hi) {
+        region_off = off16_region_off;
+    } else {
+        region_off = off16_region_off;
+    }
 
     const HuffDecChunkDesc desc = descs[block_id];
 
@@ -689,7 +717,7 @@ void slzHuffDecode4StreamKernel(
     uint32_t my_out_size  = (lane < HUFF_NUM_STREAMS - 1)
                           ? q
                           : (desc.out_size - (HUFF_NUM_STREAMS - 1) * q);
-    uint8_t* my_out = output + desc.out_offset + my_out_start;
+    uint8_t* my_out = output + region_off + (uint64_t)desc.out_offset + (uint64_t)my_out_start;
 
     (void)decodeStreamBoundedIL(
         il_base, my_tail_start, lane, K, my_n_words,

@@ -149,21 +149,17 @@ const sm_count_fallback: usize = 34;
 /// the frame-assemble kernel accepts in a single grid.
 const assembly_chunk_cap: usize = 16384;
 
-/// CUDA reference: src/encode/fast_framed.zig:66-74. Pick the
-/// sc_group_size to advertise in the frame header. Honors a caller
-/// override; otherwise picks 0.25 below the GPU saturation threshold
-/// and 0.5 at or above it.
+/// CUDA reference: src/encode/fast_framed.zig::resolveScGroupSize
+/// (updated 2026-06-09). Pick the sc_group_size to advertise in the
+/// frame header. Honors a caller override; otherwise always 0.25.
+/// The previous saturation-threshold switch to 0.5 doubled every
+/// decode warp's serial chain at 1 GB scale for a measured 1.8×
+/// decode-time cost; sc=0.25 is the configuration that beats nvCOMP
+/// LZ4/Zstd on both ratio and decode speed. Ported in step.
 fn resolveScGroupSize(src_len: usize, override: ?f32) f32 {
+    _ = src_len;
     if (override) |ov| return ov;
-    // VK adaptation: vk_api.sm_count is 0 until a future
-    // VkPhysicalDeviceProperties query populates it; the fallback path
-    // preserves CUDA's behavior when the driver did not report SM count.
-    const sm_count: usize = if (vk_api.sm_count > 0)
-        @intCast(vk_api.sm_count)
-    else
-        sm_count_fallback;
-    const saturation_bytes = sm_count * decoder_warps_per_sm * sc05_bytes_per_warp;
-    return if (src_len >= saturation_bytes) 0.5 else 0.25;
+    return 0.25;
 }
 
 /// CUDA reference: src/encode/fast_framed.zig:80-89. Map the unified

@@ -663,25 +663,45 @@ pub fn runHuffBuildAndDecode(
         // uint8_t stores so the byte path costs ~4× the memory traffic.
         // See srcVK/decode/huff_decode_4stream_kernel.comp:79-93.
         var p_out_u32: u64 = self.d_entropy_scratch;
+        // A-024: binding 6 = d_compact_counts. The kernel uses n_lit /
+        // n_lit+n_tok as boundaries to pick which region a block_id
+        // belongs to, and adds the matching region offset (passed below
+        // as a push constant) instead of trusting the u32 fold the
+        // merge kernel used to do (which silently truncated at ~6553
+        // sub-chunks).
+        var p_counts: u64 = self.d_compact_counts;
+        // A-024: BOUND-based region offsets (must match the entropy_scratch
+        // layout above — `total_subchunks × ENTROPY_SCRATCH_SLOT_BYTES`
+        // stride for tok, `2 ×` for off16). Cast to u32 here; for inputs
+        // where BOUND × ENTROPY_SCRATCH_SLOT_BYTES × 2 already overflows
+        // u32 (≈ inputs > 8192 sub-chunks at the bound, ≈ > 1 GB at
+        // sc=0.5 L3), this trims silently. Proper fix is shaderInt64 or
+        // BDA, both deferred.
+        var p_tok_off: u32 = @intCast(self.last_tok_offset);
+        var p_off16_off: u32 = @intCast(self.last_off16_offset);
         // VK adaptation: params[] layout per module_loader KERNEL_DECLS
         // contract (see above). huff_decode_4stream_kernel.comp:
-        // n_bindings=6 (CompBuf, DescsBuf, LutsBuf, OutputBuf,
-        // NBlocksBuf, OutputBufU32), push_constant_size=0. The shared-
-        // memory allocation CUDA passes as the 8th launch arg
-        // (LUT_ENTRIES * 4 = 4096 bytes) is replaced by the static
-        // `shared uint shared_lut[LUT_SIZE]` declared inside the .comp
-        // — Vulkan has no dynamic shared-mem at compute-shader scope
-        // so the size is fixed at compile time and the launch passes 0
-        // for the shared-bytes arg.
+        // n_bindings=7 (CompBuf, DescsBuf, LutsBuf, OutputBuf,
+        // NBlocksBuf, OutputBufU32, CompactCountsBuf), push_constant_size=8
+        // (2 × u32 region offsets). The shared-memory allocation CUDA
+        // passes as the 8th launch arg (LUT_ENTRIES * 4 = 4096 bytes)
+        // is replaced by the static `shared uint shared_lut[LUT_SIZE]`
+        // declared inside the .comp — Vulkan has no dynamic shared-mem
+        // at compute-shader scope so the size is fixed at compile time
+        // and the launch passes 0 for the shared-bytes arg.
         var params = [_]?*anyopaque{
             @ptrCast(&p_comp),   @ptrCast(&p_descs),
             @ptrCast(&p_lut),    @ptrCast(&p_out),
             @ptrCast(&p_n),      @ptrCast(&p_out_u32),
+            @ptrCast(&p_counts),
+            @ptrCast(&p_tok_off), @ptrCast(&p_off16_off),
         };
         var extra = [_]?*anyopaque{null};
         const t_hd = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffDecode4StreamKernel", huff_stream);
         // Iter 4c: binding 4 (NBlocksBuf) is d_compact_counts slot 5.
-        const hd_offs = [_]u64{ 0, 0, 0, 0, N_MERGED_SLOT_OFF, 0 };
+        // A-024: binding 6 (CompactCountsBuf) binds d_compact_counts
+        // at offset 0.
+        const hd_offs = [_]u64{ 0, 0, 0, 0, N_MERGED_SLOT_OFF, 0, 0 };
         try vkCall(launch_fn(module_loader.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra, &hd_offs), .launch);
         endKernelTiming(t_hd, huff_stream);
     }
@@ -952,6 +972,10 @@ pub fn uploadInputAndPrefixSum(
     // the sub-region via procLaunchKernel.binding_offsets.
     self.d_entropy_off16_scratch = self.d_entropy_scratch;
     self.d_entropy_off16_offset = off16_offset;
+    // A-024: stash region offsets for the Huff decode kernel push
+    // constants. BOUND-based to match the entropy_scratch layout above.
+    self.last_tok_offset = @intCast(tok_offset);
+    self.last_off16_offset = @intCast(off16_offset);
 
     // Always pass the device prefix-sum to the LZ kernel. When
     // `sub_chunk_cap >= chunk_size` the prefix sum is `[0, 1, 2, ...]`

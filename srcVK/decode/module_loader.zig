@@ -1885,7 +1885,13 @@ const KERNEL_DECLS = [_]KernelDecl{
     .{ .kind = .merge_huff_descs_fn, .n_bindings = 10, .push_constant_size = 8 },
     .{ .kind = .huff_build_fn, .n_bindings = 4, .push_constant_size = 0, .pin_subgroup_32 = true },
     // huff_decode binding 5 is a u32 alias of binding 3 (OutputBuf) — see kernel comment.
-    .{ .kind = .huff_decode_fn, .n_bindings = 6, .push_constant_size = 0, .pin_subgroup_32 = true },
+    // A-024: binding 6 (d_compact_counts) added so the kernel can pick
+    // which region (lit | tok | off16) each block_id falls in. The
+    // 2 × u32 push constants carry tok_region_off and off16_region_off
+    // (BOUND-based, matching the host's entropy_scratch layout) — the
+    // merge kernel no longer folds them into desc.out_offset since that
+    // u32 add truncated at ~6553 sub-chunks.
+    .{ .kind = .huff_decode_fn, .n_bindings = 7, .push_constant_size = 8, .pin_subgroup_32 = true },
 };
 
 var g_kernel_metas: [KERNEL_DECLS.len]KernelMeta = @splat(.{});

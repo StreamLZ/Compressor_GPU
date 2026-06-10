@@ -78,14 +78,23 @@ extern "C" {
 
 /* ---- Status codes --------------------------------------------------- */
 typedef enum slzStatus_t {
-    SLZ_SUCCESS                = 0,
-    SLZ_ERROR_INVALID_HANDLE   = 1,  /* handle is NULL or not from slzCreate */
-    SLZ_ERROR_INVALID_ARG      = 2,  /* a NULL/zero argument that must not be */
-    SLZ_ERROR_BUFFER_TOO_SMALL = 3,  /* output or temp capacity insufficient */
-    SLZ_ERROR_CORRUPT_FRAME    = 4,  /* decompress input is not a valid frame */
-    SLZ_ERROR_UNSUPPORTED      = 5,  /* level / option not supported */
-    SLZ_ERROR_CUDA             = 6,  /* an underlying CUDA call failed */
-    SLZ_ERROR_OUT_OF_MEMORY    = 7,  /* a library-internal allocation failed */
+    SLZ_SUCCESS                   = 0,
+    SLZ_ERROR_INVALID_HANDLE      = 1,  /* handle is NULL or not from slzCreate */
+    SLZ_ERROR_INVALID_ARG         = 2,  /* a NULL/zero argument that must not be */
+    SLZ_ERROR_BUFFER_TOO_SMALL    = 3,  /* output or temp capacity insufficient */
+    SLZ_ERROR_CORRUPT_FRAME       = 4,  /* decompress input is not a valid frame */
+    SLZ_ERROR_UNSUPPORTED         = 5,  /* level / option not supported */
+    SLZ_ERROR_CUDA                = 6,  /* an underlying CUDA call failed */
+    SLZ_ERROR_OUT_OF_MEMORY       = 7,  /* a library-internal allocation failed */
+    /* Reserved for the Vulkan backend (shared ABI so both backends speak
+     * the same status vocabulary). The CUDA backend never returns either
+     * of these today; the slot reservation prevents future Vulkan
+     * additions from re-numbering. */
+    SLZ_ERROR_DEVICE_LOST         = 8,  /* VK_ERROR_DEVICE_LOST — terminal,
+                                         * VkDevice must be rebuilt */
+    SLZ_ERROR_VK_FEATURE_MISSING  = 9,  /* required Vulkan feature/extension
+                                         * not present (subgroup_size_control,
+                                         * BDA, shaderInt64, ...) — init-time */
 } slzStatus_t;
 
 /* Human-readable text for a status code. Never NULL; the returned string
@@ -111,10 +120,18 @@ slzStatus_t slzDestroy(slzHandle_t handle);
 
 /* ---- Compression options -------------------------------------------- */
 typedef struct slzCompressOpts_t {
-    int level;             /* 1..5 — higher = smaller output, slower encode */
-    int enable_profiling;  /* 1 = capture per-kernel timings (see
-                            * slzGetLastTimings); 0 = off. */
-    int reserved[6];       /* must be zero — reserved for future options */
+    int level;                /* 1..5 — higher = smaller output, slower encode */
+    int enable_profiling;     /* 1 = capture per-kernel timings (see
+                               * slzGetLastTimings); 0 = off. */
+    int effective_level_out;  /* OUT: post-clamp level the backend actually
+                               * used. CUDA writes opts.level (no-op — the
+                               * CUDA backend never clamps). The Vulkan
+                               * Tier-2 backend writes the post-clamp level
+                               * when mobile-VRAM pressure forces L5->L3.
+                               * Callers MUST read this back after the
+                               * call and compare goldens against the
+                               * clamped level, not the requested level. */
+    int reserved[5];          /* must be zero — reserved for future options */
 } slzCompressOpts_t;
 
 /* Default options (level 5, profiling off). */
@@ -133,11 +150,48 @@ slzDecompressOpts_t slzDecompressDefaultOpts(void);
 /* Returned by slzGetLastTimings when enable_profiling was set on the
  * most recent compress/decompress call. `name` is a static null-terminated
  * string valid for the library's lifetime; `ms` is wall-clock kernel time
- * measured with cudaEvent_t. */
+ * measured with cudaEvent_t.
+ *
+ * --- Pseudo-kernel timing slots -------------------------------------
+ * Two reserved `name` values are NOT real kernel timings — they carry
+ * an out-of-band byte count in the `ms` field as a `uint32_t`
+ * reinterpret-cast of the float bits:
+ *
+ *   "__compressed_size__"   — actual encoded byte count (matches what
+ *                              the caller would have read from
+ *                              `compressed_size` in pre-3.0). Emitted
+ *                              by slzCompressAsync after the assemble-
+ *                              measure kernel drains.
+ *   "__decompressed_size__" — actual decoded byte count. Emitted by
+ *                              slzDecompressAsync for parity.
+ *
+ * Decoded as:
+ *   uint32_t size_bytes;
+ *   memcpy(&size_bytes, &kt.ms, sizeof(size_bytes));
+ *
+ * Both slots are present iff `enable_profiling` was set on the call;
+ * they are skipped on profiling-off runs because the size is delivered
+ * elsewhere (caller-known output_size for decompress; the caller still
+ * has the worst-case `max_compressed_size` for compress and may bounce
+ * the actual frame length out of `compressed_size_out` when that
+ * parameter survives v1.0 deprecation).
+ *
+ * Struct size is locked at 2 * sizeof(void*) = 16 B on LP64/LLP64; the
+ * pseudo-kernel scheme deliberately reuses the existing `ms` slot
+ * (float-bits aliased to uint32) so the array element layout does not
+ * change. Adding a union for the size would have widened the struct
+ * and broken every C caller that walks the array on stride. */
 typedef struct slzKernelTiming_t {
     const char* name;
     float ms;
 } slzKernelTiming_t;
+
+/* Reserved pseudo-kernel name constants. Compare via string equality;
+ * the library guarantees the same static pointer is used for every
+ * timing entry, so `kt.name == SLZ_PSEUDO_KERNEL_COMPRESSED_SIZE`
+ * pointer-compare is valid as well. */
+#define SLZ_PSEUDO_KERNEL_COMPRESSED_SIZE   "__compressed_size__"
+#define SLZ_PSEUDO_KERNEL_DECOMPRESSED_SIZE "__decompressed_size__"
 
 /* Retrieve the per-kernel timings captured during the most recent
  * compress/decompress call on this handle. `timings` may be NULL to query
@@ -228,12 +282,24 @@ slzStatus_t slzDecompressAsync(slzHandle_t handle,
  *   d_output        device output buffer, must be >= max_compressed_size
  *                   (use slzCompressBound to size this)
  *   max_compressed  capacity of d_output
- *   compressed_size HOST pointer; the library writes the actual
- *                   compressed frame length here. Valid as soon as
- *                   slzCompressAsync returns — the size is computed
- *                   host-side during the compress pipeline's setup
- *                   phase and does not depend on the GPU work queued
- *                   on `stream`.
+ *   compressed_size HOST pointer. RETAINED for ABI compatibility but
+ *                   the contract has changed in 3.0.0: this parameter
+ *                   is NOT written by slzCompressAsync. The actual
+ *                   encoded byte count is produced by the on-GPU
+ *                   slzAssembleMeasure kernel after the async
+ *                   submission completes; reading `*compressed_size`
+ *                   on return yields whatever value the caller pre-
+ *                   stored (typically zero). To retrieve the real
+ *                   size, set `opts.enable_profiling = 1` and, after
+ *                   syncing the user stream, call slzGetLastTimings
+ *                   (or slzWaitAndGetLastTimings); look up the
+ *                   pseudo-kernel entry whose `name` equals
+ *                   SLZ_PSEUDO_KERNEL_COMPRESSED_SIZE and reinterpret
+ *                   its `ms` field as `uint32_t` for the byte count.
+ *                   Migration: existing 2.x callers must move to the
+ *                   drain path. The synchronous slzCompressHost
+ *                   wrapper continues to write `output_size`
+ *                   normally — it does the stream sync internally.
  *   stream          caller's CUstream (void*); NULL = default stream
  *
  * Queue all GPU compress work on `stream`, then return.

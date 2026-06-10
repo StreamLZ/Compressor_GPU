@@ -69,6 +69,7 @@ pub fn init() bool {
     cuda_ffi.cuLaunchKernel_fn = cuda_ffi.getProc(cuda_ffi.FnLaunchKernel, "cuLaunchKernel");
     cuda_ffi.cuCtxSynchronize_fn = cuda_ffi.getProc(cuda_ffi.FnCtxSync, "cuCtxSynchronize");
     cuda_ffi.cuMemsetD8_fn = cuda_ffi.getProc(cuda_ffi.FnMemsetD8, "cuMemsetD8_v2");
+    cuda_ffi.cuMemGetInfo_fn = cuda_ffi.getProc(cuda_ffi.FnMemGetInfo, "cuMemGetInfo_v2");
 
     const ptx = nullTerminatedPtx("lz_kernel.ptx");
     if ((cuda_ffi.cuModuleLoadData_fn orelse return false)(&module, ptx.ptr) != cuda_ffi.CUDA_SUCCESS) return false;

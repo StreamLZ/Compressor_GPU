@@ -50,6 +50,7 @@ pub const FnMemcpyDtoDAsync = *const fn (CUdeviceptr, CUdeviceptr, usize, usize)
 pub const FnLaunchKernel = *const fn (CUfunction, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, usize, [*]?*anyopaque, [*]?*anyopaque) callconv(.c) CUresult;
 pub const FnCtxSync = *const fn () callconv(.c) CUresult;
 pub const FnMemsetD8 = *const fn (CUdeviceptr, u8, usize) callconv(.c) CUresult;
+pub const FnMemGetInfo = *const fn (*usize, *usize) callconv(.c) CUresult;
 
 pub var cuModuleLoadData_fn: ?FnModuleLoadData = null;
 pub var cuModuleGetFunction_fn: ?FnModuleGetFunction = null;
@@ -61,6 +62,10 @@ pub var cuMemcpyDtoDAsync_fn: ?FnMemcpyDtoDAsync = null;
 pub var cuLaunchKernel_fn: ?FnLaunchKernel = null;
 pub var cuCtxSynchronize_fn: ?FnCtxSync = null;
 pub var cuMemsetD8_fn: ?FnMemsetD8 = null;
+/// A-023 backport: free/total VRAM query for the batched-dispatch
+/// budget. Optional — when missing, the encode dispatch runs unbatched
+/// (pre-A-023 behavior, WDDM paging risk at 1 GB chain-parser scale).
+pub var cuMemGetInfo_fn: ?FnMemGetInfo = null;
 
 /// Resolve a single exported function from the already-loaded nvcuda
 /// handle. Returns null if either the handle or the symbol is missing -
