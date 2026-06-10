@@ -16,4 +16,5 @@ test {
     _ = @import("encode/fast_framed.zig");
     _ = @import("encode/gpu_roundtrip_tests.zig");
     _ = @import("encode/gpu_regression_tests.zig");
+    _ = @import("encode/huff_conformance_tests.zig");
 }

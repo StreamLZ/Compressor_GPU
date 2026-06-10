@@ -26,6 +26,9 @@ fn workerFn() void {
         } else |err| {
             if (err == error.SkipZigTest) {
                 _ = global_skip.fetchAdd(1, .monotonic);
+                // Always name skipped tests — the 2026-06 init-race
+                // episode hid 4 GPU tests behind silent skips for weeks.
+                std.debug.print("SKIP: {s}\n", .{test_fn.name});
             } else {
                 _ = global_fail.fetchAdd(1, .monotonic);
                 std.debug.print("FAIL: {s} ({s})\n", .{ test_fn.name, @errorName(err) });
