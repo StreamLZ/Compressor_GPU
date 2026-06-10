@@ -376,3 +376,40 @@ idea worth re-evaluating once the basic selector ships.
 - **C ABI default-level mismatch** (Zig Options.level=1 vs C header 5)
   — documented as intentional; revisit only if the L2-alias decision
   (#6) changes level semantics anyway.
+
+## 13. Fuzzing the decoder (and differential CUDA-vs-VK fuzz)
+
+Not VK parity debt (neither backend has fuzzing) — new work. The
+exposure is real and GPU-specific: `slzWalkFrameKernel` parses
+untrusted frame bytes ON DEVICE, so a malformed frame doesn't segfault
+like a CPU parser — it OOB-reads/writes silently in VRAM or spins a
+kernel into the 2 s WDDM TDR watchdog (= driver-level device reset, a
+DoS primitive if frames ever arrive from untrusted sources).
+
+Classic coverage-guided fuzzing doesn't transplant: GPU launch
+overhead caps exec rate at ~100-1000/s, there is no SanitizerCoverage
+for PTX (fuzzer is blind inside kernels), OOB needs compute-sanitizer
+(10-100x slowdown) to be visible at all, and a TDR kills the CUDA
+context so the harness must treat device-reset as a finding and
+re-init.
+
+Three tiers, cheapest first:
+1. **Mutation fuzz (decoder rejects gracefully)**: mutate the golden
+   .slz frames — structure-aware (walk header fields, chunk sizes,
+   sub-chunk counts) plus random flips/truncation — and assert clean
+   rejection: correct error code, no hang, no TDR, no sanitizer
+   findings (run a sampled subset under tools/sanitize.bat).
+2. **Roundtrip property fuzz (encoder)**: randomized structured inputs
+   × random level/sc, byte-identity assert. The D-wave L5 hardening
+   cases are hand-picked instances of this; fuzzing generalizes them.
+3. **Differential CUDA-vs-VK fuzz** (the standout): feed both backends
+   the same mutated frame, diff accept/reject decision AND output
+   bytes. Two independent implementations of one format = a free
+   oracle; any divergence is a bug in one of them. This is the
+   project's "runtime oracle" principle applied systematically.
+
+Prereq: audit what the walk kernel currently validates (status field
+coverage, WALK_MAX_CHUNKS, size cross-checks) so tier 1 starts from a
+documented contract of what "graceful rejection" means per corruption
+class. Effort: tier 1 ~a day; tier 3 ~a day on top (mostly harness
+plumbing — both CLIs already exist).
