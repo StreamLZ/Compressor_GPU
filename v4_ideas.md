@@ -160,14 +160,13 @@ The VK port accumulated 158 tests vs CUDA's 22; nothing flowed back
   contexts — now serialized behind `lockGpuTests()`. ptest went
   19 pass/4 skip → **25 pass/0 skip/0 fail**.
 
-**Remaining backlog** (in priority order):
-- Huffman kernel conformance (CUDA entropy kernels have zero isolated
-  tests; CPU oracle exists in tools/huff_test/huff_ref.c; the VK
-  version empirically catches bitbufRefill-class bugs). ~A day.
-- C ABI tests: `slzCompressAsync`/D2D on CUDA currently has NO test
-  (the old ABI tests were src_vulkan's). Medium.
-- Host-unit mirrors of srcVK decoder_unit/encoder_unit where the
-  logic is shared. Low.
+**Remaining backlog**: superseded by the comprehensive audit in
+`/BACKPORTS.md` (2026-06-10) — the full VK→CUDA parity-debt ledger
+covering performance (A-017 compact-huff fusion mirror), tooling
+(device-name print, per-kernel `-db` timings, encode phase profiler,
+compute-sanitizer practice), the rest of the test suite (huff
+conformance, C ABI, cli_smoke, L5 hardening, host-unit mirrors), and
+the explicitly-evaluated not-applicable items.
 
 ## 8. v4 wire format: self-describing tokens (remove the serial parse)
 
