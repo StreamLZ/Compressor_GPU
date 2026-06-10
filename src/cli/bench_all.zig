@@ -6,6 +6,7 @@ const util = @import("util.zig");
 const encoder = @import("../encode/streamlz_encoder.zig");
 const decoder = @import("../decode/streamlz_decoder.zig");
 const gpu_enc_driver = @import("../encode/driver.zig");
+const gpu_dec_driver = @import("../decode/driver.zig");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: util.Args) !void {
     const in_path = util.requireInput(args, w);
@@ -16,6 +17,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     defer allocator.free(src);
 
     const mb: f64 = @as(f64, @floatFromInt(src.len)) / (1024.0 * 1024.0);
+    if (gpu_dec_driver.isAvailable())
+        try w.print("Device: {s}\n", .{gpu_dec_driver.deviceName()});
     try w.print("streamlz bench-all: {s} ({d} bytes, {d} decompress runs)\n", .{
         in_path, src.len, runs,
     });

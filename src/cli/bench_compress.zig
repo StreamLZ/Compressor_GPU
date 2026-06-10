@@ -25,6 +25,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     defer allocator.free(decompressed);
 
     const mb: f64 = @as(f64, @floatFromInt(src.len)) / (1024.0 * 1024.0);
+    if (gpu_dec_driver.isAvailable())
+        try w.print("Device: {s}\n", .{gpu_dec_driver.deviceName()});
     try w.print("Input: {s} ({d} bytes, {d:.2} MB)\n", .{ in_path, src.len, mb });
 
     const comp_opts: encoder.Options = .{

@@ -136,7 +136,7 @@ pub fn gpuScanChunks(
     total_subchunks: u32,
 ) ?descriptors.ScanResult {
     if (module_loader.scan_parse_fn == 0) return null;
-    if (module_loader.compact_huff_descs_fn == 0 or module_loader.compact_raw_descs_fn == 0) return null;
+    if (module_loader.compact_all_descs_fn == 0) return null;
     const n: u32 = @intCast(chunk_descs.len);
     if (n == 0 or total_subchunks == 0) return null;
 
@@ -211,47 +211,40 @@ pub fn gpuScanChunks(
         ensureDeviceBuf(&self.d_compact_counts, &self.d_compact_counts_size, 6 * 4) catch return null;
         if (memset(self.d_compact_counts, 0, 6 * 4) != CUDA_SUCCESS) return null;
 
-        const huff_streams = [_]struct { staged_off: usize, dst: u64, n_off: u32 }{
-            .{ .staged_off = 0,                  .dst = self.d_compact_lit, .n_off = 0 },
-            .{ .staged_off = huff_arr_bytes,     .dst = self.d_compact_tok, .n_off = 4 },
-            .{ .staged_off = huff_arr_bytes * 2, .dst = self.d_compact_hi,  .n_off = 8 },
-            .{ .staged_off = huff_arr_bytes * 3, .dst = self.d_compact_lo,  .n_off = 12 },
-        };
-        const compact_names = [_][*:0]const u8{
-            "slzCompactHuffDescsKernel (lit)",
-            "slzCompactHuffDescsKernel (tok)",
-            "slzCompactHuffDescsKernel (hi)",
-            "slzCompactHuffDescsKernel (lo)",
-        };
-        for (huff_streams, 0..) |hs, ci| {
-            var k_staged: u64 = base + hs.staged_off;
-            var k_total: u64 = self.d_total_subchunks_buf;
-            var k_dst: u64 = hs.dst;
-            var k_count: u64 = self.d_compact_counts + hs.n_off;
+        // A-017 backport (2026-06-10): ONE fused launch with five
+        // single-thread blocks replaces the former 4 × huff-compact +
+        // 1 × raw-compact sequential launches. Same serial scans, but
+        // they run concurrently on five SMs — wall cost drops from the
+        // SUM of the five (~0.40 ms at enwik8-L5 scale) to ~the max of
+        // one (~0.08 ms). Counts land at the same d_compact_counts
+        // slots [0..4] the unfused path used.
+        {
+            var cf_lit: u64 = base;
+            var cf_tok: u64 = base + huff_arr_bytes;
+            var cf_hi: u64 = base + huff_arr_bytes * 2;
+            var cf_lo: u64 = base + huff_arr_bytes * 3;
+            var cf_raw_hi: u64 = base + huff_arr_bytes * 4;
+            var cf_raw_lo: u64 = base + huff_arr_bytes * 4 + raw_arr_bytes;
+            var cf_total: u64 = self.d_total_subchunks_buf;
+            var cf_out_lit: u64 = self.d_compact_lit;
+            var cf_out_tok: u64 = self.d_compact_tok;
+            var cf_out_hi: u64 = self.d_compact_hi;
+            var cf_out_lo: u64 = self.d_compact_lo;
+            var cf_out_raw: u64 = self.d_compact_raw;
+            var cf_counts: u64 = self.d_compact_counts;
             var c_params = [_]?*anyopaque{
-                @ptrCast(&k_staged), @ptrCast(&k_total),
-                @ptrCast(&k_dst), @ptrCast(&k_count),
+                @ptrCast(&cf_lit),     @ptrCast(&cf_tok),
+                @ptrCast(&cf_hi),      @ptrCast(&cf_lo),
+                @ptrCast(&cf_raw_hi),  @ptrCast(&cf_raw_lo),
+                @ptrCast(&cf_total),
+                @ptrCast(&cf_out_lit), @ptrCast(&cf_out_tok),
+                @ptrCast(&cf_out_hi),  @ptrCast(&cf_out_lo),
+                @ptrCast(&cf_out_raw), @ptrCast(&cf_counts),
             };
             var c_extra = [_]?*anyopaque{null};
-            const t_ch = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, compact_names[ci], stream);
-            if (launch(module_loader.compact_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &c_params, &c_extra) != CUDA_SUCCESS) return null;
+            const t_ch = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzCompactAllDescsKernel (fused x5)", stream);
+            if (launch(module_loader.compact_all_descs_fn, 5, 1, 1, 1, 1, 1, 0, stream, &c_params, &c_extra) != CUDA_SUCCESS) return null;
             decode_context.endKernelTiming(t_ch, stream);
-        }
-        // Raw compact.
-        {
-            var cr_hi: u64 = base + huff_arr_bytes * 4;
-            var cr_lo: u64 = base + huff_arr_bytes * 4 + raw_arr_bytes;
-            var cr_total: u64 = self.d_total_subchunks_buf;
-            var cr_dst: u64 = self.d_compact_raw;
-            var cr_count: u64 = self.d_compact_counts + 16;
-            var cr_params = [_]?*anyopaque{
-                @ptrCast(&cr_hi), @ptrCast(&cr_lo), @ptrCast(&cr_total),
-                @ptrCast(&cr_dst), @ptrCast(&cr_count),
-            };
-            var cr_extra = [_]?*anyopaque{null};
-            const t_cr = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzCompactRawDescsKernel", stream);
-            if (launch(module_loader.compact_raw_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &cr_params, &cr_extra) != CUDA_SUCCESS) return null;
-            decode_context.endKernelTiming(t_cr, stream);
         }
         if (module_loader.merge_huff_descs_fn == 0) return null;
     }

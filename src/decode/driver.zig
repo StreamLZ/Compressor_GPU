@@ -36,6 +36,12 @@ pub const qpcMs = cuda.qpcMs;
 pub const init = module_loader.init;
 pub const isAvailable = module_loader.isAvailable;
 
+/// Name of the active CUDA device (VK-parity: print next to every
+/// benchmark). Empty slice until init() has run successfully.
+pub fn deviceName() []const u8 {
+    return cuda.device_name_buf[0..cuda.device_name_len];
+}
+
 // ── Descriptor / error types ──────────────────────────────────
 pub const ChunkDesc = descriptors.ChunkDesc;
 pub const KernelTiming = descriptors.KernelTiming;

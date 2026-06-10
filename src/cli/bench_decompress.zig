@@ -46,11 +46,25 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     var dec_ctx = decoder.DecompressContext.initWithIo(allocator, io);
     defer dec_ctx.deinit();
 
+    // Per-kernel timing table (VK-parity with SLZ_VK_PROFILE_DECODE):
+    // cuEvent begin/end pairs already wrap every launch; this just
+    // turns them on and prints the table after the runs.
+    const profile_kernels = std.c.getenv("SLZ_PROFILE_DECODE") != null;
+    if (profile_kernels) gpu_dec_driver.g_default.enable_profiling = true;
+
     _ = dec_ctx.decompress(src, dst) catch |err| {
         try w.print("error: decompression failed: {s}\n", .{@errorName(err)});
         try w.flush();
         std.process.exit(1);
     };
+
+    if (gpu_dec_driver.isAvailable())
+        try w.print("Device: {s}\n", .{gpu_dec_driver.deviceName()});
+
+    // Best-of-runs per kernel name, folded across the bench loop.
+    const KernAgg = struct { name: [*:0]const u8, best_ms: f32, hits: u32 };
+    var kern_aggs: [24]KernAgg = undefined;
+    var kern_agg_count: usize = 0;
 
     var best_ns: u64 = std.math.maxInt(u64);
     var total_ns: u64 = 0;
@@ -79,6 +93,27 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
         if (gpu_dec_driver.last_huff_kernel_ns > 0) {
             if (gpu_dec_driver.last_huff_kernel_ns < best_huff_ns) best_huff_ns = gpu_dec_driver.last_huff_kernel_ns;
             total_huff_ns += gpu_dec_driver.last_huff_kernel_ns;
+        }
+        if (profile_kernels) {
+            // Fold this run's per-kernel timings into the best-of table.
+            // Names are static string literals at the launch sites, but
+            // compare by content so duplicate labels merge regardless.
+            for (gpu_dec_driver.g_default.last_timings.items) |t| {
+                const t_name = std.mem.span(t.name);
+                var found = false;
+                for (kern_aggs[0..kern_agg_count]) |*a| {
+                    if (std.mem.eql(u8, std.mem.span(a.name), t_name)) {
+                        if (t.ms < a.best_ms) a.best_ms = t.ms;
+                        a.hits += 1;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found and kern_agg_count < kern_aggs.len) {
+                    kern_aggs[kern_agg_count] = .{ .name = t.name, .best_ms = t.ms, .hits = 1 };
+                    kern_agg_count += 1;
+                }
+            }
         }
     }
 
@@ -114,5 +149,14 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
             try w.print("  huff kernel best: {d:.3} ms  ({d:.0} MB/s)\n", .{ best_huff_ms, mb * 1000.0 / best_huff_ms });
             try w.print("  huff kernel mean: {d:.3} ms  ({d:.0} MB/s)\n", .{ mean_huff_ms, mb * 1000.0 / mean_huff_ms });
         }
+    }
+    if (profile_kernels and kern_agg_count > 0) {
+        try w.writeAll("  per-kernel best across runs (cuEvent ms):\n");
+        var sum_ms: f32 = 0;
+        for (kern_aggs[0..kern_agg_count]) |a| {
+            try w.print("    {s:<36} {d:8.3} ms  x{d}\n", .{ std.mem.span(a.name), a.best_ms, a.hits });
+            sum_ms += a.best_ms;
+        }
+        try w.print("    {s:<36} {d:8.3} ms\n", .{ "(sum of bests)", sum_ms });
     }
 }

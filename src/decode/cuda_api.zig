@@ -62,6 +62,7 @@ pub var init_state: InitState = .uninit;
 pub const FnInit = *const fn (c_uint) callconv(.c) CUresult;
 pub const FnDeviceGet = *const fn (*CUdevice, c_int) callconv(.c) CUresult;
 pub const FnDeviceGetAttribute = *const fn (*c_int, c_int, CUdevice) callconv(.c) CUresult;
+pub const FnDeviceGetName = *const fn ([*]u8, c_int, CUdevice) callconv(.c) CUresult;
 pub const FnCtxCreate = *const fn (*usize, c_uint, CUdevice) callconv(.c) CUresult;
 pub const FnModuleLoadData = *const fn (*usize, [*]const u8) callconv(.c) CUresult;
 pub const FnModuleGetFunction = *const fn (*usize, usize, [*:0]const u8) callconv(.c) CUresult;
@@ -92,6 +93,7 @@ pub const FnEventDestroy = *const fn (usize) callconv(.c) CUresult;
 pub var cuInit_fn: ?FnInit = null;
 pub var cuDeviceGet_fn: ?FnDeviceGet = null;
 pub var cuDeviceGetAttribute_fn: ?FnDeviceGetAttribute = null;
+pub var cuDeviceGetName_fn: ?FnDeviceGetName = null;
 pub var cuCtxCreate_fn: ?FnCtxCreate = null;
 
 /// SM count of the active CUDA device, populated by module_loader.init.
@@ -99,6 +101,14 @@ pub var cuCtxCreate_fn: ?FnCtxCreate = null;
 /// (e.g. fast_framed.zig's adaptive sc_group_size threshold).
 /// 0 until init has run successfully.
 pub var sm_count: u32 = 0;
+
+/// Device name of the active CUDA device, populated by
+/// module_loader.init (VK-parity backport: the VK CLI prints
+/// `Device: <name>` so perf numbers are attributable; the project
+/// rule requires a device name next to every measurement).
+/// Empty until init has run successfully.
+pub var device_name_buf: [128]u8 = undefined;
+pub var device_name_len: usize = 0;
 
 /// CUDA driver API constant: CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT.
 pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;

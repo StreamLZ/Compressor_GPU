@@ -40,6 +40,7 @@ pub var scan_parse_fn: usize = 0;
 pub var walk_frame_fn: usize = 0;
 pub var prefix_sum_chunks_fn: usize = 0;
 pub var compact_huff_descs_fn: usize = 0;
+pub var compact_all_descs_fn: usize = 0;
 pub var compact_raw_descs_fn: usize = 0;
 pub var merge_huff_descs_fn: usize = 0;
 pub var huff_module: usize = 0;
@@ -90,6 +91,7 @@ pub fn init() bool {
     cuda.cuInit_fn = cuda.getProc(cuda.FnInit, "cuInit");
     cuda.cuDeviceGet_fn = cuda.getProc(cuda.FnDeviceGet, "cuDeviceGet");
     cuda.cuDeviceGetAttribute_fn = cuda.getProc(cuda.FnDeviceGetAttribute, "cuDeviceGetAttribute");
+    cuda.cuDeviceGetName_fn = cuda.getProc(cuda.FnDeviceGetName, "cuDeviceGetName");
     cuda.cuCtxCreate_fn = cuda.getProc(cuda.FnCtxCreate, "cuCtxCreate_v2") orelse cuda.getProc(cuda.FnCtxCreate, "cuCtxCreate");
     cuda.cuModuleLoadData_fn = cuda.getProc(cuda.FnModuleLoadData, "cuModuleLoadData");
     cuda.cuModuleGetFunction_fn = cuda.getProc(cuda.FnModuleGetFunction, "cuModuleGetFunction");
@@ -130,6 +132,14 @@ pub fn init() bool {
         var sm: c_int = 0;
         if (get_attr(&sm, cuda.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev) == CUDA_SUCCESS and sm > 0) {
             cuda.sm_count = @intCast(sm);
+        }
+    }
+
+    // Cache the device name (VK-parity: the CLI prints `Device: <name>`
+    // next to every benchmark so perf numbers stay attributable).
+    if (cuda.cuDeviceGetName_fn) |get_name| {
+        if (get_name(&cuda.device_name_buf, @intCast(cuda.device_name_buf.len), dev) == CUDA_SUCCESS) {
+            cuda.device_name_len = std.mem.indexOfScalar(u8, &cuda.device_name_buf, 0) orelse cuda.device_name_buf.len;
         }
     }
 
@@ -176,6 +186,10 @@ pub fn init() bool {
     // Optional pure-D2D compaction + merge kernels.
     _ = get_fn(&compact_huff_descs_fn, module, "slzCompactHuffDescsKernel");
     _ = get_fn(&compact_raw_descs_fn, module, "slzCompactRawDescsKernel");
+    // A-017 backport (2026-06-10): fused 5-block compaction replaces
+    // the five sequential single-thread launches above on the hot path;
+    // the unfused kernels stay resolved as a reference/fallback.
+    _ = get_fn(&compact_all_descs_fn, module, "slzCompactAllDescsKernel");
     _ = get_fn(&merge_huff_descs_fn, module, "slzMergeHuffDescsKernel");
     const t_lz = cuda.qpcNow();
 
