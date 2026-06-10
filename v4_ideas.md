@@ -253,13 +253,33 @@ the entropy body is Huffman or tANS, and emit whichever is smaller
 
 **Cross-check vs `docs/nvcomp_lz4_architecture.md` §22-§61 (the zstd
 + standalone-ANS steal-list), 2026-06-10**:
-- **The 4× table-build gap is attackable.** Our `slzTansFseBuildKernel`
-  (0.611 ms) is the naive serial spread; nvCOMP parallelizes exactly
-  this with MATCH.ANY symbol bucketing (#1, §27 — "one-pass parallel
-  histogram + scatter", ~20 cycles per 32 symbols), Hillis-Steele
-  prefix scans (#6), and tiered strided LUT fill (#9). Applying those
-  should land tANS table build near Huffman's 0.16 ms — removing one
-  of the two strikes against the selector.
+- **The 4× table-build gap is attackable — root cause located
+  (2026-06-10).** `initLut` in `tools/huff_test/tans_decode_kernel.cu`
+  runs the whole 4-way interleaved spread ON LANE 0: a serial
+  double loop assigning up to 2048 slots one at a time while 31
+  lanes idle. That IS the 0.611 ms.
+  **Implementation spec for the parallel spread** (next session,
+  harness-ready, verify = BIL decode stays byte-exact against the
+  new LUTs):
+  1. The slot recurrence is a pure function of cumulative weights:
+     symbol s (weight w, cum-weight ws) puts `y_j(w, ws) =
+     (w + ((ws - j - 1) & 3)) >> 2` slots into quarter j, at quarter
+     cursor = `q_base[j] + prefix-over-prior-symbols of y_j`.
+  2. So: Hillis-Steele warp scan over weights (32 symbols per batch,
+     carry across batches) gives every symbol its ws; four more
+     scans over y_j give its quarter cursors; then EVERY SYMBOL
+     fills its own slots independently — lane l takes symbols
+     l, l+32, ... and writes its w slots with
+     `running_w = w + cursor` advancing j=0..3, k=0..y_j in the
+     original order (order inside a symbol matters; order between
+     symbols no longer does).
+  3. Weight-1 symbols fill the `slots_left..L-1` tail — embarrassingly
+     parallel already.
+  Target: ≤ 0.2 ms (vs Huffman LUT build 0.160) — removes one of the
+  two strikes against the selector. nvCOMP's §27 MATCH.ANY bucketing
+  is the same idea generalized; for this specific 4-quarter spread
+  the prefix-scan form above is simpler and needs no MATCH.ANY
+  emulation on VK.
 - **The decode-core gap stands.** Nothing in nvCOMP's GPU decode path
   breaks tANS's 1-symbol-per-lookup serial state chain — their zstd
   decompress runs ~19.7 GB/s e2e on the same card, well under our
