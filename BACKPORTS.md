@@ -89,10 +89,10 @@ script; minutes per use.**
 
 | Item | VK source | Effort |
 |---|---|---|
-| 🔲 Huffman kernel conformance (isolated encode→LUT→decode, 5 cases; catches bitbufRefill-class bugs that e2e masks) | `srcVK/tests/huff_decode_conformance.zig` + CPU oracle in `tools/huff_test/huff_ref.c` | ~1 day |
+| ✅ Huffman kernel conformance (5 cases, `3a9ba9f`: src/encode/huff_conformance_tests.zig) | `srcVK/tests/huff_decode_conformance.zig` | done |
 | 🔲 C ABI tests — CUDA `slzCompressAsync`/D2D/timings currently has ZERO tests (old ABI tests were src_vulkan's, deleted) | `srcVK/tests/async_d2d_api.zig` | ~1 day |
-| 🔲 CLI smoke tests (subprocess -c/-d/-b against goldens; env-inherit lesson) | `srcVK/tests/cli_smoke.zig` | hours |
-| 🔲 L5 chain-parser hardening cases (long-match truncation, mixed-class offsets, block 1→2 recent_offset carry) | srcVK L5 hardening (+4, `f08713d`) | hours |
+| ✅ CLI smoke tests (5 cases, `e24ee0f`: src/cli_smoke_tests.zig; ptest now installs first) | `srcVK/tests/cli_smoke.zig` | done |
+| ✅ L5 chain-parser hardening (4 cases, `9173844`: src/encode/l5_hardening_tests.zig; also fixed latent per-thread-context bug in lockGpuTests) | srcVK L5 hardening (+4, `f08713d`) | done |
 | 🔲 Host-unit mirrors (descriptor walking, header building) where logic is shared | `srcVK/tests/{decoder,encoder}_unit.zig` (33 tests) | as-touched |
 | 🔲 (optional) Runner-level serial phases instead of the lockGpuTests mutex | `srcVK/test_runner_parallel.zig` 3-phase design | optional |
 
