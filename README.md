@@ -129,7 +129,7 @@ copies, v4 #1 + #2). Re-run by `tools\bench_all.bat`.
 | Level | enwik8 D2D / e2e | silesia D2D / e2e |
 |-------|------------------|-------------------|
 | L1 | **2.27** / 14.85 | **4.16** / 29.17 |
-| L2 | **2.26** / 14.86 | **4.17** / 29.12 |
+| L2 | **2.12** / 14.69 | **4.14** / 29.16 |
 | L3 | **3.49** / 15.12 | **6.29** / 30.00 |
 | L4 | **3.42** / 15.08 | **6.27** / 29.92 |
 | L5 | **3.31** / 14.64 | **6.03** / 29.15 |
@@ -144,12 +144,16 @@ the decompressed output for the host-bounce path.
 | Level | enwik8 | silesia |
 |-------|-------:|--------:|
 | L1 | 58.6% | 47.8% |
-| L2 | 58.6% | 47.8% |
+| L2 | 57.3% | 47.2% |
 | L3 | 43.7% | 38.1% |
 | L4 | 42.7% | 37.5% |
 | L5 | 39.6% | 33.9% |
 
-L1-L2 are LZ-only (no entropy stage). L3-L5 add 32-stream GPU Huffman.
+L1-L2 are LZ-only (no entropy stage); L2 adds the greedy parser's
+match-range rehash (~1 pp better ratio, +29% encode cost, decodes
+slightly FASTER than L1 — fewer tokens). L3-L5 add 32-stream GPU
+Huffman; L4 adds the rehash on top of L3; L5 swaps in the chain
+parser.
 
 ### vs nvCOMP (enwik8 100 MB, RTX 4060 Ti)
 

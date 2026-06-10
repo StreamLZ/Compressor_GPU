@@ -182,7 +182,8 @@ pub fn gpuCompressImpl(
     // L4+ enables the greedy parser's match-range rehash (CPU engine_level>=2).
     // L3 stays without it - that is the L3/L4 distinction. L5 uses the chain
     // parser so the flag is inert there.
-    var p_l4: u32 = if (level >= 4) 1 else 0;
+    // v4 #6 experiment (2026-06-10): L2 = greedy+rehash, no entropy (CUDA mirror).
+    var p_l4: u32 = if (level >= 4 or level == 2) 1 else 0;
 
     // A-008 (BDA): query the raw device address of the per-chunk hash
     // table buffer and pack it as two trailing u32 push-constant slots

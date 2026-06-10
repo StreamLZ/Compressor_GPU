@@ -53,6 +53,16 @@ Wire format unchanged from 2026-06-09; all frames byte-identical.
   L3/L4 cells were flattered by the stale out-copy): L1 5.07 /
   L2 5.05 / L3 7.13 / L4 7.04 / L5 6.86 ms, all byte-verified;
   ptest_vk 150/9/0. Catalog: PortAdaptations A-026.
+- **L2 re-differentiated: greedy + match-range rehash, LZ-only**
+  (v4 #6, both backends): hb=17-everywhere had collapsed L1 and L2
+  into byte-identical output. The rehash (formerly the L3->L4
+  distinction) needs no entropy stage - one-line gate change
+  (level >= 4 or level == 2) in each backend's encode_lz. enwik8
+  58.64% -> 57.28%, silesia 47.83% -> 47.21%; encode kernel +29%
+  (70 -> 91 ms, 1052 MB/s); decode FASTER (2.27 -> 2.12 ms - fewer
+  tokens). Level ladder now: L1 fastest-encode, L2 +rehash,
+  L3 +Huffman, L4 +rehash, L5 chain parser. Cross-backend L2 frames
+  byte-identical (SHA gate); roundtrip SHA MATCH; both suites green.
 - **Flat independent-match copy** (v4 #2, both backends): matches
   whose whole source range lies before the batch's output start read
   only pre-batch-final bytes - they now copy in one flat warp-wide

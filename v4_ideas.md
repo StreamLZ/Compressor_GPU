@@ -180,7 +180,7 @@ inputs, future sc choices, no silent edge). Also retires the A-005
 **Cost/risk**: medium; mechanical copy of the A-008 BDA recipe across
 2 kernels + dispatch; needs the A-024-style threshold tests on VK.
 
-## 6. Re-differentiate L2 (product decision, not code)
+## 6. Re-differentiate L2 — ✅ DONE 2026-06-10: L2 = greedy + match-range rehash, LZ-only
 
 **What**: Since hb=17-everywhere, L1 and L2 emit byte-identical
 output. Options: (a) document L2 as an alias of L1; (b) repurpose L2
@@ -192,6 +192,20 @@ instead of thrashing.
 
 **Why**: a level that duplicates another is API noise; (b) is the
 most honest mapping of the real tradeoff surface we measured.
+
+**RESOLVED 2026-06-10 with a fourth option found during the
+discussion**: the match-range rehash (previously the L3→L4
+distinction) does not require Huffman — it's a pure encoder-search
+improvement, format-unchanged, decoder-unaware. L2 now = greedy +
+rehash, entropy-free (one-line gate per backend: `level >= 4 or
+level == 2`). Measured: enwik8 58.64% → **57.28%** (−1.36 pp),
+silesia 47.83% → **47.21%**; encode kernel 70 → 91 ms (+29%, still
+1052 MB/s); decode FASTER (2.27 → 2.12 ms enwik8 — fewer tokens).
+Ladder now has a real step at every rung: L1 fastest-encode →
+L2 +rehash → L3 +Huffman → L4 +rehash → L5 chain. Cross-backend L2
+frames byte-identical; roundtrip SHA MATCH; both suites green.
+Options (b)/(c) not taken: (b) remains available via `--sc 0.5` on
+any level; (c) measured ≈0.1 pp, near-noise.
 
 ## 7. Backport the srcVK test suite to CUDA — ✅ first wave DONE 2026-06-10
 

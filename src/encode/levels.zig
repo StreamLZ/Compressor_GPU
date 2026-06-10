@@ -3,9 +3,13 @@
 //! Kept in their own file so the encode kernels can pull the policy in
 //! without dragging the rest of the driver.
 
-/// Hash bits per user level. L1-L3 grow the hash table; L4/L5 cap at
-/// 17 to keep the chain parser's per-chunk hash in VRAM (see the cap
-/// rationale below). Levels outside `1..5` are rejected by the
+/// Hash bits per user level — 17 everywhere since 2026-06-09 (see
+/// below). The level ladder is differentiated elsewhere: L2 and L4+
+/// enable the greedy parser's match-range rehash (encode_lz.zig
+/// `p_l4`; v4 #6, 2026-06-10 — re-differentiated L2 from L1 after
+/// hb=17-everywhere collapsed them), L3+ adds the Huffman entropy
+/// stage (fast_framed.zig), L5 swaps in the chain parser
+/// (`useChainParser`). Levels outside `1..5` are rejected by the
 /// encoder front door (`streamlz_encoder.compressFramedWithIo` and
 /// `streamlz_gpu.compressCore`), so the `else => unreachable` here
 /// is genuinely unreachable.
