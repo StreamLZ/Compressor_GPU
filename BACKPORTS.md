@@ -41,7 +41,7 @@ partition), keep per-stream params in a small array. Verify: ptest +
 SHA on the goldens. **Effort: hours. Expected: ~0.1-0.2 ms off every
 L3+ decode.**
 
-### B2. 🔲 Evaluate fusing compact_raw + gather_raw_off16 + merge_huff
+### B2. ✅ DONE — slzMergeHuffDescsParKernel (4-block A-017-style merge). Measured enwik8-L5: merge 0.199 -> 0.067 ms, per-kernel sum 4.74 -> 4.38, d2d 4.08. At 1 GB merge is 1.29 ms (serial ~5 ms est). Remaining gather overlap (0.07 ms enwik8) deferred - needs a second stream for at most ~0.07 ms.
 
 The A-021 close-path on VK (v4_ideas #10) applies in spirit to CUDA
 too: nsys shows merge 0.20 ms + compact_raw 0.08 + gather 0.08 per

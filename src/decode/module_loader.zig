@@ -43,6 +43,7 @@ pub var compact_huff_descs_fn: usize = 0;
 pub var compact_all_descs_fn: usize = 0;
 pub var compact_raw_descs_fn: usize = 0;
 pub var merge_huff_descs_fn: usize = 0;
+pub var merge_huff_descs_par_fn: usize = 0;
 pub var huff_module: usize = 0;
 pub var huff_build_fn: usize = 0;
 pub var huff_decode_fn: usize = 0;
@@ -191,6 +192,9 @@ pub fn init() bool {
     // the unfused kernels stay resolved as a reference/fallback.
     _ = get_fn(&compact_all_descs_fn, module, "slzCompactAllDescsKernel");
     _ = get_fn(&merge_huff_descs_fn, module, "slzMergeHuffDescsKernel");
+    // B2 (2026-06-10): 4-block parallel merge replaces the serial
+    // single-thread merge on the hot path; serial kept as reference.
+    _ = get_fn(&merge_huff_descs_par_fn, module, "slzMergeHuffDescsParKernel");
     const t_lz = cuda.qpcNow();
 
     // Load Huffman decode kernels (Pass 1.5, for chunk_type=4 literals).

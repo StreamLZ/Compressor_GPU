@@ -65,3 +65,52 @@ extern "C" __global__ void slzMergeHuffDescsKernel(
     appendRegion(d_merged, lut_slot, d_lo,  *d_n_lo);
     *d_n_merged = lut_slot;
 }
+
+// ── B2 (2026-06-10): 4-block parallel merge ─────────────────────────
+// The serial kernel above walks lit→tok→hi→lo with one thread
+// (~0.20 ms at enwik8-L5 scale). The four regions are independent
+// once each region's base slot is known, and the bases are just
+// prefix sums of the four counts — available to every block for the
+// cost of reading 4 u32s. Same shape as the A-017 compact fusion:
+// gridDim.x = 4 single-thread blocks, wall cost ~= the largest
+// region. Block 0 additionally writes n_merged (the total).
+extern "C" __global__ void slzMergeHuffDescsParKernel(
+    const SlzHuffDecChunkDesc* __restrict__ d_lit,
+    const SlzHuffDecChunkDesc* __restrict__ d_tok,
+    const SlzHuffDecChunkDesc* __restrict__ d_hi,
+    const SlzHuffDecChunkDesc* __restrict__ d_lo,
+    const uint32_t* __restrict__            d_n_lit,
+    const uint32_t* __restrict__            d_n_tok,
+    const uint32_t* __restrict__            d_n_hi,
+    const uint32_t* __restrict__            d_n_lo,
+    uint32_t                                /*tok_region_off (ignored)*/,
+    uint32_t                                /*off16_region_off (ignored)*/,
+    SlzHuffDecChunkDesc* __restrict__       d_merged,
+    uint32_t* __restrict__                  d_n_merged)
+{
+    if (threadIdx.x != 0) return;
+    const uint32_t n0 = *d_n_lit, n1 = *d_n_tok, n2 = *d_n_hi, n3 = *d_n_lo;
+    const uint32_t which = blockIdx.x;
+    if (which > 3) return;
+
+    const SlzHuffDecChunkDesc* src =
+        (which == 0) ? d_lit :
+        (which == 1) ? d_tok :
+        (which == 2) ? d_hi  : d_lo;
+    const uint32_t n =
+        (which == 0) ? n0 :
+        (which == 1) ? n1 :
+        (which == 2) ? n2 : n3;
+    uint32_t base = 0;
+    if (which > 0) base += n0;
+    if (which > 1) base += n1;
+    if (which > 2) base += n2;
+
+    for (uint32_t i = 0; i < n; i++) {
+        SlzHuffDecChunkDesc d = src[i];
+        const uint32_t slot = base + i;
+        d.lut_offset = slot * HUFF_LUT_ENTRIES;
+        d_merged[slot] = d;
+    }
+    if (which == 0) *d_n_merged = n0 + n1 + n2 + n3;
+}
