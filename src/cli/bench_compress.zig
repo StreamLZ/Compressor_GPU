@@ -8,6 +8,7 @@ const encoder = @import("../encode/streamlz_encoder.zig");
 const decoder = @import("../decode/streamlz_decoder.zig");
 const gpu_enc_driver = @import("../encode/driver.zig");
 const gpu_dec_driver = @import("../decode/driver.zig");
+const enc_phase = @import("../encode/enc_phase.zig");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: util.Args) !void {
     const in_path = util.requireInput(args, w);
@@ -35,12 +36,16 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     };
 
     var comp_size: usize = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_enc_driver.g_default);
+    // SLZ_PROFILE_PHASES: drop the warm-up's accumulations so the table
+    // below covers exactly one timed compress (mirrors srcVK's flow).
+    enc_phase.reset();
     {
         const t0 = std.Io.Clock.awake.now(io);
         comp_size = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_enc_driver.g_default);
         const ns = @as(u64, @intCast(t0.untilNow(io, .awake).toNanoseconds()));
         const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
         try w.print("  Compress: {d:.0}ms ({d:.1} MB/s)\n", .{ ms, mb * 1000.0 / ms });
+        try enc_phase.printAndReset(w);
     }
     try w.print("Level {d}: {d} -> {d} bytes ({d:.1}%)\n\n", .{
         args.level, src.len, comp_size,

@@ -32,6 +32,7 @@ const CompressError = encoder.CompressError;
 
 const gpu_enc = @import("driver.zig");
 const cuda_api = @import("../decode/cuda_api.zig");
+const enc_phase = @import("enc_phase.zig");
 
 /// Number of decoder warps each SM can host simultaneously on sm_8x /
 /// sm_9x. Used to size the saturation threshold below which sc_group=0.25
@@ -248,20 +249,33 @@ fn gpuEncodeAndAssemble(
         }
     }
 
+    // SLZ_PROFILE_PHASES checkpoints (srcVK profiler backport) — each
+    // begin() is 0 when profiling is off and add() then no-ops.
+    var t_ph = enc_phase.begin();
     if (!gpu_enc.gpuCompressImpl(enc_ctx, src, gpu_out, descs, comp_sizes, io, opts.level))
         return error.DestinationTooSmall;
+    enc_phase.add(.lz_total, t_ph);
 
+    t_ph = enc_phase.begin();
     const did_huff_lit = opts.level >= 3 and gpu_enc.gpuEncodeLiteralsHuffImpl(enc_ctx, allocator, gpu_out, descs, comp_sizes);
     defer if (did_huff_lit) freeHuffLit(allocator, enc_ctx);
+    enc_phase.add(.huff_lit, t_ph);
+    t_ph = enc_phase.begin();
     const did_huff_tok = opts.level >= 3 and gpu_enc.gpuEncodeTokensHuffImpl(enc_ctx, allocator, gpu_out, descs, comp_sizes);
     defer if (did_huff_tok) freeHuffTok(allocator, enc_ctx);
+    enc_phase.add(.huff_tok, t_ph);
+    t_ph = enc_phase.begin();
     const did_huff_off16 = opts.level >= 3 and gpu_enc.gpuEncodeOff16HuffImpl(enc_ctx, allocator, gpu_out, descs, comp_sizes);
     defer if (did_huff_off16) freeHuffOff16(allocator, enc_ctx);
+    enc_phase.add(.huff_off16, t_ph);
 
+    t_ph = enc_phase.begin();
     if (!gpu_enc.gpuAssembleFrameImpl(enc_ctx, allocator, descs, comp_sizes))
         return error.DestinationTooSmall;
     defer freeAssembled(allocator, enc_ctx);
+    enc_phase.add(.asm_device, t_ph);
 
+    t_ph = enc_phase.begin();
     const frame_size = try assembleFrame(
         enc_ctx,
         allocator,
@@ -273,11 +287,14 @@ fn gpuEncodeAndAssemble(
         comp_sizes,
         frame_block_hdr_pos,
     );
+    enc_phase.add(.asm_host, t_ph);
 
     if (owns_wrap_output) {
         if (dst.len < frame_size) return error.DestinationTooSmall;
+        t_ph = enc_phase.begin();
         if (!gpu_enc.copyDeviceToHost(dst[0..frame_size], enc_ctx.d_host_wrap_output))
             return error.DestinationTooSmall;
+        enc_phase.add(.wrap_d2h, t_ph);
     }
     return frame_size;
 }

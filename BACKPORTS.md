@@ -66,7 +66,7 @@ site — but the CLI never surfaces them; we had to use nsys to get
 (or env var) to `-db` printing the per-kernel table, mirroring VK's
 `SLZ_VK_PROFILE_DECODE` query-pool report. **Effort: hours.**
 
-### C3. 🔲 Encode-side phase profiler
+### C3. ✅ DONE — SLZ_PROFILE_PHASES=1 (src/encode/enc_phase.zig)
 
 VK's `SLZ_VK_PROFILE_PHASES` QPC accumulators (encode + decode)
 directly located the 238 ms d2h_final bottleneck that became a 3.2×
