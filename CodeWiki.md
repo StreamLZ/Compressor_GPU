@@ -99,7 +99,6 @@ src/
   *.ptx                   committed kernel images (@embedFile'd)
 srcVK/                    Vulkan backend — see srcVK/README.md
 docs/                     GPU_ARCHITECTURE (incl. kernel inventory),
-                          GPU_IDEAS (kernel-level idea annex),
                           nvcomp_lz4_architecture, how_to_debug_cuda,
                           cudaOptimize (incl. vs-nvCOMP methodology),
                           ngram

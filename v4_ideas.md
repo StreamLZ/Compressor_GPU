@@ -398,6 +398,11 @@ idea worth re-evaluating once the basic selector ships.
   Prize ~0.07 ms (enwik8) / ~0.85 ms (1 GB); cost is cross-stream
   ordering complexity in decode_dispatch. Bundle with any future
   stream-architecture work, not standalone.
+- **LOP3.LUT 0xfe verification** (retired GPU_IDEAS idea 5): confirm
+  nvcc already fuses the BIL-refill byte-merge ORs into LOP3; 1-2 h,
+  upside <=1-2% on a 98%-memory-bound kernel - verify, don't refactor.
+- **Packed butterfly reduction in the BIL encoder** (retired
+  GPU_IDEAS idea 6): ~30 min encode-side polish, minor.
 
 ## 13. Fuzzing the decoder (and differential CUDA-vs-VK fuzz)
 
@@ -436,14 +441,47 @@ documented contract of what "graceful rejection" means per corruption
 class. Effort: tier 1 ~a day; tier 3 ~a day on top (mostly harness
 plumbing — both CLIs already exist).
 
-## 14. Kernel-level optimization backlog (annex: docs/GPU_IDEAS.md)
+## 14. MATCH.ANY warp-cooperative match finder for the L5 chain parser
 
-Six NCU-grounded kernel optimization proposals (MATCH.ANY encode
-match-finder, strided LUT fill, multi-warp-per-chunk LZ decode,
-Hillis-Steele canonical-code scan, LOP3 verification, butterfly
-reduction) live in `docs/GPU_IDEAS.md` with full analysis, expected
-gains, and a ruled-out list. All six remain unimplemented as of
-2026-06-10 and their baseline is still representative (production LZ
-+ Huffman kernels unchanged since it was measured). That file is the
-home for NEW kernel-level ideas; this list stays structural/feature
-level.
+(Merged from the retired docs/GPU_IDEAS.md idea 1; full analysis incl.
+the nvCOMP SASS references in git history.)
+
+**What**: the L5 chain parser runs serially on lane 0 (~1.1 active
+threads/warp per NCU). nvCOMP-style warp window: each lane builds a
+rolling 4-byte key via two shuffles, `__match_any_sync` returns each
+lane's set of key-equal lanes in one instruction, BREV+FLO picks the
+nearest in-warp match - match-finding inside the 32-byte window costs
+ZERO memory traffic; only matches escaping the window fall through to
+the global hash chain.
+
+**Why NOW**: the C3 phase profiler (2026-06-10) measured the LZ chain
+parse at **86% of L5 encode wall** (266 of 311 ms on enwik8) - it is
+THE encode-perf target, and this is the only credible plan on file
+for it. Expected 2-3x on the chain parse for repetitive data.
+
+**Risks**: parser restructure must preserve token emission +
+recent-offset + chain-validation semantics; found-match set may shift
+(ratio drift) - gate with the cross-backend SHA expectation updated
+deliberately, never silently. Harness-first in a new `tools/lz_test/`
+(CPU oracle, MATCH.ANY-only variant first to bound the in-warp win).
+Effort: 1-2 weeks. Any change must be mirrored to srcVK
+(`subgroupShuffle` + the A-002 match_any emulation already exist).
+
+## 15. Multi-warp-per-chunk LZ decode (structural; AFTER #1/#2)
+
+(Merged from the retired docs/GPU_IDEAS.md idea 3.)
+
+**What**: regrid the LZ decode to `(num_chunks, K)` with K=2-4 warps
+pipelining per chunk (warp 0 parses batch N while warp 1 executes
+batch N-1) over a shared-memory token ring + one `__syncthreads()`
+per batch.
+
+**Why**: FAILED_EXPERIMENTS' meta-conclusion - PP-v2 is the ceiling
+for single-warp latency attacks; remaining gains need STRUCTURAL
+parallelism. This is the named open structural lever.
+
+**Sequencing**: strictly after #1/#2 (flat batched copies) - same
+kernel, and #1/#2's lane-efficiency win changes this idea's
+cost/benefit. Could be 0% (ring serialization) or 10-25%;
+harness-first A/B mandatory. Effort: 1-2 weeks, most speculative
+item on this list.

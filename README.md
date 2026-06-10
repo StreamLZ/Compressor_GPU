@@ -199,15 +199,18 @@ per-warp serial chains) and `hash_bits = 17` at every level. Pass
 ```
 build.zig              Zig 0.16 build script (always builds GPU)
 include/streamlz_gpu.h C ABI public header
-src/                   All Zig + CUDA source. See CodeWiki.md for the
-                       full per-file map.
+src/                   CUDA backend. See CodeWiki.md for the full
+                       per-file map.
   common/              CUDA headers #include'd by every kernel
-  format/, io/, platform/  Host-side helpers shared by encode + decode
-  encode/              GPU encode driver + kernels + entropy helpers
+  format/              Host-side wire-format parsers/writers
+  encode/              GPU encode driver + kernels
   decode/              GPU decode driver + kernels
-docs/                  GPU_ARCHITECTURE.md, GPU_IDEAS.md, cudaOptimize.md
+srcVK/                 Vulkan backend (full 1:1 port). See
+                       srcVK/README.md + srcVK/Handbook.md.
+docs/                  GPU_ARCHITECTURE.md, cudaOptimize.md, how_to_debug_cuda.md
 tools/                 Build scripts + bench harnesses
 CodeWiki.md            Source tree map + invariants
+v4_ideas.md            Forward-looking work list
 FORMAT.md              SLZ1 wire format specification
 CHANGELOG.md           Release history
 FAILED_EXPERIMENTS.md  Rejected experiments + war stories

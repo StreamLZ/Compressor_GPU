@@ -3296,3 +3296,27 @@ ceiling for per-instruction optimization") was tested again in the
 software-pipelined cmd LDG). Both passed correctness; both moved
 nothing. The structural ceiling is real and survives multiple
 independent attacks.
+
+## nvCOMP steal-list tricks ruled out by analysis (2026-05-27, preserved from retired docs/GPU_IDEAS.md)
+
+Analyzed against `docs/nvcomp_lz4_architecture.md`'s 18-trick list and
+rejected for this codec — do not re-derive:
+
+| Trick | Why ruled out |
+|-------|---------------|
+| `MUFU.RCP` modular arithmetic (#4) | tANS/FSE state advancement only; we're pure Huffman |
+| NANOSLEEP spin-wait inter-block sync (#5) | our sidecar approach wins for >4 blocks (nvCOMP doc §32) |
+| Packed-nibble decode (#8) | already optimal in `unpackWeightByte` (2 instructions) |
+| `LOP3.LUT 0xf8` branchless flag-byte parse (#10) | chunk headers parsed host-side; scan kernels off critical path |
+| `ATOMS.ADD` intra-block coordination (#12) | no intra-block work queues in this design |
+| Fixed-size tANS tables (#13), power-of-2 normalized counts (#18) | tANS only |
+| Leader-atomic + warp scan for variable output (#14) | we pre-reserve output via `descs[i].dst_offset` — already the strictly-better variant |
+| `__constant__` memory for tables (#15) | our LUT is per-block runtime-built; can't pre-stage |
+| Privatized histograms w/ MATCH.ANY, decode side (#17) | decode needs no histograms; the encode-side variant shipped in the ba46e9a warp-cooperative LUT-build |
+
+Also recorded for the ledger: GPU_IDEAS ideas 2 + 4 (strided LUT fill,
+Hillis-Steele canonical-code scan) were IMPLEMENTED at `ba46e9a`
+(2026-05-26, warp-cooperative slzHuffBuildLutKernel rewrite) hours
+after the ideas doc's baseline was captured — measured 0.77 → 0.165 ms
+today, beating the idea's own 0.30-0.35 ms prediction. Ideas 1 and 3
+were promoted to v4_ideas #14/#15; ideas 5 and 6 to the v4 #12 basket.
