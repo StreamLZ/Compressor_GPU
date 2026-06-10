@@ -44,6 +44,12 @@ __device__ __noinline__ void decodeSubChunkRawMode(
     // instantiation — the kernels used 0 B shared, so no occupancy cost.
     __shared__ uint32_t s_lit_prefix[WARPS_PER_BLOCK][WARP_SIZE];
     __shared__ uint32_t s_dst_adj[WARPS_PER_BLOCK][WARP_SIZE];
+    // v4 #2: staging for the flat INDEPENDENT-match copy (same shape:
+    // exclusive prefix of independent-match byte counts + per-token
+    // dst/src bases pre-biased by that prefix). +768 B.
+    __shared__ uint32_t s_im_prefix[WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ uint32_t s_im_dst_adj[WARPS_PER_BLOCK][WARP_SIZE];
+    __shared__ uint32_t s_im_src_adj[WARPS_PER_BLOCK][WARP_SIZE];
 
     while (cmd_pos < cmd_size) {
         // Parallel-parse fast path. 32 tokens per outer iter: coalesced
@@ -162,10 +168,57 @@ __device__ __noinline__ void decodeSubChunkRawMode(
                 }
                 __syncwarp();
 
-                // ── Match copies, token order, lit-free ──
-                // Ballot the lanes that actually carry a match and walk
-                // only those (lit-only tokens cost zero iterations now).
-                uint32_t match_mask = __ballot_sync(FULL_WARP_MASK, my_match_len > 0);
+                // ── Flat independent-match copy (v4 #2, 2026-06-10) ──
+                // A match is INDEPENDENT when its whole source range
+                // lies before this batch's output start (src_end <=
+                // dst_pos): it reads only bytes that were final before
+                // the batch began, so all independent matches can be
+                // copied flat in one warp-wide pass exactly like the
+                // literals — any order, full lane width. Sequential
+                // semantics are preserved because (a) independents read
+                // nothing the batch writes, and (b) no match's read
+                // range extends past its own output end, so a dependent
+                // match never reads a LATER token's output — hoisting
+                // independents in front of the dependent loop changes
+                // nothing any dependent observes. (The v4 entry's extra
+                // `dist >= 4` condition is unnecessary at byte
+                // granularity — src-entirely-pre-batch suffices.)
+                uint32_t my_copy_dst = dst_pos + my_dst_local + my_lit_len;
+                int32_t  my_src      = (int32_t)my_copy_dst + my_match_offset;
+                bool my_is_indep = (my_match_len > 0) &&
+                                   (my_src + (int32_t)my_match_len <= (int32_t)dst_pos);
+                uint32_t my_im_len = my_is_indep ? my_match_len : 0u;
+                uint32_t my_im_local, total_im;
+                warpScanU32(my_im_len, my_im_local, total_im);
+
+                if (total_im > 0) {
+                    s_im_prefix[threadIdx.y][lane]  = my_im_local;
+                    // flat im byte i owned by token k:
+                    //   dst: copy_dst[k] + (i - im_prefix[k])
+                    //   src: src[k]      + (i - im_prefix[k])
+                    // (u32 wraparound in the pre-biased bases is fine —
+                    // adding i back lands on the true address.)
+                    s_im_dst_adj[threadIdx.y][lane] = my_copy_dst - my_im_local;
+                    s_im_src_adj[threadIdx.y][lane] = (uint32_t)my_src - my_im_local;
+                    __syncwarp();
+                    for (uint32_t i = lane; i < total_im; i += WARP_SIZE) {
+                        uint32_t k = 0;
+                        #pragma unroll
+                        for (uint32_t step = 16; step >= 1; step >>= 1) {
+                            uint32_t cand = k + step;
+                            if (cand < batch_size && s_im_prefix[threadIdx.y][cand] <= i)
+                                k = cand;
+                        }
+                        dst[s_im_dst_adj[threadIdx.y][k] + i] =
+                            dst[s_im_src_adj[threadIdx.y][k] + i];
+                    }
+                    __syncwarp();
+                }
+
+                // ── Dependent matches, token order ──
+                // Ballot only the matches the flat pass could NOT take
+                // (batch-local or self-overlapping source ranges).
+                uint32_t match_mask = __ballot_sync(FULL_WARP_MASK, my_match_len > 0 && !my_is_indep);
                 while (match_mask != 0) {
                     uint32_t k = (uint32_t)(__ffs(match_mask) - 1);
                     match_mask &= match_mask - 1;

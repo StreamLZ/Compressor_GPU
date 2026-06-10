@@ -16,6 +16,11 @@
 // gl_LocalInvocationID.y). 512 B - the kernels used 0 B shared.
 shared uint s_lz_lit_prefix[WARPS_PER_BLOCK][WARP_SIZE];
 shared uint s_lz_dst_adj[WARPS_PER_BLOCK][WARP_SIZE];
+// v4 #2: staging for the flat INDEPENDENT-match copy (CUDA reference:
+// s_im_prefix / s_im_dst_adj / s_im_src_adj). +768 B.
+shared uint s_lz_im_prefix[WARPS_PER_BLOCK][WARP_SIZE];
+shared uint s_lz_im_dst_adj[WARPS_PER_BLOCK][WARP_SIZE];
+shared uint s_lz_im_src_adj[WARPS_PER_BLOCK][WARP_SIZE];
 
 // CUDA reference: src/decode/lz_decode_raw.cuh:24-211.
 // Templated `decodeSubChunkRawMode<OFF16_SPLIT>` in CUDA. Both
@@ -189,9 +194,54 @@ shared uint s_lz_dst_adj[WARPS_PER_BLOCK][WARP_SIZE];
                     subgroupBarrier();                                                    \
                     subgroupMemoryBarrierBuffer();                                        \
                                                                                           \
-                    /* Match copies, token order, lit-free; ballot skips                  \
-                       lit-only tokens entirely. */                                       \
-                    uvec4 _ds_mm_ballot = subgroupBallot(_ds_my_match_len > 0u);          \
+                    /* v4 #2 flat independent-match copy (CUDA ref:                       \
+                       src/decode/lz_decode_raw.cuh my_is_indep block).                   \
+                       A match whose whole source range lies before the                   \
+                       batch's output start reads only pre-batch-final                    \
+                       bytes - copy all such matches flat at full lane                    \
+                       width; sequential semantics preserved (no match                    \
+                       read extends past its own output end, so                           \
+                       dependents never read a LATER token's output). */                  \
+                    uint _ds_my_copy_dst = _ds_dst_pos + _ds_my_dst_local                 \
+                                           + _ds_my_lit_len;                              \
+                    int  _ds_my_src = int(_ds_my_copy_dst) + _ds_my_match_offset;         \
+                    bool _ds_my_is_indep = (_ds_my_match_len > 0u) &&                     \
+                        (_ds_my_src + int(_ds_my_match_len) <= int(_ds_dst_pos));         \
+                    uint _ds_my_im_len = _ds_my_is_indep ? _ds_my_match_len : 0u;         \
+                    uint _ds_my_im_local, _ds_total_im;                                   \
+                    warpScanU32(_ds_my_im_len, int(lane),                                 \
+                                _ds_my_im_local, _ds_total_im);                           \
+                                                                                          \
+                    if (_ds_total_im > 0u) {                                              \
+                        s_lz_im_prefix[gl_LocalInvocationID.y][uint(lane)] =              \
+                            _ds_my_im_local;                                              \
+                        s_lz_im_dst_adj[gl_LocalInvocationID.y][uint(lane)] =             \
+                            _ds_my_copy_dst - _ds_my_im_local;                            \
+                        s_lz_im_src_adj[gl_LocalInvocationID.y][uint(lane)] =             \
+                            uint(_ds_my_src) - _ds_my_im_local;                           \
+                        subgroupBarrier();                                                \
+                        for (uint _ds_i = uint(lane); _ds_i < _ds_total_im;               \
+                             _ds_i += WARP_SIZE) {                                        \
+                            uint _ds_own2 = 0u;                                           \
+                            for (uint _ds_s2 = 16u; _ds_s2 >= 1u; _ds_s2 >>= 1) {         \
+                                uint _ds_c2 = _ds_own2 + _ds_s2;                          \
+                                if (_ds_c2 < _ds_batch_size &&                            \
+                                    s_lz_im_prefix[gl_LocalInvocationID.y][_ds_c2] <= _ds_i) \
+                                    _ds_own2 = _ds_c2;                                    \
+                            }                                                             \
+                            (dst_ssbo)[s_lz_im_dst_adj[gl_LocalInvocationID.y][_ds_own2]  \
+                                       + _ds_i] =                                         \
+                                (dst_ssbo)[s_lz_im_src_adj[gl_LocalInvocationID.y][_ds_own2] \
+                                           + _ds_i];                                      \
+                        }                                                                 \
+                        subgroupBarrier();                                                \
+                        subgroupMemoryBarrierBuffer();                                    \
+                    }                                                                     \
+                                                                                          \
+                    /* Dependent matches, token order; ballot skips                       \
+                       lit-only tokens AND flat-copied independents. */                   \
+                    uvec4 _ds_mm_ballot = subgroupBallot(_ds_my_match_len > 0u            \
+                                                         && !_ds_my_is_indep);            \
                     uint _ds_match_mask = _ds_mm_ballot.x;                                \
                     while (_ds_match_mask != 0u) {                                        \
                         uint _ds_k = uint(findLSB(_ds_match_mask));                       \

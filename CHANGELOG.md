@@ -53,6 +53,21 @@ Wire format unchanged from 2026-06-09; all frames byte-identical.
   L3/L4 cells were flattered by the stale out-copy): L1 5.07 /
   L2 5.05 / L3 7.13 / L4 7.04 / L5 6.86 ms, all byte-verified;
   ptest_vk 150/9/0. Catalog: PortAdaptations A-026.
+- **Flat independent-match copy** (v4 #2, both backends): matches
+  whose whole source range lies before the batch's output start read
+  only pre-batch-final bytes - they now copy in one flat warp-wide
+  pass (same ownership-search shape as the literal pass, +768 B
+  shared), with only the batch-local/self-overlapping remainder left
+  in the serial token-order loop. Sequential semantics provably
+  preserved: no match read extends past its own output end, so
+  dependents never read a later token's output. Delivered ~2x the
+  #1 win: CUDA enwik9 L1 22.9 -> 20.8 ms, L5 33.1 -> 29.5; enwik8
+  L5 4.03 -> 3.31 (LZ kernel 3.13 -> 2.45); VK enwik9 L5 40.9 ->
+  35.7, VK D2D L5 kernels 5.62 -> 4.41. nvCOMP margins now: enwik8
+  kernel-sum L1 2.01x / L5 1.73x; enwik9 kernel L1 1.59x / L5 1.72x.
+  Verified: both suites green, both D2D sweeps verify-OK, 1 GB SHA
+  MATCH both backends, Intel iGPU decode SHA MATCH + cross-device
+  encode byte-identity re-confirmed post-change.
 - **Flat batched literal copy** (v4 #1, both backends): the PP fast
   path in the raw-mode LZ decoder no longer runs one warpLiteralCopy
   per token (64 syncs/batch at ~20% lane efficiency). The two

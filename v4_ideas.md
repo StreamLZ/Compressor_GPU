@@ -66,7 +66,7 @@ which is exactly #2's target. Verification: ptest 49/0/0, ptest_vk
 both backends. #2's projection should be re-derived from the
 post-#1 profile before committing to it.
 
-## 2. Flat independent-match copy + ordered fallback
+## 2. Flat independent-match copy + ordered fallback — ✅ DONE 2026-06-10, delivered ~2× what #1 did
 
 **What**: After #1, classify each token's match: *independent* if its
 source range lies entirely before this batch's output start
@@ -88,6 +88,31 @@ device-resident (D2D) pipelines.
 wrong "independent" call is silent corruption. Gate on #1 landing
 cleanly and on measuring the actual batch-local match fraction first
 (cheap kernel instrumentation).
+
+**DONE 2026-06-10** (both backends, same wave as #1). The dependency
+analysis collapsed to one provable condition: independent ⟺
+`src + match_len <= dst_pos` (batch output start) — such a match
+reads only pre-batch-final bytes, and since NO match's read range
+extends past its own output end, dependents never read a later
+token's output; hoisting all independents into a flat pass (same
+ownership-search shape as #1, 3 more shared arrays) preserves
+sequential semantics exactly. The entry's `dist >= 4` condition was
+unnecessary at byte granularity. Dependent remainder stays in the
+ballot loop. **Measured (cumulative #1+#2 in parens)**: CUDA enwik9
+L1 22.9 → 20.8 ms (24.3 → 20.8, 1.17×), L5 33.1 → 29.5 (34.0 → 29.5,
+1.15×); enwik8 L1 2.64 → 2.27 (2.85 → 2.27, 1.26×), L5 4.03 → 3.31
+(4.06 → 3.31, 1.23×; LZ kernel alone 3.13 → 2.45); silesia L5 7.13 →
+6.03. VK enwik9 L5 40.9 → 35.7 (43.4 → 35.7, 1.22×); VK D2D L5
+kernels 5.62 → 4.41. nvCOMP margins: enwik8 kernel-sum L1 **2.01×**,
+L5 1.73×; enwik9 kernel L1 1.59×, L5 **1.72×**. Combined #1+#2 came
+in at 1.15-1.26× vs the projected 1.3-1.6× — the lower end of the
+shrink the entry itself predicted for recent-offset-heavy text
+(enwik9's deeper redundancy keeps more matches batch-local, hence
+the smaller win at 1 GB than at 100 MB). Verification: ptest 49/0/0,
+ptest_vk 150/9/0, both D2D sweeps verify-OK, 1 GB SHA MATCH both
+backends, Intel iGPU decode L1+L5 SHA MATCH + cross-device encode
+byte-identity. Next decode lever is structural: #15 (multi-warp) or
+#8 (wire format).
 
 ## 3. Measure, then maybe parallelize, long-token parsing
 
