@@ -1,7 +1,25 @@
-# srcVK Vulkan Port — L1-L5 Done, Async/Perf Roadmap
+# srcVK Vulkan Port — COMPLETE (historical roadmap document)
 
-**Last updated:** 2026-06-08, HEAD `c141fdf` + uncommitted Phase 2B.
-**Status:** L1 + L2 + L3 + L4 + **L5 SHIPPED on decode + encode** (all 5 levels VK→VK roundtrip MATCH on web + enwik8 + silesia, byte-identical to CUDA SHA on L1, L2, L3-web/enwik8, L4, L5). Phase 2A encoder + Phase 2A-decoder + Phase 2B + Phase 3 + Phase 2A.5 + iter 4f all done. **ptest_vk: 108/0/0 on both NVIDIA + Intel iGPU.** Only remaining encoder residual: silesia L3 is 0.019% larger than CUDA L3 (A-008, accepted — Vulkan 4 GiB SSBO cap on hash table forces `hash_bits=18` clamp on inputs > 128 MiB; VK→VK silesia L3 decodes its own output correctly). Remaining work: async API, perf parity sweep, BDA workaround. See `srcVK/PortAdaptations.md` for the catalog of CUDA-VK divergences + their resolution status.
+**Last updated:** 2026-06-10, HEAD `7f647a9`.
+**Status: the port is DONE.** Everything this file tracked as remaining
+has shipped: Phase 4 `_vk` C ABI (`c9c28bc`), Phase 5 conformance + perf
+sweep (`48d43d8`), the BDA hash-table workaround closing the A-008
+silesia residual (`8c8964d`), L5 hardening tests (`f08713d`), the A-024
+1 GB-scale corruption fix + per-region entropy-scratch bindings
+(`db1e061` + `b77067a`), and A-023 batched dispatch on both backends.
+Current verified state: **enwik9 1 GB L1-L5 SHA-256 clean on VK**
+(decode of CUDA frames AND VK self-encode, byte-identical frames);
+enwik8 byte-identical round-trips on NVIDIA RTX 4060 Ti and Intel(R)
+Graphics; **ptest_vk 149/0/0**. The legacy `src_vulkan/` + `src_vk/`
+trees and `/third_party/` were deleted at `7f647a9` — srcVK is the
+only Vulkan tree.
+
+**The live forward-looking work list is `/v4_ideas.md`** (includes the
+one open VK perf item, A-021 kernel fusion). The CUDA↔VK divergence
+catalog remains `srcVK/PortAdaptations.md` — keep maintaining it.
+Everything below this header is preserved as historical record of the
+port: the hygiene rules and "Lessons learned" sections are still
+worth reading for anyone touching srcVK kernels.
 
 **Build-graph note**: As of 2026-06-08 the build graph at `build.zig::addSrcVkShaderSteps` correctly tracks `.glsl` `#include` deps via glslc's `-MD` depfile output (A-012 RESOLVED). Plain `zig build streamlz_vk` after editing any srcVK `.glsl` header now invalidates the right SPIR-V blobs. `tools/build_vk.bat` is kept as a force-clean utility but is no longer required after `.glsl` edits.
 

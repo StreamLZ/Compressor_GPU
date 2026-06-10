@@ -174,3 +174,67 @@ From the FAILED_EXPERIMENTS "not tried" list. Only pays for very long
 matches, which the text-workload match-length histogram says are rare.
 Keep parked unless a binary-heavy workload (silesia-like or model
 weights) becomes a target.
+
+## 10. A-021: fuse the remaining VK decode bookkeeping dispatches
+
+**What**: Apply the A-017 fusion pattern (which collapsed 4×
+`compact_huff_descs` dispatches into one grid_x=4 kernel for a 2.4×
+kernel-time win) to the remaining three unfused dispatches in the VK
+decode front-half: `compact_raw_descs`, `gather_raw_off16`,
+`merge_huff_descs`. Per `srcVK/PerfSweep.md`, these plus the A-006
+explicit barriers and A-007 descriptor ABI account for the VK L3-L5
+decode-kernel gap.
+
+**Why**: VK L3-L5 1 GB decode kernels run ~48 ms vs CUDA's ~34 ms
+(1.4×, re-measured 2026-06-10). e2e stays within the 10% parity bar
+because PCIe amortizes it, but the kernel gap is the difference
+between VK beating nvCOMP Zstd comfortably (CUDA: 34 vs 51 ms) and
+barely (VK: 48 vs 51 ms). Note the 2026-06-10 A-024 revision added two
+more huff-decode dispatches (3-region split), nudging the wrong way —
+fusion has slightly more to reclaim now.
+
+**Expected**: PerfSweep attributed ~1.45 ms of the 2.13 ms enwik8-scale
+gap to these dispatches (attribution flagged "unverified"). Plausibly
+closes half the 1.4× gap. Zero ratio impact.
+
+**Cost/risk**: medium-low — A-017 is a proven template; ~1 day + the
+standard cross-backend SHA regression.
+
+## 11. Delete legacy wire-format chunk types 1/5/6/7 (decoder)
+
+**What**: Remove the `chunk_type ∈ {1,5,6,7}` arms from
+`src/decode/lz_header_parse.cuh` (both stream-header parsers), the
+matching skip arms in `slz_wire_format.cuh::skipEntropyStream`, and
+the VK glsl mirrors; route unknown types to a status word the host
+surfaces as a parse failure (the `walk_frame_kernel` d_status
+pattern). Update FORMAT.md to document only the live {0, 4} types.
+
+**Why** (from TODO2's adversarial verify, confirmed against git
+history): these arms are NOT backward compat. The types belonged to
+the GPU codec's own deleted host-side tANS path (commits 64f3cc2 /
+cbf6a3b, removed in fbc7644 / 8982fee) — no decoder for them exists
+in-tree, and the arms redirect stream pointers into NEVER-POPULATED
+entropy scratch. A frame carrying these types decodes to silent
+garbage instead of SLZ_ERROR_CORRUPT_FRAME. Unreachable from any
+in-tree encoder output, but it converts malformed/adversarial input
+from "clean error" to "silent corruption", and the comments on the
+arms actively mislead readers into thinking the types are functional.
+
+**Cost**: ~80 lines of .cuh deleted + VK mirrors + FORMAT.md; the
+status-word plumbing is the only new code. Hours, not days.
+
+## 12. Small-items basket (carried from the retired todo.md deferrals)
+
+- **`slzCompressAsync` input-size gap**: inputs outside [128 B, ~1 GiB]
+  return SLZ_ERROR_UNSUPPORTED on the async path; the >1 GiB side is
+  the caller-relevant one (TODO2's deferral-defender). Close by D2H-ing
+  from `d_input` for the uncompressed-body path, or document loudly.
+- **DevBuf abstraction** for the (ptr, size) pairs on both contexts —
+  deferred twice already; only worth it bundled with another context
+  refactor.
+- **C ABI default-level mismatch** (Zig Options.level=1 vs C header 5)
+  — documented as intentional; revisit only if the L2-alias decision
+  (#6) changes level semantics anyway.
+- **TODO2 doc-drift sweep**: stale `src/gpu/` paths (~10 sites), the
+  `streamlz_gpu.h` async/stack-usage doc gaps, and the unverified
+  correctness-tagged items past TODO2.md line 250.
