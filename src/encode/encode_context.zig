@@ -215,20 +215,28 @@ pub const EncodeContext = struct {
     huff_tok_sizes: ?[]u32 = null,
     huff_tok_offsets: ?[]u32 = null,
 
-    /// Free every owned device + host buffer and reset every field to
-    /// its default. Called by `slzDestroy` on the per-handle
-    /// `Context.enc`. The CLI also has a `driver.g_default` singleton
-    /// that is intentionally never deinit'd — its lifetime is the
-    /// process.
-    pub fn deinit(self: *EncodeContext, allocator: std.mem.Allocator) void {
+    /// Free every owned DEVICE buffer and zero the size slots, leaving
+    /// the context fully reusable — `ensureBuf` is grow-only from a
+    /// zero size, so the next encode transparently re-allocates.
+    ///
+    /// 2026-06-10: added for the CLI `-b` / `-ba` flows, which encode
+    /// and then decode in ONE process. After a 1 GB L3 encode the
+    /// persistent set holds ~13 GB (8 GB hash + 2.9 GB LZ output +
+    /// 1 GB input + wrap/huffman buffers); the decoder then needs
+    /// ~7.5 GB more. On Vulkan's strict allocator that is a hard
+    /// OutOfDeviceMemory; on CUDA, WDDM silently pages and poisons the
+    /// decompress timings (in-process L3+ decode measured 10-30×
+    /// slower than the same frame via `-db`). Trimming between the
+    /// phases fixes the VK failure and makes CUDA `-b` numbers honest.
+    pub fn releaseDeviceBuffers(self: *EncodeContext) void {
         const free_dev = struct {
             fn f(ptr: *CUdeviceptr, sz: *usize) void {
                 if (ptr.* != 0) {
                     // Free failure on a pointer we know is valid (we
                     // allocated it via cuMemAlloc and never freed it)
                     // means the driver/context is dying - there's
-                    // nothing useful we can do in a deinit path, so
-                    // ignore the CUresult.
+                    // nothing useful we can do here, so ignore the
+                    // CUresult.
                     if (cuda_ffi.cuMemFree_fn) |free_fn| _ = free_fn(ptr.*);
                     ptr.* = 0;
                 }
@@ -257,6 +265,15 @@ pub const EncodeContext = struct {
         free_dev(&self.d_asm_descs, &self.d_asm_descs_size);
         free_dev(&self.d_asm_out, &self.d_asm_out_size);
         free_dev(&self.d_asm_sizes, &self.d_asm_sizes_size);
+    }
+
+    /// Free every owned device + host buffer and reset every field to
+    /// its default. Called by `slzDestroy` on the per-handle
+    /// `Context.enc`. The CLI also has a `driver.g_default` singleton
+    /// that is intentionally never deinit'd — its lifetime is the
+    /// process.
+    pub fn deinit(self: *EncodeContext, allocator: std.mem.Allocator) void {
+        self.releaseDeviceBuffers();
 
         if (self.assembled_offsets) |s| { allocator.free(s); self.assembled_offsets = null; }
         if (self.assembled_sizes) |s| { allocator.free(s); self.assembled_sizes = null; }

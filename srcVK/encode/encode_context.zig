@@ -187,9 +187,15 @@ pub const EncodeContext = struct {
     regions_scratch: ?[]vk.VkBufferCopyRegion = null,
     regions_scratch_cap: usize = 0,
 
-    /// CUDA reference: src/encode/encode_context.zig:223-276. Free every
-    /// owned device + host buffer and reset every field to its default.
-    pub fn deinit(self: *EncodeContext, allocator: std.mem.Allocator) void {
+    /// CUDA reference: src/encode/encode_context.zig::releaseDeviceBuffers
+    /// (2026-06-10). Free every owned DEVICE buffer and zero the size
+    /// slots; the context stays reusable (ensureBuf re-allocates from a
+    /// zero size on the next encode). Added for the CLI `-b` / `-ba`
+    /// flows: after a 1 GB L3 encode the persistent set holds ~13 GB
+    /// while the decoder needs ~7.5 GB more — under strict VMA that is
+    /// a hard OutOfDeviceMemory (CUDA merely WDDM-pages and pollutes
+    /// the decompress timings).
+    pub fn releaseDeviceBuffers(self: *EncodeContext) void {
         const free_dev = struct {
             fn f(ptr: *VkDeviceBuffer, sz: *usize) void {
                 if (ptr.* != 0) {
@@ -221,6 +227,12 @@ pub const EncodeContext = struct {
         free_dev(&self.d_asm_descs, &self.d_asm_descs_size);
         free_dev(&self.d_asm_out, &self.d_asm_out_size);
         free_dev(&self.d_asm_sizes, &self.d_asm_sizes_size);
+    }
+
+    /// CUDA reference: src/encode/encode_context.zig:223-276. Free every
+    /// owned device + host buffer and reset every field to its default.
+    pub fn deinit(self: *EncodeContext, allocator: std.mem.Allocator) void {
+        self.releaseDeviceBuffers();
 
         if (self.assembled_offsets) |s| { allocator.free(s); self.assembled_offsets = null; }
         if (self.assembled_sizes) |s| { allocator.free(s); self.assembled_sizes = null; }

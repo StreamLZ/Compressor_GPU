@@ -45,6 +45,16 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
         @as(f64, @floatFromInt(comp_size)) / @as(f64, @floatFromInt(src.len)) * 100.0,
     });
 
+    // 2026-06-10: trim the encoder's persistent device buffers before
+    // the decompress phase. After a 1 GB L3 encode they hold ~13 GB
+    // (hash + LZ output + input + wrap buffers); the decoder needs
+    // ~7.5 GB more. Vulkan's strict allocator fails outright; CUDA's
+    // WDDM pages silently and pollutes the decompress timings (the
+    // same frame measured up to 30× slower here than via `-db`). The
+    // compressed bytes are already on the host; nothing below touches
+    // the encoder, and a later encode would transparently re-allocate.
+    gpu_enc_driver.g_default.releaseDeviceBuffers();
+
     var dec_ctx = decoder.DecompressContext.initWithIo(allocator, io);
     defer dec_ctx.deinit();
 

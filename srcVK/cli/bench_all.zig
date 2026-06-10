@@ -54,6 +54,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
         };
         const best_comp_ns = @as(u64, @intCast(t_comp.untilNow(io, .awake).toNanoseconds()));
 
+        // CUDA-mirror (2026-06-10): trim encoder device buffers before
+        // the decompress phase — see bench_compress.zig for rationale.
+        gpu_enc_driver.g_default.releaseDeviceBuffers();
+
         var dec_ctx = decoder.DecompressContext.initWithIo(allocator, io);
         defer dec_ctx.deinit();
 

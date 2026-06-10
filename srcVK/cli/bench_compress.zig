@@ -100,6 +100,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
         @as(f64, @floatFromInt(comp_size)) / @as(f64, @floatFromInt(src.len)) * 100.0,
     });
 
+    // CUDA-mirror (2026-06-10): trim the encoder's persistent device
+    // buffers before the decompress phase. After a 1 GB L3 encode they
+    // hold ~13 GB; the decoder needs ~7.5 GB more, which under strict
+    // VMA is a hard OutOfDeviceMemory on a 16 GB card. The compressed
+    // bytes are already on the host; a later encode re-allocates.
+    gpu_enc_driver.g_default.releaseDeviceBuffers();
+
     var dec_ctx = decoder.DecompressContext.initWithIo(allocator, io);
     defer dec_ctx.deinit();
 
