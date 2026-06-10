@@ -28,6 +28,15 @@ var g_gpu_test_lock: SRWLOCK = .{};
 
 pub fn lockGpuTests() void {
     AcquireSRWLockExclusive(&g_gpu_test_lock);
+    // The CUDA context is per-thread current, and ptest schedules tests
+    // onto arbitrary worker threads. A GPU test landing on a thread
+    // where the context was never made current fails its first raw
+    // driver call with CUDA_ERROR_INVALID_CONTEXT (201) — seen as the
+    // deterministic longlitrun H2D failure and the intermittent "every
+    // shape and level" flake (2026-06-10). Binding here covers every
+    // GPU test in one place. Benign no-op when the context doesn't
+    // exist yet (the first test's init() creates it current).
+    _ = gpu_driver.bindContextToCallingThread();
 }
 
 pub fn unlockGpuTests() void {

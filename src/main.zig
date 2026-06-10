@@ -18,4 +18,5 @@ test {
     _ = @import("encode/gpu_regression_tests.zig");
     _ = @import("encode/huff_conformance_tests.zig");
     _ = @import("cli_smoke_tests.zig");
+    _ = @import("encode/l5_hardening_tests.zig");
 }
