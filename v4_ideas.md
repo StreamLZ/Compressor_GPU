@@ -250,6 +250,33 @@ the entropy body is Huffman or tANS, and emit whichever is smaller
   trick — wire-level change, doubles the latency-hiding on the
   state→LUT→state chain). If pursued, it belongs in the v4 wire
   format design alongside the selector.
+
+**Cross-check vs `docs/nvcomp_lz4_architecture.md` §22-§61 (the zstd
++ standalone-ANS steal-list), 2026-06-10**:
+- **The 4× table-build gap is attackable.** Our `slzTansFseBuildKernel`
+  (0.611 ms) is the naive serial spread; nvCOMP parallelizes exactly
+  this with MATCH.ANY symbol bucketing (#1, §27 — "one-pass parallel
+  histogram + scatter", ~20 cycles per 32 symbols), Hillis-Steele
+  prefix scans (#6), and tiered strided LUT fill (#9). Applying those
+  should land tANS table build near Huffman's 0.16 ms — removing one
+  of the two strikes against the selector.
+- **The decode-core gap stands.** Nothing in nvCOMP's GPU decode path
+  breaks tANS's 1-symbol-per-lookup serial state chain — their zstd
+  decompress runs ~19.7 GB/s e2e on the same card, well under our
+  entropy-stage rates, and they do NOT use interleaved dual states on
+  GPU. Dual-states-per-lane remains OUR untried lever, not a proven
+  one.
+- **Marginal decode adds**: LOP3.LUT 3-input OR (#3) — our BIL refill
+  is already one-OR-per-word so upside is limited to the byte-tail
+  path; 2D chunk×stream dispatch (#16) matters for production
+  integration at small chunk counts, not for the harness's per-byte
+  rate.
+- **Encoder build-out gets cheaper than assumed**: leader-atomic +
+  warp-scan variable-size output (#14/#2), MUFU.RCP division-free
+  state advance (#4), MATCH.ANY privatized histograms (#17), and
+  power-of-2 normalized counts (#18) together sketch most of a GPU
+  tANS *encoder* — shrinking the "resurrect the host encoder"
+  line-item in the build-out plan.
 - The idea SURVIVES in weakened form: per-chunk min() is still
   ratio-monotone, and the decode-speed cost is epsilon — the huff
   predecode is only ~0.73 ms of the ~4 ms enwik8 L5 d2d (and a
