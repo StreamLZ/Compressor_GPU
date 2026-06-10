@@ -160,13 +160,14 @@ The VK port accumulated 158 tests vs CUDA's 22; nothing flowed back
   contexts — now serialized behind `lockGpuTests()`. ptest went
   19 pass/4 skip → **25 pass/0 skip/0 fail**.
 
-**Remaining backlog**: superseded by the comprehensive audit in
-`/BACKPORTS.md` (2026-06-10) — the full VK→CUDA parity-debt ledger
-covering performance (A-017 compact-huff fusion mirror), tooling
-(device-name print, per-kernel `-db` timings, encode phase profiler,
-compute-sanitizer practice), the rest of the test suite (huff
-conformance, C ABI, cli_smoke, L5 hardening, host-unit mirrors), and
-the explicitly-evaluated not-applicable items.
+**Remaining backlog**: NONE — the VK→CUDA parity-debt ledger
+(BACKPORTS.md, 2026-06-10) was fully executed and retired the same
+day (`git log --follow -- BACKPORTS.md` for the audit trail: A-017
+compact fusion + parallel merge, device-name print, per-kernel `-db`
+timings, encode phase profiler, sanitize.bat, huff conformance,
+C ABI, cli_smoke, L5 hardening, `zig build ptx`). The SHA
+byte-identity gate moved to CLAUDE.md as a standing rule. The two
+deliberately-deferred tails live in the #12 basket below.
 
 ## 8. v4 wire format: self-describing tokens (remove the serial parse)
 
@@ -376,6 +377,20 @@ idea worth re-evaluating once the basic selector ships.
 - **C ABI default-level mismatch** (Zig Options.level=1 vs C header 5)
   — documented as intentional; revisit only if the L2-alias decision
   (#6) changes level semantics anyway.
+- **Host-unit mirrors** (from the retired BACKPORTS.md D table):
+  port `srcVK/tests/{decoder,encoder}_unit.zig` cases (33 tests —
+  descriptor walking, header building) AS-TOUCHED — only when next
+  modifying that logic, not as a standalone task.
+- **Runner-level serial phases** (retired BACKPORTS.md, optional):
+  replace the lockGpuTests SRWLOCK with srcVK's 3-phase runner design.
+  Got LESS attractive 2026-06-10: the lock now also binds the CUDA
+  context per thread; a redesign would re-solve that for cosmetic
+  gain. Only revisit if the lock pattern causes a real failure.
+- **Gather-overlap** (retired BACKPORTS.md B2 tail): run
+  slzGatherRawOff16Kernel on a second stream under merge+LUT-build.
+  Prize ~0.07 ms (enwik8) / ~0.85 ms (1 GB); cost is cross-stream
+  ordering complexity in decode_dispatch. Bundle with any future
+  stream-architecture work, not standalone.
 
 ## 13. Fuzzing the decoder (and differential CUDA-vs-VK fuzz)
 
