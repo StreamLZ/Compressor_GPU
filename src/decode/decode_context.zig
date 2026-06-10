@@ -320,6 +320,14 @@ pub const DecodeContext = struct {
     // (they share host-dependent values like total_subchunks); only the
     // back half rides the caller's stream.
     work_stream: usize = 0,
+    // B2 gather-overlap (2026-06-10): aux stream + events so
+    // slzGatherRawOff16Kernel runs concurrently with merge+huff (it
+    // writes raw sub-chunks' scratch slots, huff-decode writes huff
+    // sub-chunks' slots - disjoint). 0 = not yet created.
+    gather_stream: usize = 0,
+    ev_compact_done: usize = 0,
+    ev_gather_done: usize = 0,
+    gather_event_pending: bool = false,
 
     /// Free every owned device + host buffer and reset every field to its
     /// default. Intended for a per-handle library API teardown; the

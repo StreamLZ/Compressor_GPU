@@ -178,10 +178,28 @@ fn gatherRawOff16(
     // dispatch's upper bound); the kernel self-gates on `*p_count` so
     // over-launching is safe.
     const grid_x: u32 = scan.num_raw_off16;
-    const stream = self.work_stream;
+    // B2 overlap (2026-06-10): run the gather on a dedicated stream,
+    // concurrent with the merge + huff chain on work_stream. Safe
+    // because the gather writes RAW sub-chunks' scratch slots while
+    // huff_decode writes HUFF sub-chunks' slots (disjoint by
+    // sub-chunk). Ordering: gather_stream waits ev_compact_done
+    // (compact wrote d_compact_raw + counts on work_stream); the LZ
+    // launch waits ev_gather_done (runLzPipeline). Falls back to the
+    // legacy inline launch when the event procs or aux objects are
+    // unavailable.
+    var stream = self.work_stream;
+    if (cuda.cuStreamWaitEvent_fn != null and cuda.cuEventRecord_fn != null and ensureGatherOverlap(self)) {
+        _ = cuda.cuEventRecord_fn.?(self.ev_compact_done, self.work_stream);
+        _ = cuda.cuStreamWaitEvent_fn.?(self.gather_stream, self.ev_compact_done, 0);
+        stream = self.gather_stream;
+    }
     const t_gather = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzGatherRawOff16Kernel", stream);
     defer endKernelTiming(t_gather, stream);
     try cudaCall(launch_fn(module_loader.gather_off16_fn, grid_x, 1, 1, 256, 1, 1, 0, stream, &params, &extra), .launch);
+    if (stream == self.gather_stream and stream != self.work_stream) {
+        _ = cuda.cuEventRecord_fn.?(self.ev_gather_done, self.gather_stream);
+        self.gather_event_pending = true;
+    }
     // No post-launch sync: downstream LZ kernel reads
     // d_entropy_off16_scratch from the same stream.
 }
@@ -425,6 +443,16 @@ fn runLzPipeline(
 
     const lz_groups = (total_chunks + chunks_per_group - 1) / chunks_per_group;
     const lz_grid_x = (lz_groups + 1) / 2;
+
+    // B2 gather-overlap: the LZ kernel reads the raw-off16 scratch
+    // slots the gather wrote on gather_stream - make this stream wait
+    // for it before the LZ launch.
+    if (self.gather_event_pending) {
+        self.gather_event_pending = false;
+        if (cuda.cuStreamWaitEvent_fn) |wf| {
+            try cudaCall(wf(stream, self.ev_gather_done, 0), .sync);
+        }
+    }
 
     // Fast path: no entropy in this scan → use lean L1/L2 raw kernel.
     // Huffman literals require the general kernel (it reads entropy_scratch).
@@ -840,4 +868,23 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     if (t_e2e0) |t0| if (io) |io_val| {
         emitE2eTrace(t0, io_val, e2e_cum, facade.last_kernel_ns);
     };
+}
+
+/// B2 gather-overlap: lazily create the aux stream + the two
+/// sync-only events (CU_EVENT_DISABLE_TIMING = 0x2). Returns false
+/// (caller falls back to the inline gather) when any create fails.
+fn ensureGatherOverlap(self: *DecodeContext) bool {
+    if (self.gather_stream != 0 and self.ev_compact_done != 0 and self.ev_gather_done != 0) return true;
+    const screate = cuda.cuStreamCreate_fn orelse return false;
+    const ecreate = cuda.cuEventCreate_fn orelse return false;
+    if (self.gather_stream == 0) {
+        if (screate(&self.gather_stream, 0) != CUDA_SUCCESS) return false;
+    }
+    if (self.ev_compact_done == 0) {
+        if (ecreate(&self.ev_compact_done, 0x2) != CUDA_SUCCESS) return false;
+    }
+    if (self.ev_gather_done == 0) {
+        if (ecreate(&self.ev_gather_done, 0x2) != CUDA_SUCCESS) return false;
+    }
+    return true;
 }

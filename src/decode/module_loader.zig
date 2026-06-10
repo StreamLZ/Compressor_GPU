@@ -116,6 +116,7 @@ pub fn init() bool {
     cuda.cuCtxSetCurrent_fn = cuda.getProc(cuda.FnCtxSetCurrent, "cuCtxSetCurrent");
     cuda.cuEventCreate_fn = cuda.getProc(cuda.FnEventCreate, "cuEventCreate");
     cuda.cuEventRecord_fn = cuda.getProc(cuda.FnEventRecord, "cuEventRecord");
+    cuda.cuStreamWaitEvent_fn = cuda.getProc(cuda.FnStreamWaitEvent, "cuStreamWaitEvent");
     cuda.cuEventSynchronize_fn = cuda.getProc(cuda.FnEventSynchronize, "cuEventSynchronize");
     cuda.cuEventElapsedTime_fn = cuda.getProc(cuda.FnEventElapsedTime, "cuEventElapsedTime");
     cuda.cuEventDestroy_fn = cuda.getProc(cuda.FnEventDestroy, "cuEventDestroy_v2");
