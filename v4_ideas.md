@@ -220,10 +220,28 @@ the entropy body is Huffman or tANS, and emit whichever is smaller
   too. Better ratio AND better decode speed simultaneously.
 - Same shape as zstd's per-block entropy selection — proven practice.
 
-**Gate 0 (hours)**: re-run `tools/huff_test` huff vs tans benches on
-the same snapshot, TODAY's kernels — the Huffman kernel has been
-optimized further since the comparison (BIL u32 stores etc.), so
-"tANS was faster" must be re-proven against current Huffman.
+**Gate 0 — MEASURED 2026-06-10 (RTX 4060 Ti), premise inverted**:
+- tANS-32 harness (`tans_test.exe`, production snapshot, 3052 chunks,
+  27.8 MB lit+tok, byte-exact): best variant `sl+aligned` 0.773 ms =
+  **36.0 GB/s** (baseline 25.4, sharedlut 34.8, staged 30.6).
+  FSE table build: 0.611 ms / 3052 tables.
+- Production `slzHuffDecode4StreamKernel` in situ (nsys, enwik8 L5
+  `-db`, min of 5): **0.727 ms** for the FULL entropy payload
+  (lit + tok + off16 hi/lo) → ≥ 38 GB/s even crediting only the
+  lit+tok bytes; higher with off16 counted. Huffman LUT build:
+  0.160 ms.
+- Verdict: "tANS decodes faster" was true against the May-era Huffman
+  variants (15-26 GB/s) but the BIL-32 optimization waves overtook
+  it — today Huffman is ~5-15% faster per byte AND ~4× cheaper on
+  table build. The strict both-axes-win claim is dead.
+- The idea SURVIVES in weakened form: per-chunk min() is still
+  ratio-monotone, and the decode-speed cost is epsilon — the huff
+  predecode is only ~0.73 ms of the ~4 ms enwik8 L5 d2d (and a
+  similar minor slice at 1 GB), so even 20% of bytes flipping to a
+  0.9× codec costs ~0.02 ms. Net: a RATIO lever that is
+  speed-neutral in practice, not a speed win. Gate 1 (the ratio
+  dry-run) is now the decisive gate, and the bar should be a bit
+  higher to pay for the added pipeline complexity.
 
 **Gate 1 (a day, host-only)**: selection does NOT require double
 compression — both body sizes are computable from the per-chunk
