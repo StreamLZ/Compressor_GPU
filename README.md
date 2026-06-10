@@ -167,22 +167,11 @@ L1-L2 are LZ-only (no entropy stage). L3-L5 add 32-stream GPU Huffman.
 
 StreamLZ columns re-measured 2026-06-10; nvCOMP columns are the
 2026-05-27 `nvcomp_bench3` runs (our changes don't affect them).
-\* L5 async-wall is the 2026-05-27 figure: the D2D bench's L3+ cells
-currently fail (see KNOWN ISSUE below) so this cell could not be
-re-measured.
 
 See [docs/cudaOptimize.md](docs/cudaOptimize.md) "vs nvCOMP -
 measurement methodology" for what each window measures - the
 pipeline / async / end-to-end columns answer different questions and
 confusing them is easy.
-
-> **KNOWN ISSUE (2026-06-10):** `slzDecompressAsync` (true-D2D entry)
-> fails verification at L3+ on enwik8 in `tools\bench_d2d.bat` —
-> the call returns immediately with zero kernel time. L1/L2 D2D work
-> and are covered by `src/c_abi_tests.zig`; the host-bounce path is
-> unaffected at every level. Under investigation — likely fallout
-> from the 2026-06-09 A-024 region-offset rework, which the D2D
-> path's tests did not cover (the C ABI D2D test runs at L1).
 
 ### vs nvCOMP (enwik9 1 GB, RTX 4060 Ti, re-measured 2026-06-10)
 
