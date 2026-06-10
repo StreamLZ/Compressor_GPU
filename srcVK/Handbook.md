@@ -36,6 +36,11 @@ roundtrips on NVIDIA RTX 4060 Ti and Intel(R) Graphics; ptest_vk
   name are invalid — the Intel-iGPU default-selection saga).
 - `SLZ_VK_PROFILE_DECODE=1` — per-kernel `kper:` lines (VkQueryPool
   timestamps) + per-phase QPC timing + import-path telemetry.
+- `SLZ_VK_D2D=1` — reroutes `-db` through the TRUE-D2D entry
+  (`decompressFramedFromDevice`, the `slzDecompressAsync` path): frame
+  staged to a device buffer once, timed loop is pure device-resident
+  decode, output byte-verified against the host-path result. The VK
+  analog of CUDA's tools/bench_d2d.bat.
 - `SLZ_VK_PROFILE_PHASES=1` — per-phase QPC accumulators on encode
   (`g_enc_phase_*_ns`) and decode (`g_phase_*_ns`); prints `phase:`
   lines. This profiler located the 238 ms d2h_final bottleneck behind

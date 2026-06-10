@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const util = @import("util.zig");
+const vk = @import("../decode/vulkan_api.zig");
 const decoder = @import("../decode/streamlz_decoder.zig");
 const gpu_dec_driver = @import("../decode/driver.zig");
 const module_loader = @import("../decode/module_loader.zig");
@@ -103,6 +104,17 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     gpu_dec_driver.phaseProfileInit();
     try w.flush();
 
+    // SLZ_VK_D2D=1: benchmark the TRUE-D2D entry instead of the
+    // host-bounce path - frame staged into a device buffer once, the
+    // timed loop calls decompressFramedFromDevice (the slzDecompressAsync
+    // path), and the result is byte-verified against the host-path
+    // output from the warm-up above. Env-gated rather than a CLI flag
+    // so the flag surface stays 1:1 with CUDA (whose D2D bench is the
+    // external tools/bench_d2d.bat C harness).
+    if (std.c.getenv("SLZ_VK_D2D") != null) {
+        return runD2D(allocator, w, io, in_path, src, dst, content_size, runs);
+    }
+
     var run_i: u32 = 0;
     while (run_i < runs) : (run_i += 1) {
         const t0 = std.Io.Clock.awake.now(io);
@@ -176,4 +188,92 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     // Per-phase host-overhead breakdown (SLZ_VK_PROFILE_PHASES=1).
     gpu_dec_driver.printAndResetPhaseProfile(w);
     try w.flush();
+}
+
+/// SLZ_VK_D2D=1 mode: true-D2D decode benchmark. `dst` already holds
+/// the host-path warm-up output, which doubles as the verify oracle.
+fn runD2D(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    io: std.Io,
+    in_path: []const u8,
+    src: []const u8,
+    dst: []u8,
+    content_size: usize,
+    runs: u32,
+) !void {
+    const malloc_fn = vk.procs.malloc_device orelse return error.BackendNotAvailable;
+    const free_fn = vk.procs.free_device orelse return error.BackendNotAvailable;
+    const h2d_fn = vk.procs.h2d orelse return error.BackendNotAvailable;
+    const d2h_fn = vk.procs.d2h orelse return error.BackendNotAvailable;
+
+    var d_frame: u64 = 0;
+    if (malloc_fn(&d_frame, src.len) != vk.VK_SUCCESS_RC) return error.BackendNotAvailable;
+    defer _ = free_fn(d_frame);
+    var d_out: u64 = 0;
+    if (malloc_fn(&d_out, content_size + decoder.safe_space) != vk.VK_SUCCESS_RC) return error.BackendNotAvailable;
+    defer _ = free_fn(d_out);
+    if (h2d_fn(d_frame, @ptrCast(src.ptr), src.len) != vk.VK_SUCCESS_RC) return error.BackendNotAvailable;
+
+    // Warm-up + verify: decode once, pull the bytes back, compare to
+    // the host-path output already in `dst`.
+    _ = decoder.decompressFramedFromDevice(io, d_frame, @intCast(src.len), d_out, &gpu_dec_driver.g_default, @intCast(content_size)) catch |err| {
+        try w.print("error: true-D2D decode failed: {s}\n", .{@errorName(err)});
+        try w.flush();
+        std.process.exit(1);
+    };
+    const check = try allocator.alloc(u8, content_size);
+    defer allocator.free(check);
+    if (d2h_fn(@ptrCast(check.ptr), d_out, content_size) != vk.VK_SUCCESS_RC) return error.BackendNotAvailable;
+    const verified = std.mem.eql(u8, check, dst[0..content_size]);
+
+    module_loader.printAndResetProfile(w);
+    gpu_dec_driver.phaseProfileInit();
+    try w.flush();
+
+    var best_ns: u64 = std.math.maxInt(u64);
+    var total_ns: u64 = 0;
+    var best_kern_ns: i64 = std.math.maxInt(i64);
+    var total_kern_ns: i64 = 0;
+    var run_i: u32 = 0;
+    while (run_i < runs) : (run_i += 1) {
+        const t0 = std.Io.Clock.awake.now(io);
+        _ = try decoder.decompressFramedFromDevice(io, d_frame, @intCast(src.len), d_out, &gpu_dec_driver.g_default, @intCast(content_size));
+        const elapsed = @as(u64, @intCast(t0.untilNow(io, .awake).toNanoseconds()));
+        if (elapsed < best_ns) best_ns = elapsed;
+        total_ns += elapsed;
+        var pure_kern_ns: i64 = 0;
+        for (gpu_dec_driver.g_default.last_timings.items) |kt| {
+            pure_kern_ns += @intFromFloat(@as(f64, kt.ms) * 1_000_000.0);
+        }
+        if (pure_kern_ns > 0) {
+            if (pure_kern_ns < best_kern_ns) best_kern_ns = pure_kern_ns;
+            total_kern_ns += pure_kern_ns;
+        }
+    }
+
+    const mean_ns: u64 = total_ns / runs;
+    const mb: f64 = @as(f64, @floatFromInt(content_size)) / (1024.0 * 1024.0);
+    try w.print("bench (TRUE-D2D): {s}\n", .{in_path});
+    try w.print("  src bytes:       {d}\n", .{src.len});
+    try w.print("  decompressed:    {d} ({d:.2} MB)\n", .{ content_size, mb });
+    try w.print("  runs:            {d} (plus 1 warm-up)\n", .{runs});
+    try w.print("  d2d call best:   {d:.3} ms  ({d:.0} MB/s)\n", .{
+        @as(f64, @floatFromInt(best_ns)) / 1_000_000.0, mb * 1e9 / @as(f64, @floatFromInt(best_ns)),
+    });
+    try w.print("  d2d call mean:   {d:.3} ms  ({d:.0} MB/s)\n", .{
+        @as(f64, @floatFromInt(mean_ns)) / 1_000_000.0, mb * 1e9 / @as(f64, @floatFromInt(mean_ns)),
+    });
+    if (best_kern_ns < std.math.maxInt(i64)) {
+        const best_kern_ms = @as(f64, @floatFromInt(best_kern_ns)) / 1_000_000.0;
+        const mean_kern_ms = @as(f64, @floatFromInt(@divTrunc(total_kern_ns, @as(i64, @intCast(runs))))) / 1_000_000.0;
+        try w.print("  gpu kernel best: {d:.3} ms  ({d:.0} MB/s)\n", .{ best_kern_ms, mb * 1000.0 / best_kern_ms });
+        try w.print("  gpu kernel mean: {d:.3} ms  ({d:.0} MB/s)\n", .{ mean_kern_ms, mb * 1000.0 / mean_kern_ms });
+    }
+    try w.print("  verify:          {s}\n", .{if (verified) "OK (matches host-path output)" else "FAIL"});
+    module_loader.printAndResetProfile(w);
+    if (!verified) {
+        try w.flush();
+        std.process.exit(1);
+    }
 }
