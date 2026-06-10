@@ -1148,3 +1148,30 @@ each design-choice in the **Status** field.
 - **Discovered**: 2026-06-10 (batching); root cause + ordering fix
   same day.
 - **Status**: RESOLVED.
+
+### A-027: CUDA-side gather-overlap aux stream NOT mirrored (open divergence)
+- **File:line**: CUDA `src/decode/decode_dispatch.zig::gatherRawOff16`
+  + `ensureGatherOverlap` (aux stream + 2 events, B2 tail, `d20f6e6`);
+  VK `srcVK/decode/decode_dispatch.zig::gatherRawOff16` launches the
+  same kernel inline on work_stream.
+- **Class**: REINVENTION-in-reverse — CUDA gained machinery VK lacks.
+  Surfaced per port-means-port; this is a divergence, not a port
+  decision.
+- **Why not yet mirrored**: the CUDA overlap measured NEUTRAL within
+  noise at both scales (enwik8 4.06→4.09 ms, enwik9 34.05→34.43
+  best-of-15 — the gather was already absorbed by stream slack), so
+  the VK mirror buys nothing measurable today. A faithful VK mirror
+  also would NOT use a second queue: within one cmdbuf Vulkan
+  dispatches are unordered unless barriered, so the natural mirror is
+  NARROWING the A-006 barrier scope (record gather after compact with
+  no barrier separating it from the merge/huff-build chain, barrier
+  only before LZ) — cheaper than CUDA's event plumbing but
+  correctness-sensitive (the global-memory-barrier structure is what
+  A-006 audits).
+- **Trigger to close**: if the raw-off16 share ever grows (wire-format
+  change, #11-class entropy selector) or any future VK
+  barrier-narrowing pass touches this chain, mirror it then and
+  byte-verify via the D2D sweep.
+- **Discovered**: 2026-06-10 (self-audit after the B2 tail landed).
+- **Status**: OPEN — accepted divergence, measured-neutral on the
+  CUDA side.
