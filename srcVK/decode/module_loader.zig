@@ -214,6 +214,12 @@ pub const ProbedDevice = struct {
     device_type: c_int,
     vendor_id: u32,
     api_version: u32,
+    /// Subgroup size range from VkPhysicalDeviceSubgroupSizeControl-
+    /// Properties; 0/0 when the query is unavailable. The codec needs
+    /// 32 inside [min, max] (the gpu_warp.glsl WARP_SIZE contract) —
+    /// --probe surfaces incompatibility without attempting init.
+    min_subgroup: u32,
+    max_subgroup: u32,
 };
 
 pub fn enumerateDevicesForProbe(out: []ProbedDevice) ?u32 {
@@ -272,12 +278,27 @@ pub fn enumerateDevicesForProbe(out: []ProbedDevice) ?u32 {
                 name[name_len] = props.deviceName[name_len];
             }
         }
+        // Subgroup range (best-effort: the props2 entry point is
+        // instance-level and always present on the VK 1.2+ devices we
+        // accept; 0/0 when the chain query is unavailable).
+        var min_sg: u32 = 0;
+        var max_sg: u32 = 0;
+        if (@as(?FnGetPhysicalDeviceProperties2, @ptrCast(gipa(inst, "vkGetPhysicalDeviceProperties2")))) |gpdp2| {
+            var sg_props: VkPhysicalDeviceSubgroupSizeControlProperties = .{};
+            var props2: VkPhysicalDeviceProperties2 = .{};
+            props2.pNext = @ptrCast(&sg_props);
+            gpdp2(pd, &props2);
+            min_sg = sg_props.minSubgroupSize;
+            max_sg = sg_props.maxSubgroupSize;
+        }
         out[i] = .{
             .name_buf = name,
             .name_len = name_len,
             .device_type = dtype,
             .vendor_id = vendor,
             .api_version = api,
+            .min_subgroup = min_sg,
+            .max_subgroup = max_sg,
         };
     }
     return n;
@@ -2138,7 +2159,8 @@ pub fn init() bool {
     // pin, Intel iGPU (supports [8,32]) would silently miscompile while
     // NVIDIA (only supports [32,32]) works by accident. The guard below
     // makes the gpu_warp.glsl contract real — devices that cannot satisfy
-    // subgroupSize==32 are rejected at init so callers fall back to CPU.
+    // subgroupSize==32 are rejected at init and the codec reports
+    // BackendNotAvailable (GPU-only library; there is no CPU fallback).
     if (vkGetPhysicalDeviceProperties2_fn) |gpdp2| {
         var sg_props: VkPhysicalDeviceSubgroupSizeControlProperties = .{};
         var props2: VkPhysicalDeviceProperties2 = .{};
@@ -2154,7 +2176,9 @@ pub fn init() bool {
                 @memcpy(name_z[0..nlen], g_bound_device_name_buf[0..nlen]);
             }
             std.debug.print(
-                "[VK_INIT] rejected device '{s}': subgroupSize range [{d}, {d}] cannot satisfy WARP_SIZE=32 contract (gpu_warp.glsl). Falling back to CPU.\n",
+                "[VK_INIT] unsupported device '{s}': subgroupSize range [{d}, {d}] — this codec requires subgroupSize 32.\n" ++
+                    "Supported GPUs: NVIDIA (Turing or newer), AMD RDNA1 or newer (RX 5000+; wave64-only GCN parts such as Polaris/Vega are not supported), Intel Xe/Arc.\n" ++
+                    "If another GPU is present, select it with --device <N|name> (see --probe).\n",
                 .{ name_z[0..nlen], sg_props.minSubgroupSize, sg_props.maxSubgroupSize },
             );
             return false;

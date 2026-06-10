@@ -67,13 +67,25 @@ fn runProbe(w: *std.Io.Writer) !void {
         const major = (d.api_version >> 22) & 0x7F;
         const minor = (d.api_version >> 12) & 0x3FF;
         const patch = d.api_version & 0xFFF;
-        try w.print("device[{d}]: {s} type={s} vendor=0x{X:0>4} api={d}.{d}.{d}\n", .{
+        try w.print("device[{d}]: {s} type={s} vendor=0x{X:0>4} api={d}.{d}.{d}", .{
             i,
             name_slice,
             decode_module_loader.deviceTypeName(d.device_type),
             d.vendor_id,
             major, minor, patch,
         });
+        // Surface the WARP_SIZE=32 contract verdict per device so an
+        // incompatible machine is diagnosable from --probe alone.
+        if (d.max_subgroup != 0) {
+            const ok = d.min_subgroup <= 32 and d.max_subgroup >= 32;
+            try w.print(" subgroup=[{d},{d}]{s}\n", .{
+                d.min_subgroup,
+                d.max_subgroup,
+                if (ok) "" else "  UNSUPPORTED (requires subgroupSize 32)",
+            });
+        } else {
+            try w.writeAll(" subgroup=[?]\n");
+        }
     }
 }
 

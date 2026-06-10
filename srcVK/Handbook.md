@@ -90,8 +90,12 @@ kernels need a KERNEL_DECLS entry with correct
 
 Decode + encode pipeline creation pin `requiredSubgroupSize=32` +
 `REQUIRE_FULL_SUBGROUPS_BIT`; the device-pick guard rejects devices
-that can't satisfy it. Kernels hardcode `WARP_SIZE=32u`. NVIDIA only
-offers 32; Intel UHD/Iris/Arc and AMD wave32 satisfy the pin.
+that can't satisfy it (with a message naming the supported hardware;
+`--probe` prints each device's subgroup range). Kernels hardcode
+`WARP_SIZE=32u`. NVIDIA only offers 32; Intel UHD/Iris/Arc satisfies
+the pin; AMD only on RDNA1+ (RX 5000+, wave32-capable) — wave64-only
+GCN (Polaris/Vega, e.g. RX 400/500 series) reports [64,64] and can
+never run these kernels (verified on RX 590/RX 550, 2026-06-10).
 
 ### Persistent buffers on EncodeContext
 

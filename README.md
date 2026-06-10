@@ -5,12 +5,14 @@ Driver API, target `sm_89`) do the per-chunk LZ work and 32-stream
 Huffman decode; thin Zig drivers manage the kernel launches and the
 host-side wire-format assembly.
 
-There is one backend: CUDA. The codec was previously available as a
-CPU implementation, byte-exact with a C# reference, plus a Vulkan
-compute-shader decoder fallback. Both were retired on 2026-05-29 so
-the project could maintain one codec rather than three; see
+There are two sibling GPU backends producing byte-identical frames:
+CUDA (`src/`, `streamlz.exe`) and Vulkan (`srcVK/`,
+`streamlz_vk.exe`, built via `zig build streamlz_vk`). There is no
+CPU codec — the historical CPU implementation and an earlier partial
+Vulkan port were retired (see
 [FAILED_EXPERIMENTS.md](FAILED_EXPERIMENTS.md) "Maintaining parallel
-CPU and GPU codebases" for the rationale.
+CPU and GPU codebases" for the rationale; the current `srcVK/` tree
+is a complete 1:1 port at full L1-L5 parity).
 
 ---
 
@@ -46,13 +48,42 @@ at runtime; if it is missing or `cuInit` fails, the codec returns
 To rebuild PTX after editing any `.cu` / `.cuh`:
 
 ```
-tools\build_gpu.bat
+zig build ptx          # recompiles exactly the stale translation units
 ```
 
-The script invokes `nvcc -arch=sm_89 -O3` on the five CUDA
-translation units, then re-runs `zig build` so the freshly-built PTX
-is embedded. `build.zig` enforces a freshness gate that fails the
-build if any source is newer than any PTX.
+(`tools\build_gpu.bat` does the full rebuild with cuobjdump
+res-usage printouts.) `build.zig` enforces a freshness gate that
+fails the build if any source is newer than any PTX.
+
+---
+
+## Supported hardware
+
+**CUDA backend (`streamlz.exe`, `streamlz_gpu.dll`)** — NVIDIA only.
+The committed PTX targets `sm_89`, so the driver JIT requires compute
+capability ≥ 8.9: **RTX 40-series (Ada) or newer**. Older NVIDIA GPUs
+need a PTX rebuild with a lower `-arch` (untested). Requires
+`nvcuda.dll` at runtime.
+
+**Vulkan backend (`streamlz_vk.exe`)** — any Vulkan 1.2+ device that
+can pin `subgroupSize = 32` (the kernels are written warp-for-warp
+against the CUDA originals) and exposes `bufferDeviceAddress` +
+8-bit storage features:
+
+| Vendor | Supported | Not supported |
+|--------|-----------|---------------|
+| NVIDIA | Turing and newer | |
+| AMD | RDNA1 and newer (RX 5000+, wave32-capable) | GCN (wave64-only): Polaris RX 400/500, Vega |
+| Intel | UHD/Iris iGPUs, Arc | |
+
+Incompatible devices are rejected at init with a message naming the
+device and its subgroup range; `streamlz_vk --probe` lists every
+device with its range so you can pick a compatible one via
+`--device <N|name>` (or `SLZ_VK_DEVICE_INDEX=N`).
+
+Verified configurations: NVIDIA RTX 4060 Ti (both backends, primary
+perf target), Intel(R) Graphics iGPU (Vulkan, correctness), AMD
+RX 590/RX 550 (correctly rejected — wave64-only).
 
 ---
 
