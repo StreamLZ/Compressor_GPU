@@ -39,8 +39,11 @@ pub fn gpuWalkFrameImpl(
     try vkCall(memset(self.d_walk_meta, 0, descriptors.walk_meta_offsets.bytes), .copy);
 
     // Launch on caller's `work_stream` (= 0 in sync, caller's stream in
-    // async). No post-kernel sync — any subsequent kernel queued on the
-    // same stream serializes via stream ordering.
+    // async). A-026: followed by an explicit compute->compute barrier -
+    // when this launch is BATCHED into a stream cmdbuf (the D2D entry
+    // promotes onto pipeline_stream), downstream dispatches read the
+    // chunk descs + meta this kernel writes, and Vulkan inserts no
+    // ordering between dispatches in one cmdbuf (A-006).
     const stream = self.work_stream;
     var k_frame: u64 = d_frame;
     var k_chunks: u64 = self.d_walk_chunks;
@@ -86,6 +89,7 @@ pub fn gpuWalkFrameImpl(
     };
     const t_walk = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzWalkFrameKernel", stream);
     try vkCall(launch(module_loader.walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, stream, &params, &extra, &walk_offs), .launch);
+    if (vk.procs.compute_to_compute_barrier) |bf| try vkCall(bf(stream), .sync);
     decode_context.endKernelTiming(t_walk, stream);
 
     return .{

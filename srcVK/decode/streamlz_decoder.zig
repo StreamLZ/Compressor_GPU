@@ -10,6 +10,7 @@ const constants = @import("../format/streamlz_constants.zig");
 const frame = @import("../format/frame_format.zig");
 const block_header = @import("../format/block_header.zig");
 const gpu_driver = @import("driver.zig");
+const vk = @import("vulkan_api.zig");
 
 /// CUDA reference: src/decode/streamlz_decoder.zig:28. Bytes the decoder
 /// is allowed to overshoot past the requested output length.
@@ -105,7 +106,40 @@ pub fn decompressFramedFromDevice(
     if (!gpu_driver.copyDeviceToHost(hdr_buf[0..hdr_n], d_frame)) return error.BadMode;
     const parsed_hdr = frame.parseHeader(hdr_buf[0..]) catch return error.BadMode;
 
+    // A-026 (2026-06-10): batch the WHOLE D2D call onto pipeline_stream.
+    // Without this, the walk launch and the compressed-block D2D copy
+    // each pay their own vkQueueSubmit + fence round-trip (the WDDM
+    // per-submit floor) before fullGpuLaunchImpl's internal sync-mode
+    // promotion kicks in - measured as a ~3.4 ms wall-vs-kernel gap on
+    // enwik8 L1. Promote here instead, mirroring fullGpuLaunchImpl's
+    // iter-4 pattern (it sees work_stream != 0 and skips its own
+    // promotion, mutex, and end-of-call drain - so this fn owns all
+    // three). The dispatcher mutex serializes against concurrent
+    // sync-mode decodes sharing the singleton pipeline_stream cmdbuf.
+    const was_sync = dec_ctx.work_stream == 0;
+    if (was_sync) {
+        try gpu_driver.ensurePipelineStream(dec_ctx);
+        gpu_driver.lockDispatcherMutex();
+        dec_ctx.work_stream = dec_ctx.pipeline_stream;
+    }
+    defer if (was_sync) {
+        dec_ctx.work_stream = 0;
+        gpu_driver.unlockDispatcherMutex();
+    };
+
     const dev = try gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size);
+    // A-026 LIMITATION: the walk must be SUBMITTED before the rest of
+    // the pipeline is recorded. With the walk batched into the same
+    // cmdbuf (compute->compute barrier in place) the downstream
+    // dispatches observe stale/garbage walk output - root cause not
+    // yet isolated (verify-FAIL reproduced reliably; early submit
+    // fixes it; n_chunks reads back correct either way). Costs one
+    // extra submit+wait (~0.5 ms incl. the 0.6 ms walk kernel which
+    // cannot overlap anything anyway). Tracked in v4_ideas #12.
+    if (was_sync) {
+        const sf = vk.procs.stream_sync orelse return error.BackendNotAvailable;
+        if (sf(dec_ctx.work_stream) != vk.VK_SUCCESS_RC) return error.SyncFailed;
+    }
 
     // CUDA reference: src/decode/streamlz_decoder.zig:158-164. Stub
     // host-side slices: the kernel reads from `d_chunk_descs_override`
@@ -133,6 +167,16 @@ pub fn decompressFramedFromDevice(
         .d_n_chunks_dev = dev.d_meta + gpu_driver.walk_meta_offsets.n_chunks,
         .level = parsed_hdr.level,
     });
+
+    // A-026: drain the batch - ONE submit+wait for walk + copy + prefix
+    // + LZ (fullGpuLaunchImpl skipped its sync-mode drain because we
+    // promoted first), then materialize the per-kernel timings the
+    // bench reads from last_timings.
+    if (was_sync) {
+        const sync_fn = vk.procs.stream_sync orelse return error.BackendNotAvailable;
+        if (sync_fn(dec_ctx.work_stream) != vk.VK_SUCCESS_RC) return error.SyncFailed;
+        gpu_driver.finalizeProfiling(&dec_ctx.pending_timings, &dec_ctx.last_timings);
+    }
     return decomp_size;
 }
 

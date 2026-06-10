@@ -3762,10 +3762,26 @@ fn procD2D(dst: VkDeviceBuffer, src: VkDeviceBuffer, size: usize, stream: VkStre
 
 // A-025: D2D with a source byte offset (VkBufferCopy.srcOffset). CUDA
 // analog is src-pointer arithmetic; see vulkan_api.zig procs doc.
+// A-026 (2026-06-10): stream-aware. With a live stream entry the copy
+// records into the TRANSFER cmdbuf (procH2DAsync pattern) so the
+// existing transfer->compute semaphore in streamEndAndWait orders it
+// before the batched kernels - no per-copy vkQueueSubmit+fence round
+// trip. Input-side use only (frame -> d_comp_persist); an output-side
+// copy would need the opposite ordering and must NOT use this path.
 fn procD2DOffset(dst: VkDeviceBuffer, src: VkDeviceBuffer, src_offset: usize, size: usize, stream: VkStream) callconv(.c) VkResult {
-    _ = stream;
-    const dst_e = lookupAlloc(dst) orelse return -1;
-    const src_e = lookupAlloc(src) orelse return -1;
+    const dst_e0 = lookupAlloc(dst) orelse return -1;
+    const src_e0 = lookupAlloc(src) orelse return -1;
+    if (streamEntryFor(stream)) |se| {
+        const rc_t = streamBeginTransferIfNeeded(se);
+        if (rc_t != VK_SUCCESS_RC) return rc_t;
+        const rc_c = streamBeginIfNeeded(se);
+        if (rc_c != VK_SUCCESS_RC) return rc_c;
+        const sregion = VkBufferCopy{ .srcOffset = src_offset, .dstOffset = 0, .size = size };
+        vkCmdCopyBuffer_fn.?(se.transfer_cmdbuf, src_e0.buffer, dst_e0.buffer, 1, @ptrCast(&sregion));
+        return VK_SUCCESS_RC;
+    }
+    const dst_e = dst_e0;
+    const src_e = src_e0;
     var rc = beginOneShotCB();
     if (rc != VK_SUCCESS_RC) return rc;
     const region = VkBufferCopy{ .srcOffset = src_offset, .dstOffset = 0, .size = size };

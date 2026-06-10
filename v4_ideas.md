@@ -393,6 +393,14 @@ idea worth re-evaluating once the basic selector ships.
   Got LESS attractive 2026-06-10: the lock now also binds the CUDA
   context per thread; a redesign would re-solve that for cosmetic
   gain. Only revisit if the lock pattern causes a real failure.
+- **VK D2D walk-batching mystery** (A-026 limitation, 2026-06-10):
+  batching the walk kernel into the same pipeline_stream cmdbuf as
+  prefix+LZ (compute->compute barrier in place) makes downstream
+  dispatches observe stale walk output - verify-FAIL reproduced
+  reliably; submitting the walk early fixes it; n_chunks reads back
+  correct either way. Root cause unknown (descriptor-update or
+  barrier-scope suspect). Isolating it is worth ~0.4-0.5 ms more off
+  the VK D2D wall (7.69 -> 5.51 shipped; ~5.1 possible).
 - **Gather-overlap** (retired BACKPORTS.md B2 tail): run
   slzGatherRawOff16Kernel on a second stream under merge+LUT-build.
   Prize ~0.07 ms (enwik8) / ~0.85 ms (1 GB); cost is cross-stream
