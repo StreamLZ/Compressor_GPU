@@ -27,11 +27,11 @@ Status legend: ✅ done · 🔲 open · 🚫 evaluated, not applicable.
 | ✅ Per-kernel `-db` timings (SLZ_PROFILE_DECODE=1) | VK SLZ_VK_PROFILE_DECODE | `ee925e4` |
 | ✅ Fused 5-way compact dispatch (A-017 mirror): 0.40 -> 0.077 ms, L5 enwik8 d2d 4.17 -> 4.07 | srcVK A-017 | `ee925e4` |
 
-## B. Performance backports — open
+## B. Performance backports — ✅ complete
 
 ### B1. ✅ DONE `ee925e4` — fused as slzCompactAllDescsKernel (5 blocks incl. raw)
 
-VK fused its four compact_huff dispatches (lit/tok/hi/lo) into one
+(Original scoping note.) VK fused its four compact_huff dispatches (lit/tok/hi/lo) into one
 grid-spanning kernel for a 2.4× kernel-time win (0.59 → 0.25 ms,
 `srcVK` A-017). CUDA still launches the kernel FOUR times per decode
 (`src/decode/scan_gpu.zig:221-237`), measured at 4 × ~75 µs = ~0.3 ms
@@ -43,23 +43,23 @@ L3+ decode.**
 
 ### B2. ✅ DONE — slzMergeHuffDescsParKernel (4-block A-017-style merge). Measured enwik8-L5: merge 0.199 -> 0.067 ms, per-kernel sum 4.74 -> 4.38, d2d 4.08. At 1 GB merge is 1.29 ms (serial ~5 ms est). Remaining gather overlap (0.07 ms enwik8) deferred - needs a second stream for at most ~0.07 ms.
 
-The A-021 close-path on VK (v4_ideas #10) applies in spirit to CUDA
+(Original scoping note.) The A-021 close-path on VK (v4_ideas #10) applies in spirit to CUDA
 too: nsys shows merge 0.20 ms + compact_raw 0.08 + gather 0.08 per
 decode. Smaller prize than B1 and the kernels have ordering deps —
 measure after B1 lands before deciding.
 
-## C. Observability / tooling backports — open
+## C. Observability / tooling backports — ✅ complete
 
 ### C1. ✅ DONE `ee925e4`
 
-VK prints `Device: NVIDIA GeForce RTX 4060 Ti` at startup (and the
+(Original scoping note.) VK prints `Device: NVIDIA GeForce RTX 4060 Ti` at startup (and the
 project memory REQUIRES device names next to perf numbers). The CUDA
 CLI prints nothing — `cuDeviceGetName` at init + one line in
 bench/info modes. **Effort: <1 hour.**
 
 ### C2. ✅ DONE `ee925e4` — SLZ_PROFILE_DECODE=1
 
-The begin/endKernelTiming infrastructure and the C ABI
+(Original scoping note.) The begin/endKernelTiming infrastructure and the C ABI
 `slzGetLastTimings` already exist on CUDA, with labels at every launch
 site — but the CLI never surfaces them; we had to use nsys to get
 `slzHuffDecode4StreamKernel` numbers (2026-06-10). Add a `-kt` flag
@@ -68,7 +68,7 @@ site — but the CLI never surfaces them; we had to use nsys to get
 
 ### C3. ✅ DONE — SLZ_PROFILE_PHASES=1 (src/encode/enc_phase.zig)
 
-VK's `SLZ_VK_PROFILE_PHASES` QPC accumulators (encode + decode)
+(Original scoping note.) VK's `SLZ_VK_PROFILE_PHASES` QPC accumulators (encode + decode)
 directly located the 238 ms d2h_final bottleneck that became a 3.2×
 encode win. CUDA has only the decode-side `SLZ_E2E_TIMER` (with two
 known-stale columns — TODO2 items, fields sampled at the same
@@ -79,18 +79,18 @@ encode-perf push.**
 
 ### C4. ✅ DONE — tools/sanitize.bat (memcheck / racecheck)
 
-srcVK lesson: "always run validation before claiming done" caught 3
+(Original scoping note.) srcVK lesson: "always run validation before claiming done" caught 3
 real bugs. CUDA equivalent: a `compute-sanitizer --tool memcheck`
 (and racecheck) pass over ptest + a 1 GB decode, run at milestones.
 Document the invocation in a tools/ script. **Effort: hours to
 script; minutes per use.**
 
-## D. Test-suite backports — open (see v4_ideas #7 for the wave-1 detail)
+## D. Test-suite backports — ✅ complete except by-design deferrals (see v4_ideas #7 for the wave-1 detail)
 
 | Item | VK source | Effort |
 |---|---|---|
 | ✅ Huffman kernel conformance (5 cases, `3a9ba9f`: src/encode/huff_conformance_tests.zig) | `srcVK/tests/huff_decode_conformance.zig` | done |
-| 🔲 C ABI tests — CUDA `slzCompressAsync`/D2D/timings currently has ZERO tests (old ABI tests were src_vulkan's, deleted) | `srcVK/tests/async_d2d_api.zig` | ~1 day |
+| ✅ C ABI tests (10 cases, `5bd3ddc`: src/c_abi_tests.zig — extern-fn binding shape, host+true-D2D roundtrips, timings drain) | `srcVK/tests/async_d2d_api.zig` | done |
 | ✅ CLI smoke tests (5 cases, `e24ee0f`: src/cli_smoke_tests.zig; ptest now installs first) | `srcVK/tests/cli_smoke.zig` | done |
 | ✅ L5 chain-parser hardening (4 cases, `9173844`: src/encode/l5_hardening_tests.zig; also fixed latent per-thread-context bug in lockGpuTests) | srcVK L5 hardening (+4, `f08713d`) | done |
 | 🔲 Host-unit mirrors (descriptor walking, header building) where logic is shared | `srcVK/tests/{decoder,encoder}_unit.zig` (33 tests) | as-touched |
