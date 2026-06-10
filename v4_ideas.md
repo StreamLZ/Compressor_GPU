@@ -275,11 +275,18 @@ the entropy body is Huffman or tANS, and emit whichever is smaller
      symbols no longer does).
   3. Weight-1 symbols fill the `slots_left..L-1` tail — embarrassingly
      parallel already.
-  Target: ≤ 0.2 ms (vs Huffman LUT build 0.160) — removes one of the
-  two strikes against the selector. nvCOMP's §27 MATCH.ANY bucketing
-  is the same idea generalized; for this specific 4-quarter spread
-  the prefix-scan form above is simpler and needs no MATCH.ANY
-  emulation on VK.
+  **IMPLEMENTED + MEASURED same day** (`slzTansFseBuildParKernel` +
+  `buildPackedLut4WayParallel` in tans_upgrade_kernels.cuh): 0.611 ms
+  → **0.228 ms**, verified byte-exact via BIL decode against the new
+  LUTs. One subtlety found the hard way: the serial spread's
+  `weights_sum` accumulates ONLY w>1 symbols (weight-1 symbols are
+  tail-only), so the scan input is `w>1 ? w : 0`. The residual
+  0.228 ms is dominated by the lane-0 serial FSE bit-parse
+  (`decodeFseWeights` — adaptive field widths, inherently
+  sequential); near the floor for this table format. The table-build
+  strike against the selector is now 1.4× (0.228 vs 0.160), down
+  from 3.8×. No MATCH.ANY needed — the prefix-scan form ports to VK
+  with plain subgroup ops.
 - **The decode-core gap stands.** Nothing in nvCOMP's GPU decode path
   breaks tANS's 1-symbol-per-lookup serial state chain — their zstd
   decompress runs ~19.7 GB/s e2e on the same card, well under our

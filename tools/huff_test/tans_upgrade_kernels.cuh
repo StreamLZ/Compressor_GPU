@@ -238,3 +238,152 @@ extern "C" __global__ void __launch_bounds__(64, 4) slzTans32DecodeBilKernel(
     __syncwarp();
     if (lane == 0) out_status[chunk_id] = TANS_OK;
 }
+
+// ==================================================================
+//  Parallel 4-way LUT spread (v4_ideas #11 table-build item).
+//  The production buildPackedLut4Way walks a ~2300-iteration serial
+//  recurrence redundantly on all 32 lanes. But the slot recurrence is
+//  a pure function of cumulative weights: symbol s (weight w,
+//  cum-weight ws) puts y_j = (w + ((ws - j - 1) & 3)) >> 2 slots into
+//  quarter j at cursor q_base[j] + prefix-of-prior-symbols(y_j).
+//  Five shfl-based exclusive scans (w, y0..y3) plus one for the
+//  weight-1 tail make every symbol independent; each lane then fills
+//  its own 8 symbols' slots with no shared memory and no syncs.
+// ==================================================================
+
+__device__ __forceinline__ uint32_t warpExclScan(uint32_t v, int lane, uint32_t* total) {
+    uint32_t incl = v;
+    for (int d = 1; d < 32; d <<= 1) {
+        uint32_t n = __shfl_up_sync(0xFFFFFFFF, incl, d);
+        if (lane >= d) incl += n;
+    }
+    *total = __shfl_sync(0xFFFFFFFF, incl, 31);
+    return incl - v;
+}
+
+__device__ void buildPackedLut4WayParallel(
+    const uint16_t* weights, uint32_t log_table_bits, uint32_t* lut, int lane
+) {
+    const uint32_t L = 1u << log_table_bits;
+    const uint32_t L_mask = L - 1;
+
+    // Phase A: per-symbol exclusive prefixes, 8 batches of 32 symbols.
+    uint32_t ws_l[8], c0_l[8], c1_l[8], c2_l[8], c3_l[8], on_l[8];
+    uint32_t cw = 0, c0 = 0, c1 = 0, c2 = 0, c3 = 0, cones = 0;
+    #pragma unroll
+    for (int b = 0; b < 8; b++) {
+        uint32_t sym = (uint32_t)b * 32u + (uint32_t)lane;
+        uint32_t w = weights[sym];
+        uint32_t tot;
+        // weights_sum in the serial spread accumulates ONLY w>1 symbols
+        // (weight-1 symbols go to the tail and contribute nothing).
+        uint32_t w_eff = (w > 1u) ? w : 0u;
+        uint32_t ws_x = warpExclScan(w_eff, lane, &tot) + cw;
+        cw += tot;
+        ws_l[b] = ws_x;
+        int32_t wsi = (int32_t)ws_x;
+        uint32_t y0 = 0, y1 = 0, y2 = 0, y3 = 0;
+        if (w > 1) {
+            y0 = (uint32_t)(((int32_t)w + ((wsi - 1) & 3)) >> 2);
+            y1 = (uint32_t)(((int32_t)w + ((wsi - 2) & 3)) >> 2);
+            y2 = (uint32_t)(((int32_t)w + ((wsi - 3) & 3)) >> 2);
+            y3 = (uint32_t)(((int32_t)w + ((wsi - 4) & 3)) >> 2);
+        }
+        c0_l[b] = warpExclScan(y0, lane, &tot) + c0; c0 += tot;
+        c1_l[b] = warpExclScan(y1, lane, &tot) + c1; c1 += tot;
+        c2_l[b] = warpExclScan(y2, lane, &tot) + c2; c2 += tot;
+        c3_l[b] = warpExclScan(y3, lane, &tot) + c3; c3 += tot;
+        uint32_t one = (w == 1u) ? 1u : 0u;
+        on_l[b] = warpExclScan(one, lane, &tot) + cones; cones += tot;
+    }
+
+    uint32_t slots_left = L - cones;
+    uint32_t sa = slots_left >> 2;
+    uint32_t qb0 = 0;
+    uint32_t qb1 = qb0 + sa + ((slots_left & 3) > 0 ? 1u : 0u);
+    uint32_t qb2 = qb1 + sa + ((slots_left & 3) > 1 ? 1u : 0u);
+    uint32_t qb3 = qb2 + sa + ((slots_left & 3) > 2 ? 1u : 0u);
+
+    // Phase B: every symbol fills its own slots independently.
+    #pragma unroll
+    for (int b = 0; b < 8; b++) {
+        uint32_t sym = (uint32_t)b * 32u + (uint32_t)lane;
+        uint32_t w = weights[sym];
+        if (w > 1) {
+            uint32_t ws_x = ws_l[b];
+            int32_t wsi = (int32_t)ws_x;
+            uint32_t wb_lo = ilog2(w);
+            uint32_t bps_lo = log_table_bits - wb_lo;
+            uint32_t bps_hi = bps_lo - 1;
+            uint32_t crossover = (1u << (wb_lo + 1)) - w;
+            uint32_t sym_shifted = sym << 16;
+            uint32_t cursor = 0;
+            uint32_t base[4];
+            base[0] = qb0 + c0_l[b];
+            base[1] = qb1 + c1_l[b];
+            base[2] = qb2 + c2_l[b];
+            base[3] = qb3 + c3_l[b];
+            #pragma unroll
+            for (uint32_t j = 0; j < 4; j++) {
+                uint32_t y = (uint32_t)(((int32_t)w + ((wsi - (int32_t)j - 1) & 3)) >> 2);
+                for (uint32_t k = 0; k < y; k++) {
+                    uint32_t offset = cursor;
+                    uint32_t running_w = w + offset;
+                    uint32_t bps = (offset < crossover) ? bps_lo : bps_hi;
+                    lut[base[j] + k] = (bps << 24) | sym_shifted |
+                                       (uint16_t)(L_mask & (running_w << bps));
+                    cursor++;
+                }
+            }
+        } else if (w == 1u) {
+            lut[slots_left + on_l[b]] = (log_table_bits << 24) | (sym << 16);
+        }
+    }
+}
+
+// FSE build kernel with the parallel spread; signature matches
+// slzTansFseBuildKernel so the bench can A/B them directly.
+extern "C" __global__ void __launch_bounds__(64) slzTansFseBuildParKernel(
+    const uint8_t* __restrict__ src_buf,
+    const TansDecChunkDesc* __restrict__ descs,
+    TansLutEnt*    __restrict__ lut_buf,
+    TansTableMeta* __restrict__ meta_buf,
+    uint32_t       num_chunks,
+    uint32_t*      __restrict__ work_counter
+) {
+    const int lane = threadIdx.x & 31;
+    const uint32_t warp_id = threadIdx.y;
+    const uint32_t warp_global = blockIdx.x * 2 + warp_id;
+    const uint32_t total_warps = gridDim.x * 2;
+
+    __shared__ uint16_t s_weights_p[2][256];
+
+    for (uint32_t chunk_id = warp_global; chunk_id < num_chunks; chunk_id += total_warps) {
+        uint32_t log_table_bits = 0;
+        uint32_t err = TANS_OK;
+
+        if (lane == 0) {
+            const uint8_t* src = src_buf + descs[chunk_id].src_offset;
+            uint32_t src_size = descs[chunk_id].src_size;
+            const uint8_t* after_table = nullptr;
+            err = decodeFseWeights(src, src_size, s_weights_p[warp_id],
+                                   log_table_bits, after_table);
+            if (err == TANS_OK) {
+                meta_buf[chunk_id].src_after_table_off =
+                    (uint32_t)((uintptr_t)after_table - (uintptr_t)src_buf);
+                meta_buf[chunk_id].src_end_off =
+                    (uint32_t)((uintptr_t)(src + src_size) - (uintptr_t)src_buf);
+                meta_buf[chunk_id].log_table_bits = log_table_bits;
+            }
+            meta_buf[chunk_id].error = err;
+        }
+        err = __shfl_sync(0xFFFFFFFF, err, 0);
+        if (err != TANS_OK) continue;
+        log_table_bits = __shfl_sync(0xFFFFFFFF, log_table_bits, 0);
+        __syncwarp();
+
+        uint32_t* glut = (uint32_t*)((uint8_t*)lut_buf +
+                         (uint64_t)chunk_id * 2048 * sizeof(TansLutEnt));
+        buildPackedLut4WayParallel(s_weights_p[warp_id], log_table_bits, glut, lane);
+    }
+}

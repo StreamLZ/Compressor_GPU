@@ -207,6 +207,55 @@ static int runUpgradeBenches(
                n_chunks, total_dst / 1e6, best_ms, (double)total_dst / (best_ms * 1e6));
     }
 
+    // ── Parallel FSE table build (5-scan spread) vs production build ──
+    // Verification is via the decode path: rebuild every LUT + meta with
+    // the parallel kernel into fresh buffers, then run the (already
+    // byte-exact) BIL decode against them — matching output proves the
+    // tables identical in effect.
+    {
+        TansLutEnt* d_lut2 = NULL;
+        TansTableMeta* d_meta2 = NULL;
+        UCK(cudaMalloc(&d_lut2, (uint64_t)n_chunks * 2048 * sizeof(TansLutEnt)));
+        UCK(cudaMalloc(&d_meta2, sizeof(TansTableMeta) * n_chunks));
+        UCK(cudaMemset(d_lut2, 0, (uint64_t)n_chunks * 2048 * sizeof(TansLutEnt)));
+
+        dim3 fse_grid((n_chunks + 1) / 2);
+        slzTansFseBuildParKernel<<<fse_grid, block>>>((const uint8_t*)d_comp, d_descs, d_lut2, d_meta2, n_chunks, NULL);
+        le = cudaGetLastError();
+        if (le != cudaSuccess) { printf("fse-par launch error: %s\n", cudaGetErrorString(le)); return 1; }
+        UCK(cudaDeviceSynchronize());
+
+        UCK(cudaMemset(d_out2, 0, out2_bytes));
+        UCK(cudaMemset(d_status, 0xFF, sizeof(uint32_t) * (size_t)n_chunks));
+        slzTans32DecodeBilKernel<<<grid, block>>>(d_src2, d_out2, d_descs, d_status, n_chunks, d_lut2, d_meta2, d_src2off, d_Karr, d_newoff);
+        UCK(cudaDeviceSynchronize());
+        UCK(cudaMemcpy(gpu2, d_out2, out2_bytes, cudaMemcpyDeviceToHost));
+        UCK(cudaMemcpy(status2, d_status, sizeof(uint32_t) * n_chunks, cudaMemcpyDeviceToHost));
+        int sb = 0, mm = 0;
+        for (uint32_t c = 0; c < n_chunks; c++) {
+            if (status2[c] != TANS_OK) sb++;
+            uint32_t cmp_len = (descs[c].dst_size + 127u) & ~127u;
+            if (cmp_len > slot) cmp_len = slot;
+            if (memcmp(gpu2 + (uint64_t)c * slot, exp2 + (uint64_t)c * slot, cmp_len) != 0) mm++;
+        }
+        printf("verify (fse-build-par via decode): %d status errors, %d chunk mismatches%s\n",
+               sb, mm, (sb == 0 && mm == 0) ? "  -- BYTE-EXACT" : "");
+        if (sb || mm) return 1;
+
+        float best_ms = 1e9f;
+        for (int r = 0; r < N_RUNS; r++) {
+            cudaEventRecord(e0);
+            slzTansFseBuildParKernel<<<fse_grid, block>>>((const uint8_t*)d_comp, d_descs, d_lut2, d_meta2, n_chunks, NULL);
+            cudaEventRecord(e1);
+            cudaEventSynchronize(e1);
+            float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+            if (ms < best_ms) best_ms = ms;
+        }
+        printf("[fse-build-par] %u chunks -> best %.3f ms\n", n_chunks, best_ms);
+
+        cudaFree(d_lut2); cudaFree(d_meta2);
+    }
+
     cudaFree(d_out2); cudaFree(d_newoff); cudaFree(d_src2); cudaFree(d_src2off); cudaFree(d_Karr);
     free(new_off); free(exp2); free(gpu2); free(status2); free(src2); free(src2_off); free(Karr);
     return 0;
