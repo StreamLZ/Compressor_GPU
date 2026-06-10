@@ -361,3 +361,10 @@ CPU-only Zig port of the C# StreamLZ codec. Superseded by 3.0.
 - ReleaseSafe + fuzz-harness builds for production hardening.
 
 See git history at tag `v2.0.0` for the 2.x source tree.
+- **v4 #3 measured and parked**: permanent `SLZ_COUNT_PP`
+  instrumentation (compile-time device counters in lz_decode_raw.cuh,
+  default off; `-db` readback via newly-resolved cuModuleGetGlobal
+  under env SLZ_COUNT_PP=1). Long tokens cost 0.16-0.38% of tokens /
+  4.8-10.2% of iterations with ~30-full PP batches - the truncation
+  fix already captured the win; the in-lane long-token parse is not
+  worth building.

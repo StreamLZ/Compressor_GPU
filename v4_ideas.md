@@ -136,6 +136,20 @@ showed no change from the truncation fix, which argues it is small).
 1-2 days and a fiddly two-level variable-length scan. Don't build it
 without the measurement.
 
+**MEASURED 2026-06-10 — parked, don't build.** Instrumentation now
+permanent: `SLZ_COUNT_PP` compile-time flag in lz_decode_raw.cuh
+(device counters, default 0/zero-cost) + `-db` readback via
+cuModuleGetGlobal under env `SLZ_COUNT_PP=1`. Results (raw-mode
+decoder, post-#1/#2):
+  enwik8 L1: serial tokens 0.16%, serial iters 4.8%, avg batch 31.1
+  enwik9 L1: serial tokens 0.38%, serial iters 10.2%, avg batch 30.0
+  enwik9 L5: serial tokens 0.29%, serial iters 8.2%, avg batch 30.4
+The db1e061 truncation fix did the heavy lifting — long tokens cost
+exactly one serial iteration each and batches stay ~30-full. The
+in-lane long-token parse could only remove per-iteration overhead
+(the long copies themselves stay), bounding the win well under the
+iteration fractions. Not worth 1-2 days of fiddly scan code.
+
 ## 4. Tighten `total_subchunks` from worst-case BOUND to actual — ✅ DONE, verified 2026-06-10
 
 **What**: `uploadInputAndPrefixSum` (both backends) sizes entropy
@@ -436,6 +450,15 @@ both sides, enwik8-L5 lit+tok, 3052 chunks / 27.8 MB raw):
 the off16 planes + an enwik9 L5 snapshot — if those push the total
 toward ~0.2 pp, the selector is worth building; if it stays ≈0.1 pp,
 park it.
+**Scoped 2026-06-10**: the extension needs REAL tANS sizes for data
+that was never tANS-encoded (off16 planes; enwik9), and a size MODEL
+would swamp the 0.1-vs-0.2 pp signal — so the prerequisite is
+resurrecting the retired host tANS encoder as a measurement tool:
+`git show 8982fee^:src/encode/entropy/tans_encoder.zig` (1388 lines;
+needs src/io/bit_writer.zig from the same commit), plus an
+encoder-side per-sub-chunk plane dump hook (encode_huff.zig has the
+raw lit/tok/off16-hi/lo bytes AND the exact produced huff sizes —
+better than gate1's +64 B approximations). Own-session-sized.
 
 **Build-out (if both gates pass)**: decode side is moderate — scan
 already dispatches on chunk_type; descs partition into a Huffman

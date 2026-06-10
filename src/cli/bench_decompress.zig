@@ -159,4 +159,37 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
         }
         try w.print("    {s:<36} {d:8.3} ms\n", .{ "(sum of bests)", sum_ms });
     }
+
+    // v4 #3: serial-vs-PP fraction readback. Only produces output when
+    // the PTX was built with SLZ_COUNT_PP=1 (lz_decode_raw.cuh) AND the
+    // env var is set; otherwise cuModuleGetGlobal fails on the missing
+    // symbol and we stay silent. Counters are cumulative across runs -
+    // the fractions cancel the run count.
+    if (std.c.getenv("SLZ_COUNT_PP") != null) countPpReport(w) catch {};
+}
+
+fn countPpReport(w: *std.Io.Writer) !void {
+    const cuda = @import("../decode/cuda_api.zig");
+    const module_loader = @import("../decode/module_loader.zig");
+    const gg = cuda.cuModuleGetGlobal_fn orelse return;
+    const d2h = cuda.cuMemcpyDtoH_fn orelse return;
+    if (module_loader.module == 0) return;
+    var vals: [3]u64 = .{ 0, 0, 0 };
+    const names = [_][*:0]const u8{ "g_slz_pp_batches", "g_slz_pp_tokens", "g_slz_serial_iters" };
+    for (names, 0..) |nm, i| {
+        var dptr: usize = 0;
+        var sz: usize = 0;
+        if (gg(&dptr, &sz, module_loader.module, nm) != cuda.CUDA_SUCCESS) return;
+        if (d2h(@ptrCast(&vals[i]), dptr, 8) != cuda.CUDA_SUCCESS) return;
+    }
+    const pp_batches = vals[0];
+    const pp_tokens = vals[1];
+    const serial = vals[2];
+    const total_tokens = pp_tokens + serial;
+    if (total_tokens == 0) return;
+    const tok_frac = @as(f64, @floatFromInt(serial)) / @as(f64, @floatFromInt(total_tokens));
+    const iter_frac = @as(f64, @floatFromInt(serial)) / @as(f64, @floatFromInt(serial + pp_batches));
+    const avg_batch = if (pp_batches > 0) @as(f64, @floatFromInt(pp_tokens)) / @as(f64, @floatFromInt(pp_batches)) else 0;
+    try w.print("  pp-count: tokens {d} (pp {d} + serial {d})  serial-token-frac {d:.2}%\n", .{ total_tokens, pp_tokens, serial, tok_frac * 100.0 });
+    try w.print("  pp-count: iters  {d} (pp {d} + serial {d})  serial-iter-frac  {d:.2}%  avg-batch {d:.1}\n", .{ serial + pp_batches, pp_batches, serial, iter_frac * 100.0, avg_batch });
 }

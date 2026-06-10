@@ -96,6 +96,7 @@ pub fn init() bool {
     cuda.cuCtxCreate_fn = cuda.getProc(cuda.FnCtxCreate, "cuCtxCreate_v2") orelse cuda.getProc(cuda.FnCtxCreate, "cuCtxCreate");
     cuda.cuModuleLoadData_fn = cuda.getProc(cuda.FnModuleLoadData, "cuModuleLoadData");
     cuda.cuModuleGetFunction_fn = cuda.getProc(cuda.FnModuleGetFunction, "cuModuleGetFunction");
+    cuda.cuModuleGetGlobal_fn = cuda.getProc(cuda.FnModuleGetGlobal, "cuModuleGetGlobal_v2");
     cuda.cuMemAlloc_fn = cuda.getProc(cuda.FnMemAlloc, "cuMemAlloc_v2");
     cuda.cuMemFree_fn = cuda.getProc(cuda.FnMemFree, "cuMemFree_v2");
     cuda.cuMemcpyHtoD_fn = cuda.getProc(cuda.FnMemcpyHtoD, "cuMemcpyHtoD_v2");

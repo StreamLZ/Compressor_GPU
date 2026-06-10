@@ -21,6 +21,22 @@
 
 #include "lz_decode_core.cuh"
 
+// v4 #3 measurement instrumentation: serial-vs-PP iteration counters.
+// Compile-time gated, default OFF (zero cost in shipping PTX). To
+// measure: set SLZ_COUNT_PP to 1 here, `zig build ptx && zig build`,
+// run `streamlz -db` with env SLZ_COUNT_PP=1 (the bench reads the
+// globals back via cuModuleGetGlobal and prints the fractions), then
+// set back to 0. Counters are cumulative across runs - fractions are
+// ratios, so the run count cancels out.
+#ifndef SLZ_COUNT_PP
+#define SLZ_COUNT_PP 0
+#endif
+#if SLZ_COUNT_PP
+__device__ unsigned long long g_slz_pp_batches = 0;   // PP fast-path iterations
+__device__ unsigned long long g_slz_pp_tokens = 0;    // tokens consumed by PP batches
+__device__ unsigned long long g_slz_serial_iters = 0; // serial-path iterations (1 token each)
+#endif
+
 template <bool OFF16_SPLIT>
 __device__ __noinline__ void decodeSubChunkRawMode(
     const uint8_t* __restrict__ cmd, uint32_t cmd_size,
@@ -233,6 +249,12 @@ __device__ __noinline__ void decodeSubChunkRawMode(
                     __syncwarp();
                 }
 
+#if SLZ_COUNT_PP
+                if (lane == 0) {
+                    atomicAdd(&g_slz_pp_batches, 1ull);
+                    atomicAdd(&g_slz_pp_tokens, (unsigned long long)batch_size);
+                }
+#endif
                 cmd_pos   += batch_size;
                 off16_pos += total_off16_used;
                 dst_pos   += total_dst;
@@ -250,6 +272,9 @@ __device__ __noinline__ void decodeSubChunkRawMode(
         int32_t match_offset = recent_offset;
         uint32_t use_recent = 0;
 
+#if SLZ_COUNT_PP
+        if (lane == 0) atomicAdd(&g_slz_serial_iters, 1ull);
+#endif
         // ── Token parse (lane 0 only) ──
         if (lane == 0) {
             uint32_t token = cmd[cmd_pos];
