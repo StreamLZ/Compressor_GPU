@@ -92,7 +92,7 @@ showed no change from the truncation fix, which argues it is small).
 1-2 days and a fiddly two-level variable-length scan. Don't build it
 without the measurement.
 
-## 4. Tighten `total_subchunks` from worst-case BOUND to actual
+## 4. Tighten `total_subchunks` from worst-case BOUND to actual — ✅ DONE, verified 2026-06-10
 
 **What**: `uploadInputAndPrefixSum` (both backends) sizes entropy
 scratch as `num_chunks × ceil(256 KB / sub_chunk_cap)` using the
@@ -109,8 +109,17 @@ constants stop truncating) — i.e. this is the cheap path to VK 1 GB
 L3+ decode. Keep the kernels' self-gating untouched; only the host
 sizing changes.
 
-**Cost/risk**: small, host-only, both backends in step. Highest
-correctness-value-per-line item on this list.
+**Status**: the exact-sum landed on BOTH backends during the
+2026-06-10 A-024 region-offset wave (`uploadInputAndPrefixSum`,
+host-path only; this entry pre-dated that commit and went stale).
+Runtime verification completed 2026-06-10 evening — the first-ever
+VK 1 GB L3+ decodes: enwik9 L3 AND L5 SHA-256 MATCH on RTX 4060 Ti;
+L3 154.4 ms e2e / 44.9 ms kernels, L5 152.0 / 45.4 (-db, r=10).
+e2e at parity with CUDA (PCIe-bound); kernel gap 1.32× vs CUDA's
+34.4 = the A-021 fusion debt (#10), and VK now beats nvCOMP Zstd's
+50.8 ms at 1 GB on kernels. RESIDUAL: the true-D2D path keeps the
+worst-case bound (host can't read device descs) — at 1 GB L3+ D2D
+that's 12 GB scratch again; noted in the #12 basket.
 
 ## 5. Close the VK A-024 residual permanently (BDA entropy scratch)
 
@@ -403,6 +412,13 @@ idea worth re-evaluating once the basic selector ships.
   removed). Full record: PortAdaptations A-026. The hoped ~0.4-0.5 ms
   was mostly the walk kernel itself (which overlaps nothing); real
   win was ~0.1 ms at L1/L2 plus a genuine correctness fix.
+- **D2D entropy-scratch sizing still worst-case** (#4 residual,
+  2026-06-10): the true-D2D path can't host-sum the chunk descs, so
+  1 GB L3+ D2D would allocate the old 12 GB scratch. Cheap exact
+  option: D2H the 4-byte `d_total_subchunks_buf` after prefix-sum —
+  but that adds a mid-pipeline sync point, undoing the A-026
+  single-submit batching. Only matters if 1 GB-class D2D becomes a
+  real workload; bundle with any D2D scale work.
 - **Gather-overlap** (retired BACKPORTS.md B2 tail): run
   slzGatherRawOff16Kernel on a second stream under merge+LUT-build.
   Prize ~0.07 ms (enwik8) / ~0.85 ms (1 GB); cost is cross-stream

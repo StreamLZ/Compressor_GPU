@@ -53,6 +53,15 @@ Wire format unchanged from 2026-06-09; all frames byte-identical.
   L3/L4 cells were flattered by the stale out-copy): L1 5.07 /
   L2 5.05 / L3 7.13 / L4 7.04 / L5 6.86 ms, all byte-verified;
   ptest_vk 150/9/0. Catalog: PortAdaptations A-026.
+- **VK 1 GB L3+ decode verified** (v4 #4 close-out): the exact
+  `total_subchunks` sizing from the A-024 wave (entropy scratch
+  12 -> 6 GB at 1 GB sc=0.25, region offsets back under 2^32) got
+  its first explicit runtime proof - enwik9 L3 AND L5 decode on VK
+  SHA-256 MATCH (RTX 4060 Ti): L3 154.4 ms e2e / 44.9 ms kernels,
+  L5 152.0 / 45.4. e2e at CUDA parity (PCIe-bound); kernel gap
+  1.32x = the A-021 fusion debt (v4 #10); VK beats nvCOMP Zstd's
+  50.8 ms 1 GB kernel time. Residual: the true-D2D path keeps the
+  worst-case bound (v4 #12 basket).
 
 ### Added
 
