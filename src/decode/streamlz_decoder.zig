@@ -154,6 +154,18 @@ pub fn decompressFramedFromDevice(
     const n_chunks_bound: u32 = (decomp_size + min_eff_chunk_size - 1) / min_eff_chunk_size;
     if (n_chunks_bound == 0 or n_chunks_bound > gpu_driver.WALK_MAX_CHUNKS) return error.BadMode;
 
+    // D2H the (tiny) frame header to learn the codec level. The L3+
+    // entropy stages in fullGpuLaunchImpl gate on `req.level >= 3`;
+    // before 2026-06-10 this request left `.level` at its default of 1,
+    // so Huffman frames silently misrouted down the raw path and the
+    // true-D2D entry failed at L3+ (found by tools\bench_d2d.bat).
+    // Same bug class as srcVK iter-4b (`bcaa1f1`). A ≤64-byte D2H is
+    // ~tens of µs against a ≥multi-ms decode.
+    var hdr_buf: [64]u8 = @splat(0);
+    const hdr_n: u32 = @min(frame_size, 64);
+    if (!gpu_driver.copyDeviceToHost(hdr_buf[0..hdr_n], d_frame)) return error.BadMode;
+    const parsed_hdr = frame.parseHeader(hdr_buf[0..]) catch return error.BadMode;
+
     const dev = try gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size);
 
     // Stub slices: the kernel reads from `d_chunk_descs_override` and
@@ -172,6 +184,7 @@ pub fn decompressFramedFromDevice(
         .decompressed_size = decomp_size,
         .chunks_per_group = 1,
         .sub_chunk_cap = @intCast(gpu_driver.ENTROPY_SCRATCH_SLOT_BYTES),
+        .level = parsed_hdr.level,
         .io = io,
         .d_output_target = d_output,
         .d_compressed_src = d_frame + block_start,

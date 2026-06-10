@@ -319,38 +319,44 @@ test "C ABI: slzCompressAsync + slzDecompressAsync D2D roundtrip (NULL stream)" 
         null,
     ));
 
-    // Full D2D compress on the NULL stream (defaults to sync behavior).
-    try testing.expectEqual(SLZ_SUCCESS, slzCompressAsync(
-        h,
-        @ptrFromInt(d_in),
-        src.len,
-        @ptrFromInt(d_comp),
-        bound,
-        &comp_size,
-        .{ .level = 1 },
-        null,
-    ));
-    try testing.expect(comp_size > 0);
-    try testing.expect(comp_size <= bound);
-    if (sync_fn() != cuda.CUDA_SUCCESS) return error.SyncFailed;
+    // Full D2D roundtrips on the NULL stream at L1 AND L5 — the L5
+    // case exercises the Huffman/entropy decode path through the
+    // true-D2D entry. Regression guard for the 2026-06-10 bug where
+    // decompressFramedFromDevice left DecodeRequest.level at its
+    // default of 1, silently misrouting every L3+ frame down the raw
+    // path (this test originally ran only at L1 and missed it).
+    for ([_]c_int{ 1, 5 }) |lvl| {
+        try testing.expectEqual(SLZ_SUCCESS, slzCompressAsync(
+            h,
+            @ptrFromInt(d_in),
+            src.len,
+            @ptrFromInt(d_comp),
+            bound,
+            &comp_size,
+            .{ .level = lvl },
+            null,
+        ));
+        try testing.expect(comp_size > 0);
+        try testing.expect(comp_size <= bound);
+        if (sync_fn() != cuda.CUDA_SUCCESS) return error.SyncFailed;
 
-    // True-D2D decompress of the device-resident frame.
-    try testing.expectEqual(SLZ_SUCCESS, slzDecompressAsync(
-        h,
-        @ptrFromInt(d_comp),
-        comp_size,
-        @ptrFromInt(d_out),
-        src.len,
-        .{},
-        null,
-    ));
-    if (sync_fn() != cuda.CUDA_SUCCESS) return error.SyncFailed;
+        try testing.expectEqual(SLZ_SUCCESS, slzDecompressAsync(
+            h,
+            @ptrFromInt(d_comp),
+            comp_size,
+            @ptrFromInt(d_out),
+            src.len,
+            .{},
+            null,
+        ));
+        if (sync_fn() != cuda.CUDA_SUCCESS) return error.SyncFailed;
 
-    const dst = try allocator.alloc(u8, src.len);
-    defer allocator.free(dst);
-    @memset(dst, 0x55);
-    if (d2h_fn(@ptrCast(dst.ptr), d_out, src.len) != cuda.CUDA_SUCCESS) return error.CopyFailed;
-    try testing.expectEqualSlices(u8, src, dst);
+        const dst = try allocator.alloc(u8, src.len);
+        defer allocator.free(dst);
+        @memset(dst, 0x55);
+        if (d2h_fn(@ptrCast(dst.ptr), d_out, src.len) != cuda.CUDA_SUCCESS) return error.CopyFailed;
+        try testing.expectEqualSlices(u8, src, dst);
+    }
 }
 
 // ── Timings drain ──────────────────────────────────────────────────

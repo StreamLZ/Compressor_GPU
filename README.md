@@ -162,7 +162,7 @@ L1-L2 are LZ-only (no entropy stage). L3-L5 add 32-stream GPU Huffman.
 | Window | StreamLZ L5 | nvCOMP Zstd | StreamLZ win |
 |--------|------------:|------------:|-------------:|
 | Pipeline kernel-sum | **4.39 ms** | 6.25 ms | 1.42× |
-| Async call wall     | 5.94 ms* | 6.25 ms | 1.05× |
+| Async call wall     | **5.47 ms** | 6.25 ms | 1.14× |
 | End-to-end host wall | **15.38 ms** | 18.16 ms | 1.18× |
 
 StreamLZ columns re-measured 2026-06-10; nvCOMP columns are the
