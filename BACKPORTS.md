@@ -77,7 +77,7 @@ instant). Backport the per-phase accumulator pattern to
 in there. **Effort: ~half day. Value: prerequisite for the next
 encode-perf push.**
 
-### C4. 🔲 compute-sanitizer as the validation-layer analog
+### C4. ✅ DONE — tools/sanitize.bat (memcheck / racecheck)
 
 srcVK lesson: "always run validation before claiming done" caught 3
 real bugs. CUDA equivalent: a `compute-sanitizer --tool memcheck`
