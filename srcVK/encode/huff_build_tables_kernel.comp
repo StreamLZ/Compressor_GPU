@@ -1,6 +1,5 @@
 // 1:1 port of src/encode/huffman_kernel.cu, entry point slzHuffBuildTablesKernel.
 // CUDA reference: src/encode/huffman_kernel.cu:111-227.
-// See srcVK/PortInstructions.md.
 //
 // Per-sub-chunk Huffman table builder. Histograms the input via shared
 // atomicAdd, then lane 0 builds a sibling-merge tree, applies the

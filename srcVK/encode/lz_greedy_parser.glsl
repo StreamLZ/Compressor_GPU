@@ -12,7 +12,6 @@
 //   __popc(x)                     -> bitCount(x)
 //   __syncwarp()                  -> subgroupBarrier(); subgroupMemoryBarrierBuffer();
 //
-// See srcVK/PortInstructions.md.
 
 #ifndef SRCVK_ENCODE_LZ_GREEDY_PARSER_GLSL
 #define SRCVK_ENCODE_LZ_GREEDY_PARSER_GLSL
@@ -33,8 +32,8 @@ const uint NO_MATCH_STEP_MAX         = 16u;
 // a bitmask of every lane whose `key` equals this lane's. GLSL has no
 // direct equivalent — we open-code it by walking the 32 lanes via
 // subgroupShuffle and comparing keys. This is the same shape the
-// foundation-wave match_any_bench used and is documented at
-// srcVK/PortInstructions.md (intrinsic mapping table).
+// foundation-wave match_any_bench used (intrinsic mapping documented
+// in the retired PortInstructions.md, in git history).
 uint openCodedMatchAny(uint key) {
     uint mask = 0u;
     for (uint i = 0u; i < WARP_SIZE; i += 1u) {

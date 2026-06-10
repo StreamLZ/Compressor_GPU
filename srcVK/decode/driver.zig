@@ -6,7 +6,6 @@
 //! must live here — Zig cannot re-export a pub var from another module
 //! through pub const).
 //!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
 
 const vk = @import("vulkan_api.zig");
 const module_loader = @import("module_loader.zig");

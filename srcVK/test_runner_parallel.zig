@@ -3,7 +3,6 @@
 //! Parallel test runner for the VK port. Runs tests across multiple
 //! threads for faster CI/dev feedback. Used by `zig build ptest_vk`.
 //!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
 
 const std = @import("std");
 const builtin = @import("builtin");

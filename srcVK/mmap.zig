@@ -5,7 +5,6 @@
 //! path. On Windows uses CreateFileMappingW + MapViewOfFile; on POSIX
 //! uses std.posix.mmap.
 //!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
 
 const std = @import("std");
 const builtin = @import("builtin");

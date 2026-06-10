@@ -1,7 +1,6 @@
 // 1:1 port of src/decode/lz_decode_core.cuh.
 // Shared warp/subgroup primitives used by raw + general decoders:
 // warpScanU32, warpLiteralCopy, warpMatchCopy.
-// See srcVK/PortInstructions.md.
 
 #ifndef SRCVK_DECODE_LZ_DECODE_CORE_GLSL
 #define SRCVK_DECODE_LZ_DECODE_CORE_GLSL

@@ -4,7 +4,6 @@
 //! decoded via VK port; byte-compare against original. Test bodies
 //! added by the fleshout agent.
 //!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
 
 const std = @import("std");
 const testing = std.testing;

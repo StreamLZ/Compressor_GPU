@@ -3,7 +3,6 @@
 // 3-pass assembly chain: write [3-byte sub-chunk header][assembled
 // payload] for every sub-chunk into d_frame. One warp per sub-chunk.
 //
-// See srcVK/PortInstructions.md.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require

@@ -5,7 +5,6 @@
 //! (renamed from `cudaCall` per Section B), and the per-kernel timing
 //! types.
 //!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
 
 const std = @import("std");
 

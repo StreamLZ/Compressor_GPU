@@ -4,7 +4,6 @@
 // + host-precomputed per-chunk layout into a complete StreamLZ frame.
 // L1 hot path.
 //
-// See srcVK/PortInstructions.md.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require

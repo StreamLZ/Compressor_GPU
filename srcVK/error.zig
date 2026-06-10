@@ -7,7 +7,6 @@
 //! decode/encode trees re-use `NotImplementedL2` and `NotYetPorted`
 //! directly from this module.
 //!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
 
 /// Returned by L2+ entry points whose bodies have not yet been ported
 /// from CUDA. The L2 gate in srcVK/decode/decode_dispatch.zig and the

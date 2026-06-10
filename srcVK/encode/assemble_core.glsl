@@ -8,7 +8,6 @@
 // uses for warpCopy / warpLiteralCopy). The CUDA `RawStreams` struct
 // dissolves into a fixed set of in-scope locals named `_pr_*`.
 //
-// See srcVK/PortInstructions.md.
 
 #ifndef SRCVK_ENCODE_ASSEMBLE_CORE_GLSL
 #define SRCVK_ENCODE_ASSEMBLE_CORE_GLSL

@@ -1,6 +1,5 @@
 // 1:1 port of src/encode/huffman_kernel.cu, entry point slzHuffEncode4StreamKernel.
 // CUDA reference: src/encode/huffman_kernel.cu:246-395.
-// See srcVK/PortInstructions.md.
 //
 // HUFF_NUM_STREAMS-way parallel encode. One workgroup per sub-chunk; the
 // 32 warp lanes each encode one input slice into per-stream scratch, then

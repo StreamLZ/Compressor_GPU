@@ -4,7 +4,6 @@
 //! VK decoder, byte-compare against the original. Bodies stubbed in
 //! this skeleton pass; fleshout adds the real test {} blocks.
 //!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
 
 const std = @import("std");
 const encoder = @import("streamlz_encoder.zig");

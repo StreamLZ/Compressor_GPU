@@ -1,7 +1,6 @@
 // 1:1 port of src/decode/compact_descs_kernels.cuh, entry point
 // slzCompactRawDescsKernel.
 // CUDA reference: src/decode/compact_descs_kernels.cuh:62-89.
-// See srcVK/PortInstructions.md.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require

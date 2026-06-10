@@ -3,7 +3,6 @@
 //! Encode driver facade. Owns g_default + last_kernel_ns; re-exports
 //! every public symbol from the encode sub-modules.
 //!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
 
 const module_loader = @import("module_loader.zig");
 const encode_context = @import("encode_context.zig");

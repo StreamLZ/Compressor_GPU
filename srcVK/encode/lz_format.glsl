@@ -4,7 +4,6 @@
 // (the SSBO byte-load lives in the caller) to sidestep GLSL's lack of
 // SSBO-pointer parameters.
 //
-// See srcVK/PortInstructions.md.
 
 #ifndef SRCVK_ENCODE_LZ_FORMAT_GLSL
 #define SRCVK_ENCODE_LZ_FORMAT_GLSL

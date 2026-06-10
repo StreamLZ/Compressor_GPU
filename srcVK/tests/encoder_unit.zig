@@ -4,7 +4,6 @@
 //! Options validation, writeUncompressedFrame path for tiny inputs. No
 //! GPU. Test bodies added by the fleshout agent.
 //!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
 
 const std = @import("std");
 const testing = std.testing;

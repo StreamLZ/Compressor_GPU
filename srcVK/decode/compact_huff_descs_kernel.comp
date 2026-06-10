@@ -1,7 +1,6 @@
 // 1:1 port of src/decode/compact_descs_kernels.cuh, entry point
 // slzCompactHuffDescsKernel.
 // CUDA reference: src/decode/compact_descs_kernels.cuh:39-60.
-// See srcVK/PortInstructions.md.
 //
 // VK adaptation (A-017, 2026-06-08): CUDA dispatches this kernel 4×
 // per decode (one per Huffman stream type: lit, tok, off16hi, off16lo)

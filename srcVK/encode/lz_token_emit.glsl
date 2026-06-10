@@ -7,7 +7,6 @@
 // names + cursor identifiers in scope as plain identifiers. The
 // arithmetic and emit sequence are byte-identical to CUDA.
 //
-// See srcVK/PortInstructions.md.
 
 #ifndef SRCVK_ENCODE_LZ_TOKEN_EMIT_GLSL
 #define SRCVK_ENCODE_LZ_TOKEN_EMIT_GLSL

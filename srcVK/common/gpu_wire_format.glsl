@@ -2,7 +2,6 @@
 // Shared device-side wire-format constants used by every encode + decode
 // compute shader. Must agree byte-for-byte with srcVK/format/streamlz_constants.zig
 // and srcVK/decode/slz_wire_format.glsl.
-// See srcVK/PortInstructions.md.
 
 #ifndef SRCVK_COMMON_GPU_WIRE_FORMAT_GLSL
 #define SRCVK_COMMON_GPU_WIRE_FORMAT_GLSL

@@ -1,7 +1,6 @@
 // 1:1 port of src/decode/slz_wire_format.cuh.
 // Device-side wire-format constants + descriptor structs + header
 // parsers. Must match srcVK/decode/descriptors.zig byte-for-byte.
-// See srcVK/PortInstructions.md.
 
 #ifndef SRCVK_DECODE_SLZ_WIRE_FORMAT_GLSL
 #define SRCVK_DECODE_SLZ_WIRE_FORMAT_GLSL

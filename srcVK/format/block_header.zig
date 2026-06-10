@@ -3,7 +3,6 @@
 //! Internal 2-byte StreamLZ block header + 4-byte chunk header parsers.
 //! Pure host code, no CUDA tokens, no device dependencies.
 //!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
 
 const std = @import("std");
 const constants = @import("streamlz_constants.zig");

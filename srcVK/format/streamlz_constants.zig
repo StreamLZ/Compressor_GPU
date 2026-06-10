@@ -5,7 +5,6 @@
 //! srcVK/common/gpu_wire_format.glsl — the two files must agree byte for
 //! byte.
 //!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
 
 // ── Chunk sizing and header bit layout ─────────────────────────────────
 pub const chunk_size: usize = 0x40000; // 256 KB

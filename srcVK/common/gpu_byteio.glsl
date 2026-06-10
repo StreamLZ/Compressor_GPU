@@ -10,7 +10,6 @@
 // `const uint8_t* p` becomes an explicit list of byte arguments. The
 // arithmetic is identical to the CUDA implementation.
 //
-// See srcVK/PortInstructions.md.
 
 #ifndef SRCVK_COMMON_GPU_BYTEIO_GLSL
 #define SRCVK_COMMON_GPU_BYTEIO_GLSL

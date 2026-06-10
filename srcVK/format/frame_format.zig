@@ -4,7 +4,6 @@
 //! dependencies — the wire format is shared verbatim between the CUDA
 //! and Vulkan backends.
 //!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
 
 const std = @import("std");
 const constants = @import("streamlz_constants.zig");

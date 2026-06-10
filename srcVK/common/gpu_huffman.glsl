@@ -3,7 +3,6 @@
 // HUFF_BODY_HEADER_BYTES, HUFF_*. L2 stub: constants live in this header
 // (the Zig host encode_huff.zig references them at compile time); the
 // device-side bodies of the Huffman shaders are stubbed.
-// See srcVK/PortInstructions.md.
 
 #ifndef SRCVK_COMMON_GPU_HUFFMAN_GLSL
 #define SRCVK_COMMON_GPU_HUFFMAN_GLSL

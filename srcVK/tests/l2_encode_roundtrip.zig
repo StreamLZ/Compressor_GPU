@@ -19,7 +19,6 @@
 //! cross-backend tests (cross_backend_roundtrip.zig) carry the full SHA
 //! byte-identity gate.
 //!
-//! See srcVK/PortInstructions.md for the fleshout checklist.
 
 const std = @import("std");
 const testing = std.testing;

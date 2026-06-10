@@ -1,6 +1,5 @@
 // 1:1 port of src/decode/scan_parse_kernel.cuh, entry point slzScanParseKernel.
 // CUDA reference: src/decode/scan_parse_kernel.cuh:108-234.
-// See srcVK/PortInstructions.md.
 //
 // One thread per chunk walks every sub-chunk's literal / token / off16
 // stream headers and stages a descriptor per stream type per global

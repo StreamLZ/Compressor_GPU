@@ -3,7 +3,6 @@
 // 3-pass assembly chain: measure each sub-chunk's assembled payload size
 // into `enc_sizes`. One warp per sub-chunk.
 //
-// See srcVK/PortInstructions.md.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require

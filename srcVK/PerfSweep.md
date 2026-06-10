@@ -130,7 +130,7 @@ input sizes — but the kernel-time gap is real and worth documenting.
 
 Note this is **after** the A-016 (u32-aliased SSBO store) and A-017
 (fused 4x compact_huff_descs) fixes that closed L5 specifically from
-1.15x/1.17x to 1.03x/1.04x as documented in ToDo.md. The remaining
+1.15x/1.17x to 1.03x/1.04x (history in the retired ToDo.md). The remaining
 1.20x-1.37x is concentrated in the `lz_decode_kernel` (L3+ huff-aware
 workhorse) and is consistent with the structural cost of:
 1. Per-binding offset dispatch ABI (A-007) — extra descriptor work per
@@ -149,11 +149,11 @@ fusion approach could close it.
 
 ### Open gap: web.txt small-file regime (decode 2.66x-2.92x, encode 1.33x-1.67x)
 
-Documented residual **#1** in `srcVK/ToDo.md` "Known accepted residuals".
+Documented residual **#1** in `srcVK/Handbook.md` "Accepted residuals".
 Captured by **A-VK-WDDM submit-floor** (no dedicated catalog entry yet
 because there is no single source line to point at — it is the
 structural cost of Vulkan-on-WDDM per-dispatch overhead floor). The
-sweep numbers track the prior bench numbers in the ToDo.md (decode
+sweep numbers track the prior bench numbers (decode
 2.6x, encode 1.73x). No regression.
 
 ### Closed gap: silesia L3 0.019% larger output (A-008 RESOLVED 2026-06-09)

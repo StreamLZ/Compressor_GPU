@@ -206,8 +206,10 @@ PortAdaptations.md                catalog of every CUDA-VK divergence
                                   static + runtime verification status)
 PerfSweep.md                      Phase 5 perf parity tables (L1-L5 ×
                                   3 corpora × VK + CUDA × decode + encode)
-ToDo.md                           current status + remaining work + the
-                                  CRITICAL HYGIENE RULES section
+Handbook.md                       operations handbook: invariants,
+                                  env-var contract, lessons learned,
+                                  measurement recipes (replaces the
+                                  retired ToDo.md/gameplan.md)
 ```
 
 ---
@@ -272,8 +274,8 @@ imported destination + single submit) eliminated 200+ ms of D2H staging
 cost on enwik8.
 
 For per-divergence detail see [PortAdaptations.md](PortAdaptations.md).
-For the full kernel inventory + bench measurement procedures see
-[ToDo.md](ToDo.md).
+For invariants + bench measurement procedures see
+[Handbook.md](Handbook.md).
 
 ---
 

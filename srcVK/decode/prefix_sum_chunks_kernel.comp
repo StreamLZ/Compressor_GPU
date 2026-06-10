@@ -1,6 +1,5 @@
 // 1:1 port of src/decode/prefix_sum_chunks_kernel.cuh, entry point slzPrefixSumChunksKernel.
 // CUDA reference: src/decode/prefix_sum_chunks_kernel.cuh:17-38.
-// See srcVK/PortInstructions.md.
 // L1 hot path: per-chunk first-sub-chunk-index prefix sum.
 
 #version 460 core

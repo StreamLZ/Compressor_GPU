@@ -9,7 +9,6 @@
 //! tests skip with SkipZigTest so a CUDA-toolchain-less dev box still
 //! reports a clean run.
 //!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
 
 const std = @import("std");
 const testing = std.testing;

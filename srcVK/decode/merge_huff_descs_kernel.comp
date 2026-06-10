@@ -1,7 +1,6 @@
 // 1:1 port of src/decode/merge_huff_descs_kernel.cuh, entry point
 // slzMergeHuffDescsKernel.
 // CUDA reference: src/decode/merge_huff_descs_kernel.cuh:41-62.
-// See srcVK/PortInstructions.md.
 //
 // Single-threaded merge of four per-stream compacted SlzHuffDecChunkDesc
 // arrays into one merged array. Adds per-region out_offset and assigns

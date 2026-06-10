@@ -3,7 +3,6 @@
 // path. Streamlined single-LZ-block path: no off32, no delta literals,
 // no block split.
 //
-// See srcVK/PortInstructions.md.
 
 #ifndef SRCVK_DECODE_LZ_DECODE_RAW_GLSL
 #define SRCVK_DECODE_LZ_DECODE_RAW_GLSL

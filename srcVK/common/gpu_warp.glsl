@@ -13,7 +13,6 @@
 //   #extension GL_KHR_shader_subgroup_shuffle   : require
 //   #extension GL_KHR_shader_subgroup_vote      : require
 //
-// See srcVK/PortInstructions.md.
 
 #ifndef SRCVK_COMMON_GPU_WARP_GLSL
 #define SRCVK_COMMON_GPU_WARP_GLSL

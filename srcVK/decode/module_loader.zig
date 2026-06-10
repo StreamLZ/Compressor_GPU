@@ -15,7 +15,6 @@
 //! hold VkPipeline handles (built by vkCreateComputePipelines off the
 //! corresponding VkShaderModule + a per-kernel VkPipelineLayout).
 //!
-//! See srcVK/PortInstructions.md for the fleshout checklist for this file.
 
 const std = @import("std");
 const vulkan_api = @import("vulkan_api.zig");
@@ -1430,8 +1429,8 @@ var g_max_storage_buffer_range: u64 = 0;
 // readbackAndPrintProfile (called from cli/bench_decompress.zig) drains
 // streams, reads all timestamps, sums per KernelKind, prints "kper:"
 // lines to stderr, and resets the recording cursor. Pure measurement
-// instrumentation — no algorithm change. See M5/M6/M7 in
-// srcVK/gameplan.md for the env-var contract.
+// instrumentation — no algorithm change. See srcVK/Handbook.md for
+// the env-var contract.
 var g_profile_enabled: bool = false;
 const g_profile_max_records: u32 = 1024;
 const g_profile_slot_count: u32 = g_profile_max_records * 2;

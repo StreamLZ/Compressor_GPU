@@ -3,7 +3,6 @@
 // parallel greedy LZ encoder. One warp per chunk, one chunk per
 // workgroup (matching CUDA's grid_x=num_chunks, block(32,1,1) launch).
 //
-// See srcVK/PortInstructions.md.
 
 #version 460 core
 #extension GL_KHR_shader_subgroup_basic : require

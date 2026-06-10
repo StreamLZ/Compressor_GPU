@@ -1,7 +1,6 @@
 // 1:1 port of src/decode/gather_raw_off16_kernel.cuh, entry point
 // slzGatherRawOff16Kernel.
 // CUDA reference: src/decode/gather_raw_off16_kernel.cuh:23-38.
-// See srcVK/PortInstructions.md.
 //
 // Single-launch scatter of raw (type-0) off16 sub-streams from the
 // compressed blob into the off16 scratch. Per-block self-gate on the

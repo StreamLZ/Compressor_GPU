@@ -1,7 +1,6 @@
 // 1:1 port of src/decode/huffman_kernel.cu, entry point
 // slzHuffDecode4StreamKernel.
 // CUDA reference: src/decode/huffman_kernel.cu:386-697.
-// See srcVK/PortInstructions.md.
 //
 // 32-stream bounded-interleaved (BIL) Huffman decode. One warp (= one
 // 32-wide subgroup) per HuffDecChunkDesc. All 32 lanes decode their own

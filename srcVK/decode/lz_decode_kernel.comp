@@ -1,7 +1,6 @@
 // 1:1 port of src/decode/lz_decode_kernels.cuh, entry point slzLzDecodeKernel.
 // CUDA reference: src/decode/lz_decode_kernels.cuh:31-144 (general entry).
 // Phase 2A-decoder iter 4: full general decoder body + lit/cmd in-scratch path.
-// See srcVK/PortInstructions.md.
 //
 // L2+ general entropy-capable LZ decoder. Iterates sub-chunks per warp
 // and hands off to parseAndDecodeSubChunk (general decoder) or copies

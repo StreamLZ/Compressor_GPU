@@ -1,6 +1,5 @@
 // 1:1 port of src/decode/lz_decode_kernels.cuh, entry point slzLzDecodeRawKernel.
 // CUDA reference: src/decode/lz_decode_kernels.cuh:158-231 (raw-mode entry).
-// See srcVK/PortInstructions.md.
 // L1 hot path: this is the raw LZ decode kernel for level-1 frames.
 
 #version 460 core
