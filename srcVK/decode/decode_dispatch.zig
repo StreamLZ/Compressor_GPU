@@ -201,6 +201,7 @@ const FnLaunchKernel = *const fn (
 const FnCtxSync = *const fn () callconv(.c) VkResult;
 const FnStreamSync = *const fn (VkStream) callconv(.c) VkResult;
 const FnD2D = *const fn (VkDeviceBuffer, VkDeviceBuffer, usize, VkStream) callconv(.c) VkResult;
+const FnD2DOffset = *const fn (VkDeviceBuffer, VkDeviceBuffer, usize, usize, VkStream) callconv(.c) VkResult;
 
 /// CUDA reference: src/decode/decode_dispatch.zig:47-65. Renamed from
 /// CudaProcs per Section B. Bundle of the function-pointer slots the
@@ -230,6 +231,8 @@ pub const VkProcs = struct {
     // Optional so legacy backends without the slot still resolve.
     stream_flush_transfer: ?FnStreamSync,
     d2d: ?FnD2D,
+    // A-025: D2D with source byte offset (true-D2D compressed-block copy).
+    d2d_offset: ?FnD2DOffset,
     // VK adaptation: COMPUTE_SHADER_WRITE → COMPUTE_SHADER_READ pipeline
     // barrier on the stream's open cmdbuf. Required at the Huffman-decode
     // → LZ-decode boundary where the LZ general kernel reads the
@@ -255,6 +258,7 @@ pub const VkProcs = struct {
             .stream_sync = vk.procs.stream_sync orelse return error.BackendNotAvailable,
             .stream_flush_transfer = vk.procs.stream_flush_transfer,
             .d2d = vk.procs.d2d,
+            .d2d_offset = vk.procs.d2d_offset,
             .compute_to_compute_barrier = vk.procs.compute_to_compute_barrier,
         };
     }
@@ -533,6 +537,10 @@ pub const DecodeRequest = struct {
     io: ?std.Io,
     d_output_target: ?u64,
     d_compressed_src: ?u64,
+    /// A-025: byte offset of the compressed block within
+    /// `d_compressed_src`. CUDA folds this into the pointer; VK needs it
+    /// separate because VkDeviceBuffer is a registry index.
+    d_compressed_src_offset: u64 = 0,
     /// When non-null, the chunk descs already live on the device at
     /// this address (`chunk_descs.len * sizeof(ChunkDesc)` bytes) and
     /// the H2D from the host slice is skipped. Used by
@@ -1034,8 +1042,11 @@ pub fn uploadInputAndPrefixSum(
     // available so it batches with the surrounding kernels (iter 4).
     if (req.compressed_block.len > 0) {
         if (req.d_compressed_src) |dev_src| {
-            const d2d = procs.d2d orelse return error.BackendNotAvailable;
-            try vkCall(d2d(self.d_comp_persist, dev_src, req.compressed_block.len, self.work_stream), .copy);
+            // A-025: the compressed block sits at a byte offset inside
+            // the caller's frame buffer; the offset travels separately
+            // (registry-index handles cannot carry pointer arithmetic).
+            const d2d_off = procs.d2d_offset orelse return error.BackendNotAvailable;
+            try vkCall(d2d_off(self.d_comp_persist, dev_src, req.d_compressed_src_offset, req.compressed_block.len, self.work_stream), .copy);
         } else {
             const _t_h2d_comp0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
             try vkCall(h2dRoute(procs, self.work_stream, self.d_comp_persist, @ptrCast(req.compressed_block.ptr), req.compressed_block.len), .copy);

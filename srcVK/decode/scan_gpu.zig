@@ -44,30 +44,28 @@ pub fn gpuWalkFrameImpl(
     const stream = self.work_stream;
     var k_frame: u64 = d_frame;
     var k_chunks: u64 = self.d_walk_chunks;
-    var k_meta_n: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.n_chunks;
-    var k_meta_decomp: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.decomp_size;
-    var k_meta_sccap: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.sub_chunk_cap;
-    var k_meta_bstart: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.block_start;
-    var k_meta_bsize: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.block_size;
-    var k_meta_status: u64 = self.d_walk_meta + descriptors.walk_meta_offsets.status;
+    // A-025 (2026-06-10): VkDeviceBuffer is a registry index, so the
+    // CUDA-shaped `d_walk_meta + offset` arithmetic the port carried
+    // here was meaningless (it addressed a DIFFERENT allocation - the
+    // first true-D2D test caught it as silent corruption). Pass the
+    // base handle for every meta binding and route the per-slot offset
+    // through binding_offsets (the iter-4c convention); the slots are
+    // 256-byte strided in walk_meta_offsets to satisfy
+    // minStorageBufferOffsetAlignment.
+    var k_meta_n: u64 = self.d_walk_meta;
+    var k_meta_decomp: u64 = self.d_walk_meta;
+    var k_meta_sccap: u64 = self.d_walk_meta;
+    var k_meta_bstart: u64 = self.d_walk_meta;
+    var k_meta_bsize: u64 = self.d_walk_meta;
+    var k_meta_status: u64 = self.d_walk_meta;
     var k_size: u32 = frame_size;
     var k_max: u32 = descriptors.WALK_MAX_CHUNKS;
     // walk_frame: n_bindings=8 (FrameBuf, ChunksBuf, NChunksBuf,
     // DecompressedSizeBuf, SubChunkCapBuf, BlockStartBuf, BlockSizeBuf,
     // StatusBuf), push_constant_size=8 (frame_size, max_chunks).
     //
-    // Iter 4c NOTE: this site does `self.d_walk_meta + offset` arithmetic
-    // on a VkDeviceBuffer handle — same broken pattern the iter 4c work
-    // fixed in the scan/compact/merge sites. This site is left as-is
-    // because the only caller (decompressFramedFromDevice / L2 D2D path)
-    // is currently L2-stubbed and has zero ptest_vk coverage. When that
-    // path is enabled, this site must be migrated to per-binding offsets;
-    // the walk_meta_offsets values (0/4/8/12/16/20) also violate
-    // minStorageBufferOffsetAlignment (typically 16) so the meta layout
-    // must be widened to per-field 16/64-byte slots first. Pre-iter-4c
-    // behaviour preserved here (the handle arithmetic was always broken;
-    // adding the iter 4c fix without aligned offsets would just trade
-    // one form of failure for another).
+    // (The former iter-4c NOTE about this site is resolved by A-025
+    // above: per-binding offsets + 256-byte meta stride.)
     var params = [_]?*anyopaque{
         @ptrCast(&k_frame),       @ptrCast(&k_chunks),
         @ptrCast(&k_meta_n),      @ptrCast(&k_meta_decomp),
@@ -76,8 +74,18 @@ pub fn gpuWalkFrameImpl(
         @ptrCast(&k_size),        @ptrCast(&k_max),
     };
     var extra = [_]?*anyopaque{null};
+    var walk_offs = [_]u64{
+        0, // FrameBuf
+        0, // ChunksBuf
+        descriptors.walk_meta_offsets.n_chunks,
+        descriptors.walk_meta_offsets.decomp_size,
+        descriptors.walk_meta_offsets.sub_chunk_cap,
+        descriptors.walk_meta_offsets.block_start,
+        descriptors.walk_meta_offsets.block_size,
+        descriptors.walk_meta_offsets.status,
+    };
     const t_walk = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzWalkFrameKernel", stream);
-    try vkCall(launch(module_loader.walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, stream, &params, &extra, null), .launch);
+    try vkCall(launch(module_loader.walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, stream, &params, &extra, &walk_offs), .launch);
     decode_context.endKernelTiming(t_walk, stream);
 
     return .{

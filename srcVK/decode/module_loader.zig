@@ -2619,6 +2619,7 @@ pub fn init() bool {
     // the dedicated transfer queue. See procD2HOffsetGather impl below.
     vulkan_api.procs.d2h_offset_gather = procD2HOffsetGather;
     vulkan_api.procs.d2d = procD2D;
+    vulkan_api.procs.d2d_offset = procD2DOffset;
     vulkan_api.procs.memset_d8 = procMemsetD8;
     vulkan_api.procs.memset_d8_async = procMemsetD8Async;
     vulkan_api.procs.malloc_host = procMallocHost;
@@ -3756,12 +3757,18 @@ fn procD2HOffsetGather(
 }
 
 fn procD2D(dst: VkDeviceBuffer, src: VkDeviceBuffer, size: usize, stream: VkStream) callconv(.c) VkResult {
+    return procD2DOffset(dst, src, 0, size, stream);
+}
+
+// A-025: D2D with a source byte offset (VkBufferCopy.srcOffset). CUDA
+// analog is src-pointer arithmetic; see vulkan_api.zig procs doc.
+fn procD2DOffset(dst: VkDeviceBuffer, src: VkDeviceBuffer, src_offset: usize, size: usize, stream: VkStream) callconv(.c) VkResult {
     _ = stream;
     const dst_e = lookupAlloc(dst) orelse return -1;
     const src_e = lookupAlloc(src) orelse return -1;
     var rc = beginOneShotCB();
     if (rc != VK_SUCCESS_RC) return rc;
-    const region = VkBufferCopy{ .srcOffset = 0, .dstOffset = 0, .size = size };
+    const region = VkBufferCopy{ .srcOffset = src_offset, .dstOffset = 0, .size = size };
     vkCmdCopyBuffer_fn.?(g_command_buffer, src_e.buffer, dst_e.buffer, 1, @ptrCast(&region));
     rc = submitAndWait();
     return rc;

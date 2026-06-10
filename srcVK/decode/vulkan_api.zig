@@ -364,6 +364,14 @@ pub const Procs = struct {
     /// stream's command buffer; no wait.
     d2d: ?*const fn (VkDeviceBuffer, VkDeviceBuffer, usize, VkStream) callconv(.c) VkResult = null,
 
+    /// A-025 (2026-06-10): D2D copy with a SOURCE byte offset. CUDA
+    /// expresses this as plain pointer arithmetic on the src CUdeviceptr;
+    /// VkDeviceBuffer is a registry index so the offset must travel
+    /// separately and become VkBufferCopy.srcOffset. Args: (dst, src,
+    /// src_offset, size, stream). Used by the true-D2D decode entry to
+    /// copy the compressed block out of the middle of the frame buffer.
+    d2d_offset: ?*const fn (VkDeviceBuffer, VkDeviceBuffer, usize, usize, VkStream) callconv(.c) VkResult = null,
+
     /// CUDA reference: cuMemsetD8_fn. Device memset (8-bit).
     /// VK adaptation: vkCmdFillBuffer with the byte broadcast to u32 +
     /// vkQueueWaitIdle.

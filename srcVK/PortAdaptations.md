@@ -1037,3 +1037,49 @@ If enabling that feature would let us match CUDA without trickery,
 the entry's resolution path is "enable feature + remove adaptation",
 not "verify adaptation correctness." Track which feature would close
 each design-choice in the **Status** field.
+
+### A-025: True-D2D enablement — registry-handle arithmetic in the D2D entry chain
+- **File:line**: `srcVK/decode/scan_gpu.zig::gpuWalkFrameImpl` (walk meta
+  bindings), `srcVK/decode/descriptors.zig::walk_meta_offsets` (256-byte
+  stride), `srcVK/decode/decode_dispatch.zig` (`d_compressed_src_offset`
+  + the upload-phase D2D copy), `srcVK/decode/module_loader.zig::procD2DOffset`
+  (new procs slot), `srcVK/decode/streamlz_decoder.zig::decompressFramedFromDevice`.
+- **CUDA reference**: `src/decode/streamlz_decoder.zig::decompressFramedFromDevice`
+  + `src/decode/scan_gpu.zig::gpuWalkFrameImpl` — CUDA folds every
+  sub-region into raw `CUdeviceptr + offset` arithmetic.
+- **Class**: language/API necessity (VkDeviceBuffer is a registry
+  index, not an addressable VA) + latent-port-bug fix.
+- **Why**: the true-D2D entry was ported shape-faithfully from CUDA but
+  NEVER runtime-exercised (zero ptest coverage; the iter-4c note in
+  gpuWalkFrameImpl explicitly deferred this site). Three breaks hid
+  there: (1) `.level = 1` hardcoded — Huffman frames misrouted down the
+  raw path (same class as iter-4b; CUDA had the identical bug, both
+  fixed 2026-06-10); (2) `d_frame + block_start` and `d_meta + offset`
+  handle arithmetic — resolves to a DIFFERENT registry allocation,
+  observed as silent corruption by the first true-D2D test; (3) the
+  packed 0/4/8/...-byte meta slots violate
+  minStorageBufferOffsetAlignment so per-binding offsets alone could
+  not fix (2).
+- **Adaptation**: walk_meta_offsets restrided to 256-byte slots
+  (iter-4c d_compact_counts convention; n_chunks stays slot 0 so
+  `d_meta + n_chunks` degenerates to the base handle); walk launch
+  passes the base handle for all six meta bindings with the slot
+  offsets in `binding_offsets`; new `procs.d2d_offset(dst, src,
+  src_offset, size, stream)` slot carries the compressed block's
+  in-frame byte offset into `VkBufferCopy.srcOffset`;
+  `DecodeRequest.d_compressed_src_offset` threads it from the entry.
+- **Risk if wrong**: silent D2D corruption (the pre-fix state) or
+  VUID alignment failures on Intel (64-byte min alignment) — covered
+  by the new test on both devices.
+- **Static verification**: every remaining `+` on a VkDeviceBuffer in
+  the D2D chain audited: `d_meta + n_chunks(=0)` is offset-free; all
+  other sub-region binds go through binding_offsets.
+- **Runtime verification**: ✅ 2026-06-10. New
+  `_cuda_shape: slzDecompressAsync TRUE-D2D roundtrip at L1 and L5`
+  in `srcVK/tests/async_d2d_api.zig` (procs.malloc_device-staged frame,
+  poisoned output, byte-compare) — FAILED with silent corruption
+  pre-fix, passes post-fix on NVIDIA RTX 4060 Ti AND Intel(R) Graphics
+  (ptest_vk 150/9/0 both).
+- **Discovered**: 2026-06-10, mirroring the CUDA L3+ D2D level-bug fix;
+  the first-ever VK true-D2D runtime test exposed the rest.
+- **Status**: RESOLVED.

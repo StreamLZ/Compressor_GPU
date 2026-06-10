@@ -772,3 +772,85 @@ test "_cuda_shape: slzGetLastTimings returns SUCCESS + a count [serial]" {
     // best-effort across submit boundaries). The call returning
     // SUCCESS + writing *count is the contract.
 }
+
+// ── Tests: TRUE D2D via the CUDA-shaped surface ────────────────────────
+//
+// 2026-06-10: the CUDA backend's L3+ true-D2D path silently misrouted
+// Huffman frames because DecodeRequest.level was never set (fixed both
+// backends same day). The srcVK true-D2D entry had NEVER been
+// runtime-exercised — every prior test in this file drives the Tier-1
+// host-pointer fallthrough or sentinel paths. This test stages a real
+// frame into a procs.malloc_device buffer and decodes it via
+// slzDecompressAsync with device handles, at L1 AND L5.
+
+const vk_api = @import("../decode/vulkan_api.zig");
+const vk_dec_driver = @import("../decode/driver.zig");
+
+extern fn slzDecompressAsync(handle: ?VkHandle, d_frame: ?*const anyopaque, frame_size: usize, d_output: ?*anyopaque, output_size: usize, opts: DecompressOpts, stream: ?*anyopaque) c_int;
+
+test "_cuda_shape: slzDecompressAsync TRUE-D2D roundtrip at L1 and L5 [serial]" {
+    const allocator = testing.allocator;
+    if (!vk_dec_driver.init()) return error.SkipZigTest;
+    const malloc_fn = vk_api.procs.malloc_device orelse return error.SkipZigTest;
+    const free_fn = vk_api.procs.free_device orelse return error.SkipZigTest;
+    const h2d_fn = vk_api.procs.h2d orelse return error.SkipZigTest;
+    const d2h_fn = vk_api.procs.d2h orelse return error.SkipZigTest;
+    const memset_fn = vk_api.procs.memset_d8 orelse return error.SkipZigTest;
+
+    var h: ?VkHandle = null;
+    try testing.expectEqual(SLZ_SUCCESS, slzCreate(&h));
+    defer _ = slzDestroy(h);
+
+    // 192 KiB repeating text → 3 chunks at the 64 KB sc=0.25 chunking;
+    // compresses well at both L1 and L5 so the entropy path is real.
+    const src = try repeatingPayload(allocator, 192 * 1024);
+    defer allocator.free(src);
+
+    for ([_]c_int{ 1, 5 }) |lvl| {
+        var bound: usize = 0;
+        try testing.expectEqual(SLZ_SUCCESS, slzCompressBound(h, src.len, .{ .level = lvl }, &bound));
+        const compressed = try allocator.alloc(u8, bound);
+        defer allocator.free(compressed);
+        var comp_size: usize = 0;
+        try testing.expectEqual(SLZ_SUCCESS, slzCompressHost(
+            h,
+            src.ptr,
+            src.len,
+            compressed.ptr,
+            compressed.len,
+            &comp_size,
+            .{ .level = lvl },
+        ));
+        try testing.expect(comp_size > 0);
+
+        var d_frame: u64 = 0;
+        if (malloc_fn(&d_frame, comp_size) != vk_api.VK_SUCCESS_RC) return error.SkipZigTest;
+        defer _ = free_fn(d_frame);
+        var d_out: u64 = 0;
+        if (malloc_fn(&d_out, src.len) != vk_api.VK_SUCCESS_RC) return error.SkipZigTest;
+        defer _ = free_fn(d_out);
+
+        if (h2d_fn(d_frame, @ptrCast(compressed.ptr), comp_size) != vk_api.VK_SUCCESS_RC) return error.CopyFailed;
+        if (memset_fn(d_out, 0xAA, src.len) != vk_api.VK_SUCCESS_RC) return error.CopyFailed;
+
+        const rc = slzDecompressAsync(
+            h,
+            @ptrFromInt(d_frame),
+            comp_size,
+            @ptrFromInt(d_out),
+            src.len,
+            .{},
+            null,
+        );
+        if (rc != SLZ_SUCCESS) {
+            std.debug.print("true-D2D decode L{d} rc={d}\n", .{ lvl, rc });
+            return error.TestUnexpectedResult;
+        }
+
+        const dst = try allocator.alloc(u8, src.len);
+        defer allocator.free(dst);
+        @memset(dst, 0x55);
+        if (d2h_fn(@ptrCast(dst.ptr), d_out, src.len) != vk_api.VK_SUCCESS_RC) return error.CopyFailed;
+        try testing.expectEqualSlices(u8, src, dst);
+    }
+}

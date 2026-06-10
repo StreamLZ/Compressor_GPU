@@ -105,13 +105,22 @@ pub const WALK_MAX_CHUNKS: u32 = 16384;
 /// CUDA reference: src/decode/descriptors.zig:141-149. Field offsets into
 /// the walk-result meta buffer.
 pub const walk_meta_offsets = struct {
+    // VK adaptation (A-025, 2026-06-10): CUDA packs these six u32 meta
+    // slots at 0/4/8/12/16/20 and addresses them with raw pointer
+    // arithmetic. VK binds each slot as its own SSBO sub-range via
+    // procLaunchKernel.binding_offsets, and VkDescriptorBufferInfo
+    // .offset must satisfy minStorageBufferOffsetAlignment (16 NVIDIA /
+    // 64 Intel iGPU). 256-byte stride matches the iter-4c
+    // d_compact_counts convention and clears every reported alignment.
+    // n_chunks stays at 0 so `d_meta + n_chunks` remains a plain base
+    // handle for the LZ kernel's TotalChunksBuf binding.
     pub const n_chunks: u32 = 0;
-    pub const decomp_size: u32 = 4;
-    pub const sub_chunk_cap: u32 = 8;
-    pub const block_start: u32 = 12;
-    pub const block_size: u32 = 16;
-    pub const status: u32 = 20;
-    pub const bytes: usize = 24;
+    pub const decomp_size: u32 = 256;
+    pub const sub_chunk_cap: u32 = 512;
+    pub const block_start: u32 = 768;
+    pub const block_size: u32 = 1024;
+    pub const status: u32 = 1280;
+    pub const bytes: usize = 1536;
 };
 
 /// CUDA reference: src/decode/descriptors.zig:154-157. Device-only
