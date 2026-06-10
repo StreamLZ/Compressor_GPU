@@ -233,6 +233,8 @@ pub const VkProcs = struct {
     d2d: ?FnD2D,
     // A-025: D2D with source byte offset (true-D2D compressed-block copy).
     d2d_offset: ?FnD2DOffset,
+    // v4 #12: input-side transfer-leg D2D (source not written by batched compute).
+    d2d_input_offset: ?FnD2DOffset,
     // VK adaptation: COMPUTE_SHADER_WRITE → COMPUTE_SHADER_READ pipeline
     // barrier on the stream's open cmdbuf. Required at the Huffman-decode
     // → LZ-decode boundary where the LZ general kernel reads the
@@ -259,6 +261,7 @@ pub const VkProcs = struct {
             .stream_flush_transfer = vk.procs.stream_flush_transfer,
             .d2d = vk.procs.d2d,
             .d2d_offset = vk.procs.d2d_offset,
+            .d2d_input_offset = vk.procs.d2d_input_offset,
             .compute_to_compute_barrier = vk.procs.compute_to_compute_barrier,
         };
     }
@@ -1045,7 +1048,7 @@ pub fn uploadInputAndPrefixSum(
             // A-025: the compressed block sits at a byte offset inside
             // the caller's frame buffer; the offset travels separately
             // (registry-index handles cannot carry pointer arithmetic).
-            const d2d_off = procs.d2d_offset orelse return error.BackendNotAvailable;
+            const d2d_off = procs.d2d_input_offset orelse procs.d2d_offset orelse return error.BackendNotAvailable;
             try vkCall(d2d_off(self.d_comp_persist, dev_src, req.d_compressed_src_offset, req.compressed_block.len, self.work_stream), .copy);
         } else {
             const _t_h2d_comp0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;

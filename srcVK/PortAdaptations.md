@@ -1083,3 +1083,54 @@ each design-choice in the **Status** field.
 - **Discovered**: 2026-06-10, mirroring the CUDA L3+ D2D level-bug fix;
   the first-ever VK true-D2D runtime test exposed the rest.
 - **Status**: RESOLVED.
+
+### A-026: True-D2D submit batching + stream-D2D ordering (the walk-batch mystery)
+- **File:line**: `srcVK/decode/streamlz_decoder.zig::decompressFramedFromDevice`
+  (sync-mode promotion onto pipeline_stream),
+  `srcVK/decode/module_loader.zig::procD2DOffset` (compute-cmdbuf
+  recording + barriers), `::procD2DInputOffset` (transfer-leg
+  input-side variant), `::recordTransferToComputeBarrier`,
+  `srcVK/decode/decode_dispatch.zig` (frame copy routed via
+  `d2d_input_offset`).
+- **CUDA reference**: CUDA's true-D2D entry runs everything on one
+  stream; `cuMemcpyDtoDAsync` is implicitly stream-ordered with
+  kernel launches — copy-after-kernel ordering is free.
+- **Class**: API necessity (Vulkan has no implicit stream ordering
+  across cmdbufs/queues) + latent-port-bug fix.
+- **Why**: (1) Without batching, the walk launch and each D2D copy
+  paid their own vkQueueSubmit + fence (WDDM floor 50-150 us each) —
+  a ~3.4 ms wall-vs-kernel gap on enwik8 L1 D2D. (2) The first cut
+  (2026-06-10 morning) batched everything EXCEPT the walk: batching
+  the walk made downstream kernels read stale chunk descs
+  ("walk-batch mystery", verify-FAIL; tracked as v4 #12). Root cause
+  isolated the same day: stream-path D2D copies recorded into the
+  TRANSFER cmdbuf, and `streamEndAndWait` submits the transfer leg
+  BEFORE the compute leg (h2d_sem dance) — so the chunk-descs copy
+  (walk output -> d_descs_persist) executed before its producer.
+  The same inversion made the OUTPUT-side copy
+  (`finalizeOutput`: d_output -> caller target) read the PREVIOUS
+  decode's output — latent in benches (identical input per
+  iteration) but real corruption for back-to-back D2D decodes of
+  different frames.
+- **Adaptation**: stream-path `procD2DOffset` now records into the
+  COMPUTE cmdbuf between a compute->transfer and a transfer->compute
+  global memory barrier — mirroring CUDA's stream ordering for ANY
+  D2D regardless of producer. The explicitly input-side copy
+  (caller frame -> d_comp_persist; nothing writes d_frame) keeps the
+  transfer-leg DMA fast path via the new `procs.d2d_input_offset`.
+  With ordering fixed, the walk batches into the same cmdbuf as the
+  rest (early-submit workaround removed) — one submit per decode.
+- **Risk if wrong**: silent stale-data corruption (the pre-fix
+  state). Descriptor-set reuse was the initial suspect and was
+  RULED OUT experimentally (forcing all-transient sets still
+  failed).
+- **Runtime verification**: ✅ 2026-06-10. Batched-walk repro
+  verify-FAILED pre-fix, passes post-fix; tools/bench_d2d_vk.bat
+  all 5 cells verify OK (L1 5.07 / L2 5.05 / L3 7.13 / L4 7.04 /
+  L5 6.86 ms, RTX 4060 Ti); ptest_vk 150/9/0. L3/L4 read ~0.3 ms
+  slower than the pre-fix sweep — that delta was the bug's flattery
+  (the out-copy "overlapped" compute only because it copied stale
+  bytes); post-fix numbers are the first correct ones.
+- **Discovered**: 2026-06-10 (batching); root cause + ordering fix
+  same day.
+- **Status**: RESOLVED.

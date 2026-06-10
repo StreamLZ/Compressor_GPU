@@ -372,6 +372,11 @@ pub const Procs = struct {
     /// copy the compressed block out of the middle of the frame buffer.
     d2d_offset: ?*const fn (VkDeviceBuffer, VkDeviceBuffer, usize, usize, VkStream) callconv(.c) VkResult = null,
 
+    /// v4 #12: input-side D2D (transfer-leg fast path). Same signature
+    /// as d2d_offset; legal only when no batched kernel writes the
+    /// source. d2d/d2d_offset are compute-ordered and always safe.
+    d2d_input_offset: ?*const fn (VkDeviceBuffer, VkDeviceBuffer, usize, usize, VkStream) callconv(.c) VkResult = null,
+
     /// CUDA reference: cuMemsetD8_fn. Device memset (8-bit).
     /// VK adaptation: vkCmdFillBuffer with the byte broadcast to u32 +
     /// vkQueueWaitIdle.

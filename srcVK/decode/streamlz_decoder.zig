@@ -128,18 +128,15 @@ pub fn decompressFramedFromDevice(
     };
 
     const dev = try gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size);
-    // A-026 LIMITATION: the walk must be SUBMITTED before the rest of
-    // the pipeline is recorded. With the walk batched into the same
-    // cmdbuf (compute->compute barrier in place) the downstream
-    // dispatches observe stale/garbage walk output - root cause not
-    // yet isolated (verify-FAIL reproduced reliably; early submit
-    // fixes it; n_chunks reads back correct either way). Costs one
-    // extra submit+wait (~0.5 ms incl. the 0.6 ms walk kernel which
-    // cannot overlap anything anyway). Tracked in v4_ideas #12.
-    if (was_sync) {
-        const sf = vk.procs.stream_sync orelse return error.BackendNotAvailable;
-        if (sf(dec_ctx.work_stream) != vk.VK_SUCCESS_RC) return error.SyncFailed;
-    }
+    // v4 #12 RESOLVED (2026-06-10): the walk now batches into the same
+    // cmdbuf as the rest of the pipeline - the former "early submit"
+    // workaround is gone. The mystery was never the walk: the chunk-desc
+    // D2D copy (uploadInputAndPrefixSum) recorded into the TRANSFER
+    // cmdbuf, which streamEndAndWait submits BEFORE the compute leg, so
+    // it read the descs before the batched walk wrote them. Stream-path
+    // D2D is now compute-cmdbuf-ordered (procD2DOffset); only the
+    // explicitly input-side copy keeps the transfer-leg DMA fast path
+    // (procs.d2d_input_offset).
 
     // CUDA reference: src/decode/streamlz_decoder.zig:158-164. Stub
     // host-side slices: the kernel reads from `d_chunk_descs_override`

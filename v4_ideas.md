@@ -393,14 +393,16 @@ idea worth re-evaluating once the basic selector ships.
   Got LESS attractive 2026-06-10: the lock now also binds the CUDA
   context per thread; a redesign would re-solve that for cosmetic
   gain. Only revisit if the lock pattern causes a real failure.
-- **VK D2D walk-batching mystery** (A-026 limitation, 2026-06-10):
-  batching the walk kernel into the same pipeline_stream cmdbuf as
-  prefix+LZ (compute->compute barrier in place) makes downstream
-  dispatches observe stale walk output - verify-FAIL reproduced
-  reliably; submitting the walk early fixes it; n_chunks reads back
-  correct either way. Root cause unknown (descriptor-update or
-  barrier-scope suspect). Isolating it is worth ~0.4-0.5 ms more off
-  the VK D2D wall (7.69 -> 5.51 shipped; ~5.1 possible).
+- ~~**VK D2D walk-batching mystery**~~ ✅ SOLVED 2026-06-10 (same
+  day): not the walk at all — stream-path D2D copies recorded into
+  the TRANSFER cmdbuf, which submits BEFORE the compute leg, so the
+  chunk-descs copy read walk output before walk ran (and the
+  output-side copy latently read the PREVIOUS decode's output).
+  Fix: compute-cmdbuf-ordered D2D + `d2d_input_offset` transfer-leg
+  variant for the input frame copy; walk now batches (workaround
+  removed). Full record: PortAdaptations A-026. The hoped ~0.4-0.5 ms
+  was mostly the walk kernel itself (which overlaps nothing); real
+  win was ~0.1 ms at L1/L2 plus a genuine correctness fix.
 - **Gather-overlap** (retired BACKPORTS.md B2 tail): run
   slzGatherRawOff16Kernel on a second stream under merge+LUT-build.
   Prize ~0.07 ms (enwik8) / ~0.85 ms (1 GB); cost is cross-stream
@@ -500,3 +502,38 @@ kernel, and #1/#2's lane-efficiency win changes this idea's
 cost/benefit. Could be 0% (ring serialization) or 10-25%;
 harness-first A/B mandatory. Effort: 1-2 weeks, most speculative
 item on this list.
+
+## 16. Dictionary support (zstd-style preset dictionaries)
+
+**What**: accept an external dictionary at encode AND decode time —
+the classic zstd `-D` shape: prepend D bytes of shared context the
+match finder may reference (negative offsets at chunk start) without
+emitting them. Wire format: a dictionary ID (e.g. xxhash of the dict
+bytes) in the frame header so decode can refuse a missing/mismatched
+dict. API: `slzCompressWithDict(dict, ...)` /
+`slzDecompressWithDict(dict, ...)` plus CLI `-D <file>`.
+
+**Why**: the small-input story is currently weak — a 4 KB JSON blob
+barely compresses because every chunk starts cold. Dictionaries are
+THE standard fix and the main feature gap vs zstd/nvCOMP for
+many-small-records workloads (logs, KV stores, RPC payloads). Also a
+natural fit for the GPU batch shape: one dict staged once in VRAM,
+thousands of small records decoded against it in one launch.
+
+**Sketch**: decode side is the easy half — stage dict bytes
+immediately before each chunk's output window (or address them via a
+second SSBO/base pointer) so back-references reaching past the chunk
+start land in the dict; the LZ kernels' copy loops need a base-adjust,
+not a redesign. Encode side: seed the hash/chain tables with dict
+positions before parsing real input (hb tables already exist; dict
+entries get negative-space indices). Levels: greedy (L1) first, chain
+(L5) after. Both backends in step per port-means-port; cross-backend
+SHA gate extends to dict frames.
+
+**Cost/risk**: medium — wire-format addition (header dict-ID field),
+new ABI surface, and the negative-offset window touches the decode
+kernels' bounds logic (corruption risk class, needs the full test
+battery + fuzz tier from #13). No ratio/speed effect on dict-less
+frames. Gate on a measured win: build the host-side prototype first
+and measure ratio lift on a real small-records corpus (e.g. 10k JSON
+docs) before touching kernels.

@@ -2620,6 +2620,7 @@ pub fn init() bool {
     vulkan_api.procs.d2h_offset_gather = procD2HOffsetGather;
     vulkan_api.procs.d2d = procD2D;
     vulkan_api.procs.d2d_offset = procD2DOffset;
+    vulkan_api.procs.d2d_input_offset = procD2DInputOffset;
     vulkan_api.procs.memset_d8 = procMemsetD8;
     vulkan_api.procs.memset_d8_async = procMemsetD8Async;
     vulkan_api.procs.malloc_host = procMallocHost;
@@ -3760,24 +3761,48 @@ fn procD2D(dst: VkDeviceBuffer, src: VkDeviceBuffer, size: usize, stream: VkStre
     return procD2DOffset(dst, src, 0, size, stream);
 }
 
-// A-025: D2D with a source byte offset (VkBufferCopy.srcOffset). CUDA
-// analog is src-pointer arithmetic; see vulkan_api.zig procs doc.
-// A-026 (2026-06-10): stream-aware. With a live stream entry the copy
-// records into the TRANSFER cmdbuf (procH2DAsync pattern) so the
-// existing transfer->compute semaphore in streamEndAndWait orders it
-// before the batched kernels - no per-copy vkQueueSubmit+fence round
-// trip. Input-side use only (frame -> d_comp_persist); an output-side
-// copy would need the opposite ordering and must NOT use this path.
-fn procD2DOffset(dst: VkDeviceBuffer, src: VkDeviceBuffer, src_offset: usize, size: usize, stream: VkStream) callconv(.c) VkResult {
-    const dst_e0 = lookupAlloc(dst) orelse return -1;
-    const src_e0 = lookupAlloc(src) orelse return -1;
+// v4 #12: INPUT-SIDE D2D - the transfer-leg fast path the general
+// procD2DOffset gave up. Legal ONLY when no batched kernel writes the
+// source (e.g. the caller-staged frame -> d_comp_persist copy: nothing
+// writes d_frame). Records into the TRANSFER cmdbuf, so it executes
+// before ALL compute in the batch on the dedicated DMA engine.
+fn procD2DInputOffset(dst: VkDeviceBuffer, src: VkDeviceBuffer, src_offset: usize, size: usize, stream: VkStream) callconv(.c) VkResult {
     if (streamEntryFor(stream)) |se| {
+        const dst_e = lookupAlloc(dst) orelse return -1;
+        const src_e = lookupAlloc(src) orelse return -1;
         const rc_t = streamBeginTransferIfNeeded(se);
         if (rc_t != VK_SUCCESS_RC) return rc_t;
         const rc_c = streamBeginIfNeeded(se);
         if (rc_c != VK_SUCCESS_RC) return rc_c;
         const sregion = VkBufferCopy{ .srcOffset = src_offset, .dstOffset = 0, .size = size };
-        vkCmdCopyBuffer_fn.?(se.transfer_cmdbuf, src_e0.buffer, dst_e0.buffer, 1, @ptrCast(&sregion));
+        vkCmdCopyBuffer_fn.?(se.transfer_cmdbuf, src_e.buffer, dst_e.buffer, 1, @ptrCast(&sregion));
+        return VK_SUCCESS_RC;
+    }
+    return procD2DOffset(dst, src, src_offset, size, stream);
+}
+
+// A-025: D2D with a source byte offset (VkBufferCopy.srcOffset). CUDA
+// analog is src-pointer arithmetic; see vulkan_api.zig procs doc.
+// A-026 (2026-06-10): stream-aware. v4 #12 root-cause fix (same day):
+// the first cut recorded the copy into the TRANSFER cmdbuf, but the
+// transfer leg submits BEFORE the compute leg (streamEndAndWait's
+// h2d_sem dance) - so a D2D whose source is written by a batched
+// kernel (walk descs -> d_descs_persist) executed before its producer
+// and read stale bytes. That WAS the walk-batch mystery. CUDA's
+// cuMemcpyDtoDAsync is stream-ordered with kernels; mirror that by
+// recording into the COMPUTE cmdbuf between a compute->transfer and
+// a transfer->compute barrier. Both copies are device-local, so the
+// dedicated DMA engine buys nothing here anyway.
+fn procD2DOffset(dst: VkDeviceBuffer, src: VkDeviceBuffer, src_offset: usize, size: usize, stream: VkStream) callconv(.c) VkResult {
+    const dst_e0 = lookupAlloc(dst) orelse return -1;
+    const src_e0 = lookupAlloc(src) orelse return -1;
+    if (streamEntryFor(stream)) |se| {
+        const rc_c = streamBeginIfNeeded(se);
+        if (rc_c != VK_SUCCESS_RC) return rc_c;
+        const sregion = VkBufferCopy{ .srcOffset = src_offset, .dstOffset = 0, .size = size };
+        recordComputeToTransferBarrier(se.cmdbuf);
+        vkCmdCopyBuffer_fn.?(se.cmdbuf, src_e0.buffer, dst_e0.buffer, 1, @ptrCast(&sregion));
+        recordTransferToComputeBarrier(se.cmdbuf);
         return VK_SUCCESS_RC;
     }
     const dst_e = dst_e0;
@@ -4442,6 +4467,29 @@ inline fn recordComputeToTransferBarrier(cb: VkCommandBuffer) void {
         cb,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,
+        1,
+        @ptrCast(&mb),
+        0,
+        null,
+        0,
+        null,
+    );
+}
+
+// v4 #12 (2026-06-10): TRANSFER_WRITE → COMPUTE_SHADER_READ, the
+// inverse of recordComputeToTransferBarrier. Used by the stream-path
+// D2D copy now that it records into the COMPUTE cmdbuf: downstream
+// dispatches read the copied bytes.
+inline fn recordTransferToComputeBarrier(cb: VkCommandBuffer) void {
+    const mb = VkMemoryBarrier{
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+    };
+    vkCmdPipelineBarrier_fn.?(
+        cb,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0,
         1,
         @ptrCast(&mb),

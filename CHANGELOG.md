@@ -37,6 +37,22 @@ Wire format unchanged from 2026-06-09; all frames byte-identical.
   7.69 -> 5.51 ms, L5 8.27 -> 7.15 ms (CUDA: 4.04/5.47). Known
   limitation: the walk kernel still submits early (batching it
   corrupts downstream reads despite barriers - open item, v4 #12).
+- **VK walk-batch mystery SOLVED + stream-D2D ordering fix** (v4 #12,
+  same day): stream-path D2D copies recorded into the TRANSFER
+  cmdbuf, which submits BEFORE the compute leg - so the chunk-descs
+  copy read walk output before the batched walk ran, and the
+  output-side copy (finalizeOutput) latently read the PREVIOUS
+  decode's output (benign in benches, real corruption for
+  back-to-back D2D decodes of different frames). Fix: procD2DOffset
+  records into the COMPUTE cmdbuf between compute<->transfer
+  barriers (mirrors cuMemcpyDtoDAsync stream ordering); the
+  input-side frame copy keeps the DMA transfer leg via new
+  procs.d2d_input_offset; the walk now batches (workaround removed,
+  one submit per decode). Descriptor-set reuse was ruled out
+  experimentally. Post-fix sweep (first CORRECT numbers - the old
+  L3/L4 cells were flattered by the stale out-copy): L1 5.07 /
+  L2 5.05 / L3 7.13 / L4 7.04 / L5 6.86 ms, all byte-verified;
+  ptest_vk 150/9/0. Catalog: PortAdaptations A-026.
 
 ### Added
 
