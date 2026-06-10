@@ -66,6 +66,12 @@ pub fn build(b: *std.Build) void {
         .test_runner = .{ .path = b.path("src/test_runner_parallel.zig"), .mode = .simple },
     });
     const run_tests = b.addRunArtifact(test_runner);
+    // cli_smoke_tests.zig spawns zig-out/bin/streamlz.exe as a child
+    // process — install the production binary first so the smoke tests
+    // never run against a stale exe (mirrors ptest_vk's dependency on
+    // srcvk_install).
+    run_tests.step.dependOn(b.getInstallStep());
+    run_tests.has_side_effects = true;
     b.step("test", "Run unit tests (parallel)").dependOn(&run_tests.step);
     b.step("ptest", "Run unit tests (parallel, alias for test)").dependOn(&run_tests.step);
 
