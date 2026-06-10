@@ -553,13 +553,33 @@ fn uploadInputAndPrefixSum(
     // there is no host fallback - every GPU decode path needs it.
     _ = try scan_gpu.gpuPrefixSumChunksImpl(self, self.d_descs_persist, @intCast(req.chunk_descs.len), req.sub_chunk_cap);
 
-    // Skip the D2H of `total_subchunks` and use a host-computed
-    // worst-case bound: `chunk_count * ceil(chunk_size / sub_chunk_cap)`.
-    // Over-allocating entropy_scratch is safe - the kernels self-gate
-    // on the actual counts via d_total_subchunks_buf / d_compact_counts.
+    // Skip the D2H of `total_subchunks` and compute the count on host.
+    // 2026-06-10: when the host can read the chunk descs (the CLI /
+    // host-bounce path), sum the EXACT per-chunk sub-chunk count,
+    // mirroring slzPrefixSumChunksKernel term for term — the old
+    // worst-case bound (chunk_count × ceil(256 KB / cap)) was 2× the
+    // actual at sc=0.25 (64 KB chunks → 1 sub-chunk each), sizing the
+    // 1 GB L3+ entropy scratch at 12 GB instead of 6 GB. Also what
+    // keeps the VK port's u32 region offsets under 2^32 at 1 GB
+    // (A-024 residual). The D2D path (d_chunk_descs_override != null)
+    // passes an undefined host slice, so it keeps the worst-case bound.
     const chunk_size_bytes: u32 = 0x40000; // = `constants.chunk_size`, inlined to avoid the format-layer import
-    const max_sub_per_chunk: u32 = if (req.sub_chunk_cap == 0) 4 else @max(1, (chunk_size_bytes + req.sub_chunk_cap - 1) / req.sub_chunk_cap);
-    const total_subchunks: u32 = @as(u32, @intCast(req.chunk_descs.len)) * max_sub_per_chunk;
+    const total_subchunks: u32 = blk: {
+        const max_sub_per_chunk: u32 = if (req.sub_chunk_cap == 0) 4 else @max(1, (chunk_size_bytes + req.sub_chunk_cap - 1) / req.sub_chunk_cap);
+        if (req.d_chunk_descs_override != null or req.sub_chunk_cap == 0)
+            break :blk @as(u32, @intCast(req.chunk_descs.len)) * max_sub_per_chunk;
+        var total: u32 = 0;
+        for (req.chunk_descs) |ch| {
+            // Mirror slzPrefixSumChunksKernel: non-LZ chunks
+            // (uncompressed / memset / empty) occupy one slot.
+            const n_subs: u32 = if (ch.flags != 0 or ch.decomp_size == 0)
+                1
+            else
+                (ch.decomp_size + req.sub_chunk_cap - 1) / req.sub_chunk_cap;
+            total += n_subs;
+        }
+        break :blk total;
+    };
     // descriptors.ENTROPY_SCRATCH_SLOT_BYTES holds the largest sub-chunk's
     // lit/tok streams; off16-hi at +0, off16-lo at +OFF16_HILO_SPLIT_OFFSET
     // within each slot. Layout: [lit: total*slot] [tok: total*slot] [off16: total*slot].

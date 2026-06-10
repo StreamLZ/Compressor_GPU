@@ -1413,6 +1413,15 @@ var g_timestamp_period_ns: f32 = 1.0;
 // (or the property query failed); procLaunchKernel treats 0 as "no check".
 var g_min_storage_buffer_offset_alignment: u64 = 0;
 
+// 2026-06-10: maxStorageBufferRange (4 GiB - 1 on desktop GPUs) captured
+// so procLaunchKernel can clamp per-binding ranges. A single allocation
+// may legitimately exceed the per-binding cap — the 1 GB L3+ entropy
+// scratch is ~6 GB, bound per-region (lit/tok/off16) at offsets that
+// keep each kernel's addressable window ≤ 2.14 GB (WALK_MAX_CHUNKS ×
+// ENTROPY_SCRATCH_SLOT_BYTES). 0 = property query did not run; the
+// clamp falls back to 4 GiB - 1.
+var g_max_storage_buffer_range: u64 = 0;
+
 // ── Per-kernel GPU profiling (SLZ_VK_PROFILE_DECODE=1) ───────────────
 // Reserves a fixed range of query-pool slots [g_profile_slot_base ..
 // g_profile_slot_base + g_profile_slot_count) carved out of
@@ -1862,7 +1871,13 @@ const KernelDecl = struct {
 };
 
 const KERNEL_DECLS = [_]KernelDecl{
-    .{ .kind = .kernel_fn, .n_bindings = 6, .push_constant_size = 16, .pin_subgroup_32 = true },
+    // 2026-06-10: bindings 6/7 are the tok / off16 region views of the
+    // SAME entropy-scratch buffer (bound at tok_offset / off16_offset via
+    // binding_offsets) so every in-shader byte offset stays region-relative
+    // (≤ 2.14 GB) and the 1 GB L3+ ~6 GB scratch never needs a >4 GiB
+    // binding. CUDA keeps one u64 pointer + stride; this is the VK
+    // equivalent under maxStorageBufferRange (see PortAdaptations A-024).
+    .{ .kind = .kernel_fn, .n_bindings = 8, .push_constant_size = 16, .pin_subgroup_32 = true },
     // srcVK/decode/lz_decode_raw_kernel.comp:25-50 declares 4 SSBO
     // bindings (CompressedBuf, ChunksBuf, DstBuf, TotalChunksBuf) plus
     // a 2× u32 push-constant block (chunks_per_group, sub_chunk_cap).
@@ -1885,13 +1900,16 @@ const KERNEL_DECLS = [_]KernelDecl{
     .{ .kind = .merge_huff_descs_fn, .n_bindings = 10, .push_constant_size = 8 },
     .{ .kind = .huff_build_fn, .n_bindings = 4, .push_constant_size = 0, .pin_subgroup_32 = true },
     // huff_decode binding 5 is a u32 alias of binding 3 (OutputBuf) — see kernel comment.
-    // A-024: binding 6 (d_compact_counts) added so the kernel can pick
-    // which region (lit | tok | off16) each block_id falls in. The
-    // 2 × u32 push constants carry tok_region_off and off16_region_off
-    // (BOUND-based, matching the host's entropy_scratch layout) — the
-    // merge kernel no longer folds them into desc.out_offset since that
-    // u32 add truncated at ~6553 sub-chunks.
-    .{ .kind = .huff_decode_fn, .n_bindings = 7, .push_constant_size = 8, .pin_subgroup_32 = true },
+    // A-024 (2026-06-10 revision): binding 6 (d_compact_counts) lets the
+    // kernel pick which region (lit | tok | off16) each block_id falls
+    // in; the kernel is dispatched THREE times, once per region, with
+    // the output bindings (3 + 5) bound AT the region's byte offset and
+    // a single u32 push constant selecting which region this dispatch
+    // serves. In-shader write offsets stay region-relative (≤ 2.14 GB),
+    // which keeps the 1 GB L3+ ~6 GB scratch under maxStorageBufferRange
+    // per binding AND under u32 arithmetic. CUDA keeps one dispatch with
+    // u64 region params; see PortAdaptations A-024.
+    .{ .kind = .huff_decode_fn, .n_bindings = 7, .push_constant_size = 4, .pin_subgroup_32 = true },
 };
 
 var g_kernel_metas: [KERNEL_DECLS.len]KernelMeta = @splat(.{});
@@ -2519,6 +2537,7 @@ pub fn init() bool {
         // per-binding-offset launch-kernel path. Required by Vulkan spec
         // VUID-VkDescriptorBufferInfo-offset-00925.
         g_min_storage_buffer_offset_alignment = props.limits.minStorageBufferOffsetAlignment;
+        g_max_storage_buffer_range = props.limits.maxStorageBufferRange;
     }
     if (vkCreateQueryPool_fn) |create_qp| {
         const qp_ci = VkQueryPoolCreateInfo{
@@ -5131,11 +5150,19 @@ fn procLaunchKernel(
                 }
                 if (off >= entry.size) return -1;
             }
-            const remaining: u64 = if (off == 0) VK_WHOLE_SIZE else (entry.size - off);
+            // 2026-06-10: explicit range, clamped to maxStorageBufferRange.
+            // A single allocation may exceed the per-binding cap (the 1 GB
+            // L3+ entropy scratch is ~6 GB, bound per-region); WHOLE_SIZE /
+            // size-off past the cap violates the storage-buffer range limit.
+            // Every shader's in-binding window is ≤ 2.14 GB (a region is at
+            // most WALK_MAX_CHUNKS × ENTROPY_SCRATCH_SLOT_BYTES), so the
+            // clamp never hides bytes a kernel can legally address.
+            const range_cap: u64 = if (g_max_storage_buffer_range != 0) g_max_storage_buffer_range else 0xFFFF_FFFF;
+            const avail: u64 = entry.size - off;
             infos[b] = .{
                 .buffer = entry.buffer,
                 .offset = off,
-                .range = remaining,
+                .range = if (avail > range_cap) range_cap else avail,
             };
             writes[b] = .{
                 .dstSet = dset,

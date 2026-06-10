@@ -96,7 +96,17 @@
                 uvec4 _ds_long_ballot = subgroupBallot(_ds_my_is_long);                   \
                 uint _ds_any_long = _ds_long_ballot.x;                                    \
                                                                                           \
-                if (_ds_any_long == 0u) {                                                 \
+                /* PP-prefix truncation (CUDA ref: src/decode/lz_decode_raw.cuh,         \
+                   db1e061): a long token at lane j used to force tokens 0..j-1          \
+                   through the serial path one at a time. Truncate the batch to          \
+                   the all-short prefix and PP it; the next window starts AT the          \
+                   long token and goes serial exactly once. findLSB == CUDA's            \
+                   __ffs(x)-1 (x != 0 here). The PP body already handles                  \
+                   batch_size < 32 via the _ds_my_valid guards. */                        \
+                if (_ds_any_long != 0u)                                                   \
+                    _ds_batch_size = uint(findLSB(_ds_any_long));                         \
+                                                                                          \
+                if (_ds_batch_size > 0u) {                                                \
                     bool _ds_my_valid = uint(lane) < _ds_batch_size;                      \
                     uint _ds_my_lit_len   = _ds_my_valid ? (_ds_my_cmd & TOKEN_LIT_MASK) : 0u; \
                     uint _ds_my_match_len = _ds_my_valid                                  \

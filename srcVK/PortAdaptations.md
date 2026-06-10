@@ -942,15 +942,30 @@ verification status. An unverified adaptation is a known risk surface.
   its block_id position in the merged array (boundaries = n_lit,
   n_lit + n_tok from `d_compact_counts`) and applies the region offset
   at full width.
-- **Residual divergence**: CUDA applies the offsets as `uint64_t`
-  kernel params (exact at any scale). VK passes them as u32 push
-  constants (shaderInt64 not enabled, A-004/A-005 discipline), so VK
-  still truncates when the BOUND-based scratch layout exceeds 4 GiB —
-  ≈ 820 MB inputs at sc=0.5, ≈ 1 GB+ at sc=0.25. Close paths: tighten
-  the host-side total_subchunks bound from the 256 KB-chunk worst case
-  to the actual per-chunk sub-chunk count (halves the layout, putting
-  1 GB sc=0.25 back under 4 GiB), or move entropy_scratch addressing
-  to BDA like A-008.
+- **Residual divergence — CLOSED 2026-06-10 via per-region bindings**:
+  CUDA applies the offsets as `uint64_t` kernel params and addresses
+  the whole multi-GB scratch through one pointer. VK (shaderInt64 not
+  enabled; SSBO indexing is u32; a binding cannot exceed
+  `maxStorageBufferRange` = 4 GiB - 1) now addresses the SAME single
+  allocation through three region windows instead:
+  * `slzHuffDecode4StreamKernel` is dispatched THREE times (region
+    0 = lit, 1 = tok, 2 = off16), output bindings 3 + 5 bound AT the
+    region byte offset, a single u32 `region_select` push constant,
+    out-of-region blocks exit before the LUT load. In-shader write
+    offsets are region-relative.
+  * `lz_decode_kernel.comp` gains bindings 6 / 7 (tok / off16 region
+    views, host pre-offset via binding_offsets); the
+    `entropy_slot_stride` push constant is no longer consumed (kept in
+    the ABI). This also retires the A-005 `.x`-truncation risk.
+  * `procLaunchKernel` clamps per-binding ranges to the queried
+    `maxStorageBufferRange` (a 6 GB buffer's lit window previously
+    requested an out-of-spec WHOLE_SIZE range).
+  Every region is at most WALK_MAX_CHUNKS × ENTROPY_SCRATCH_SLOT_BYTES
+  = 2.14 GB, so all in-shader offsets stay u32-safe at ANY supported
+  input. Combined with the exact host-side total_subchunks count
+  (2026-06-10, both backends — the old 256 KB-chunk worst-case bound
+  was 2× the actual at sc=0.25), the 1 GB scratch is ~6 GB in one
+  VMA allocation, identical layout to CUDA.
 - **Static verification**: side-by-side review of the region-pick
   logic on both backends; VK `COMPACT_COUNTS_STRIDE_U32 = 64` matches
   the iter-4c 256-byte-strided counts layout (a first draft read the
@@ -960,14 +975,22 @@ verification status. An unverified adaptation is a known risk surface.
   PASS + SHA-256 match at sc=0.5 and sc=0.25; the 819 MB / 820 MB
   threshold pair both PASS (pre-fix: 820 MB failed at byte 8,
   bisection pinned the 2^32 wrap between 6,552 and 6,560 sub-chunks).
-  VK — enwik8 L3/L5 round-trip PASS, byte-identical to CUDA; 1 GB
-  sc=0.5 still fails per the residual above (pre-existing, now
-  documented rather than silent).
+  VK (2026-06-10, post per-region revision) — ptest_vk 149/0;
+  enwik8 L1/L3/L5 round-trip PASS byte-identical to CUDA on BOTH
+  NVIDIA RTX 4060 Ti and Intel(R) Graphics; enwik9 1 GB L1-L5 decode
+  of CUDA-encoded frames all SHA-256 MATCH; VK self-encode at 1 GB
+  L3/L5 produces byte-identical frames to CUDA and round-trips SHA
+  clean. VK 1 GB decode kernel: L1 25.1 ms (CUDA parity), L3-L5
+  ~48 ms (1.4× CUDA — the pre-existing A-021 kernel-chain gap, still
+  at-or-under nvCOMP Zstd's 50.8 ms on the same card). Known limit:
+  in-process `-b` at 1 GB L3+ on a 16 GB card fails OutOfDeviceMemory
+  (encoder persistent buffers + 6 GB decode scratch exceed strict VMA
+  budget; CUDA's `-b` survives only via WDDM paging) — separate
+  encode/decode processes work.
 - **Discovered**: 2026-06-09 enwik9 stress session (CUDA-as-oracle
   runtime bisection)
-- **Status**: ✅ RESOLVED on CUDA; ⚠️ PARTIAL on VK (u32 push-constant
-  truncation above ~4 GiB scratch bound — close via bound tightening,
-  BDA, or shaderInt64)
+- **Status**: ✅ RESOLVED on both backends (CUDA db1e061; VK
+  2026-06-10 per-region revision)
 
 ## Process notes
 

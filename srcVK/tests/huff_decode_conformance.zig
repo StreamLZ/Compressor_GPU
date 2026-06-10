@@ -172,6 +172,16 @@ fn huffRoundtripOne(allocator: std.mem.Allocator, src: []const u8) !void {
     if (malloc_fn(&d_decoded, src.len) != VK_SUCCESS_RC) return error.SkipZigTest;
     defer _ = free_fn(d_decoded);
 
+    // A-024 (2026-06-10): the decode kernel partitions its merged-descs
+    // block-id range into lit | tok | off16 regions via d_compact_counts
+    // (256-byte stride per slot: n_lit at byte 0, n_tok at byte 256) and
+    // only handles blocks whose region matches the region_select push
+    // constant. This standalone probe has ONE desc which must classify
+    // as region 0 (lit): n_lit = 1, n_tok = 0.
+    var d_counts: VkDeviceBuffer = 0;
+    if (malloc_fn(&d_counts, 512) != VK_SUCCESS_RC) return error.SkipZigTest;
+    defer _ = free_fn(d_counts);
+
     // ── H2D uploads ────────────────────────────────────────────────
     // Encoder input bytes.
     if (h2d_fn(d_input, @ptrCast(src.ptr), src.len) != VK_SUCCESS_RC) return error.KernelLaunchFailed;
@@ -204,6 +214,12 @@ fn huffRoundtripOne(allocator: std.mem.Allocator, src: []const u8) !void {
 
     var n_blocks: u32 = 1;
     if (h2d_fn(d_n_blocks, @ptrCast(&n_blocks), 4) != VK_SUCCESS_RC) return error.KernelLaunchFailed;
+
+    // A-024 counts: n_lit = 1 at byte 0, n_tok = 0 at byte 256 (the
+    // 256-byte COUNTS_STRIDE layout the dispatch uses).
+    var counts_host = [_]u8{0} ** 512;
+    counts_host[0] = 1;
+    if (h2d_fn(d_counts, @ptrCast(&counts_host), 512) != VK_SUCCESS_RC) return error.KernelLaunchFailed;
 
     if (sync_fn() != VK_SUCCESS_RC) return error.SyncFailed;
 
@@ -293,12 +309,15 @@ fn huffRoundtripOne(allocator: std.mem.Allocator, src: []const u8) !void {
     if (sync_fn() != VK_SUCCESS_RC) return error.SyncFailed;
 
     // ── Kernel 4: decoder decode 4-stream ──────────────────────────
-    // Binding order per huff_decode_4stream_kernel.comp:55-93 and
-    // KERNEL_DECLS huff_decode_fn (n_bindings=6, push_constant_size=0).
-    // Layout: SSBOs [Comp, Descs, Luts, Output, NBlocks, OutputU32] —
-    // no push consts. Binding 5 is a u32-aliased view of binding 3's
-    // VkBuffer (same backing memory) used for the Phase 2 hot loop's
-    // 4-byte aligned store fast path.
+    // Binding order per huff_decode_4stream_kernel.comp and KERNEL_DECLS
+    // huff_decode_fn (A-024 2026-06-10: n_bindings=7,
+    // push_constant_size=4). Layout: SSBOs [Comp, Descs, Luts, Output,
+    // NBlocks, OutputU32, CompactCounts] then push const
+    // [region_select: u32]. Binding 5 is a u32-aliased view of binding
+    // 3's VkBuffer used for the Phase 2 hot loop's 4-byte store fast
+    // path. The single desc classifies as region 0 (lit) via the counts
+    // staged above, so one dispatch with region_select=0 suffices —
+    // the production dispatch loops over all three regions.
     {
         var p_comp: VkDeviceBuffer = d_bil_out;
         var p_descs: VkDeviceBuffer = d_dec_descs;
@@ -306,9 +325,12 @@ fn huffRoundtripOne(allocator: std.mem.Allocator, src: []const u8) !void {
         var p_out: VkDeviceBuffer = d_decoded;
         var p_n: VkDeviceBuffer = d_n_blocks;
         var p_out_u32: VkDeviceBuffer = d_decoded;
+        var p_counts: VkDeviceBuffer = d_counts;
+        var p_region: u32 = 0;
         var params = [_]?*anyopaque{
-            @ptrCast(&p_comp), @ptrCast(&p_descs), @ptrCast(&p_lut),
-            @ptrCast(&p_out),  @ptrCast(&p_n),     @ptrCast(&p_out_u32),
+            @ptrCast(&p_comp),   @ptrCast(&p_descs), @ptrCast(&p_lut),
+            @ptrCast(&p_out),    @ptrCast(&p_n),     @ptrCast(&p_out_u32),
+            @ptrCast(&p_counts), @ptrCast(&p_region),
         };
         var extra = [_]?*anyopaque{null};
         if (launch_fn(dec_module_loader.huff_decode_fn, 1, 1, 1, 32, 1, 1, 0, 0, &params, &extra, null) != VK_SUCCESS_RC) {

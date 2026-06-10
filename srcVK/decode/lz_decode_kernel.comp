@@ -74,6 +74,22 @@ layout(std430, binding = 5) readonly buffer FirstSubChunkIdxBuf {
     uint first_subchunk_idx[];
 };
 
+// 2026-06-10 (A-024 revision): tok / off16 region views of the SAME
+// entropy-scratch buffer, bound by the host at tok_offset /
+// off16_offset via per-binding offsets. CUDA derives these regions
+// with u64 pointer arithmetic (base + stride, + 2*stride); Vulkan
+// SSBO indexing is u32 and a binding cannot span more than
+// maxStorageBufferRange (4 GiB - 1), so the ~6 GB scratch at 1 GB
+// inputs is addressed through three region-relative windows instead.
+// Each region is at most WALK_MAX_CHUNKS × ENTROPY_SCRATCH_SLOT_BYTES
+// = 2.14 GB, so all in-shader offsets stay u32-safe.
+layout(std430, binding = 6) buffer EntropyScratchTokBuf {
+    uint8_t entropy_scratch_tok[];
+};
+layout(std430, binding = 7) buffer EntropyScratchOff16Buf {
+    uint8_t entropy_scratch_off16[];
+};
+
 // Scalar args 3, 5, 7 ride in via push constants. Layout matches the
 // CUDA arg list order (chunks_per_group, sub_chunk_cap, entropy_slot_stride).
 //
@@ -95,16 +111,14 @@ void main() {
     if (group_id >= (total_chunks + pc.chunks_per_group - 1u) / pc.chunks_per_group) return;
     uint base_chunk = group_id * pc.chunks_per_group;
 
-    // VK adaptation: collapse u64 stride to u32 for the offset arithmetic
-    // below. ENTROPY_SCRATCH_SLOT_BYTES * total_subchunks fits in u32 for
-    // every supported workload (sub-chunk count caps at WALK_MAX_CHUNKS *
-    // 4 per chunk = ~1M slots, each 128 KB, = 128 GiB worst case theoretical
-    // but the kernel is dispatched with total_subchunks limited by the
-    // host's `chunk_count * ceil(chunk_size / sub_chunk_cap)` bound which
-    // fits in u32 byte ranges for every shipped scenario). The .y half is
-    // asserted zero on the host before launch (host-side TODO follow-up
-    // mirrors CUDA's silent assumption); for now the kernel reads .x.
-    uint entropy_slot_stride_u32 = pc.entropy_slot_stride.x;
+    // 2026-06-10 (A-024 revision): the entropy_slot_stride push constant
+    // is no longer consumed — tok / off16 slots are reached through the
+    // region-relative bindings 6 / 7 (host binds them at tok_offset /
+    // off16_offset), so each region's in-shader offset is just
+    // global_subchunk_index × ENTROPY_SCRATCH_SLOT_BYTES (≤ 2.14 GB,
+    // u32-safe). The push constant stays in the ABI so the host launch
+    // layout is unchanged. This also retires the A-005 `.x`-truncation
+    // risk: no in-shader offset crosses 4 GiB anymore.
 
     // CUDA reference: src/decode/lz_decode_kernels.cuh:52-143.
     // Outer chunk loop.
@@ -181,11 +195,12 @@ void main() {
 
             if (sc_comp_size < sc_size) {
                 // CUDA reference: src/decode/lz_decode_kernels.cuh:115-128.
-                // Derive tok/off16 sub-slots on demand from base + stride.
-                // tok at +stride, off16 at +2*stride from the lit slot.
-                uint tok_slot = subchunk_scratch_base + entropy_slot_stride_u32;
-                uint off16_slot = subchunk_scratch_base + 2u * entropy_slot_stride_u32;
-
+                // CUDA derives tok/off16 sub-slots as base + stride and
+                // base + 2*stride into ONE u64-addressed buffer. VK
+                // (2026-06-10, A-024 revision): the tok / off16 regions
+                // are separate bindings pre-offset by the host, so all
+                // three streams use the SAME region-relative slot offset.
+                //
                 // Pass the absolute sc_dst_off as base_offset; only the
                 // sub-chunk at output offset 0 (the very first sub-chunk
                 // in the frame) triggers the 8-byte initial copy. CUDA's
@@ -195,8 +210,8 @@ void main() {
                     compressed, sc_payload, sc_comp_size, sc_size,
                     dst, sc_dst_off, sc_dst_off, sc_mode,
                     entropy_scratch, subchunk_scratch_base,
-                    entropy_scratch, tok_slot,
-                    entropy_scratch, off16_slot,
+                    entropy_scratch_tok, subchunk_scratch_base,
+                    entropy_scratch_off16, subchunk_scratch_base,
                     /*has_entropy=*/1u, lane);
             } else {
                 // CUDA reference: src/decode/lz_decode_kernels.cuh:130-133.

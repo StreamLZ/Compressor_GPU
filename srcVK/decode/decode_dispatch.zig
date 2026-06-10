@@ -670,39 +670,44 @@ pub fn runHuffBuildAndDecode(
         // merge kernel used to do (which silently truncated at ~6553
         // sub-chunks).
         var p_counts: u64 = self.d_compact_counts;
-        // A-024: BOUND-based region offsets (must match the entropy_scratch
-        // layout above — `total_subchunks × ENTROPY_SCRATCH_SLOT_BYTES`
-        // stride for tok, `2 ×` for off16). Cast to u32 here; for inputs
-        // where BOUND × ENTROPY_SCRATCH_SLOT_BYTES × 2 already overflows
-        // u32 (≈ inputs > 8192 sub-chunks at the bound, ≈ > 1 GB at
-        // sc=0.5 L3), this trims silently. Proper fix is shaderInt64 or
-        // BDA, both deferred.
-        var p_tok_off: u32 = @intCast(self.last_tok_offset);
-        var p_off16_off: u32 = @intCast(self.last_off16_offset);
-        // VK adaptation: params[] layout per module_loader KERNEL_DECLS
-        // contract (see above). huff_decode_4stream_kernel.comp:
-        // n_bindings=7 (CompBuf, DescsBuf, LutsBuf, OutputBuf,
-        // NBlocksBuf, OutputBufU32, CompactCountsBuf), push_constant_size=8
-        // (2 × u32 region offsets). The shared-memory allocation CUDA
-        // passes as the 8th launch arg (LUT_ENTRIES * 4 = 4096 bytes)
-        // is replaced by the static `shared uint shared_lut[LUT_SIZE]`
-        // declared inside the .comp — Vulkan has no dynamic shared-mem
-        // at compute-shader scope so the size is fixed at compile time
-        // and the launch passes 0 for the shared-bytes arg.
+        // A-024 (2026-06-10 revision): THREE dispatches, one per region
+        // (0 = lit, 1 = tok, 2 = off16). Each binds the output views
+        // (bindings 3 + 5) AT the region's byte offset and passes the
+        // region id as the single u32 push constant; blocks outside the
+        // selected region exit before the LUT load. In-shader write
+        // offsets stay region-relative (≤ 2.14 GB), keeping the ~6 GB
+        // 1 GB-input scratch under both u32 arithmetic and the
+        // per-binding maxStorageBufferRange. CUDA keeps ONE dispatch
+        // with u64 region params — divergence documented in
+        // PortAdaptations A-024. Region bases are multiples of
+        // ENTROPY_SCRATCH_SLOT_BYTES (128 KB), satisfying
+        // minStorageBufferOffsetAlignment everywhere.
+        //
+        // params[] layout per module_loader KERNEL_DECLS: n_bindings=7
+        // (CompBuf, DescsBuf, LutsBuf, OutputBuf, NBlocksBuf,
+        // OutputBufU32, CompactCountsBuf), push_constant_size=4
+        // (region_select). The shared-memory allocation CUDA passes as
+        // the 8th launch arg is replaced by the static
+        // `shared uint shared_lut[LUT_SIZE]` inside the .comp.
+        var p_region: u32 = 0;
         var params = [_]?*anyopaque{
             @ptrCast(&p_comp),   @ptrCast(&p_descs),
             @ptrCast(&p_lut),    @ptrCast(&p_out),
             @ptrCast(&p_n),      @ptrCast(&p_out_u32),
             @ptrCast(&p_counts),
-            @ptrCast(&p_tok_off), @ptrCast(&p_off16_off),
+            @ptrCast(&p_region),
         };
         var extra = [_]?*anyopaque{null};
+        const region_bases = [_]u64{ 0, self.last_tok_offset, self.last_off16_offset };
         const t_hd = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzHuffDecode4StreamKernel", huff_stream);
-        // Iter 4c: binding 4 (NBlocksBuf) is d_compact_counts slot 5.
-        // A-024: binding 6 (CompactCountsBuf) binds d_compact_counts
-        // at offset 0.
-        const hd_offs = [_]u64{ 0, 0, 0, 0, N_MERGED_SLOT_OFF, 0, 0 };
-        try vkCall(launch_fn(module_loader.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra, &hd_offs), .launch);
+        for (region_bases, 0..) |region_base, region_idx| {
+            p_region = @intCast(region_idx);
+            // Iter 4c: binding 4 (NBlocksBuf) is d_compact_counts slot 5.
+            // Bindings 3 / 5 (byte + u32 views of entropy scratch) bind
+            // at this region's base; binding 6 (CompactCountsBuf) at 0.
+            const hd_offs = [_]u64{ 0, 0, 0, region_base, N_MERGED_SLOT_OFF, region_base, 0 };
+            try vkCall(launch_fn(module_loader.huff_decode_fn, n_huff, 1, 1, 32, 1, 1, 0, huff_stream, &params, &extra, &hd_offs), .launch);
+        }
         endKernelTiming(t_hd, huff_stream);
     }
     return split_huff_build_ns;
@@ -805,6 +810,13 @@ pub fn runLzPipeline(
         // as uvec2/u64). CUDA's kernel argument list is unchanged; only the
         // VK host packing order changes — buffer-pointer params first, then
         // push-constant scalars.
+        // 2026-06-10 (A-024 revision): bindings 6 / 7 are the tok / off16
+        // region views of the SAME entropy-scratch buffer, bound at
+        // last_tok_offset / last_off16_offset so every in-shader byte
+        // offset stays region-relative (≤ 2.14 GB). The stride push
+        // constant remains in the ABI but the kernel no longer reads it.
+        var p_entropy_scratch_tok: u64 = self.d_entropy_scratch;
+        var p_entropy_scratch_off16: u64 = self.d_entropy_scratch;
         var lz_params = [_]?*anyopaque{
             @ptrCast(&common.comp),
             @ptrCast(&common.descs_dev),
@@ -812,14 +824,17 @@ pub fn runLzPipeline(
             @ptrCast(&common.total),
             @ptrCast(&p_entropy_scratch),
             @ptrCast(&p_first_sub_idx),
+            @ptrCast(&p_entropy_scratch_tok),
+            @ptrCast(&p_entropy_scratch_off16),
             @ptrCast(&common.chunks_per_group),
             @ptrCast(&common.sub_chunk_cap),
             @ptrCast(&p_entropy_slot_stride),
         };
         var lz_extra = [_]?*anyopaque{null};
+        const lz_offs = [_]u64{ 0, 0, 0, 0, 0, 0, self.last_tok_offset, self.last_off16_offset };
 
         const t_lz = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeKernel", stream);
-        try vkCall(launch_fn(module_loader.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra, null), .launch);
+        try vkCall(launch_fn(module_loader.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra, &lz_offs), .launch);
         endKernelTiming(t_lz, stream);
     }
 
@@ -953,27 +968,56 @@ pub fn uploadInputAndPrefixSum(
     if (g_phase_profile_enabled) g_phase_upload_prefixsum_ns += qpcDeltaNs(_t_ps0, vk.qpcNow());
     const _t_upload_misc_resume = if (g_phase_profile_enabled) vk.qpcNow() else 0;
 
-    // Skip the D2H of `total_subchunks` and use a host-computed
-    // worst-case bound: `chunk_count * ceil(chunk_size / sub_chunk_cap)`.
-    // Over-allocating entropy_scratch is safe — the kernels self-gate
-    // on the actual counts via d_total_subchunks_buf / d_compact_counts.
+    // Skip the D2H of `total_subchunks` and compute the count on host.
+    // 2026-06-10 (CUDA-mirror): when the host can read the chunk descs
+    // (the CLI / host-bounce path), sum the EXACT per-chunk sub-chunk
+    // count, mirroring slzPrefixSumChunksKernel's loop term for term —
+    // the old worst-case bound (chunk_count × ceil(256 KB / cap)) was
+    // 2× the actual at sc=0.25 (64 KB chunks → 1 sub-chunk each), which
+    // ballooned the 1 GB L3+ entropy scratch to 12 GB (a hard VMA
+    // failure under strict DEVICE_LOCAL) and pushed the off16 region
+    // offset past the 4 GiB u32 push-constant ceiling (A-024 residual).
+    // With the exact count, 1 GB sc=0.25 sits at ~6 GB scratch and the
+    // region offsets stay under 2^32. The D2D path
+    // (d_chunk_descs_override != null) passes an undefined host slice,
+    // so it keeps the worst-case bound.
     const chunk_size_bytes: u32 = 0x40000; // = `constants.chunk_size`, inlined to avoid the format-layer import
-    const max_sub_per_chunk: u32 = if (req.sub_chunk_cap == 0) 4 else @max(1, (chunk_size_bytes + req.sub_chunk_cap - 1) / req.sub_chunk_cap);
-    const total_subchunks: u32 = @as(u32, @intCast(req.chunk_descs.len)) * max_sub_per_chunk;
+    const total_subchunks: u32 = blk: {
+        const max_sub_per_chunk: u32 = if (req.sub_chunk_cap == 0) 4 else @max(1, (chunk_size_bytes + req.sub_chunk_cap - 1) / req.sub_chunk_cap);
+        if (req.d_chunk_descs_override != null or req.sub_chunk_cap == 0)
+            break :blk @as(u32, @intCast(req.chunk_descs.len)) * max_sub_per_chunk;
+        var total: u32 = 0;
+        for (req.chunk_descs) |ch| {
+            // Mirror slzPrefixSumChunksKernel: non-LZ chunks
+            // (uncompressed / memset / empty) occupy one slot.
+            const n_subs: u32 = if (ch.flags != 0 or ch.decomp_size == 0)
+                1
+            else
+                (ch.decomp_size + req.sub_chunk_cap - 1) / req.sub_chunk_cap;
+            total += n_subs;
+        }
+        break :blk total;
+    };
     // descriptors.ENTROPY_SCRATCH_SLOT_BYTES holds the largest sub-chunk's
     // lit/tok streams; off16-hi at +0, off16-lo at +OFF16_HILO_SPLIT_OFFSET
     // within each slot. Layout: [lit: total*slot] [tok: total*slot] [off16: total*slot].
     const per_subchunk_scratch: usize = @intCast(descriptors.ENTROPY_SCRATCH_SLOT_BYTES);
     const entropy_scratch_bytes = @as(usize, total_subchunks) * per_subchunk_scratch * 3;
-    try ensureDeviceBuf(&self.d_entropy_scratch, &self.d_entropy_scratch_size, entropy_scratch_bytes);
     const tok_offset = @as(usize, total_subchunks) * per_subchunk_scratch;
     const off16_offset = @as(usize, total_subchunks) * per_subchunk_scratch * 2;
-    // Iter 4c: store the base handle + offset; the gather kernel binds
-    // the sub-region via procLaunchKernel.binding_offsets.
-    self.d_entropy_off16_scratch = self.d_entropy_scratch;
-    self.d_entropy_off16_offset = off16_offset;
+    // L1/L2 gate (CUDA-mirror, 2026-06-10): entropy_scratch is consumed
+    // only by the Huffman predecode → gather → LZ-general chain
+    // (level >= 3). L1/L2 frames contain no type-4 chunks, so the
+    // pointer is never dereferenced; skip the multi-GB allocation.
+    if (req.level >= 3) {
+        try ensureDeviceBuf(&self.d_entropy_scratch, &self.d_entropy_scratch_size, entropy_scratch_bytes);
+        // Iter 4c: store the base handle + offset; the gather kernel binds
+        // the sub-region via procLaunchKernel.binding_offsets.
+        self.d_entropy_off16_scratch = self.d_entropy_scratch;
+        self.d_entropy_off16_offset = off16_offset;
+    }
     // A-024: stash region offsets for the Huff decode kernel push
-    // constants. BOUND-based to match the entropy_scratch layout above.
+    // constants. Must match the entropy_scratch layout above.
     self.last_tok_offset = @intCast(tok_offset);
     self.last_off16_offset = @intCast(off16_offset);
 
@@ -1290,15 +1334,17 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
         e2e_cum.postscan = e2e_cum.h2d;
     };
 
-    // Phase 2-3: L2 scan/compact/merge/gather + Huffman descriptor merge.
+    // Phase 2-3: scan/compact/merge/gather + Huffman descriptor merge.
     //
-    // VK adaptation: gated on level>=2 to skip L2 work on L1 frames.
-    // CUDA currently dispatches unconditionally (no-op on L1); upstream
-    // TODO to backport this gate.
+    // 2026-06-10 (CUDA-mirror): gate tightened from level>=2 to
+    // level>=3 — the encoder front door only runs the Huffman pass at
+    // level >= 3, so L2 frames have no entropy streams either and the
+    // whole chain ran as worst-case-grid no-ops on L2. CUDA backported
+    // the original VK gate and tightened it (db1e061); this re-syncs.
     var scan: ScanResult = .{ .num_raw_off16 = 0 };
     var n_huff: u32 = 0;
     var have_huff = false;
-    if (req.level >= 2) {
+    if (req.level >= 3) {
         // Phase 2: scan + raw-off16 gather. The GPU scan kernel reads
         // from `d_comp_persist` (filled by the prior H2D / D2D), so the
         // same code path handles both decode entry points.

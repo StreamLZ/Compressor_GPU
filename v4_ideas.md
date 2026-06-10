@@ -1,0 +1,176 @@
+# v4 Ideas — future work
+
+Candidate work beyond the 2026-06-09 wave (`db1e061`). State at that
+commit: sc=0.25 + hb=17 defaults, A-024 fixed, A-023 on both backends;
+on enwik9 1 GB StreamLZ beats nvCOMP LZ4 at L1 (52.6% vs 53.6%, 24.3
+vs 33.0 ms decode kernel) and nvCOMP Zstd at L5 (35.50% vs 35.75%,
+34.2 vs 50.8 ms). Ideas are ordered by leverage-per-risk, not by size.
+
+A standing guardrail first: per `FAILED_EXPERIMENTS.md` (2026-05-24
+meta-entry, re-confirmed twice on 2026-06-09), the decode kernels are
+issue-bound at ~92% SM throughput and ~91% occupancy. **Per-load
+latency attacks (staging, prefetch, wide loads, software pipelining)
+do not move wall-clock and should not be retried.** The only lever
+that has ever worked is reducing per-warp instruction count or
+per-warp serial chain length. Every speed idea below is that class.
+
+---
+
+## 1. Flat batched literal copy (token-ownership binary search)
+
+**What**: In the PP fast path (`lz_decode_raw.cuh`), replace the 32
+serialized per-token `warpLiteralCopy` calls with ONE warp-wide pass
+over the batch's concatenated literal bytes. The per-token prefix sums
+(`my_lit_local`, `my_dst_local`) already exist in registers; stage all
+32 to shared memory (currently 0 bytes used — no occupancy cost), then
+each lane copies flat literal byte `i`, finding its owning token
+`k = max{k : lit_prefix[k] <= i}` with a 5-step shared-memory binary
+search, and writes to `dst_pos + dst_local[k] + (i - lit_prefix[k])`.
+Two `__syncwarp()`s per batch instead of today's 64.
+
+**Why**: NCU shows 17.9/32 average active threads — the idle lanes are
+concentrated in the copy phase (parse is already fully parallel). A
+typical token carries ~5-8 literal bytes, so today's per-token copy
+iteration runs at ~20% lane efficiency plus ~10 instructions of
+shuffle/sync overhead. Flattened, every copy iteration moves 32 bytes
+at full width. This is the same instruction-count lever as the two
+historical wins (PP +22%, PP-for-OFF16_SPLIT +21-25%), and nvCOMP
+ships exactly this design (the §8 binary-search in
+`docs/nvcomp_lz4_architecture.md`).
+
+**Expected**: ~1.2× decode kernel alone (literals are ~55% of output
+bytes at L1). Zero ratio impact. The safest half of the #1/#2 pair —
+the literal stream is separate from the output, so there is no
+read-after-write hazard inside the batch.
+
+**Cost/risk**: days; rewrites the correctness core of both decode
+kernels; needs full level/scale re-verification. Do this FIRST and
+measure before deciding on #2.
+
+## 2. Flat independent-match copy + ordered fallback
+
+**What**: After #1, classify each token's match: *independent* if its
+source range lies entirely before this batch's output start
+(`match_src + match_len <= batch_dst_start`) and `dist >= 4`.
+Flatten all independent matches in one ownership-search pass exactly
+like #1; run the dependent remainder serially in token order (the
+current path). Conservative classification — any doubt → serial.
+
+**Why**: same lever; matches are the other ~45% of output bytes.
+
+**Expected**: #1+#2 combined ≈ 1.3-1.6× decode kernel (enwik9 L1
+24.3 → ~15-18 ms, would be ~2× nvCOMP LZ4). Shrinks toward 1.2-1.3×
+if 30-40% of match bytes are batch-local (recent-offset-heavy text
+keeps matches near). Zero ratio impact. Note e2e barely moves either
+way (PCIe-bound: kernel is ~16% of 149 ms) — this pays off only for
+device-resident (D2D) pipelines.
+
+**Cost/risk**: days; the dependency analysis is the hard part and a
+wrong "independent" call is silent corruption. Gate on #1 landing
+cleanly and on measuring the actual batch-local match fraction first
+(cheap kernel instrumentation).
+
+## 3. Measure, then maybe parallelize, long-token parsing
+
+**What**: `db1e061` stopped one long token from serializing the 32
+short tokens ahead of it (PP-prefix truncation), but each long token
+still costs a full serial iteration. Step 1 is pure measurement: count
+serial iterations vs PP batches per workload (two atomics in a debug
+build). Only if the serial fraction is >~10% on inputs we care about,
+extend PP to parse long tokens in-lane: ballot the long lanes, prefix-
+scan each lane's `length_stream` byte consumption (the tag byte
+determines 1-vs-3 bytes), and fold the result into the existing scans.
+
+**Why**: deep-redundancy inputs have materially longer matches (enwik9
+L1 hits 50.3% vs enwik8's 58.6% at the same settings), so
+`TOKEN_LONG_NEAR` frequency grows exactly on the inputs where decode
+speed matters most. But we have NOT measured the residual cost since
+the truncation fix — it may already be negligible (enwik9 sc=0.5
+showed no change from the truncation fix, which argues it is small).
+
+**Cost/risk**: measurement is hours; the parallel long-token parse is
+1-2 days and a fiddly two-level variable-length scan. Don't build it
+without the measurement.
+
+## 4. Tighten `total_subchunks` from worst-case BOUND to actual
+
+**What**: `uploadInputAndPrefixSum` (both backends) sizes entropy
+scratch as `num_chunks × ceil(256 KB / sub_chunk_cap)` using the
+hardcoded 256 KB chunk constant. At sc=0.25 the real chunks are 64 KB
+with exactly 1 sub-chunk each — the bound is 2× too big. The host
+builds `chunk_descs` anyway; summing `ceil(decomp_size / cap)` over
+them gives the exact count for the same loop cost.
+
+**Why**: (a) L3-L5 1 GB scratch drops 12 GB → 6 GB — today 12 GB
+*barely* fits a 16 GB card and will fail on 12 GB cards; (b) it puts
+the per-region byte offsets at 1 GB sc=0.25 back under 4 GiB, which
+makes the **VK A-024 residual moot at current scales** (VK's u32 push
+constants stop truncating) — i.e. this is the cheap path to VK 1 GB
+L3+ decode. Keep the kernels' self-gating untouched; only the host
+sizing changes.
+
+**Cost/risk**: small, host-only, both backends in step. Highest
+correctness-value-per-line item on this list.
+
+## 5. Close the VK A-024 residual permanently (BDA entropy scratch)
+
+**What**: Address `entropy_scratch` in the VK Huffman-decode and
+LZ-general kernels through `VK_KHR_buffer_device_address`
+(`buffer_reference` + uvec2 address, the proven A-008 pattern) instead
+of a descriptor-bound SSBO, so region offsets are full 64-bit device
+addresses.
+
+**Why**: #4 defers the 4 GiB ceiling; this removes it (multi-GB
+inputs, future sc choices, no silent edge). Also retires the A-005
+`entropy_slot_stride.x` truncation in the same stroke.
+
+**Cost/risk**: medium; mechanical copy of the A-008 BDA recipe across
+2 kernels + dispatch; needs the A-024-style threshold tests on VK.
+
+## 6. Re-differentiate L2 (product decision, not code)
+
+**What**: Since hb=17-everywhere, L1 and L2 emit byte-identical
+output. Options: (a) document L2 as an alias of L1; (b) repurpose L2
+as the "max LZ ratio" profile — sc=0.5 (+~2 pp ratio at 1 GB, ~1.8×
+slower large-input decode), giving the `--sc 0.5` tradeoff a stable
+level name; (c) give L2 hb=18 back together with the A-023 batching
+(now exists on both backends) so its 16 GB hash pages in batches
+instead of thrashing.
+
+**Why**: a level that duplicates another is API noise; (b) is the
+most honest mapping of the real tradeoff surface we measured.
+
+## 7. CUDA regression test for the A-023 batched dispatch
+
+**What**: ptest case that sets
+`encode_lz.g_force_batch_count_for_test` (e.g. batch=7 over a
+64-chunk input), encodes, and asserts byte-identity against the
+unbatched encode — mirroring `srcVK/tests/a023_batched_lz_dispatch.zig`.
+
+**Why**: the CUDA batched path only triggers organically above ~8 GB
+of hash demand; CI never exercises it today. Hours of work, closes a
+real coverage hole introduced by the backport.
+
+## 8. v4 wire format: self-describing tokens (remove the serial parse)
+
+**What**: The remaining structural ceiling is that token k cannot be
+located without decoding tokens 0..k-1. A v4 format could emit a small
+per-batch sidecar (e.g. one u16 per 32 tokens: total cmd/lit/off16
+consumption) letting every warp jump straight to its batch — or
+restructure tokens at fixed stride. Encoder cost is a few bytes per
+batch (~0.1% of output).
+
+**Why**: `FAILED_EXPERIMENTS.md` names format change as one of two
+remaining structural levers. Combined with #1/#2 this is the
+"saturate DRAM bandwidth" endgame (~2× beyond #1/#2, speculative).
+
+**Cost/risk**: weeks; breaks format compatibility; both backends +
+both directions. Only worth it if decode throughput becomes the
+product's headline number.
+
+## 9. Tensor-core bulk copy for ≥256 B matches (parking lot)
+
+From the FAILED_EXPERIMENTS "not tried" list. Only pays for very long
+matches, which the text-workload match-length histogram says are rare.
+Keep parked unless a binary-heavy workload (silesia-like or model
+weights) becomes a target.
