@@ -1,5 +1,78 @@
 # Changelog
 
+## Unreleased — 2026-06-10 (VK-parity backports, D2D enablement on both backends, doc consolidation)
+
+Wire format unchanged from 2026-06-09; all frames byte-identical.
+
+### Fixed
+
+- **L3+ true-D2D decode was broken on BOTH backends.** Neither
+  `decompressFramedFromDevice` threaded the frame's codec level into
+  the decode request (CUDA defaulted, VK hardcoded `1`), so Huffman
+  frames silently misrouted down the raw path on the device-resident
+  entry. The VK path additionally carried CUDA pointer arithmetic on
+  registry-index buffer handles (walk meta, compressed-block offset) -
+  silent wrong-allocation reads, plus a meta layout that violated
+  minStorageBufferOffsetAlignment (A-025: 256-byte meta stride +
+  binding_offsets + `procs.d2d_offset`). Found by the first-ever D2D
+  bench/test runs; both paths now byte-verified at L1+L5
+  (`toolsench_d2d.bat` 10/10; new VK true-D2D test, both devices;
+  validation layers clean).
+- **CUDA GPU tests could fail with CUDA_ERROR_INVALID_CONTEXT (201)**
+  when scheduled onto an unbound ptest worker thread (the cause of the
+  intermittent "every shape and level" flake). `lockGpuTests()` now
+  binds the context after acquiring the lock.
+- VK device rejection message no longer claims a CPU fallback exists;
+  it names the supported hardware and points at `--device`/`--probe`.
+
+### Performance
+
+- **CUDA decode bookkeeping fused** (srcVK A-017 backports):
+  `slzCompactAllDescsKernel` (one launch, 5 single-thread blocks)
+  replaces 5 sequential compactions (0.40 -> 0.077 ms); 4-block
+  `slzMergeHuffDescsParKernel` replaces the serial merge (0.199 ->
+  0.067 ms). enwik8 L5 d2d 4.17 -> 4.06 ms; per-kernel sum 4.92 ->
+  4.39 ms (vs nvCOMP Zstd 6.25: 1.42x).
+- **VK true-D2D batched onto pipeline_stream** (A-026): L1 D2D call
+  7.69 -> 5.51 ms, L5 8.27 -> 7.15 ms (CUDA: 4.04/5.47). Known
+  limitation: the walk kernel still submits early (batching it
+  corrupts downstream reads despite barriers - open item, v4 #12).
+
+### Added
+
+- Observability parity: CUDA CLI prints `Device:`; per-kernel `-db`
+  table via `SLZ_PROFILE_DECODE=1`; encode phase profiler via
+  `SLZ_PROFILE_PHASES=1` (first table localized the L5 chain parser
+  at 86% of encode wall). VK `-db` gains `SLZ_VK_D2D=1` true-D2D
+  bench mode (byte-verifying); `--probe` prints per-device subgroup
+  ranges with an UNSUPPORTED marker.
+- `zig build ptx` - stale-only nvcc rebuild (replaces the manual
+  vcvarsall + touch-the-sibling-PTXs workflow); the freshness gate
+  error now points at it.
+- `toolssanitize.bat` - compute-sanitizer gate; memcheck + racecheck
+  baseline: 0 errors/0 hazards across the kernel set.
+- Test backports (CUDA suite 25 -> 49, all genuinely executing;
+  runner now prints SKIP names): Huffman 4-kernel conformance (5),
+  CLI smoke via subprocess (5), L5 chain-parser hardening (4), C ABI
+  via extern-fn binding (10, incl. true-D2D L1+L5); VK suite + the
+  first true-D2D roundtrip test (150/9/0 both devices).
+- README: Supported hardware section (CUDA = CC>=8.9 as shipped; VK =
+  NVIDIA Turing+/AMD RDNA1+/Intel Xe - wave64 GCN rejected with a
+  clear message, verified on RX 590/550); perf tables re-measured
+  post-backports (the vs-nvCOMP kernel-sum rows were badly stale:
+  L1 1.18x -> 1.62x, L5 1.14x -> 1.42x).
+
+### Docs
+
+- BACKPORTS.md fully executed and retired (audit trail in git
+  history); SHA gate promoted to CLAUDE.md; port-era docs
+  (srcVK ToDo/gameplan/PortInstructions, 8 docs/vulkan_* plans,
+  docs/GPU_README, docs/GPU_IDEAS) consolidated into
+  srcVK/Handbook.md, GPU_ARCHITECTURE (kernel inventory),
+  cudaOptimize (vs-nvCOMP methodology), v4_ideas (#14/#15 + basket) +
+  FAILED_EXPERIMENTS; CodeWiki rewritten for the current tree.
+  PortAdaptations gains A-025/A-026 and updated A-017/A-021.
+
 ## Unreleased — 2026-06-09 (1 GB-scale correctness + decode-speed wave)
 
 Frames produced by older builds remain decodable (sc_group_size and
