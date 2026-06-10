@@ -200,28 +200,35 @@ closes half the 1.4× gap. Zero ratio impact.
 **Cost/risk**: medium-low — A-017 is a proven template; ~1 day + the
 standard cross-backend SHA regression.
 
-## 11. Delete legacy wire-format chunk types 1/5/6/7 (decoder)
+## 11. tANS entropy stage (GPU-native reintroduction)
 
-**What**: Remove the `chunk_type ∈ {1,5,6,7}` arms from
-`src/decode/lz_header_parse.cuh` (both stream-header parsers), the
-matching skip arms in `slz_wire_format.cuh::skipEntropyStream`, and
-the VK glsl mirrors; route unknown types to a status word the host
-surfaces as a parse failure (the `walk_frame_kernel` d_status
-pattern). Update FORMAT.md to document only the live {0, 4} types.
+**What**: A GPU tANS (FSE-class) entropy coder as an alternative to —
+or replacement for — the 32-stream canonical Huffman at L3+, or as a
+new top level above L5. The codebase had a host-side tANS-32 path
+once (the retired chunk types 5/6/7; born in 64f3cc2 / cbf6a3b,
+encoder deleted in fbc7644 / 8982fee, the dead decoder wire-format
+arms finally removed in e8061dd, which reduced the stream types to
+{0, 4, 8}). A v4 tANS would be designed GPU-first: encoder + decoder
+kernels on both backends, 32-lane interleaved states (the existing
+BIL 4-stream layout generalizes), one new chunk type.
 
-**Why** (from TODO2's adversarial verify, confirmed against git
-history): these arms are NOT backward compat. The types belonged to
-the GPU codec's own deleted host-side tANS path (commits 64f3cc2 /
-cbf6a3b, removed in fbc7644 / 8982fee) — no decoder for them exists
-in-tree, and the arms redirect stream pointers into NEVER-POPULATED
-entropy scratch. A frame carrying these types decodes to silent
-garbage instead of SLZ_ERROR_CORRUPT_FRAME. Unreachable from any
-in-tree encoder output, but it converts malformed/adversarial input
-from "clean error" to "silent corruption", and the comments on the
-arms actively mislead readers into thinking the types are functional.
+**Why**: tANS reaches fractional-bit code lengths that canonical
+Huffman cannot — zstd's FSE typically takes 1-4% more out of the
+entropy stage on skewed streams, and the post-LZ token/offset streams
+are exactly that shape. On enwik9 L5 at 35.50% vs nvCOMP Zstd's
+35.75%, even a 1-2% entropy-stage gain (≈ 0.3-0.7 pp of end ratio)
+meaningfully widens a lead that is currently thin.
 
-**Cost**: ~80 lines of .cuh deleted + VK mirrors + FORMAT.md; the
-status-word plumbing is the only new code. Hours, not days.
+**Prototype gate (do this first, it's cheap)**: histogram the actual
+lit/tok/off16 stream contents on the bench corpora and compute
+Shannon-vs-Huffman-vs-tANS sizes host-side, no kernels. If the
+measured gap is under ~1% of entropy-stage bytes, stop there.
+
+**Cost/risk**: weeks-class — new kernels in both directions on both
+backends, a wire-format addition (pairs naturally with #8's v4 format
+work), full conformance + cross-backend SHA matrix. Decode-speed risk
+is the serial per-stream state update; the 32-stream interleave is
+what keeps it GPU-shaped, same as Huffman today.
 
 ## 12. Small-items basket (carried from the retired todo.md deferrals)
 
@@ -235,6 +242,3 @@ status-word plumbing is the only new code. Hours, not days.
 - **C ABI default-level mismatch** (Zig Options.level=1 vs C header 5)
   — documented as intentional; revisit only if the L2-alias decision
   (#6) changes level semantics anyway.
-- **TODO2 doc-drift sweep**: stale `src/gpu/` paths (~10 sites), the
-  `streamlz_gpu.h` async/stack-usage doc gaps, and the unverified
-  correctness-tagged items past TODO2.md line 250.
