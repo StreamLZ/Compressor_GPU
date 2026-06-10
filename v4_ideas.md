@@ -202,7 +202,7 @@ matches, which the text-workload match-length histogram says are rare.
 Keep parked unless a binary-heavy workload (silesia-like or model
 weights) becomes a target.
 
-## 10. A-021: fuse the remaining VK decode bookkeeping dispatches
+## 10. A-021: fuse the remaining VK decode bookkeeping dispatches — ✅ DONE 2026-06-10
 
 **What**: Apply the A-017 fusion pattern (which collapsed 4×
 `compact_huff_descs` dispatches into one grid_x=4 kernel for a 2.4×
@@ -233,6 +233,16 @@ raw pair, `ee925e4`) and `slzMergeHuffDescsParKernel` (4-block
 parallel merge, 0.199 → 0.067 ms CUDA-side, `ec6071d`). Port those
 shapes rather than designing fresh; see the A-017/A-021 2026-06-10
 updates in srcVK/PortAdaptations.md.
+
+**DONE 2026-06-10 (same day)**: both kernels mirrored
+(`compact_all_descs_kernel.comp` grid_x=5 as the only compact path,
+`merge_huff_descs_par_kernel.comp` grid_x=4 with serial fallback —
+both matching CUDA's host shapes). Dispatches 12 → 10 per L3+
+decode. Measured: enwik9 kernels L3 44.9 → 42.9 ms, L5 45.4 →
+43.4 ms — gap vs CUDA 1.32× → 1.26×; enwik8 L5 D2D 5.77 → 5.62 ms.
+SHA MATCH at 1 GB; ptest_vk 150/9/0. The residual ~1.26× lives in
+kernel_fn itself (the LZ workhorse) per the A-021 attribution note —
+that's #1/#2/#15 territory, not more fusion.
 
 ## 11. Per-chunk adaptive entropy: Huffman vs tANS, pick the smaller
 

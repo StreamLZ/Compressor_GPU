@@ -364,8 +364,16 @@ pub fn mergeHuffDescs(
         COUNTS_STRIDE * 5,
     };
     const stream = self.work_stream;
-    const t_merge = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzMergeHuffDescsKernel", stream);
-    try vkCall(launch_fn(module_loader.merge_huff_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &m_params, &m_extra, &m_offs), .launch);
+    // A-021 (2026-06-10, CUDA-mirror of src/decode/decode_dispatch.zig
+    // mergeHuffDescs): prefer the 4-block parallel merge (wall ~= the
+    // largest region instead of the sum of all four); the serial kernel
+    // stays as a fallback when the par pipeline failed to build.
+    const use_par = module_loader.merge_huff_descs_par_fn != 0;
+    const merge_fn = if (use_par) module_loader.merge_huff_descs_par_fn else module_loader.merge_huff_descs_fn;
+    const grid_x: u32 = if (use_par) 4 else 1;
+    const label: [*:0]const u8 = if (use_par) "slzMergeHuffDescsParKernel (x4)" else "slzMergeHuffDescsKernel";
+    const t_merge = beginKernelTiming(self.enable_profiling, &self.pending_timings, label, stream);
+    try vkCall(launch_fn(merge_fn, grid_x, 1, 1, 1, 1, 1, 0, stream, &m_params, &m_extra, &m_offs), .launch);
     endKernelTiming(t_merge, stream);
     // Iter 4c: merge wrote d_huff_descs + n_merged. huff_build_lut +
     // huff_decode_4stream read both downstream. VK requires the explicit

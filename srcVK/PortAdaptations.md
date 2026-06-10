@@ -814,6 +814,20 @@ verification status. An unverified adaptation is a known risk surface.
   mirror — porting them is the A-021 close path with measured
   expected wins (VK merge 954 µs and compact_raw 430 µs on the L3
   silesia cell above are the corresponding targets).
+- **2026-06-10 close-path EXECUTED (v4 #10)**: both CUDA reference
+  kernels mirrored back —
+  `srcVK/decode/compact_all_descs_kernel.comp` (5-way fused compact,
+  grid_x=5, replaces compact_huff(×4)+compact_raw as the only compact
+  path, matching CUDA's no-fallback shape) and
+  `srcVK/decode/merge_huff_descs_par_kernel.comp` (4-block parallel
+  merge, serial kernel kept as fallback, matching CUDA's `use_par`).
+  Dispatch count 12 → 10 per L3+ decode; one fewer A-006 barrier
+  boundary. enwik8-L5 kper: compact_all 240 µs, merge_par 191 µs.
+  Measured (RTX 4060 Ti, -db r=10): enwik9 L3 kernels 44.9 → 42.9 ms,
+  L5 45.4 → 43.4 ms (gap vs CUDA 34.4: 1.32× → 1.26×); enwik8 L5 D2D
+  kernels 5.77 → 5.62 ms, verify OK. enwik9 L3 1 GB SHA MATCH;
+  ptest_vk 150/9/0. Status remains ACTIVE for the residual ~1.26×
+  (lives mostly in kernel_fn itself per the attribution note).
 
 ### A-023: Batched LZ dispatch + skip the wrap_input H2D when VK can't satisfy CUDA's full-hash allocation on enwik9 L3/L5
 - **File:line**:

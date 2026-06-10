@@ -1,0 +1,164 @@
+// 1:1 port of src/decode/compact_descs_kernels.cuh, entry point
+// slzCompactAllDescsKernel.
+// CUDA reference: src/decode/compact_descs_kernels.cuh:100-164.
+//
+// A-021 (2026-06-10): the 5-way fused compaction — the original VK
+// A-017 fusion collapsed the 4 Huffman-stream compactions into one
+// grid_x=4 dispatch; CUDA's 2026-06-10 backport (`ee925e4`) went one
+// further and folded the raw hi+lo pair in as block 4. This kernel
+// mirrors that 5-block shape back, eliminating the separate
+// slzCompactRawDescsKernel dispatch (one less per-dispatch overhead
+// floor + one less A-006 barrier boundary on the VK side).
+//
+// blockIdx 0-3 compact the lit/tok/hi/lo Huffman streams; block 4
+// compacts the raw hi+lo pair. Counts land at the same COUNTS_STRIDE
+// slots the unfused kernels used (huff at slot 0-3, raw at slot 4).
+
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+
+#include "slz_wire_format.glsl"
+
+layout(local_size_x = 1) in;
+
+// VK adaptation: HUFF_LUT_ENTRIES is defined in srcVK/decode/descriptors.zig
+// (= 1024). Mirror the constant locally to match the CUDA compact loop's
+// `k * HUFF_LUT_ENTRIES` lut_offset stamping.
+const uint HUFF_LUT_ENTRIES = 1024u;
+
+// COUNTS_STRIDE = 256 bytes = 64 u32 per slot — must match
+// srcVK/decode/scan_gpu.zig::COUNTS_STRIDE. Slots: lit=0, tok=64,
+// hi=128, lo=192, raw=256 (u32 indices).
+const uint COUNTS_STRIDE_U32 = 64u;
+
+// SlzScanHuffDesc layout matches descriptors.zig::ScanHuffDesc — 5 × u32.
+struct SlzScanHuffDescGlsl {
+    uint in_offset;
+    uint in_size;
+    uint out_offset;
+    uint out_size;
+    uint valid;
+};
+
+// SlzScanRawDesc layout matches descriptors.zig::ScanRawDesc — 4 × u32.
+struct SlzScanRawDescGlsl {
+    uint src_offset;
+    uint size;
+    uint gpu_offset;
+    uint valid;
+};
+
+// SlzHuffDecChunkDesc layout matches descriptors.zig::HuffDecChunkDesc — 5 × u32.
+struct SlzHuffDecChunkDescGlsl {
+    uint in_offset;
+    uint in_size;
+    uint out_offset;
+    uint out_size;
+    uint lut_offset;
+};
+
+// SlzRawOff16Desc layout matches descriptors.zig::RawOff16Desc — 3 × u32.
+struct SlzRawOff16DescGlsl {
+    uint src_offset;
+    uint size;
+    uint gpu_offset;
+};
+
+// Binding order mirrors the CUDA parameter order verbatim
+// (src/decode/compact_descs_kernels.cuh:100-113).
+// arg 0..3: per-stream views of d_scan_staged (same VkBuffer, binding
+// offsets 0 / huff_arr_bytes / 2x / 3x — see compact_huff_descs_kernel.comp
+// for why each stream needs its own binding under std430).
+layout(std430, binding = 0) readonly buffer StagedBufLit { SlzScanHuffDescGlsl d_staged_lit[]; };
+layout(std430, binding = 1) readonly buffer StagedBufTok { SlzScanHuffDescGlsl d_staged_tok[]; };
+layout(std430, binding = 2) readonly buffer StagedBufHi  { SlzScanHuffDescGlsl d_staged_hi[];  };
+layout(std430, binding = 3) readonly buffer StagedBufLo  { SlzScanHuffDescGlsl d_staged_lo[];  };
+
+// arg 4..5: raw staged views of d_scan_staged (offsets 4*huff_arr_bytes
+// and 4*huff_arr_bytes + raw_arr_bytes).
+layout(std430, binding = 4) readonly buffer StagedRawHiBuf { SlzScanRawDescGlsl d_staged_raw_hi[]; };
+layout(std430, binding = 5) readonly buffer StagedRawLoBuf { SlzScanRawDescGlsl d_staged_raw_lo[]; };
+
+// arg 6: const uint32_t* d_total_subs
+layout(std430, binding = 6) readonly buffer TotalSubsBuf {
+    uint d_total_subs;
+};
+
+// arg 7..10: per-stream dst buffers d_compact_{lit,tok,hi,lo}.
+layout(std430, binding = 7)  buffer OutBufLit { SlzHuffDecChunkDescGlsl d_out_lit[]; };
+layout(std430, binding = 8)  buffer OutBufTok { SlzHuffDecChunkDescGlsl d_out_tok[]; };
+layout(std430, binding = 9)  buffer OutBufHi  { SlzHuffDecChunkDescGlsl d_out_hi[];  };
+layout(std430, binding = 10) buffer OutBufLo  { SlzHuffDecChunkDescGlsl d_out_lo[];  };
+
+// arg 11: SlzRawOff16Desc* d_out_raw (d_compact_raw, offset 0).
+layout(std430, binding = 11) buffer OutRawBuf { SlzRawOff16DescGlsl d_out_raw[]; };
+
+// arg 12: uint32_t* d_counts — full d_compact_counts buffer (offset 0).
+// Writes slots 0-4 at which * COUNTS_STRIDE_U32.
+layout(std430, binding = 12) buffer NOutBuf {
+    uint d_counts[];
+};
+
+void main() {
+    // CUDA reference: NOT SLZ_GUARD_SINGLE_THREAD — that guard also
+    // rejects workgroup ID != 0, but this kernel deliberately runs 5
+    // single-thread workgroups. local_size_x=1 makes the thread guard
+    // moot; gate only on the workgroup range.
+    uint which = gl_WorkGroupID.x;
+    if (which > 4u) return;
+
+    uint tot = d_total_subs;
+
+    if (which < 4u) {
+        // CUDA reference: src/decode/compact_descs_kernels.cuh:122-143.
+        uint k = 0u;
+        for (uint i = 0u; i < tot; i = i + 1u) {
+            SlzScanHuffDescGlsl s;
+            if      (which == 0u) s = d_staged_lit[i];
+            else if (which == 1u) s = d_staged_tok[i];
+            else if (which == 2u) s = d_staged_hi[i];
+            else                  s = d_staged_lo[i];
+
+            if (s.valid != 0u) {
+                SlzHuffDecChunkDescGlsl o;
+                o.in_offset  = s.in_offset;
+                o.in_size    = s.in_size;
+                o.out_offset = s.out_offset;
+                o.out_size   = s.out_size;
+                o.lut_offset = k * HUFF_LUT_ENTRIES;
+
+                if      (which == 0u) d_out_lit[k] = o;
+                else if (which == 1u) d_out_tok[k] = o;
+                else if (which == 2u) d_out_hi[k]  = o;
+                else                  d_out_lo[k]  = o;
+
+                k = k + 1u;
+            }
+        }
+        d_counts[which * COUNTS_STRIDE_U32] = k;
+    } else {
+        // CUDA reference: src/decode/compact_descs_kernels.cuh:144-163.
+        uint k = 0u;
+        for (uint i = 0u; i < tot; i = i + 1u) {
+            SlzScanRawDescGlsl hi = d_staged_raw_hi[i];
+            if (hi.valid != 0u) {
+                SlzRawOff16DescGlsl o;
+                o.src_offset = hi.src_offset;
+                o.size       = hi.size;
+                o.gpu_offset = hi.gpu_offset;
+                d_out_raw[k] = o;
+                k = k + 1u;
+            }
+            SlzScanRawDescGlsl lo = d_staged_raw_lo[i];
+            if (lo.valid != 0u) {
+                SlzRawOff16DescGlsl o;
+                o.src_offset = lo.src_offset;
+                o.size       = lo.size;
+                o.gpu_offset = lo.gpu_offset;
+                d_out_raw[k] = o;
+                k = k + 1u;
+            }
+        }
+        d_counts[4u * COUNTS_STRIDE_U32] = k;
+    }
+}

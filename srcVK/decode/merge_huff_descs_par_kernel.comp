@@ -1,0 +1,89 @@
+// 1:1 port of src/decode/merge_huff_descs_kernel.cuh, entry point
+// slzMergeHuffDescsParKernel.
+// CUDA reference: src/decode/merge_huff_descs_kernel.cuh:69-116.
+//
+// A-021 (2026-06-10): 4-block parallel merge. The serial kernel
+// (merge_huff_descs_kernel.comp) walks lit→tok→hi→lo with one thread;
+// the four regions are independent once each region's base slot is
+// known, and the bases are just prefix sums of the four counts —
+// available to every workgroup for the cost of reading 4 u32s. Same
+// shape as the A-017 compact fusion: grid_x = 4 single-thread
+// workgroups, wall cost ~= the largest region. Workgroup 0
+// additionally writes n_merged (the total). CUDA measured 0.199 →
+// 0.067 ms at enwik8-L5 scale (`ec6071d`).
+//
+// Bindings + push constants identical to the serial kernel so the
+// host launch site only changes the pipeline handle and grid_x.
+
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+
+#include "slz_wire_format.glsl"
+
+layout(local_size_x = 1) in;
+
+const uint HUFF_LUT_ENTRIES = 1024u;
+
+// SlzHuffDecChunkDesc layout matches descriptors.zig::HuffDecChunkDesc — 5 × u32.
+struct SlzHuffDecChunkDescGlsl {
+    uint in_offset;
+    uint in_size;
+    uint out_offset;
+    uint out_size;
+    uint lut_offset;
+};
+
+layout(std430, binding = 0) readonly buffer LitBuf { SlzHuffDecChunkDescGlsl d_lit[]; };
+layout(std430, binding = 1) readonly buffer TokBuf { SlzHuffDecChunkDescGlsl d_tok[]; };
+layout(std430, binding = 2) readonly buffer HiBuf  { SlzHuffDecChunkDescGlsl d_hi[];  };
+layout(std430, binding = 3) readonly buffer LoBuf  { SlzHuffDecChunkDescGlsl d_lo[];  };
+
+layout(std430, binding = 4) readonly buffer NLitBuf { uint d_n_lit; };
+layout(std430, binding = 5) readonly buffer NTokBuf { uint d_n_tok; };
+layout(std430, binding = 6) readonly buffer NHiBuf  { uint d_n_hi;  };
+layout(std430, binding = 7) readonly buffer NLoBuf  { uint d_n_lo;  };
+
+layout(std430, binding = 8) buffer MergedBuf  { SlzHuffDecChunkDescGlsl d_merged[]; };
+layout(std430, binding = 9) buffer NMergedBuf { uint d_n_merged; };
+
+// Scalar args: tok_region_off, off16_region_off — kept for ABI
+// compatibility with the host launch but NOT consumed (A-024: region
+// offsets are applied as 64-bit inside the huff-decode kernel; see the
+// serial kernel's comment block).
+layout(push_constant) uniform Push {
+    uint tok_region_off;
+    uint off16_region_off;
+} pc;
+
+void main() {
+    // CUDA reference: src/decode/merge_huff_descs_kernel.cuh:91-115.
+    // local_size_x=1 makes the thread guard moot; gate on workgroup range
+    // (SLZ_GUARD_SINGLE_THREAD would reject workgroups 1-3).
+    uint which = gl_WorkGroupID.x;
+    if (which > 3u) return;
+
+    uint n0 = d_n_lit;
+    uint n1 = d_n_tok;
+    uint n2 = d_n_hi;
+    uint n3 = d_n_lo;
+
+    uint n = (which == 0u) ? n0 :
+             (which == 1u) ? n1 :
+             (which == 2u) ? n2 : n3;
+    uint base = 0u;
+    if (which > 0u) base = base + n0;
+    if (which > 1u) base = base + n1;
+    if (which > 2u) base = base + n2;
+
+    for (uint i = 0u; i < n; i = i + 1u) {
+        SlzHuffDecChunkDescGlsl d;
+        if      (which == 0u) d = d_lit[i];
+        else if (which == 1u) d = d_tok[i];
+        else if (which == 2u) d = d_hi[i];
+        else                  d = d_lo[i];
+        uint slot = base + i;
+        d.lut_offset = slot * HUFF_LUT_ENTRIES;
+        d_merged[slot] = d;
+    }
+    if (which == 0u) d_n_merged = n0 + n1 + n2 + n3;
+}

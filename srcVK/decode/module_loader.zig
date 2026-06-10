@@ -330,7 +330,9 @@ pub var walk_frame_fn: usize = 0;
 pub var prefix_sum_chunks_fn: usize = 0;
 pub var compact_huff_descs_fn: usize = 0;
 pub var compact_raw_descs_fn: usize = 0;
+pub var compact_all_descs_fn: usize = 0;
 pub var merge_huff_descs_fn: usize = 0;
+pub var merge_huff_descs_par_fn: usize = 0;
 pub var huff_module: usize = 0;
 pub var huff_build_fn: usize = 0;
 pub var huff_decode_fn: usize = 0;
@@ -1867,7 +1869,9 @@ const KernelKind = enum(usize) {
     prefix_sum_chunks_fn,
     compact_huff_descs_fn,
     compact_raw_descs_fn,
+    compact_all_descs_fn,
     merge_huff_descs_fn,
+    merge_huff_descs_par_fn,
     huff_build_fn,
     huff_decode_fn,
 };
@@ -1917,7 +1921,14 @@ const KERNEL_DECLS = [_]KernelDecl{
     // 10 bindings = 4× staged + total + 4× dst + counts. Dispatched with grid_x=4.
     .{ .kind = .compact_huff_descs_fn, .n_bindings = 10, .push_constant_size = 0 },
     .{ .kind = .compact_raw_descs_fn, .n_bindings = 5, .push_constant_size = 0 },
+    // A-021: 5-way fused compact (A-017 + raw pair, mirrors CUDA
+    // slzCompactAllDescsKernel). 13 bindings = 4x staged huff + 2x staged
+    // raw + total + 4x huff dst + raw dst + counts. Dispatched grid_x=5.
+    .{ .kind = .compact_all_descs_fn, .n_bindings = 13, .push_constant_size = 0 },
     .{ .kind = .merge_huff_descs_fn, .n_bindings = 10, .push_constant_size = 8 },
+    // A-021: 4-block parallel merge (mirrors CUDA slzMergeHuffDescsParKernel).
+    // Same bindings/pc as the serial merge; dispatched grid_x=4.
+    .{ .kind = .merge_huff_descs_par_fn, .n_bindings = 10, .push_constant_size = 8 },
     .{ .kind = .huff_build_fn, .n_bindings = 4, .push_constant_size = 0, .pin_subgroup_32 = true },
     // huff_decode binding 5 is a u32 alias of binding 3 (OutputBuf) — see kernel comment.
     // A-024 (2026-06-10 revision): binding 6 (d_compact_counts) lets the
@@ -2682,8 +2693,19 @@ pub fn init() bool {
     if (!buildKernel(.compact_raw_descs_fn, spv_blobs.compact_raw_descs)) return false;
     compact_raw_descs_fn = @intCast(metaFor(.compact_raw_descs_fn).pipeline);
 
+    // A-021: fused 5-way compact + parallel merge. Optional (mirrors the
+    // CUDA module_loader: call sites check the slot and fall back to the
+    // unfused/serial kernels when 0).
+    if (buildKernel(.compact_all_descs_fn, spv_blobs.compact_all_descs)) {
+        compact_all_descs_fn = @intCast(metaFor(.compact_all_descs_fn).pipeline);
+    }
+
     if (!buildKernel(.merge_huff_descs_fn, spv_blobs.merge_huff_descs)) return false;
     merge_huff_descs_fn = @intCast(metaFor(.merge_huff_descs_fn).pipeline);
+
+    if (buildKernel(.merge_huff_descs_par_fn, spv_blobs.merge_huff_descs_par)) {
+        merge_huff_descs_par_fn = @intCast(metaFor(.merge_huff_descs_par_fn).pipeline);
+    }
 
     // L1 required kernels: lz_decode_raw + prefix_sum_chunks must load.
     if (kernel_raw_fn == 0 or prefix_sum_chunks_fn == 0) return false;

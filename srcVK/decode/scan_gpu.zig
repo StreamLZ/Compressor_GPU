@@ -178,8 +178,9 @@ pub fn gpuScanChunks(
 ) GpuError!descriptors.ScanResult {
     if (!module_loader.init()) return error.BackendNotAvailable;
     if (module_loader.scan_parse_fn == 0) return error.KernelMissing;
-    if (module_loader.compact_huff_descs_fn == 0 or module_loader.compact_raw_descs_fn == 0)
-        return error.KernelMissing;
+    // A-021: the fused 5-way compact is the only compact path (mirrors
+    // CUDA src/decode/scan_gpu.zig:139 - no unfused fallback).
+    if (module_loader.compact_all_descs_fn == 0) return error.KernelMissing;
     if (module_loader.merge_huff_descs_fn == 0) return error.KernelMissing;
 
     const n: u32 = @intCast(chunk_descs.len);
@@ -344,82 +345,63 @@ pub fn gpuScanChunks(
         try ensureDeviceBuf(&self.d_compact_counts, &self.d_compact_counts_size, counts_bytes);
         try vkCall(memset(self.d_compact_counts, 0, counts_bytes), .copy);
 
-        // A-017 (2026-06-08): fuse 4 separate compact_huff dispatches
-        // into one with grid_x=4. CUDA reference does 4 cuLaunchKernel
-        // calls (src/decode/scan_gpu.zig:214-239) for {lit, tok, hi, lo};
-        // VK collapses to a single vkCmdDispatch with each workgroup
-        // selecting its stream type via gl_WorkGroupID.x. Eliminates 3×
-        // per-dispatch overhead floor (~75 µs/dispatch on Vulkan-on-WDDM)
-        // — measured savings ~225 µs/decode on RTX 4060 Ti.
+        // A-021 (2026-06-10): ONE fused launch with five single-thread
+        // workgroups — gl_WorkGroupID.x 0-3 compact the four Huffman
+        // streams (the original A-017 fusion), workgroup 4 compacts the
+        // raw hi+lo pair. Mirrors CUDA's slzCompactAllDescsKernel
+        // (src/decode/scan_gpu.zig:214-246, backported `ee925e4` from
+        // this side's A-017 and now mirrored back). Eliminates the
+        // separate compact_raw dispatch's per-dispatch overhead floor;
+        // counts land in the same COUNTS_STRIDE slots [0..4] the
+        // unfused path used.
         //
-        // compact_huff_descs_kernel.comp: n_bindings=10 (4× per-stream
-        // staged source views at offsets 0/huff_arr_bytes/2x/3x, total_subs,
-        // 4× per-stream dst buffers d_compact_{lit,tok,hi,lo}, NOutBuf at
-        // offset 0 covering all 4 count slots). push_constant_size=0.
+        // compact_all_descs_kernel.comp: n_bindings=13 (4× staged huff
+        // views at offsets 0/huff_arr_bytes/2x/3x, 2× staged raw views
+        // at 4x / 4x+raw_arr_bytes, total_subs, 4× huff dst, raw dst,
+        // counts at offset 0). push_constant_size=0.
         {
             var k_st_lit: u64 = self.d_scan_staged;
             var k_st_tok: u64 = self.d_scan_staged;
             var k_st_hi:  u64 = self.d_scan_staged;
             var k_st_lo:  u64 = self.d_scan_staged;
+            var k_st_raw_hi: u64 = self.d_scan_staged;
+            var k_st_raw_lo: u64 = self.d_scan_staged;
             var k_total:  u64 = self.d_total_subchunks_buf;
             var k_out_lit: u64 = self.d_compact_lit;
             var k_out_tok: u64 = self.d_compact_tok;
             var k_out_hi:  u64 = self.d_compact_hi;
             var k_out_lo:  u64 = self.d_compact_lo;
+            var k_out_raw: u64 = self.d_compact_raw;
             var k_count: u64 = self.d_compact_counts;
             var c_params = [_]?*anyopaque{
-                @ptrCast(&k_st_lit), @ptrCast(&k_st_tok),
-                @ptrCast(&k_st_hi),  @ptrCast(&k_st_lo),
+                @ptrCast(&k_st_lit),    @ptrCast(&k_st_tok),
+                @ptrCast(&k_st_hi),     @ptrCast(&k_st_lo),
+                @ptrCast(&k_st_raw_hi), @ptrCast(&k_st_raw_lo),
                 @ptrCast(&k_total),
                 @ptrCast(&k_out_lit), @ptrCast(&k_out_tok),
                 @ptrCast(&k_out_hi),  @ptrCast(&k_out_lo),
+                @ptrCast(&k_out_raw),
                 @ptrCast(&k_count),
             };
             var c_extra = [_]?*anyopaque{null};
-            // Per-binding byte offsets: stream-N staged source at N*huff_arr_bytes
-            // within d_scan_staged; all dst buffers and counts buffer start at 0.
-            const ch_offs = [_]u64{
+            // Per-binding byte offsets: stream-N staged source at
+            // N*huff_arr_bytes within d_scan_staged, raw hi/lo after the
+            // 4 huff arrays; all dst buffers and counts start at 0.
+            const ca_offs = [_]u64{
                 0, huff_arr_bytes, huff_arr_bytes * 2, huff_arr_bytes * 3,
+                huff_arr_bytes * 4, huff_arr_bytes * 4 + raw_arr_bytes,
                 0,
                 0, 0, 0, 0,
                 0,
-            };
-            const t_ch = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzCompactHuffDescsKernel (fused×4)", stream);
-            // grid_x=4: one workgroup per stream type. local_size_x=1 unchanged
-            // (compact is inherently serial per stream).
-            try vkCall(launch(module_loader.compact_huff_descs_fn, 4, 1, 1, 1, 1, 1, 0, stream, &c_params, &c_extra, &ch_offs), .launch);
-            decode_context.endKernelTiming(t_ch, stream);
-        }
-        // CUDA reference: src/decode/scan_gpu.zig:241-255. Raw compact —
-        // 1 launch of slzCompactRawDescsKernel reading hi+lo staged
-        // arrays into d_compact_raw, count at slot 4 (matches the
-        // COUNTS_STRIDE * 4 offset wired below).
-        // compact_raw_descs_kernel.comp: n_bindings=5 (StagedHiBuf,
-        // StagedLoBuf, TotalSubsBuf, OutBuf, NOutBuf), push_constant_size=0.
-        {
-            // Iter 4c: same per-binding-offset pattern as the huff path.
-            var cr_hi: u64 = self.d_scan_staged;
-            var cr_lo: u64 = self.d_scan_staged;
-            var cr_total: u64 = self.d_total_subchunks_buf;
-            var cr_dst: u64 = self.d_compact_raw;
-            var cr_count: u64 = self.d_compact_counts;
-            var cr_params = [_]?*anyopaque{
-                @ptrCast(&cr_hi), @ptrCast(&cr_lo), @ptrCast(&cr_total),
-                @ptrCast(&cr_dst), @ptrCast(&cr_count),
-            };
-            var cr_extra = [_]?*anyopaque{null};
-            const cr_offs = [_]u64{
-                huff_arr_bytes * 4,
-                huff_arr_bytes * 4 + raw_arr_bytes,
                 0,
-                0,
-                COUNTS_STRIDE * 4,
             };
-            const t_cr = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzCompactRawDescsKernel", stream);
-            try vkCall(launch(module_loader.compact_raw_descs_fn, 1, 1, 1, 1, 1, 1, 0, stream, &cr_params, &cr_extra, &cr_offs), .launch);
-            decode_context.endKernelTiming(t_cr, stream);
+            const t_ca = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzCompactAllDescsKernel (fused x5)", stream);
+            // grid_x=5: one workgroup per stream type + raw. local_size_x=1
+            // unchanged (compact is inherently serial per stream).
+            try vkCall(launch(module_loader.compact_all_descs_fn, 5, 1, 1, 1, 1, 1, 0, stream, &c_params, &c_extra, &ca_offs), .launch);
+            decode_context.endKernelTiming(t_ca, stream);
         }
-        // Iter 4c: compact_huff (x4) + compact_raw wrote d_compact_lit
+        // Iter 4c / A-021: the fused compact wrote d_compact_lit
         // /tok/hi/lo, d_compact_raw, and the per-stream counters in
         // d_compact_counts that the merge / gather / huff_build /
         // huff_decode kernels read downstream. Barrier so those reads

@@ -53,6 +53,16 @@ Wire format unchanged from 2026-06-09; all frames byte-identical.
   L3/L4 cells were flattered by the stale out-copy): L1 5.07 /
   L2 5.05 / L3 7.13 / L4 7.04 / L5 6.86 ms, all byte-verified;
   ptest_vk 150/9/0. Catalog: PortAdaptations A-026.
+- **VK bookkeeping-dispatch fusion** (v4 #10 / A-021 close path): the
+  two CUDA reference kernels mirrored back to GLSL -
+  `compact_all_descs_kernel.comp` (5-way fused compact incl. the raw
+  pair, grid_x=5, now the only compact path) and
+  `merge_huff_descs_par_kernel.comp` (4-block parallel merge, serial
+  fallback kept). L3+ decode dispatches 12 -> 10. enwik9 kernels:
+  L3 44.9 -> 42.9 ms, L5 45.4 -> 43.4 ms (gap vs CUDA 34.4 narrows
+  1.32x -> 1.26x); enwik8 L5 D2D kernels 5.77 -> 5.62 ms, verify OK.
+  1 GB L3 SHA MATCH; ptest_vk 150/9/0. Residual gap lives in the LZ
+  workhorse kernel itself (v4 #1/#2/#15 territory).
 - **VK 1 GB L3+ decode verified** (v4 #4 close-out): the exact
   `total_subchunks` sizing from the A-024 wave (entropy scratch
   12 -> 6 GB at 1 GB sc=0.25, region offsets back under 2^32) got

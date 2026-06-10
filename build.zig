@@ -422,7 +422,7 @@ fn ptxRebuild(step: *std.Build.Step, opts: std.Build.Step.MakeOptions) anyerror!
 // formality at Step 2; the fleshout agent expands the bodies.
 
 const srcvk_kernels = [_][]const u8{
-    // decode (11)
+    // decode (13)
     "decode/lz_decode_raw_kernel",
     "decode/lz_decode_kernel",
     "decode/prefix_sum_chunks_kernel",
@@ -430,7 +430,9 @@ const srcvk_kernels = [_][]const u8{
     "decode/walk_frame_kernel",
     "decode/compact_huff_descs_kernel",
     "decode/compact_raw_descs_kernel",
+    "decode/compact_all_descs_kernel",
     "decode/merge_huff_descs_kernel",
+    "decode/merge_huff_descs_par_kernel",
     "decode/scan_parse_kernel",
     "decode/huff_build_lut_kernel",
     "decode/huff_decode_4stream_kernel",
