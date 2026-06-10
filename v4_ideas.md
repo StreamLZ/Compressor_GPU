@@ -230,10 +230,26 @@ the entropy body is Huffman or tANS, and emit whichever is smaller
   (lit + tok + off16 hi/lo) → ≥ 38 GB/s even crediting only the
   lit+tok bytes; higher with off16 counted. Huffman LUT build:
   0.160 ms.
-- Verdict: "tANS decodes faster" was true against the May-era Huffman
-  variants (15-26 GB/s) but the BIL-32 optimization waves overtook
-  it — today Huffman is ~5-15% faster per byte AND ~4× cheaper on
-  table build. The strict both-axes-win claim is dead.
+- **Harness upgraded same day**: the two Huffman learnings tANS never
+  received were transplanted and verified byte-exact —
+  `slzTans32DecodeU32StoreKernel` (4-byte output interleave → u32
+  stores): 37.8 GB/s; `slzTans32DecodeBilKernel` (+ BIL word-
+  interleaved comp layout, host-transcoded snapshot): **40.8 GB/s**
+  (0.681 ms). +13% over the prior best.
+- **Exact Huffman denominator** (NCU `smsp__sass_data_bytes_mem_
+  global_op_st` = 38.36 MB on enwik8 L5): production Huffman =
+  38.36 MB / 0.727 ms = **52.8 GB/s** — the earlier "≥38" bound was
+  loose (off16 planes add ~10 MB to the payload).
+- Verdict: even fully upgraded, tANS decodes at ~0.77× Huffman's
+  per-byte rate, and its table build is 4× dearer (0.61 vs 0.16 ms).
+  The structural reason: Huffman's LUT yields up to 2 symbols per
+  lookup (double-symbol entries, X2 batches); the tANS state chain
+  yields exactly 1, serially dependent. The strict both-axes-win
+  claim stays dead at the current design. One known lever remains
+  untried: dual FSE states per lane (zstd's interleaved-states ILP
+  trick — wire-level change, doubles the latency-hiding on the
+  state→LUT→state chain). If pursued, it belongs in the v4 wire
+  format design alongside the selector.
 - The idea SURVIVES in weakened form: per-chunk min() is still
   ratio-monotone, and the decode-speed cost is epsilon — the huff
   predecode is only ~0.73 ms of the ~4 ms enwik8 L5 d2d (and a

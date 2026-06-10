@@ -28,6 +28,10 @@
 // Brings in slzTansFseBuildKernel, slzTans32DecodeKernel, TansDecChunkDesc,
 // TansLutEnt, TansTableMeta, TANS_OK, and all device helpers.
 #include "tans_decode_kernel.cu"
+// 2026-06-10 upgrade variants (u32 stores + BIL-interleaved refill)
+// and their host driver (transcode + permuted-expected verify + bench).
+#include "tans_upgrade_kernels.cuh"
+#include "tans_upgrade_bench.h"
 
 #define CK(call) do { \
     cudaError_t e_ = (call); \
@@ -287,6 +291,13 @@ int main(int argc, char** argv) {
         if (ms < best_ms) best_ms = ms;
     }
     printf("[fse-build]     %u chunks -> best %.3f ms\n", n_chunks, best_ms);
+
+    // ── 2026-06-10 upgrade variants ──
+    if (runUpgradeBenches(comp, comp_size, descs, n_chunks, ref, total_dst,
+                          d_comp, d_descs, d_status, d_lut, d_meta) != 0) {
+        printf("upgrade-variant verify FAILED\n");
+        return 1;
+    }
 
     cudaFree(d_comp); cudaFree(d_out); cudaFree(d_descs); cudaFree(d_status);
     cudaFree(d_lut); cudaFree(d_meta); cudaFree(d_work);
