@@ -31,6 +31,10 @@
 // 2026-06-10 upgrade variants (u32 stores + BIL-interleaved refill)
 // and their host driver (transcode + permuted-expected verify + bench).
 #include "tans_upgrade_kernels.cuh"
+// CPU Huffman reference (canonical code-length builder) for the Gate-1
+// per-chunk huff-vs-tans size dry-run. NO_MAIN suppresses its main().
+#define HUFF_REF_NO_MAIN
+#include "huff_ref.c"
 #include "tans_upgrade_bench.h"
 
 #define CK(call) do { \

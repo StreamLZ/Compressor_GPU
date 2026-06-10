@@ -256,6 +256,46 @@ static int runUpgradeBenches(
         cudaFree(d_lut2); cudaFree(d_meta2);
     }
 
+    // ── Gate 1 dry-run: per-chunk Huffman-vs-tANS size selector ──
+    // tANS side = REAL production sizes from the snapshot
+    // (128 B sizes/states header + src_size, which covers FSE table +
+    // sub-streams). Huffman side = exact canonical bit count on the
+    // SAME decoded bytes (build_code_lengths + height_limit(10) from
+    // huff_ref.c, matching production MAX_CODE_LEN) + production
+    // framing: 5 B chunk header + 128 B weights + 96 B sub-header +
+    // 4 B K + ~64 B stream/word padding estimate.
+    {
+        uint64_t tot_huff = 0, tot_tans = 0, tot_min = 0;
+        uint32_t flips = 0;
+        uint64_t old_off = 0;
+        for (uint32_t c = 0; c < n_chunks; c++) {
+            uint32_t dsz = descs[c].dst_size;
+            const uint8_t* p = ref + old_off;
+            uint32_t hist[256];
+            memset(hist, 0, sizeof(hist));
+            for (uint32_t i = 0; i < dsz; i++) hist[p[i]]++;
+            uint8_t lens[256];
+            build_code_lengths(hist, lens);
+            height_limit(hist, lens, MAX_CODE_LEN);
+            uint64_t bits = 0;
+            for (int s = 0; s < 256; s++) bits += (uint64_t)hist[s] * lens[s];
+            uint64_t huff_sz = 5 + 128 + 96 + 4 + (bits + 7) / 8 + 64;
+            uint64_t tans_sz = 5 + 128 + descs[c].src_size;
+            tot_huff += huff_sz;
+            tot_tans += tans_sz;
+            if (tans_sz < huff_sz) { flips++; tot_min += tans_sz; }
+            else                   { tot_min += huff_sz; }
+            old_off += dsz;
+        }
+        printf("[gate1] %u chunks, %.1f MB raw: huff-only %.3f MB, tans-only %.3f MB,\n"
+               "        per-chunk min %.3f MB -> selector saves %.3f MB vs huff-only "
+               "(%.2f%%), %u/%u chunks flip to tANS\n",
+               n_chunks, total_dst / 1e6, tot_huff / 1e6, tot_tans / 1e6,
+               tot_min / 1e6, (tot_huff - tot_min) / 1e6,
+               100.0 * (double)(tot_huff - tot_min) / (double)tot_huff,
+               flips, n_chunks);
+    }
+
     cudaFree(d_out2); cudaFree(d_newoff); cudaFree(d_src2); cudaFree(d_src2off); cudaFree(d_Karr);
     free(new_off); free(exp2); free(gpu2); free(status2); free(src2); free(src2_off); free(Karr);
     return 0;

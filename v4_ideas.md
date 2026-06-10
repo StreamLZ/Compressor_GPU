@@ -313,15 +313,27 @@ the entropy body is Huffman or tANS, and emit whichever is smaller
   dry-run) is now the decisive gate, and the bar should be a bit
   higher to pay for the added pipeline complexity.
 
-**Gate 1 (a day, host-only)**: selection does NOT require double
-compression — both body sizes are computable from the per-chunk
-histogram (Huffman: Σ count×codelen from the table build that already
-runs; tANS: the old tans_encoder.zig exact bit-count dry-runner,
-resurrect from git). Run the dry-run selector over real L3/L5 chunk
-streams on enwik8/enwik9/silesia and report chunks-flipped + end-ratio
-delta. Expect flips concentrated in tokens/off16-hi (skewed, where
-Huffman's integer-bit loss is largest) and few in text literals
-(near-flat ~5-6 bits). If the delta is < ~0.1-0.2 pp, stop here.
+**Gate 1 — MEASURED 2026-06-10** (`[gate1]` in the harness driver:
+real production tANS sizes from the snapshot vs exact canonical
+Huffman bit-counts on the same decoded bytes, production framing on
+both sides, enwik8-L5 lit+tok, 3052 chunks / 27.8 MB raw):
+- huff-only 20.963 MB, tans-only 20.885 MB (tANS WINS overall on
+  these streams by 0.37%), per-chunk min 20.850 MB.
+- **Selector saves 0.54% of entropy-stage bytes vs huff-only;
+  1618/3052 chunks (53%) flip to tANS.**
+- Scaled to the frame: ≈ 0.29% smaller .slz ≈ **0.1 pp of end ratio**
+  on this corpus slice — right at the go/no-go bar. Untested upside:
+  the off16 hi/lo planes (more skewed than lit/tok → tANS should win
+  bigger) and enwik9-class inputs (deeper redundancy). Known
+  approximations: huff stream/word padding estimated flat (+64 B/chunk)
+  and 11-bit escape pairs not modeled — both small and roughly offsetting.
+- Speed economics post-upgrades: flipping 53% of chunks costs
+  ~nothing (tANS decode 40.8 GB/s vs huff 52.8; build 0.228 vs
+  0.160 ms; predecode is <1 ms of a 4+ ms decode).
+**Next measurement before any pipeline work**: extend the dry-run to
+the off16 planes + an enwik9 L5 snapshot — if those push the total
+toward ~0.2 pp, the selector is worth building; if it stays ≈0.1 pp,
+park it.
 
 **Build-out (if both gates pass)**: decode side is moderate — scan
 already dispatches on chunk_type; descs partition into a Huffman
