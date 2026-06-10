@@ -403,6 +403,13 @@ idea worth re-evaluating once the basic selector ships.
   upside <=1-2% on a 98%-memory-bound kernel - verify, don't refactor.
 - **Packed butterfly reduction in the BIL encoder** (retired
   GPU_IDEAS idea 6): ~30 min encode-side polish, minor.
+- **BUG: L3+ true-D2D decode fails** (found 2026-06-10 by
+  toolsench_d2d.bat during the README perf refresh): slzDecompressAsync
+  verify-FAILs on enwik8 L3 with zero kernel time (instant return);
+  L1/L2 D2D pass. Suspect the 2026-06-09 A-024 region-offset rework -
+  the D2D path had no L3+ coverage (c_abi_tests D2D case runs at L1).
+  FIX FIRST, then extend c_abi_tests.zig's D2D roundtrip to L5, then
+  re-measure the README L5 async-wall cell (marked with * there).
 
 ## 13. Fuzzing the decoder (and differential CUDA-vs-VK fuzz)
 
