@@ -94,6 +94,17 @@ pub fn decompressFramedFromDevice(
     const n_chunks_bound: u32 = (decomp_size + min_eff_chunk_size - 1) / min_eff_chunk_size;
     if (n_chunks_bound == 0 or n_chunks_bound > gpu_driver.WALK_MAX_CHUNKS) return error.BadMode;
 
+    // CUDA reference: src/decode/streamlz_decoder.zig (2026-06-10 fix).
+    // D2H the (tiny) frame header to learn the codec level - the L3+
+    // entropy stages gate on `req.level >= 3`, and the previous
+    // hardcoded `.level = 1` silently misrouted Huffman frames down
+    // the raw path on the true-D2D entry (same bug class as iter-4b
+    // `bcaa1f1`; found on the CUDA side by tools/bench_d2d.bat).
+    var hdr_buf: [64]u8 = @splat(0);
+    const hdr_n: u32 = @min(frame_size, 64);
+    if (!gpu_driver.copyDeviceToHost(hdr_buf[0..hdr_n], d_frame)) return error.BadMode;
+    const parsed_hdr = frame.parseHeader(hdr_buf[0..]) catch return error.BadMode;
+
     const dev = try gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size);
 
     // CUDA reference: src/decode/streamlz_decoder.zig:158-164. Stub
@@ -119,7 +130,7 @@ pub fn decompressFramedFromDevice(
         .d_compressed_src = d_frame + block_start,
         .d_chunk_descs_override = dev.d_chunk_descs,
         .d_n_chunks_dev = dev.d_meta + gpu_driver.walk_meta_offsets.n_chunks,
-        .level = 1,
+        .level = parsed_hdr.level,
     });
     return decomp_size;
 }
