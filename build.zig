@@ -41,6 +41,11 @@ pub fn build(b: *std.Build) void {
 
     const ptx_freshness = newPtxFreshnessStep(b);
 
+    // `zig build ptx` — recompile exactly the stale .cu TUs (and all of
+    // them after a shared-.cuh edit), replacing the manual
+    // vcvarsall + nvcc + touch-the-sibling-PTXs workflow.
+    b.step("ptx", "Recompile stale GPU kernels (.cu -> .ptx) via nvcc; no-op when fresh").dependOn(newPtxRebuildStep(b));
+
     // ── streamlz CLI ─────────────────────────────────────────────────────
     const cli_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -263,10 +268,147 @@ fn ptxFreshnessCheck(step: *std.Build.Step, opts: std.Build.Step.MakeOptions) an
             "PTX is stale relative to .cu/.cuh sources.\n" ++
                 "  newest source: {s}\n" ++
                 "  oldest PTX:    {s}\n" ++
-                "Run tools\\build_gpu.bat to rebuild every kernel + the embedding exe.",
+                "Run `zig build ptx` (stale-only nvcc rebuild), then re-run this build.\n" ++
+                "(tools\\build_gpu.bat does the full rebuild with cuobjdump res-usage.)",
             .{ newest_src_path.?, oldest_ptx_path.? },
         );
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  `zig build ptx` — stale-only nvcc rebuild
+// ────────────────────────────────────────────────────────────────────────
+//
+// E-section QoL item (BACKPORTS.md): the manual workflow was
+// vcvarsall → nvcc for the edited TU → touch the four sibling .ptx so
+// the freshness gate stops tripping on a shared-.cuh edit. This step
+// replaces all of it: a TU is rebuilt when its .ptx is older than its
+// .cu or ANY .cuh under the kernel dirs (the same global conservatism
+// the gate uses, so a header edit rebuilds every TU and the gate then
+// passes with no touch dance). Fresh TUs are skipped, so the step is a
+// fast no-op when nothing changed. PTX only — for cubin + res-usage
+// printouts use tools/build_gpu.bat.
+//
+// The nvcc invocations run from a generated .bat (one vcvarsall call,
+// `if errorlevel 1` after each nvcc) because passing a compound
+// command line through cmd.exe /c as a single argv element gets
+// re-quoted by the spawn layer and breaks on the spaces in the
+// vcvarsall path.
+
+const vcvarsall_path = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat";
+
+const ptx_tus = [_]struct { cu: []const u8, ptx: []const u8 }{
+    .{ .cu = "src/decode/lz_kernel.cu", .ptx = "src/decode/lz_kernel.ptx" },
+    .{ .cu = "src/decode/huffman_kernel.cu", .ptx = "src/decode/huffman_kernel.ptx" },
+    .{ .cu = "src/encode/lz_kernel.cu", .ptx = "src/encode/lz_kernel.ptx" },
+    .{ .cu = "src/encode/huffman_kernel.cu", .ptx = "src/encode/huffman_kernel.ptx" },
+    .{ .cu = "src/encode/assemble_kernel.cu", .ptx = "src/encode/assemble_kernel.ptx" },
+};
+
+fn newPtxRebuildStep(b: *std.Build) *std.Build.Step {
+    const step = b.allocator.create(std.Build.Step) catch @panic("oom");
+    step.* = std.Build.Step.init(.{
+        .id = .custom,
+        .name = "gpu-ptx-rebuild",
+        .owner = b,
+        .makeFn = ptxRebuild,
+    });
+    return step;
+}
+
+fn ptxRebuild(step: *std.Build.Step, opts: std.Build.Step.MakeOptions) anyerror!void {
+    _ = opts;
+    const b = step.owner;
+    const alloc = b.allocator;
+    const io = b.graph.io;
+
+    // Newest header mtime across the kernel dirs. Any .cuh edit makes
+    // every TU stale — same conservatism as the freshness gate, which
+    // is what lets this step fully replace the manual touch dance.
+    var newest_cuh_mtime: i96 = std.math.minInt(i96);
+    for (kernel_dirs) |sub| {
+        var dir = b.build_root.handle.openDir(io, sub, .{ .iterate = true }) catch |err| {
+            return step.fail("cannot open {s}: {s}", .{ sub, @errorName(err) });
+        };
+        defer dir.close(io);
+        var walker = dir.walk(alloc) catch |err| {
+            return step.fail("walk {s} failed: {s}", .{ sub, @errorName(err) });
+        };
+        defer walker.deinit();
+        while (walker.next(io) catch |err| {
+            return step.fail("walk {s} next failed: {s}", .{ sub, @errorName(err) });
+        }) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.basename, ".cuh")) continue;
+            const stat = entry.dir.statFile(io, entry.basename, .{}) catch continue;
+            const mtime_ns: i96 = stat.mtime.toNanoseconds();
+            if (mtime_ns > newest_cuh_mtime) newest_cuh_mtime = mtime_ns;
+        }
+    }
+
+    var stale = std.ArrayListUnmanaged(usize).empty;
+    defer stale.deinit(alloc);
+    for (ptx_tus, 0..) |tu, i| {
+        const cu_stat = b.build_root.handle.statFile(io, tu.cu, .{}) catch |err| {
+            return step.fail("cannot stat {s}: {s}", .{ tu.cu, @errorName(err) });
+        };
+        const cu_mtime: i96 = cu_stat.mtime.toNanoseconds();
+        const newest_dep = @max(cu_mtime, newest_cuh_mtime);
+        const ptx_stat = b.build_root.handle.statFile(io, tu.ptx, .{}) catch {
+            try stale.append(alloc, i); // missing .ptx → rebuild
+            continue;
+        };
+        if (ptx_stat.mtime.toNanoseconds() < newest_dep) try stale.append(alloc, i);
+    }
+
+    if (stale.items.len == 0) {
+        std.debug.print("ptx: all {d} kernels fresh, nothing to do\n", .{ptx_tus.len});
+        return;
+    }
+
+    var bat = std.ArrayListUnmanaged(u8).empty;
+    defer bat.deinit(alloc);
+    try bat.appendSlice(alloc, "@echo off\r\ncall \"" ++ vcvarsall_path ++ "\" x64 >nul 2>&1\r\n");
+    for (stale.items) |i| {
+        const tu = ptx_tus[i];
+        std.debug.print("ptx: rebuilding {s}\n", .{tu.ptx});
+        const cu_abs = b.pathFromRoot(tu.cu);
+        const ptx_abs = b.pathFromRoot(tu.ptx);
+        try bat.appendSlice(alloc, "echo nvcc ");
+        try bat.appendSlice(alloc, tu.ptx);
+        try bat.appendSlice(alloc, "\r\nnvcc -ptx -o \"");
+        try bat.appendSlice(alloc, ptx_abs);
+        try bat.appendSlice(alloc, "\" \"");
+        try bat.appendSlice(alloc, cu_abs);
+        try bat.appendSlice(alloc, "\" -arch=sm_89 -O3\r\nif errorlevel 1 exit /b 1\r\n");
+    }
+
+    b.cache_root.handle.writeFile(io, .{
+        .sub_path = "ptx_rebuild.bat",
+        .data = bat.items,
+    }) catch |err| {
+        return step.fail("cannot write ptx_rebuild.bat: {s}", .{@errorName(err)});
+    };
+    const bat_path = b.cache_root.join(alloc, &.{"ptx_rebuild.bat"}) catch @panic("oom");
+
+    const result = std.process.run(alloc, io, .{
+        .argv = &.{ "cmd.exe", "/c", bat_path },
+    }) catch |err| {
+        return step.fail("spawning nvcc batch failed: {s}", .{@errorName(err)});
+    };
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    const code: u32 = switch (result.term) {
+        .exited => |c| c,
+        else => 1,
+    };
+    if (code != 0) {
+        return step.fail(
+            "nvcc rebuild failed (exit {d}).\nstdout:\n{s}\nstderr:\n{s}",
+            .{ code, result.stdout, result.stderr },
+        );
+    }
+    std.debug.print("ptx: rebuilt {d} kernel(s); run `zig build` to re-embed\n", .{stale.items.len});
 }
 
 // ────────────────────────────────────────────────────────────────────────

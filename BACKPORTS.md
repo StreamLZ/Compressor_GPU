@@ -104,10 +104,11 @@ script; minutes per use.**
   Make it a stated gate for CUDA encoder PRs too.
 - **Runtime oracle over static diff** — already in project memory;
   applies in both directions.
-- **PTX freshness QoL**: the gate only errors; a `zig build ptx` step
-  that shells nvcc via vcvars (mirroring how `build_vk.bat` was
-  retired by the depfile fix) would remove the manual
-  touch-the-other-PTXs dance. Optional.
+- ✅ **PTX freshness QoL** (DONE): `zig build ptx` recompiles exactly the
+  stale TUs (all five after a shared-.cuh edit, mirroring the gate's
+  conservatism) via nvcc+vcvarsall; no-op when fresh. The gate's error
+  message now points at it. tools/build_gpu.bat remains for full
+  rebuilds with cuobjdump res-usage.
 
 ## F. Evaluated — NOT applicable to CUDA
 
