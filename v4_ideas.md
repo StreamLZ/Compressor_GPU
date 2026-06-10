@@ -200,35 +200,52 @@ closes half the 1.4× gap. Zero ratio impact.
 **Cost/risk**: medium-low — A-017 is a proven template; ~1 day + the
 standard cross-backend SHA regression.
 
-## 11. tANS entropy stage (GPU-native reintroduction)
+## 11. Per-chunk adaptive entropy: Huffman vs tANS, pick the smaller
 
-**What**: A GPU tANS (FSE-class) entropy coder as an alternative to —
-or replacement for — the 32-stream canonical Huffman at L3+, or as a
-new top level above L5. The codebase had a host-side tANS-32 path
-once (the retired chunk types 5/6/7; born in 64f3cc2 / cbf6a3b,
-encoder deleted in fbc7644 / 8982fee, the dead decoder wire-format
-arms finally removed in e8061dd, which reduced the stream types to
-{0, 4, 8}). A v4 tANS would be designed GPU-first: encoder + decoder
-kernels on both backends, 32-lane interleaved states (the existing
-BIL 4-stream layout generalizes), one new chunk type.
+**The idea (2026-06-10)**: at encode time, decide PER CHUNK whether
+the entropy body is Huffman or tANS, and emit whichever is smaller
+(ties → Huffman). History makes this a both-axes win, not a tradeoff:
 
-**Why**: tANS reaches fractional-bit code lengths that canonical
-Huffman cannot — zstd's FSE typically takes 1-4% more out of the
-entropy stage on skewed streams, and the post-LZ token/offset streams
-are exactly that shape. On enwik9 L5 at 35.50% vs nvCOMP Zstd's
-35.75%, even a 1-2% entropy-stage gain (≈ 0.3-0.7 pp of end ratio)
-meaningfully widens a lead that is currently thin.
+- tANS originally lost to Huffman on *overall* enwik8 + silesia ratio,
+  so it was removed and Huffman got the optimization budget. BUT the
+  `tools/huff_test` harness (tans_test.cu — production-snapshot
+  testbed for `slzTansFseBuildKernel` + `slzTans32DecodeKernel`, four
+  optimization variants, byte-exact verified) later pushed GPU tANS-32
+  decode FASTER than the Huffman kernel of the time.
+- If tANS is only ever used where it is strictly smaller, ratio is
+  monotone-better by construction (the chunk_type byte already exists
+  on the wire — the selector flag is free).
+- If tANS decode throughput ≥ Huffman's, every flipped chunk also
+  decodes faster, so the throughput-bound predecode pass speeds up
+  too. Better ratio AND better decode speed simultaneously.
+- Same shape as zstd's per-block entropy selection — proven practice.
 
-**Prototype gate (do this first, it's cheap)**: histogram the actual
-lit/tok/off16 stream contents on the bench corpora and compute
-Shannon-vs-Huffman-vs-tANS sizes host-side, no kernels. If the
-measured gap is under ~1% of entropy-stage bytes, stop there.
+**Gate 0 (hours)**: re-run `tools/huff_test` huff vs tans benches on
+the same snapshot, TODAY's kernels — the Huffman kernel has been
+optimized further since the comparison (BIL u32 stores etc.), so
+"tANS was faster" must be re-proven against current Huffman.
 
-**Cost/risk**: weeks-class — new kernels in both directions on both
-backends, a wire-format addition (pairs naturally with #8's v4 format
-work), full conformance + cross-backend SHA matrix. Decode-speed risk
-is the serial per-stream state update; the 32-stream interleave is
-what keeps it GPU-shaped, same as Huffman today.
+**Gate 1 (a day, host-only)**: selection does NOT require double
+compression — both body sizes are computable from the per-chunk
+histogram (Huffman: Σ count×codelen from the table build that already
+runs; tANS: the old tans_encoder.zig exact bit-count dry-runner,
+resurrect from git). Run the dry-run selector over real L3/L5 chunk
+streams on enwik8/enwik9/silesia and report chunks-flipped + end-ratio
+delta. Expect flips concentrated in tokens/off16-hi (skewed, where
+Huffman's integer-bit loss is largest) and few in text literals
+(near-flat ~5-6 bits). If the delta is < ~0.1-0.2 pp, stop here.
+
+**Build-out (if both gates pass)**: decode side is moderate — scan
+already dispatches on chunk_type; descs partition into a Huffman
+batch + a tANS batch with two predecode launches; the tANS decode +
+table-build kernels exist in prototype under tools/huff_test. Encoder:
+resurrect the host-side tANS encoder for the winning chunks only
+(acceptable at L4/L5), GPU tANS encode later if it matters. Biggest
+multiplier is the VK port (GLSL tANS decode + table build, in step,
+per port-means-port). Wire format: re-introduce a tANS chunk type
+(fresh tag; do NOT resurrect the retired 1/5/6/7 forms). The paired
+combined-body trick (old types 5/7) is a real header-amortization
+idea worth re-evaluating once the basic selector ships.
 
 ## 12. Small-items basket (carried from the retired todo.md deferrals)
 
