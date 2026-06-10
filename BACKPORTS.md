@@ -23,10 +23,13 @@ Status legend: ✅ done · 🔲 open · 🚫 evaluated, not applicable.
 | ✅ GPU-test serialization under the parallel runner | srcVK race-class lesson #3 | `eb5cf44` (`lockGpuTests`) |
 | ✅ A-023 forced-batch regression test + hook | `srcVK/tests/a023_batched_lz_dispatch.zig` | `eb5cf44` |
 | ✅ Real-corpus roundtrip tests (web.txt + slices) | srcVK l3_l4 corpus suite (byte-65544 lesson) | `eb5cf44` |
+| ✅ Device-name print in -b/-db/-ba | VK CLI `Device:` line | `ee925e4` |
+| ✅ Per-kernel `-db` timings (SLZ_PROFILE_DECODE=1) | VK SLZ_VK_PROFILE_DECODE | `ee925e4` |
+| ✅ Fused 5-way compact dispatch (A-017 mirror): 0.40 -> 0.077 ms, L5 enwik8 d2d 4.17 -> 4.07 | srcVK A-017 | `ee925e4` |
 
 ## B. Performance backports — open
 
-### B1. 🔲 Fuse the 4 `slzCompactHuffDescsKernel` launches (A-017 mirror)
+### B1. ✅ DONE `ee925e4` — fused as slzCompactAllDescsKernel (5 blocks incl. raw)
 
 VK fused its four compact_huff dispatches (lit/tok/hi/lo) into one
 grid-spanning kernel for a 2.4× kernel-time win (0.59 → 0.25 ms,
@@ -47,14 +50,14 @@ measure after B1 lands before deciding.
 
 ## C. Observability / tooling backports — open
 
-### C1. 🔲 Print the device name in the CUDA CLI
+### C1. ✅ DONE `ee925e4`
 
 VK prints `Device: NVIDIA GeForce RTX 4060 Ti` at startup (and the
 project memory REQUIRES device names next to perf numbers). The CUDA
 CLI prints nothing — `cuDeviceGetName` at init + one line in
 bench/info modes. **Effort: <1 hour.**
 
-### C2. 🔲 Surface per-kernel timings in `-db`
+### C2. ✅ DONE `ee925e4` — SLZ_PROFILE_DECODE=1
 
 The begin/endKernelTiming infrastructure and the C ABI
 `slzGetLastTimings` already exist on CUDA, with labels at every launch
