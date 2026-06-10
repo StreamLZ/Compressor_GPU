@@ -442,7 +442,16 @@ verification status. An unverified adaptation is a known risk surface.
   closed the bulk of the gap. Web search of NVIDIA Vulkan best-practices
   + WebGPU dispatch-overhead research confirmed multi-dispatch fusion
   as the canonical mitigation for the WDDM dispatch-floor pattern.
-- **Status**: RESOLVED.
+- **Status**: RESOLVED — and the divergence has since REVERSED
+  direction. **2026-06-10 update**: CUDA backported this fusion at
+  `ee925e4` and went further — `slzCompactAllDescsKernel` fuses FIVE
+  compactions in one launch (the 4 huff streams + the raw hi/lo pair
+  that VK still runs as a separate `compact_raw_descs` dispatch), and
+  `ec6071d` added `slzMergeHuffDescsParKernel` (4-block parallel
+  merge, CUDA merge 0.199 → 0.067 ms). The CUDA reference cited above
+  (`scan_gpu.zig` 4-launch loop) no longer exists. VK is now the
+  backend with the unfused tail: mirroring CUDA's 5-way compact +
+  parallel merge is the concrete close path for A-021 / v4_ideas #10.
 
 ### A-016: u32-aliased SSBO view for the Phase 2 hot-loop store (Huffman decode)
 - **File:line**: `srcVK/decode/huff_decode_4stream_kernel.comp:79-93`
@@ -791,6 +800,20 @@ verification status. An unverified adaptation is a known risk surface.
   apply the A-017 fusion pattern to `compact_raw_descs` +
   `gather_raw_off16` + `merge_huff_descs` (separate optimization
   todo; explicitly out of Phase 5 scope per the assignment brief).
+- **2026-06-10 update**: two facts changed. (1) The "matching CUDA
+  per-kernel breakdown ... HAS NOT been captured" caveat above is now
+  CLOSED: CUDA's CLI gained the same per-kernel table
+  (`SLZ_PROFILE_DECODE=1` on `-db`, commit `ee925e4`). CUDA enwik8-L5
+  best-of-runs: lz 3.23 ms, huff_decode 0.73, build_lut 0.165,
+  merge(serial) 0.198, compact(fused ×5) 0.077, gather 0.074 — so a
+  matched-cell attribution diff is now a 5-minute measurement, not an
+  open task. (2) CUDA implemented the close path on its own side:
+  `slzCompactAllDescsKernel` (5-way fused compact incl. raw,
+  `ee925e4`) + `slzMergeHuffDescsParKernel` (4-block parallel merge,
+  0.199 → 0.067 ms, `ec6071d`). Both are direct references for the VK
+  mirror — porting them is the A-021 close path with measured
+  expected wins (VK merge 954 µs and compact_raw 430 µs on the L3
+  silesia cell above are the corresponding targets).
 
 ### A-023: Batched LZ dispatch + skip the wrap_input H2D when VK can't satisfy CUDA's full-hash allocation on enwik9 L3/L5
 - **File:line**:

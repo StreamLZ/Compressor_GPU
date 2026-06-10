@@ -218,6 +218,13 @@ closes half the 1.4× gap. Zero ratio impact.
 **Cost/risk**: medium-low — A-017 is a proven template; ~1 day + the
 standard cross-backend SHA regression.
 
+**2026-06-10 update**: CUDA now provides direct reference kernels to
+mirror — `slzCompactAllDescsKernel` (5-way fused compact incl. the
+raw pair, `ee925e4`) and `slzMergeHuffDescsParKernel` (4-block
+parallel merge, 0.199 → 0.067 ms CUDA-side, `ec6071d`). Port those
+shapes rather than designing fresh; see the A-017/A-021 2026-06-10
+updates in srcVK/PortAdaptations.md.
+
 ## 11. Per-chunk adaptive entropy: Huffman vs tANS, pick the smaller
 
 **The idea (2026-06-10)**: at encode time, decide PER CHUNK whether
