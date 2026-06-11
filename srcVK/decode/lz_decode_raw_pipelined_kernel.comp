@@ -228,6 +228,39 @@ void executeDeps(int lane, uint slot) {
     }
 }
 
+// A-028 barrier-isolation experiment (set to 1, rebuild, bench):
+// the parser warp does ALL the work (flats at 32-lane stride + deps)
+// while warps 1-3 idle through the IDENTICAL barrier cadence as the
+// K=4 team. Same total work as the single-warp kernel + the
+// pipeline's barriers. Result ~= single-warp 2.36 ms -> barriers are
+// cheap and the pipeline's loss is warp imbalance/occupancy;
+// result ~= K=4's 3.18 ms -> barrier pricing confirmed.
+#define SLZ_PIPE_BARRIER_EXPERIMENT 0
+
+void executeFlatsSolo(uint lit_base, int lane, uint slot) {
+    uint bs = s_pb[slot].batch_size;
+    uint batch_dst = s_pb[slot].dst_pos;
+    uint batch_lit = s_pb[slot].lit_pos;
+    for (uint i = uint(lane); i < s_pb[slot].total_lit; i += WARP_SIZE) {
+        uint k = 0u;
+        for (uint step = 16u; step >= 1u; step >>= 1) {
+            uint cand = k + step;
+            if (cand < bs && s_pb[slot].lit_prefix[cand] <= i) k = cand;
+        }
+        dst[batch_dst + s_pb[slot].dst_adj[k] + i] = compressed[lit_base + batch_lit + i];
+    }
+    for (uint i = uint(lane); i < s_pb[slot].total_im; i += WARP_SIZE) {
+        uint k = 0u;
+        for (uint step = 16u; step >= 1u; step >>= 1) {
+            uint cand = k + step;
+            if (cand < bs && s_pb[slot].im_prefix[cand] <= i) k = cand;
+        }
+        dst[s_pb[slot].im_dst_adj[k] + i] = dst[s_pb[slot].im_src_adj[k] + i];
+    }
+    subgroupBarrier();
+    subgroupMemoryBarrierBuffer();
+}
+
 // ── Pipelined sub-chunk decode ───────────────────────────────────
 void decodeSubChunkPipelined(
     uint cmd_base, uint cmd_size,
@@ -269,6 +302,25 @@ void decodeSubChunkPipelined(
         uint cur = 0u;
         while (s_have[cur] != 0u) {
             uint dm = s_pb[cur].dep_mask;
+#if SLZ_PIPE_BARRIER_EXPERIMENT
+            // Parser does everything; team idles through the same
+            // barrier cadence. See the experiment note above.
+            if (is_parser) {
+                executeFlatsSolo(lit_base, lane, cur);
+            }
+            if (dm != 0u) {
+                groupMemoryBarrier();
+                barrier();
+                if (is_parser) executeDeps(lane, cur);
+            }
+            if (is_parser) {
+                bool got = (cmd_pos < cmd_size) && fillBatch(
+                    cmd_base, cmd_size, off16_base, off16_count,
+                    cmd_pos, lit_pos, off16_pos, dst_pos, recent_offset,
+                    lane, 1u - cur);
+                if (lane == 0) s_have[1u - cur] = got ? 1u : 0u;
+            }
+#else
             if (is_parser) {
                 bool got = (cmd_pos < cmd_size) && fillBatch(
                     cmd_base, cmd_size, off16_base, off16_count,
@@ -284,6 +336,7 @@ void decodeSubChunkPipelined(
                 if (gl_LocalInvocationID.y == 1u)
                     executeDeps(lane, cur);
             }
+#endif
             groupMemoryBarrier();
             barrier(); // handoff: slot 1-cur staged; slot cur executed
             cur = 1u - cur;

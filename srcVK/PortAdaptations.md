@@ -1229,3 +1229,19 @@ each design-choice in the **Status** field.
 - **Verification**: static N/A (intentional divergence); runtime =
   the three measurements above + ptest_vk 151/9/0 on the default
   path + SLZ_VK_PIPELINE=1 SHA MATCH on enwik8 L1.
+
+### A-028 addendum: barrier-isolation experiment (2026-06-11, same day)
+
+Follow-up experiment (SLZ_PIPE_BARRIER_EXPERIMENT in the .comp):
+parser warp does ALL work (flats stride-32 + deps) while warps 1-3
+idle through the identical barrier cadence -> 6.26 ms (vs
+single-warp 2.36 / K=2 2.89 / K=4 3.18). Barriers with idle waiters
+are near-free, so the 2.65x slowdown is NOT barrier-instruction
+pricing - it is the collapse of useful-warp residency (1 working
+warp per 128-thread workgroup vs the single-warp kernel's 48
+independent decode warps per SM). Corrected attribution for A-028:
+the VK pipeline loses primarily because cooperative blocks SACRIFICE
+cross-chunk warp parallelism, and the VK driver (no __launch_bounds__
+analogue, its own scheduling) cannot recoup it the way CUDA's
+launch_bounds-pinned 12-blocks/SM + near-free BAR.SYNC do. Same
+ACCEPTED status; the experiment block stays in the shader, flag off.
