@@ -240,12 +240,20 @@ FAILED_EXPERIMENTS.md  Rejected experiments + war stories
 SECURITY.md            Security policy + threat model
 ```
 
-For the source tree map, kernel pipeline, level table, and the six
-"do not break" invariants, see [CodeWiki.md](CodeWiki.md).
+## Documentation
 
-For the algorithmic notes (warp mapping, BIL Huffman wire format,
-LUT-build kernel, parallel-parse hot loop), see
-[docs/GPU_ARCHITECTURE.md](docs/GPU_ARCHITECTURE.md).
+| You want | Read |
+|---|---|
+| To work on the code: layout, where changes go, the gates | [CodeWiki.md](CodeWiki.md) |
+| The wire format, byte for byte | [FORMAT.md](FORMAT.md) |
+| Why the kernels are shaped the way they are | [docs/GPU_ARCHITECTURE.md](docs/GPU_ARCHITECTURE.md) |
+| CUDA debugging and profiling recipes | [docs/how_to_debug_cuda.md](docs/how_to_debug_cuda.md) |
+| The Vulkan backend | [srcVK/README.md](srcVK/README.md) and [srcVK/Handbook.md](srcVK/Handbook.md) |
+| Every known difference between the two backends | [srcVK/PortAdaptations.md](srcVK/PortAdaptations.md) |
+| The work ledger: every idea, measurement, and verdict | [v4_ideas.md](v4_ideas.md) |
+| Things that were tried and failed (do not retry them) | [FAILED_EXPERIMENTS.md](FAILED_EXPERIMENTS.md) |
+| Safety guarantees for untrusted input | [SECURITY.md](SECURITY.md) |
+| Release history | [CHANGELOG.md](CHANGELOG.md) |
 
 ---
 

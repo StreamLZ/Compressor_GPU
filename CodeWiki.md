@@ -6,26 +6,12 @@ Vulkan port in `srcVK/`. Zig code drives the kernels and handles the
 wire format on the host; the heavy work runs on the GPU in both
 directions.
 
-This page routes you: what to read, where your change goes, and
-which rules will get a change rejected. If you remember one thing,
-remember this: **the two backends are each other's test oracle.**
-Most rules below exist to protect that property.
-
----
-
-## The document map
-
-| You want | Read |
-|---|---|
-| To use the codec: CLI, performance, integrity | [README.md](README.md) |
-| The wire format, byte for byte | [FORMAT.md](FORMAT.md) |
-| Why the kernels are shaped the way they are | [docs/GPU_ARCHITECTURE.md](docs/GPU_ARCHITECTURE.md) |
-| CUDA debugging and profiling recipes | [docs/how_to_debug_cuda.md](docs/how_to_debug_cuda.md) |
-| The Vulkan backend | [srcVK/README.md](srcVK/README.md) and [srcVK/Handbook.md](srcVK/Handbook.md) |
-| Every known difference between the two backends | [srcVK/PortAdaptations.md](srcVK/PortAdaptations.md) |
-| The work ledger: every idea, measurement, and verdict | [v4_ideas.md](v4_ideas.md) |
-| Things that were tried and failed (do not retry them) | [FAILED_EXPERIMENTS.md](FAILED_EXPERIMENTS.md) |
-| Safety guarantees for untrusted input | [SECURITY.md](SECURITY.md) |
+This page is about the code: what every file is, where your change
+goes, and which rules will get a change rejected. (For the index of
+all project documentation, see the README's Documentation section.)
+If you remember one thing, remember this: **the two backends are
+each other's test oracle.** Most rules below exist to protect that
+property.
 
 ---
 
