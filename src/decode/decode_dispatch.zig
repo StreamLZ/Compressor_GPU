@@ -310,6 +310,29 @@ pub const DecodeRequest = struct {
     /// directly from the compressed buffer. Default `1` keeps existing
     /// callers behavioral on raw-input paths that don't know the level.
     level: u8 = 1,
+    /// v4 #19 device-only verify. When merkle_n_chunks > 0 the
+    /// dispatch runs, on device, after the LZ kernel:
+    ///   1. slzScPrefixApplyKernel - writes the true first-8 bytes of
+    ///      chunks 1+ into the output (source = the SC tail table
+    ///      inside the uploaded compressed block at
+    ///      `merkle_prefix_off`), making the output FINAL in VRAM;
+    ///   2. slzChunkHashKernel - per-chunk XXH32s into the persistent
+    ///      device hash buffer at chunk index `merkle_chunk_base`
+    ///      (sized for `merkle_total_chunks` across the frame);
+    ///   3. on the frame's LAST block (`merkle_run_verdict`):
+    ///      slzMerkleVerdictKernel rolls the whole array into the
+    ///      root, compares against `merkle_expected_root` (a launch
+    ///      scalar read from the frame header area by the host - not
+    ///      payload traffic), and the 4-byte verdict is read into
+    ///      `merkle_verdict_out.*` alongside the existing readbacks.
+    merkle_n_chunks: u32 = 0,
+    merkle_chunk_base: u32 = 0,
+    merkle_total_chunks: u32 = 0,
+    merkle_eff_chunk: u32 = 0,
+    merkle_prefix_off: u64 = 0, // 0 = no prefix table (single-chunk block)
+    merkle_run_verdict: bool = false,
+    merkle_expected_root: u32 = 0,
+    merkle_verdict_out: ?*u32 = null,
 
     /// True when the LZ kernel can write decompressed bytes straight
     /// into the caller's device buffer (no `dst_start_off` prefix to
@@ -887,6 +910,93 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     // D2D when the LZ kernel already wrote straight to the caller's
     // device buffer — same predicate as the LZ dst-pick in runBackHalf.
     if (!req.writesDirectlyToTarget()) {
+        // v4 #19 device-only verify (see DecodeRequest field docs).
+        // The hash pass re-reads the whole decoded output (~1.1 ms at
+        // 100 MB - bandwidth-bound), so it runs on the AUX stream,
+        // overlapped under the finalize D2H of the same buffer
+        // (read-read, safe): LZ-done event -> aux waits -> hash +
+        // combine + verdict on aux, while the D2H streams on the
+        // heavy stream. The verdict D2H at the end syncs aux only.
+        var merkle_stream: usize = heavy_stream;
+        if (req.merkle_n_chunks > 0 and
+            module_loader.seg_hash_fn != 0 and
+            module_loader.chunk_combine_fn != 0 and
+            module_loader.sc_prefix_apply_fn != 0 and
+            module_loader.merkle_verdict_fn != 0)
+        {
+            if (cuda.cuStreamWaitEvent_fn != null and cuda.cuEventRecord_fn != null and
+                ensureGatherOverlap(self) and ensureMerkleEvent(self))
+            {
+                _ = cuda.cuEventRecord_fn.?(self.ev_lz_done_merkle, heavy_stream);
+                _ = cuda.cuStreamWaitEvent_fn.?(self.gather_stream, self.ev_lz_done_merkle, 0);
+                merkle_stream = self.gather_stream;
+            }
+            const dst_dev: u64 = if (req.d_output_target) |t_dev| t_dev else self.d_output;
+            var p_total_sz: u64 = @intCast(req.decompressed_size);
+            // 1. SC prefixes -> output is final on device.
+            if (req.merkle_prefix_off != 0 and req.merkle_n_chunks > 1) {
+                var a_dst: u64 = dst_dev;
+                var a_comp: u64 = self.d_comp_persist;
+                var a_off: u64 = req.merkle_prefix_off;
+                var a_n: u32 = req.merkle_n_chunks;
+                var a_eff: u32 = req.merkle_eff_chunk;
+                var ap = [_]?*anyopaque{
+                    @ptrCast(&a_dst), @ptrCast(&a_comp), @ptrCast(&a_off),
+                    @ptrCast(&a_n), @ptrCast(&a_eff), @ptrCast(&p_total_sz),
+                };
+                var ax = [_]?*anyopaque{null};
+                const a_grid: u32 = (req.merkle_n_chunks + 127) / 128;
+                try cudaCall(procs.launch(module_loader.sc_prefix_apply_fn, a_grid, 1, 1, 128, 1, 1, 0, merkle_stream, &ap, &ax), .launch);
+            }
+            // 2. Hierarchical per-chunk hashes (4 KiB segments -> chunk
+            // hash) appended at the frame-global base. One thread per
+            // SEGMENT: ~24k threads at 100 MB.
+            const spc: u32 = (req.merkle_eff_chunk + 1023) / 1024; // KEEP IN SYNC: SLZ_MERKLE_SEG_BYTES
+            const total_hash_bytes = @as(usize, req.merkle_total_chunks) * 4;
+            const seg_bytes = @as(usize, req.merkle_n_chunks) * spc * 4;
+            try ensureDeviceBuf(&self.d_merkle_hashes, &self.d_merkle_hashes_size, total_hash_bytes);
+            try ensureDeviceBuf(&self.d_merkle_seghashes, &self.d_merkle_seghashes_size, seg_bytes);
+            var h_data: u64 = dst_dev;
+            var h_n: u32 = req.merkle_n_chunks;
+            var h_eff: u32 = req.merkle_eff_chunk;
+            var h_segs: u64 = self.d_merkle_seghashes;
+            var h_prefix: u64 = 0;
+            var sp = [_]?*anyopaque{
+                @ptrCast(&h_data), @ptrCast(&h_n), @ptrCast(&h_eff),
+                @ptrCast(&p_total_sz), @ptrCast(&h_segs), @ptrCast(&h_prefix),
+            };
+            var sx = [_]?*anyopaque{null};
+            const n_segs: u32 = req.merkle_n_chunks * spc;
+            const s_grid: u32 = (n_segs + 127) / 128;
+            const t_h = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzSegHashKernel", merkle_stream);
+            try cudaCall(procs.launch(module_loader.seg_hash_fn, s_grid, 1, 1, 128, 1, 1, 0, merkle_stream, &sp, &sx), .launch);
+            endKernelTiming(t_h, heavy_stream);
+            var c_out: u64 = self.d_merkle_hashes + @as(u64, req.merkle_chunk_base) * 4;
+            var cp = [_]?*anyopaque{
+                @ptrCast(&h_segs), @ptrCast(&h_n), @ptrCast(&h_eff),
+                @ptrCast(&p_total_sz), @ptrCast(&c_out),
+            };
+            var cx = [_]?*anyopaque{null};
+            const c_grid: u32 = (req.merkle_n_chunks + 127) / 128;
+            try cudaCall(procs.launch(module_loader.chunk_combine_fn, c_grid, 1, 1, 128, 1, 1, 0, merkle_stream, &cp, &cx), .launch);
+            // 3. Verdict on the frame's last block.
+            if (req.merkle_run_verdict) {
+                try ensureDeviceBuf(&self.d_merkle_verdict, &self.d_merkle_verdict_size, 4);
+                var v_hashes: u64 = self.d_merkle_hashes;
+                var v_n: u32 = req.merkle_total_chunks;
+                var v_exp: u32 = req.merkle_expected_root;
+                var v_out: u64 = self.d_merkle_verdict;
+                var vp = [_]?*anyopaque{
+                    @ptrCast(&v_hashes), @ptrCast(&v_n), @ptrCast(&v_exp), @ptrCast(&v_out),
+                };
+                var vx = [_]?*anyopaque{null};
+                try cudaCall(procs.launch(module_loader.merkle_verdict_fn, 1, 1, 1, 1, 1, 1, 0, merkle_stream, &vp, &vx), .launch);
+                if (req.merkle_verdict_out) |vo| {
+                    try cudaCall(procs.stream_sync(merkle_stream), .sync);
+                    try cudaCall(procs.d2h(@ptrCast(vo), self.d_merkle_verdict, 4), .copy);
+                }
+            }
+        }
         try finalizeOutput(self, &procs, req, heavy_stream);
     }
     if (self.work_stream == 0) {
@@ -895,6 +1005,14 @@ pub fn fullGpuLaunchImpl(self: *DecodeContext, req: DecodeRequest) GpuError!void
     if (t_e2e0) |t0| if (io) |io_val| {
         emitE2eTrace(t0, io_val, e2e_cum, facade.last_kernel_ns);
     };
+}
+
+/// v4 #19: lazily create the LZ-done event the Merkle verify chain
+/// waits on (sync-only, like the B2 events).
+fn ensureMerkleEvent(self: *DecodeContext) bool {
+    if (self.ev_lz_done_merkle != 0) return true;
+    const ecreate = cuda.cuEventCreate_fn orelse return false;
+    return ecreate(&self.ev_lz_done_merkle, 0x2) == CUDA_SUCCESS;
 }
 
 /// B2 gather-overlap: lazily create the aux stream + the two

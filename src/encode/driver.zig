@@ -63,6 +63,31 @@ pub var last_kernel_ns: i64 = 0;
 // Every caller threads its own `*EncodeContext`; the `g_default` singleton
 // above remains the conventional handle used by the CLI / C ABI today.
 pub const gpuCompressImpl = encode_lz.gpuCompressImpl;
+pub const enc_module_loader = module_loader;
+
+/// v4 #19 device-only: launch slzMerkleRootWriteKernel - rolls the
+/// collected per-chunk hashes into the root and writes the 4-byte LE
+/// trailer at `trailer_off` inside the device-resident frame. Sync
+/// launch on the default stream (the subsequent frame D2H orders
+/// after it). Returns false when the launch cannot run (caller falls
+/// back to the host trailer).
+pub fn launchMerkleRootWrite(enc_ctx: *encode_context.EncodeContext, d_frame: u64, trailer_off: usize) bool {
+    const cuda_ffi = @import("cuda_ffi.zig");
+    const launch_fn = cuda_ffi.cuLaunchKernel_fn orelse return false;
+    const sync_fn = cuda_ffi.cuCtxSynchronize_fn orelse return false;
+    if (enc_ctx.d_merkle_hashes == 0 or enc_ctx.merkle_total == 0) return false;
+    var p_hashes: u64 = enc_ctx.d_merkle_hashes;
+    var p_n: u32 = enc_ctx.merkle_total;
+    var p_frame: u64 = d_frame;
+    var p_off: u64 = @intCast(trailer_off);
+    var params = [_]?*anyopaque{
+        @ptrCast(&p_hashes), @ptrCast(&p_n), @ptrCast(&p_frame), @ptrCast(&p_off),
+    };
+    var extra = [_]?*anyopaque{null};
+    if (launch_fn(module_loader.merkle_root_write_fn, 1, 1, 1, 1, 1, 1, 0, 0, &params, &extra) != cuda_ffi.CUDA_SUCCESS)
+        return false;
+    return sync_fn() == cuda_ffi.CUDA_SUCCESS;
+}
 pub const gpuEncodeLiteralsHuffImpl = encode_huff.gpuEncodeLiteralsHuffImpl;
 pub const gpuEncodeTokensHuffImpl = encode_huff.gpuEncodeTokensHuffImpl;
 pub const gpuEncodeOff16HuffImpl = encode_huff.gpuEncodeOff16HuffImpl;

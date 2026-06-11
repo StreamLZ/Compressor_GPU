@@ -109,8 +109,24 @@ pub fn chunkMerkleRoot(gpa: std.mem.Allocator, data: []const u8, eff_chunk: usiz
     return xxhash32(std.mem.sliceAsBytes(hashes));
 }
 
+/// The wire-defined two-level chunk hash: XXH32 over the concatenated
+/// XXH32s of the chunk's 4096-byte segments (last segment partial).
+/// The hierarchy exists for GPU parallelism (one device thread per
+/// segment); this host implementation MUST stay value-identical to
+/// slzSegHashKernel + slzChunkCombineKernel.
+pub const merkle_seg_bytes: usize = 1024;
+
 fn hashChunk(data: []const u8, eff_chunk: usize, i: usize) u32 {
     const start = i * eff_chunk;
-    const len = @min(eff_chunk, data.len - start);
-    return xxhash32(data[start..][0..len]);
+    const chunk_len = @min(eff_chunk, data.len - start);
+    const chunk = data[start..][0..chunk_len];
+    const n_segs = (chunk_len + merkle_seg_bytes - 1) / merkle_seg_bytes;
+    var seg_hashes: [256]u32 = undefined; // eff_chunk <= 256 KiB -> <= 256 segs
+    std.debug.assert(n_segs <= seg_hashes.len);
+    for (0..n_segs) |s| {
+        const s0 = s * merkle_seg_bytes;
+        const sl = @min(merkle_seg_bytes, chunk_len - s0);
+        seg_hashes[s] = xxhash32(chunk[s0..][0..sl]);
+    }
+    return xxhash32(std.mem.sliceAsBytes(seg_hashes[0..n_segs]));
 }

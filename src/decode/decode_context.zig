@@ -252,6 +252,15 @@ pub const DecodeContext = struct {
     d_walk_meta: CUdeviceptr = 0,
     d_walk_meta_size: usize = 0,
 
+    // v4 #19 v2: device-side Merkle verify scratch (per-chunk hash
+    // output + the H2D'd SC prefix table the hash kernel splices in).
+    d_merkle_hashes: u64 = 0,
+    d_merkle_hashes_size: usize = 0,
+    d_merkle_verdict: u64 = 0,
+    d_merkle_verdict_size: usize = 0,
+    d_merkle_seghashes: u64 = 0,
+    d_merkle_seghashes_size: usize = 0,
+
     // Pure-D2D prefix-sum scratch: d_first_sub_idx holds the per-chunk
     // first-sub-chunk index; d_total_subchunks_buf is a single u32 with
     // the running total (device-resident, never D2H'd on the pure path).
@@ -327,6 +336,7 @@ pub const DecodeContext = struct {
     gather_stream: usize = 0,
     ev_compact_done: usize = 0,
     ev_gather_done: usize = 0,
+    ev_lz_done_merkle: usize = 0,
     gather_event_pending: bool = false,
 
     /// Free every owned device + host buffer and reset every field to its

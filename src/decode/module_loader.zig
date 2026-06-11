@@ -37,6 +37,10 @@ pub var kernel_fn: usize = 0;
 pub var kernel_raw_fn: usize = 0;
 pub var kernel_raw_pipeline_fn: usize = 0;
 pub var kernel_general_pipeline_fn: usize = 0;
+pub var seg_hash_fn: usize = 0;
+pub var chunk_combine_fn: usize = 0;
+pub var sc_prefix_apply_fn: usize = 0;
+pub var merkle_verdict_fn: usize = 0;
 pub var gather_off16_fn: usize = 0;
 pub var scan_parse_fn: usize = 0;
 pub var walk_frame_fn: usize = 0;
@@ -180,6 +184,10 @@ pub fn init() bool {
     _ = get_fn(&kernel_raw_fn, module, "slzLzDecodeRawKernel");
     _ = get_fn(&kernel_raw_pipeline_fn, module, "slzLzDecodeRawPipelinedKernel");
     _ = get_fn(&kernel_general_pipeline_fn, module, "slzLzDecodeGeneralPipelinedKernel");
+    _ = get_fn(&seg_hash_fn, module, "slzSegHashKernel");
+    _ = get_fn(&chunk_combine_fn, module, "slzChunkCombineKernel");
+    _ = get_fn(&sc_prefix_apply_fn, module, "slzScPrefixApplyKernel");
+    _ = get_fn(&merkle_verdict_fn, module, "slzMerkleVerdictKernel");
     // GPU decode-scan kernel. Required: the decode dispatch fails
     // BackendNotAvailable when this symbol is missing (the CPU scan
     // path has been retired).

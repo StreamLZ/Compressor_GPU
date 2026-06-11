@@ -118,6 +118,18 @@ pub fn compressFramedOne(
     var pos: usize = 0;
     const sc_grp = resolveScGroupSize(src.len, opts.sc_group_size_override);
 
+    // v4 #19 device-only Merkle: arm the per-block hash collection.
+    // (Works for host-wrapped AND caller-device input - the hash
+    // kernel reads d_input either way.)
+    {
+        const eff0 = effChunkFor(src.len, opts.sc_group_size_override);
+        enc_ctx.merkle_collect = opts.chunk_checksum and src.len > 0;
+        enc_ctx.merkle_eff = @intCast(eff0);
+        enc_ctx.merkle_total = @intCast((src.len + eff0 - 1) / eff0);
+        enc_ctx.merkle_base = 0;
+        enc_ctx.merkle_device_done = false;
+    }
+
     const hdr_len = frame.writeHeader(dst, .{
         .codec = .fast,
         .level = codecLevelFor(opts.level),
@@ -299,14 +311,33 @@ fn gpuEncodeAndAssemble(
     );
     enc_phase.add(.asm_host, t_ph);
 
+    // v4 #19 device-only: roll the per-chunk hashes into the root and
+    // write the 4-byte trailer into the DEVICE frame, then let the
+    // existing final D2H (or the caller's device read) carry it home.
+    // Zero extra transfers in either direction.
+    var out_frame_size = frame_size;
+    if (enc_ctx.merkle_collect and
+        enc_ctx.merkle_base == enc_ctx.merkle_total and
+        gpu_enc.enc_module_loader.merkle_root_write_fn != 0)
+    {
+        const d_frame: u64 = if (enc_ctx.d_output_override != 0)
+            enc_ctx.d_output_override
+        else
+            enc_ctx.d_host_wrap_output;
+        if (d_frame != 0 and gpu_enc.launchMerkleRootWrite(enc_ctx, d_frame, frame_size)) {
+            enc_ctx.merkle_device_done = true;
+            out_frame_size += 4;
+        }
+    }
+
     if (owns_wrap_output) {
-        if (dst.len < frame_size) return error.DestinationTooSmall;
+        if (dst.len < out_frame_size) return error.DestinationTooSmall;
         t_ph = enc_phase.begin();
-        if (!gpu_enc.copyDeviceToHost(dst[0..frame_size], enc_ctx.d_host_wrap_output))
+        if (!gpu_enc.copyDeviceToHost(dst[0..out_frame_size], enc_ctx.d_host_wrap_output))
             return error.DestinationTooSmall;
         enc_phase.add(.wrap_d2h, t_ph);
     }
-    return frame_size;
+    return out_frame_size;
 }
 
 /// Launch `slzFrameAssembleKernel`. Per-chunk uncompressed handling is

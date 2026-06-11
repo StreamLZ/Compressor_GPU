@@ -38,6 +38,10 @@ fn nullTerminatedPtx(comptime name: []const u8) [:0]const u8 {
 // the file-level doc above.
 pub var module: cuda_ffi.CUmodule = 0;
 pub var kernel_fn: cuda_ffi.CUfunction = 0;
+// v4 #19 device-only Merkle (optional - host fallback when 0):
+pub var seg_hash_fn: cuda_ffi.CUfunction = 0;
+pub var chunk_combine_fn: cuda_ffi.CUfunction = 0;
+pub var merkle_root_write_fn: cuda_ffi.CUfunction = 0;
 pub var huff_module: cuda_ffi.CUmodule = 0;
 pub var huff_tables_kernel_fn: cuda_ffi.CUfunction = 0;
 pub var huff_encode_kernel_fn: cuda_ffi.CUfunction = 0;
@@ -100,6 +104,9 @@ pub fn init() bool {
 
     const get_fn = cuda_ffi.cuModuleGetFunction_fn orelse return false;
     if (get_fn(&kernel_fn, module, "slzLzEncodeKernel") != cuda_ffi.CUDA_SUCCESS) return false;
+    _ = get_fn(&seg_hash_fn, module, "slzSegHashKernel");
+    _ = get_fn(&chunk_combine_fn, module, "slzChunkCombineKernel");
+    _ = get_fn(&merkle_root_write_fn, module, "slzMerkleRootWriteKernel");
 
     // GPU Huffman encoder (chunk_type=4). Optional - if the module or
     // either kernel is missing, gpuEncode*Huff returns false and the

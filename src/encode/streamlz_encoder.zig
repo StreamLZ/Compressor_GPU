@@ -140,13 +140,15 @@ pub fn compressFramedWithIo(
     }
     // v4 #19: chunk-Merkle trailer (after the content trailer when both
     // are set - the decoder reads them in the same order).
-    // d_input_override != 0 means the caller's data is DEVICE-resident
-    // and the host `src` slice is a length-only sentinel (see
-    // EncodeContext.d_input_override) - it MUST NOT be dereferenced.
-    // v1 therefore skips the Merkle trailer on the D2D path (flag
-    // stays clear; decoders handle both). v2: hash on device via the
-    // slzChunkHashKernel already staged in the PTX modules.
-    if (opts.chunk_checksum and enc_ctx.d_input_override == 0) {
+    // v4 #19 v2: the device path (fast_framed) computes per-chunk
+    // hashes on GPU and writes the root trailer INTO the device frame
+    // before the final D2H - in that case the trailer is already in
+    // `dst` and frame_len already includes it. This host block is the
+    // FALLBACK (kernels unavailable), and it can only run when `src`
+    // is dereferenceable: d_input_override != 0 means the caller's
+    // data is device-resident and the host slice is a length-only
+    // sentinel that must not be touched.
+    if (opts.chunk_checksum and !enc_ctx.merkle_device_done and enc_ctx.d_input_override == 0) {
         if (frame_len + 4 > dst.len) return error.DestinationTooSmall;
         const xxh = @import("../format/xxhash32.zig");
         const eff = fast_framed.effChunkFor(src.len, opts.sc_group_size_override);

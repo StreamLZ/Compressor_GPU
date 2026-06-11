@@ -470,10 +470,59 @@ slzLzDecodeGeneralPipelinedKernel(
 // stored root. One thread per chunk; ~free next to the LZ kernel.
 #include "../common/xxh32_device.cuh"
 
-extern "C" __global__ void slzChunkHashKernel(
+extern "C" __global__ void slzSegHashKernel(
     const uint8_t* __restrict__ data,
     uint32_t n_chunks,
     uint32_t eff_chunk,
     uint64_t total_size,
+    uint32_t* __restrict__ seg_hashes,
+    const uint8_t* __restrict__ prefix_table
+) SLZ_SEG_HASH_KERNEL_BODY
+
+extern "C" __global__ void slzChunkCombineKernel(
+    const uint32_t* __restrict__ seg_hashes,
+    uint32_t n_chunks,
+    uint32_t eff_chunk,
+    uint64_t total_size,
     uint32_t* __restrict__ out_hashes
-) SLZ_CHUNK_HASH_KERNEL_BODY
+) SLZ_CHUNK_COMBINE_KERNEL_BODY
+
+// ── v4 #19 device-only verify: SC-prefix apply + verdict ─────────
+// slzScPrefixApplyKernel writes the true first-8 bytes of chunks 1+
+// into the decoded output ON DEVICE (source = the SC tail table that
+// is already resident in the uploaded compressed block). This fixes
+// the long-standing quirk where the LZ kernel leaves garbage there
+// and the HOST patches it after D2H - the output is now final in
+// VRAM, which is what makes device-side verification (and future
+// D2D coverage) possible. One thread per chunk.
+extern "C" __global__ void slzScPrefixApplyKernel(
+    uint8_t* __restrict__ dst,
+    const uint8_t* __restrict__ comp,
+    uint64_t prefix_off,     // offset of the SC tail table in `comp`
+    uint32_t n_chunks,
+    uint32_t eff_chunk,
+    uint64_t total_size
+) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x + 1; // chunks 1..n-1
+    if (i >= n_chunks) return;
+    const uint64_t start = (uint64_t)i * eff_chunk;
+    uint32_t len = 8;
+    if (start + len > total_size) len = (uint32_t)(total_size - start);
+    const uint8_t* src = comp + prefix_off + (uint64_t)(i - 1) * 8;
+    for (uint32_t k = 0; k < len; k++) dst[start + k] = src[k];
+}
+
+// slzMerkleVerdictKernel: roll the per-chunk hash array into the
+// Merkle root (one thread - the array is ~6 KB) and compare against
+// the frame's expected root. verdict: 1 = match, 2 = mismatch.
+// (0 = kernel never ran; the host falls back to its parallel hash.)
+extern "C" __global__ void slzMerkleVerdictKernel(
+    const uint32_t* __restrict__ hashes,
+    uint32_t n_chunks,
+    uint32_t expected_root,
+    uint32_t* __restrict__ verdict_out
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const uint32_t root = xxh32Device((const uint8_t*)hashes, n_chunks * 4u);
+    verdict_out[0] = (root == expected_root) ? 1u : 2u;
+}

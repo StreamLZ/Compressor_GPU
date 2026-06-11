@@ -248,6 +248,26 @@ fn decompressFrameInner(
 
     var pos: usize = hdr.header_size;
     var dst_off: usize = 0;
+    // v4 #19 device-only verification: per-chunk hashing, prefix
+    // application, root roll-up and the compare all run ON DEVICE;
+    // the host contributes the expected root as a launch scalar
+    // (parsed from the frame tail it already holds) and reads one
+    // 4-byte verdict alongside the final sync. Needs the content
+    // size (our encoder always writes it) to pre-size the device
+    // hash buffer; falls back to the parallel host hash otherwise.
+    // verdict: 0 = device path did not run, 1 = match, 2 = mismatch.
+    var merkle_total: usize = 0;
+    var merkle_filled: usize = 0;
+    var merkle_verdict: u32 = 0;
+    var merkle_expected: u32 = 0;
+    if (hdr.chunk_merkle and gpu_driver.hasChunkHashKernel()) {
+        if (hdr.content_size) |csz| {
+            const eff0 = @min(frame.scGroupSizeToBytes(hdr.sc_group_size), constants.chunk_size);
+            merkle_total = (@as(usize, @intCast(csz)) + eff0 - 1) / eff0;
+            if (src.len >= 4)
+                merkle_expected = std.mem.readInt(u32, src[src.len - 4 ..][0..4], .little);
+        }
+    }
 
     while (pos + 4 <= src.len) {
         const first_word = std.mem.readInt(u32, src[pos..][0..4], .little);
@@ -287,6 +307,18 @@ fn decompressFrameInner(
         }
 
         const block_src = src[pos .. pos + block_hdr.compressed_size];
+        // v4 #19: per-block device-hash geometry.
+        var blk_merkle_n: u32 = 0;
+        var blk_merkle_base: u32 = 0;
+        var blk_run_verdict = false;
+        if (merkle_total > 0) {
+            const eff_cs0 = @min(frame.scGroupSizeToBytes(hdr.sc_group_size), constants.chunk_size);
+            const n_blk = (block_hdr.decompressed_size + eff_cs0 - 1) / eff_cs0;
+            blk_merkle_n = @intCast(n_blk);
+            blk_merkle_base = @intCast(merkle_filled);
+            merkle_filled += n_blk;
+            blk_run_verdict = merkle_filled == merkle_total;
+        }
         try dispatchCompressedBlock(
             block_src,
             dst,
@@ -297,6 +329,12 @@ fn decompressFrameInner(
             dec_ctx,
             d_output_target,
             io,
+            blk_merkle_n,
+            blk_merkle_base,
+            @intCast(merkle_total),
+            blk_run_verdict,
+            merkle_expected,
+            &merkle_verdict,
         );
         // Restore the 8-byte SC tail prefix bytes that the encoder
         // appended at the end of the block. The decoder kernel writes
@@ -346,15 +384,25 @@ fn decompressFrameInner(
     // (~1 ms/100 MB across threads), so default-ON integrity does not
     // move the e2e headline. D2D outputs live on device; skipped there
     // like the content checksum (the GPU-side verify is the v2 plan).
-    if (hdr.chunk_merkle and d_output_target == null) {
+    if (hdr.chunk_merkle) {
         const merkle_pos = pos + @as(usize, if (hdr.content_checksum) 4 else 0);
         if (merkle_pos + 4 > src.len) return error.Truncated;
         const expected = std.mem.readInt(u32, src[merkle_pos..][0..4], .little);
         const xxh = @import("../format/xxhash32.zig");
-        const eff = @min(frame.scGroupSizeToBytes(hdr.sc_group_size), constants.chunk_size);
-        const actual = xxh.chunkMerkleRoot(std.heap.page_allocator, dst[0..dst_off], eff) catch
+        if (merkle_verdict == 1) {
+            // Device verdict: match. Pin the tail-derived scalar the
+            // device compared against to the canonical trailer slot.
+            if (merkle_expected != expected) return error.ChecksumMismatch;
+        } else if (merkle_verdict == 2) {
             return error.ChecksumMismatch;
-        if (actual != expected) return error.ChecksumMismatch;
+        } else if (d_output_target == null) {
+            // Device path did not run (kernels missing / no content
+            // size): parallel host hash fallback over the host copy.
+            const eff = @min(frame.scGroupSizeToBytes(hdr.sc_group_size), constants.chunk_size);
+            const actual = xxh.chunkMerkleRoot(std.heap.page_allocator, dst[0..dst_off], eff) catch
+                return error.ChecksumMismatch;
+            if (actual != expected) return error.ChecksumMismatch;
+        }
     }
     return .{ .written = dst_off };
 }
@@ -373,6 +421,13 @@ fn dispatchCompressedBlock(
     dec_ctx: *gpu_driver.DecodeContext,
     d_output_target: ?u64,
     io: ?std.Io,
+    // v4 #19 device-only verify geometry (see DecodeRequest docs).
+    merkle_n: u32,
+    merkle_base: u32,
+    merkle_total: u32,
+    merkle_run_verdict: bool,
+    merkle_expected: u32,
+    merkle_verdict_out: *u32,
 ) DecompressError!void {
     const eff_chunk_size = @min(frame.scGroupSizeToBytes(sc_group_size), constants.chunk_size);
     const num_chunks = (decompressed_size + eff_chunk_size - 1) / eff_chunk_size;
@@ -411,7 +466,10 @@ fn dispatchCompressedBlock(
 
     try gpu_driver.fullGpuLaunchImpl(dec_ctx, .{
         .chunk_descs = chunk_descs,
-        .compressed_block = block_payload,
+        // v4 #19: upload the FULL block (incl. the SC tail prefix
+        // table) - descriptors never reference the tail, and the
+        // prefix-apply kernel reads it in place from d_comp.
+        .compressed_block = block_src,
         .dst_full = dst.ptr,
         .dst_start_off = dst_start_off,
         .decompressed_size = decompressed_size,
@@ -421,6 +479,14 @@ fn dispatchCompressedBlock(
         .d_output_target = d_output_target,
         .d_compressed_src = null,
         .level = level,
+        .merkle_n_chunks = merkle_n,
+        .merkle_chunk_base = merkle_base,
+        .merkle_total_chunks = merkle_total,
+        .merkle_eff_chunk = @intCast(eff_chunk_size),
+        .merkle_prefix_off = if (prefix_sz != 0 and merkle_n > 0) @as(u64, @intCast(block_payload.len)) else 0,
+        .merkle_run_verdict = merkle_run_verdict,
+        .merkle_expected_root = merkle_expected,
+        .merkle_verdict_out = if (merkle_run_verdict) merkle_verdict_out else null,
     });
 }
 

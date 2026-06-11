@@ -238,6 +238,47 @@ pub fn gpuCompressImpl(
         }
     }
 
+    // v4 #19 device-only: per-chunk content hashes of THIS BLOCK's
+    // input, straight off d_input (pristine in VRAM - no prefix
+    // special cases on the encode side). Appends at the frame-global
+    // chunk base; the root-write kernel runs once per frame in
+    // fast_framed. One thread per chunk; ~free.
+    if (self.merkle_collect and module_loader.seg_hash_fn != 0 and module_loader.chunk_combine_fn != 0) {
+        const spc: u32 = (self.merkle_eff + 1023) / 1024; // KEEP IN SYNC: SLZ_MERKLE_SEG_BYTES
+        const total_hash_bytes = @as(usize, self.merkle_total) * 4;
+        const mh_n: u32 = @intCast(chunk_descs.len);
+        const seg_bytes = @as(usize, mh_n) * spc * 4;
+        if (encode_context.ensureBuf(&self.d_merkle_hashes, &self.d_merkle_hashes_size, total_hash_bytes) and
+            encode_context.ensureBuf(&self.d_merkle_seghashes, &self.d_merkle_seghashes_size, seg_bytes))
+        {
+            var mh_data = d_input;
+            var mh_n_v: u32 = mh_n;
+            var mh_eff: u32 = self.merkle_eff;
+            var mh_total: u64 = @intCast(input.len);
+            var mh_segs: CUdeviceptr = self.d_merkle_seghashes;
+            var mh_prefix: u64 = 0;
+            var sp = [_]?*anyopaque{
+                @ptrCast(&mh_data), @ptrCast(&mh_n_v), @ptrCast(&mh_eff),
+                @ptrCast(&mh_total), @ptrCast(&mh_segs), @ptrCast(&mh_prefix),
+            };
+            var sx = [_]?*anyopaque{null};
+            const n_segs: u32 = mh_n * spc;
+            const s_grid: u32 = (n_segs + 127) / 128;
+            var c_out: CUdeviceptr = self.d_merkle_hashes + @as(u64, self.merkle_base) * 4;
+            var cp = [_]?*anyopaque{
+                @ptrCast(&mh_segs), @ptrCast(&mh_n_v), @ptrCast(&mh_eff),
+                @ptrCast(&mh_total), @ptrCast(&c_out),
+            };
+            var cx = [_]?*anyopaque{null};
+            const c_grid: u32 = (mh_n + 127) / 128;
+            if (launch_fn(module_loader.seg_hash_fn, s_grid, 1, 1, 128, 1, 1, 0, 0, &sp, &sx) == cuda_ffi.CUDA_SUCCESS and
+                launch_fn(module_loader.chunk_combine_fn, c_grid, 1, 1, 128, 1, 1, 0, 0, &cp, &cx) == cuda_ffi.CUDA_SUCCESS)
+            {
+                self.merkle_base += mh_n;
+            }
+        }
+    }
+
     // Unbatched path: download comp_sizes first (always needed - the
     // assemble descs and frame splice are built from them), then the
     // compressed payload bytes - but ONLY at L3+: the Huffman passes

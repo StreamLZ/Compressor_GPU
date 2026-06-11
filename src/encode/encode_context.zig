@@ -169,6 +169,24 @@ pub const EncodeContext = struct {
     h_gather_pinned: ?[*]u8 = null,
     h_gather_size: usize = 0,
 
+    // ── v4 #19 device-only Merkle (encode side) ──────────────────
+    // Per-frame: fast_framed sets total/eff and resets base before
+    // the block loop; gpuCompressImpl launches the per-chunk hash
+    // kernel per block (appending at base); fast_framed launches the
+    // root-write kernel into the device frame before the final D2H.
+    d_merkle_hashes: CUdeviceptr = 0,
+    d_merkle_hashes_size: usize = 0,
+    d_merkle_seghashes: CUdeviceptr = 0,
+    d_merkle_seghashes_size: usize = 0,
+    merkle_collect: bool = false,
+    merkle_eff: u32 = 0,
+    merkle_total: u32 = 0,
+    merkle_base: u32 = 0,
+    /// Set by fast_framed when the device root-write kernel ran and
+    /// the trailer is already inside the D2H'd frame; the encoder
+    /// then skips the host-side trailer append.
+    merkle_device_done: bool = false,
+
     // ── GPU Huffman encode persistent device buffers ───────────
     d_huff_descs_persist: CUdeviceptr = 0,
     d_huff_descs_size: usize = 0,
@@ -259,6 +277,8 @@ pub const EncodeContext = struct {
         free_dev(&self.d_frame_prefix_bytes, &self.d_frame_prefix_bytes_size);
         free_dev(&self.d_input_persist, &self.d_input_size);
         free_dev(&self.d_output_persist, &self.d_output_size);
+        free_dev(&self.d_merkle_hashes, &self.d_merkle_hashes_size);
+        free_dev(&self.d_merkle_seghashes, &self.d_merkle_seghashes_size);
         if (self.h_gather_pinned) |p| {
             if (cuda_ffi.cuMemFreeHost_fn) |free_host| _ = free_host(@ptrCast(p));
             self.h_gather_pinned = null;

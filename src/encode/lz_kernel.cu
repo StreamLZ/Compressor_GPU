@@ -250,10 +250,36 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
 // ── v4 #19: per-chunk content hash (Merkle-root checksum) ────────
 #include "../common/xxh32_device.cuh"
 
-extern "C" __global__ void slzChunkHashKernel(
+extern "C" __global__ void slzSegHashKernel(
     const uint8_t* __restrict__ data,
     uint32_t n_chunks,
     uint32_t eff_chunk,
     uint64_t total_size,
+    uint32_t* __restrict__ seg_hashes,
+    const uint8_t* __restrict__ prefix_table
+) SLZ_SEG_HASH_KERNEL_BODY
+
+extern "C" __global__ void slzChunkCombineKernel(
+    const uint32_t* __restrict__ seg_hashes,
+    uint32_t n_chunks,
+    uint32_t eff_chunk,
+    uint64_t total_size,
     uint32_t* __restrict__ out_hashes
-) SLZ_CHUNK_HASH_KERNEL_BODY
+) SLZ_CHUNK_COMBINE_KERNEL_BODY
+
+// v4 #19 device-only encode: roll the per-chunk hashes into the root
+// and write the 4-byte LE trailer DIRECTLY into the device-resident
+// assembled frame, so it rides home inside the existing final D2H.
+extern "C" __global__ void slzMerkleRootWriteKernel(
+    const uint32_t* __restrict__ hashes,
+    uint32_t n_chunks,
+    uint8_t* __restrict__ frame_dst,
+    uint64_t trailer_off
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const uint32_t root = xxh32Device((const uint8_t*)hashes, n_chunks * 4u);
+    frame_dst[trailer_off + 0] = (uint8_t)(root & 0xFFu);
+    frame_dst[trailer_off + 1] = (uint8_t)((root >> 8) & 0xFFu);
+    frame_dst[trailer_off + 2] = (uint8_t)((root >> 16) & 0xFFu);
+    frame_dst[trailer_off + 3] = (uint8_t)((root >> 24) & 0xFFu);
+}

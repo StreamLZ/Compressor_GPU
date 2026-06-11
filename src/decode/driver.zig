@@ -34,6 +34,11 @@ pub const qpcMs = cuda.qpcMs;
 
 // ── Module lifecycle ──────────────────────────────────────────
 pub const init = module_loader.init;
+/// v4 #19 v2: whether the device-side per-chunk hash kernel resolved
+/// (the decoder falls back to the parallel host hash when absent).
+pub fn hasChunkHashKernel() bool {
+    return module_loader.seg_hash_fn != 0 and module_loader.chunk_combine_fn != 0;
+}
 pub const isAvailable = module_loader.isAvailable;
 
 /// Name of the active CUDA device (VK-parity: print next to every
