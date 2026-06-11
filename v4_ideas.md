@@ -927,3 +927,17 @@ cycles, 0 failures. ~280 suite executions today, 1 hit total. Suspect
 ranking unchanged (K=4 pipeline serial/prime boundary), mitigation
 SLZ_NO_PIPELINE=1.
 
+**Detection sub-item (2026-06-11, from "does the software KNOW it
+fails?"):** today, NO by default -- silent wrong bytes; only test
+memcmp catches it. The #13 XXH32 trailer is the existing safeguard
+but is opt-in (--checksum). Measured cost of flipping the default:
+encode 87 -> 100 ms (+15%), decode e2e 16 -> 29 ms (+81%) on enwik8
+-- the scalar host XXH32 costs ~13 ms/100 MB EACH WAY; unacceptable
+as a default. Reverted. The right build-out if always-on integrity
+matters: GPU-SIDE per-chunk verification (hash d_output regions
+inside the decode pipeline, ~free vs PCIe) or an XXH3-class
+vectorized host hash (~30 GB/s -> ~3 ms). Either is a wire/flag
+addition -- fold into the #8 wire-format design if pursued. NOTE:
+flipping any checksum default must land on BOTH backends in one
+commit or the cross-backend SHA gate fails by construction (the
+trailer changes frame bytes).
