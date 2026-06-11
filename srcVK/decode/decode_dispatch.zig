@@ -789,6 +789,19 @@ pub fn runLzPipeline(
         // lz_decode_raw_kernel.comp: n_bindings=4 (CompressedBuf, ChunksBuf,
         // DstBuf, TotalChunksBuf), push_constant_size=8 (chunks_per_group,
         // sub_chunk_cap as 2× u32).
+        // v4 #15 (2026-06-11, CUDA-mirror): 2-warp pipelined raw kernel
+        // by default - both subgroups of a workgroup cooperate on ONE
+        // group, so the grid doubles. SLZ_NO_PIPELINE=1 is the debug
+        // escape back to the single-warp kernel (same env var as CUDA).
+        // WIP 2026-06-11: the VK pipelined kernel TDRs at multi-workgroup
+        // scale (bisected to the parsePipelined parse/barrier block; even
+        // with the decode body disabled it hangs, while the same shell
+        // running the proven macro passes). OPT-IN until fixed.
+        const use_pipeline = module_loader.kernel_raw_pipeline_fn != 0 and
+            std.c.getenv("SLZ_VK_PIPELINE") != null;
+        const raw_kernel = if (use_pipeline) module_loader.kernel_raw_pipeline_fn else module_loader.kernel_raw_fn;
+        const raw_grid_x: u32 = if (use_pipeline) lz_grid_x * 2 else lz_grid_x;
+        const raw_label: [*:0]const u8 = if (use_pipeline) "slzLzDecodeRawPipelinedKernel" else "slzLzDecodeRawKernel";
         var raw_params = [_]?*anyopaque{
             @ptrCast(&common.comp),
             @ptrCast(&common.descs_dev),
@@ -798,8 +811,8 @@ pub fn runLzPipeline(
             @ptrCast(&common.sub_chunk_cap),
         };
         var raw_extra = [_]?*anyopaque{null};
-        const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", stream);
-        try vkCall(launch_fn(module_loader.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra, null), .launch);
+        const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, raw_label, stream);
+        try vkCall(launch_fn(raw_kernel, raw_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra, null), .launch);
         endKernelTiming(t_lzr, stream);
     } else {
         var p_first_sub_idx: VkDeviceBuffer = self.d_first_subchunk_idx;

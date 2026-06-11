@@ -15,6 +15,7 @@ const std = @import("std");
 
 // ── decode (13) ─────────────────────────────────────────────────────
 pub const lz_decode_raw: []const u8 = @embedFile("lz_decode_raw_kernel.spv");
+pub const lz_decode_raw_pipelined: []const u8 = @embedFile("lz_decode_raw_pipelined_kernel.spv");
 pub const lz_decode: []const u8 = @embedFile("lz_decode_kernel.spv");
 pub const prefix_sum_chunks: []const u8 = @embedFile("prefix_sum_chunks_kernel.spv");
 pub const gather_raw_off16: []const u8 = @embedFile("gather_raw_off16_kernel.spv");

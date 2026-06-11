@@ -1,0 +1,540 @@
+// 1:1 port of src/decode/lz_decode_kernels.cuh entry point
+// slzLzDecodeRawPipelinedKernel + src/decode/lz_decode_raw_pipeline.cuh.
+// CUDA reference commit: v4 #15 (2026-06-11).
+//
+// v4 #15: 2-warp pipelined raw-mode decode. Both subgroups of a
+// workgroup cooperate on ONE chunk group: subgroup 0 (parser) runs
+// the PP scans and stages each batch into a PipeBatch shared double
+// buffer; subgroup 1 (copier) executes the staged flat-literal +
+// flat-independent-match + dependent-match copies one batch behind.
+// barrier()-paced per batch (the GLSL analogue of __syncthreads;
+// intra-workgroup spin-waits deadlock on NVIDIA — no scheduler
+// fairness). Serial long tokens drain the pipeline and execute
+// cooperatively. Grid is doubled by the host dispatch.
+//
+// Both CUDA bug lessons are baked in (see the CUDA file):
+//  - a window STARTING with a long token routes to the serial
+//    handler — never an early exit (most 64 KB chunks open with a
+//    long match; the boundary cuts mid-text);
+//  - dep_mask is the raw ballot, never masked with
+//    (1u << batch_size) - 1u (UB at batch_size == 32; invalid lanes
+//    ballot 0 anyway).
+//
+// VK adaptation vs the CUDA bridge: the off32 header is parsed
+// PROPERLY here, and a non-empty off32 falls back to the proven
+// non-pipelined parseAndDecodeSubChunkRaw macro (the CUDA bridge
+// assumes off32 == 0 — safe at sc <= 0.25 where sub-chunks are
+// <= 64 KB, but the guard costs nothing).
+//
+// Because this is a standalone .comp (not an #include'd .glsl shared
+// by other kernels), the SSBOs are file-scope and plain GLSL
+// functions can reference them directly — no macro bodies needed for
+// fillBatch/executeBatch.
+
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "slz_wire_format.glsl"
+#include "lz_decode_core.glsl"
+#include "lz_decode_raw.glsl"
+#include "lz_decode_general.glsl"
+#include "lz_header_parse.glsl"
+#include "lz_dispatch.glsl"
+
+layout(local_size_x = 32, local_size_y = 2, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer CompressedBuf {
+    uint8_t compressed[];
+};
+layout(std430, binding = 1) readonly buffer ChunksBuf {
+    SlzChunkDesc chunks[];
+};
+layout(std430, binding = 2) buffer DstBuf {
+    uint8_t dst[];
+};
+layout(std430, binding = 3) readonly buffer TotalChunksBuf {
+    uint d_total_chunks;
+};
+layout(push_constant) uniform Push {
+    uint chunks_per_group;
+    uint sub_chunk_cap;
+} pc;
+
+// ── Shared pipeline state ────────────────────────────────────────
+struct PipeBatch {
+    uint batch_size;
+    uint total_lit;
+    uint total_im;
+    uint dst_pos;
+    uint lit_pos;
+    uint dep_mask;
+    uint lit_prefix[32];
+    uint dst_adj[32];
+    uint im_prefix[32];
+    uint im_dst_adj[32];
+    uint im_src_adj[32];
+    uint match_len[32];
+    int  match_offset[32];
+};
+shared PipeBatch s_pb[2];
+shared uint s_have_batch;
+shared uint s_have_next;
+shared uint s_state[6];  // cmd_pos, lit_pos, off16_pos, dst_pos, recent, length_offset
+shared uint s_long[5];   // slit, smatch, soff, use_recent, off16_pos
+shared uint s_parse[8];  // lit_ptr, cmd_ptr, off16_raw, len_stream, lit_size, cmd_size, off16_count, len_avail
+shared uint s_hdr;       // sub-chunk header broadcast
+shared uint s_off32_nz;  // off32 fallback flag
+
+// ── Parser: fill one PP batch (subgroup 0 only) ─────────────────
+// Returns true when a batch was staged; false at a long token.
+// Advances parser state in place (inout params).
+bool fillBatch(
+    uint cmd_base, uint cmd_size,
+    uint off16_base, uint off16_count,
+    inout uint cmd_pos, inout uint lit_pos, inout uint off16_pos,
+    inout uint dst_pos, inout int recent_offset,
+    int lane, uint slot
+) {
+    uint remaining = cmd_size - cmd_pos;
+    uint batch_size = remaining < WARP_SIZE ? remaining : WARP_SIZE;
+    uint my_cmd = (uint(lane) < batch_size)
+        ? uint(compressed[cmd_base + cmd_pos + uint(lane)]) : 0u;
+    bool my_is_long = (uint(lane) < batch_size) && (my_cmd < TOKEN_SHORT_MIN);
+    uvec4 lb = subgroupBallot(my_is_long);
+    uint any_long = lb.x;
+    if (any_long != 0u)
+        batch_size = uint(findLSB(any_long));
+    if (batch_size == 0u)
+        return false;
+
+    bool my_valid = uint(lane) < batch_size;
+    uint my_lit_len   = my_valid ? (my_cmd & TOKEN_LIT_MASK) : 0u;
+    uint my_match_len = my_valid ? ((my_cmd >> TOKEN_MATCH_SHIFT) & TOKEN_MATCH_MASK) : 0u;
+    uint my_use_recent = my_valid ? ((my_cmd >> TOKEN_USE_RECENT_SHIFT) & TOKEN_USE_RECENT_MASK) : 0u;
+    uint my_consumes_off16 = (my_valid && my_use_recent == 0u) ? 1u : 0u;
+
+    uint my_off16_local, total_off16_used;
+    warpScanU32(my_consumes_off16, lane, my_off16_local, total_off16_used);
+
+    int my_match_offset = recent_offset;
+    if (my_consumes_off16 != 0u) {
+        uint entry_idx = off16_pos + my_off16_local;
+        if (entry_idx < off16_count) {
+            uint lo = uint(compressed[off16_base + entry_idx * OFF16_ENTRY_BYTES + 0u]);
+            uint hi = uint(compressed[off16_base + entry_idx * OFF16_ENTRY_BYTES + 1u]);
+            my_match_offset = -int(readU16LE(lo, hi));
+        }
+    }
+
+    uvec4 fb = subgroupBallot(my_consumes_off16 != 0u);
+    uint fresh_mask = fb.x;
+    uint my_prefix = fresh_mask & ((2u << uint(lane)) - 1u);
+    int src_lane = (my_prefix != 0u) ? lastBitSet(my_prefix) : 0;
+    int shuffled_off = subgroupShuffle(my_match_offset, uint(src_lane));
+    if (my_use_recent != 0u && my_prefix != 0u)
+        my_match_offset = shuffled_off;
+
+    uint my_total = my_lit_len + my_match_len;
+    uint my_dst_local, total_dst;
+    warpScanU32(my_total, lane, my_dst_local, total_dst);
+    uint my_lit_local, total_lit;
+    warpScanU32(my_lit_len, lane, my_lit_local, total_lit);
+
+    uint my_copy_dst = dst_pos + my_dst_local + my_lit_len;
+    int  my_src      = int(my_copy_dst) + my_match_offset;
+    bool my_is_indep = (my_match_len > 0u) &&
+                       (my_src + int(my_match_len) <= int(dst_pos));
+    uint my_im_len = my_is_indep ? my_match_len : 0u;
+    uint my_im_local, total_im;
+    warpScanU32(my_im_len, lane, my_im_local, total_im);
+
+    s_pb[slot].lit_prefix[lane]   = my_lit_local;
+    s_pb[slot].dst_adj[lane]      = my_dst_local - my_lit_local;
+    s_pb[slot].im_prefix[lane]    = my_im_local;
+    s_pb[slot].im_dst_adj[lane]   = my_copy_dst - my_im_local;
+    s_pb[slot].im_src_adj[lane]   = uint(my_src) - my_im_local;
+    s_pb[slot].match_len[lane]    = my_match_len;
+    s_pb[slot].match_offset[lane] = my_match_offset;
+    uvec4 db = subgroupBallot(my_match_len > 0u && !my_is_indep);
+    if (lane == 0) {
+        s_pb[slot].batch_size = batch_size;
+        s_pb[slot].total_lit  = total_lit;
+        s_pb[slot].total_im   = total_im;
+        s_pb[slot].dst_pos    = dst_pos;
+        s_pb[slot].lit_pos    = lit_pos;
+        s_pb[slot].dep_mask   = db.x; // raw ballot; never (1<<bs)-1 masked
+    }
+
+    cmd_pos   += batch_size;
+    off16_pos += total_off16_used;
+    dst_pos   += total_dst;
+    lit_pos   += total_lit;
+    if (fresh_mask != 0u) {
+        int last_fresh = lastBitSet(fresh_mask);
+        recent_offset = subgroupShuffle(my_match_offset, uint(last_fresh));
+    }
+    return true;
+}
+
+// ── Copier: execute one staged batch (subgroup 1) ────────────────
+void executeBatch(uint lit_base, int lane, uint slot) {
+    uint bs = s_pb[slot].batch_size;
+    uint batch_dst = s_pb[slot].dst_pos;
+    uint batch_lit = s_pb[slot].lit_pos;
+
+    // Flat literal copy (#1).
+    for (uint i = uint(lane); i < s_pb[slot].total_lit; i += WARP_SIZE) {
+        uint k = 0u;
+        for (uint step = 16u; step >= 1u; step >>= 1) {
+            uint cand = k + step;
+            if (cand < bs && s_pb[slot].lit_prefix[cand] <= i) k = cand;
+        }
+        dst[batch_dst + s_pb[slot].dst_adj[k] + i] = compressed[lit_base + batch_lit + i];
+    }
+    subgroupBarrier();
+    subgroupMemoryBarrierBuffer();
+
+    // Flat independent-match copy (#2).
+    if (s_pb[slot].total_im > 0u) {
+        for (uint i = uint(lane); i < s_pb[slot].total_im; i += WARP_SIZE) {
+            uint k = 0u;
+            for (uint step = 16u; step >= 1u; step >>= 1) {
+                uint cand = k + step;
+                if (cand < bs && s_pb[slot].im_prefix[cand] <= i) k = cand;
+            }
+            dst[s_pb[slot].im_dst_adj[k] + i] = dst[s_pb[slot].im_src_adj[k] + i];
+        }
+        subgroupBarrier();
+        subgroupMemoryBarrierBuffer();
+    }
+
+    // Dependent matches, token order.
+    uint dep_mask = s_pb[slot].dep_mask;
+    while (dep_mask != 0u) {
+        uint k = uint(findLSB(dep_mask));
+        dep_mask &= dep_mask - 1u;
+        uint k_match_len = s_pb[slot].match_len[k];
+        int  k_match_off = s_pb[slot].match_offset[k];
+        uint copy_dst = s_pb[slot].im_dst_adj[k] + s_pb[slot].im_prefix[k];
+        uint match_src = uint(int(copy_dst) + k_match_off);
+        warpMatchCopy(dst, copy_dst, match_src, k_match_len, -k_match_off, lane);
+        subgroupBarrier();
+        subgroupMemoryBarrierBuffer();
+    }
+}
+
+// ── Pipelined sub-chunk decode ───────────────────────────────────
+void decodeSubChunkPipelined(
+    uint cmd_base, uint cmd_size,
+    uint lit_base, uint lit_size,
+    uint off16_base, uint off16_count,
+    uint len_base, uint len_avail,
+    uint initial_copy, uint dst_offset,
+    int lane, bool is_parser
+) {
+    uint cmd_pos = 0u, lit_pos = 0u, off16_pos = 0u;
+    uint dst_pos = dst_offset + initial_copy;
+    int recent_offset = INITIAL_RECENT_OFFSET;
+    uint length_offset = 0u;
+
+    // DEBUG BISECT 5: do nothing at all (output will be wrong; we
+    // only test whether the PARSE in parsePipelined hangs).
+    if (true) return;
+
+    while (true) {
+        // Prime.
+        if (is_parser) {
+            bool got = (cmd_pos < cmd_size) && fillBatch(
+                cmd_base, cmd_size, off16_base, off16_count,
+                cmd_pos, lit_pos, off16_pos, dst_pos, recent_offset,
+                lane, 0u);
+            if (lane == 0) s_have_batch = got ? 1u : 0u;
+        }
+        barrier();
+
+        // DEBUG BISECT 4: execute the primed batch once, then stop.
+        if (s_have_batch != 0u && is_parser) {
+            executeBatch(lit_base, lane, 0u);
+        }
+        barrier();
+        break;
+        // (unreachable steady loop removed for the bisect)
+
+        // Drained — broadcast parser state.
+        if (is_parser && lane == 0) {
+            s_state[0] = cmd_pos;   s_state[1] = lit_pos;
+            s_state[2] = off16_pos; s_state[3] = dst_pos;
+            s_state[4] = uint(recent_offset);
+            s_state[5] = length_offset;
+        }
+        barrier();
+        cmd_pos = s_state[0];   lit_pos = s_state[1];
+        off16_pos = s_state[2]; dst_pos = s_state[3];
+        recent_offset = int(s_state[4]);
+        length_offset = s_state[5];
+
+        if (cmd_pos >= cmd_size) break;
+
+        // Serial long token — both warps idle, execute cooperatively.
+        uint slit = 0u, smatch = 0u;
+        int soff = recent_offset;
+        uint suse_recent = 0u;
+        if (is_parser && lane == 0) {
+            uint token = uint(compressed[cmd_base + cmd_pos]);
+            if (token == TOKEN_LONG_LITERAL) {
+                suse_recent = 1u;
+                uint extlen;
+                readLength(compressed, len_base, length_offset, len_avail, extlen);
+                slit = extlen + LONG_LITERAL_BASE;
+            } else if (token == TOKEN_LONG_NEAR) {
+                uint extlen2;
+                readLength(compressed, len_base, length_offset, len_avail, extlen2);
+                smatch = extlen2 + LONG_NEAR_BASE;
+                if (off16_pos < off16_count) {
+                    uint lo = uint(compressed[off16_base + off16_pos * OFF16_ENTRY_BYTES + 0u]);
+                    uint hi = uint(compressed[off16_base + off16_pos * OFF16_ENTRY_BYTES + 1u]);
+                    soff = -int(readU16LE(lo, hi));
+                    off16_pos++;
+                }
+            }
+            s_long[0] = slit; s_long[1] = smatch;
+            s_long[2] = uint(soff); s_long[3] = suse_recent;
+            s_long[4] = off16_pos;
+            s_state[5] = length_offset; // re-broadcast post-readLength
+        }
+        barrier();
+        slit = s_long[0]; smatch = s_long[1];
+        soff = int(s_long[2]); suse_recent = s_long[3];
+        off16_pos = s_long[4];
+        length_offset = s_state[5];
+        cmd_pos++;
+
+        if (slit > 0u) {
+            uint gl = gl_LocalInvocationID.y * WARP_SIZE + uint(lane);
+            for (uint i = gl; i < slit; i += LZ_KERNEL_BLOCK_THREADS)
+                dst[dst_pos + i] = compressed[lit_base + lit_pos + i];
+            barrier();
+            memoryBarrierBuffer();
+        }
+        dst_pos += slit;
+        lit_pos += slit;
+        if (smatch > 0u) {
+            // One warp performs the match (warpMatchCopy is
+            // warp-granular; running it on both would double-write).
+            if (is_parser) {
+                uint msrc = uint(int(dst_pos) + soff);
+                warpMatchCopy(dst, dst_pos, msrc, smatch, -soff, lane);
+            }
+            barrier();
+            memoryBarrierBuffer();
+        }
+        dst_pos += smatch;
+        if (suse_recent == 0u) recent_offset = soff;
+    }
+
+    // Trailing literals — 64 threads.
+    uint trailing = (lit_size > lit_pos) ? (lit_size - lit_pos) : 0u;
+    uint gl2 = gl_LocalInvocationID.y * WARP_SIZE + uint(lane);
+    for (uint i = gl2; i < trailing; i += LZ_KERNEL_BLOCK_THREADS)
+        dst[dst_pos + i] = compressed[lit_base + lit_pos + i];
+}
+
+// ── Bridge: header parse (subgroup 0) + shared broadcast ─────────
+void parsePipelined(
+    uint sc_src_off, uint sc_comp_size, uint sc_decomp_size,
+    uint dst_offset, uint base_offset, int lane
+) {
+    uint src = sc_src_off;
+    uint src_end = sc_src_off + sc_comp_size;
+    bool is_parser = (gl_LocalInvocationID.y == 0u);
+
+    uint initial_copy = 0u;
+    if (base_offset == 0u) {
+        uint gl = gl_LocalInvocationID.y * WARP_SIZE + uint(lane);
+        if (gl < INITIAL_LITERAL_COPY_BYTES)
+            dst[dst_offset + gl] = compressed[src + gl];
+        barrier();
+        memoryBarrierBuffer();
+        src += INITIAL_LITERAL_COPY_BYTES;
+        initial_copy = INITIAL_LITERAL_COPY_BYTES;
+    }
+
+    if (is_parser) {
+        uint lit_ptr = src;
+        uint lit_size = 0u;
+        if (lane == 0) {
+            uint b0 = uint(compressed[src + 0u]);
+            uint b1 = uint(compressed[src + 1u]);
+            uint b2 = uint(compressed[src + 2u]);
+            Type0HdrFields h = parseType0HdrFields(b0, b1, b2);
+            lit_size = h.size;
+            src += h.header_bytes;
+            lit_ptr = src;
+            src += lit_size;
+        }
+        lit_size = subgroupShuffle(lit_size, 0u);
+        src = subgroupShuffle(src, 0u);
+        lit_ptr = src - lit_size;
+
+        uint cmd_ptr;
+        uint cmd_size = 0u;
+        if (lane == 0) {
+            uint c0 = uint(compressed[src + 0u]);
+            uint c1 = uint(compressed[src + 1u]);
+            uint c2 = uint(compressed[src + 2u]);
+            Type0HdrFields hc = parseType0HdrFields(c0, c1, c2);
+            cmd_size = hc.size;
+            src += hc.header_bytes;
+            cmd_ptr = src;
+            src += cmd_size;
+        }
+        cmd_size = subgroupShuffle(cmd_size, 0u);
+        src = subgroupShuffle(src, 0u);
+        cmd_ptr = src - cmd_size;
+
+        if (lane == 0 && sc_decomp_size > LZ_BLOCK_SIZE) { src += 2u; }
+        src = subgroupShuffle(src, 0u);
+
+        uint off16_raw = src;
+        uint off16_count = 0u;
+        if (lane == 0) {
+            uint o0 = uint(compressed[src + 0u]);
+            uint o1 = uint(compressed[src + 1u]);
+            off16_count = readU16LE(o0, o1);
+            off16_raw = src + 2u;
+            src += 2u + off16_count * OFF16_ENTRY_BYTES;
+        }
+        off16_count = subgroupShuffle(off16_count, 0u);
+        src = subgroupShuffle(src, 0u);
+        off16_raw = src - off16_count * OFF16_ENTRY_BYTES;
+
+        uint len_avail = 0u;
+        uint off32_nz = 0u;
+        if (lane == 0) {
+            uint t0 = uint(compressed[src + 0u]);
+            uint t1 = uint(compressed[src + 1u]);
+            uint t2 = uint(compressed[src + 2u]);
+            uint tmp = readLE24(t0, t1, t2);
+            src += 3u;
+            off32_nz = (tmp != 0u) ? 1u : 0u;
+            len_avail = src_end - src;
+        }
+        off32_nz = subgroupShuffle(off32_nz, 0u);
+        len_avail = subgroupShuffle(len_avail, 0u);
+        src = subgroupShuffle(src, 0u);
+
+        if (lane == 0) {
+            s_parse[0] = lit_ptr;
+            s_parse[1] = cmd_ptr;
+            s_parse[2] = off16_raw;
+            s_parse[3] = src; // len_stream
+            s_parse[4] = lit_size;
+            s_parse[5] = cmd_size;
+            s_parse[6] = off16_count;
+            s_parse[7] = len_avail;
+            s_off32_nz = off32_nz;
+        }
+    }
+    barrier();
+
+    if (s_off32_nz != 0u) {
+        // off32 present (sub-chunk > 64 KB at sc > 0.25) — the
+        // pipeline path doesn't handle off32; fall back to the proven
+        // non-pipelined macro on subgroup 0, subgroup 1 idles to the
+        // barrier in the caller. (VK adaptation: guard the CUDA
+        // bridge lacks — its raw path never sees off32 at the sc
+        // defaults, but the guard costs nothing.)
+        if (is_parser) {
+            parseAndDecodeSubChunkRaw(
+                compressed, sc_src_off, sc_comp_size, sc_decomp_size,
+                dst, dst_offset, base_offset, lane);
+        }
+        return;
+    }
+
+    decodeSubChunkPipelined(
+        s_parse[1], s_parse[5],   // cmd
+        s_parse[0], s_parse[4],   // lit
+        s_parse[2], s_parse[6],   // off16
+        s_parse[3], s_parse[7],   // length stream
+        initial_copy, dst_offset,
+        lane, is_parser);
+}
+
+void main() {
+    uint total_chunks = d_total_chunks;
+    // Both subgroups share ONE group id (grid doubled by the host).
+    uint group_id = gl_WorkGroupID.x;
+    int  lane = int(gl_LocalInvocationID.x & LANE_MASK);
+    if (group_id >= (total_chunks + pc.chunks_per_group - 1u) / pc.chunks_per_group) return;
+    uint base_chunk = group_id * pc.chunks_per_group;
+
+    for (uint c = 0u; c < pc.chunks_per_group; c = c + 1u) {
+        uint chunk_idx = base_chunk + c;
+        if (chunk_idx >= total_chunks) return;
+
+        SlzChunkDesc ch = chunks[chunk_idx];
+        if (ch.decomp_size == 0u) continue;
+
+        if ((ch.flags & CHUNK_FLAG_UNCOMPRESSED) != 0u) {
+            uint gl = gl_LocalInvocationID.y * WARP_SIZE + uint(lane);
+            for (uint i = gl; i < ch.decomp_size; i += LZ_KERNEL_BLOCK_THREADS)
+                dst[ch.dst_offset + i] = compressed[ch.src_offset + i];
+            barrier();
+            memoryBarrierBuffer();
+            continue;
+        }
+        if ((ch.flags & CHUNK_FLAG_MEMSET) != 0u) {
+            uint8_t fill_byte = uint8_t(chunkMemsetFill(ch));
+            uint gl = gl_LocalInvocationID.y * WARP_SIZE + uint(lane);
+            for (uint i = gl; i < ch.decomp_size; i += LZ_KERNEL_BLOCK_THREADS)
+                dst[ch.dst_offset + i] = fill_byte;
+            barrier();
+            memoryBarrierBuffer();
+            continue;
+        }
+
+        uint chunk_src = ch.src_offset;
+        uint sc_dst_off = ch.dst_offset;
+        uint sc_remaining = ch.decomp_size;
+
+        while (sc_remaining > 0u) {
+            uint sc_size = sc_remaining;
+            if (sc_size > pc.sub_chunk_cap) sc_size = pc.sub_chunk_cap;
+
+            if (gl_LocalInvocationID.y == 0u && lane == 0) {
+                uint h0 = uint(compressed[chunk_src + 0u]);
+                uint h1 = uint(compressed[chunk_src + 1u]);
+                uint h2 = uint(compressed[chunk_src + 2u]);
+                s_hdr = readBE24(h0, h1, h2);
+            }
+            barrier();
+            uint sub_chunk_header = s_hdr;
+
+            if (!subchunkIsLz(sub_chunk_header)) break;
+
+            uint sc_comp_size = subchunkCompSize(sub_chunk_header);
+            uint sc_payload = chunk_src + 3u;
+
+            if (sc_comp_size < sc_size) {
+                parsePipelined(sc_payload, sc_comp_size, sc_size,
+                               sc_dst_off, sc_dst_off, lane);
+            } else {
+                uint gl = gl_LocalInvocationID.y * WARP_SIZE + uint(lane);
+                for (uint i = gl; i < sc_size; i += LZ_KERNEL_BLOCK_THREADS)
+                    dst[sc_dst_off + i] = compressed[sc_payload + i];
+            }
+            barrier();
+            memoryBarrierBuffer();
+
+            chunk_src += 3u + sc_comp_size;
+            sc_dst_off += sc_size;
+            sc_remaining -= sc_size;
+        }
+    }
+}

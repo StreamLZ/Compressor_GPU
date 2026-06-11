@@ -435,6 +435,7 @@ fn ptxRebuild(step: *std.Build.Step, opts: std.Build.Step.MakeOptions) anyerror!
 const srcvk_kernels = [_][]const u8{
     // decode (13)
     "decode/lz_decode_raw_kernel",
+    "decode/lz_decode_raw_pipelined_kernel",
     "decode/lz_decode_kernel",
     "decode/prefix_sum_chunks_kernel",
     "decode/gather_raw_off16_kernel",

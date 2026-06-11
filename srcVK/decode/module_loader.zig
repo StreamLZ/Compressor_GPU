@@ -324,6 +324,7 @@ pub fn deviceTypeName(device_type: c_int) []const u8 {
 pub var module: usize = 0;
 pub var kernel_fn: usize = 0;
 pub var kernel_raw_fn: usize = 0;
+pub var kernel_raw_pipeline_fn: usize = 0;
 pub var gather_off16_fn: usize = 0;
 pub var scan_parse_fn: usize = 0;
 pub var walk_frame_fn: usize = 0;
@@ -1863,6 +1864,7 @@ const KernelMeta = struct {
 const KernelKind = enum(usize) {
     kernel_fn,
     kernel_raw_fn,
+    kernel_raw_pipeline_fn,
     gather_off16_fn,
     scan_parse_fn,
     walk_frame_fn,
@@ -1909,6 +1911,9 @@ const KERNEL_DECLS = [_]KernelDecl{
     // bindings (CompressedBuf, ChunksBuf, DstBuf, TotalChunksBuf) plus
     // a 2× u32 push-constant block (chunks_per_group, sub_chunk_cap).
     .{ .kind = .kernel_raw_fn, .n_bindings = 4, .push_constant_size = 8, .pin_subgroup_32 = true },
+    // v4 #15: 2-warp pipelined raw kernel - same ABI as kernel_raw_fn,
+    // grid doubled by the dispatch (both subgroups share one group).
+    .{ .kind = .kernel_raw_pipeline_fn, .n_bindings = 4, .push_constant_size = 8, .pin_subgroup_32 = true },
     .{ .kind = .gather_off16_fn, .n_bindings = 4, .push_constant_size = 4, .pin_subgroup_32 = true },
     .{ .kind = .scan_parse_fn, .n_bindings = 10, .push_constant_size = 8, .pin_subgroup_32 = true },
     // walk_frame / prefix_sum_chunks / compact_huff / compact_raw /
@@ -2672,6 +2677,11 @@ pub fn init() bool {
 
     if (!buildKernel(.kernel_raw_fn, spv_blobs.lz_decode_raw)) return false;
     kernel_raw_fn = @intCast(metaFor(.kernel_raw_fn).pipeline);
+
+    // v4 #15: pipelined raw kernel. Optional (call site gates on the slot).
+    if (buildKernel(.kernel_raw_pipeline_fn, spv_blobs.lz_decode_raw_pipelined)) {
+        kernel_raw_pipeline_fn = @intCast(metaFor(.kernel_raw_pipeline_fn).pipeline);
+    }
 
     if (!buildKernel(.gather_off16_fn, spv_blobs.gather_raw_off16)) return false;
     gather_off16_fn = @intCast(metaFor(.gather_off16_fn).pipeline);

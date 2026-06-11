@@ -269,3 +269,44 @@ A-013/A-014) ships at parity.
       identified.
 - [x] Small-file (web.txt) regression catalogued under existing residual
       #1 / submit-floor adaptation
+
+---
+
+## 2026-06-11 addendum — post-v4-optimization-wave numbers
+
+The Phase 5 tables above predate the 2026-06-10/11 v4 wave (#1 flat
+literal copy, #2 flat independent-match copy, #5 BDA scratch, #6 L2
+rehash, #10 dispatch fusion, #15 CUDA 2-warp pipeline). Current
+`-db` numbers (RTX 4060 Ti, `gpu kernel best` / `e2e best`, ms,
+serial runs; CUDA = pipelined raw kernel default ON, VK = pipeline
+opt-in pending the WIP hang fix):
+
+### enwik8 (100 MB)
+| Lvl | CUDA kern / e2e | VK kern (2026-06-10 wave) | VK/CUDA kern |
+|-----|-----------------|---------------------------|--------------|
+| L1  | 1.93 / 14.57    | ~4.6 (pre-#15 single-warp) | ~2.4x (pipeline pending) |
+| L2  | 1.97 / 14.52    | —                         | — |
+| L3  | 3.49 / 15.12    | —                         | — |
+| L4  | 3.42 / 15.08    | —                         | — |
+| L5  | 3.31 / 14.64    | 4.4 (D2D cell, post-#2)   | 1.33x |
+
+### enwik9 (1 GB)
+| Lvl | CUDA kern | VK kern | VK/CUDA |
+|-----|-----------|---------|---------|
+| L1  | 17.2 (58.2 GB/s) | 21.2 (post-#2, single-warp) | 1.23x |
+| L3  | (post-#2) 29.5-region | 42.9 (post-#10) | — |
+| L5  | 29.5      | 35.5 (post-#5) | 1.20x |
+
+### CUDA D2D async wall (fresh streamlz_gpu.dll — see the stale-DLL
+note in the v4 #15 commit)
+| Lvl | wall | vs nvCOMP |
+|-----|------|-----------|
+| L1  | 3.27 | 1.46x (LZ4 4.77) |
+| L5  | 4.80 | 1.30x (Zstd 6.25) |
+
+NOTE: the VK column is sparse because the VK #15 mirror is WIP (the
+pipelined kernel TDRs at multi-workgroup scale — bisected to the
+parse/broadcast block; tracked in the v4 #15 entry). A full 60-cell
+re-sweep belongs after that lands; these are the spot measurements
+from the v4 wave's gates. The Phase 5 small-file (web.txt) gap and
+encode tables have NOT been re-measured.
