@@ -31,108 +31,107 @@ wire-format assembly.
 
 ## Source layout (CUDA tree)
 
-### Top level
+The shape first, details below.
 
-| Path | Purpose |
-|---|---|
-| `build.zig` | Zig 0.16 build script. Steps: `install` / `run` / `test`+`ptest` / `gpulib` / `ptx` / `srcvk-shaders` / `streamlz_vk` / `ptest_vk` / `fuzz` / `stress18` / `chaincount` / `tans_gate2` |
-| `include/streamlz_gpu.h` | C ABI public header |
-| `srcVK/` | Vulkan backend (its own canon: see `srcVK/README.md`) |
-| `docs/` | GPU_ARCHITECTURE (incl. kernel inventory), nvcomp_lz4_architecture, how_to_debug_cuda, cudaOptimize (incl. vs-nvCOMP methodology), ngram |
-| `v4_ideas.md` | THE forward-looking work list |
-| `FAILED_EXPERIMENTS.md` | Negative results (do not re-run these) |
+```text
+Compressor_GPU/
+├── build.zig                  build script (all steps)
+├── include/streamlz_gpu.h     C ABI header
+├── src/
+│   ├── main.zig, cli.zig, cli/      CLI
+│   ├── streamlz_gpu.zig             C ABI impl (streamlz_gpu.dll)
+│   ├── common/                      shared CUDA headers
+│   ├── format/                      host-side wire format
+│   ├── encode/                      encode driver + kernels (.zig/.cu/.cuh/.ptx)
+│   ├── decode/                      decode driver + kernels (.zig/.cu/.cuh/.ptx)
+│   └── *_tests.zig, test_runner_parallel.zig, stress18_main.zig,
+│       chain_count_main.zig         tests + measurement mains
+├── srcVK/                     Vulkan backend (own canon: srcVK/README.md)
+├── tools/                     bench/profile/fuzz/measurement harnesses
+├── docs/                      architecture + tooling notes
+├── v4_ideas.md                THE forward-looking work list
+└── FAILED_EXPERIMENTS.md      negative results (do not re-run)
+```
 
 ### `src/` core
 
 | File | Purpose |
 |---|---|
 | `main.zig` | Entry point + test aggregation block |
-| `cli.zig`, `cli/` | CLI mode dispatcher + per-mode handlers: `util.zig` (args), compress, decompress, info, bench_compress (`-b`), bench_decompress (`-db`), bench_all (`-ba`) |
-| `streamlz_gpu.zig` | C ABI implementation (root of `streamlz_gpu.dll`) |
-| `c_abi_tests.zig` | C ABI tests via extern-fn binding shape |
-| `cli_smoke_tests.zig` | Subprocess CLI tests (spawn `streamlz.exe`) |
-| `test_runner_parallel.zig` | Parallel test runner; prints SKIP names |
-| `stress18_main.zig` | v4 #18 in-process roundtrip stress harness |
-| `chain_count_main.zig` | v4 #14 chain-parser instrumentation readback |
-| `version.zig`, `mmap.zig` | Misc |
+| `cli.zig`, `cli/` | Mode dispatcher + handlers: compress, decompress, info, `-b`, `-db`, `-ba` |
+| `streamlz_gpu.zig` | C ABI implementation |
+| `c_abi_tests.zig` | C ABI tests (extern-fn binding shape) |
+| `cli_smoke_tests.zig` | Subprocess CLI tests |
+| `test_runner_parallel.zig` | Parallel runner; prints SKIP names |
+| `stress18_main.zig` | v4 #18 roundtrip stress harness |
+| `chain_count_main.zig` | v4 #14 chain-parser readback |
 
-### `src/common/` (shared CUDA headers, `#include`'d by kernels)
+### `src/common/`
 
 | File | Purpose |
 |---|---|
 | `gpu_warp.cuh` | Warp/lane geometry + `SLZ_GUARD_SINGLE_THREAD` |
 | `gpu_byteio.cuh` | Endian load/store primitives |
 | `gpu_huffman.cuh` | Canonical-Huffman wire constants |
-| `gpu_wire_format.cuh` | Encode/decode shared LZ wire constants |
-| `xxh32_device.cuh` | Device XXH32 + the chunk-Merkle hash kernel bodies (v4 #19; included by BOTH `lz_kernel.cu` TUs) |
+| `gpu_wire_format.cuh` | Shared LZ wire constants |
+| `xxh32_device.cuh` | Device XXH32 + chunk-Merkle kernel bodies (v4 #19; in BOTH `lz_kernel.cu` TUs) |
 
-### `src/format/` (host-side wire format)
+### `src/format/`
 
 | File | Purpose |
 |---|---|
-| `frame_format.zig` | Frame header parse/write, flags, trailers |
+| `frame_format.zig` | Frame header, flags, trailers |
 | `block_header.zig` | Block + internal-block headers |
-| `streamlz_constants.zig` | Wire constants (host side of the sync pair) |
-| `xxhash32.zig` | XXH32 + the chunk-Merkle root (host mirror of the device definition; threaded fallback) |
+| `streamlz_constants.zig` | Wire constants (host side) |
+| `xxhash32.zig` | XXH32 + chunk-Merkle root (host mirror; threaded fallback) |
 
 ### `src/encode/`
 
 | File | Purpose |
 |---|---|
-| `streamlz_encoder.zig` | Public encode API (`compressFramed`, `compressBound`) |
-| `fast_framed.zig` | L1-L5 frame builder; orchestrates the kernels |
-| `enc_phase.zig` | `SLZ_PROFILE_PHASES=1` per-phase QPC profiler |
-| `driver.zig` | Facade |
-| `cuda_ffi.zig` | `nvcuda.dll` handle + `cu*_fn` slots (encode side) |
-| `module_loader.zig` | PTX load + kernel handles (SRWLOCK-guarded init) |
+| `streamlz_encoder.zig` | Public API: `compressFramed`, `compressBound` |
+| `fast_framed.zig` | L1-L5 frame builder; kernel orchestration |
+| `enc_phase.zig` | `SLZ_PROFILE_PHASES=1` phase profiler |
+| `driver.zig`, `cuda_ffi.zig`, `module_loader.zig` | Facade, driver FFI, PTX load |
 | `encode_context.zig` | `EncodeContext` + persistent device buffers |
-| `encode_lz.zig` | `gpuCompressImpl` (A-023 VRAM-budgeted batching; v4 #17 pinned gather; v4 #19 hash launches) |
-| `encode_huff.zig` | Per-stream Huffman launchers (L3+) |
+| `encode_lz.zig` | `gpuCompressImpl` (A-023 batching, #17 pinned gather, #19 hashing) |
+| `encode_huff.zig` | Huffman launchers (L3+) |
 | `encode_assemble.zig` | Measure/write + frame-assemble launchers |
-| `levels.zig` | `hashBitsForLevel` (17 at EVERY level), `useChainParser` |
-| `lz_kernel.cu` | LZ encode aggregator TU |
-| `huffman_kernel.cu` | Huffman encode kernels TU |
-| `assemble_kernel.cu` | Wire assembly kernels TU |
-| `lz_format.cuh`, `lz_chain_parser.cuh`, `lz_greedy_parser.cuh`, `lz_token_emit.cuh` | Kernel implementation headers |
-
-Encode-side tests: `gpu_roundtrip_tests.zig` (roundtrips + the shared
-GPU-test lock: `lockGpuTests` serializes + binds the CUDA context to
-the worker thread; also the v4 #18 mismatch-artifact capture),
-`gpu_regression_tests.zig` (A-023 forced-batch + real-corpus cases),
-`huff_conformance_tests.zig` (4-kernel Huffman chain, byte-identity),
-`l5_hardening_tests.zig` (chain-parser adversarial patterns).
+| `levels.zig` | Level policy (`hashBitsForLevel` = 17 everywhere) |
+| `lz_kernel.cu`, `huffman_kernel.cu`, `assemble_kernel.cu` | Kernel TUs |
+| `lz_*.cuh` | Parser/format/emit kernel headers |
+| `gpu_roundtrip_tests.zig` | Roundtrips, GPU-test lock, #18 artifact capture |
+| `gpu_regression_tests.zig`, `huff_conformance_tests.zig`, `l5_hardening_tests.zig` | Regression, conformance, adversarial |
 
 ### `src/decode/`
 
 | File | Purpose |
 |---|---|
-| `streamlz_decoder.zig` | Public decode API + CPU frame walk (host path) + checksum verification |
-| `driver.zig` | Facade (deviceName, `bindContextToCallingThread`) |
-| `cuda_api.zig` | `nvcuda.dll` handle + `cu*_fn` slots + QPC helpers |
-| `module_loader.zig` | PTX load + kernel handles + device-name cache |
-| `descriptors.zig` | `ChunkDesc` + `GpuError` + `walk_meta_offsets` |
+| `streamlz_decoder.zig` | Public API + host frame walk + checksum verify |
+| `driver.zig`, `cuda_api.zig`, `module_loader.zig` | Facade, driver FFI, PTX load |
+| `descriptors.zig` | `ChunkDesc`, `GpuError`, walk meta |
 | `decode_context.zig` | `DecodeContext` + `ensureDeviceBuf` + profiling |
-| `decode_dispatch.zig` | `fullGpuLaunchImpl` + huff/LZ/verify kernel launches |
-| `scan_host.zig`, `scan_gpu.zig` | CPU walk fallback; GPU walk + fused compact dispatch |
-| `lz_kernel.cu` | LZ decode aggregator TU |
-| `huffman_kernel.cu` | LUT build + 32-stream Huffman decode TU |
-| `lz_decode_*.cuh`, `lz_decode_raw_pipeline.cuh`, `lz_dispatch.cuh`, `lz_header_parse.cuh`, `slz_wire_format.cuh` | Decode kernel implementation headers (incl. the v4 #15 K=4 pipeline) |
-| `walk_frame_kernel.cuh`, `prefix_sum_chunks_kernel.cuh`, `scan_parse_kernel.cuh`, `compact_descs_kernels.cuh`, `merge_huff_descs_kernel.cuh`, `gather_raw_off16_kernel.cuh` | Orchestration kernels (incl. fused `slzCompactAllDescsKernel` and `slzMergeHuffDescsParKernel`) |
+| `decode_dispatch.zig` | `fullGpuLaunchImpl`: huff/LZ/verify launches |
+| `scan_host.zig`, `scan_gpu.zig` | CPU walk fallback; GPU walk + fused compact |
+| `lz_kernel.cu`, `huffman_kernel.cu` | Kernel TUs |
+| `lz_decode_*.cuh` (incl. `lz_decode_raw_pipeline.cuh`) | Decode cores incl. the v4 #15 K=4 pipeline |
+| `lz_dispatch.cuh`, `lz_header_parse.cuh`, `slz_wire_format.cuh` | Dispatch + header parse |
+| `walk/prefix_sum/scan_parse/compact/merge/gather *.cuh` | Orchestration kernels (fused compact, parallel merge) |
 
-Committed `*.ptx` kernel images sit beside the `.cu` files and are
+Committed `*.ptx` images sit beside the `.cu` files and are
 `@embedFile`'d, so plain `zig build` needs no CUDA toolchain.
 
 ### `tools/`
 
 | Path | Purpose |
 |---|---|
-| `build_gpu.bat` | Full nvcc rebuild + cuobjdump res-usage |
-| `sanitize.bat` | compute-sanitizer gate (memcheck/racecheck) |
-| `bench_all.bat`, `bench_d2d.bat`, `build_d2d_bench.bat`, `slz_gpu_*.c` | Bench harnesses (host + device-resident C ABI) |
-| `ncu_profile_lz.bat` | NCU profile of the LZ decode kernels (admin shell) |
-| `huff_test/` | Standalone Huffman/tANS kernel harness |
-| `tans_gate2/` | v4 #11 gate-2 measurement (resurrected host tANS encoder) |
-| `fuzz_frames.zig` | v4 #13 differential frame-mutation fuzzer |
+| `build_gpu.bat` | Full nvcc rebuild + res-usage |
+| `sanitize.bat` | compute-sanitizer gate |
+| `bench_all.bat`, `bench_d2d.bat`, `build_d2d_bench.bat`, `slz_gpu_*.c` | Bench harnesses |
+| `ncu_profile_lz.bat` | NCU profile (admin shell) |
+| `huff_test/` | Huffman/tANS kernel harness |
+| `tans_gate2/` | v4 #11 measurement (host tANS replay) |
+| `fuzz_frames.zig` | v4 #13 differential fuzzer |
 
 
 ## Public APIs
