@@ -916,7 +916,9 @@ attribution is uneconomical. INSTRUMENTED instead: the roundtrip
 test now self-captures evidence on the next occurrence —
 `v18_mismatch_<label>.frame/.out` written at the failure site for
 offline replay (`streamlz -d` the frame, diff the out). STATUS: open
-but armed; revisit immediately when an artifact appears. Suspect
+but armed; revisit immediately when an artifact appears. 15-min
+surveillance campaign same evening: 147 more suite runs, 0 failures
+(~180 total today, 1 hit) - true rate < 1-in-180 per suite run. Suspect
 ranking unchanged (K=4 pipeline serial/prime boundary), mitigation
 SLZ_NO_PIPELINE=1.
 
