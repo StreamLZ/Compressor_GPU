@@ -114,7 +114,7 @@ backends, Intel iGPU decode L1+L5 SHA MATCH + cross-device encode
 byte-identity. Next decode lever is structural: #15 (multi-warp) or
 #8 (wire format).
 
-## 3. Measure, then maybe parallelize, long-token parsing
+## 3. Measure, then maybe parallelize, long-token parsing — ❌ MEASURED 2026-06-10, parked (long tokens 0.16-0.38% of tokens; truncation fix already captured the win)
 
 **What**: `db1e061` stopped one long token from serializing the 32
 short tokens ahead of it (PP-prefix truncation), but each long token
@@ -675,7 +675,7 @@ that belongs with the #8 wire-format era, not an optimization of the
 current parser. L5 encode stays ~390 MB/s by design (users choosing
 L5 chose ratio); L1-L4 encode is already 1.0-1.3 GB/s post-#17.
 
-## 15. Multi-warp-per-chunk LZ decode — ✅ DONE 2026-06-11: 2-warp pipeline, default ON
+## 15. Multi-warp-per-chunk LZ decode — ✅ DONE 2026-06-11: K=4 parser+copier-team pipeline, default ON ALL levels (CUDA); VK = A-028 accepted divergence
 
 (Merged from the retired docs/GPU_IDEAS.md idea 3.)
 
@@ -966,7 +966,7 @@ flipping any checksum default must land on BOTH backends in one
 commit or the cross-backend SHA gate fails by construction (the
 trailer changes frame bytes).
 
-## 19. Chunk-Merkle content checksum — ✅ DONE 2026-06-11 (v1, both backends, default ON)
+## 19. Chunk-Merkle content checksum — ✅ DONE 2026-06-11, DEVICE-ONLY (hierarchical 1KB segs, all kernels on-GPU both directions, default ON, ~zero cost)
 
 **What (user-designed)**: per-chunk XXH32s of the decompressed
 content, concatenated in chunk-index order, hashed again → ONE u32
