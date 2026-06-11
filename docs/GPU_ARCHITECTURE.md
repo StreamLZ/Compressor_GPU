@@ -50,15 +50,26 @@ mechanical work of making it actually fast.
 The codec settles on a few mapping decisions and applies them
 consistently.
 
-One chunk is one warp. A chunk holds at most 256 KB of decompressed
-output, partitioned into one or more sub-chunks of at most 128 KB
-each (default 64 KB). The warp owns the chunk end to end. There is no
-cross-warp coordination during the decode loop.
+One chunk is one CUDA block (since v4 #15, 2026-06-11). A chunk
+holds at most 256 KB of decompressed output, partitioned into one or
+more sub-chunks of at most 128 KB each (default 64 KB). The block's
+four warps cooperate on that one chunk with fixed roles: warp 0 (the
+parser) runs the token-parse scans and stages each 32-token batch's
+prefix sums into a shared-memory double buffer, while warps 1-3 (the
+copier team, 96 lanes) execute the staged batch's copies one batch
+behind. The parser can run ahead because its state advancement comes
+entirely from the warp scans, never from the copies — so its global
+reads (cmd bytes, off16 entries) hide under the team's global
+writes. See "The K=4 pipelined decode" section below for the
+synchronization rules and measured results.
 
-Two warps are packed into one CUDA block (`WARPS_PER_BLOCK = 2`). The
-two warps in a block do not cooperate; they decode independent
-chunks. Packing two of them together amortizes the per-block launch
-and scheduling overhead, but each is doing its own thing.
+The pre-#15 model — one chunk per warp, two non-cooperating warps
+packed per block (`WARPS_PER_BLOCK = 2`) purely to amortize launch
+overhead — survives in `slzLzDecodeKernel` / `slzLzDecodeRawKernel`,
+the fallback when `SLZ_NO_PIPELINE=1` is set or the pipelined
+symbols are missing. Everything in "Inside the decode loop" below
+describes per-batch work that is identical in both models; only who
+executes which phase changed.
 
 For Huffman decoding, the encoder has already split the input into
 32 sub-streams so the decoder can run all 32 lanes in parallel.
@@ -104,7 +115,9 @@ next kernel's grid.
    slzHuffBuildLutKernel  ->  slzHuffDecode4StreamKernel
             |
             v
-   slzLzDecodeKernel  (or slzLzDecodeRawKernel for L1/L2)
+   slzLzDecodeGeneralPipelinedKernel
+   (or slzLzDecodeRawPipelinedKernel for L1/L2;
+    slzLzDecode[Raw]Kernel under SLZ_NO_PIPELINE=1)
 ```
 
 The walk kernel parses the frame header on the device and emits a
@@ -223,6 +236,68 @@ the same SASS that hand-inlined loops would produce. After the
 extraction, both the LZ decode kernel and the LZ raw kernel had
 exactly the same register and stack usage they had before, confirming
 that the extraction was purely a readability change.
+
+## The K=4 pipelined decode (v4 #15)
+
+The single-warp decode loop alternates between parsing a 32-token
+batch (global reads of cmd/off16 bytes feeding warp scans) and
+copying that batch's output (global reads/writes of literal and
+match bytes). After the flat batched copies (v4 #1/#2) collapsed the
+copy phase's instruction count, NCU showed the kernel at 52.7% SM
+throughput with `long_scoreboard` (memory latency) as the dominant
+stall: the warp simply waits on its own loads. The fix is
+structural — split the two phases across warps so one phase's
+latency hides under the other's.
+
+`slzLzDecodeRawPipelinedKernel` / `slzLzDecodeGeneralPipelinedKernel`
+give each chunk a 128-thread block (`blockDim (32,4)`, 12 blocks/SM):
+
+* Warp 0 (parser) runs `fillBatch` — the same PP scans as the
+  single-warp loop — and stages each batch's prefix sums, match
+  data, and dependent-match ballot into a `PipeBatch` shared-memory
+  double buffer. Its state advancement (cmd/lit/off16/dst positions,
+  recent offset) comes entirely from the scans, so it never waits on
+  output bytes.
+* Warps 1-3 (the copier team, 96 lanes) execute the staged batch one
+  behind the parser: the flat-literal and flat-independent-match
+  passes as two team-wide loops (no barrier between them — the
+  independent-match reads touch only pre-batch-final bytes, and the
+  write ranges are disjoint), then warp 1 alone runs the dependent
+  matches in token order.
+* The slot handoff is ONE `__syncthreads()` per batch, with per-slot
+  staged flags. The team's internal phase order uses hardware named
+  barrier 1 via `__barrier_sync_count(1, 96)`, so the parser never
+  participates in a mid-batch sync.
+* Serial long tokens drain the pipeline, execute cooperatively on
+  all warps, and re-prime. In the general kernel, sub-chunks with
+  off32 entries or exotic modes fall back to the warp-level
+  `decodeSubChunkGeneral` on warp 0 inside the kernel.
+
+Synchronization rules this design is built on (each one measured,
+see FAILED_EXPERIMENTS.md "mbarrier pipeline ring"):
+
+* `__syncthreads` beats mbarrier at this cadence: a `cuda::pipeline`
+  producer/consumer ring measured 2.18-2.64 ms vs 1.90 ms on enwik8
+  L1. Four mbarrier ops per ~150 ns batch cost more than one
+  hardware `BAR.SYNC`; the barrier stall is mostly the inherent wait
+  for the slower side, which only width rebalancing removes.
+* Named barriers must use the `__barrier_sync_count` intrinsic, not
+  inline-asm `bar.sync` (the `asm volatile` is an optimizer wall in
+  the hot loop; +0.8 ms measured).
+* Warp counts per block must be a power of two: K=3 (96-thread
+  blocks) packs unevenly on the SM's four schedulers and measured
+  19.0 ms vs 16.2 at 1 GB.
+* Raw spin-waits between warps deadlock — NVIDIA's warp scheduler
+  has no fairness guarantee.
+
+Results (RTX 4060 Ti): enwik8 L1 2.28 → 1.77 ms, enwik9 L1
+20.9 → 16.2 ms (61.7 GB/s, 2.03× nvCOMP LZ4); enwik8 L5
+3.31 → 2.93 ms, enwik9 L5 29.5 → 26.3 ms (1.93× nvCOMP Zstd). NCU
+after: 71.9% SM and 71.9% memory throughput moving in lockstep —
+balanced saturation — with the residual barrier stall (8.2) being
+the lockstep tax. One trade: parser count per SM halves vs the old
+packing, so parser-bound corpora pay slightly at L1 (silesia
+3.87 → 4.05 ms); at L3+ even silesia wins.
 
 ## Why the header parser is marked `__noinline__`
 
@@ -773,8 +848,10 @@ symbols carry the `slz` prefix.
 | encode | `slzAssembleMeasureKernel` | `encode/assemble_kernel.cu` |
 | encode | `slzAssembleWriteKernel` | `encode/assemble_kernel.cu` |
 | encode | `slzFrameAssembleKernel` | `encode/assemble_kernel.cu` |
-| decode | `slzLzDecodeKernel` | `decode/lz_kernel.cu` |
-| decode | `slzLzDecodeRawKernel` | `decode/lz_kernel.cu` |
+| decode | `slzLzDecodeGeneralPipelinedKernel` (hot path: K=4 pipeline, L3+) | `decode/lz_kernel.cu` |
+| decode | `slzLzDecodeRawPipelinedKernel` (hot path: K=4 pipeline, L1/L2) | `decode/lz_kernel.cu` |
+| decode | `slzLzDecodeKernel` (fallback: SLZ_NO_PIPELINE) | `decode/lz_kernel.cu` |
+| decode | `slzLzDecodeRawKernel` (fallback: SLZ_NO_PIPELINE) | `decode/lz_kernel.cu` |
 | decode | `slzWalkFrameKernel` | `decode/lz_kernel.cu` |
 | decode | `slzPrefixSumChunksKernel` | `decode/lz_kernel.cu` |
 | decode | `slzScanParseKernel` | `decode/lz_kernel.cu` |
