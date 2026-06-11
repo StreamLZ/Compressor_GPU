@@ -29,39 +29,45 @@ wire-format assembly.
 
 ---
 
-## Source layout (CUDA tree)
+## Repository layout
 
-- `build.zig` - build script; steps: `install`, `run`, `test`/`ptest`, `gpulib`, `ptx`, `srcvk-shaders`, `streamlz_vk`, `ptest_vk`, `fuzz`, `stress18`, `chaincount`, `tans_gate2`
-- `include/streamlz_gpu.h` - C ABI public header
+Two sibling backends live side by side; everything else serves them.
+
+- `src/` - the CUDA backend (this wiki's subject; detailed below)
+- `srcVK/` - the Vulkan backend, with its own docs (`srcVK/README.md`)
+- `include/streamlz_gpu.h` - C ABI public header (shared by both backends)
+- `build.zig` - builds everything; steps: `install`, `run`, `test`/`ptest`, `gpulib`, `ptx`, `srcvk-shaders`, `streamlz_vk`, `ptest_vk`, plus tool builds (`fuzz`, `stress18`, `chaincount`, `tans_gate2`)
+- `tools/` - bench, sanitize, profile, and fuzz harnesses
+- `docs/` - architecture + CUDA tooling notes
 - `v4_ideas.md` - THE forward-looking work list
 - `FAILED_EXPERIMENTS.md` - negative results; do not re-run these
-- `srcVK/` - Vulkan backend, its own canon (see `srcVK/README.md`)
-- `docs/` - GPU_ARCHITECTURE (incl. kernel inventory), how_to_debug_cuda, cudaOptimize, nvcomp_lz4_architecture, ngram
 
-### `src/`
+## CUDA backend: `src/` in detail
 
-- `main.zig` - entry point + test aggregation block
+Top-level files:
+
+- `main.zig` - CLI entry point + test aggregation block
 - `cli.zig` + `cli/` - mode dispatcher + handlers (compress, decompress, info, `-b`, `-db`, `-ba`)
 - `streamlz_gpu.zig` - C ABI implementation (root of `streamlz_gpu.dll`)
 - `c_abi_tests.zig`, `cli_smoke_tests.zig`, `test_runner_parallel.zig` - C ABI tests, subprocess CLI tests, parallel runner
 - `stress18_main.zig`, `chain_count_main.zig` - v4 #18 stress harness, v4 #14 instrumentation readback
 - `version.zig`, `mmap.zig`
 
-### `src/common/` - shared CUDA headers
+`src/common/` - CUDA headers shared by the encode and decode kernels:
 
 - `gpu_warp.cuh` - warp/lane geometry + `SLZ_GUARD_SINGLE_THREAD`
 - `gpu_byteio.cuh` - endian load/store primitives
 - `gpu_huffman.cuh`, `gpu_wire_format.cuh` - wire constants (device side)
 - `xxh32_device.cuh` - device XXH32 + chunk-Merkle kernel bodies (v4 #19; included by BOTH `lz_kernel.cu` TUs)
 
-### `src/format/` - host-side wire format
+`src/format/` - host-side wire format:
 
 - `frame_format.zig` - frame header, flags, trailers
 - `block_header.zig` - block + internal-block headers
 - `streamlz_constants.zig` - wire constants (host side)
 - `xxhash32.zig` - XXH32 + chunk-Merkle root (host mirror of the device definition)
 
-### `src/encode/`
+`src/encode/`:
 
 - `streamlz_encoder.zig` - public API: `compressFramed`, `compressBound`
 - `fast_framed.zig` - L1-L5 frame builder; orchestrates everything below
@@ -74,19 +80,19 @@ wire-format assembly.
 - `lz_kernel.cu`, `huffman_kernel.cu`, `assemble_kernel.cu` + `lz_*.cuh` - kernel TUs and their headers
 - tests: `gpu_roundtrip_tests.zig` (roundtrips, GPU-test lock, #18 capture), `gpu_regression_tests.zig`, `huff_conformance_tests.zig`, `l5_hardening_tests.zig`
 
-### `src/decode/`
+`src/decode/`:
 
 - `streamlz_decoder.zig` - public API + host frame walk + checksum verify
 - `driver.zig`, `cuda_api.zig`, `module_loader.zig` - facade, driver FFI, PTX load
 - `descriptors.zig`, `decode_context.zig` - `ChunkDesc`/errors, context + device buffers
 - `decode_dispatch.zig` - `fullGpuLaunchImpl`: huff/LZ/verify launches
 - `scan_host.zig`, `scan_gpu.zig` - CPU walk fallback; GPU walk + fused compact
-- `lz_kernel.cu`, `huffman_kernel.cu` + `lz_decode_*.cuh` (incl. the #15 K=4 pipeline), `lz_dispatch.cuh`, `lz_header_parse.cuh`, `slz_wire_format.cuh`, and the orchestration `*_kernel.cuh` files - kernel TUs and their headers
+- `lz_kernel.cu`, `huffman_kernel.cu` + `lz_decode_*.cuh` (incl. the #15 K=4 pipeline) and the orchestration `*_kernel.cuh` files - kernel TUs and their headers
 
 Committed `*.ptx` images sit beside the `.cu` files and are
 `@embedFile`'d, so plain `zig build` needs no CUDA toolchain.
 
-### `tools/`
+`tools/`:
 
 - `build_gpu.bat` - full nvcc rebuild + cuobjdump res-usage
 - `sanitize.bat` - compute-sanitizer gate (memcheck/racecheck)
