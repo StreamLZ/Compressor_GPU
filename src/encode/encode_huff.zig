@@ -14,6 +14,46 @@ const gpu_decode = @import("../decode/driver.zig");
 const CUdeviceptr = cuda_ffi.CUdeviceptr;
 const EncodeContext = encode_context.EncodeContext;
 const HuffEncDesc = encode_context.HuffEncDesc;
+
+// ── v4 #11 gate-2 measurement hook ───────────────────────────────
+// When SLZ_TANS_GATE2_DUMP=<path> is set, append one binary record
+// per non-empty entropy plane: "TG2R" u32 | plane u8 (0=lit 1=tok
+// 2=off16hi 3=off16lo) | raw_len u32 | huff_wire_len u32 | raw bytes
+// (de-strided). tools/tans_gate2 replays the records through the
+// resurrected host tANS encoder to get REAL per-chunk tANS sizes vs
+// the exact production Huffman sizes. Measurement-only: zero cost
+// when the env var is unset; libc append-mode I/O so no std.Io
+// plumbing is needed in these fns.
+fn dumpGate2Records(
+    output: []const u8,
+    descs: []const HuffEncDesc,
+    sizes: []const u32,
+    plane: u8,
+) void {
+    const path = std.c.getenv("SLZ_TANS_GATE2_DUMP") orelse return;
+    const f = std.c.fopen(path, "ab") orelse return;
+    defer _ = std.c.fclose(f);
+    var destride_buf: [65536 * 2]u8 = undefined;
+    for (descs, 0..) |d, i| {
+        if (d.src_size == 0) continue;
+        var raw: []const u8 = undefined;
+        if (d.src_stride == 1) {
+            raw = output[d.src_offset..][0..d.src_size];
+        } else {
+            var k: usize = 0;
+            while (k < d.src_size) : (k += 1)
+                destride_buf[k] = output[d.src_offset + k * d.src_stride];
+            raw = destride_buf[0..d.src_size];
+        }
+        var hdr: [13]u8 = undefined;
+        std.mem.writeInt(u32, hdr[0..4], 0x52324754, .little); // "TG2R"
+        hdr[4] = plane;
+        std.mem.writeInt(u32, hdr[5..9], @intCast(raw.len), .little);
+        std.mem.writeInt(u32, hdr[9..13], sizes[i], .little);
+        _ = std.c.fwrite(&hdr, 1, hdr.len, f);
+        _ = std.c.fwrite(raw.ptr, 1, raw.len, f);
+    }
+}
 const CompressChunkDesc = encode_context.CompressChunkDesc;
 
 // Per-block dst capacity fixed component for the BIL Huffman encoder.
@@ -347,6 +387,8 @@ pub fn gpuEncodeOff16HuffImpl(
     };
     @memcpy(hi_sizes, all_sizes[0..n]);
     @memcpy(lo_sizes, all_sizes[n..]);
+    dumpGate2Records(output, descs[0..n], hi_sizes, 2);
+    dumpGate2Records(output, descs[n..], lo_sizes, 3);
     allocator.free(all_sizes);
 
     // No-clobber assert: catch a double-encode-without-free at the
@@ -452,10 +494,15 @@ fn encodeByteStreamHuff(
         total += dst_cap;
     }
 
-    return encodeStreamAndPublish(
+    const ok = encodeStreamAndPublish(
         self, allocator, descs, offsets, total,
         d_out, d_out_size, out_sizes_field, out_offsets_field, profile_names,
     );
+    if (ok) {
+        if (out_sizes_field.*) |sz|
+            dumpGate2Records(output, descs, sz, if (which == .lit) 0 else 1);
+    }
+    return ok;
 }
 
 /// Entropy-codes each sub-chunk's literal stream. Populates `huff_lit_*`.

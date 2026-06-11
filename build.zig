@@ -76,6 +76,16 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(fuzz_exe);
     b.step("fuzz", "Build the v4 #13 frame-mutation fuzz harness").dependOn(&b.addInstallArtifact(fuzz_exe, .{}).step);
 
+    // v4 #11 gate-2: replay SLZ_TANS_GATE2_DUMP records through the
+    // resurrected host tANS-32 encoder (measurement-only, host-only).
+    const gate2_module = b.createModule(.{
+        .root_source_file = b.path("tools/tans_gate2/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const gate2_exe = b.addExecutable(.{ .name = "tans_gate2", .root_module = gate2_module });
+    b.step("tans_gate2", "Build the v4 #11 gate-2 tANS-vs-Huffman measurement tool").dependOn(&b.addInstallArtifact(gate2_exe, .{}).step);
+
     // ── Unit tests ───────────────────────────────────────────────────────
     const test_runner = b.addTest(.{
         .root_module = cli_module,

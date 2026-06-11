@@ -92,6 +92,19 @@ Wire format unchanged from 2026-06-09; all frames byte-identical.
   Verified: ptest_vk 150/9/0, enwik9 1 GB L3+L5 SHA MATCH, D2D sweep
   all-verified, Intel iGPU L5 SHA MATCH (BDA on both vendors);
   enwik9 L5 kernels 35.7 -> 35.5 ms.
+- **v4 #11 (per-chunk Huffman-vs-tANS selector) measured and PARKED
+  definitively**: gate-2 replaced gate-1's estimates with REAL wire
+  sizes on both sides - the retired host tANS encoder resurrected as
+  a measurement tool (tools/tans_gate2, zig build tans_gate2) fed by
+  a new env-gated per-plane dump hook in encode_huff.zig
+  (SLZ_TANS_GATE2_DUMP). Selector value: enwik8 L5 0.008 pp, enwik9
+  L5 0.021 pp of end ratio - 5-10x below the build bar. The gate-1
+  "tANS wins 53% of chunks" signal was Huffman-estimate error (the
+  idealized+64B model overestimated real BIL huff by 0.8%; the two
+  gates' tANS totals agree within 0.08%). The off16-plane upside is
+  rejected: hi near-random, lo's huff form expands vs raw. Tooling
+  stays in-tree; re-measure takes ~10 min if a skewed-entropy corpus
+  class ever appears.
 - **Encode wall: vestigial L1/L2 payload gather removed on BOTH
   backends + CUDA L3+ gather goes async/pinned** (v4 #17): phase
   profiling showed ~17 ms of per-chunk synchronous pageable D2H in

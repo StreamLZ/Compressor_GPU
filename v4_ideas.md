@@ -328,7 +328,7 @@ SHA MATCH at 1 GB; ptest_vk 150/9/0. The residual ~1.26× lives in
 kernel_fn itself (the LZ workhorse) per the A-021 attribution note —
 that's #1/#2/#15 territory, not more fusion.
 
-## 11. Per-chunk adaptive entropy: Huffman vs tANS, pick the smaller
+## 11. Per-chunk adaptive entropy: Huffman vs tANS — ❌ PARKED 2026-06-11: gate-2 measured 0.008-0.021 pp (real wire sizes both sides); gate-1 signal was huff-estimate error
 
 **The idea (2026-06-10)**: at encode time, decide PER CHUNK whether
 the entropy body is Huffman or tANS, and emit whichever is smaller
@@ -483,6 +483,36 @@ per port-means-port). Wire format: re-introduce a tANS chunk type
 (fresh tag; do NOT resurrect the retired 1/5/6/7 forms). The paired
 combined-body trick (old types 5/7) is a real header-amortization
 idea worth re-evaluating once the basic selector ships.
+**Gate 2 — MEASURED 2026-06-11, PARKED DEFINITIVELY.** The
+prerequisite tooling was built and stays in-tree for reuse: the
+retired host tANS encoder resurrected as a measurement tool
+(`tools/tans_gate2/`, from `git show 8982fee^`, with a 3-constant
+stub for the retired constants file), an env-gated per-plane dump
+hook in encode_huff.zig (`SLZ_TANS_GATE2_DUMP=<path>` appends
+plane/raw/huff-wire-size records for all four planes, de-strided),
+and a `zig build tans_gate2` replay driver. REAL wire sizes on both
+sides this time. Results (L5, per-chunk min(huff, tans)):
+- enwik8: selector saves 3,049 bytes = **0.008 pp** of end ratio
+  (lit flips 19.8%, tok 0%, off16hi 4.8%, off16lo 0%).
+- enwik9: saves 73,554 bytes = **0.021 pp** (lit 33.3%, tok 0%,
+  off16hi 6.3%, off16lo 0%).
+- The off16 upside hoped for in the gate-1 note is REJECTED: hi is
+  near-random already (tANS ~0.01%), lo's huff form EXPANDS vs raw
+  (production already picks raw there).
+**Gate-1 reconciliation (the 0.54%/53%-flips signal was estimate
+error):** gate-2's tANS totals match gate-1's within 0.08% (20.90
+vs 20.89 MB on e8 lit+tok — the two tANS container formats cost the
+same), but gate-1's Huffman side (idealized canonical bit-counts
++ flat 64 B/chunk padding) OVERESTIMATED real BIL huff by 0.8%.
+With real sizes, huff-only BEATS tans-only overall (e8 lit+tok
+20.79 vs 20.90 MB) and the selector residue is ~0.01-0.02 pp.
+VERDICT: 0.021 pp at 1 GB is 5-10x below the build bar — the
+selector cannot pay for a new chunk type, a second predecode batch,
+a host tANS encoder in the encode path, and a full VK mirror. PARK
+unless a future corpus class shows radically more skewed entropy
+planes; the measurement now takes ~10 minutes end-to-end with the
+in-tree tooling (dump env var -> tans_gate2 replay).
+
 
 ## 12. Small-items basket (carried from the retired todo.md deferrals)
 
