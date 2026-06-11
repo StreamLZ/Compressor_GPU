@@ -986,3 +986,38 @@ flip at the #18 signature offset 65544 changes the root), ptest_vk
 corruption smoke on BOTH backends (flipped payload byte →
 ChecksumMismatch, exit 1). README e2e tables predate the +2 ms
 verification cost — re-sweep pending (noted there).
+**Device-only rebuild same night (user-directed architecture, f9f01d0).**
+The v1 host hash and the first device attempt (prefix-table upload +
+hash-array readback) were both wrong shapes - the user called it: no
+uploads, no readbacks, device end to end. Final architecture:
+- DECODE: slzScPrefixApplyKernel writes the true chunk-prefix bytes
+  into d_output ON DEVICE (source = the SC tail inside the now-
+  UNSTRIPPED uploaded block - fixes the host-post-pass quirk at the
+  root); slzSegHashKernel (one thread per 1 KiB segment) +
+  slzChunkCombineKernel produce per-chunk hashes;
+  slzMerkleVerdictKernel rolls up and compares against the expected
+  root (launch scalar from the frame tail). Host reads ONE 4-byte
+  verdict. Chain runs on the aux stream overlapped under the
+  finalize D2H (read-read safe) - the ~1.1 ms bandwidth-bound hash
+  pass largely hides.
+- ENCODE: same kernels over d_input; slzMerkleRootWriteKernel writes
+  the trailer DIRECTLY into the device-resident assembled frame
+  (rides the existing final D2H). Async/D2D encode now emits the
+  trailer too (sentinel skip deleted).
+- WIRE (pre-push): chunk hash is TWO-LEVEL - XXH32 of the XXH32s of
+  the chunk's 1024 B segments - because one thread per 64 KiB chunk
+  measured 3.4 ms (the serial XXH32 chain cannot be split; the
+  parallelism must come from the definition). 24k threads -> 1.1 ms,
+  bandwidth-bound. FORMAT.md updated; host fallback identical on
+  both backends.
+- Measured: encode 88 ms (baseline 87), decode e2e 15.6-17 vs 16
+  baseline, D2D kernel window unchanged (1.77 ms).
+- Cross-validation: SHA 5/5 with CUDA roots computed ON DEVICE vs VK
+  roots computed with HOST threads - two independent implementations
+  agreeing byte-for-byte on every trailer.
+- Gates: ptest 51/0/0, ptest_vk 151/9/0, corruption ->
+  ChecksumMismatch exit 1 on both backends, clean-decode SHA MATCH.
+- Follow-ups recorded: VK GLSL mirror of the verify kernels (VK
+  currently host-computes; frames identical either way), and the
+  decode D2D-path verdict surface for the C ABI (the kernels already
+  run; Async callers need an error channel).
