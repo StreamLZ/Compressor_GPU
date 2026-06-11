@@ -121,9 +121,9 @@ device-resident path.
 ## Performance
 
 Best-of-8+ decode on an RTX 4060 Ti (sm_89), `streamlz -db`,
-re-measured 2026-06-11 (v4 #15 K=4 pipelined LZ kernels at every
-level, and frames carrying the default-on chunk-Merkle checksum, so
-the e2e column INCLUDES integrity verification). Re-run by
+re-measured 2026-06-11 with the pipelined decode kernels at every
+level. Frames carry the default-on checksum, so the e2e column
+INCLUDES integrity verification. Re-run by
 `tools\bench_all.bat`.
 
 ### Decode (ms): D2D wall-clock and end-to-end
