@@ -558,7 +558,7 @@ idea worth re-evaluating once the basic selector ships.
   FIX FIRST, then extend c_abi_tests.zig's D2D roundtrip to L5, then
   re-measure the README L5 async-wall cell (marked with * there).
 
-## 13. Fuzzing the decoder (and differential CUDA-vs-VK fuzz)
+## 13. Fuzzing the decoder (and differential CUDA-vs-VK fuzz) — ✅ SHIPPED 2026-06-10 (fuzz_frames.zig differential harness + XXH32 content checksum, 4b0dfbf); ongoing-use tool
 
 Not VK parity debt (neither backend has fuzzing) — new work. The
 exposure is real and GPU-specific: `slzWalkFrameKernel` parses
