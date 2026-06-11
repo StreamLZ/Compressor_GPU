@@ -86,6 +86,17 @@ pub fn build(b: *std.Build) void {
     const gate2_exe = b.addExecutable(.{ .name = "tans_gate2", .root_module = gate2_module });
     b.step("tans_gate2", "Build the v4 #11 gate-2 tANS-vs-Huffman measurement tool").dependOn(&b.addInstallArtifact(gate2_exe, .{}).step);
 
+    // v4 #18: in-process roundtrip stress harness (test-runner-like
+    // conditions: persistent contexts, buffer reuse, warm-up case).
+    const stress18_module = b.createModule(.{
+        .root_source_file = b.path("src/stress18_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const stress18_exe = b.addExecutable(.{ .name = "stress18", .root_module = stress18_module });
+    b.step("stress18", "Build the v4 #18 roundtrip stress harness").dependOn(&b.addInstallArtifact(stress18_exe, .{}).step);
+
     // ── Unit tests ───────────────────────────────────────────────────────
     const test_runner = b.addTest(.{
         .root_module = cli_module,

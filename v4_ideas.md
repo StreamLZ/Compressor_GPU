@@ -903,3 +903,20 @@ the kernel's cross-chunk-iteration shared-state reuse (s_have/s_pb
 across the c-loop and sc-loop) and the prime path for cpg > 1.
 Until attributed, treat releases with care: SLZ_NO_PIPELINE=1 is
 the mitigation.
+**Investigated 2026-06-11 (same evening) — unreproduced, instrumented
+for capture.** Attribution attempts: 20 more full-suite loops (0
+failures; total now ~33 suite runs, 1 failure), 100 CLI roundtrips of
+the exact medium-text shape (0), and a new in-process stress harness
+(`zig build stress18` — same g_default contexts, suite case order,
+buffer-growth warm-up) at 500 iters pipelined + 500 iters
+SLZ_NO_PIPELINE=1 (0 + 0). Geometry was ruled equal (cpg=1 both
+paths). The event is rarer than 1-in-30 and needs the full suite's
+environment (16 runner threads / longer context history), so brute
+attribution is uneconomical. INSTRUMENTED instead: the roundtrip
+test now self-captures evidence on the next occurrence —
+`v18_mismatch_<label>.frame/.out` written at the failure site for
+offline replay (`streamlz -d` the frame, diff the out). STATUS: open
+but armed; revisit immediately when an artifact appears. Suspect
+ranking unchanged (K=4 pipeline serial/prime boundary), mitigation
+SLZ_NO_PIPELINE=1.
+

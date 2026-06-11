@@ -81,8 +81,39 @@ fn roundtripOne(allocator: std.mem.Allocator, case: Case) !void {
         var first_diff: usize = 0;
         while (first_diff < case.bytes.len and case.bytes[first_diff] == dst[first_diff]) : (first_diff += 1) {}
         std.debug.print("byte mismatch for {s} at offset {d}\n", .{ case.label, first_diff });
+        // v4 #18: this mismatch is intermittent (~1 in 30+ suite runs;
+        // unreproduced by 1100+ targeted in-process/CLI roundtrips of
+        // the same shape via `zig build stress18`) — capture the
+        // evidence the moment it fires again: the exact frame and the
+        // wrong output, replayable offline (`streamlz -d` the .frame,
+        // diff against the .out). Capture failure is non-fatal.
+        captureMismatchArtifacts(case.label, compressed[0..n], dst[0..written]);
         return error.TestUnexpectedResult;
     }
+}
+
+/// v4 #18 evidence capture (see the call site above). libc I/O — no
+/// std.Io plumbing exists in this test path.
+fn captureMismatchArtifacts(label: []const u8, frame: []const u8, out: []const u8) void {
+    var name_buf: [256]u8 = undefined;
+    var safe_label_buf: [64]u8 = undefined;
+    var sl: usize = 0;
+    for (label) |c| {
+        if (sl >= safe_label_buf.len) break;
+        safe_label_buf[sl] = if (c == ' ') '_' else c;
+        sl += 1;
+    }
+    const f1 = std.fmt.bufPrintZ(&name_buf, "v18_mismatch_{s}.frame", .{safe_label_buf[0..sl]}) catch return;
+    if (std.c.fopen(f1, "wb")) |fh| {
+        _ = std.c.fwrite(frame.ptr, 1, frame.len, fh);
+        _ = std.c.fclose(fh);
+    }
+    const f2 = std.fmt.bufPrintZ(&name_buf, "v18_mismatch_{s}.out", .{safe_label_buf[0..sl]}) catch return;
+    if (std.c.fopen(f2, "wb")) |fh| {
+        _ = std.c.fwrite(out.ptr, 1, out.len, fh);
+        _ = std.c.fclose(fh);
+    }
+    std.debug.print("v4 #18 artifacts captured: v18_mismatch_{s}.frame/.out\n", .{safe_label_buf[0..sl]});
 }
 
 test "GPU roundtrip: every shape and level" {
