@@ -696,6 +696,16 @@ kernel is DONE at 52.7 → 71.9% SM and 2.28 → 1.77 ms in one wave;
 remaining levers are #8 (wire format, changes the work itself) or
 K=8 width (would crater parser-bound corpora; silesia already pays
 at K=4). Next: port THIS design to the L3+ general kernel.
+**L3+ port DONE 2026-06-11 (same day):** slzLzDecodeGeneralPipelinedKernel
+reuses parseSubChunkHeaders on the parser warp + shared ParsedStreams
+broadcast; mode-1/off32-free sub-chunks take the K=4 pipeline
+(templated on off16_split), the rest fall back to warp-level
+decodeSubChunkGeneral in-kernel. enwik8 L3/L4/L5 kernels 3.49/3.42/3.31
+-> 2.88/2.93/2.93 ms; enwik9 L5 29.5 -> 26.27 (nvCOMP Zstd 1.93x);
+silesia L3+ all improved; D2D L5 wall 4.80 -> 4.49 (1.39x). All SHA +
+suite gates green. v4 #15 is now COMPLETE on CUDA across all levels;
+remaining: VK mirror (TDR fix first).
+
 
 
 

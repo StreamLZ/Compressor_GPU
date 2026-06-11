@@ -92,6 +92,20 @@ Wire format unchanged from 2026-06-09; all frames byte-identical.
   Verified: ptest_vk 150/9/0, enwik9 1 GB L3+L5 SHA MATCH, D2D sweep
   all-verified, Intel iGPU L5 SHA MATCH (BDA on both vendors);
   enwik9 L5 kernels 35.7 -> 35.5 ms.
+- **K=4 pipeline ported to the L3+ general kernel** (v4 #15 L3+
+  port, CUDA, default ON): new slzLzDecodeGeneralPipelinedKernel -
+  one chunk group per block, the parser warp reuses the existing
+  warp-cooperative parseSubChunkHeaders and publishes ParsedStreams
+  via shared; mode-1/off32-free sub-chunks (everything at the
+  sc=0.25 default) run decodeSubChunkRawModePipelined templated on
+  ps.off16_split, everything else falls back to the warp-level
+  decodeSubChunkGeneral on warp 0 in-kernel. enwik8 kernels: L3
+  3.49 -> 2.88 ms, L4 3.42 -> 2.93, L5 3.31 -> 2.93; enwik9 L5
+  29.5 -> 26.27 ms (nvCOMP Zstd margin 1.72x -> 1.93x); silesia L3+
+  all improved (L3 6.29 -> 6.02); D2D L5 wall 4.80 -> 4.49 ms
+  (1.39x), LZ slice 2.49 -> 2.17. ptest 50/0/0; enwik8 L5 + enwik9
+  1 GB L5 SHA MATCH; D2D verify OK. SLZ_NO_PIPELINE=1 escapes both
+  kernels.
 - **K=4 copier team for the pipelined raw kernel** (v4 #15
   escalations, CUDA): the post-#15 NCU profile showed barrier stall
   9.5 as the new top stall. The mbarrier route (cuda::pipeline

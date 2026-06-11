@@ -36,6 +36,7 @@ pub var module: usize = 0;
 pub var kernel_fn: usize = 0;
 pub var kernel_raw_fn: usize = 0;
 pub var kernel_raw_pipeline_fn: usize = 0;
+pub var kernel_general_pipeline_fn: usize = 0;
 pub var gather_off16_fn: usize = 0;
 pub var scan_parse_fn: usize = 0;
 pub var walk_frame_fn: usize = 0;
@@ -178,6 +179,7 @@ pub fn init() bool {
     // is present. Failing to load is fine; falls back to general kernel.
     _ = get_fn(&kernel_raw_fn, module, "slzLzDecodeRawKernel");
     _ = get_fn(&kernel_raw_pipeline_fn, module, "slzLzDecodeRawPipelinedKernel");
+    _ = get_fn(&kernel_general_pipeline_fn, module, "slzLzDecodeGeneralPipelinedKernel");
     // GPU decode-scan kernel. Required: the decode dispatch fails
     // BackendNotAvailable when this symbol is missing (the CPU scan
     // path has been retired).

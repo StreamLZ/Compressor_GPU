@@ -517,8 +517,19 @@ fn runLzPipeline(
         };
         var lz_extra = [_]?*anyopaque{null};
 
-        const t_lz = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeKernel", stream);
-        try cudaCall(launch_fn(module_loader.kernel_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &lz_params, &lz_extra), .launch);
+        // v4 #15 L3+ port (2026-06-11): same K=4 pipeline as the raw
+        // branch above — one group per block, parser warp + 3-warp
+        // copier team, blockDim (32,4), grid doubled. Sub-chunks that
+        // are not mode-1/off32-free fall back to the warp-level
+        // general decoder inside the kernel. SLZ_NO_PIPELINE=1 escapes.
+        const use_gen_pipeline = module_loader.kernel_general_pipeline_fn != 0 and
+            std.c.getenv("SLZ_NO_PIPELINE") == null;
+        const gen_kernel = if (use_gen_pipeline) module_loader.kernel_general_pipeline_fn else module_loader.kernel_fn;
+        const gen_grid_x: u32 = if (use_gen_pipeline) lz_grid_x * 2 else lz_grid_x;
+        const gen_block_y: u32 = if (use_gen_pipeline) 4 else 2;
+        const gen_label: [*:0]const u8 = if (use_gen_pipeline) "slzLzDecodeGeneralPipelinedKernel" else "slzLzDecodeKernel";
+        const t_lz = beginKernelTiming(self.enable_profiling, &self.pending_timings, gen_label, stream);
+        try cudaCall(launch_fn(gen_kernel, gen_grid_x, 1, 1, 32, gen_block_y, 1, 0, stream, &lz_params, &lz_extra), .launch);
         endKernelTiming(t_lz, stream);
     }
 

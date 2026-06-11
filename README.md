@@ -130,9 +130,9 @@ rows use it, L3+ unchanged). Re-run by `tools\bench_all.bat`.
 |-------|------------------|-------------------|
 | L1 | **1.77** / 14.37 | **4.05** / 29.01 |
 | L2 | **1.94** / 14.42 | **4.06** / 29.08 |
-| L3 | **3.49** / 15.12 | **6.29** / 30.00 |
-| L4 | **3.42** / 15.08 | **6.27** / 29.92 |
-| L5 | **3.31** / 14.64 | **6.03** / 29.15 |
+| L3 | **2.88** / 14.62 | **6.02** / 29.74 |
+| L4 | **2.93** / 14.55 | **6.26** / 29.87 |
+| L5 | **2.93** / 14.32 | **5.94** / 28.93 |
 
 D2D wall-clock = the time a device-resident caller of
 `slzDecompressAsync` sees on the wire. End-to-end adds the host-to-
@@ -165,9 +165,9 @@ parser.
 
 | Window | StreamLZ L5 | nvCOMP Zstd | StreamLZ win |
 |--------|------------:|------------:|-------------:|
-| Pipeline kernel-sum | **3.62 ms** | 6.25 ms | 1.73× |
-| Async call wall     | **4.80 ms** | 6.25 ms | 1.30× |
-| End-to-end host wall | **14.64 ms** | 18.16 ms | 1.24× |
+| Pipeline kernel-sum | **3.48 ms** | 6.25 ms | 1.80× |
+| Async call wall     | **4.49 ms** | 6.25 ms | 1.39× |
+| End-to-end host wall | **14.32 ms** | 18.16 ms | 1.27× |
 
 StreamLZ columns re-measured 2026-06-11; nvCOMP columns are the
 2026-05-27 `nvcomp_bench3` runs (our changes don't affect them).
@@ -192,8 +192,8 @@ StreamLZ, best-of-20 for nvCOMP; e2e = host wall incl. PCIe both ways):
 | | StreamLZ L5 | nvCOMP Zstd | margin |
 |--------|------------:|------------:|-------:|
 | Ratio | **35.50%** | 35.75% | 2.5 MB smaller |
-| Decode kernel | **29.5 ms** (33.9 GB/s) | 50.8 ms (19.7 GB/s) | 1.72× |
-| Decode e2e | **140.8 ms** | 164.4 ms | 1.17× |
+| Decode kernel | **26.3 ms** (38.1 GB/s) | 50.8 ms (19.7 GB/s) | 1.93× |
+| Decode e2e | **140.2 ms** | 164.4 ms | 1.17× |
 
 These numbers use the 2026-06-09 defaults: `sc_group_size = 0.25` at
 every input size (64 KB sub-chunks — more decode warps, shorter

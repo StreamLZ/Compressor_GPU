@@ -314,3 +314,152 @@ slzLzDecodeRawPipelinedKernel(
         }
     }
 }
+
+// ── v4 #15 L3+ port: Pipelined general (entropy-capable) kernel ──
+// Same interface as slzLzDecodeKernel but one chunk group per block
+// with the K=4 pipeline (parser warp + 3-warp copier team). Grid is
+// doubled by the host. Per sub-chunk: the parser warp runs the
+// existing warp-cooperative parseSubChunkHeaders, lane 0 publishes
+// the ParsedStreams to shared, and the block routes:
+//   - mode 1 + no off32  -> decodeSubChunkRawModePipelined, templated
+//     on ps.off16_split (entropy frames read off16 from the gathered
+//     hi/lo scratch planes; raw frames read the interleaved stream)
+//   - anything else      -> the proven warp-level
+//     decodeSubChunkGeneral on warp 0, team idles to the barrier
+//     (off32 sub-chunks > 64 KB and exotic modes are rare at the
+//     sc=0.25 default).
+extern "C" __global__ void
+__launch_bounds__(SLZ_PIPE_BLOCK_THREADS, SLZ_PIPE_MIN_BLOCKS_PER_SM)
+slzLzDecodeGeneralPipelinedKernel(
+    const uint8_t* __restrict__ compressed,
+    const SlzChunkDesc* __restrict__ chunks,
+    uint8_t* __restrict__ dst,
+    uint32_t chunks_per_group,
+    const uint32_t* __restrict__ d_total_chunks,
+    uint32_t sub_chunk_cap,
+    uint8_t* __restrict__ entropy_scratch,
+    uint64_t entropy_slot_stride,
+    const uint32_t* __restrict__ first_subchunk_idx
+) {
+    const uint32_t total_chunks = *d_total_chunks;
+    const uint32_t group_id = blockIdx.x;
+    const int lane = threadIdx.x & LANE_MASK;
+    if (group_id >= (total_chunks + chunks_per_group - 1) / chunks_per_group) return;
+    const uint32_t base_chunk = group_id * chunks_per_group;
+
+    __shared__ PipeBatch s_pipe_batch[SLZ_PIPE_STAGES];
+    __shared__ ParsedStreams s_ps;
+    __shared__ uint32_t s_sch_hdr;
+
+    for (uint32_t c = 0; c < chunks_per_group; c++) {
+        uint32_t chunk_idx = base_chunk + c;
+        if (chunk_idx >= total_chunks) return;
+
+        const SlzChunkDesc& ch = chunks[chunk_idx];
+        if (ch.decomp_size == 0) continue;
+
+        if (ch.flags & CHUNK_FLAG_UNCOMPRESSED) {
+            const uint8_t* src = compressed + ch.src_offset;
+            uint32_t gl = threadIdx.y * WARP_SIZE + lane;
+            for (uint32_t i = gl; i < ch.decomp_size; i += SLZ_PIPE_BLOCK_THREADS)
+                dst[ch.dst_offset + i] = src[i];
+            __syncthreads();
+            continue;
+        }
+        if (ch.flags & CHUNK_FLAG_MEMSET) {
+            uint32_t gl = threadIdx.y * WARP_SIZE + lane;
+            for (uint32_t i = gl; i < ch.decomp_size; i += SLZ_PIPE_BLOCK_THREADS)
+                dst[ch.dst_offset + i] = ch.memset_fill;
+            __syncthreads();
+            continue;
+        }
+
+        const uint8_t* chunk_src = compressed + ch.src_offset;
+        uint32_t sc_dst_off = ch.dst_offset;
+        uint32_t sc_remaining = ch.decomp_size;
+        uint32_t global_subchunk_index =
+            first_subchunk_idx ? first_subchunk_idx[chunk_idx] : chunk_idx;
+        uint8_t* subchunk_scratch_base = entropy_scratch
+            ? (entropy_scratch + (uint64_t)global_subchunk_index * ENTROPY_SCRATCH_SLOT_BYTES)
+            : nullptr;
+
+        while (sc_remaining > 0) {
+            uint32_t sc_size = sc_remaining;
+            if (sc_size > sub_chunk_cap) sc_size = sub_chunk_cap;
+
+            if (lane == 0 && threadIdx.y == 0) s_sch_hdr = readBE24(chunk_src);
+            __syncthreads();
+            uint32_t sub_chunk_header = s_sch_hdr;
+
+            if (!subchunkIsLz(sub_chunk_header)) break;
+
+            uint32_t sc_comp_size = subchunkCompSize(sub_chunk_header);
+            uint32_t sc_mode = subchunkMode(sub_chunk_header);
+            const uint8_t* sc_payload = chunk_src + 3;
+
+            if (sc_comp_size < sc_size) {
+                uint8_t* tok_slot = subchunk_scratch_base
+                    ? (subchunk_scratch_base + entropy_slot_stride) : nullptr;
+                uint8_t* off16_slot = subchunk_scratch_base
+                    ? (subchunk_scratch_base + 2 * entropy_slot_stride) : nullptr;
+
+                // Header parse on the parser warp (warp-cooperative,
+                // includes the base_offset==0 initial 8-byte copy);
+                // lane 0 publishes the result for the team.
+                if (threadIdx.y == 0) {
+                    ParsedStreams ps;
+                    parseSubChunkHeaders(sc_payload, sc_comp_size, sc_size, dst,
+                                         sc_dst_off, sc_dst_off,
+                                         subchunk_scratch_base, tok_slot,
+                                         off16_slot, ps);
+                    if (lane == 0) s_ps = ps;
+                }
+                __syncthreads();
+
+                if (sc_mode == 1 && s_ps.off32_count1 == 0 && s_ps.off32_count2 == 0) {
+                    if (s_ps.off16_split) {
+                        decodeSubChunkRawModePipelined<true>(
+                            s_ps.cmd_ptr, s_ps.cmd_size,
+                            s_ps.lit_ptr, s_ps.lit_size,
+                            s_ps.off16_raw, s_ps.off16_count,
+                            s_ps.off16_hi, s_ps.off16_lo,
+                            s_ps.len_stream, s_ps.len_avail,
+                            dst, sc_size, s_ps.initial_copy, sc_dst_off,
+                            s_pipe_batch);
+                    } else {
+                        decodeSubChunkRawModePipelined<false>(
+                            s_ps.cmd_ptr, s_ps.cmd_size,
+                            s_ps.lit_ptr, s_ps.lit_size,
+                            s_ps.off16_raw, s_ps.off16_count,
+                            s_ps.off16_hi, s_ps.off16_lo,
+                            s_ps.len_stream, s_ps.len_avail,
+                            dst, sc_size, s_ps.initial_copy, sc_dst_off,
+                            s_pipe_batch);
+                    }
+                } else {
+                    // off32 present or exotic mode: proven warp-level
+                    // general decoder on the parser warp (ps already
+                    // parsed - no re-parse).
+                    if (threadIdx.y == 0) {
+                        const DecodeOutput out_general = { dst, sc_size, sc_dst_off };
+                        if (s_ps.off16_split) {
+                            decodeSubChunkGeneral<true>(s_ps, out_general, sc_mode);
+                        } else {
+                            decodeSubChunkGeneral<false>(s_ps, out_general, sc_mode);
+                        }
+                    }
+                }
+            } else {
+                uint32_t gl = threadIdx.y * WARP_SIZE + lane;
+                for (uint32_t i = gl; i < sc_size; i += SLZ_PIPE_BLOCK_THREADS)
+                    dst[sc_dst_off + i] = sc_payload[i];
+            }
+            __syncthreads();
+
+            chunk_src += 3 + sc_comp_size;
+            sc_dst_off += sc_size;
+            sc_remaining -= sc_size;
+            if (subchunk_scratch_base) subchunk_scratch_base += ENTROPY_SCRATCH_SLOT_BYTES;
+        }
+    }
+}
