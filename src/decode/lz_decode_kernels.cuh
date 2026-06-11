@@ -237,7 +237,7 @@ slzLzDecodeRawKernel(
 #include "lz_decode_raw_pipeline.cuh"
 
 extern "C" __global__ void
-__launch_bounds__(LZ_KERNEL_BLOCK_THREADS, LZ_KERNEL_MIN_BLOCKS_PER_SM)
+__launch_bounds__(SLZ_PIPE_BLOCK_THREADS, SLZ_PIPE_MIN_BLOCKS_PER_SM)
 slzLzDecodeRawPipelinedKernel(
     const uint8_t* __restrict__ compressed,
     const SlzChunkDesc* __restrict__ chunks,
@@ -252,7 +252,7 @@ slzLzDecodeRawPipelinedKernel(
     if (group_id >= (total_chunks + chunks_per_group - 1) / chunks_per_group) return;
     const uint32_t base_chunk = group_id * chunks_per_group;
 
-    __shared__ PipeBatch s_pipe_batch[2];
+    __shared__ PipeBatch s_pipe_batch[SLZ_PIPE_STAGES];
 
     for (uint32_t c = 0; c < chunks_per_group; c++) {
         uint32_t chunk_idx = base_chunk + c;
@@ -264,14 +264,14 @@ slzLzDecodeRawPipelinedKernel(
         if (ch.flags & CHUNK_FLAG_UNCOMPRESSED) {
             const uint8_t* src = compressed + ch.src_offset;
             uint32_t gl = threadIdx.y * WARP_SIZE + lane;
-            for (uint32_t i = gl; i < ch.decomp_size; i += LZ_KERNEL_BLOCK_THREADS)
+            for (uint32_t i = gl; i < ch.decomp_size; i += SLZ_PIPE_BLOCK_THREADS)
                 dst[ch.dst_offset + i] = src[i];
             __syncthreads();
             continue;
         }
         if (ch.flags & CHUNK_FLAG_MEMSET) {
             uint32_t gl = threadIdx.y * WARP_SIZE + lane;
-            for (uint32_t i = gl; i < ch.decomp_size; i += LZ_KERNEL_BLOCK_THREADS)
+            for (uint32_t i = gl; i < ch.decomp_size; i += SLZ_PIPE_BLOCK_THREADS)
                 dst[ch.dst_offset + i] = ch.memset_fill;
             __syncthreads();
             continue;
@@ -303,7 +303,7 @@ slzLzDecodeRawPipelinedKernel(
                 );
             } else {
                 uint32_t gl = threadIdx.y * WARP_SIZE + lane;
-                for (uint32_t i = gl; i < sc_size; i += LZ_KERNEL_BLOCK_THREADS)
+                for (uint32_t i = gl; i < sc_size; i += SLZ_PIPE_BLOCK_THREADS)
                     dst[sc_dst_off + i] = sc_payload[i];
             }
             __syncthreads();

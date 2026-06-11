@@ -668,6 +668,26 @@ solve complexity on the simple kernel, port second):
    L5 LZ slice is 2.5-3.2 ms. Port the finished design once.
 Combined 1+2 honest estimate: 10-20% more on the raw kernel
 (enwik9 L1 17.2 → ~14-15.5 ms).
+**Escalations 1+2 RESOLVED 2026-06-11 (same session):**
+mbarrier (escalation 1) measured and REJECTED — cuda::pipeline ring
+S=2/S=4 = 2.18/2.64 ms vs 1.90 __syncthreads on enwik8 L1; the
+barrier stall was inherent slower-side wait, not rendezvous cost
+(FAILED_EXPERIMENTS.md "mbarrier pipeline ring"). K=4 copier team
+(escalation 2) SHIPPED default: 1 parser warp + 3-warp copier team
+(96 flat-copy lanes, two tight passes — merged pool measured 3.00 ms
+and lost), team-internal order via __barrier_sync_count(1,96) named
+barrier (inline-asm bar.sync = optimizer wall, +0.8 ms), one
+__syncthreads per batch for the slot handoff, blockDim (32,4),
+12 blocks/SM. Measured: enwik8 L1 1.90 → **1.77 ms** (kernel-sum
+1.88, nvCOMP LZ4 2.54x), enwik9 L1 17.15 → **16.22 ms** (61.7 GB/s,
+nvCOMP 2.03x), D2D wall 3.27 → 3.13 (1.53x); silesia L1 pays 3.87 →
+4.05 (binary = parser-bound + blocks/SM halved; still under the
+pre-#15 4.16). K=3 rejected (uneven SMSP packing: 19.0 ms e9).
+ptest 50/0/0, 1 GB SHA MATCH, D2D verify OK. Remaining knob if
+silesia matters more later: ship both K=2 and K=4 kernel entries and
+pick per frame by token/lit statistics from the walk. L3+ port and
+VK mirror now target THIS design (K=4 + named barrier).
+
 
 
 

@@ -128,8 +128,8 @@ rows use it, L3+ unchanged). Re-run by `tools\bench_all.bat`.
 
 | Level | enwik8 D2D / e2e | silesia D2D / e2e |
 |-------|------------------|-------------------|
-| L1 | **1.93** / 14.57 | **3.87** / 28.98 |
-| L2 | **1.97** / 14.52 | **3.88** / 28.94 |
+| L1 | **1.77** / 14.37 | **4.05** / 29.01 |
+| L2 | **1.94** / 14.42 | **4.06** / 29.08 |
 | L3 | **3.49** / 15.12 | **6.29** / 30.00 |
 | L4 | **3.42** / 15.08 | **6.27** / 29.92 |
 | L5 | **3.31** / 14.64 | **6.03** / 29.15 |
@@ -159,9 +159,9 @@ parser.
 
 | Window | StreamLZ L1 | nvCOMP LZ4 | StreamLZ win |
 |--------|------------:|-----------:|-------------:|
-| Pipeline kernel-sum | **2.04 ms** | 4.77 ms | 2.34× |
-| Async call wall     | **3.27 ms** | 4.77 ms | 1.46× |
-| End-to-end host wall | **14.57 ms** | 18.29 ms | 1.26× |
+| Pipeline kernel-sum | **1.88 ms** | 4.77 ms | 2.54× |
+| Async call wall     | **3.13 ms** | 4.77 ms | 1.52× |
+| End-to-end host wall | **14.37 ms** | 18.29 ms | 1.27× |
 
 | Window | StreamLZ L5 | nvCOMP Zstd | StreamLZ win |
 |--------|------------:|------------:|-------------:|
@@ -186,8 +186,8 @@ StreamLZ, best-of-20 for nvCOMP; e2e = host wall incl. PCIe both ways):
 | | StreamLZ L1 | nvCOMP LZ4 | margin |
 |--------|------------:|-----------:|-------:|
 | Ratio | **52.6%** | 53.6% | 10 MB smaller |
-| Decode kernel | **17.2 ms** (58.2 GB/s) | 33.0 ms (30.3 GB/s) | 1.92× |
-| Decode e2e | **145.5 ms** | 162.0 ms | 1.11× |
+| Decode kernel | **16.2 ms** (61.7 GB/s) | 33.0 ms (30.3 GB/s) | 2.03× |
+| Decode e2e | **137.7 ms** | 162.0 ms | 1.18× |
 
 | | StreamLZ L5 | nvCOMP Zstd | margin |
 |--------|------------:|------------:|-------:|

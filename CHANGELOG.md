@@ -92,6 +92,24 @@ Wire format unchanged from 2026-06-09; all frames byte-identical.
   Verified: ptest_vk 150/9/0, enwik9 1 GB L3+L5 SHA MATCH, D2D sweep
   all-verified, Intel iGPU L5 SHA MATCH (BDA on both vendors);
   enwik9 L5 kernels 35.7 -> 35.5 ms.
+- **K=4 copier team for the pipelined raw kernel** (v4 #15
+  escalations, CUDA): the post-#15 NCU profile showed barrier stall
+  9.5 as the new top stall. The mbarrier route (cuda::pipeline
+  producer/consumer ring) measured SLOWER (2.18/2.64 ms vs 1.90 -
+  rendezvous cost was inherent slower-side wait; see
+  FAILED_EXPERIMENTS.md), so the win came from width: 1 parser warp
+  + a 3-warp copier team (96 flat-copy lanes, two tight passes),
+  team-internal phases ordered by hardware named barrier 1 via
+  __barrier_sync_count (inline-asm bar.sync = optimizer wall,
+  +0.8 ms), one __syncthreads per batch, blockDim (32,4), 12
+  blocks/SM. enwik8 L1 1.90 -> 1.77 ms (kernel-sum vs nvCOMP LZ4
+  2.54x), enwik9 L1 17.15 -> 16.22 ms (61.7 GB/s, 2.03x), D2D wall
+  3.27 -> 3.13 ms (1.52x); silesia L1 3.87 -> 4.05 (parser-bound
+  binary corpus pays for halved blocks/SM; still under pre-#15
+  4.16). Negative results recorded: mbarrier ring, merged flat pool
+  (3.00 ms), K=3 blocks (uneven SMSP packing, 19.0 ms at 1 GB).
+  ptest 50/0/0, 1 GB SHA MATCH, D2D sweep verify-OK. nvcc now
+  compiles with -std=c++17.
 - **Two-warp pipelined raw LZ decode** (v4 #15, CUDA, default ON):
   NCU-gated (post-#1/#2 kernel at 52.7% SM / 22.9 long_scoreboard -
   the issue pipe was no longer saturated), then built: warp 0 parses

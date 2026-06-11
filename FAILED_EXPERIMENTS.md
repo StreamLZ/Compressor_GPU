@@ -3320,3 +3320,34 @@ Hillis-Steele canonical-code scan) were IMPLEMENTED at `ba46e9a`
 after the ideas doc's baseline was captured — measured 0.77 → 0.165 ms
 today, beating the idea's own 0.30-0.35 ms prediction. Ideas 1 and 3
 were promoted to v4_ideas #14/#15; ideas 5 and 6 to the v4 #12 basket.
+
+## mbarrier pipeline ring loses to __syncthreads at LZ batch granularity (2026-06-11)
+
+v4 #15 escalation: the K=2 pipelined raw kernel's top NCU stall was
+barrier (9.5), so the obvious move was replacing the per-batch
+__syncthreads rendezvous with a cuda::pipeline producer/consumer
+mbarrier ring (parser = producer, copier = consumer, batch_size==0
+sentinel per segment). Byte-correct on the first build — and SLOWER:
+S=2 ring 2.18 ms, S=4 ring 2.64 ms vs 1.90 ms for __syncthreads
+pacing (enwik8 L1 kernel). Four mbarrier ops per ~150 ns batch plus
+libcu++ try_wait/backoff bookkeeping cost more than one hardware
+BAR.SYNC on a 64-thread block. The "barrier stall" was mostly the
+INHERENT wait for the slower side, which no barrier mechanism
+removes — only width rebalancing does (the K=4 copier team shipped
+instead: 1.77 ms). Three sub-findings from the same session:
+- Inline-asm `bar.sync 1, N` as the copier-team barrier costs ~0.8 ms
+  on enwik8 L1 vs the `__barrier_sync_count(1, N)` intrinsic — the
+  asm volatile is an optimization wall in the hot loop, not a
+  hardware cost.
+- Merging the flat-literal and flat-independent-match passes into one
+  branchy work pool (one index space, per-byte if) measured 3.00 ms
+  vs 1.90 for two tight loops — keep the passes separate; they need
+  no barrier between them anyway.
+- K=3 (96-thread blocks) is the worst of all worlds (2.08/19.0 ms):
+  3 warps sit unevenly on the SM's 4 schedulers. Use power-of-two
+  warp counts.
+Rule confirmed again: at sub-microsecond producer/consumer cadence
+inside one block, __syncthreads is the fastest synchronization on
+sm_89; mbarrier rings pay off only when arrive/wait latency can hide
+under real work (async copies, multi-stage tile pipelines), not as a
+drop-in rendezvous replacement.

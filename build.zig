@@ -391,7 +391,9 @@ fn ptxRebuild(step: *std.Build.Step, opts: std.Build.Step.MakeOptions) anyerror!
         try bat.appendSlice(alloc, ptx_abs);
         try bat.appendSlice(alloc, "\" \"");
         try bat.appendSlice(alloc, cu_abs);
-        try bat.appendSlice(alloc, "\" -arch=sm_89 -O3\r\nif errorlevel 1 exit /b 1\r\n");
+        // -std=c++17: libcu++ (<cuda/pipeline>, v4 #15 mbarrier ring)
+        // refuses to compile under MSVC's default C++14.
+        try bat.appendSlice(alloc, "\" -arch=sm_89 -O3 -std=c++17\r\nif errorlevel 1 exit /b 1\r\n");
     }
 
     b.cache_root.handle.writeFile(io, .{

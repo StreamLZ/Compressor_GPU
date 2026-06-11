@@ -1,25 +1,30 @@
-// ── v4 #15: 2-warp pipelined raw-mode sub-chunk decoder ─────────
+// ── v4 #15: K=4 pipelined raw-mode sub-chunk decoder ────────────
 // Parser warp (threadIdx.y==0) runs the PP scan and stages parsed
-// batch data to a shared-memory double buffer. Copier warp
-// (threadIdx.y==1) runs the flat literal + flat independent-match +
-// dependent-match copies from the staged data. Overlap: the parser
-// fills batch N+1 while the copier executes batch N — the parser's
-// global reads (cmd bytes, off16 entries) hide under the copier's
-// global writes, attacking the NCU-measured long_scoreboard stall
-// (22.9 at 52.7% SM throughput post-#1/#2).
+// batch data to a shared-memory double buffer. A 3-warp copier team
+// (threadIdx.y 1-3, 96 lanes) runs the flat literal + flat
+// independent-match passes, then warp 1 alone runs the dependent
+// matches. Overlap: the parser fills batch N+1 while the team
+// executes batch N — the parser's global reads hide under the team's
+// global writes (long_scoreboard 22.9 → 8.9 measured at K=2), and
+// the tripled copy width raised SM throughput further (K=4 vs K=2:
+// enwik8 L1 1.90 → 1.77 ms, enwik9 L1 17.15 → 16.22; silesia pays
+// ~4% back — binary corpora are parser-bound and blocks/SM halve).
 //
 // The parser can run ahead because its state advancement (cmd_pos /
 // lit_pos / off16_pos / dst_pos / recent_offset) comes entirely from
 // the warp scans, never from the copies.
 //
-// Synchronization is __syncthreads()-paced (one barrier per batch
-// per side). Intra-block spin-waits are NOT safe on NVIDIA hardware:
-// the warp scheduler has no fairness guarantee, so a spinning warp
-// can starve the warp it waits on forever (measured: instant
-// deadlock on RTX 4060 Ti with the volatile-flag version).
+// Synchronization: ONE __syncthreads per batch for the slot handoff;
+// the copier team orders its internal phases with hardware named
+// barrier 1 (__barrier_sync_count — NOT inline-asm bar.sync, which
+// acts as an optimizer wall and measured +0.8 ms), so the parser
+// never waits mid-batch. Intra-block spin-waits are NOT safe on
+// NVIDIA hardware (no warp-scheduler fairness; instant deadlock
+// measured), and a cuda::pipeline mbarrier ring measured SLOWER than
+// __syncthreads pacing (see FAILED_EXPERIMENTS.md).
 //
 // Serial long tokens (TOKEN_LONG_LITERAL / TOKEN_LONG_NEAR) drain
-// the pipeline first, then both warps execute the long token's
+// the pipeline first, then all warps execute the long token's
 // copies cooperatively, then the pipeline re-primes. One serial
 // iteration per long token, same as the non-pipelined kernel's
 // PP-prefix truncation contract (~5-10% of iterations per the v4 #3
@@ -37,6 +42,33 @@
 #pragma once
 
 #include "lz_decode_core.cuh"
+
+// Double buffer: the parser runs at most one batch ahead.
+// (A cuda::pipeline mbarrier ring was measured 2026-06-11 and LOST:
+// S=2 2.18 ms / S=4 2.64 ms vs 1.90 ms for __syncthreads pacing on
+// enwik8 L1 — four mbarrier ops per ~150 ns batch cost more than one
+// hardware BAR.SYNC on a small block. See FAILED_EXPERIMENTS.md.)
+#define SLZ_PIPE_STAGES 2
+
+// v4 #15 escalation 2: K=4 warps per block — 1 parser + a 3-warp
+// copier team (96 copy lanes vs the original 32). The copier team
+// synchronizes internally with a NAMED barrier (bar.sync 1, 96) so
+// the parser never participates in mid-batch copier syncs and keeps
+// parsing batch N+1. Block-level handoff stays one __syncthreads per
+// batch. 128-thread blocks: 12 blocks/SM keeps the SM's 1536-thread
+// budget exactly (parser count per SM halves vs K=2; the bet is that
+// tripled copy width on the flat passes more than compensates).
+#define SLZ_PIPE_WARPS 4
+#define SLZ_PIPE_BLOCK_THREADS (SLZ_PIPE_WARPS * WARP_SIZE)
+#define SLZ_PIPE_TEAM_THREADS ((SLZ_PIPE_WARPS - 1) * WARP_SIZE)
+#define SLZ_PIPE_MIN_BLOCKS_PER_SM 12
+
+// Copier-team barrier: hardware named barrier 1 (barrier 0 belongs
+// to __syncthreads), counted for the 3 copier warps only. bar.sync
+// orders the participants' memory accesses like __syncthreads does.
+__device__ __forceinline__ void pipeTeamBar() {
+    __barrier_sync_count(1, SLZ_PIPE_TEAM_THREADS);
+}
 
 struct PipeBatch {
     uint32_t batch_size; // tokens staged (>= 1)
@@ -156,21 +188,39 @@ __device__ bool fillBatch(
     return true;
 }
 
-// ── Copier: execute one staged batch's copies ────────────────────
-// Runs on the copier warp (or the parser during drain testing); all
-// reads come from the PipeBatch, all writes go to dst.
-__device__ void executeBatch(
+// ── Copier team: execute one staged batch's copies (3 warps) ─────
+// All reads come from the PipeBatch, all writes go to dst.
+//
+// Phase 1 (96 lanes): the flat-literal and flat-independent-match
+// passes merge into ONE flat work pool — they are hazard-free
+// against each other (im reads only pre-batch-final bytes by the
+// v4 #2 classification, and their write ranges are disjoint by
+// construction), so a single index space [0, total_lit + total_im)
+// feeds all team lanes.
+// Phase 2 (warp y==1 only, after a team barrier): dependent matches
+// in token order — they may read phase-1 output, so they wait for
+// it; warps 2-3 park at the closing team barrier meanwhile. The
+// parser is NOT a participant in either team barrier and keeps
+// parsing batch N+1 throughout.
+__device__ void executeBatchTeam(
     uint8_t* __restrict__ dst,
     const uint8_t* __restrict__ lit,
-    int lane,
+    int lane,           // lane within own warp
+    uint32_t team_lane, // 0..95 across the 3 copier warps
+    uint32_t warp_y,    // threadIdx.y (1..3)
     const PipeBatch* s
 ) {
     uint32_t bs = s->batch_size;
     uint32_t batch_dst = s->dst_pos;
     uint32_t batch_lit = s->lit_pos;
 
-    // Flat literal copy (v4 #1): ownership binary search per byte.
-    for (uint32_t i = lane; i < s->total_lit; i += WARP_SIZE) {
+    // Phase 1: flat literal pass then flat independent-match pass,
+    // all team lanes. No barrier between them — they are hazard-free
+    // against each other (im reads only pre-batch-final bytes by the
+    // v4 #2 classification; write ranges disjoint by construction).
+    // Two tight loops measured decisively faster than one merged
+    // branchy pool (1.90 vs 3.00 ms on enwik8 L1 at K=2).
+    for (uint32_t i = team_lane; i < s->total_lit; i += SLZ_PIPE_TEAM_THREADS) {
         uint32_t k = 0;
         #pragma unroll
         for (uint32_t step = 16; step >= 1; step >>= 1) {
@@ -179,48 +229,47 @@ __device__ void executeBatch(
         }
         dst[batch_dst + s->dst_adj[k] + i] = lit[batch_lit + i];
     }
-    __syncwarp();
-
-    // Flat independent-match copy (v4 #2).
-    if (s->total_im > 0) {
-        for (uint32_t i = lane; i < s->total_im; i += WARP_SIZE) {
-            uint32_t k = 0;
-            #pragma unroll
-            for (uint32_t step = 16; step >= 1; step >>= 1) {
-                uint32_t cand = k + step;
-                if (cand < bs && s->im_prefix[cand] <= i) k = cand;
-            }
-            dst[s->im_dst_adj[k] + i] = dst[s->im_src_adj[k] + i];
+    for (uint32_t i = team_lane; i < s->total_im; i += SLZ_PIPE_TEAM_THREADS) {
+        uint32_t k = 0;
+        #pragma unroll
+        for (uint32_t step = 16; step >= 1; step >>= 1) {
+            uint32_t cand = k + step;
+            if (cand < bs && s->im_prefix[cand] <= i) k = cand;
         }
-        __syncwarp();
+        dst[s->im_dst_adj[k] + i] = dst[s->im_src_adj[k] + i];
     }
+    pipeTeamBar(); // phase-1 writes visible to the dep warp
 
-    // Dependent matches in token order. copy_dst reconstructs as
-    // im_dst_adj[k] + im_prefix[k] = (my_copy_dst - my_im_local) +
-    // my_im_local = my_copy_dst — valid for every lane, dependent or
-    // not, because the same my_im_local cancels.
-    uint32_t dep_mask = s->dep_mask;
-    while (dep_mask != 0) {
-        uint32_t k = (uint32_t)(__ffs(dep_mask) - 1);
-        dep_mask &= dep_mask - 1;
-        uint32_t k_match_len = s->match_len[k];
-        int32_t  k_match_off = s->match_offset[k];
-        uint32_t copy_dst = s->im_dst_adj[k] + s->im_prefix[k];
-        uint32_t match_src = (uint32_t)((int32_t)copy_dst + k_match_off);
-        warpMatchCopy(dst, copy_dst, match_src, k_match_len, -k_match_off, lane);
-        __syncwarp();
+    // Phase 2: dependent matches in token order, warp 1 only.
+    // copy_dst reconstructs as im_dst_adj[k] + im_prefix[k] =
+    // (my_copy_dst - my_im_local) + my_im_local = my_copy_dst —
+    // valid for every lane because the same my_im_local cancels.
+    if (warp_y == 1) {
+        uint32_t dep_mask = s->dep_mask;
+        while (dep_mask != 0) {
+            uint32_t k = (uint32_t)(__ffs(dep_mask) - 1);
+            dep_mask &= dep_mask - 1;
+            uint32_t k_match_len = s->match_len[k];
+            int32_t  k_match_off = s->match_offset[k];
+            uint32_t copy_dst = s->im_dst_adj[k] + s->im_prefix[k];
+            uint32_t match_src = (uint32_t)((int32_t)copy_dst + k_match_off);
+            warpMatchCopy(dst, copy_dst, match_src, k_match_len, -k_match_off, lane);
+            __syncwarp();
+        }
     }
+    pipeTeamBar(); // dep writes done before the team touches the next slot
 }
 
 // ── Main pipelined decode loop ───────────────────────────────────
-// Control flow per outer iteration:
-//   prime:   parser fills slot 0          (copier idle)
-//   steady:  parser fills slot 1-cur, copier executes slot cur
-//   drain:   parser produced nothing — copier executes the last
-//            staged slot, then both warps fall through
-//   serial:  if cmd remains (long token), both warps execute it
+// Two-flag double buffer, ONE __syncthreads per batch: the loop
+// condition reads s_have[cur] after the barrier that ordered the
+// parser's pre-barrier write of that slot's flag.
+//   prime:   parser fills slot 0          (team idle)
+//   steady:  parser fills slot 1-cur, team executes slot cur
+//   drain:   parser produced nothing — team executed the last slot
+//            in the same iteration, both fall through
+//   serial:  if cmd remains (long token), all warps execute it
 //            cooperatively, then re-prime
-// All shared-flag handoffs are __syncthreads()-paced.
 template <bool OFF16_SPLIT>
 __device__ __noinline__ void decodeSubChunkRawModePipelined(
     const uint8_t* __restrict__ cmd, uint32_t cmd_size,
@@ -231,10 +280,12 @@ __device__ __noinline__ void decodeSubChunkRawModePipelined(
     uint8_t* __restrict__ dst, uint32_t dst_size,
     uint32_t initial_copy,
     uint32_t dst_offset,
-    PipeBatch* s_batch // [2], caller-allocated shared memory
+    PipeBatch* s_batch // [SLZ_PIPE_STAGES], caller-allocated shared
 ) {
     const int lane = threadIdx.x & LANE_MASK;
-    const bool is_parser = (threadIdx.y == 0);
+    const uint32_t warp_y = threadIdx.y;
+    const bool is_parser = (warp_y == 0);
+    const uint32_t team_lane = (warp_y - 1) * WARP_SIZE + lane; // copier warps only
     (void)dst_size;
 
     uint32_t cmd_pos = 0, lit_pos = 0, off16_pos = 0;
@@ -242,9 +293,8 @@ __device__ __noinline__ void decodeSubChunkRawModePipelined(
     int32_t recent_offset = INITIAL_RECENT_OFFSET;
     uint32_t length_offset = 0;
 
-    __shared__ uint32_t s_have_batch; // parser → both: slot cur is staged
-    __shared__ uint32_t s_have_next;  // parser → both: slot 1-cur is staged
-    __shared__ uint32_t s_state[6];   // parser → copier state broadcast
+    __shared__ uint32_t s_have[SLZ_PIPE_STAGES]; // per-slot staged flags
+    __shared__ uint32_t s_state[6];   // parser → team state broadcast
     __shared__ uint32_t s_long[5];    // serial-token broadcast
 
     while (true) {
@@ -254,29 +304,27 @@ __device__ __noinline__ void decodeSubChunkRawModePipelined(
                 cmd, cmd_size, off16_raw, off16_count, off16_hi, off16_lo,
                 cmd_pos, lit_pos, off16_pos, dst_pos, recent_offset,
                 lane, &s_batch[0]);
-            if (lane == 0) s_have_batch = got ? 1 : 0;
+            if (lane == 0) s_have[0] = got ? 1 : 0;
         }
         __syncthreads();
 
         // ── Steady state: overlap fill(N+1) with execute(N) ─────
         uint32_t cur = 0;
-        while (s_have_batch) {
+        while (s_have[cur]) {
             if (is_parser) {
                 bool got = (cmd_pos < cmd_size) && fillBatch<OFF16_SPLIT>(
                     cmd, cmd_size, off16_raw, off16_count, off16_hi, off16_lo,
                     cmd_pos, lit_pos, off16_pos, dst_pos, recent_offset,
                     lane, &s_batch[1 - cur]);
-                if (lane == 0) s_have_next = got ? 1 : 0;
+                if (lane == 0) s_have[1 - cur] = got ? 1 : 0;
             } else {
-                executeBatch(dst, lit, lane, &s_batch[cur]);
+                executeBatchTeam(dst, lit, lane, team_lane, warp_y, &s_batch[cur]);
             }
             __syncthreads(); // slot 1-cur staged; slot cur executed
-            if (is_parser && lane == 0) s_have_batch = s_have_next;
-            __syncthreads(); // both warps agree on continuation
             cur = 1 - cur;
         }
 
-        // ── Drained. Broadcast parser state to the copier warp ──
+        // ── Drained. Broadcast parser state to the copier team ──
         if (is_parser && lane == 0) {
             s_state[0] = cmd_pos;   s_state[1] = lit_pos;
             s_state[2] = off16_pos; s_state[3] = dst_pos;
@@ -332,7 +380,7 @@ __device__ __noinline__ void decodeSubChunkRawModePipelined(
         if (slit > 0) {
             // 64-thread cooperative literal copy.
             uint32_t gl = threadIdx.y * WARP_SIZE + lane;
-            for (uint32_t i = gl; i < slit; i += LZ_KERNEL_BLOCK_THREADS)
+            for (uint32_t i = gl; i < slit; i += SLZ_PIPE_BLOCK_THREADS)
                 dst[dst_pos + i] = lit[lit_pos + i];
             __syncthreads();
         }
@@ -357,7 +405,7 @@ __device__ __noinline__ void decodeSubChunkRawModePipelined(
     // ── Trailing literals (both warps, 64 threads) ───────────────
     uint32_t trailing = (lit_size > lit_pos) ? (lit_size - lit_pos) : 0;
     uint32_t gl = threadIdx.y * WARP_SIZE + lane;
-    for (uint32_t i = gl; i < trailing; i += LZ_KERNEL_BLOCK_THREADS)
+    for (uint32_t i = gl; i < trailing; i += SLZ_PIPE_BLOCK_THREADS)
         dst[dst_pos + i] = lit[lit_pos + i];
 }
 
