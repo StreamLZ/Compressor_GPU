@@ -9,6 +9,25 @@
 #include "lz_format.cuh"
 #include "lz_token_emit.cuh"
 
+// ── v4 #14 gate-0 instrumentation (compile-time, default off) ────
+// Counts the chain parser's actual work shape so the warp-
+// parallelization decision is data-driven: findMatchChain calls,
+// chain-candidate evaluations, and forward-extend byte compares.
+// Same pattern as SLZ_COUNT_PP in lz_decode_raw.cuh: flip to 1,
+// `zig build ptx && zig build`, run an L5 encode, read the globals,
+// flip back.
+#ifndef SLZ_COUNT_CHAIN
+#define SLZ_COUNT_CHAIN 0
+#endif
+#if SLZ_COUNT_CHAIN
+__device__ unsigned long long g_slz_chain_calls = 0;
+__device__ unsigned long long g_slz_chain_cand = 0;
+__device__ unsigned long long g_slz_extend_bytes = 0;
+#define SLZ_CHAIN_COUNT(var, n) atomicAdd(&(var), (unsigned long long)(n))
+#else
+#define SLZ_CHAIN_COUNT(var, n) ((void)0)
+#endif
+
 // ── Lazy-match cost weights ─────────────────────────────────────
 // Port of CPU isLazyMatchBetter: a candidate found `step` bytes
 // ahead must beat the current match by enough length to pay for the
@@ -89,6 +108,7 @@ __device__ ChainMatch findMatchChain(
     uint32_t end_pos,
     uint32_t lit_run_length
 ) {
+    SLZ_CHAIN_COUNT(g_slz_chain_calls, 1);
     // Read 4 bytes at current position
     uint32_t bytes_at_pos = readU32LE(src + pos);
 
@@ -153,6 +173,7 @@ __device__ ChainMatch findMatchChain(
                 uint32_t chain_steps = CHAIN_MAX_STEPS;
                 uint32_t hash_value = head;
                 while (candidate_offset < LZ_BLOCK_SIZE) {  // stays within 64KB block
+                    SLZ_CHAIN_COUNT(g_slz_chain_cand, 1);
                     if (candidate_offset > MIN_HASH_MATCH_OFFSET) {
                         if (candidate_offset <= pos) {
                             uint32_t ref = pos - candidate_offset;
@@ -173,6 +194,7 @@ __device__ ChainMatch findMatchChain(
                                     uint32_t ml = 4;
                                     uint32_t max_ext = end_pos - pos;
                                     while (ml < max_ext && src[pos + ml] == src[ref + ml]) ml++;
+                                    SLZ_CHAIN_COUNT(g_slz_extend_bytes, ml);
                                     int32_t cand_len = (int32_t)ml;
                                     if (cand_len > best_match_length && cand_len >= minimum_match_length) {
                                         best_match_length = cand_len;

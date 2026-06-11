@@ -625,7 +625,7 @@ documented contract of what "graceful rejection" means per corruption
 class. Effort: tier 1 ~a day; tier 3 ~a day on top (mostly harness
 plumbing — both CLIs already exist).
 
-## 14. MATCH.ANY warp-cooperative match finder for the L5 chain parser
+## 14. MATCH.ANY warp-cooperative match finder — ❌ PARKED 2026-06-11: both warp shapes measured out (offsets <=32 ~4%; 2.1 candidates/call)
 
 (Merged from the retired docs/GPU_IDEAS.md idea 1; full analysis incl.
 the nvCOMP SASS references in git history.)
@@ -650,6 +650,30 @@ deliberately, never silently. Harness-first in a new `tools/lz_test/`
 (CPU oracle, MATCH.ANY-only variant first to bound the in-warp win).
 Effort: 1-2 weeks. Any change must be mirrored to srcVK
 (`subgroupShuffle` + the A-002 match_any emulation already exist).
+
+**Gate 0 MEASURED 2026-06-11 — PARKED, both warp shapes bounded out.**
+Three measurements (tooling now in-tree):
+1. **Offset distribution** (via the SLZ_TANS_GATE2_DUMP planes): only
+   **3.7%** (enwik8 L5) / **4.1%** (silesia L5) of explicit matches
+   have offset <= 32 — the MATCH.ANY in-warp window can directly
+   serve ~4% of match-finding. The entry's headline mechanism is
+   dead on real corpora.
+2. **Chain shape** (new SLZ_COUNT_CHAIN compile-flag counters in
+   lz_chain_parser.cuh + `zig build chaincount` readback): enwik8 L5
+   = 48.5M findMatchChain calls (0.48/input byte — lazy re-search),
+   **2.14 chain candidates per call**, **4.72 extend byte-compares
+   per call**. The semantics-preserving alternative (warp-cooperative
+   candidate evaluation + parallel extends) has nothing to spread
+   across 32 lanes — ~93% would idle.
+3. Occupancy is NOT the limit (1526 warps at the 64 KB desc grid
+   ~= 45/SM); the limit is the serial dependency chain of ~31k tiny
+   match decisions per chunk — fundamental sequential LZ parsing.
+**Conclusion**: the only remaining route is nvCOMP-style speculative
+multi-position parsing — a DIFFERENT algorithm with guaranteed
+found-match drift (ratio change), i.e. a deliberate product decision
+that belongs with the #8 wire-format era, not an optimization of the
+current parser. L5 encode stays ~390 MB/s by design (users choosing
+L5 chose ratio); L1-L4 encode is already 1.0-1.3 GB/s post-#17.
 
 ## 15. Multi-warp-per-chunk LZ decode — ✅ DONE 2026-06-11: 2-warp pipeline, default ON
 

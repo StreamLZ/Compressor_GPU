@@ -97,6 +97,16 @@ pub fn build(b: *std.Build) void {
     const stress18_exe = b.addExecutable(.{ .name = "stress18", .root_module = stress18_module });
     b.step("stress18", "Build the v4 #18 roundtrip stress harness").dependOn(&b.addInstallArtifact(stress18_exe, .{}).step);
 
+    // v4 #14 gate-0: chain-parser work-shape readback (SLZ_COUNT_CHAIN).
+    const chaincount_module = b.createModule(.{
+        .root_source_file = b.path("src/chain_count_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const chaincount_exe = b.addExecutable(.{ .name = "chaincount", .root_module = chaincount_module });
+    b.step("chaincount", "Build the v4 #14 chain-parser instrumentation readback").dependOn(&b.addInstallArtifact(chaincount_exe, .{}).step);
+
     // ── Unit tests ───────────────────────────────────────────────────────
     const test_runner = b.addTest(.{
         .root_module = cli_module,
