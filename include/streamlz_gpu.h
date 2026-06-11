@@ -253,7 +253,16 @@ slzStatus_t slzCompressBound(slzHandle_t handle, size_t input_size,
  * caller-facing buffers (d_input, d_output, d_frame). Caller is
  * responsible for all of those, using their own stream and memory
  * management. The library only does the work between H2D-of-input and
- * the moment results are device-resident in d_output. */
+ * the moment results are device-resident in d_output.
+ *
+ * COMPRESS INPUT-SIZE LIMITS: slzCompressAsync accepts input_size in
+ * (128 B, 1 GiB] and returns SLZ_ERROR_UNSUPPORTED outside that range.
+ * At or below 128 B the encoder would emit the header-dominated
+ * uncompressed-body form (use slzCompressHost for tiny payloads);
+ * above 1 GiB (16384 sub-chunks x 64 KB) the device-resident assembly
+ * path's chunk cap is the ceiling. Segment larger payloads at the
+ * application layer — 1 GiB segments compress and decode independently
+ * with no measurable ratio loss at that scale. */
 
 /* Decompress a StreamLZ frame whose bytes are device-resident at
  * d_frame into d_output. `output_size` MUST equal the value returned

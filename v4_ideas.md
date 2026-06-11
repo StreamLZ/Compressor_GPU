@@ -490,12 +490,21 @@ idea worth re-evaluating once the basic selector ships.
   return SLZ_ERROR_UNSUPPORTED on the async path; the >1 GiB side is
   the caller-relevant one (TODO2's deferral-defender). Close by D2H-ing
   from `d_input` for the uncompressed-body path, or document loudly.
+  ✅ DOCUMENTED 2026-06-11: header now states the exact bounds
+  ((128 B, 1 GiB], where 1 GiB = 16384 sub-chunks x 64 KB), the why,
+  and the segment-at-the-app-layer guidance. The D2H fallback stays
+  unbuilt — no realistic D2D caller feeds those sizes.
 - **DevBuf abstraction** for the (ptr, size) pairs on both contexts —
   deferred twice already; only worth it bundled with another context
   refactor.
 - **C ABI default-level mismatch** (Zig Options.level=1 vs C header 5)
   — documented as intentional; revisit only if the L2-alias decision
   (#6) changes level semantics anyway.
+  ✅ CLOSED 2026-06-11: the #6 trigger fired (L2 re-differentiated) and
+  the decision is KEEP. The ladder change didn't move the 1-vs-5
+  speed/ratio positioning: CLI defaults to L1 (interactive speed), the
+  C library defaults to L5 (offline ratio), both surfaces document it
+  and the per-call value carries through. No code change.
 - **Host-unit mirrors** (from the retired BACKPORTS.md D table):
   port `srcVK/tests/{decoder,encoder}_unit.zig` cases (33 tests —
   descriptor walking, header building) AS-TOUCHED — only when next
@@ -522,16 +531,25 @@ idea worth re-evaluating once the basic selector ships.
   but that adds a mid-pipeline sync point, undoing the A-026
   single-submit batching. Only matters if 1 GB-class D2D becomes a
   real workload; bundle with any D2D scale work.
-- **Gather-overlap** (retired BACKPORTS.md B2 tail): run
-  slzGatherRawOff16Kernel on a second stream under merge+LUT-build.
-  Prize ~0.07 ms (enwik8) / ~0.85 ms (1 GB); cost is cross-stream
-  ordering complexity in decode_dispatch. Bundle with any future
-  stream-architecture work, not standalone.
+- ~~**Gather-overlap** (retired BACKPORTS.md B2 tail)~~ ✅ DONE
+  2026-06-10 as the B2 tail itself (`d20f6e6`): ensureGatherOverlap +
+  ev_compact_done/ev_gather_done event plumbing in decode_dispatch;
+  the gather runs on the aux stream under merge+LUT-build and the LZ
+  launch waits on the event. This basket line was a stale duplicate.
 - **LOP3.LUT 0xfe verification** (retired GPU_IDEAS idea 5): confirm
   nvcc already fuses the BIL-refill byte-merge ORs into LOP3; 1-2 h,
   upside <=1-2% on a 98%-memory-bound kernel - verify, don't refactor.
+  ✅ VERIFIED-MOOT 2026-06-11: the hot refill paths never had OR
+  chains — all four sites use `__byte_perm` (PRMT in SASS; cuobjdump
+  shows 190 PRMT/LOP3 sites in the cubin). The only OR-chain in the
+  source is the once-per-stream K header read (cold). Nothing to fuse.
 - **Packed butterfly reduction in the BIL encoder** (retired
   GPU_IDEAS idea 6): ~30 min encode-side polish, minor.
+  ✅ MOOTED 2026-06-11: the two butterflies (min-K, sum-tail) have a
+  data dependency — my_tail_bytes derives from K, so the reductions
+  cannot share a pass. Total cost is ~15 SASS instructions once per
+  huff block: unmeasurable, and an encoder touch would cost a full
+  cross-backend SHA gate. Closed without change.
 - **BUG: L3+ true-D2D decode fails** (found 2026-06-10 by
   toolsench_d2d.bat during the README perf refresh): slzDecompressAsync
   verify-FAILs on enwik8 L3 with zero kernel time (instant return);
