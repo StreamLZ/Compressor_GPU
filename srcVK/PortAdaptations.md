@@ -1245,3 +1245,16 @@ cross-chunk warp parallelism, and the VK driver (no __launch_bounds__
 analogue, its own scheduling) cannot recoup it the way CUDA's
 launch_bounds-pinned 12-blocks/SM + near-free BAR.SYNC do. Same
 ACCEPTED status; the experiment block stays in the shader, flag off.
+
+### A-028 addendum 2: post-reboot clean re-verification
+
+The original trio was measured in the post-TDR degraded-driver
+window (the TDR debugging itself had scarred the VK driver state
+~2x machine-wide until reboot; CUDA unaffected). Clean numbers
+(2026-06-11 post-reboot, tight means): single-warp **2.352** /
+K=2 pipeline **3.068** / K=4 team **3.383** ms (enwik8 L1 kernel).
+Same ordering, same conclusion - the gaps are in fact LARGER on a
+healthy driver. A-028 stands. Operational lesson recorded: repeated
+VK TDRs degrade the NVIDIA VK driver until reboot
+(Win+Ctrl+Shift+B insufficient) - re-baseline any VK perf numbers
+taken after a TDR debugging session.

@@ -272,41 +272,110 @@ A-013/A-014) ships at parity.
 
 ---
 
-## 2026-06-11 addendum — post-v4-optimization-wave numbers
+## 2026-06-11 full 60-cell re-sweep (post v4 #15 wave, both backends)
 
-The Phase 5 tables above predate the 2026-06-10/11 v4 wave (#1 flat
-literal copy, #2 flat independent-match copy, #5 BDA scratch, #6 L2
-rehash, #10 dispatch fusion, #15 CUDA 2-warp pipeline). Current
-`-db` numbers (RTX 4060 Ti, `gpu kernel best` / `e2e best`, ms,
-serial runs; CUDA = pipelined raw kernel default ON, VK = pipeline
-opt-in pending the WIP hang fix):
+**Date:** 2026-06-11 (evening, post-reboot — see driver-state note)
+**HEAD:** fa0f155 (CUDA K=4 pipelined decode default ALL levels; VK
+single-warp default per A-028)
+**Device (both backends):** `NVIDIA GeForce RTX 4060 Ti` (verbatim
+deviceName, `SLZ_VK_DEVICE_INDEX=1`)
+**Bench shape:** decode `-db -r 5` (best-of-5 + warm-up); encode
+`-b -r 5 -l N` (single-shot encode — treat encode ratios as ±5%
+bands per the F-001 note above). All 15 frames re-encoded with the
+current CUDA encoder first (the June-8 frames predate the L2
+re-differentiation). All 60 runs strictly serial.
+**Driver-state note:** the first VK pass of this sweep was measured
+2-2.4x slow and DISCARDED — the morning's TDR debugging (v4 #15 VK
+bring-up) had degraded the NVIDIA VK driver state machine-wide
+(CUDA unaffected; Win+Ctrl+Shift+B insufficient; full reboot
+cleared it). VK cells below are the post-reboot re-run, spot-checked
+stable (enwik8 L1 kernel 2.351 ms, mean within 0.5% of best).
+Raw captures: `c:/tmp/perfsweep11/` (60 files, same naming as the
+Phase 5 sweep).
 
-### enwik8 (100 MB)
-| Lvl | CUDA kern / e2e | VK kern (2026-06-10 wave) | VK/CUDA kern |
-|-----|-----------------|---------------------------|--------------|
-| L1  | 1.93 / 14.57    | ~4.6 (pre-#15 single-warp) | ~2.4x (pipeline pending) |
-| L2  | 1.97 / 14.52    | —                         | — |
-| L3  | 3.49 / 15.12    | —                         | — |
-| L4  | 3.42 / 15.08    | —                         | — |
-| L5  | 3.31 / 14.64    | 4.4 (D2D cell, post-#2)   | 1.33x |
+### Decode parity (e2e best, ms)
 
-### enwik9 (1 GB)
-| Lvl | CUDA kern | VK kern | VK/CUDA |
-|-----|-----------|---------|---------|
-| L1  | 17.2 (58.2 GB/s) | 21.2 (post-#2, single-warp) | 1.23x |
-| L3  | (post-#2) 29.5-region | 42.9 (post-#10) | — |
-| L5  | 29.5      | 35.5 (post-#5) | 1.20x |
+| Level | Corpus | VK | CUDA | VK/CUDA | Bar |
+|---|---|---:|---:|---:|---|
+| L1 | web    | 5.405  | 0.886  | 6.10x | over (A-VK-WDDM small-file submit floor) |
+| L1 | enwik8 | 15.173 | 14.496 | 1.05x | within |
+| L1 | silesia| 29.566 | 29.364 | 1.01x | within |
+| L2 | web    | 5.342  | 0.907  | 5.89x | over (submit floor) |
+| L2 | enwik8 | 15.223 | 14.476 | 1.05x | within |
+| L2 | silesia| 29.416 | 29.531 | 1.00x | within |
+| L3 | web    | 5.044  | 0.989  | 5.10x | over (submit floor) |
+| L3 | enwik8 | 15.905 | 14.729 | 1.08x | within |
+| L3 | silesia| 30.760 | 30.149 | 1.02x | within |
+| L4 | web    | 5.273  | 1.004  | 5.25x | over (submit floor) |
+| L4 | enwik8 | 15.258 | 14.699 | 1.04x | within |
+| L4 | silesia| 30.539 | 30.385 | 1.01x | within |
+| L5 | web    | 4.947  | 1.021  | 4.85x | over (submit floor) |
+| L5 | enwik8 | 15.084 | 14.487 | 1.04x | within |
+| L5 | silesia| 29.965 | 29.502 | 1.02x | within |
 
-### CUDA D2D async wall (fresh streamlz_gpu.dll — see the stale-DLL
-note in the v4 #15 commit)
-| Lvl | wall | vs nvCOMP |
-|-----|------|-----------|
-| L1  | 3.27 | 1.46x (LZ4 4.77) |
-| L5  | 4.80 | 1.30x (Zstd 6.25) |
+**e2e verdict: every large-corpus cell is within the 10% parity bar
+at every level** — PCIe + host wall dominates and both backends
+saturate it. The web.txt small-file gap is the known per-submit
+floor (A-VK-WDDM), unchanged in kind.
 
-NOTE: the VK column is sparse because the VK #15 mirror is WIP (the
-pipelined kernel TDRs at multi-workgroup scale — bisected to the
-parse/broadcast block; tracked in the v4 #15 entry). A full 60-cell
-re-sweep belongs after that lands; these are the spot measurements
-from the v4 wave's gates. The Phase 5 small-file (web.txt) gap and
-encode tables have NOT been re-measured.
+### Decode parity (gpu kernel best, ms — apples-to-apples)
+
+| Level | Corpus | VK | CUDA | VK/CUDA | Note |
+|---|---|---:|---:|---:|---|
+| L1 | web    | 0.759 | 0.317 | 2.39x | small-file fixed costs |
+| L1 | enwik8 | 2.351 | 1.859 | 1.26x | CUDA = K=4 pipeline (A-028) |
+| L1 | silesia| 4.218 | 4.289 | **0.98x** | VK FASTER (CUDA K=4 pays parser dilution on binary) |
+| L2 | web    | 0.784 | 0.345 | 2.27x | |
+| L2 | enwik8 | 2.225 | 1.950 | 1.14x | |
+| L2 | silesia| 4.206 | 4.572 | **0.92x** | VK FASTER |
+| L3 | web    | 0.807 | 0.380 | 2.12x | |
+| L3 | enwik8 | 4.072 | 3.018 | 1.35x | worst cell; CUDA pipelined general kernel |
+| L3 | silesia| 7.096 | 6.243 | 1.14x | |
+| L4 | web    | 0.825 | 0.406 | 2.03x | |
+| L4 | enwik8 | 3.871 | 3.068 | 1.26x | |
+| L4 | silesia| 7.079 | 6.569 | 1.08x | |
+| L5 | web    | 0.847 | 0.431 | 1.97x | |
+| L5 | enwik8 | 3.792 | 3.079 | 1.23x | |
+| L5 | silesia| 6.861 | 6.272 | 1.09x | |
+
+**Kernel verdict:** the enwik8 kernel gap (1.14-1.35x) is the
+A-028-documented cost of NOT running the pipeline on VK (measured:
+the pipeline is slower than single-warp on this driver — residency,
+not barriers). On binary-heavy silesia VK is at or AHEAD of CUDA at
+L1/L2 — the same parser-dilution effect that costs CUDA's K=4 there.
+e2e remains within bar everywhere that matters.
+
+### Encode parity (compress wall best, ms; single-shot ±5%)
+
+| Level | Corpus | VK | CUDA | VK/CUDA | Ratio (both, identical) |
+|---|---|---:|---:|---:|---:|
+| L1 | web    | 20  | 12  | 1.67x | 48.6% |
+| L1 | enwik8 | 109 | 123 | **0.89x** | 58.6% |
+| L1 | silesia| 188 | 235 | **0.80x** | 47.8% |
+| L2 | web    | 22  | 12  | 1.83x | 46.8% |
+| L2 | enwik8 | 106 | 131 | **0.81x** | 57.3% |
+| L2 | silesia| 206 | 249 | **0.83x** | 47.2% |
+| L3 | web    | 21  | 14  | 1.50x | 37.1% |
+| L3 | enwik8 | 122 | 151 | **0.81x** | 43.7% |
+| L3 | silesia| 234 | 283 | **0.83x** | 38.1% |
+| L4 | web    | 22  | 15  | 1.47x | 35.5% |
+| L4 | enwik8 | 132 | 163 | **0.81x** | 42.7% |
+| L4 | silesia| 241 | 293 | **0.82x** | 37.5% |
+| L5 | web    | 67  | 69  | 0.97x | 32.5% |
+| L5 | enwik8 | 266 | 305 | **0.87x** | 39.6% |
+| L5 | silesia| 550 | 553 | **0.99x** | 33.9% |
+
+**Encode verdict: VK is FASTER than CUDA on every large-corpus cell
+(0.80-0.99x)** — the encode pipeline has no A-028-class divergence
+and the VK submit path amortizes better at encode batch sizes.
+Compression ratios are byte-identical at every cell (cross-backend
+SHA discipline holds). All 30 roundtrips PASS.
+
+### Summary vs the standing parity goal
+
+- e2e decode: PASS everywhere on real workloads (1.00-1.08x).
+- kernel decode: enwik8 1.14-1.35x over bar, ATTRIBUTED (A-028,
+  measured, accepted); silesia at/ahead of parity.
+- encode: VK ahead across the board on large corpora.
+- web.txt small-file regime: unchanged known residual (submit
+  floor), both directions.
