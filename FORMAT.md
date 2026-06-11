@@ -26,7 +26,9 @@ The constants in this document are mirrored byte-for-byte in
 ├───────────────────────────┤
 │    End mark               │  4 bytes (0x00000000)
 ├───────────────────────────┤
-│    Content checksum       │  4 bytes (optional, XXH32)
+│    Content checksum       │  4 bytes (optional, XXH32; flag bit 1)
+├───────────────────────────┤
+│    Chunk-Merkle checksum  │  4 bytes (default-on, XXH32 root; flag bit 5)
 └───────────────────────────┘
 ```
 
@@ -61,7 +63,7 @@ Offset  Size  Field
 | Bit | Name                | Meaning |
 |-----|---------------------|---------|
 | 0   | ContentSizePresent  | 8-byte content size follows the fixed header. The GPU encoder always sets this bit. |
-| 1   | ContentChecksum     | 4-byte XXH32 checksum follows the end mark. The GPU encoder does not set this bit. |
+| 1   | ContentChecksum     | 4-byte XXH32 of the whole uncompressed content follows the end mark. Opt-in: the GPU encoder sets it when `content_checksum` is requested (CLI `--checksum`). |
 | 2   | BlockChecksums      | Per-block XXH32 checksum follows each block payload. The GPU encoder does not set this bit. |
 | 3   | DictionaryIdPresent | 4-byte dictionary ID follows the optional content size. The GPU encoder does not set this bit; decoders reject frames with this bit set (`error.UnknownDictionary`). |
 | 4   | ParallelDecodeMeta  | Legacy CPU-codec sidecar; the GPU decoder skips it, the GPU encoder never sets it. |
@@ -95,10 +97,10 @@ to 4 MB).
 A 32-bit IEEE 754 little-endian float in units of 256 KB chunks. The
 GPU encoder picks adaptively from `{0.25, 0.5}`:
 
-- **0.25** (64 KB sub-chunks) below the GPU saturation threshold —
+- **0.25** (64 KB sub-chunks) below the GPU saturation threshold -
   each decoder warp gets its own sub-chunk, more sub-chunks =
   more parallelism.
-- **0.5** (128 KB sub-chunks) at or above saturation — larger
+- **0.5** (128 KB sub-chunks) at or above saturation - larger
   sub-chunks compress better and the decoder is already saturated.
 
 The saturation threshold is `sm_count × 48 warps × 128 KB`. On an
@@ -111,7 +113,7 @@ no hard-coded SC group size is correct.
 
 64-bit signed integer little-endian (negative values mean "unknown",
 but the GPU encoder never writes a negative value). Capped at 4 GB
-on the decoder side — frames claiming more return
+on the decoder side - frames claiming more return
 `error.ContentSizeTooLarge`.
 
 ---
@@ -136,7 +138,7 @@ The compressed-size field packs flags into the high bits:
 | 0-29 | Size                   | Payload size in bytes. |
 
 An entire 4-byte word of zeros at the block position is the **end
-mark** — no decompressed-size field follows.
+mark** - no decompressed-size field follows.
 
 ---
 
@@ -148,9 +150,21 @@ The block list ends with 4 zero bytes:
 00 00 00 00
 ```
 
-If `ContentChecksum` is set in the frame flags, a 4-byte XXH32 of the
-uncompressed content follows the end mark. The GPU encoder does not
-set this flag.
+Trailers follow the end mark in flag-bit order:
+
+1. If `ContentChecksum` (bit 1) is set, a 4-byte XXH32 of the whole
+   uncompressed content. Opt-in via the encoder's `content_checksum`
+   option (CLI `--checksum`).
+2. If `ChunkMerkleChecksum` (bit 5) is set, the 4-byte Merkle root
+   (default-on since 2026-06-11). Definition: each chunk's hash is
+   XXH32 over the concatenated XXH32s (LE) of its 1024-byte segments
+   (last segment partial); the root is XXH32 over the concatenated
+   per-chunk hashes in chunk-index order. The chunk grid is the
+   frame's effective chunk size, so the root depends on the `--sc`
+   setting: it is a self-verification value, not a
+   content-addressable file hash. The decoder recomputes it from its
+   own output (on the GPU) and rejects the frame with
+   `error.ChecksumMismatch` on disagreement.
 
 ---
 
@@ -162,7 +176,7 @@ followed by an **SC tail prefix table**.
 
 ### Internal block header (2 bytes)
 
-Bytes 0 and 1 are not the same byte order as the rest of the frame —
+Bytes 0 and 1 are not the same byte order as the rest of the frame -
 this header is **inspected byte-by-byte**, not read as a u16.
 
 ```
@@ -191,7 +205,7 @@ back-reference reaches across a chunk boundary, so each chunk can be
 handed to its own decoder warp.
 
 The first eight bytes of each chunk past the first arrive at the
-decoder garbage — the decoder's initial `Copy64` only fires when the
+decoder garbage - the decoder's initial `Copy64` only fires when the
 chunk's `base_offset == 0`, and SC chunks 1..N-1 do not satisfy that.
 The encoder repairs this by appending an **SC tail prefix table**
 after the last chunk's payload:
@@ -201,7 +215,9 @@ after the last chunk's payload:
 ```
 
 Total table size: `(num_chunks - 1) × 8` bytes. The decoder
-overwrites each chunk's first 8 bytes from this table after
+restores each chunk's first 8 bytes from this table (on the GPU via
+`slzScPrefixApplyKernel` when checksum verification runs, and on the
+host) after
 parallel decode completes.
 
 ---
@@ -380,7 +396,7 @@ layout. The body decomposes into:
 Why this layout: in the hot loop every warp lane refills the same
 word index simultaneously. The interleaved area lets that refill be
 **one coalesced 128-byte sector load** instead of 32 scattered
-4-byte loads — measured ~12-13% kernel speedup over the prior
+4-byte loads - measured ~12-13% kernel speedup over the prior
 concatenated layout at ~0.01% header growth.
 
 All 32 stream sizes are stored explicitly so each lane can compute

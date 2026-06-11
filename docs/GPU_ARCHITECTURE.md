@@ -58,14 +58,14 @@ parser) runs the token-parse scans and stages each 32-token batch's
 prefix sums into a shared-memory double buffer, while warps 1-3 (the
 copier team, 96 lanes) execute the staged batch's copies one batch
 behind. The parser can run ahead because its state advancement comes
-entirely from the warp scans, never from the copies — so its global
+entirely from the warp scans, never from the copies - so its global
 reads (cmd bytes, off16 entries) hide under the team's global
 writes. See "The K=4 pipelined decode" section below for the
 synchronization rules and measured results.
 
-The pre-#15 model — one chunk per warp, two non-cooperating warps
+The pre-#15 model - one chunk per warp, two non-cooperating warps
 packed per block (`WARPS_PER_BLOCK = 2`) purely to amortize launch
-overhead — survives in `slzLzDecodeKernel` / `slzLzDecodeRawKernel`,
+overhead - survives in `slzLzDecodeKernel` / `slzLzDecodeRawKernel`,
 the fallback when `SLZ_NO_PIPELINE=1` is set or the pipelined
 symbols are missing. Everything in "Inside the decode loop" below
 describes per-batch work that is identical in both models; only who
@@ -246,21 +246,21 @@ match bytes). After the flat batched copies (v4 #1/#2) collapsed the
 copy phase's instruction count, NCU showed the kernel at 52.7% SM
 throughput with `long_scoreboard` (memory latency) as the dominant
 stall: the warp simply waits on its own loads. The fix is
-structural — split the two phases across warps so one phase's
+structural - split the two phases across warps so one phase's
 latency hides under the other's.
 
 `slzLzDecodeRawPipelinedKernel` / `slzLzDecodeGeneralPipelinedKernel`
 give each chunk a 128-thread block (`blockDim (32,4)`, 12 blocks/SM):
 
-* Warp 0 (parser) runs `fillBatch` — the same PP scans as the
-  single-warp loop — and stages each batch's prefix sums, match
+* Warp 0 (parser) runs `fillBatch` - the same PP scans as the
+  single-warp loop - and stages each batch's prefix sums, match
   data, and dependent-match ballot into a `PipeBatch` shared-memory
   double buffer. Its state advancement (cmd/lit/off16/dst positions,
   recent offset) comes entirely from the scans, so it never waits on
   output bytes.
 * Warps 1-3 (the copier team, 96 lanes) execute the staged batch one
   behind the parser: the flat-literal and flat-independent-match
-  passes as two team-wide loops (no barrier between them — the
+  passes as two team-wide loops (no barrier between them - the
   independent-match reads touch only pre-batch-final bytes, and the
   write ranges are disjoint), then warp 1 alone runs the dependent
   matches in token order.
@@ -287,14 +287,14 @@ see FAILED_EXPERIMENTS.md "mbarrier pipeline ring"):
 * Warp counts per block must be a power of two: K=3 (96-thread
   blocks) packs unevenly on the SM's four schedulers and measured
   19.0 ms vs 16.2 at 1 GB.
-* Raw spin-waits between warps deadlock — NVIDIA's warp scheduler
+* Raw spin-waits between warps deadlock - NVIDIA's warp scheduler
   has no fairness guarantee.
 
 Results (RTX 4060 Ti): enwik8 L1 2.28 → 1.77 ms, enwik9 L1
 20.9 → 16.2 ms (61.7 GB/s, 2.03× nvCOMP LZ4); enwik8 L5
 3.31 → 2.93 ms, enwik9 L5 29.5 → 26.3 ms (1.93× nvCOMP Zstd). NCU
-after: 71.9% SM and 71.9% memory throughput moving in lockstep —
-balanced saturation — with the residual barrier stall (8.2) being
+after: 71.9% SM and 71.9% memory throughput moving in lockstep -
+balanced saturation - with the residual barrier stall (8.2) being
 the lockstep tax. One trade: parser count per SM halves vs the old
 packing, so parser-bound corpora pay slightly at L1 (silesia
 3.87 → 4.05 ms); at L3+ even silesia wins.
@@ -354,12 +354,12 @@ sliced into 4-byte BIL words; let `K = min(words[s])` be the largest
 prefix every stream has. The body is:
 
 ```
-  [128 B weights — 4 bits/symbol]
-  [96 B sub-header — 32 × u24 LE per-stream byte sizes]
-  [4 B K — u32 LE]
-  [K rows × 128 B interleaved area — row w holds lane k's word w at
+  [128 B weights - 4 bits/symbol]
+  [96 B sub-header - 32 × u24 LE per-stream byte sizes]
+  [4 B K - u32 LE]
+  [K rows × 128 B interleaved area - row w holds lane k's word w at
                                       offset (w · 128 + k · 4)]
-  [tail area — per-stream bytes from word K onward, at exclusive
+  [tail area - per-stream bytes from word K onward, at exclusive
                prefix-sum-of-tail-sizes offsets]
 ```
 
@@ -438,9 +438,9 @@ reference encoder, verified across every sub-chunk of enwik8 and
 silesia in `tools/huff_test/huff_lut_build_experiments.cu` against a
 CPU oracle.
 
-The earlier build sat on lane zero for two long serial passes — a
+The earlier build sat on lane zero for two long serial passes - a
 256-iter histogram + canonical-code assignment, then a 256-by-256
-nested loop filling dual-symbol LUT entries — while the other
+nested loop filling dual-symbol LUT entries - while the other
 thirty-one lanes idled. NCU on that version showed it compute-bound
 at 53% SM busy with "Fixed Latency Dependency" the top stall: the
 signature of a long chain of dependent shared-memory writes on a
@@ -483,7 +483,7 @@ wrote to global). Moving the LUT into shared (`__shared__ uint32_t
 lut[1024]`, 4 KB) keeps Pass 1 and Pass 2's many small spans on the
 ~10× faster shared-memory path. At the end of the kernel the warp
 copies the LUT to global with a coalesced uint4 loop using
-`__stcs` — the decoder kernel that consumes the LUT runs in a
+`__stcs` - the decoder kernel that consumes the LUT runs in a
 separate launch and may not be scheduled on this SM, so L1 caching
 the bytes here would only pollute the cache.
 
@@ -502,7 +502,7 @@ the cost of going parallel and synchronizing.
 The kernel uses about 5.5 KB of static shared memory per block
 (256 B code lengths, 1 KB used-symbol list, 4 KB LUT, plus three
 small per-length arrays). At sm_89 that gives eighteen blocks per
-SM resident — below the twenty-four block-count cap that the prior
+SM resident - below the twenty-four block-count cap that the prior
 build hit but, in practice, the workload-imbalance of canonical
 Huffman at this scale already caps achieved occupancy at around 30%
 either way. The win is in the dependent-instruction chains the new
@@ -749,8 +749,12 @@ and the caller receives a device pointer to the result.
 
 ## Resource utilization
 
-Final register, stack, and shared-memory usage for every kernel,
-compiled with `nvcc -arch=sm_89 -O3`:
+Register, stack, and shared-memory usage per kernel, compiled with
+`nvcc -arch=sm_89 -O3`. (2026-06-10 snapshot: predates the v4 #15
+pipelined kernels and the v4 #19 hash kernels; regenerate with
+`tools\build_gpu.bat` for current numbers. The pipelined LZ kernels
+additionally hold a ~2.6 KB PipeBatch double buffer plus handoff
+flags in static shared memory.)
 
 | Kernel | REG | STACK | SHARED |
 |---|---:|---:|---:|
@@ -781,10 +785,11 @@ coalesced uint4 dump to global; the encode-side
 `slzHuffBuildTablesKernel` stages 9.5 KB for the histogram, tree
 nodes, and code tables. The Huffman decode kernel takes 4 KB of
 dynamic shared per launch for the runtime LUT (allocated at kernel
-launch, not counted in the SHARED column above). The LZ decode
-kernel keeps its entire working set in registers; the entropy
-scratch lives in global memory and the hardware caches absorb the
-traffic.
+launch, not counted in the SHARED column above). The single-warp LZ
+decode kernels keep their working set in registers; the pipelined
+K=4 kernels add the shared PipeBatch double buffer that the parser
+and copier team hand batches through. The entropy scratch lives in
+global memory and the hardware caches absorb the traffic.
 
 † The `4Stream` suffix on the two Huffman kernel names is retained
 for the Zig dispatch ABI introduced by the prior 4-stream design.
@@ -828,6 +833,11 @@ tokens in parallel and roll back on mispredictions. Speculation
 would add branch-misprediction overhead that exceeds the gain on
 the rare long-token cases.
 
+(One absence that used to be on this list is gone: as of v4 #19 the
+codec DOES verify its own output - per-chunk hashes computed on
+device, rolled into a 4-byte Merkle root in the frame; see FORMAT.md
+and the README's Integrity section.)
+
 There is no persistent-thread scheduling. Each kernel is a one-shot
 launch that exits when its work is done. There is no thread-pool
 or work-stealing layer. The grid-of-blocks model is sufficient.
@@ -863,11 +873,16 @@ symbols carry the `slz` prefix.
 | decode | `slzGatherRawOff16Kernel` | `decode/lz_kernel.cu` |
 | decode | `slzHuffBuildLutKernel` | `decode/huffman_kernel.cu` |
 | decode | `slzHuffDecode4StreamKernel` | `decode/huffman_kernel.cu` |
+| both | `slzSegHashKernel` (v4 #19: per-1 KiB-segment XXH32) | both `lz_kernel.cu` TUs |
+| both | `slzChunkCombineKernel` (v4 #19: segment hashes -> chunk hash) | both `lz_kernel.cu` TUs |
+| decode | `slzScPrefixApplyKernel` (v4 #19: SC prefixes -> output, on device) | `decode/lz_kernel.cu` |
+| decode | `slzMerkleVerdictKernel` (v4 #19: root compare, 4-byte verdict) | `decode/lz_kernel.cu` |
+| encode | `slzMerkleRootWriteKernel` (v4 #19: root trailer into the device frame) | `encode/lz_kernel.cu` |
 
 The `4Stream` suffix on the Huffman kernels is retained for the Zig
 dispatch ABI; both sides actually operate on `HUFF_NUM_STREAMS = 32`
 streams (one per warp lane). The `.cuh` files are a size-only split,
-`#include`d into the single per-direction aggregator `.cu` — only the
+`#include`d into the single per-direction aggregator `.cu` - only the
 `.cu` emits a `.ptx`. Per-kernel REG/STACK/SHARED numbers come from
 `tools\build_gpu.bat`'s cuobjdump res-usage printout; live per-kernel
 timings from `SLZ_PROFILE_DECODE=1` / `SLZ_PROFILE_PHASES=1`.

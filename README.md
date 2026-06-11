@@ -8,7 +8,7 @@ host-side wire-format assembly.
 There are two sibling GPU backends producing byte-identical frames:
 CUDA (`src/`, `streamlz.exe`) and Vulkan (`srcVK/`,
 `streamlz_vk.exe`, built via `zig build streamlz_vk`). There is no
-CPU codec — the historical CPU implementation and an earlier partial
+CPU codec - the historical CPU implementation and an earlier partial
 Vulkan port were retired (see
 [FAILED_EXPERIMENTS.md](FAILED_EXPERIMENTS.md) "Maintaining parallel
 CPU and GPU codebases" for the rationale; the current `srcVK/` tree
@@ -41,7 +41,7 @@ roughly the same across all five (within ±0.5 ms on a 100 MB input).
 
 The PTX kernel images are committed under `src/encode/` and
 `src/decode/`, so plain `zig build` does not require CUDA installed
-— the Zig drivers `@embedFile` the PTX. The codec needs `nvcuda.dll`
+- the Zig drivers `@embedFile` the PTX. The codec needs `nvcuda.dll`
 at runtime; if it is missing or `cuInit` fails, the codec returns
 `error.BackendNotAvailable`.
 
@@ -59,13 +59,13 @@ fails the build if any source is newer than any PTX.
 
 ## Supported hardware
 
-**CUDA backend (`streamlz.exe`, `streamlz_gpu.dll`)** — NVIDIA only.
+**CUDA backend (`streamlz.exe`, `streamlz_gpu.dll`)** - NVIDIA only.
 The committed PTX targets `sm_89`, so the driver JIT requires compute
 capability ≥ 8.9: **RTX 40-series (Ada) or newer**. Older NVIDIA GPUs
 need a PTX rebuild with a lower `-arch` (untested). Requires
 `nvcuda.dll` at runtime.
 
-**Vulkan backend (`streamlz_vk.exe`)** — any Vulkan 1.2+ device that
+**Vulkan backend (`streamlz_vk.exe`)** - any Vulkan 1.2+ device that
 can pin `subgroupSize = 32` (the kernels are written warp-for-warp
 against the CUDA originals) and exposes `bufferDeviceAddress` +
 8-bit storage features:
@@ -83,7 +83,7 @@ device with its range so you can pick a compatible one via
 
 Verified configurations: NVIDIA RTX 4060 Ti (both backends, primary
 perf target), Intel(R) Graphics iGPU (Vulkan, correctness), AMD
-RX 590/RX 550 (correctly rejected — wave64-only).
+RX 590/RX 550 (correctly rejected - wave64-only).
 
 ---
 
@@ -107,9 +107,9 @@ slzDestroy(ctx);
 
 Two buffer models:
 
-* `slzCompressHost` / `slzDecompressHost` — caller's data on host;
+* `slzCompressHost` / `slzDecompressHost` - caller's data on host;
   the pipeline does its own H2D + D2H.
-* `slzCompressAsync` / `slzDecompressAsync` — caller's data is
+* `slzCompressAsync` / `slzDecompressAsync` - caller's data is
   GPU-resident; the codec submits all work on the caller's CUstream
   and never bounces through host memory.
 
@@ -120,24 +120,28 @@ device-resident path.
 
 ## Performance
 
-Best-of-10+ decode on an RTX 4060 Ti (sm_89), `streamlz -db`,
-re-measured 2026-06-11 (post v4 #15 two-warp pipelined raw kernel; L1/L2
-rows use it, L3+ unchanged). Re-run by `tools\bench_all.bat`.
+Best-of-8+ decode on an RTX 4060 Ti (sm_89), `streamlz -db`,
+re-measured 2026-06-11 (v4 #15 K=4 pipelined LZ kernels at every
+level, and frames carrying the default-on chunk-Merkle checksum, so
+the e2e column INCLUDES integrity verification). Re-run by
+`tools\bench_all.bat`.
 
 ### Decode (ms): D2D wall-clock and end-to-end
 
 | Level | enwik8 D2D / e2e | silesia D2D / e2e |
 |-------|------------------|-------------------|
-| L1 | **1.77** / 14.37 | **4.05** / 29.01 |
-| L2 | **1.94** / 14.42 | **4.06** / 29.08 |
-| L3 | **2.88** / 14.62 | **6.02** / 29.74 |
-| L4 | **2.93** / 14.55 | **6.26** / 29.87 |
-| L5 | **2.93** / 14.32 | **5.94** / 28.93 |
+| L1 | **1.75** / 15.50 | **4.04** / 31.01 |
+| L2 | **1.83** / 15.48 | **4.31** / 31.26 |
+| L3 | **2.87** / 15.68 | **6.02** / 31.92 |
+| L4 | **2.92** / 15.66 | **6.26** / 32.00 |
+| L5 | **2.94** / 15.45 | **5.94** / 31.05 |
 
 D2D wall-clock = the time a device-resident caller of
 `slzDecompressAsync` sees on the wire. End-to-end adds the host-to-
 device upload of the compressed frame + device-to-host download of
-the decompressed output for the host-bounce path.
+the decompressed output for the host-bounce path, plus the
+default-on checksum verification (computed on the GPU, overlapped
+with the output download; see Integrity below).
 
 ### Compression ratio
 
@@ -151,9 +155,20 @@ the decompressed output for the host-bounce path.
 
 L1-L2 are LZ-only (no entropy stage); L2 adds the greedy parser's
 match-range rehash (~1 pp better ratio, +29% encode cost, decodes
-slightly FASTER than L1 — fewer tokens). L3-L5 add 32-stream GPU
+slightly FASTER than L1 - fewer tokens). L3-L5 add 32-stream GPU
 Huffman; L4 adds the rehash on top of L3; L5 swaps in the chain
 parser.
+
+### Integrity
+
+Every frame carries a 4-byte chunk-Merkle checksum by default (wire
+flag bit 5): per-chunk hashes are computed on the GPU at encode,
+rolled into one root, and the decoder recomputes them from its own
+output (also on the GPU, overlapped with the transfer) - corrupted
+data returns `error.ChecksumMismatch` instead of wrong bytes. Cost
+is ~1 ms per 100 MB on encode and ~zero on decode. Pass
+`chunk_checksum = false` to strip it; `--checksum` additionally
+enables the LZ4-style whole-file XXH32 (flag bit 1). See FORMAT.md.
 
 ### vs nvCOMP (enwik8 100 MB, RTX 4060 Ti)
 
@@ -161,13 +176,13 @@ parser.
 |--------|------------:|-----------:|-------------:|
 | Pipeline kernel-sum | **1.88 ms** | 4.77 ms | 2.54× |
 | Async call wall     | **3.13 ms** | 4.77 ms | 1.52× |
-| End-to-end host wall | **14.37 ms** | 18.29 ms | 1.27× |
+| End-to-end host wall | **15.50 ms** | 18.29 ms | 1.18× |
 
 | Window | StreamLZ L5 | nvCOMP Zstd | StreamLZ win |
 |--------|------------:|------------:|-------------:|
 | Pipeline kernel-sum | **3.48 ms** | 6.25 ms | 1.80× |
 | Async call wall     | **4.49 ms** | 6.25 ms | 1.39× |
-| End-to-end host wall | **14.32 ms** | 18.16 ms | 1.27× |
+| End-to-end host wall | **15.45 ms** | 18.16 ms | 1.18× |
 
 StreamLZ columns re-measured 2026-06-11; nvCOMP columns are the
 2026-05-27 `nvcomp_bench3` runs (our changes don't affect them).
@@ -177,7 +192,7 @@ measurement methodology" for what each window measures - the
 pipeline / async / end-to-end columns answer different questions and
 confusing them is easy.
 
-### vs nvCOMP (enwik9 1 GB, RTX 4060 Ti, re-measured 2026-06-10)
+### vs nvCOMP (enwik9 1 GB, RTX 4060 Ti, re-measured 2026-06-11)
 
 At 1 GB scale StreamLZ wins ratio AND decode speed simultaneously at
 both ends of the level range (decode kernel = cuEvent best-of-30 for
@@ -186,17 +201,17 @@ StreamLZ, best-of-20 for nvCOMP; e2e = host wall incl. PCIe both ways):
 | | StreamLZ L1 | nvCOMP LZ4 | margin |
 |--------|------------:|-----------:|-------:|
 | Ratio | **52.6%** | 53.6% | 10 MB smaller |
-| Decode kernel | **16.2 ms** (61.7 GB/s) | 33.0 ms (30.3 GB/s) | 2.03× |
-| Decode e2e | **137.7 ms** | 162.0 ms | 1.18× |
+| Decode kernel | **16.3 ms** (61.4 GB/s) | 33.0 ms (30.3 GB/s) | 2.03× |
+| Decode e2e | **148.9 ms** (incl. verification) | 162.0 ms | 1.09× |
 
 | | StreamLZ L5 | nvCOMP Zstd | margin |
 |--------|------------:|------------:|-------:|
 | Ratio | **35.50%** | 35.75% | 2.5 MB smaller |
-| Decode kernel | **26.3 ms** (38.1 GB/s) | 50.8 ms (19.7 GB/s) | 1.93× |
-| Decode e2e | **140.2 ms** | 164.4 ms | 1.17× |
+| Decode kernel | **26.3 ms** (38.0 GB/s) | 50.8 ms (19.7 GB/s) | 1.93× |
+| Decode e2e | **148.9 ms** (incl. verification) | 164.4 ms | 1.10× |
 
 These numbers use the 2026-06-09 defaults: `sc_group_size = 0.25` at
-every input size (64 KB sub-chunks — more decode warps, shorter
+every input size (64 KB sub-chunks - more decode warps, shorter
 per-warp serial chains) and `hash_bits = 17` at every level. Pass
 `--sc 0.5` for ~2 pp better ratio at ~1.8× slower 1 GB-scale decode.
 

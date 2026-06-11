@@ -1,4 +1,4 @@
-# StreamLZ — Vulkan backend
+# StreamLZ - Vulkan backend
 
 GPU-accelerated LZ77 compressor + decompressor. Vulkan 1.3 compute
 shaders do the per-chunk LZ work and 32-stream Huffman decode; thin
@@ -51,7 +51,7 @@ CLI prints at startup before trusting any perf number.
 
 Two surfaces are exported:
 
-**CUDA-shaped** (`include/streamlz_gpu.h`) — drop-in CUDA replacement.
+**CUDA-shaped** (`include/streamlz_gpu.h`) - drop-in CUDA replacement.
 Same `slzCreate` / `slzCompressHost` / `slzDecompressHost` /
 `slzCompressAsync` / `slzDecompressAsync` / `slzGetLastTimings` names
 as the CUDA build. Existing CUDA call sites don't need to change.
@@ -69,14 +69,14 @@ slzDecompressHost(ctx, comp, comp_size, out, out_size, &written, slzDecompressDe
 slzDestroy(ctx);
 ```
 
-**VK-native** (`include/streamlz_gpu_vk.h`) — `_vk`-suffixed surface
+**VK-native** (`include/streamlz_gpu_vk.h`) - `_vk`-suffixed surface
 with opaque `slzVkHandle_t`, true async + polling (`slzCompressAsync_vk`
 + `slzCompressAsyncPoll_vk` pair), VkBuffer registration via
 `slzRegisterBuffer_vk`, synthetic-pointer helpers for D2D testing via
 `slzMakeDeviceOnlyHandle_vk`. 16 symbols total. Use this when you
 want VK-native semantics rather than CUDA-shaped emulation.
 
-Both surfaces share the same internal codec — picking one is purely a
+Both surfaces share the same internal codec - picking one is purely a
 caller-style decision.
 
 ---
@@ -85,18 +85,21 @@ caller-style decision.
 
 Best-of-5 decode + single-shot encode on an RTX 4060 Ti (sm_89,
 Vulkan API 1.4.325), `streamlz_vk -db -r 5` and `streamlz_vk -b -r 5`.
-Full sweep tables in [PerfSweep.md](PerfSweep.md); 60 raw bench
-captures under `c:/tmp/perfsweep/`.
+Full sweep tables in [PerfSweep.md](PerfSweep.md) (the 2026-06-11
+"full 60-cell re-sweep" section is current); raw captures under
+`c:/tmp/perfsweep11/`.
 
 ### Decode (ms): end-to-end host wall-clock
 
 | Level | enwik8 (95 MB) | silesia (203 MB) |
 |-------|---------------:|-----------------:|
-| L1 | **15.0** | **29.0** |
-| L2 | **14.9** | **29.1** |
-| L3 | **17.1** | **32.7** |
-| L4 | **17.1** | **32.7** |
-| L5 | **17.1** | **32.7** |
+| L1 | **15.2** | **29.6** |
+| L2 | **15.2** | **29.4** |
+| L3 | **15.9** | **30.8** |
+| L4 | **15.3** | **30.5** |
+| L5 | **15.1** | **30.0** |
+
+(2026-06-11 sweep, RTX 4060 Ti via `SLZ_VK_DEVICE_INDEX=1`.)
 
 End-to-end = H2D upload of compressed frame + GPU decode + D2H download
 of decompressed output, as a host-bounce caller sees it.
@@ -106,34 +109,36 @@ of decompressed output, as a host-bounce caller sees it.
 | Level | enwik8 | silesia |
 |-------|-------:|--------:|
 | L1 | 58.6% | 47.8% |
-| L2 | 58.6% | 47.8% |
-| L3 | 43.7% | 38.0% (CUDA 38.0%; 1.00019× wider, A-008) |
+| L2 | 57.3% | 47.2% |
+| L3 | 43.7% | 38.1% |
 | L4 | 42.7% | 37.5% |
 | L5 | 39.6% | 33.9% |
 
-Byte-identical to the CUDA backend on every (level, corpus) cell
-**except** silesia L3, where the Vulkan 4 GiB SSBO range cap forces a
-`hash_bits=18` clamp (CUDA uses 19); cost is 0.019% larger output.
-Documented as A-008.
+Byte-identical to the CUDA backend on EVERY (level, corpus) cell,
+including the checksum trailers: the cross-backend SHA gate runs
+after every encoder change. (The historical silesia L3 A-008
+exception closed when hash_bits settled at 17 everywhere and the
+v4 #5 BDA work removed the SSBO range cap.) L2 gained the
+match-range rehash 2026-06-10 (v4 #6), which is why it now differs
+from L1.
 
 ### StreamLZ-Vulkan vs StreamLZ-CUDA (RTX 4060 Ti, enwik8 + silesia)
 
 | Window | VK vs CUDA | Notes |
 |--------|-----------:|-------|
-| Decode e2e (all levels, large workloads) | **0.96-1.03×** | Inside 10% parity bar everywhere |
-| Decode `gpu kernel` (L1/L2 large workloads) | **0.96-1.02×** | At or under CUDA |
-| Decode `gpu kernel` (L3-L5 large workloads) | 1.20-1.37× | Over bar; absorbed by host overhead at e2e (A-021) |
-| Encode (L1/L2 enwik8) | **0.81-0.86×** | VK measurably faster than CUDA |
-| Encode (L3-L5 large workloads) | 0.95-1.01× | At parity (within single-shot noise band) |
-| Output bytes | 14/15 cells identical | silesia L3 1.00019× (A-008) |
+| Decode e2e (all levels, large workloads) | **1.00-1.08×** | Inside the 10% parity bar everywhere |
+| Decode `gpu kernel` (L1/L2 silesia) | **0.92-0.98×** | VK FASTER (CUDA's K=4 pipeline pays parser dilution on binary corpora) |
+| Decode `gpu kernel` (enwik8, all levels) | 1.14-1.35× | Over bar; attributed + accepted (A-028: the K=4 pipeline measured SLOWER on the VK driver, so VK stays single-warp) |
+| Encode (L1/L2 large workloads) | 0.98-1.08× | At parity post v4 #17 |
+| Encode (L3-L5 large workloads) | **0.85-0.93×** | VK faster (BAR-mapped gather; documented #17 residual) |
+| Output bytes | 15/15 cells identical | incl. checksum trailers |
 
 ### StreamLZ-Vulkan vs nvCOMP (transitive)
 
-The CUDA backend beats nvCOMP LZ4 by 1.18× (kernel-sum) / 1.03×
-(async wall) / 1.18× (end-to-end host wall) on enwik8 L1, and beats
-nvCOMP Zstd by 1.14× / 1.05× / 1.19× on enwik8 L5 — see the root
-[README.md](../README.md) "vs nvCOMP" section for methodology + raw
-numbers.
+The CUDA backend beats nvCOMP LZ4 by 2.5× (kernel-sum) / 1.5×
+(async wall) on enwik8 L1, and nvCOMP Zstd by 1.8× / 1.4× on enwik8
+L5 - see the root [README.md](../README.md) "vs nvCOMP" section for
+methodology + current numbers.
 
 The Vulkan backend is within 5% of the CUDA backend at end-to-end on
 every large-workload cell, so it inherits the nvCOMP advantage with a
@@ -141,13 +146,15 @@ small margin. Concrete enwik8 e2e numbers (RTX 4060 Ti):
 
 | Codec | enwik8 L1 e2e | enwik8 L5 e2e |
 |-------|--------------:|--------------:|
-| StreamLZ-VK | **15.0 ms** | **17.1 ms** |
-| StreamLZ-CUDA | 15.5 ms | 15.3 ms |
-| nvCOMP LZ4 | 18.3 ms | — |
-| nvCOMP Zstd | — | 18.2 ms |
+| StreamLZ-VK | **15.2 ms** | **15.1 ms** |
+| StreamLZ-CUDA | 15.5 ms | 15.5 ms |
+| nvCOMP LZ4 | 18.3 ms | n/a |
+| nvCOMP Zstd | n/a | 18.2 ms |
 
-VK is roughly tied with CUDA at L1, slightly behind at L5 (the
-A-021 kernel-time residual on the Huffman+LZ decode chain), and still
+VK is at parity with CUDA end-to-end at every level (the remaining
+enwik8 KERNEL-time gap is the A-028 accepted divergence: CUDA's K=4
+pipelined decode measured slower on the VK driver, so VK keeps the
+single-warp kernels and PCIe absorbs the difference), and still
 ahead of nvCOMP at both levels.
 
 ### Web.txt small-file regime
@@ -202,7 +209,7 @@ tests/                            integration + cross-backend + ptest
 
 PortAdaptations.md                catalog of every CUDA-VK divergence
                                   (21 entries; 16 RESOLVED, 5 ACTIVE
-                                  residuals — all documented with both
+                                  residuals - all documented with both
                                   static + runtime verification status)
 PerfSweep.md                      Phase 5 perf parity tables (L1-L5 ×
                                   3 corpora × VK + CUDA × decode + encode)
@@ -282,7 +289,7 @@ For invariants + bench measurement procedures see
 ## How to measure
 
 ```powershell
-# Decode (-r 5 + 1 warmup) — apples-to-apples with CUDA
+# Decode (-r 5 + 1 warmup) - apples-to-apples with CUDA
 $env:SLZ_VK_DEVICE_INDEX = "1"
 ./zig-out/bin/streamlz_vk.exe -db -r 5 tests/goldens/enwik8.txt.L1.slz
 
@@ -303,7 +310,7 @@ $env:SLZ_VK_DEVICE_INDEX = "1"; zig build ptest_vk -Doptimize=ReleaseFast
 $env:SLZ_VK_DEVICE_INDEX = "0"; zig build ptest_vk -Doptimize=ReleaseFast
 ```
 
-GPU benchmarks must run **serially** — never parallelize bench
+GPU benchmarks must run **serially** - never parallelize bench
 invocations (even across backends); they contend for GPU/WDDM and
 produce biased numbers. Always verify the `Device: <name>` line in the
 CLI output before trusting any perf number.
