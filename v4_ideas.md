@@ -883,3 +883,23 @@ Verification: cross-backend SHA gate 5/5 MATCH after EACH backend's
 change; ptest 50/0/0; ptest_vk 151/9/0; PerfSweep encode table
 re-measured post-#17.
 
+
+## 18. OPEN BUG (intermittent): L1 roundtrip byte mismatch at chunk1+8 — suspect K=4 pipeline race
+
+Caught 2026-06-11 (late): ONE ptest failure in ~6 full-suite runs —
+`byte mismatch for medium text L1 at offset 65544` (= 65536 + 8,
+chunk 1's first post-SC-prefix byte) in
+gpu_roundtrip_tests "every shape and level". Three immediate re-runs
+clean. The commit under test only added an env-gated L3+ dump hook
+(inert at L1), so the suspect is the v4 #15 K=4 pipelined raw
+kernel (shipped same day) under a small-grid / multi-chunk-group
+timing it rarely hits — the failing offset is exactly the
+prime/serial boundary the pipeline negotiates. All large-scale SHA
+gates (enwik8/enwik9, 1 GB) pass repeatedly; the failing shape is a
+small multi-chunk test input.
+**Repro plan (next session, FIRST)**: loop the roundtrip L1 shapes
+100+ times pipelined vs SLZ_NO_PIPELINE=1 to attribute; then audit
+the kernel's cross-chunk-iteration shared-state reuse (s_have/s_pb
+across the c-loop and sc-loop) and the prime path for cpg > 1.
+Until attributed, treat releases with care: SLZ_NO_PIPELINE=1 is
+the mitigation.
