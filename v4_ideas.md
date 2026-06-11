@@ -780,3 +780,32 @@ battery + fuzz tier from #13). No ratio/speed effect on dict-less
 frames. Gate on a measured win: build the host-side prototype first
 and measure ratio lift on a real small-records corpus (e.g. 10k JSON
 docs) before touching kernels.
+
+## 17. Reverse-port VK persistent encode regions to CUDA (~15-20% encode wall)
+
+**What**: The 2026-06-11 60-cell sweep found VK encode FASTER than
+CUDA on every large-corpus cell (0.80-0.99x wall). The kernels are
+at parity (1:1 ports, same GPU) — the whole gap is the non-kernel
+slice: CUDA enwik8 L1 = 74 ms kernel inside a 123 ms wall (~49 ms
+of upload/download/assembly/setup) vs VK's ~35 ms of the same. The
+structural cause is known: VK encode got the Phase 4 persistent
+encode regions treatment (A-018..A-020 — device buffers allocated
+once, reused across calls) while the CUDA encode path predates it
+and was deliberately left alone under the decode-first policy.
+Reverse-port that treatment: persistent device allocations for the
+encode scratch/staging buffers, pinned-host staging where the VK
+path effectively has it, and the same per-call setup elision.
+
+**Why**: first measured case of the VK tree leading the CUDA tree;
+the sweep gives exact per-cell before/after targets (e.g. enwik8 L1
+123 -> ~109 ms, silesia L5 553 -> ~550 already at parity — the win
+concentrates at L1-L4 on large inputs).
+
+**Expected**: ~15-20% encode wall on large inputs. Zero kernel
+changes, zero wire-format risk, zero decode impact.
+
+**Cost/risk**: days, low risk — allocation-lifetime plumbing in the
+CUDA encode driver only. Verify with the standard battery (ptest +
+cross-backend SHA gate on L1/L3/L5) plus a re-run of the encode
+column of the 60-cell sweep. Risk class: leaks/reuse-after-free in
+long-lived contexts; the VK implementation is the reference.
