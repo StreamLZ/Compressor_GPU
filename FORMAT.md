@@ -64,7 +64,9 @@ Offset  Size  Field
 | 1   | ContentChecksum     | 4-byte XXH32 checksum follows the end mark. The GPU encoder does not set this bit. |
 | 2   | BlockChecksums      | Per-block XXH32 checksum follows each block payload. The GPU encoder does not set this bit. |
 | 3   | DictionaryIdPresent | 4-byte dictionary ID follows the optional content size. The GPU encoder does not set this bit; decoders reject frames with this bit set (`error.UnknownDictionary`). |
-| 4-7 | Reserved            | Must be 0. |
+| 4   | ParallelDecodeMeta  | Legacy CPU-codec sidecar; the GPU decoder skips it, the GPU encoder never sets it. |
+| 5   | ChunkMerkleChecksum | 4-byte trailer after the end mark (after the bit-1 trailer when both are set): XXH32 over the concatenated per-chunk XXH32s (LE, chunk-index order) of the decompressed content, chunk grid = the frame's effective chunk size. A self-verification root, NOT a plain content hash - do not compare external XXH32(file) against it. The GPU encoder sets this by default since 2026-06-11 (v4 #19); not set on the device-resident (Async) encode path in v1. |
+| 6-7 | Reserved            | Must be 0. |
 
 ### Codec ID at offset 6
 

@@ -317,6 +317,19 @@ pub fn decompressFrameInner(
         const actual = xxh.xxhash32(dst[0..dst_off]);
         if (actual != expected) return error.ChecksumMismatch;
     }
+    // v4 #19 (CUDA-mirror): chunk-Merkle trailer, after the content
+    // trailer when both flags are set. Parallel per-chunk hash; see
+    // src/decode/streamlz_decoder.zig for the CUDA reference.
+    if (hdr.chunk_merkle) {
+        const merkle_pos = pos + @as(usize, if (hdr.content_checksum) 4 else 0);
+        if (merkle_pos + 4 > src.len) return error.Truncated;
+        const expected = std.mem.readInt(u32, src[merkle_pos..][0..4], .little);
+        const xxh = @import("../format/xxhash32.zig");
+        const eff = @min(frame.scGroupSizeToBytes(hdr.sc_group_size), constants.chunk_size);
+        const actual = xxh.chunkMerkleRoot(std.heap.page_allocator, dst[0..dst_off], eff) catch
+            return error.ChecksumMismatch;
+        if (actual != expected) return error.ChecksumMismatch;
+    }
     return .{ .written = dst_off };
 }
 

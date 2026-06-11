@@ -66,3 +66,51 @@ test "xxhash32 known vectors" {
     // >16 bytes exercises the 4-lane accumulator path:
     try testing.expectEqual(xxhash32("abcdefghijklmnop"), xxhash32("abcdefghijklmnop"));
 }
+
+/// v4 #19 (CUDA-mirror): chunk-Merkle root. See
+/// src/format/xxhash32.zig::chunkMerkleRoot for full semantics. The
+/// two implementations MUST stay value-identical - the cross-backend
+/// SHA gate compares whole frames including this trailer.
+pub fn chunkMerkleRoot(gpa: std.mem.Allocator, data: []const u8, eff_chunk: usize) error{OutOfMemory}!u32 {
+    std.debug.assert(eff_chunk > 0);
+    const n_chunks = if (data.len == 0) 0 else (data.len + eff_chunk - 1) / eff_chunk;
+    if (n_chunks == 0) return xxhash32(&[_]u8{});
+
+    const hashes = try gpa.alloc(u32, n_chunks);
+    defer gpa.free(hashes);
+
+    const n_threads = @min(@max(std.Thread.getCpuCount() catch 4, 1), 16);
+    if (n_chunks < 8 or n_threads < 2) {
+        for (0..n_chunks) |i| hashes[i] = hashChunk(data, eff_chunk, i);
+    } else {
+        const Worker = struct {
+            fn run(d: []const u8, eff: usize, out: []u32, start: usize, stride: usize) void {
+                var i = start;
+                while (i < out.len) : (i += stride) out[i] = hashChunk(d, eff, i);
+            }
+        };
+        var threads: [16]std.Thread = undefined;
+        var spawned: usize = 0;
+        const nt = @min(n_threads, n_chunks);
+        while (spawned < nt) : (spawned += 1) {
+            threads[spawned] = std.Thread.spawn(
+                .{},
+                Worker.run,
+                .{ data, eff_chunk, hashes, spawned, nt },
+            ) catch break;
+        }
+        var lane = spawned;
+        while (lane < nt) : (lane += 1) {
+            var i = lane;
+            while (i < n_chunks) : (i += nt) hashes[i] = hashChunk(data, eff_chunk, i);
+        }
+        for (0..spawned) |t_i| threads[t_i].join();
+    }
+    return xxhash32(std.mem.sliceAsBytes(hashes));
+}
+
+fn hashChunk(data: []const u8, eff_chunk: usize, i: usize) u32 {
+    const start = i * eff_chunk;
+    const len = @min(eff_chunk, data.len - start);
+    return xxhash32(data[start..][0..len]);
+}

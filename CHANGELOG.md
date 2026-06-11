@@ -92,6 +92,17 @@ Wire format unchanged from 2026-06-09; all frames byte-identical.
   Verified: ptest_vk 150/9/0, enwik9 1 GB L3+L5 SHA MATCH, D2D sweep
   all-verified, Intel iGPU L5 SHA MATCH (BDA on both vendors);
   enwik9 L5 kernels 35.7 -> 35.5 ms.
+- **Chunk-Merkle content checksum, default ON** (v4 #19, both
+  backends, wire flag bit 5): XXH32-of-per-chunk-XXH32s as a single
+  4-byte trailer; decoder verifies its output and returns
+  ChecksumMismatch instead of silently wrong bytes. Parallel host
+  hash costs ~2 ms/100 MB per side (encode 87 -> 89 ms, decode e2e
+  16 -> 18 ms) vs +13 ms for the scalar whole-file hash it replaces
+  as the integrity story. Not emitted on the Async/D2D encode path
+  in v1 (sentinel host slice); device-side hash kernel staged in
+  both PTX modules for v2. Gates: ptest 51/0/0, ptest_vk 151/9/0,
+  cross-backend SHA 5/5 including trailers, corruption smoke both
+  backends.
 - **v4 #11 (per-chunk Huffman-vs-tANS selector) measured and PARKED
   definitively**: gate-2 replaced gate-1's estimates with REAL wire
   sizes on both sides - the retired host tANS encoder resurrected as

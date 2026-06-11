@@ -34,7 +34,10 @@ pub const FrameFlags = packed struct(u8) {
     block_checksums: bool = false,
     dictionary_id_present: bool = false,
     parallel_decode_metadata_present: bool = false,
-    _reserved: u3 = 0,
+    /// Bit 5 (v4 #19): chunk-Merkle checksum trailer follows the
+    /// end-mark. See the CUDA reference for full semantics.
+    chunk_merkle: bool = false,
+    _reserved: u2 = 0,
 };
 
 /// CUDA reference: src/format/frame_format.zig:91-103. Codec enum.
@@ -66,6 +69,7 @@ pub const FrameHeader = struct {
     content_size: ?u64,
     dictionary_id: ?u32,
     content_checksum: bool,
+    chunk_merkle: bool,
     header_size: usize,
 };
 
@@ -139,6 +143,7 @@ pub fn parseHeader(src: []const u8) ParseError!FrameHeader {
         .content_size = content_size,
         .dictionary_id = dict_id,
         .content_checksum = raw_flags.content_checksum,
+        .chunk_merkle = raw_flags.chunk_merkle,
         .header_size = pos,
     };
 }
@@ -171,6 +176,7 @@ pub const WriteHeaderOptions = struct {
     parallel_decode_metadata_present: bool = false,
     content_size: ?u64 = null,
     content_checksum: bool = false,
+    chunk_merkle: bool = false,
     block_checksums: bool = false,
     dictionary_id: ?u32 = null,
 };
@@ -194,6 +200,7 @@ pub fn writeHeader(dst: []u8, opts: WriteHeaderOptions) WriteError!usize {
     const flags: FrameFlags = .{
         .content_size_present = opts.content_size != null,
         .content_checksum = opts.content_checksum,
+        .chunk_merkle = opts.chunk_merkle,
         .block_checksums = opts.block_checksums,
         .dictionary_id_present = opts.dictionary_id != null,
         .parallel_decode_metadata_present = opts.parallel_decode_metadata_present,

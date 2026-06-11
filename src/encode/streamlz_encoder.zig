@@ -66,6 +66,12 @@ pub const Options = struct {
     /// verifies it post-decode and returns error.ChecksumMismatch on
     /// any corruption (v4 #13, 2026-06-10).
     content_checksum: bool = false,
+    /// v4 #19: chunk-Merkle checksum (flag bit 5) - XXH32 over the
+    /// per-chunk XXH32s of the source, 4-byte trailer. Default ON:
+    /// integrity costs ~1 ms/100 MB (parallel host hash) and lets the
+    /// decoder KNOW when output is corrupt instead of returning wrong
+    /// bytes silently. Pass false to strip it.
+    chunk_checksum: bool = true,
 };
 
 /// Upper bound on the compressed-output size for an input of `src_len`
@@ -80,7 +86,7 @@ pub fn compressBound(src_len: usize) usize {
     // off32 / length headers that follow.
     const per_sub_chunk_overhead: usize = 3 + 8 + 3 + 256;
     const sc_prefix_upper_bound: usize = chunk_count * 8;
-    return frame.max_header_size + 4
+    return frame.max_header_size + 4 + 4 // (+4: v4 #19 merkle trailer)
         + chunk_count * (8 + 2 + 4)
         + sub_chunks * per_sub_chunk_overhead
         + src_len
@@ -130,6 +136,22 @@ pub fn compressFramedWithIo(
         if (frame_len + 4 > dst.len) return error.DestinationTooSmall;
         const xxh = @import("../format/xxhash32.zig");
         std.mem.writeInt(u32, dst[frame_len..][0..4], xxh.xxhash32(src), .little);
+        frame_len += 4;
+    }
+    // v4 #19: chunk-Merkle trailer (after the content trailer when both
+    // are set - the decoder reads them in the same order).
+    // d_input_override != 0 means the caller's data is DEVICE-resident
+    // and the host `src` slice is a length-only sentinel (see
+    // EncodeContext.d_input_override) - it MUST NOT be dereferenced.
+    // v1 therefore skips the Merkle trailer on the D2D path (flag
+    // stays clear; decoders handle both). v2: hash on device via the
+    // slzChunkHashKernel already staged in the PTX modules.
+    if (opts.chunk_checksum and enc_ctx.d_input_override == 0) {
+        if (frame_len + 4 > dst.len) return error.DestinationTooSmall;
+        const xxh = @import("../format/xxhash32.zig");
+        const eff = fast_framed.effChunkFor(src.len, opts.sc_group_size_override);
+        const root = xxh.chunkMerkleRoot(allocator, src, eff) catch return error.OutOfMemory;
+        std.mem.writeInt(u32, dst[frame_len..][0..4], root, .little);
         frame_len += 4;
     }
     return frame_len;

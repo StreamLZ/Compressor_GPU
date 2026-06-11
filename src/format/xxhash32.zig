@@ -66,3 +66,70 @@ test "xxhash32 known vectors" {
     // >16 bytes exercises the 4-lane accumulator path:
     try testing.expectEqual(xxhash32("abcdefghijklmnop"), xxhash32("abcdefghijklmnop"));
 }
+
+/// v4 #19: chunk-Merkle root. Hash each eff_chunk-sized chunk of
+/// `data` independently (parallel across threads — the per-chunk
+/// independence is the whole point), concatenate the per-chunk u32s
+/// in chunk-index order (LE), and return XXH32 over that array. The
+/// frame stores ONLY this root (4 bytes); the per-chunk values are
+/// scaffolding. NOTE: the root depends on eff_chunk (the frame's own
+/// chunk grid), so it is a self-verification value, not a
+/// content-addressable file hash — external plain-XXH32 tools must
+/// not compare against it (hence its own flag bit, not bit 1).
+pub fn chunkMerkleRoot(gpa: std.mem.Allocator, data: []const u8, eff_chunk: usize) error{OutOfMemory}!u32 {
+    std.debug.assert(eff_chunk > 0);
+    const n_chunks = if (data.len == 0) 0 else (data.len + eff_chunk - 1) / eff_chunk;
+    if (n_chunks == 0) return xxhash32(&[_]u8{});
+
+    const hashes = try gpa.alloc(u32, n_chunks);
+    defer gpa.free(hashes);
+
+    const n_threads = @min(@max(std.Thread.getCpuCount() catch 4, 1), 16);
+    if (n_chunks < 8 or n_threads < 2) {
+        for (0..n_chunks) |i| hashes[i] = hashChunk(data, eff_chunk, i);
+    } else {
+        const Worker = struct {
+            fn run(d: []const u8, eff: usize, out: []u32, start: usize, stride: usize) void {
+                var i = start;
+                while (i < out.len) : (i += stride) out[i] = hashChunk(d, eff, i);
+            }
+        };
+        var threads: [16]std.Thread = undefined;
+        var spawned: usize = 0;
+        const nt = @min(n_threads, n_chunks);
+        while (spawned < nt) : (spawned += 1) {
+            threads[spawned] = std.Thread.spawn(
+                .{},
+                Worker.run,
+                .{ data, eff_chunk, hashes, spawned, nt },
+            ) catch break; // spawn failure: lanes >= spawned covered below
+        }
+        // Cover any lanes whose thread failed to spawn (stride nt keeps
+        // lane ownership disjoint, so double work is impossible).
+        var lane = spawned;
+        while (lane < nt) : (lane += 1) {
+            var i = lane;
+            while (i < n_chunks) : (i += nt) hashes[i] = hashChunk(data, eff_chunk, i);
+        }
+        for (0..spawned) |t_i| threads[t_i].join();
+    }
+    return xxhash32(std.mem.sliceAsBytes(hashes));
+}
+
+fn hashChunk(data: []const u8, eff_chunk: usize, i: usize) u32 {
+    const start = i * eff_chunk;
+    const len = @min(eff_chunk, data.len - start);
+    return xxhash32(data[start..][0..len]);
+}
+
+test "chunkMerkleRoot basic properties" {
+    const testing = std.testing;
+    var data: [200000]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @intCast((i * 31) % 251);
+    const r1 = try chunkMerkleRoot(testing.allocator, &data, 65536);
+    const r2 = try chunkMerkleRoot(testing.allocator, &data, 65536);
+    try testing.expectEqual(r1, r2); // deterministic across thread counts
+    data[65544] ^= 0x01; // chunk 1, byte 8 - the #18 signature offset
+    const r3 = try chunkMerkleRoot(testing.allocator, &data, 65536);
+    try testing.expect(r1 != r3); // corruption detected
+}

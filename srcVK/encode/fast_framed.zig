@@ -177,6 +177,13 @@ fn codecLevelFor(user_level: u8) u8 {
 
 /// CUDA reference: src/encode/fast_framed.zig:91-139. Compress one frame
 /// from src into dst. Returns the number of bytes written.
+/// v4 #19 (CUDA-mirror): the frame's effective chunk size - the
+/// Merkle chunk grid. MUST match compressFramedOne's eff_chunk.
+pub fn effChunkFor(src_len: usize, sc_override: ?f32) usize {
+    const sc = resolveScGroupSize(src_len, sc_override);
+    return @min(frame.scGroupSizeToBytes(sc), lz_constants.chunk_size);
+}
+
 pub fn compressFramedOne(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -214,6 +221,7 @@ pub fn compressFramedOne(
         .content_size = if (opts.include_content_size) @as(u64, @intCast(src.len)) else null,
         .dictionary_id = null,
         .content_checksum = false,
+        .chunk_merkle = opts.chunk_checksum,
     }) catch return error.DestinationTooSmall;
     pos += hdr_len;
 

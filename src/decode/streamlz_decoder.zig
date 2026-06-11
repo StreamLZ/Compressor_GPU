@@ -341,6 +341,21 @@ fn decompressFrameInner(
         const actual = xxh.xxhash32(dst[0..dst_off]);
         if (actual != expected) return error.ChecksumMismatch;
     }
+    // v4 #19: chunk-Merkle trailer - follows the content trailer when
+    // both flags are set. Verified with the parallel per-chunk hash
+    // (~1 ms/100 MB across threads), so default-ON integrity does not
+    // move the e2e headline. D2D outputs live on device; skipped there
+    // like the content checksum (the GPU-side verify is the v2 plan).
+    if (hdr.chunk_merkle and d_output_target == null) {
+        const merkle_pos = pos + @as(usize, if (hdr.content_checksum) 4 else 0);
+        if (merkle_pos + 4 > src.len) return error.Truncated;
+        const expected = std.mem.readInt(u32, src[merkle_pos..][0..4], .little);
+        const xxh = @import("../format/xxhash32.zig");
+        const eff = @min(frame.scGroupSizeToBytes(hdr.sc_group_size), constants.chunk_size);
+        const actual = xxh.chunkMerkleRoot(std.heap.page_allocator, dst[0..dst_off], eff) catch
+            return error.ChecksumMismatch;
+        if (actual != expected) return error.ChecksumMismatch;
+    }
     return .{ .written = dst_off };
 }
 

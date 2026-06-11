@@ -941,3 +941,48 @@ addition -- fold into the #8 wire-format design if pursued. NOTE:
 flipping any checksum default must land on BOTH backends in one
 commit or the cross-backend SHA gate fails by construction (the
 trailer changes frame bytes).
+
+## 19. Chunk-Merkle content checksum — ✅ DONE 2026-06-11 (v1, both backends, default ON)
+
+**What (user-designed)**: per-chunk XXH32s of the decompressed
+content, concatenated in chunk-index order, hashed again → ONE u32
+trailer after the end mark (flag bit 5). Total wire cost 4 bytes.
+The decoder recomputes per-chunk hashes of its OUTPUT and compares
+the root — corruption anywhere → `error.ChecksumMismatch` instead of
+silently wrong bytes. Born from #18's "does the software KNOW it
+fails?" (it didn't, by default).
+
+**Why Merkle instead of plain XXH32(file)**: the per-chunk hashes
+are embarrassingly parallel. Plain scalar XXH32 measured +13 ms per
+100 MB EACH WAY (+15% encode, +81% decode e2e — unacceptable as a
+default); the parallel root costs ~2 ms per side (16 host threads,
+~50 GB/s effective). Measured default-ON: encode 87 → 89 ms, decode
+e2e 16 → 18 ms on enwik8 L1.
+
+**v1 shape**: host-parallel hash (`chunkMerkleRoot` in both
+backends' format/xxhash32.zig, value-identical — the cross-backend
+SHA gate covers the trailer: 5/5 MATCH). Default ON in both
+encoders' Options (`chunk_checksum`, pass false to strip). NOT set
+on the device-resident Async encode path in v1 (the host `src` is a
+length-only sentinel there — dereferencing it was an AV found by
+c_abi_tests; the same reason D2D decode skips verification). The
+chunk grid = the frame's eff_chunk, derived identically on both
+sides (`effChunkFor` mirrors the encoder/decoder walk grid). NOTE:
+the root depends on the chunk grid — same content at different --sc
+gives a different root; it is self-verification, not a
+content-addressable hash (hence its own flag bit, never bit 1).
+
+**v2 (when wanted)**: `slzChunkHashKernel` (device XXH32, one thread
+per chunk) is already written and staged in BOTH PTX modules
+(src/common/xxh32_device.cuh) — wiring it in moves the cost to
+~0.1 ms, adds D2D-path coverage on both encode and decode, and on
+the decode side needs the SC-prefix post-pass moved device-side
+first (the host post-pass means d_output lacks the final first-8
+bytes of chunks 1+; the D2D path already has the device variant).
+
+**Verification**: ptest 51/0/0 (incl. a new unit test asserting a
+flip at the #18 signature offset 65544 changes the root), ptest_vk
+151/9/0, cross-backend SHA 5/5 with trailers, roundtrip SHA MATCH,
+corruption smoke on BOTH backends (flipped payload byte →
+ChecksumMismatch, exit 1). README e2e tables predate the +2 ms
+verification cost — re-sweep pending (noted there).

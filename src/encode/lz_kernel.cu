@@ -246,3 +246,14 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
         comp_sizes[chunk_id] = out_pos;
     }
 }
+
+// ── v4 #19: per-chunk content hash (Merkle-root checksum) ────────
+#include "../common/xxh32_device.cuh"
+
+extern "C" __global__ void slzChunkHashKernel(
+    const uint8_t* __restrict__ data,
+    uint32_t n_chunks,
+    uint32_t eff_chunk,
+    uint64_t total_size,
+    uint32_t* __restrict__ out_hashes
+) SLZ_CHUNK_HASH_KERNEL_BODY

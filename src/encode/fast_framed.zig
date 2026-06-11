@@ -96,6 +96,15 @@ fn codecLevelFor(user_level: u8) u8 {
     };
 }
 
+/// v4 #19: the frame's effective chunk size for a given input length
+/// and sc override - the chunk grid the Merkle root is defined over.
+/// MUST match the eff_chunk used by compressFramedOne below (and the
+/// decoder's walk grid).
+pub fn effChunkFor(src_len: usize, sc_override: ?f32) usize {
+    const sc = resolveScGroupSize(src_len, sc_override);
+    return @min(frame.scGroupSizeToBytes(sc), lz_constants.chunk_size);
+}
+
 pub fn compressFramedOne(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -117,6 +126,7 @@ pub fn compressFramedOne(
         .content_size = if (opts.include_content_size) @as(u64, @intCast(src.len)) else null,
         .dictionary_id = null,
         .content_checksum = opts.content_checksum,
+        .chunk_merkle = opts.chunk_checksum,
     }) catch return error.DestinationTooSmall;
     pos += hdr_len;
 

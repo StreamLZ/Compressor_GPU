@@ -26,6 +26,8 @@ pub const Options = struct {
     include_content_size: bool = true,
     block_size: u32 = lz_constants.chunk_size,
     sc_group_size_override: ?f32 = null,
+    /// v4 #19 (CUDA-mirror): chunk-Merkle checksum, default ON.
+    chunk_checksum: bool = true,
 };
 
 /// CUDA reference: src/encode/streamlz_encoder.zig:70-84. Upper bound on
@@ -35,7 +37,7 @@ pub fn compressBound(src_len: usize) usize {
     const sub_chunks: usize = (src_len + lz_constants.sub_chunk_size - 1) / lz_constants.sub_chunk_size;
     const per_sub_chunk_overhead: usize = 3 + 8 + 3 + 256;
     const sc_prefix_upper_bound: usize = chunk_count * 8;
-    return frame.max_header_size + 4
+    return frame.max_header_size + 4 + 4 // (+4: v4 #19 merkle trailer)
         + chunk_count * (8 + 2 + 4)
         + sub_chunks * per_sub_chunk_overhead
         + src_len
@@ -67,5 +69,21 @@ pub fn compressFramedWithIo(
 ) CompressError!usize {
     if (opts.level < 1 or opts.level > 5) return error.BadLevel;
     if (dst.len < compressBound(src.len)) return error.DestinationTooSmall;
-    return fast_framed.compressFramedOne(allocator, io, src, dst, opts, enc_ctx);
+    var frame_len = try fast_framed.compressFramedOne(allocator, io, src, dst, opts, enc_ctx);
+    // v4 #19 (CUDA-mirror): chunk-Merkle trailer after the end mark.
+    // d_input_override != 0 means the caller's data is DEVICE-resident
+    // and the host `src` slice is a length-only sentinel (see
+    // EncodeContext.d_input_override) - it MUST NOT be dereferenced.
+    // v1 therefore skips the Merkle trailer on the D2D path (flag
+    // stays clear; decoders handle both). v2: hash on device via the
+    // slzChunkHashKernel already staged in the PTX modules.
+    if (opts.chunk_checksum and enc_ctx.d_input_override == 0) {
+        if (frame_len + 4 > dst.len) return error.DestinationTooSmall;
+        const xxh = @import("../format/xxhash32.zig");
+        const eff = fast_framed.effChunkFor(src.len, opts.sc_group_size_override);
+        const root = xxh.chunkMerkleRoot(allocator, src, eff) catch return error.OutOfMemory;
+        std.mem.writeInt(u32, dst[frame_len..][0..4], root, .little);
+        frame_len += 4;
+    }
+    return frame_len;
 }
