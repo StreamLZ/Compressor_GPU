@@ -918,7 +918,12 @@ test now self-captures evidence on the next occurrence —
 offline replay (`streamlz -d` the frame, diff the out). STATUS: open
 but armed; revisit immediately when an artifact appears. 15-min
 surveillance campaign same evening: 147 more suite runs, 0 failures
-(~180 total today, 1 hit) - true rate < 1-in-180 per suite run. Suspect
+(~180 total today, 1 hit) - true rate < 1-in-180 per suite run.
+Second campaign same night, FULL failure-condition recreation (1 GB
+decode + dump-encode + gate2 replay setup, then per-cycle: 3 CUDA
+encodes + 3 VK encodes + 6 hashes + suite - the exact command shape
+from the failure moment incl. VK-CUDA driver interleaving): 99
+cycles, 0 failures. ~280 suite executions today, 1 hit total. Suspect
 ranking unchanged (K=4 pipeline serial/prime boundary), mitigation
 SLZ_NO_PIPELINE=1.
 
