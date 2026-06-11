@@ -116,7 +116,7 @@ pub fn compressFramedOne(
         .sc_group_size = sc_grp,
         .content_size = if (opts.include_content_size) @as(u64, @intCast(src.len)) else null,
         .dictionary_id = null,
-        .content_checksum = false,
+        .content_checksum = opts.content_checksum,
     }) catch return error.DestinationTooSmall;
     pos += hdr_len;
 

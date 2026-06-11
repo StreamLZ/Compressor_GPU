@@ -19,6 +19,7 @@ pub const Args = struct {
     output: ?[]const u8 = null,
     report_mem: bool = false,
     sc_group: ?f32 = null,
+    checksum: bool = false,
 };
 
 pub fn parseArgs(raw: []const []const u8, w: *std.Io.Writer) Args {
@@ -41,6 +42,7 @@ pub fn parseArgs(raw: []const []const u8, w: *std.Io.Writer) Args {
         if (eql(arg, "-l")) { i += 1; result.level = parseInt(u8, expect(raw, i, "-l", w), w, "-l"); continue; }
         if (eql(arg, "-r")) { i += 1; result.runs = parseInt(u32, expect(raw, i, "-r", w), w, "-r"); continue; }
         if (eql(arg, "-o")) { i += 1; result.output = expect(raw, i, "-o", w); continue; }
+        if (eql(arg, "--checksum")) { result.checksum = true; continue; }
         if (eql(arg, "--sc")) {
             i += 1;
             const v = expect(raw, i, "--sc", w);

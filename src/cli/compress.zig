@@ -63,6 +63,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     const written = encoder.compressFramedWithIo(allocator, io, src, out_map.slice(), .{
         .level = args.level,
         .sc_group_size_override = args.sc_group,
+        .content_checksum = args.checksum,
     }, &gpu_enc_driver.g_default) catch |err| {
         out_map.unmap();
         try w.print("error: compression failed: {s}\n", .{@errorName(err)});

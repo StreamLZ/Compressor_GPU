@@ -327,6 +327,20 @@ fn decompressFrameInner(
     if (hdr.content_size) |cs| {
         if (dst_off != cs) return error.SizeMismatch;
     }
+
+    // v4 #13 (2026-06-10): XXH32 content checksum verification. The 4-byte
+    // LE hash follows the end-mark when the frame's ContentChecksum flag is
+    // set. Computed over the decompressed output, not the compressed frame.
+    // For D2D (d_output_target != null) the output lives on the device and
+    // there's no host copy to hash — skip verification (the D2D caller can
+    // opt into their own check if needed).
+    if (hdr.content_checksum and d_output_target == null) {
+        if (pos + 4 > src.len) return error.Truncated;
+        const expected = std.mem.readInt(u32, src[pos..][0..4], .little);
+        const xxh = @import("../format/xxhash32.zig");
+        const actual = xxh.xxhash32(dst[0..dst_off]);
+        if (actual != expected) return error.ChecksumMismatch;
+    }
     return .{ .written = dst_off };
 }
 

@@ -114,6 +114,7 @@ pub const FrameHeader = struct {
     sc_group_size: f32,
     content_size: ?u64,
     dictionary_id: ?u32,
+    content_checksum: bool,
     header_size: usize,
 };
 
@@ -197,6 +198,7 @@ pub fn parseHeader(src: []const u8) ParseError!FrameHeader {
         .sc_group_size = sc_group_size,
         .content_size = content_size,
         .dictionary_id = dict_id,
+        .content_checksum = raw_flags.content_checksum,
         .header_size = pos,
     };
 }

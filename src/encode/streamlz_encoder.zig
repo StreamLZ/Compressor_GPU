@@ -61,6 +61,11 @@ pub const Options = struct {
     /// `fast_framed.compressFramedOne` pick adaptively (0.25 below the
     /// GPU saturation threshold, 0.5 at or above).
     sc_group_size_override: ?f32 = null,
+
+    /// Emit an XXH32 content checksum after the end-mark. The decoder
+    /// verifies it post-decode and returns error.ChecksumMismatch on
+    /// any corruption (v4 #13, 2026-06-10).
+    content_checksum: bool = false,
 };
 
 /// Upper bound on the compressed-output size for an input of `src_len`
@@ -80,7 +85,8 @@ pub fn compressBound(src_len: usize) usize {
         + sub_chunks * per_sub_chunk_overhead
         + src_len
         + 64
-        + sc_prefix_upper_bound;
+        + sc_prefix_upper_bound
+        + 4; // XXH32 content checksum trailer
 }
 
 /// Compress host bytes `src` into host bytes `dst`, producing one
@@ -119,5 +125,12 @@ pub fn compressFramedWithIo(
 ) CompressError!usize {
     if (opts.level < 1 or opts.level > 5) return error.BadLevel;
     if (dst.len < compressBound(src.len)) return error.DestinationTooSmall;
-    return fast_framed.compressFramedOne(allocator, io, src, dst, opts, enc_ctx);
+    var frame_len = try fast_framed.compressFramedOne(allocator, io, src, dst, opts, enc_ctx);
+    if (opts.content_checksum) {
+        if (frame_len + 4 > dst.len) return error.DestinationTooSmall;
+        const xxh = @import("../format/xxhash32.zig");
+        std.mem.writeInt(u32, dst[frame_len..][0..4], xxh.xxhash32(src), .little);
+        frame_len += 4;
+    }
+    return frame_len;
 }

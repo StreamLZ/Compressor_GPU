@@ -304,6 +304,19 @@ pub fn decompressFrameInner(
     if (hdr.content_size) |cs| {
         if (dst_off != cs) return error.SizeMismatch;
     }
+
+    // v4 #13 (2026-06-10, CUDA-mirror): XXH32 content checksum
+    // verification. The 4-byte LE hash follows the end-mark when the
+    // frame's ContentChecksum flag is set. Computed over the
+    // decompressed output, not the compressed frame. See
+    // src/decode/streamlz_decoder.zig for the CUDA reference.
+    if (hdr.content_checksum) {
+        if (pos + 4 > src.len) return error.Truncated;
+        const expected = std.mem.readInt(u32, src[pos..][0..4], .little);
+        const xxh = @import("../format/xxhash32.zig");
+        const actual = xxh.xxhash32(dst[0..dst_off]);
+        if (actual != expected) return error.ChecksumMismatch;
+    }
     return .{ .written = dst_off };
 }
 

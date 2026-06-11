@@ -65,6 +65,17 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     b.step("run", "Run the streamlz CLI").dependOn(&run_cmd.step);
 
+    // v4 #13: frame-mutation fuzz harness (differential CUDA-vs-VK).
+    // Host-only tool - drives both backend CLIs as subprocesses.
+    const fuzz_module = b.createModule(.{
+        .root_source_file = b.path("tools/fuzz_frames.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const fuzz_exe = b.addExecutable(.{ .name = "fuzz_frames", .root_module = fuzz_module });
+    b.installArtifact(fuzz_exe);
+    b.step("fuzz", "Build the v4 #13 frame-mutation fuzz harness").dependOn(&b.addInstallArtifact(fuzz_exe, .{}).step);
+
     // ── Unit tests ───────────────────────────────────────────────────────
     const test_runner = b.addTest(.{
         .root_module = cli_module,
