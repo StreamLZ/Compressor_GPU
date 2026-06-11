@@ -82,13 +82,12 @@ struct PipeBatch {
     int  match_offset[32];
 };
 shared PipeBatch s_pb[2];
-shared uint s_have_batch;
-shared uint s_have_next;
+shared uint s_have[2]; // per-slot staged flags
 shared uint s_state[6];  // cmd_pos, lit_pos, off16_pos, dst_pos, recent, length_offset
 shared uint s_long[5];   // slit, smatch, soff, use_recent, off16_pos
-shared uint s_parse[8];  // lit_ptr, cmd_ptr, off16_raw, len_stream, lit_size, cmd_size, off16_count, len_avail
+
 shared uint s_hdr;       // sub-chunk header broadcast
-shared uint s_off32_nz;  // off32 fallback flag
+
 
 // ── Parser: fill one PP batch (subgroup 0 only) ─────────────────
 // Returns true when a batch was staged; false at a long token.
@@ -242,36 +241,56 @@ void decodeSubChunkPipelined(
     int recent_offset = INITIAL_RECENT_OFFSET;
     uint length_offset = 0u;
 
-    // DEBUG BISECT 5: do nothing at all (output will be wrong; we
-    // only test whether the PARSE in parsePipelined hangs).
-    if (true) return;
-
     while (true) {
-        // Prime.
+        // Prime: parser stages the first batch of this run.
         if (is_parser) {
             bool got = (cmd_pos < cmd_size) && fillBatch(
                 cmd_base, cmd_size, off16_base, off16_count,
                 cmd_pos, lit_pos, off16_pos, dst_pos, recent_offset,
                 lane, 0u);
-            if (lane == 0) s_have_batch = got ? 1u : 0u;
+            if (lane == 0) s_have[0] = got ? 1u : 0u;
         }
         barrier();
 
-        // DEBUG BISECT 4: execute the primed batch once, then stop.
-        if (s_have_batch != 0u && is_parser) {
-            executeBatch(lit_base, lane, 0u);
+        // Steady state: fill(N+1, slot 1-cur) overlaps execute(N,
+        // slot cur). Per-slot flags, ONE barrier per batch (the loop
+        // condition reads s_have[cur] after the barrier that ordered
+        // the parser's pre-barrier write of that slot's flag) —
+        // mirrors the shipped CUDA loop.
+        uint cur = 0u;
+        while (s_have[cur] != 0u) {
+            if (is_parser) {
+                bool got = (cmd_pos < cmd_size) && fillBatch(
+                    cmd_base, cmd_size, off16_base, off16_count,
+                    cmd_pos, lit_pos, off16_pos, dst_pos, recent_offset,
+                    lane, 1u - cur);
+                if (lane == 0) s_have[1u - cur] = got ? 1u : 0u;
+            } else {
+                executeBatch(lit_base, lane, cur);
+            }
+            // barrier() only — NO memoryBarrierBuffer here. The
+            // copier's dst writes need cross-lane visibility only
+            // WITHIN its own subgroup per batch (executeBatch's
+            // subgroupMemoryBarrierBuffer covers that); the parser
+            // never reads dst. A per-batch device-scope buffer fence
+            // measured +26% kernel time. Cross-subgroup dst
+            // visibility is established once at the drain below.
+            barrier();
+            cur = 1u - cur;
         }
-        barrier();
-        break;
-        // (unreachable steady loop removed for the bisect)
 
-        // Drained — broadcast parser state.
+        // Drained — broadcast parser state. The buffer fence here is
+        // the ONE place cross-subgroup dst visibility is needed: the
+        // serial path below (and the next pipelined segment's IM
+        // reads on re-prime) may read bytes the copier subgroup
+        // wrote during the drained segment.
         if (is_parser && lane == 0) {
             s_state[0] = cmd_pos;   s_state[1] = lit_pos;
             s_state[2] = off16_pos; s_state[3] = dst_pos;
             s_state[4] = uint(recent_offset);
             s_state[5] = length_offset;
         }
+        memoryBarrierBuffer();
         barrier();
         cmd_pos = s_state[0];   lit_pos = s_state[1];
         off16_pos = s_state[2]; dst_pos = s_state[3];
@@ -353,102 +372,97 @@ void parsePipelined(
     uint src_end = sc_src_off + sc_comp_size;
     bool is_parser = (gl_LocalInvocationID.y == 0u);
 
+    // Initial 8-byte copy: each subgroup writes the same 8 bytes
+    // redundantly (benign same-value writes, exactly like the proven
+    // macro running per-warp) — no workgroup barrier needed.
     uint initial_copy = 0u;
     if (base_offset == 0u) {
-        uint gl = gl_LocalInvocationID.y * WARP_SIZE + uint(lane);
-        if (gl < INITIAL_LITERAL_COPY_BYTES)
-            dst[dst_offset + gl] = compressed[src + gl];
-        barrier();
-        memoryBarrierBuffer();
+        if (uint(lane) < INITIAL_LITERAL_COPY_BYTES)
+            dst[dst_offset + uint(lane)] = compressed[src + uint(lane)];
+        subgroupBarrier();
+        subgroupMemoryBarrierBuffer();
         src += INITIAL_LITERAL_COPY_BYTES;
         initial_copy = INITIAL_LITERAL_COPY_BYTES;
     }
 
-    if (is_parser) {
-        uint lit_ptr = src;
-        uint lit_size = 0u;
-        if (lane == 0) {
-            uint b0 = uint(compressed[src + 0u]);
-            uint b1 = uint(compressed[src + 1u]);
-            uint b2 = uint(compressed[src + 2u]);
-            Type0HdrFields h = parseType0HdrFields(b0, b1, b2);
-            lit_size = h.size;
-            src += h.header_bytes;
-            lit_ptr = src;
-            src += lit_size;
-        }
-        lit_size = subgroupShuffle(lit_size, 0u);
-        src = subgroupShuffle(src, 0u);
-        lit_ptr = src - lit_size;
-
-        uint cmd_ptr;
-        uint cmd_size = 0u;
-        if (lane == 0) {
-            uint c0 = uint(compressed[src + 0u]);
-            uint c1 = uint(compressed[src + 1u]);
-            uint c2 = uint(compressed[src + 2u]);
-            Type0HdrFields hc = parseType0HdrFields(c0, c1, c2);
-            cmd_size = hc.size;
-            src += hc.header_bytes;
-            cmd_ptr = src;
-            src += cmd_size;
-        }
-        cmd_size = subgroupShuffle(cmd_size, 0u);
-        src = subgroupShuffle(src, 0u);
-        cmd_ptr = src - cmd_size;
-
-        if (lane == 0 && sc_decomp_size > LZ_BLOCK_SIZE) { src += 2u; }
-        src = subgroupShuffle(src, 0u);
-
-        uint off16_raw = src;
-        uint off16_count = 0u;
-        if (lane == 0) {
-            uint o0 = uint(compressed[src + 0u]);
-            uint o1 = uint(compressed[src + 1u]);
-            off16_count = readU16LE(o0, o1);
-            off16_raw = src + 2u;
-            src += 2u + off16_count * OFF16_ENTRY_BYTES;
-        }
-        off16_count = subgroupShuffle(off16_count, 0u);
-        src = subgroupShuffle(src, 0u);
-        off16_raw = src - off16_count * OFF16_ENTRY_BYTES;
-
-        uint len_avail = 0u;
-        uint off32_nz = 0u;
-        if (lane == 0) {
-            uint t0 = uint(compressed[src + 0u]);
-            uint t1 = uint(compressed[src + 1u]);
-            uint t2 = uint(compressed[src + 2u]);
-            uint tmp = readLE24(t0, t1, t2);
-            src += 3u;
-            off32_nz = (tmp != 0u) ? 1u : 0u;
-            len_avail = src_end - src;
-        }
-        off32_nz = subgroupShuffle(off32_nz, 0u);
-        len_avail = subgroupShuffle(len_avail, 0u);
-        src = subgroupShuffle(src, 0u);
-
-        if (lane == 0) {
-            s_parse[0] = lit_ptr;
-            s_parse[1] = cmd_ptr;
-            s_parse[2] = off16_raw;
-            s_parse[3] = src; // len_stream
-            s_parse[4] = lit_size;
-            s_parse[5] = cmd_size;
-            s_parse[6] = off16_count;
-            s_parse[7] = len_avail;
-            s_off32_nz = off32_nz;
-        }
+    // Header parse: BOTH subgroups run it redundantly and arrive at
+    // identical register values — the same structure as the proven
+    // parseAndDecodeSubChunkRaw macro executed per-warp. No
+    // is_parser gating, no shared broadcast, no workgroup barrier.
+    // (The original bridge parsed on subgroup 0 and broadcast via
+    // shared + barrier(); that apparatus TDR'd at multi-workgroup
+    // scale even with the decode body disabled — see the v4 #15
+    // entry. Redundant parse removes the apparatus entirely.)
+    uint lit_ptr = src;
+    uint lit_size = 0u;
+    if (lane == 0) {
+        uint b0 = uint(compressed[src + 0u]);
+        uint b1 = uint(compressed[src + 1u]);
+        uint b2 = uint(compressed[src + 2u]);
+        Type0HdrFields h = parseType0HdrFields(b0, b1, b2);
+        lit_size = h.size;
+        src += h.header_bytes;
+        lit_ptr = src;
+        src += lit_size;
     }
-    barrier();
+    lit_size = subgroupShuffle(lit_size, 0u);
+    src = subgroupShuffle(src, 0u);
+    lit_ptr = src - lit_size;
 
-    if (s_off32_nz != 0u) {
+    uint cmd_ptr;
+    uint cmd_size = 0u;
+    if (lane == 0) {
+        uint c0 = uint(compressed[src + 0u]);
+        uint c1 = uint(compressed[src + 1u]);
+        uint c2 = uint(compressed[src + 2u]);
+        Type0HdrFields hc = parseType0HdrFields(c0, c1, c2);
+        cmd_size = hc.size;
+        src += hc.header_bytes;
+        cmd_ptr = src;
+        src += cmd_size;
+    }
+    cmd_size = subgroupShuffle(cmd_size, 0u);
+    src = subgroupShuffle(src, 0u);
+    cmd_ptr = src - cmd_size;
+
+    if (lane == 0 && sc_decomp_size > LZ_BLOCK_SIZE) { src += 2u; }
+    src = subgroupShuffle(src, 0u);
+
+    uint off16_raw = src;
+    uint off16_count = 0u;
+    if (lane == 0) {
+        uint o0 = uint(compressed[src + 0u]);
+        uint o1 = uint(compressed[src + 1u]);
+        off16_count = readU16LE(o0, o1);
+        off16_raw = src + 2u;
+        src += 2u + off16_count * OFF16_ENTRY_BYTES;
+    }
+    off16_count = subgroupShuffle(off16_count, 0u);
+    src = subgroupShuffle(src, 0u);
+    off16_raw = src - off16_count * OFF16_ENTRY_BYTES;
+
+    uint len_avail = 0u;
+    uint off32_nz = 0u;
+    if (lane == 0) {
+        uint t0 = uint(compressed[src + 0u]);
+        uint t1 = uint(compressed[src + 1u]);
+        uint t2 = uint(compressed[src + 2u]);
+        uint tmp = readLE24(t0, t1, t2);
+        src += 3u;
+        off32_nz = (tmp != 0u) ? 1u : 0u;
+        len_avail = src_end - src;
+    }
+    off32_nz = subgroupShuffle(off32_nz, 0u);
+    len_avail = subgroupShuffle(len_avail, 0u);
+    src = subgroupShuffle(src, 0u);
+
+    if (off32_nz != 0u) {
         // off32 present (sub-chunk > 64 KB at sc > 0.25) — the
         // pipeline path doesn't handle off32; fall back to the proven
-        // non-pipelined macro on subgroup 0, subgroup 1 idles to the
-        // barrier in the caller. (VK adaptation: guard the CUDA
-        // bridge lacks — its raw path never sees off32 at the sc
-        // defaults, but the guard costs nothing.)
+        // non-pipelined macro on subgroup 0. Uniform across the
+        // workgroup (both subgroups computed the same off32_nz), so
+        // no barrier is crossed divergently. (VK adaptation: guard
+        // the CUDA bridge lacks.)
         if (is_parser) {
             parseAndDecodeSubChunkRaw(
                 compressed, sc_src_off, sc_comp_size, sc_decomp_size,
@@ -458,10 +472,10 @@ void parsePipelined(
     }
 
     decodeSubChunkPipelined(
-        s_parse[1], s_parse[5],   // cmd
-        s_parse[0], s_parse[4],   // lit
-        s_parse[2], s_parse[6],   // off16
-        s_parse[3], s_parse[7],   // length stream
+        cmd_ptr, cmd_size,
+        lit_ptr, lit_size,
+        off16_raw, off16_count,
+        src, len_avail,   // length stream
         initial_copy, dst_offset,
         lane, is_parser);
 }

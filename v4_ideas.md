@@ -705,6 +705,28 @@ decodeSubChunkGeneral in-kernel. enwik8 L3/L4/L5 kernels 3.49/3.42/3.31
 silesia L3+ all improved; D2D L5 wall 4.80 -> 4.49 (1.39x). All SHA +
 suite gates green. v4 #15 is now COMPLETE on CUDA across all levels;
 remaining: VK mirror (TDR fix first).
+**VK TDR SOLVED 2026-06-11 (late session):** the hang was the parse
+broadcast APPARATUS, not the parse — `if (is_parser)` gating +
+`s_parse[8]` shared broadcast + `barrier()` in the bridge TDR'd at
+multi-workgroup scale on the NVIDIA Vulkan driver even with the
+decode body disabled. Fix: BOTH subgroups run the header parse
+redundantly (identical register values from the same read-only
+bytes — the exact structure of the proven per-warp macro); no
+gating, no shared, no barrier in the parse. Full pipeline (prime +
+steady overlap + serial long tokens) now SHA MATCH on enwik8 L1 at
+1526 workgroups. Perf lesson while fixing: GLSL memoryBarrierBuffer
+is a DEVICE-scope fence — one per batch cost +26% kernel time; the
+pipeline needs it ONCE per drain (before the serial path reads
+copier output), with subgroup-scope fences inside executeBatch
+covering per-batch copier-lane visibility. STATUS: correct but
+SLOWER than the single-warp kernel (2.89 vs 2.36 ms enwik8 L1
+kernel) — the per-batch workgroup barrier() costs more on the VK
+driver than the K=2 overlap saves. Stays OPT-IN (SLZ_VK_PIPELINE=1);
+the path to VK perf is the K=4 redesign (3-warp copier team — needs
+a named-barrier substitute; GLSL has none, so likely full barrier()
+with the parser parked or a 2-subgroup team layout), not tuning the
+K=2 form. ptest_vk 151/9/0 on the default path.
+
 
 
 
