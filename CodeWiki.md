@@ -85,6 +85,87 @@ No silent forks.
 
 ---
 
+## Source layout
+
+Repository root:
+
+- `src/` - the CUDA backend (detailed below)
+- `srcVK/` - the Vulkan backend; same structure, own docs
+- `include/streamlz_gpu.h` - the C ABI header both backends implement
+- `tools/` - benchmark, sanitizer, profiling, and fuzzing harnesses
+- `docs/` - design and tooling notes (see the document map above)
+- `assets/` - test corpora
+- `build.zig` - builds all of the above
+
+### `src/` - top level
+
+- `main.zig` - CLI entry point; also the root that pulls every test file into `zig build test`
+- `cli.zig` and `cli/` - command-line parsing and one handler file per mode: `compress.zig`, `decompress.zig`, `info.zig` (frame header dump), `bench_compress.zig` (`-b`), `bench_decompress.zig` (`-db`), `bench_all.zig` (`-ba`), `util.zig` (shared arg helpers)
+- `streamlz_gpu.zig` - implements the C ABI; the root file of `streamlz_gpu.dll`
+- `c_abi_tests.zig` - calls the DLL surface through extern declarations, exactly like a C program would
+- `cli_smoke_tests.zig` - spawns the built `streamlz.exe` and checks real command lines end to end
+- `test_runner_parallel.zig` - the custom test runner behind `zig build ptest`; runs tests in parallel and names every skipped one
+- `stress18_main.zig` - standalone encode/decode loop built to chase an intermittent roundtrip mismatch (`zig build stress18`)
+- `chain_count_main.zig` - runs one level-5 encode and prints how much work the match-finder did (`zig build chaincount`)
+- `version.zig`, `mmap.zig` - version string; memory-mapped file IO
+
+### `src/common/` - headers shared by encode and decode kernels
+
+- `gpu_warp.cuh` - warp and lane index helpers, plus the guard macro that makes single-thread kernels reject every thread but one (including extra blocks)
+- `gpu_byteio.cuh` - unaligned little-endian loads and stores
+- `gpu_wire_format.cuh` - the LZ token and header constants, device side
+- `gpu_huffman.cuh` - the canonical-Huffman constants, device side
+- `xxh32_device.cuh` - the XXH32 hash function for GPU threads, plus the kernel bodies for the per-chunk integrity checksum (compiled into both the encode and decode kernel modules)
+
+### `src/format/` - the wire format on the host side
+
+- `streamlz_constants.zig` - the host-side twin of `gpu_wire_format.cuh`; every constant exists in both and asserts keep them equal
+- `frame_format.zig` - frame header read/write: magic, version, flags, optional content size, trailers
+- `block_header.zig` - block headers and the 2-byte internal block header
+- `xxhash32.zig` - XXH32 and the chunk-checksum root computation on the host (the fallback when the GPU kernels are unavailable, value-identical by definition)
+
+### `src/encode/`
+
+- `streamlz_encoder.zig` - the public API: `compressFramed`, `compressBound`, the options struct (level, checksums, chunk sizing)
+- `fast_framed.zig` - the frame builder; calls every stage below in order and owns the frame-level bookkeeping
+- `levels.zig` - what each level means: parser choice, entropy on or off, hash-table size
+- `encode_context.zig` - the context struct holding every persistent device buffer between calls
+- `encode_lz.zig` - launches the LZ match-finding kernel, batched so the per-chunk hash tables fit in VRAM
+- `encode_huff.zig` - launches the Huffman table-build and encode kernels (levels 3-5)
+- `encode_assemble.zig` - launches the measure/write/assemble kernels that splice the final frame together in GPU memory
+- `driver.zig`, `cuda_ffi.zig`, `module_loader.zig` - public facade, the `nvcuda.dll` function-pointer table, and PTX loading with thread-safe one-time init
+- `enc_phase.zig` - per-phase wall-clock profiler (`SLZ_PROFILE_PHASES=1`)
+- `lz_kernel.cu` - the LZ encode kernel module; parsers split into `lz_greedy_parser.cuh` (levels 1-4), `lz_chain_parser.cuh` (level 5), shared pieces in `lz_format.cuh` and `lz_token_emit.cuh`
+- `huffman_kernel.cu`, `assemble_kernel.cu` - the Huffman encode and frame-assembly kernel modules
+- tests: `gpu_roundtrip_tests.zig` (many shapes and levels through encode+decode, plus the lock that serializes GPU tests), `gpu_regression_tests.zig` (cases that once broke), `huff_conformance_tests.zig` (Huffman output byte-identity), `l5_hardening_tests.zig` (adversarial inputs for the level-5 parser)
+
+### `src/decode/`
+
+- `streamlz_decoder.zig` - the public API: `decompressFramed`, frame walking, trailer verification, error surface
+- `decode_dispatch.zig` - the heart of decode: one function that launches the whole kernel sequence for a block, including the integrity-check kernels
+- `decode_context.zig` - persistent device buffers, stream/event handles, per-kernel timing capture
+- `descriptors.zig` - the chunk descriptor structs shared with the kernels, and the error set
+- `scan_gpu.zig`, `scan_host.zig` - sub-chunk header scanning on device, with the host fallback
+- `driver.zig`, `cuda_api.zig`, `module_loader.zig` - facade, driver function table, PTX loading (also owns the single CUDA context)
+- `lz_kernel.cu` - the LZ decode kernel module; the pipelined hot path is `lz_decode_raw_pipeline.cuh`, the single-warp originals are `lz_decode_raw.cuh` and friends, header parsing in `lz_header_parse.cuh`, format constants in `slz_wire_format.cuh`
+- `huffman_kernel.cu` - decode-side LUT build and the 32-stream Huffman decode
+- bookkeeping kernels, one file each: `walk_frame_kernel.cuh` (parse the frame on device), `prefix_sum_chunks_kernel.cuh`, `scan_parse_kernel.cuh`, `compact_descs_kernels.cuh`, `merge_huff_descs_kernel.cuh`, `gather_raw_off16_kernel.cuh`
+
+Compiled `.ptx` files are committed next to their `.cu` sources.
+
+### `tools/`
+
+- `bench_all.bat` - encode+decode both corpora at all levels, SHA-verified; the canonical "is everything still byte-exact" check
+- `bench_d2d.bat`, `build_d2d_bench.bat`, `slz_gpu_*.c` - the same through the C ABI with device-resident buffers
+- `sanitize.bat` - compute-sanitizer memory and race checking
+- `build_gpu.bat` - full nvcc rebuild with per-kernel register/memory usage printouts
+- `ncu_profile_lz.bat` - Nsight Compute profile of the decode kernels (needs an admin shell)
+- `fuzz_frames.zig` - mutates valid frames and decodes them on both backends, comparing outcomes (`zig build fuzz`)
+- `huff_test/` - standalone harness for the Huffman kernels
+- `tans_gate2/` - measurement harness that compares Huffman against a tANS entropy coder on real stream data
+
+---
+
 ## Build and test
 
 ```text
