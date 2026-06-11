@@ -799,7 +799,7 @@ frames. Gate on a measured win: build the host-side prototype first
 and measure ratio lift on a real small-records corpus (e.g. 10k JSON
 docs) before touching kernels.
 
-## 17. Reverse-port VK persistent encode regions to CUDA (~15-20% encode wall)
+## 17. Reverse-port VK persistent encode regions to CUDA — ✅ DONE 2026-06-11 (both backends; CUDA L1 encode 123→87 ms)
 
 **What**: The 2026-06-11 60-cell sweep found VK encode FASTER than
 CUDA on every large-corpus cell (0.80-0.99x wall). The kernels are
@@ -827,3 +827,29 @@ CUDA encode driver only. Verify with the standard battery (ptest +
 cross-backend SHA gate on L1/L3/L5) plus a re-run of the encode
 column of the 60-cell sweep. Risk class: leaks/reuse-after-free in
 long-lived contexts; the VK implementation is the reference.
+**DONE 2026-06-11 (same evening, BOTH backends — and the diagnosis
+improved on the entry).** Phase profiling (SLZ_PROFILE_PHASES, the
+VK-backported tool) showed the gap was not allocation lifetime —
+CUDA's ensureBuf already persists device buffers — but the LZ
+payload gather: ~17 ms of per-chunk synchronous pageable D2H at
+enwik8 scale. Two fixes:
+1. **The gather is VESTIGIAL at L1/L2**: nothing on the host reads
+   the gathered LZ bytes — the device-resident assemble reads
+   d_output on-GPU and the frame returns via the single wrap_d2h
+   copy. Only the L3+ Huffman passes consume host bytes. Both
+   backends now skip the payload gather below L3 (comp_sizes D2H
+   stays — assemble needs it).
+2. **L3+ gather goes async+pinned on CUDA** (new cuMemAllocHost
+   persistent staging + cuMemcpyDtoHAsync per region + one stream
+   sync + host splice — the VK d2h_offset_gather shape).
+Measured (enwik8, -b single-shot): CUDA L1 123 → **87 ms**
+(778 → 1091 MB/s, −29%), L2 131 → 96, L5 305 → 295; VK L1
+109 → **91 ms**, L5 ~unchanged. Post-#17 parity: L1/L2 0.98-1.08×
+(parity), L3+ VK leads 0.85-0.93× — RESIDUAL: CUDA's L3+ gather +
+huff-input path still trails VK's BAR-mapped multi-region gather;
+close by feeding the huff passes device-side or porting the
+multi-region shape, only if L3+ encode wall ever matters.
+Verification: cross-backend SHA gate 5/5 MATCH after EACH backend's
+change; ptest 50/0/0; ptest_vk 151/9/0; PerfSweep encode table
+re-measured post-#17.
+

@@ -51,6 +51,12 @@ pub const FnLaunchKernel = *const fn (CUfunction, c_uint, c_uint, c_uint, c_uint
 pub const FnCtxSync = *const fn () callconv(.c) CUresult;
 pub const FnMemsetD8 = *const fn (CUdeviceptr, u8, usize) callconv(.c) CUresult;
 pub const FnMemGetInfo = *const fn (*usize, *usize) callconv(.c) CUresult;
+// v4 #17: pinned-staging async gather (reverse-port of VK's
+// d2h_offset_gather + ensureD2hFinalBuf shape).
+pub const FnMemAllocHost = *const fn (*?*anyopaque, usize) callconv(.c) CUresult;
+pub const FnMemFreeHost = *const fn (*anyopaque) callconv(.c) CUresult;
+pub const FnMemcpyDtoHAsync = *const fn (*anyopaque, CUdeviceptr, usize, usize) callconv(.c) CUresult;
+pub const FnStreamSync = *const fn (usize) callconv(.c) CUresult;
 
 pub var cuModuleLoadData_fn: ?FnModuleLoadData = null;
 pub var cuModuleGetFunction_fn: ?FnModuleGetFunction = null;
@@ -66,6 +72,10 @@ pub var cuMemsetD8_fn: ?FnMemsetD8 = null;
 /// budget. Optional — when missing, the encode dispatch runs unbatched
 /// (pre-A-023 behavior, WDDM paging risk at 1 GB chain-parser scale).
 pub var cuMemGetInfo_fn: ?FnMemGetInfo = null;
+pub var cuMemAllocHost_fn: ?FnMemAllocHost = null;
+pub var cuMemFreeHost_fn: ?FnMemFreeHost = null;
+pub var cuMemcpyDtoHAsync_fn: ?FnMemcpyDtoHAsync = null;
+pub var cuStreamSync_fn: ?FnStreamSync = null;
 
 /// Resolve a single exported function from the already-loaded nvcuda
 /// handle. Returns null if either the handle or the symbol is missing -

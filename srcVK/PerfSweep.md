@@ -347,35 +347,42 @@ e2e remains within bar everywhere that matters.
 
 ### Encode parity (compress wall best, ms; single-shot ±5%)
 
+(Re-measured same evening AFTER v4 #17 landed on BOTH backends —
+the L1/L2 host-side payload gather was found vestigial and skipped,
+and CUDA's L3+ gather went async+pinned. Pre-#17 cells for
+reference: CUDA enwik8 L1 was 123, VK 109.)
+
 | Level | Corpus | VK | CUDA | VK/CUDA | Ratio (both, identical) |
 |---|---|---:|---:|---:|---:|
-| L1 | web    | 20  | 12  | 1.67x | 48.6% |
-| L1 | enwik8 | 109 | 123 | **0.89x** | 58.6% |
-| L1 | silesia| 188 | 235 | **0.80x** | 47.8% |
-| L2 | web    | 22  | 12  | 1.83x | 46.8% |
-| L2 | enwik8 | 106 | 131 | **0.81x** | 57.3% |
-| L2 | silesia| 206 | 249 | **0.83x** | 47.2% |
+| L1 | web    | 19  | 10  | 1.90x | 48.6% |
+| L1 | enwik8 | 91  | 87  | 1.05x | 58.6% |
+| L1 | silesia| 177 | 180 | 0.98x | 47.8% |
+| L2 | web    | 23  | 11  | 2.09x | 46.8% |
+| L2 | enwik8 | 101 | 96  | 1.05x | 57.3% |
+| L2 | silesia| 193 | 179 | 1.08x | 47.2% |
 | L3 | web    | 21  | 14  | 1.50x | 37.1% |
-| L3 | enwik8 | 122 | 151 | **0.81x** | 43.7% |
-| L3 | silesia| 234 | 283 | **0.83x** | 38.1% |
-| L4 | web    | 22  | 15  | 1.47x | 35.5% |
-| L4 | enwik8 | 132 | 163 | **0.81x** | 42.7% |
-| L4 | silesia| 241 | 293 | **0.82x** | 37.5% |
-| L5 | web    | 67  | 69  | 0.97x | 32.5% |
-| L5 | enwik8 | 266 | 305 | **0.87x** | 39.6% |
-| L5 | silesia| 550 | 553 | **0.99x** | 33.9% |
+| L3 | enwik8 | 120 | 141 | **0.85x** | 43.7% |
+| L3 | silesia| 226 | 260 | **0.87x** | 38.1% |
+| L4 | web    | 23  | 14  | 1.64x | 35.5% |
+| L4 | enwik8 | 131 | 150 | **0.87x** | 42.7% |
+| L4 | silesia| 254 | 274 | **0.93x** | 37.5% |
+| L5 | web    | 67  | 68  | 0.99x | 32.5% |
+| L5 | enwik8 | 264 | 295 | **0.89x** | 39.6% |
+| L5 | silesia| 473 | 554 | **0.85x** | 33.9% |
 
-**Encode verdict: VK is FASTER than CUDA on every large-corpus cell
-(0.80-0.99x)** — the encode pipeline has no A-028-class divergence
-and the VK submit path amortizes better at encode batch sizes.
-Compression ratios are byte-identical at every cell (cross-backend
-SHA discipline holds). All 30 roundtrips PASS.
+**Encode verdict (post-#17): L1/L2 at parity on real corpora
+(0.98-1.08x); L3+ VK still leads 0.85-0.93x** — the residual is the
+L3+ gather + huff-input path, where VK's multi-region BAR-mapped
+gather beats CUDA's async-pinned staging; noted as the #17 residual.
+Compression ratios byte-identical at every cell (cross-backend SHA
+gate re-run after BOTH encoder changes: 5/5 MATCH). 30/30 roundtrips
+PASS.
 
 ### Summary vs the standing parity goal
 
 - e2e decode: PASS everywhere on real workloads (1.00-1.08x).
 - kernel decode: enwik8 1.14-1.35x over bar, ATTRIBUTED (A-028,
   measured, accepted); silesia at/ahead of parity.
-- encode: VK ahead across the board on large corpora.
+- encode: parity at L1/L2 post-#17; VK ahead 0.85-0.93x at L3+ (gather residual).
 - web.txt small-file regime: unchanged known residual (submit
   floor), both directions.

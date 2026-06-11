@@ -159,6 +159,16 @@ pub const EncodeContext = struct {
     d_sizes_persist: CUdeviceptr = 0,
     d_sizes_size: usize = 0,
 
+    // ── v4 #17: pinned host staging for the LZ compressed-chunk
+    // gather (reverse-port of VK's ensureD2hFinalBuf shape). Grow-only,
+    // freed in deinit via cuMemFreeHost. The gather queues one
+    // cuMemcpyDtoHAsync per chunk into this buffer (true DMA — the
+    // copy engine pipelines the regions) and syncs ONCE, replacing the
+    // per-chunk synchronous pageable D2H loop that cost ~17 ms at
+    // enwik8 scale (382 chunks x ~45 us each).
+    h_gather_pinned: ?[*]u8 = null,
+    h_gather_size: usize = 0,
+
     // ── GPU Huffman encode persistent device buffers ───────────
     d_huff_descs_persist: CUdeviceptr = 0,
     d_huff_descs_size: usize = 0,
@@ -249,6 +259,11 @@ pub const EncodeContext = struct {
         free_dev(&self.d_frame_prefix_bytes, &self.d_frame_prefix_bytes_size);
         free_dev(&self.d_input_persist, &self.d_input_size);
         free_dev(&self.d_output_persist, &self.d_output_size);
+        if (self.h_gather_pinned) |p| {
+            if (cuda_ffi.cuMemFreeHost_fn) |free_host| _ = free_host(@ptrCast(p));
+            self.h_gather_pinned = null;
+            self.h_gather_size = 0;
+        }
         free_dev(&self.d_host_wrap_input, &self.d_host_wrap_input_size);
         free_dev(&self.d_host_wrap_output, &self.d_host_wrap_output_size);
         free_dev(&self.d_descs_persist, &self.d_descs_size);
@@ -307,6 +322,24 @@ pub fn ensureBuf(ptr: *CUdeviceptr, current_size: *usize, needed: usize) bool {
     if (alloc_fn(ptr, needed) != cuda_ffi.CUDA_SUCCESS) return false;
     current_size.* = needed;
     return true;
+}
+
+/// v4 #17: grow-only pinned host staging (cuMemAllocHost). Returns the
+/// staging base or null when pinned allocation is unavailable/fails —
+/// callers fall back to the synchronous pageable path.
+pub fn ensurePinnedGather(self: *EncodeContext, needed: usize) ?[*]u8 {
+    if (self.h_gather_size >= needed) return self.h_gather_pinned;
+    const alloc_host = cuda_ffi.cuMemAllocHost_fn orelse return null;
+    if (self.h_gather_pinned) |p| {
+        if (cuda_ffi.cuMemFreeHost_fn) |free_host| _ = free_host(@ptrCast(p));
+        self.h_gather_pinned = null;
+        self.h_gather_size = 0;
+    }
+    var raw: ?*anyopaque = null;
+    if (alloc_host(&raw, needed) != cuda_ffi.CUDA_SUCCESS) return null;
+    self.h_gather_pinned = @ptrCast(raw.?);
+    self.h_gather_size = needed;
+    return self.h_gather_pinned;
 }
 
 /// Copy `dst.len` bytes from a device address into the host slice `dst`.

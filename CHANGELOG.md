@@ -92,6 +92,21 @@ Wire format unchanged from 2026-06-09; all frames byte-identical.
   Verified: ptest_vk 150/9/0, enwik9 1 GB L3+L5 SHA MATCH, D2D sweep
   all-verified, Intel iGPU L5 SHA MATCH (BDA on both vendors);
   enwik9 L5 kernels 35.7 -> 35.5 ms.
+- **Encode wall: vestigial L1/L2 payload gather removed on BOTH
+  backends + CUDA L3+ gather goes async/pinned** (v4 #17): phase
+  profiling showed ~17 ms of per-chunk synchronous pageable D2H in
+  the CUDA LZ encode at enwik8 scale - and that NOTHING on the host
+  consumes the gathered bytes below L3 (the device assemble reads
+  d_output on-GPU; only the L3+ Huffman passes need host bytes).
+  Both backends now skip the payload gather at L1/L2; CUDA's L3+
+  gather uses new persistent pinned staging (cuMemAllocHost) with
+  per-region cuMemcpyDtoHAsync + one stream sync, mirroring VK's
+  d2h_offset_gather shape. enwik8 encode wall: CUDA L1 123 -> 87 ms
+  (778 -> 1091 MB/s), L2 131 -> 96, L5 305 -> 295; VK L1 109 -> 91.
+  Post-#17 encode parity: L1/L2 at 0.98-1.08x, L3+ VK leads
+  0.85-0.93x (documented residual). Cross-backend SHA gate 5/5
+  MATCH after each backend's change; both suites green; PerfSweep
+  encode table re-measured.
 - **K=4 pipeline ported to the L3+ general kernel** (v4 #15 L3+
   port, CUDA, default ON): new slzLzDecodeGeneralPipelinedKernel -
   one chunk group per block, the parser warp reuses the existing

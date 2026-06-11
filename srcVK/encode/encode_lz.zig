@@ -291,9 +291,16 @@ pub fn gpuCompressImpl(
         if (d2h_fn(@ptrCast(&comp_sizes_out[batch_start]), d_sizes, batch_sizes_bytes) != VK_SUCCESS_RC) return false;
         if (_prof) enc_phase.g_enc_phase_lz_d2h_comp_sizes_ns += qpcDeltaNs(_t_dsz0, vk.qpcNow());
 
-        // Per-batch gather of compressed bytes.
+        // Per-batch gather of compressed bytes — ONLY at L3+ (v4 #17,
+        // mirrored from the CUDA finding the same day): the Huffman
+        // passes are the sole consumers of the host-side LZ bytes; at
+        // L1/L2 the device-resident assemble reads d_output on the GPU
+        // and the finished frame returns via the single d2h_final copy,
+        // so the gather was pure waste (~4.5 ms at enwik8 scale).
         const _t_gather0 = if (_prof) vk.qpcNow() else 0;
-        if (vk.procs.d2h_offset_gather) |gather_fn| {
+        if (level < 3) {
+            // skip — no host consumer below L3
+        } else if (vk.procs.d2h_offset_gather) |gather_fn| {
             // VK adaptation (Gemini Risk A, 2026-06-08): persistent
             // scratch on EncodeContext instead of per-call
             // page_allocator.alloc — one VirtualAlloc lifetime-of-encoder

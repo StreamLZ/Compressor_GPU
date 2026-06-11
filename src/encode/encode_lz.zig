@@ -212,12 +212,16 @@ pub fn gpuCompressImpl(
             // Per-batch D2H: comp_sizes land at their GLOBAL positions
             // so downstream passes (Huffman / assemble) read them at
             // the same index they would have in the unbatched path.
+            // Payload bytes only at L3+ (see the unbatched note - the
+            // Huffman passes are the sole host-side consumers).
             if (d2h_fn(@ptrCast(comp_sizes_out.ptr + batch_start), d_sizes, @as(usize, bc) * 4) != cuda_ffi.CUDA_SUCCESS) return false;
-            for (batch_start..batch_end) |i| {
-                const cs = comp_sizes_out[i];
-                if (cs > 0) {
-                    const dst_off = chunk_descs[i].dst_offset;
-                    if (d2h_fn(@ptrCast(output.ptr + dst_off), d_output + dst_off, cs) != cuda_ffi.CUDA_SUCCESS) return false;
+            if (level >= 3) {
+                for (batch_start..batch_end) |i| {
+                    const cs = comp_sizes_out[i];
+                    if (cs > 0) {
+                        const dst_off = chunk_descs[i].dst_offset;
+                        if (d2h_fn(@ptrCast(output.ptr + dst_off), d_output + dst_off, cs) != cuda_ffi.CUDA_SUCCESS) return false;
+                    }
                 }
             }
         }
@@ -234,17 +238,63 @@ pub fn gpuCompressImpl(
         }
     }
 
-    // Unbatched path: download comp_sizes first, then only the actual
-    // compressed bytes per block (the historical post-kernel shape,
-    // kept outside the kernel-time capture above).
+    // Unbatched path: download comp_sizes first (always needed - the
+    // assemble descs and frame splice are built from them), then the
+    // compressed payload bytes - but ONLY at L3+: the Huffman passes
+    // are the sole consumers of the host-side LZ bytes. At L1/L2 the
+    // device-resident assemble reads d_output directly on the GPU and
+    // the finished frame returns via the single wrap_d2h copy, so the
+    // per-chunk payload gather was pure waste (~12-17 ms at enwik8
+    // scale; v4 #17 measurement).
     if (!batched_dispatch) {
         if (d2h_fn(@ptrCast(comp_sizes_out.ptr), d_sizes, sizes_bytes) != cuda_ffi.CUDA_SUCCESS) return false;
-
-        for (0..chunk_descs.len) |i| {
-            const cs = comp_sizes_out[i];
-            if (cs > 0) {
-                const dst_off = chunk_descs[i].dst_offset;
-                if (d2h_fn(@ptrCast(output.ptr + dst_off), d_output + dst_off, cs) != cuda_ffi.CUDA_SUCCESS) return false;
+    }
+    if (!batched_dispatch and level >= 3) {
+        // v4 #17 fast path: queue one cuMemcpyDtoHAsync per chunk into
+        // persistent PINNED staging (true DMA — the copy engine
+        // pipelines all regions), sync ONCE, then splice the spans to
+        // the caller's pageable `output`. Replaces ~N synchronous
+        // pageable D2H calls (~45 us each; ~17 ms at enwik8 scale,
+        // vs VK's 4.5 ms multi-region gather — the A-018 reference).
+        var gathered = false;
+        if (cuda_ffi.cuMemcpyDtoHAsync_fn) |d2h_async| {
+            if (cuda_ffi.cuStreamSync_fn) |stream_sync| {
+                if (encode_context.ensurePinnedGather(self, output.len)) |pinned| {
+                    var ok = true;
+                    for (0..chunk_descs.len) |i| {
+                        const cs = comp_sizes_out[i];
+                        if (cs > 0) {
+                            const dst_off = chunk_descs[i].dst_offset;
+                            if (d2h_async(@ptrCast(pinned + dst_off), d_output + dst_off, cs, 0) != cuda_ffi.CUDA_SUCCESS) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (ok and stream_sync(0) == cuda_ffi.CUDA_SUCCESS) {
+                        for (0..chunk_descs.len) |i| {
+                            const cs = comp_sizes_out[i];
+                            if (cs > 0) {
+                                const dst_off = chunk_descs[i].dst_offset;
+                                @memcpy(output[dst_off..][0..cs], pinned[dst_off..][0..cs]);
+                            }
+                        }
+                        gathered = true;
+                    } else {
+                        // A failed async queue leaves copies in flight;
+                        // drain before the sync fallback reuses d_output.
+                        _ = stream_sync(0);
+                    }
+                }
+            }
+        }
+        if (!gathered) {
+            for (0..chunk_descs.len) |i| {
+                const cs = comp_sizes_out[i];
+                if (cs > 0) {
+                    const dst_off = chunk_descs[i].dst_offset;
+                    if (d2h_fn(@ptrCast(output.ptr + dst_off), d_output + dst_off, cs) != cuda_ffi.CUDA_SUCCESS) return false;
+                }
             }
         }
     }
