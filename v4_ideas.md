@@ -646,6 +646,29 @@ mirror (port-means-port — divergence OPEN until then; GLSL barrier()
 replaces __syncthreads, same PipeBatch shape), and K=3/4 variants
 were not explored (the 1-deep __syncthreads pipeline already
 captures most of the overlap; deeper needs persistent-threads).
+**Post-#15 NCU profile (2026-06-11, slz_lz_pipe_post15.ncu-rep)**:
+SM 63.3% (was 52.7), memory 63.3%, long_scoreboard 22.9 → **8.9**
+(the pipeline did its job), but **barrier stall 9.5 is now the top
+stall** — the __syncthreads pacing itself. Escalation ladder, in
+order (STRATEGY: finish ALL of these on the L1/L2 raw kernel FIRST,
+then port the finished design to the L3+ general kernel once —
+solve complexity on the simple kernel, port second):
+1. **mbarrier depth** — cuda::barrier<thread_scope_block> per-slot
+   arrive/wait replaces the full-block __syncthreads rendezvous;
+   directly attacks the measured 9.5 barrier stall; the supported
+   form of the spin-wait that deadlocked. sm_80+, works in the
+   nvcc→PTX flow.
+2. **K=4 role-split copiers** — warp1 flat literals, warp2 flat
+   independent matches (provably concurrent with literals: disjoint
+   writes, pre-batch reads), warp3 dependent matches (waits on lit
+   pass). Widens the flat passes; SM+memory both at 63% = headroom
+   on both axes. Composes with mbarrier.
+3. **L3+ general-kernel port LAST** (after 1+2 are proven): the
+   OFF16_SPLIT=true PP path in the general kernel never got #15;
+   L5 LZ slice is 2.5-3.2 ms. Port the finished design once.
+Combined 1+2 honest estimate: 10-20% more on the raw kernel
+(enwik9 L1 17.2 → ~14-15.5 ms).
+
 
 
 ## 16. Dictionary support (zstd-style preset dictionaries)
