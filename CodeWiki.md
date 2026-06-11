@@ -1,304 +1,190 @@
-# StreamLZ - Code Wiki
+# StreamLZ Contributor Guide
 
-Internal reference for contributors (CUDA backend; refreshed
-2026-06-11). For user-facing docs see [README.md](README.md). For the
-GPU-only-strip rationale and prior history see
-[FAILED_EXPERIMENTS.md](FAILED_EXPERIMENTS.md).
+StreamLZ is a GPU LZ77 codec with two sibling backends that produce
+byte-identical compressed frames: a CUDA backend in `src/` and a
+Vulkan port in `srcVK/`. Zig code drives the kernels and handles the
+wire format on the host; the heavy work runs on the GPU in both
+directions.
 
-For the GPU codec's algorithmic notes (warp mapping, BIL wire format,
-LUT-build kernel, etc.) see [docs/GPU_ARCHITECTURE.md](docs/GPU_ARCHITECTURE.md).
-For CUDA tooling recipes (nvcc, NCU, nsys paths + invocations) see
-[docs/how_to_debug_cuda.md](docs/how_to_debug_cuda.md).
-
-**The Vulkan backend (`srcVK/`) has its own canon** - byte-identical
-wire format, full L1-L5 parity: [srcVK/README.md](srcVK/README.md)
-(layout), [srcVK/Handbook.md](srcVK/Handbook.md) (invariants +
-recipes), [srcVK/PortAdaptations.md](srcVK/PortAdaptations.md) (the
-A-NNN CUDA↔VK divergence catalog - extend it for every new
-divergence). This wiki covers the CUDA tree.
+This page routes you: what to read, where your change goes, and
+which rules will get a change rejected. If you remember one thing,
+remember this: **the two backends are each other's test oracle.**
+Most rules below exist to protect that property.
 
 ---
 
-## What this codebase is
+## The document map
 
-StreamLZ is a GPU-accelerated LZ77-style compression library with two
-sibling backends producing byte-identical frames: CUDA kernels
-(NVIDIA Driver API, target `sm_89`) under `src/`, and a 1:1 Vulkan
-port under `srcVK/`. Zig drivers manage kernel launches and host-side
-wire-format assembly.
-
----
-
-## Repository layout
-
-Two sibling backends live side by side; everything else serves them.
-
-- `src/` - the CUDA backend (this wiki's subject; detailed below)
-- `srcVK/` - the Vulkan backend, with its own docs (`srcVK/README.md`)
-- `include/streamlz_gpu.h` - C ABI public header (shared by both backends)
-- `build.zig` - builds everything; steps: `install`, `run`, `test`/`ptest`, `gpulib`, `ptx`, `srcvk-shaders`, `streamlz_vk`, `ptest_vk`, plus tool builds (`fuzz`, `stress18`, `chaincount`, `tans_gate2`)
-- `tools/` - bench, sanitize, profile, and fuzz harnesses
-- `docs/` - architecture + CUDA tooling notes
-- `v4_ideas.md` - THE forward-looking work list
-- `FAILED_EXPERIMENTS.md` - negative results; do not re-run these
-
-## CUDA backend: `src/` in detail
-
-Top-level files:
-
-- `main.zig` - CLI entry point + test aggregation block
-- `cli.zig` + `cli/` - mode dispatcher + handlers (compress, decompress, info, `-b`, `-db`, `-ba`)
-- `streamlz_gpu.zig` - C ABI implementation (root of `streamlz_gpu.dll`)
-- `c_abi_tests.zig`, `cli_smoke_tests.zig`, `test_runner_parallel.zig` - C ABI tests, subprocess CLI tests, parallel runner
-- `stress18_main.zig`, `chain_count_main.zig` - v4 #18 stress harness, v4 #14 instrumentation readback
-- `version.zig`, `mmap.zig`
-
-`src/common/` - CUDA headers shared by the encode and decode kernels:
-
-- `gpu_warp.cuh` - warp/lane geometry + `SLZ_GUARD_SINGLE_THREAD`
-- `gpu_byteio.cuh` - endian load/store primitives
-- `gpu_huffman.cuh`, `gpu_wire_format.cuh` - wire constants (device side)
-- `xxh32_device.cuh` - device XXH32 + chunk-Merkle kernel bodies (v4 #19; included by BOTH `lz_kernel.cu` TUs)
-
-`src/format/` - host-side wire format:
-
-- `frame_format.zig` - frame header, flags, trailers
-- `block_header.zig` - block + internal-block headers
-- `streamlz_constants.zig` - wire constants (host side)
-- `xxhash32.zig` - XXH32 + chunk-Merkle root (host mirror of the device definition)
-
-`src/encode/`:
-
-- `streamlz_encoder.zig` - public API: `compressFramed`, `compressBound`
-- `fast_framed.zig` - L1-L5 frame builder; orchestrates everything below
-- `driver.zig`, `cuda_ffi.zig`, `module_loader.zig` - facade, driver FFI, PTX load
-- `encode_context.zig` - `EncodeContext` + persistent device buffers
-- `encode_lz.zig` - `gpuCompressImpl` (A-023 batching, #17 pinned gather, #19 hashing)
-- `encode_huff.zig`, `encode_assemble.zig` - Huffman + assembly launchers
-- `levels.zig` - level policy (`hashBitsForLevel` = 17 everywhere)
-- `enc_phase.zig` - `SLZ_PROFILE_PHASES=1` profiler
-- `lz_kernel.cu`, `huffman_kernel.cu`, `assemble_kernel.cu` + `lz_*.cuh` - kernel TUs and their headers
-- tests: `gpu_roundtrip_tests.zig` (roundtrips, GPU-test lock, #18 capture), `gpu_regression_tests.zig`, `huff_conformance_tests.zig`, `l5_hardening_tests.zig`
-
-`src/decode/`:
-
-- `streamlz_decoder.zig` - public API + host frame walk + checksum verify
-- `driver.zig`, `cuda_api.zig`, `module_loader.zig` - facade, driver FFI, PTX load
-- `descriptors.zig`, `decode_context.zig` - `ChunkDesc`/errors, context + device buffers
-- `decode_dispatch.zig` - `fullGpuLaunchImpl`: huff/LZ/verify launches
-- `scan_host.zig`, `scan_gpu.zig` - CPU walk fallback; GPU walk + fused compact
-- `lz_kernel.cu`, `huffman_kernel.cu` + `lz_decode_*.cuh` (incl. the #15 K=4 pipeline) and the orchestration `*_kernel.cuh` files - kernel TUs and their headers
-
-Committed `*.ptx` images sit beside the `.cu` files and are
-`@embedFile`'d, so plain `zig build` needs no CUDA toolchain.
-
-`tools/`:
-
-- `build_gpu.bat` - full nvcc rebuild + cuobjdump res-usage
-- `sanitize.bat` - compute-sanitizer gate (memcheck/racecheck)
-- `bench_all.bat`, `bench_d2d.bat`, `build_d2d_bench.bat`, `slz_gpu_*.c` - bench harnesses
-- `ncu_profile_lz.bat` - NCU profile (admin shell)
-- `huff_test/`, `tans_gate2/` - kernel + measurement harnesses
-- `fuzz_frames.zig` - v4 #13 differential fuzzer
-
-
-## Public APIs
-
-* **Zig library**: `src/encode/streamlz_encoder.zig`
-  (`compressFramed`, `compressFramedWithIo`, `compressBound`),
-  `src/decode/streamlz_decoder.zig` (`decompressFramed`,
-  `DecompressContext`).
-* **C ABI** (`src/streamlz_gpu.zig`, header `include/streamlz_gpu.h`):
-  `slzCreate`/`slzDestroy`, `slzCompressHost`/`slzDecompressHost`
-  (library-owned worker thread per call), `slzCompressAsync`/
-  `slzDecompressAsync` (true D2D, nvCOMP-shaped, ride the caller's
-  stream), `slzCompressBound`, `slzGetDecompressedSize`,
-  `slzGetLastTimings`/`slzWaitAndGetLastTimings`, version/status
-  strings, default-opts helpers. Covered by `src/c_abi_tests.zig`
-  through extern-fn declarations (the real C-caller binding shape).
-
-The CLI and `tools/` scripts are the in-tree consumers of both.
+| You want | Read |
+|---|---|
+| To use the codec: CLI, performance, integrity | [README.md](README.md) |
+| The wire format, byte for byte | [FORMAT.md](FORMAT.md) |
+| Why the kernels are shaped the way they are | [docs/GPU_ARCHITECTURE.md](docs/GPU_ARCHITECTURE.md) |
+| CUDA debugging and profiling recipes | [docs/how_to_debug_cuda.md](docs/how_to_debug_cuda.md) |
+| The Vulkan backend | [srcVK/README.md](srcVK/README.md) and [srcVK/Handbook.md](srcVK/Handbook.md) |
+| Every known difference between the two backends | [srcVK/PortAdaptations.md](srcVK/PortAdaptations.md) |
+| The work ledger: every idea, measurement, and verdict | [v4_ideas.md](v4_ideas.md) |
+| Things that were tried and failed (do not retry them) | [FAILED_EXPERIMENTS.md](FAILED_EXPERIMENTS.md) |
+| Safety guarantees for untrusted input | [SECURITY.md](SECURITY.md) |
 
 ---
 
-## Encode pipeline
+## Where your change goes
 
-`compressFramed` → `fast_framed.compressFramedOne`:
+**Changing the wire format.** Both backends and FORMAT.md must move
+together, and existing frames must still decode. The format
+constants live in exactly one place per side: host constants in
+`src/format/streamlz_constants.zig`, device constants in
+`src/common/gpu_wire_format.cuh` and `gpu_huffman.cuh`; compile-time
+asserts catch drift between them. Mirror the change into the
+`srcVK/` equivalents, then run the cross-backend gate (below).
 
-1. Frame header: `sc_group_size = 0.25` unconditionally (64 KB
-   sub-chunks - the structural lever that beat nvCOMP; override via
-   `-sc`), codec=Fast, content_size.
-2. LZ kernel (`slzLzEncodeKernel`): one warp per chunk, raw streams
-   per sub-chunk. A-023: dispatch is batched under a cuMemGetInfo
-   VRAM budget so the per-chunk hash tables never page over PCIe.
-3. Huffman kernels (L3+): three passes (literals, tokens, off16) →
-   chunk_type=4 BIL bodies.
-4. Assembly: device-side measure/write (`gpuAssembleFrameImpl`), the
-   host walk picks compressed-vs-raw per chunk (expansion falls back
-   to `UNCOMPRESSED_CHUNK_MARKER`), then `slzFrameAssembleKernel`
-   splices the frame device-side; D2H only when the caller wants
-   host output.
-5. SC tail prefix table + end mark.
-6. Integrity (v4 #19, default on): per-chunk hashes of `d_input` are
-   computed on device per block (`slzSegHashKernel` +
-   `slzChunkCombineKernel`), and `slzMerkleRootWriteKernel` writes
-   the 4-byte root trailer directly into the device-resident frame
-   before the final D2H. Host fallback in `format/xxhash32.zig` when
-   the kernels are unavailable.
+**Changing the encoder.** Start at
+`src/encode/streamlz_encoder.zig` (the public API), which hands off
+to `fast_framed.zig` - the frame builder that orchestrates every
+kernel launch for all five levels. The per-stage launchers are
+`encode_lz.zig`, `encode_huff.zig`, and `encode_assemble.zig`;
+level policy (which parser, which entropy stage) is `levels.zig`.
+The kernels themselves are in `lz_kernel.cu` (with the parsers in
+`lz_*.cuh` headers), `huffman_kernel.cu`, and `assemble_kernel.cu`.
 
-v4 #17: at L1/L2 the host-side LZ payload gather is SKIPPED entirely
-(nothing on the host consumes it; the device assemble reads
-`d_output` in place). At L3+ the gather rides persistent pinned
-staging with async copies.
+**Changing the decoder.** Start at
+`src/decode/streamlz_decoder.zig` (public API, frame walk, checksum
+verification), which calls `decode_dispatch.zig` - the function
+`fullGpuLaunchImpl` there launches the entire kernel sequence. The
+hot decode loop lives in `lz_decode_raw_pipeline.cuh`; setting the
+environment variable `SLZ_NO_PIPELINE=1` selects the older
+single-warp kernels instead, which is useful for isolating pipeline
+bugs. Device-resident callers enter through
+`decompressFramedFromDevice`, which walks the frame on the GPU.
 
-`SLZ_PROFILE_PHASES=1` prints per-phase wall times after `-b`
-(enc_phase.zig). The LZ chain parser is ~86% of L5 encode wall and
-is MEASURED-FUNDAMENTAL (v4 #14, parked): 2.1 chain candidates and
-4.7 extend-bytes per findMatchChain call leave nothing for a warp to
-parallelize; faster L5 encode means a different parse algorithm
-(see the #14 entry and the #8 wire-format discussion).
+**Changing a kernel.** One `.cu` file compiles to one `.ptx` file;
+the `.cuh` headers are just a size split, included into that single
+translation unit. Kernels are looked up by name string at runtime,
+so renaming one means changing the symbol, the Zig driver string,
+and regenerating the `.ptx`. All kernel names start with `slz`. The
+descriptor structs passed to kernels are hand-mirrored between Zig
+and CUDA, with size asserts on the CUDA side. Compiled `.ptx` files
+are committed to the repo so a fresh clone builds without a CUDA
+toolchain; `zig build ptx` regenerates stale ones, and the build
+fails loudly if a `.cu` is newer than its `.ptx`.
 
----
+**Changing the C ABI.** `src/streamlz_gpu.zig` implements
+`include/streamlz_gpu.h`. Two call styles: `slzCompressHost` /
+`slzDecompressHost` run on a library-owned worker thread, and
+`slzCompressAsync` / `slzDecompressAsync` operate on device-resident
+buffers and ride the caller's CUDA stream. The tests in
+`src/c_abi_tests.zig` bind through extern declarations - the same
+shape a real C caller uses.
 
-## Decode pipeline
-
-`decompressFramed` walks the frame on the host;
-`dispatchCompressedBlock` builds `ChunkDesc`s and calls
-`fullGpuLaunchImpl`, which runs (L3+; L1/L2 skip the entropy stages
-entirely): prefix-sum → scan-parse → **fused 5-way compact**
-(`slzCompactAllDescsKernel`: 4 huff streams + raw in one launch) →
-gather-raw-off16 → **parallel merge** (`slzMergeHuffDescsParKernel`,
-4 blocks) → Huffman LUT build + 32-stream decode → the K=4 pipelined
-LZ kernel (`slzLzDecodeGeneralPipelinedKernel`, or
-`slzLzDecodeRawPipelinedKernel` for L1/L2; one chunk per 128-thread
-block, parser warp + 3-warp copier team - see GPU_ARCHITECTURE).
-`SLZ_NO_PIPELINE=1` falls back to the single-warp kernels. A-024:
-huff-decode region offsets are applied in-kernel as u64.
-
-Integrity verification (v4 #19) runs after the LZ kernel on the aux
-stream, overlapped with the output D2H: `slzScPrefixApplyKernel`
-(makes the output final on device), `slzSegHashKernel` +
-`slzChunkCombineKernel` (per-chunk hashes), `slzMerkleVerdictKernel`
-(root compare). The host reads a 4-byte verdict; mismatch returns
-`error.ChecksumMismatch`.
-
-The pure-D2D entry is `decompressFramedFromDevice` (frame walk on
-GPU via `gpuWalkFrameImpl`; used by `slzDecompressAsync`).
-
-`SLZ_PROFILE_DECODE=1` on `-db` prints a per-kernel best-of-runs
-table from the cuEvent pairs.
+**Changing anything in `srcVK/`.** Port, don't reinvent: mirror the
+CUDA values, dispatch shapes, and workgroup sizes. When a difference
+is genuinely unavoidable (driver behavior, missing extension), it
+gets a numbered entry in `srcVK/PortAdaptations.md` with evidence.
+No silent forks.
 
 ---
 
-## Wire format
+## Build and test
 
-Constants are split between two locations and must stay in sync:
-
-* `src/format/streamlz_constants.zig` - host-side
-* `src/common/gpu_wire_format.cuh` + `gpu_huffman.cuh` - device-side
-
-See [docs/GPU_ARCHITECTURE.md](docs/GPU_ARCHITECTURE.md) for the
-sub-chunk header layout, the off16 hi/lo split, and the BIL format.
-The wire format is byte-identical across CUDA and VK; the
-cross-backend SHA gate in [CLAUDE.md](CLAUDE.md) enforces it after
-encoder changes.
-
----
-
-## Build
-
-```
-zig build                                 ReleaseFast streamlz.exe
-zig build ptx                             recompile STALE .cu -> .ptx via
-                                          nvcc+vcvarsall (no-op when fresh;
-                                          replaces the touch-the-PTXs dance)
-zig build gpulib                          streamlz_gpu.dll only
-zig build test | ptest                    parallel unit tests (installs the
-                                          exe first - cli_smoke spawns it)
-zig build streamlz_vk | ptest_vk          Vulkan backend + its test suite
-zig build fuzz | stress18 | chaincount    measurement/fuzz tools
-zig build tans_gate2                      v4 #11 replay tool
+```text
+zig build                          builds streamlz.exe (no CUDA toolchain needed)
+zig build ptx                      recompiles stale .cu -> .ptx (needs nvcc)
+zig build test                     unit + integration tests (ptest = parallel)
+zig build streamlz_vk              Vulkan backend (ptest_vk = its test suite)
+zig build gpulib                   streamlz_gpu.dll only
+zig build fuzz                     differential frame-mutation fuzzer
 zig build run -- -l 3 in.bin -o out.slz
 ```
 
-PTX is committed, so plain `zig build` needs no CUDA toolchain. The
-freshness gate fails the build when any `.cu`/`.cuh` is newer than
-any `.ptx` and points at `zig build ptx`. `tools/build_gpu.bat`
-remains for full rebuilds with cuobjdump res-usage printouts.
-
-At milestones, run `tools\sanitize.bat` (memcheck) and
-`tools\sanitize.bat racecheck` - both clean as of 2026-06-10.
+GPU tests skip cleanly on machines without a CUDA device. At
+milestones, run `tools\sanitize.bat` (memory checker) and
+`tools\sanitize.bat racecheck` (race checker).
 
 ---
 
-## CUDA loading
+## The gates
 
-`nvcuda.dll` loads at runtime via `LoadLibraryA`; missing driver →
-`error.BackendNotAvailable` / `SLZ_ERROR_CUDA` (no CPU fallback).
-Encode's `init()` defers to decode's so exactly ONE CUDA context
-exists per process; both inits are SRWLOCK-guarded (a second thread
-arriving mid-bring-up blocks instead of mis-reporting "unavailable").
+These checks decide whether a change lands.
 
-**The context is per-thread current.** Any code running raw driver
-calls from a thread that never bound it gets
-`CUDA_ERROR_INVALID_CONTEXT (201)`. The C ABI binds inside every
-job; tests get it from `lockGpuTests()`; new thread-crossing code
-must call `gpu_driver.bindContextToCallingThread()`.
+(The test corpora live in `assets/`: `enwik8.txt` is a 100 MB
+Wikipedia text dump, `silesia_all.tar` is the 213 MB Silesia
+mixed-content corpus.)
 
----
-
-## Levels
-
-L1-L5, all GPU. Policy lives in `src/encode/levels.zig`:
-
-| Level | Parser | hash_bits | Huffman | LZ rehash |
-|-------|--------|-----------|---------|-----------|
-| L1 | greedy | 17 | no | no |
-| L2 | greedy | 17 | no | yes (v4 #6) |
-| L3 | greedy | 17 | yes | no |
-| L4 | greedy | 17 | yes | yes |
-| L5 | lazy chain | 17 | yes | yes |
-
-hash_bits is 17 at EVERY level since 2026-06-09: at sc=0.25 a 1 GB
-input is ~15k chunks, and any larger per-chunk hash overflows
-consumer VRAM and collapses encode via WDDM paging; measured ratio
-cost of the cap is ≈0.0-0.1 pp. Levels outside 1..5 →
-`error.BadLevel`.
+1. **Cross-backend identity.** After any encoder change, encode
+   enwik8 at levels 1, 3, and 5 on both backends and compare the
+   output files by SHA-256. They must be byte-identical - even when
+   both backends roundtrip their own output correctly, a frame
+   divergence is a bug. Touch a level-specific path, test all five
+   levels.
+2. **Both test suites green**: `zig build ptest` and
+   `zig build ptest_vk`.
+3. **Real-corpus roundtrips**: `tools\bench_all.bat` encodes and
+   decodes enwik8 and silesia at all levels and fails on the first
+   SHA mismatch; `tools\bench_d2d.bat` does the same through the
+   device-resident C ABI path.
+4. **Honest measurements.** Performance numbers are only quotable
+   from a run whose output shows which GPU ran it - on this
+   project's multi-GPU dev box the Vulkan CLI silently picks the
+   Intel iGPU unless `SLZ_VK_DEVICE_INDEX=1` is set. Run GPU
+   benchmarks one at a time, never concurrently. And prefer
+   re-measuring (`streamlz -db file.slz -r 10`; add the
+   `SLZ_PROFILE_DECODE=1` environment variable for a per-kernel
+   table) over trusting numbers written down in docs.
 
 ---
 
-## Performance (RTX 4060 Ti, sm_89 - always print the Device line)
+## How it works, in one minute
 
-Headline (2026-06-11, enwik9 1 GB, decode-kernel best): **L1 52.6%
-@ 16.3 ms (61 GB/s) vs nvCOMP LZ4 53.6% @ 33 ms (2.0x); L5 35.50% @
-26.3 ms vs nvCOMP Zstd 35.75% @ 50.8 ms (1.9x) - better ratio AND
-faster decode on both axes.** enwik8 100 MB: L5 kernel 2.94 ms, e2e
-~15.5 ms including the default-on checksum verification; encode L1
-88 ms (1.1 GB/s), L5 ~295 ms (chain parser ~86% of it, measured
-fundamental - v4 #14).
+**Encode.** The frame builder writes a header, then runs the LZ
+match-finding kernel (one warp per chunk - 64 KB of input each at
+the default settings - dispatched in batches sized to fit VRAM), then - at level 3 and up - Huffman
+kernels over the literal, token, and offset streams. A device-side
+assembly pass splices everything into the final frame layout in GPU
+memory, integrity hash kernels stamp a 4-byte checksum trailer into
+that device-resident frame, and one transfer brings the finished
+frame to the host. Set `SLZ_PROFILE_PHASES=1` to see the per-phase
+time breakdown.
 
-Numbers move; regenerate with `-db -r 10` (+`SLZ_PROFILE_DECODE=1`
-for the per-kernel table) rather than trusting tables in docs. GPU
-benches run SERIALLY, never in parallel (project rule).
+**Decode.** The host (or, for device-resident input, a GPU kernel)
+walks the frame structure, then a chain of small bookkeeping kernels
+sizes and sorts the per-chunk work, Huffman tables are built and the
+entropy streams decoded 32 lanes wide, and the LZ kernel reconstructs
+the output - each chunk handled by a 128-thread block in which one
+warp parses tokens while three warps execute the copies a step
+behind. Checksum kernels then re-hash the output on a side stream,
+overlapped with the transfer back to the host, so corruption is
+caught at ~zero cost. Set `SLZ_PROFILE_DECODE=1` for per-kernel
+times.
+
+**Levels.** L1 = greedy parse, LZ only. L2 = greedy plus a second
+hashing pass over match ranges (~1 point better ratio, slightly
+faster to DECODE than L1 because it emits fewer tokens). L3 = L1
+plus Huffman. L4 = L2 plus Huffman. L5 = lazy chain parser plus
+Huffman, the best ratio and the slowest encode - its parser is
+inherently serial, which is a measured property, not an oversight
+(v4_ideas.md entry 14 has the data).
+
+**CUDA bring-up.** The NVIDIA driver is loaded at runtime
+(`nvcuda.dll`); without it every entry point reports the backend
+unavailable - there is no CPU fallback. The process owns exactly one
+CUDA context, and the context binds per thread: code that calls
+driver functions from a new thread must call
+`gpu_driver.bindContextToCallingThread()` first or every call fails
+with `CUDA_ERROR_INVALID_CONTEXT`. Tests handle this through
+`lockGpuTests()`, which also serializes GPU tests against each
+other.
 
 ---
 
-## Invariants - do not break these
+## Performance anchor
 
-1. **One `.cu` → one `.ptx`.** The `.cuh` files are a size-only
-   split, `#include`d into a single TU.
-2. **Kernels are bound by string** via `cuModuleGetFunction`.
-   Renaming needs the symbol + driver string + regenerated `.ptx`.
-3. **All kernel symbols use the `slz` prefix.**
-4. **Descriptor structs mirror Zig `extern struct`s** with
-   `static_assert(sizeof(...))` guards on the CUDA side.
-5. **Committed `.ptx` are intentional** (clone builds without nvcc);
-   `.cubin` is git-ignored.
-6. **Wire-format constants live in one place per side** (see Wire
-   format above); `static_assert`s catch drift.
-7. **`SLZ_GUARD_SINGLE_THREAD()` also rejects `blockIdx.x != 0`** -
-   multi-block single-thread kernels (the fused compact, the
-   parallel merge) must use a thread-only guard.
-8. **Every VK↔CUDA divergence gets an A-NNN entry** in
-   `srcVK/PortAdaptations.md`, and encoder changes pass the
-   cross-backend SHA gate (CLAUDE.md).
+As of 2026-06-11 on an RTX 4060 Ti: decoding enwik9 (a 1 GB text
+corpus) takes
+16.3 ms of GPU kernel time at level 1 (61 GB/s - twice as fast as
+nvCOMP LZ4, at better compression) and 26.3 ms at level 5 (1.9x
+nvCOMP Zstd, at better compression). Host-to-host on enwik8,
+decode is ~15.5 ms including the always-on integrity check.
+Encoding 100 MB: 88 ms at level 1, ~295 ms at level 5. Current
+tables live in README.md; the Vulkan sweep is in
+srcVK/PerfSweep.md.
