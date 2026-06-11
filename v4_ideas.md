@@ -726,6 +726,19 @@ the path to VK perf is the K=4 redesign (3-warp copier team — needs
 a named-barrier substitute; GLSL has none, so likely full barrier()
 with the parser parked or a 2-subgroup team layout), not tuning the
 K=2 form. ptest_vk 151/9/0 on the default path.
+**VK K=4 measured 2026-06-11 (same session): pipeline REJECTED on VK
+— A-028.** K=4 ported (96-lane team flats, deps on warp 1 gated by a
+uniform dep_mask check so dep-free batches pay one barrier,
+groupMemoryBarrier for workgroup-scope dst visibility), byte-correct
+— and slower still: single-warp 2.36 / K=2 2.89 / K=4 3.18 ms
+(enwik8 L1 kernel). On the NVIDIA VK driver the per-batch workgroup
+barrier costs more than overlap + width recover — opposite of CUDA.
+VK default STAYS single-warp; both pipeline forms remain opt-in
+(SLZ_VK_PIPELINE=1). Catalogued as PortAdaptations A-028 (accepted,
+measured). The VK-vs-CUDA decode gap (1.33-1.35×) is now a
+documented architectural cost of the driver's barrier pricing, not
+an unported optimization.
+
 
 
 

@@ -801,6 +801,7 @@ pub fn runLzPipeline(
             std.c.getenv("SLZ_VK_PIPELINE") != null;
         const raw_kernel = if (use_pipeline) module_loader.kernel_raw_pipeline_fn else module_loader.kernel_raw_fn;
         const raw_grid_x: u32 = if (use_pipeline) lz_grid_x * 2 else lz_grid_x;
+        const raw_block_y: u32 = if (use_pipeline) 4 else 2;
         const raw_label: [*:0]const u8 = if (use_pipeline) "slzLzDecodeRawPipelinedKernel" else "slzLzDecodeRawKernel";
         var raw_params = [_]?*anyopaque{
             @ptrCast(&common.comp),
@@ -812,7 +813,7 @@ pub fn runLzPipeline(
         };
         var raw_extra = [_]?*anyopaque{null};
         const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, raw_label, stream);
-        try vkCall(launch_fn(raw_kernel, raw_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra, null), .launch);
+        try vkCall(launch_fn(raw_kernel, raw_grid_x, 1, 1, 32, raw_block_y, 1, 0, stream, &raw_params, &raw_extra, null), .launch);
         endKernelTiming(t_lzr, stream);
     } else {
         var p_first_sub_idx: VkDeviceBuffer = self.d_first_subchunk_idx;

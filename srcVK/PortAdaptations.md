@@ -1200,3 +1200,32 @@ each design-choice in the **Status** field.
   NOTE: >4 GiB-offset inputs (~1.2 GB+) now have no known ceiling but
   remain runtime-UNVERIFIED - no test asset of that size exists yet;
   the next enwik9-x2-class corpus run should confirm.
+
+### A-028: v4 #15 pipelined decode NOT default on VK (measured architectural divergence)
+
+- **CUDA**: K=4 pipelined kernels (parser warp + 3-warp copier team,
+  one chunk group per block) are DEFAULT for all levels since
+  2026-06-11: enwik8 L1 2.28 -> 1.77 ms, enwik9 L1 -> 16.2 ms.
+- **VK**: BOTH pipeline forms were ported, are byte-correct at scale
+  (enwik8 L1 SHA MATCH, 1526 workgroups), and are SLOWER than the
+  single-warp kernel on the NVIDIA Vulkan driver:
+  single-warp 2.36 ms / K=2 pipeline 2.89 / K=4 team 3.18 (enwik8 L1
+  kernel best, RTX 4060 Ti). The per-batch workgroup barrier()
+  (OpControlBarrier) costs more on this driver than the parse/copy
+  overlap and the 96-lane copy width recover - the exact opposite of
+  CUDA, where BAR.SYNC is nearly free and the same design won 21%.
+  Suspected contributors: no __launch_bounds__ analogue in Vulkan
+  (occupancy not pinned to 12-24 blocks/SM), and heavier barrier
+  lowering; unprofiled (no NCU equivalent wired for VK).
+- **Status**: ACCEPTED divergence, measured 2026-06-11. VK default
+  remains the single-warp kernel; the pipelined kernel stays built +
+  opt-in via SLZ_VK_PIPELINE=1 for future driver/hardware revisits.
+  Two debugging artifacts worth keeping: (1) the original
+  parse-broadcast apparatus (is_parser gating + shared + barrier in
+  the bridge) TDR'd this driver outright - the redundant per-subgroup
+  parse is mandatory; (2) GLSL memoryBarrierBuffer is DEVICE-scope
+  (+26% when used per batch) - groupMemoryBarrier is the workgroup-
+  scope fence the pipeline semantics actually need.
+- **Verification**: static N/A (intentional divergence); runtime =
+  the three measurements above + ptest_vk 151/9/0 on the default
+  path + SLZ_VK_PIPELINE=1 SHA MATCH on enwik8 L1.
