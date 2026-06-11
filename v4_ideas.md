@@ -687,6 +687,16 @@ ptest 50/0/0, 1 GB SHA MATCH, D2D verify OK. Remaining knob if
 silesia matters more later: ship both K=2 and K=4 kernel entries and
 pick per frame by token/lit statistics from the walk. L3+ port and
 VK mirror now target THIS design (K=4 + named barrier).
+**K=4 NCU verdict (2026-06-11, post-ship re-profile)**: SM 71.9%,
+memory 71.9% (lockstep — balanced saturation), warps 92.9%,
+long_scoreboard 6.6, barrier 8.2. The residual barrier stall is the
+lockstep tax (faster side waits per batch) — the mbarrier
+alternative measured worse, so this is the design's floor. L1 raw
+kernel is DONE at 52.7 → 71.9% SM and 2.28 → 1.77 ms in one wave;
+remaining levers are #8 (wire format, changes the work itself) or
+K=8 width (would crater parser-bound corpora; silesia already pays
+at K=4). Next: port THIS design to the L3+ general kernel.
+
 
 
 
