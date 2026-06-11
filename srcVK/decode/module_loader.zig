@@ -1901,7 +1901,10 @@ const KERNEL_DECLS = [_]KernelDecl{
     // (≤ 2.14 GB) and the 1 GB L3+ ~6 GB scratch never needs a >4 GiB
     // binding. CUDA keeps one u64 pointer + stride; this is the VK
     // equivalent under maxStorageBufferRange (see PortAdaptations A-024).
-    .{ .kind = .kernel_fn, .n_bindings = 8, .push_constant_size = 16, .pin_subgroup_32 = true },
+    // v4 #5 (2026-06-10): entropy scratch regions are BDA-addressed (3 u64
+    // region addresses appended to the pc) - bindings drop to 5 (comp,
+    // chunks, dst, total, first_subchunk_idx), no region-view binds.
+    .{ .kind = .kernel_fn, .n_bindings = 5, .push_constant_size = 32, .pin_subgroup_32 = true },
     // srcVK/decode/lz_decode_raw_kernel.comp:25-50 declares 4 SSBO
     // bindings (CompressedBuf, ChunksBuf, DstBuf, TotalChunksBuf) plus
     // a 2× u32 push-constant block (chunks_per_group, sub_chunk_cap).
@@ -1930,17 +1933,12 @@ const KERNEL_DECLS = [_]KernelDecl{
     // Same bindings/pc as the serial merge; dispatched grid_x=4.
     .{ .kind = .merge_huff_descs_par_fn, .n_bindings = 10, .push_constant_size = 8 },
     .{ .kind = .huff_build_fn, .n_bindings = 4, .push_constant_size = 0, .pin_subgroup_32 = true },
-    // huff_decode binding 5 is a u32 alias of binding 3 (OutputBuf) — see kernel comment.
-    // A-024 (2026-06-10 revision): binding 6 (d_compact_counts) lets the
-    // kernel pick which region (lit | tok | off16) each block_id falls
-    // in; the kernel is dispatched THREE times, once per region, with
-    // the output bindings (3 + 5) bound AT the region's byte offset and
-    // a single u32 push constant selecting which region this dispatch
-    // serves. In-shader write offsets stay region-relative (≤ 2.14 GB),
-    // which keeps the 1 GB L3+ ~6 GB scratch under maxStorageBufferRange
-    // per binding AND under u32 arithmetic. CUDA keeps one dispatch with
-    // u64 region params; see PortAdaptations A-024.
-    .{ .kind = .huff_decode_fn, .n_bindings = 7, .push_constant_size = 4, .pin_subgroup_32 = true },
+    // v4 #5 (2026-06-10, supersedes the A-024 3-dispatch revision): the
+    // output scratch is BDA-addressed (3 region base addresses as lo/hi
+    // u32 pairs in the push constants, pre-added on the host) - ONE
+    // dispatch, no region-bound output bindings, no 4 GiB ceiling.
+    // 5 bindings: CompBuf, DescsBuf, LutsBuf, NBlocksBuf, CompactCountsBuf.
+    .{ .kind = .huff_decode_fn, .n_bindings = 5, .push_constant_size = 24, .pin_subgroup_32 = true },
 };
 
 var g_kernel_metas: [KERNEL_DECLS.len]KernelMeta = @splat(.{});

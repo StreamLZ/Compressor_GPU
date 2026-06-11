@@ -310,27 +310,29 @@ fn huffRoundtripOne(allocator: std.mem.Allocator, src: []const u8) !void {
 
     // ── Kernel 4: decoder decode 4-stream ──────────────────────────
     // Binding order per huff_decode_4stream_kernel.comp and KERNEL_DECLS
-    // huff_decode_fn (A-024 2026-06-10: n_bindings=7,
-    // push_constant_size=4). Layout: SSBOs [Comp, Descs, Luts, Output,
-    // NBlocks, OutputU32, CompactCounts] then push const
-    // [region_select: u32]. Binding 5 is a u32-aliased view of binding
-    // 3's VkBuffer used for the Phase 2 hot loop's 4-byte store fast
-    // path. The single desc classifies as region 0 (lit) via the counts
-    // staged above, so one dispatch with region_select=0 suffices —
-    // the production dispatch loops over all three regions.
+    // huff_decode_fn (v4 #5 2026-06-10: n_bindings=5,
+    // push_constant_size=24). Layout: SSBOs [Comp, Descs, Luts,
+    // NBlocks, CompactCounts]; push consts = three u64 region base
+    // ADDRESSES as lo/hi u32 pairs (lit / tok / off16) — the output is
+    // BDA-addressed, not descriptor-bound. The single desc classifies
+    // as region 0 (lit) via the counts staged above; pass d_decoded's
+    // device address for all three regions so any pick lands right.
     {
+        const out_addr = dec_module_loader.getBufferDeviceAddress(d_decoded);
+        try testing.expect(out_addr != 0);
         var p_comp: VkDeviceBuffer = d_bil_out;
         var p_descs: VkDeviceBuffer = d_dec_descs;
         var p_lut: VkDeviceBuffer = d_lut;
-        var p_out: VkDeviceBuffer = d_decoded;
         var p_n: VkDeviceBuffer = d_n_blocks;
-        var p_out_u32: VkDeviceBuffer = d_decoded;
         var p_counts: VkDeviceBuffer = d_counts;
-        var p_region: u32 = 0;
+        var p_lo: u32 = @truncate(out_addr);
+        var p_hi: u32 = @truncate(out_addr >> 32);
         var params = [_]?*anyopaque{
-            @ptrCast(&p_comp),   @ptrCast(&p_descs), @ptrCast(&p_lut),
-            @ptrCast(&p_out),    @ptrCast(&p_n),     @ptrCast(&p_out_u32),
-            @ptrCast(&p_counts), @ptrCast(&p_region),
+            @ptrCast(&p_comp), @ptrCast(&p_descs), @ptrCast(&p_lut),
+            @ptrCast(&p_n),    @ptrCast(&p_counts),
+            @ptrCast(&p_lo),   @ptrCast(&p_hi),
+            @ptrCast(&p_lo),   @ptrCast(&p_hi),
+            @ptrCast(&p_lo),   @ptrCast(&p_hi),
         };
         var extra = [_]?*anyopaque{null};
         if (launch_fn(dec_module_loader.huff_decode_fn, 1, 1, 1, 32, 1, 1, 0, 0, &params, &extra, null) != VK_SUCCESS_RC) {

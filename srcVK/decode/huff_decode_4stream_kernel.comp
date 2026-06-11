@@ -28,6 +28,10 @@
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_KHR_shader_subgroup_shuffle_relative : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+// v4 #5 (2026-06-10): output goes through buffer_device_address (the
+// proven A-008 pattern) instead of region-bound SSBO views.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
 
 #include "gpu_warp.glsl"
 #include "gpu_huffman.glsl"
@@ -67,30 +71,30 @@ layout(std430, binding = 2) readonly buffer LutsBuf {
     uint luts[];
 };
 
-// arg 3: uint8_t* output  (decoded literal scratch)
-layout(std430, binding = 3) buffer OutputBuf {
-    uint8_t output_buf[];
+// arg 3 (CUDA: uint8_t* output): v4 #5 — the decoded-output scratch is
+// addressed through buffer_device_address instead of a descriptor
+// binding. The three REGION base addresses (lit / tok / off16, each =
+// scratch base + region byte offset, added as u64 on the HOST) arrive
+// in the push constants; each block picks its region's address and
+// constructs the references below. All in-shader offsets stay
+// region-relative u32 (≤ 2.14 GB per region) — the 64-bit-ness lives
+// entirely in the reference base, which is what removes the A-024
+// 4 GiB / u32 region-offset ceiling AND the 3-dispatch region split.
+// Byte view + u32 view of the same address (the u32 view keeps the
+// Phase-2 coalesced-store win; Phase 1 alignment guarantee unchanged).
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer OutByteRef {
+    uint8_t b[];
 };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer OutWordRef {
+    uint w[];
+};
+// Set once in main() from the region pick; used by decodeStreamBoundedIL.
+OutByteRef g_out;
+OutWordRef g_out32;
 
 // arg 4: const uint32_t* d_n_blocks
-layout(std430, binding = 4) readonly buffer NBlocksBuf {
+layout(std430, binding = 3) readonly buffer NBlocksBuf {
     uint d_n_blocks;
-};
-
-// VK adaptation: u32-aliased view of the OutputBuf at binding 3. CUDA's
-// reference (huffman_kernel.cu:506) issues a single 32-bit store
-// `*reinterpret_cast<uint32_t*>(out + written) = acc` in the Phase 2
-// hot loop. GLSL has no reinterpret cast across a byte-typed SSBO; the
-// naive port emits four sequential uint8_t stores per inner-k iteration
-// which the SPIR-V→NVIDIA-driver pipeline does not coalesce into a
-// single u32 transaction, costing ~1.77 ms of the 2.46 ms kernel time
-// on enwik8 L5 (72% of huff_decode_fn). The host binds the SAME VkBuffer
-// at binding 3 (uint8_t view) and binding 5 (uint32_t view); Phase 1
-// guarantees (out_base_abs + written) & 3 == 0 before Phase 2a starts,
-// so writes through this view are 4-aligned by construction. Phase 1
-// preamble + Phase 2's pending drain + Phase 3 keep the byte view.
-layout(std430, binding = 5) buffer OutputBufU32 {
-    uint output_buf_u32[];
 };
 
 // A-024: d_compact_counts gives n_lit/n_tok/n_hi/n_lo so each block can
@@ -106,22 +110,23 @@ layout(std430, binding = 5) buffer OutputBufU32 {
 // `uint` member. Here we bind the whole buffer at offset 0 and index
 // into the strided layout: u32-index = byte_offset / 4 = COUNTS_STRIDE
 // (256) / 4 = 64 per field.
-layout(std430, binding = 6) readonly buffer CompactCountsBuf {
+layout(std430, binding = 4) readonly buffer CompactCountsBuf {
     uint d_compact_counts[];
 };
 const uint COMPACT_COUNTS_STRIDE_U32 = 64u;  // 256 bytes / 4 = 64 u32s
 
-// A-024 (2026-06-10 revision): the kernel is dispatched THREE times,
-// once per region (0 = lit, 1 = tok, 2 = off16). The host binds the
-// output views (bindings 3 + 5) AT the region's byte offset inside the
-// shared entropy-scratch buffer, so every in-shader write offset is
-// region-relative — ≤ 2.14 GB (WALK_MAX_CHUNKS × SLOT) — which keeps
-// both the u32 arithmetic and the per-binding maxStorageBufferRange
-// happy even when the whole scratch is ~6 GB (1 GB input). Blocks whose
-// merged-array position falls outside the selected region exit before
-// the LUT load. CUDA keeps a single dispatch with u64 region params.
+// v4 #5 (2026-06-10, supersedes the A-024 3-dispatch revision): ONE
+// dispatch, mirroring CUDA slzHuffDecode4StreamKernel's shape — each
+// block picks its region from d_compact_counts and gets that region's
+// 64-bit base address from the push constants (lo/hi u32 pairs; the
+// host pre-adds scratch_base + tok/off16 region byte offsets as u64).
 layout(push_constant) uniform Push {
-    uint region_select; // 0 = lit, 1 = tok, 2 = off16 (hi + lo)
+    uint lit_addr_lo;
+    uint lit_addr_hi;
+    uint tok_addr_lo;
+    uint tok_addr_hi;
+    uint off16_addr_lo;
+    uint off16_addr_hi;
 } pc;
 
 // ── Shared LUT ──────────────────────────────────────────────────────
@@ -379,7 +384,7 @@ void decodeStreamBoundedIL(uint il_base_abs, uint tail_start_abs,
         // pending byte-by-byte until 4-aligned.
         while (pending > 0u && ((out_base_abs + written) & 3u) != 0u) {
             uint byte_val = acc_lo & 0xFFu;
-            output_buf[out_base_abs + written] = uint8_t(byte_val);
+            g_out.b[out_base_abs + written] = uint8_t(byte_val);
             written += 1u;
             // acc >>= 8. Shift the uvec2 right by 8 bits.
             acc_lo = (acc_lo >> 8) | ((acc_hi & 0xFFu) << 24);
@@ -450,7 +455,7 @@ void decodeStreamBoundedIL(uint il_base_abs, uint tail_start_abs,
                 // (CUDA reference: `*reinterpret_cast<uint32_t*>(out + written) = acc`).
                 // Single 32-bit store replaces four 8-bit stores; ~10× faster
                 // because driver actually coalesces 32-bit aligned stores.
-                output_buf_u32[(out_base_abs + written) >> 2u] = acc_lo;
+                g_out32.w[(out_base_abs + written) >> 2u] = acc_lo;
                 // acc >>= 32. After flushing the low 4 bytes, the
                 // remaining bytes shift down by 4.
                 acc_lo = acc_hi;
@@ -510,7 +515,7 @@ void decodeStreamBoundedIL(uint il_base_abs, uint tail_start_abs,
             if (pending >= 4u) {
                 // CUDA reference: src/decode/huffman_kernel.cu:552-557.
                 // VK adaptation: u32-aligned store via aliased binding 5.
-                output_buf_u32[(out_base_abs + written) >> 2u] = acc_lo;
+                g_out32.w[(out_base_abs + written) >> 2u] = acc_lo;
                 acc_lo = acc_hi;
                 acc_hi = 0u;
                 written += 4u;
@@ -523,7 +528,7 @@ void decodeStreamBoundedIL(uint il_base_abs, uint tail_start_abs,
     // CUDA reference: src/decode/huffman_kernel.cu:562-566.
     while (pending > 0u) {
         uint byte_val = acc_lo & 0xFFu;
-        output_buf[out_base_abs + written] = uint8_t(byte_val);
+        g_out.b[out_base_abs + written] = uint8_t(byte_val);
         written += 1u;
         acc_lo = (acc_lo >> 8) | ((acc_hi & 0xFFu) << 24);
         acc_hi = acc_hi >> 8;
@@ -563,14 +568,14 @@ void decodeStreamBoundedIL(uint il_base_abs, uint tail_start_abs,
             // CUDA reference: src/decode/huffman_kernel.cu:597-599.
             uint b11 = bitbufEscapeBit(bit_buf);
             uint sym = (b11 != 0u) ? lutSym2(entry) : lutSym1(entry);
-            output_buf[out_base_abs + out_pos] = uint8_t(sym);
+            g_out.b[out_base_abs + out_pos] = uint8_t(sym);
             out_pos += 1u;
         } else {
             // CUDA reference: src/decode/huffman_kernel.cu:600-604.
-            output_buf[out_base_abs + out_pos] = uint8_t(lutSym1(entry));
+            g_out.b[out_base_abs + out_pos] = uint8_t(lutSym1(entry));
             out_pos += 1u;
             if (num_syms == int(LUT_NUM_SYMS_DUAL) && out_pos < my_out_size) {
-                output_buf[out_base_abs + out_pos] = uint8_t(lutSym2(entry));
+                g_out.b[out_base_abs + out_pos] = uint8_t(lutSym2(entry));
                 out_pos += 1u;
             }
         }
@@ -596,15 +601,19 @@ void main() {
     // region-relative with no further add.
     uint n_lit = d_compact_counts[0u * COMPACT_COUNTS_STRIDE_U32];
     uint n_tok = d_compact_counts[1u * COMPACT_COUNTS_STRIDE_U32];
-    uint my_region;
+    // v4 #5: pick this block's region ADDRESS (CUDA picks a u64
+    // region_off the same way; here the offset is pre-added into the
+    // address on the host). hi and lo share the off16 region.
+    uvec2 region_addr;
     if (block_id < n_lit) {
-        my_region = 0u;
+        region_addr = uvec2(pc.lit_addr_lo, pc.lit_addr_hi);
     } else if (block_id < n_lit + n_tok) {
-        my_region = 1u;
+        region_addr = uvec2(pc.tok_addr_lo, pc.tok_addr_hi);
     } else {
-        my_region = 2u;
+        region_addr = uvec2(pc.off16_addr_lo, pc.off16_addr_hi);
     }
-    if (my_region != pc.region_select) return;
+    g_out   = OutByteRef(region_addr);
+    g_out32 = OutWordRef(region_addr);
 
     // CUDA reference: src/decode/huffman_kernel.cu:643. Parse the 5×u32
     // HuffDecChunkDesc (in_offset, in_size, out_offset, out_size,

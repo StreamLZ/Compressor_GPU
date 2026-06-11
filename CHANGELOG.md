@@ -78,6 +78,20 @@ Wire format unchanged from 2026-06-09; all frames byte-identical.
   Verified: both suites green, both D2D sweeps verify-OK, 1 GB SHA
   MATCH both backends, Intel iGPU decode SHA MATCH + cross-device
   encode byte-identity re-confirmed post-change.
+- **VK entropy scratch BDA-addressed** (v4 #5 / A-024+A-005 permanent
+  close): huff_decode_4stream + lz_decode general now address the
+  lit/tok/off16 scratch regions through
+  VK_KHR_buffer_device_address (A-008 pattern) - three pre-offset
+  u64 region addresses in the push constants, in-shader offsets stay
+  region-relative u32. Removes the 4 GiB maxStorageBufferRange / u32
+  region-offset ceiling permanently (the #4 exact sizing only
+  deferred it to ~1.2 GB inputs), collapses the A-024 3-dispatch
+  huff split back to ONE dispatch (CUDA-identical shape), and drops
+  the dead entropy_slot_stride from the ABI (A-005 retired).
+  KERNEL_DECLS: huff 7 bindings/4 B pc -> 5/24; lz 8/16 -> 5/32.
+  Verified: ptest_vk 150/9/0, enwik9 1 GB L3+L5 SHA MATCH, D2D sweep
+  all-verified, Intel iGPU L5 SHA MATCH (BDA on both vendors);
+  enwik9 L5 kernels 35.7 -> 35.5 ms.
 - **v4 #3 measured and parked**: permanent `SLZ_COUNT_PP`
   instrumentation (compile-time device counters in lz_decode_raw.cuh,
   default off; `-db` readback via newly-resolved cuModuleGetGlobal

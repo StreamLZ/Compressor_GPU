@@ -153,8 +153,11 @@ verification status. An unverified adaptation is a known risk surface.
 - **Runtime verification**: Implicitly verified for current workloads
   (web/enwik8 fit in u32). NOT verified for very-large inputs
 - **Discovered**: Iter 4 (`ac013b5`)
-- **Status**: ACTIVE — accept truncation for current workloads;
-  add assert when targeting >4 GiB scratch
+- **Status**: ✅ **RESOLVED 2026-06-10 via v4 #5 (BDA)**. The
+  entropy_slot_stride push constant was dropped from the LZ-general
+  ABI entirely - scratch regions arrive as three pre-offset 64-bit
+  device addresses (buffer_reference), so there is no u64-to-u32
+  truncation surface left.
 
 ### A-006: `compute_to_compute_barrier` between Huff decode + LZ decode
 - **File:line**: `srcVK/decode/decode_dispatch.zig::runBackHalf` +
@@ -1175,3 +1178,25 @@ each design-choice in the **Status** field.
 - **Discovered**: 2026-06-10 (self-audit after the B2 tail landed).
 - **Status**: OPEN — accepted divergence, measured-neutral on the
   CUDA side.
+
+### A-024 / A-005 close-out addendum (v4 #5, 2026-06-10)
+- Both kernels that addressed entropy scratch through descriptor-bound
+  region windows (huff_decode_4stream, lz_decode general) now use
+  VK_KHR_buffer_device_address (the proven A-008 pattern): the host
+  pre-adds the lit/tok/off16 region byte offsets to the scratch base
+  as u64 and passes three addresses as lo/hi u32 push-constant pairs;
+  in-shader offsets stay region-relative u32. This removes the 4 GiB
+  maxStorageBufferRange / u32 region-offset ceiling PERMANENTLY (the
+  #4 exact sizing only deferred it to ~1.2 GB inputs) and collapses
+  the A-024 3-dispatch huff-decode split back to ONE dispatch
+  (mirrors CUDA's slzHuffDecode4StreamKernel shape verbatim - the
+  region pick from d_compact_counts is now identical on both sides).
+- KERNEL_DECLS: huff_decode 7 bindings/4 B pc -> 5/24; lz general
+  8 bindings/16 B pc -> 5/32 (legacy unread stride dropped).
+- Verified: ptest_vk 150/9/0; enwik9 1 GB L3 AND L5 SHA-256 MATCH;
+  bench_d2d_vk all cells byte-verified; Intel(R) Graphics enwik8 L5
+  decode SHA MATCH (BDA path confirmed on both vendors); enwik9 L5
+  kernels 35.7 -> 35.5 ms (the two recovered dispatch overheads).
+  NOTE: >4 GiB-offset inputs (~1.2 GB+) now have no known ceiling but
+  remain runtime-UNVERIFIED - no test asset of that size exists yet;
+  the next enwik9-x2-class corpus run should confirm.

@@ -16,6 +16,9 @@
 #extension GL_KHR_shader_subgroup_ballot : require
 #extension GL_KHR_shader_subgroup_vote : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+// v4 #5 (2026-06-10): entropy scratch is BDA-addressed (A-008 pattern).
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
 
 #include "slz_wire_format.glsl"
 #include "lz_decode_core.glsl"
@@ -56,52 +59,50 @@ layout(std430, binding = 3) readonly buffer TotalChunksBuf {
     uint d_total_chunks;
 };
 
-// arg 6: uint8_t* entropy_scratch (3 sub-slots per sub-chunk: lit/tok/off16,
-// each ENTROPY_SCRATCH_SLOT_BYTES wide; layout matches host-side
-// runHuffBuildAndDecode at decode_dispatch.zig).
-//
-// VK adaptation: typed as `uint8_t` for parity with the per-byte reads
-// the parseSubChunkHeaders / decodeSubChunkGeneral macros emit when they
-// pull entropy-decoded bytes back into the LZ token loop.
-layout(std430, binding = 4) buffer EntropyScratchBuf {
-    uint8_t entropy_scratch[];
+// arg 6 (CUDA: uint8_t* entropy_scratch): v4 #5 (2026-06-10, supersedes
+// the A-024 region-view bindings) — the three lit/tok/off16 region
+// windows of the entropy scratch are addressed via
+// buffer_device_address. The host pre-adds the region byte offsets to
+// the scratch base as u64 and passes three addresses in the push
+// constants; in-shader offsets stay region-relative u32 (≤ 2.14 GB per
+// region). This is the closest VK shape to CUDA's u64 pointer
+// arithmetic (base + region_off) and removes the 4 GiB /
+// maxStorageBufferRange ceiling permanently.
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer ScratchRef {
+    uint8_t b[];
 };
+// Set once in main() from the push constants.
+ScratchRef g_scr_lit;
+ScratchRef g_scr_tok;
+ScratchRef g_scr_off16;
 
 // arg 8: const uint32_t* first_subchunk_idx (per-chunk global sub-chunk
 // base index, written by runHuffBuildAndDecode's prefix sum).
-layout(std430, binding = 5) readonly buffer FirstSubChunkIdxBuf {
+layout(std430, binding = 4) readonly buffer FirstSubChunkIdxBuf {
     uint first_subchunk_idx[];
 };
 
-// 2026-06-10 (A-024 revision): tok / off16 region views of the SAME
-// entropy-scratch buffer, bound by the host at tok_offset /
-// off16_offset via per-binding offsets. CUDA derives these regions
-// with u64 pointer arithmetic (base + stride, + 2*stride); Vulkan
-// SSBO indexing is u32 and a binding cannot span more than
-// maxStorageBufferRange (4 GiB - 1), so the ~6 GB scratch at 1 GB
-// inputs is addressed through three region-relative windows instead.
-// Each region is at most WALK_MAX_CHUNKS × ENTROPY_SCRATCH_SLOT_BYTES
-// = 2.14 GB, so all in-shader offsets stay u32-safe.
-layout(std430, binding = 6) buffer EntropyScratchTokBuf {
-    uint8_t entropy_scratch_tok[];
-};
-layout(std430, binding = 7) buffer EntropyScratchOff16Buf {
-    uint8_t entropy_scratch_off16[];
-};
-
-// Scalar args 3, 5, 7 ride in via push constants. Layout matches the
-// CUDA arg list order (chunks_per_group, sub_chunk_cap, entropy_slot_stride).
-//
-// VK adaptation: CUDA's u64 entropy_slot_stride is split into uvec2 (lo,
-// hi) for std430 push-constant compat. Both halves are loaded as u32
-// in the kernel and combined via packUint2x32 below.
+// Scalar args ride in via push constants, host packing order =
+// declaration order: chunks_per_group, sub_chunk_cap, then the three
+// region base addresses (v4 #5) as lo/hi u32 pairs. The legacy
+// entropy_slot_stride u64 (unread since the A-024 revision — regions
+// arrive pre-offset) is dropped from the ABI here.
 layout(push_constant) uniform Push {
     uint chunks_per_group;
     uint sub_chunk_cap;
-    uvec2 entropy_slot_stride; // u64 split lo/hi
+    uint lit_addr_lo;
+    uint lit_addr_hi;
+    uint tok_addr_lo;
+    uint tok_addr_hi;
+    uint off16_addr_lo;
+    uint off16_addr_hi;
 } pc;
 
 void main() {
+    // v4 #5: construct the three region references once per invocation.
+    g_scr_lit   = ScratchRef(uvec2(pc.lit_addr_lo, pc.lit_addr_hi));
+    g_scr_tok   = ScratchRef(uvec2(pc.tok_addr_lo, pc.tok_addr_hi));
+    g_scr_off16 = ScratchRef(uvec2(pc.off16_addr_lo, pc.off16_addr_hi));
     // CUDA reference: src/decode/lz_decode_kernels.cuh:43-50.
     uint total_chunks = d_total_chunks;
     uint warp_id = gl_LocalInvocationID.y;
@@ -208,9 +209,9 @@ void main() {
                 parseAndDecodeSubChunk(
                     compressed, sc_payload, sc_comp_size, sc_size,
                     dst, sc_dst_off, sc_dst_off, sc_mode,
-                    entropy_scratch, subchunk_scratch_base,
-                    entropy_scratch_tok, subchunk_scratch_base,
-                    entropy_scratch_off16, subchunk_scratch_base,
+                    g_scr_lit.b, subchunk_scratch_base,
+                    g_scr_tok.b, subchunk_scratch_base,
+                    g_scr_off16.b, subchunk_scratch_base,
                     /*has_entropy=*/1u, lane);
             } else {
                 // CUDA reference: src/decode/lz_decode_kernels.cuh:130-133.

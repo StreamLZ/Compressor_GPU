@@ -179,7 +179,7 @@ e2e at parity with CUDA (PCIe-bound); kernel gap 1.32× vs CUDA's
 worst-case bound (host can't read device descs) — at 1 GB L3+ D2D
 that's 12 GB scratch again; noted in the #12 basket.
 
-## 5. Close the VK A-024 residual permanently (BDA entropy scratch)
+## 5. Close the VK A-024 residual permanently (BDA entropy scratch) — ✅ DONE 2026-06-10
 
 **What**: Address `entropy_scratch` in the VK Huffman-decode and
 LZ-general kernels through `VK_KHR_buffer_device_address`
@@ -193,6 +193,18 @@ inputs, future sc choices, no silent edge). Also retires the A-005
 
 **Cost/risk**: medium; mechanical copy of the A-008 BDA recipe across
 2 kernels + dispatch; needs the A-024-style threshold tests on VK.
+**DONE 2026-06-10**: both kernels converted (huff_decode_4stream +
+lz_decode general) via the A-008 recipe — three pre-offset region
+addresses as push-constant lo/hi pairs, in-shader offsets stay
+region-relative u32. Bonus: the A-024 3-dispatch huff split collapsed
+back to ONE dispatch (CUDA-identical shape, region pick from
+d_compact_counts), and the dead entropy_slot_stride left the ABI
+(A-005 retired). KERNEL_DECLS: huff 7/4B → 5/24B, lz 8/16B → 5/32B.
+Verified: ptest_vk 150/9/0, enwik9 1 GB L3+L5 SHA MATCH, D2D sweep
+all-verified, Intel iGPU L5 SHA MATCH (BDA on both vendors); enwik9
+L5 kernels 35.7 → 35.5 ms. The >4 GiB-offset regime (~1.2 GB+ inputs)
+has no remaining known ceiling but awaits a test asset that large.
+
 
 ## 6. Re-differentiate L2 — ✅ DONE 2026-06-10: L2 = greedy + match-range rehash, LZ-only
 
