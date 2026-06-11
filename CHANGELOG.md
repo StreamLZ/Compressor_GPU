@@ -92,6 +92,21 @@ Wire format unchanged from 2026-06-09; all frames byte-identical.
   Verified: ptest_vk 150/9/0, enwik9 1 GB L3+L5 SHA MATCH, D2D sweep
   all-verified, Intel iGPU L5 SHA MATCH (BDA on both vendors);
   enwik9 L5 kernels 35.7 -> 35.5 ms.
+- **Two-warp pipelined raw LZ decode** (v4 #15, CUDA, default ON):
+  NCU-gated (post-#1/#2 kernel at 52.7% SM / 22.9 long_scoreboard -
+  the issue pipe was no longer saturated), then built: warp 0 parses
+  PP batch N+1 into a shared double buffer while warp 1 executes
+  batch N's flat copies; __syncthreads()-paced (intra-block
+  spin-waits deadlock on NVIDIA - no scheduler fairness). Serial
+  long tokens drain + run cooperatively. enwik8 L1 2.28 -> 1.93 ms,
+  enwik9 L1 20.9 -> 17.2 ms (58.2 GB/s; nvCOMP LZ4 margin 1.92x),
+  silesia L1 4.16 -> 3.87; D2D async wall L1 4.04 -> 3.27 ms
+  (1.46x). Cumulative #1+#2+#15 enwik9 L1: 24.3 -> 17.2 = 1.41x.
+  ptest 50/0/0 pipelined; 1 GB SHA MATCH. SLZ_NO_PIPELINE=1 escape.
+  VK mirror pending (OPEN divergence; tracked in the entry).
+  Side-find: default `zig build` does NOT rebuild streamlz_gpu.dll -
+  all D2D numbers since 2026-06-10 15:29 had measured a stale DLL
+  (now rebuilt via `zig build gpulib`; README async cells refreshed).
 - **v4 #3 measured and parked**: permanent `SLZ_COUNT_PP`
   instrumentation (compile-time device counters in lz_decode_raw.cuh,
   default off; `-db` readback via newly-resolved cuModuleGetGlobal

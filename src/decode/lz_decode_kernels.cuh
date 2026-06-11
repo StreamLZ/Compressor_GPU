@@ -229,3 +229,88 @@ slzLzDecodeRawKernel(
         }
     }
 }
+
+// ── v4 #15: Pipelined raw kernel ──────────────────────────────────
+// Same interface as slzLzDecodeRawKernel but both warps in a block
+// cooperate on the SAME chunk group via the 2-warp pipeline
+// (lz_decode_raw_pipeline.cuh). Grid must be doubled by the host.
+#include "lz_decode_raw_pipeline.cuh"
+
+extern "C" __global__ void
+__launch_bounds__(LZ_KERNEL_BLOCK_THREADS, LZ_KERNEL_MIN_BLOCKS_PER_SM)
+slzLzDecodeRawPipelinedKernel(
+    const uint8_t* __restrict__ compressed,
+    const SlzChunkDesc* __restrict__ chunks,
+    uint8_t* __restrict__ dst,
+    uint32_t chunks_per_group,
+    const uint32_t* __restrict__ d_total_chunks,
+    uint32_t sub_chunk_cap
+) {
+    const uint32_t total_chunks = *d_total_chunks;
+    const uint32_t group_id = blockIdx.x;
+    const int lane = threadIdx.x & LANE_MASK;
+    if (group_id >= (total_chunks + chunks_per_group - 1) / chunks_per_group) return;
+    const uint32_t base_chunk = group_id * chunks_per_group;
+
+    __shared__ PipeBatch s_pipe_batch[2];
+
+    for (uint32_t c = 0; c < chunks_per_group; c++) {
+        uint32_t chunk_idx = base_chunk + c;
+        if (chunk_idx >= total_chunks) return;
+
+        const SlzChunkDesc& ch = chunks[chunk_idx];
+        if (ch.decomp_size == 0) continue;
+
+        if (ch.flags & CHUNK_FLAG_UNCOMPRESSED) {
+            const uint8_t* src = compressed + ch.src_offset;
+            uint32_t gl = threadIdx.y * WARP_SIZE + lane;
+            for (uint32_t i = gl; i < ch.decomp_size; i += LZ_KERNEL_BLOCK_THREADS)
+                dst[ch.dst_offset + i] = src[i];
+            __syncthreads();
+            continue;
+        }
+        if (ch.flags & CHUNK_FLAG_MEMSET) {
+            uint32_t gl = threadIdx.y * WARP_SIZE + lane;
+            for (uint32_t i = gl; i < ch.decomp_size; i += LZ_KERNEL_BLOCK_THREADS)
+                dst[ch.dst_offset + i] = ch.memset_fill;
+            __syncthreads();
+            continue;
+        }
+
+        const uint8_t* chunk_src = compressed + ch.src_offset;
+        uint32_t sc_dst_off = ch.dst_offset;
+        uint32_t sc_remaining = ch.decomp_size;
+
+        while (sc_remaining > 0) {
+            uint32_t sc_size = sc_remaining;
+            if (sc_size > sub_chunk_cap) sc_size = sub_chunk_cap;
+
+            __shared__ uint32_t s_sch;
+            if (lane == 0 && threadIdx.y == 0) s_sch = readBE24(chunk_src);
+            __syncthreads();
+            uint32_t sub_chunk_header = s_sch;
+
+            if (!subchunkIsLz(sub_chunk_header)) break;
+
+            uint32_t sc_comp_size = subchunkCompSize(sub_chunk_header);
+            const uint8_t* sc_payload = chunk_src + 3;
+
+            if (sc_comp_size < sc_size) {
+                parseAndDecodeSubChunkRawPipelined(
+                    sc_payload, sc_comp_size, sc_size,
+                    dst, sc_dst_off, sc_dst_off,
+                    s_pipe_batch
+                );
+            } else {
+                uint32_t gl = threadIdx.y * WARP_SIZE + lane;
+                for (uint32_t i = gl; i < sc_size; i += LZ_KERNEL_BLOCK_THREADS)
+                    dst[sc_dst_off + i] = sc_payload[i];
+            }
+            __syncthreads();
+
+            chunk_src += 3 + sc_comp_size;
+            sc_dst_off += sc_size;
+            sc_remaining -= sc_size;
+        }
+    }
+}

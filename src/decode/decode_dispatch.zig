@@ -471,6 +471,19 @@ fn runLzPipeline(
     };
 
     if (use_raw_kernel) {
+        // v4 #15 (2026-06-11): pipelined kernel — both warps in a block
+        // cooperate on the SAME group (warp 0 parses batch N+1 while
+        // warp 1 executes batch N's copies from a shared double
+        // buffer), grid doubled to compensate. Hides the
+        // long-scoreboard memory-latency stall the post-#1/#2 NCU
+        // profile exposed (52.7% SM, 22.9 stall). Default ON; measured
+        // enwik8 L1 2.28 -> 1.93 ms, enwik9 L1 20.9 -> 17.2 ms,
+        // silesia L1 4.16 -> 3.87 ms. SLZ_NO_PIPELINE=1 is the debug
+        // escape back to the single-warp kernel.
+        const use_pipeline = module_loader.kernel_raw_pipeline_fn != 0 and
+            std.c.getenv("SLZ_NO_PIPELINE") == null;
+        const raw_kernel = if (use_pipeline) module_loader.kernel_raw_pipeline_fn else module_loader.kernel_raw_fn;
+        const raw_grid_x: u32 = if (use_pipeline) lz_grid_x * 2 else lz_grid_x;
         var raw_params = [_]?*anyopaque{
             @ptrCast(&common.comp),
             @ptrCast(&common.descs_dev),
@@ -480,8 +493,9 @@ fn runLzPipeline(
             @ptrCast(&common.sub_chunk_cap),
         };
         var raw_extra = [_]?*anyopaque{null};
-        const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzLzDecodeRawKernel", stream);
-        try cudaCall(launch_fn(module_loader.kernel_raw_fn, lz_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra), .launch);
+        const label: [*:0]const u8 = if (use_pipeline) "slzLzDecodeRawPipelinedKernel" else "slzLzDecodeRawKernel";
+        const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, label, stream);
+        try cudaCall(launch_fn(raw_kernel, raw_grid_x, 1, 1, 32, 2, 1, 0, stream, &raw_params, &raw_extra), .launch);
         endKernelTiming(t_lzr, stream);
     } else {
         var p_entropy_scratch: u64 = self.d_entropy_scratch;

@@ -603,7 +603,7 @@ deliberately, never silently. Harness-first in a new `tools/lz_test/`
 Effort: 1-2 weeks. Any change must be mirrored to srcVK
 (`subgroupShuffle` + the A-002 match_any emulation already exist).
 
-## 15. Multi-warp-per-chunk LZ decode (structural; AFTER #1/#2)
+## 15. Multi-warp-per-chunk LZ decode — ✅ DONE 2026-06-11: 2-warp pipeline, default ON
 
 (Merged from the retired docs/GPU_IDEAS.md idea 3.)
 
@@ -621,6 +621,32 @@ kernel, and #1/#2's lane-efficiency win changes this idea's
 cost/benefit. Could be 0% (ring serialization) or 10-25%;
 harness-first A/B mandatory. Effort: 1-2 weeks, most speculative
 item on this list.
+**DONE 2026-06-11.** NCU gate first (admin counters unlocked): the
+post-#1/#2 raw kernel measured 52.7% SM throughput (was ~92%), 22.9
+long_scoreboard stall, 0.0 barrier stall — the issue pipe was no
+longer saturated, so the structural lever had room. Implementation
+(`lz_decode_raw_pipeline.cuh`, K=2): warp 0 parses batch N+1 (PP
+scans → PipeBatch shared double buffer) while warp 1 executes batch
+N's flat copies; __syncthreads()-paced (intra-block spin-waits
+deadlock — no warp-scheduler fairness; measured instantly). Serial
+long tokens drain the pipeline then run cooperatively. Two bugs cost
+a debugging session: the prime-failure path skipped the serial
+handler (most chunks open with a long match at the 64 KB boundary),
+and `(1u << batch_size) - 1u` at batch_size==32 is UB that silently
+dropped every dependent match of full batches. Measured (default ON,
+SLZ_NO_PIPELINE=1 escape): enwik8 L1 2.28 → **1.93 ms**, enwik9 L1
+20.9 → **17.2 ms** (58.2 GB/s, nvCOMP LZ4 margin 1.92×), silesia L1
+4.16 → 3.87. D2D async wall L1 4.04 → **3.27 ms** (1.46× vs nvCOMP).
+Cumulative #1+#2+#15 on enwik9 L1: 24.3 → 17.2 = **1.41×**. ptest
+50/0/0 with pipeline forced; 1 GB SHA MATCH. Side-find: the default
+`zig build` does NOT rebuild streamlz_gpu.dll — every D2D number
+since 2026-06-10 15:29 measured a stale DLL (`zig build gpulib` now
+required; README async cells were re-measured fresh). REMAINING: VK
+mirror (port-means-port — divergence OPEN until then; GLSL barrier()
+replaces __syncthreads, same PipeBatch shape), and K=3/4 variants
+were not explored (the 1-deep __syncthreads pipeline already
+captures most of the overlap; deeper needs persistent-threads).
+
 
 ## 16. Dictionary support (zstd-style preset dictionaries)
 

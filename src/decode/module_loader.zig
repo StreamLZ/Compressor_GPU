@@ -35,6 +35,7 @@ fn nullTerminatedPtx(comptime name: []const u8) [:0]const u8 {
 pub var module: usize = 0;
 pub var kernel_fn: usize = 0;
 pub var kernel_raw_fn: usize = 0;
+pub var kernel_raw_pipeline_fn: usize = 0;
 pub var gather_off16_fn: usize = 0;
 pub var scan_parse_fn: usize = 0;
 pub var walk_frame_fn: usize = 0;
@@ -176,6 +177,7 @@ pub fn init() bool {
     // Optional lean L1/L2-raw kernel - driver routes to it when no entropy
     // is present. Failing to load is fine; falls back to general kernel.
     _ = get_fn(&kernel_raw_fn, module, "slzLzDecodeRawKernel");
+    _ = get_fn(&kernel_raw_pipeline_fn, module, "slzLzDecodeRawPipelinedKernel");
     // GPU decode-scan kernel. Required: the decode dispatch fails
     // BackendNotAvailable when this symbol is missing (the CPU scan
     // path has been retired).
