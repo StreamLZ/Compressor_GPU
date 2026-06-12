@@ -1339,6 +1339,26 @@ PTX with -lineinfo and re-run racecheck to map the offsets to source
 (candidates: the s_have double-buffer flags, the PipeBatch slot
 handoff, or s_state/s_long broadcast), then audit the barrier that
 should separate them. Until fixed, #18's mitigation stands.
+**Investigated further same day (3b6cfd3):** hazard detail from
+per-hazard mode: WAR - COPIER warp 1 lane 31 READS a u32 of the
+body's shared state that PARSER lane 0 later WRITES with a small
+value (1/0: s_have flag or PipeBatch scalar shapes). Control:
+SLZ_NO_PIPELINE=1 single-warp kernel = ZERO hazards (race is
+exclusively pipeline machinery). Source mapping FAILED two ways:
+offline ptxas offsets do not match the driver JIT's layout, and the
+new SLZ_JIT_LINEINFO hook (cuModuleLoadDataEx +
+CU_JIT_GENERATE_LINE_INFO, gated, committed) did not get racecheck
+to print lines. Source audit: every copier-read/parser-write pair
+traceable in the code is separated by a block-wide __syncthreads -
+which raises the COMPETING HYPOTHESIS that racecheck mismodels the
+copier team's NAMED barrier (__barrier_sync_count(1, 96)) and these
+are false positives; the once-in-280-runs #18 mismatch argues
+something real exists SOMEWHERE. DECISIVE NEXT EXPERIMENT: build a
+diagnostic kernel variant replacing pipeTeamBar with block-wide
+pacing (parser idles - slow, diagnostic only): hazards persisting =
+real race independent of the named barrier; hazards vanishing =
+named-barrier modeling artifact, and the #18 hunt moves elsewhere
+(e.g. the encode-side or the host SC-prefix post-pass).
 
 **Detection sub-item (2026-06-11, from "does the software KNOW it
 fails?"):** today, NO by default -- silent wrong bytes; only test
