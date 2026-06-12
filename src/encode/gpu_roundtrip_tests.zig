@@ -351,6 +351,60 @@ test "v4 #20: chunk-size table frames - footer correctness, roundtrips, D2D walk
         error.BadMode,
         decoder.decompressFramedFromDevice(null, d_frame, @intCast(n_tab), d_out, &gpu_driver.g_default, @intCast(payload.len)),
     );
+
+    // Dictionary x table: one frame carrying BOTH features. The 4-byte
+    // dictionary ID shifts every header offset the table walk derives,
+    // and the LZ kernels reach into the dictionary from descriptors the
+    // TABLE walk produced (the dict D2D test covers the serial walk
+    // only). Payload = builtin text-dictionary slices + random filler,
+    // so dictionary matches provably fire: if none did, the dict frame
+    // would be the no-dict frame plus exactly 4 ID bytes (the phase-1
+    // splice invariant), so strictly-smaller proves engagement.
+    const dictionary = @import("../dict/dictionary.zig");
+    const text_dict = dictionary.findById(dictionary.id_text).?.data;
+    var prng = std.Random.DefaultPrng.init(0x2016);
+    prng.random().bytes(payload);
+    var rec: usize = 0;
+    while ((rec + 1) * 256 <= payload.len) : (rec += 1) {
+        const src_off = (rec * 180) % (text_dict.len - 192);
+        @memcpy(payload[rec * 256 ..][0..192], text_dict[src_off..][0..192]);
+    }
+    const n_nodict = try encoder.compressFramed(
+        allocator,
+        payload,
+        plain,
+        .{ .level = 1, .chunk_size_table = true },
+        &gpu_encoder.g_default,
+    );
+    const n_dict = try encoder.compressFramed(
+        allocator,
+        payload,
+        tabled,
+        .{ .level = 1, .dictionary_id = dictionary.id_text, .chunk_size_table = true },
+        &gpu_encoder.g_default,
+    );
+    try testing.expect(n_dict < n_nodict);
+    const dict_hdr = frame_format.parseHeader(tabled[0..n_dict]) catch unreachable;
+    try testing.expect(dict_hdr.chunk_size_table);
+    try testing.expectEqual(@as(?u32, dictionary.id_text), dict_hdr.dictionary_id);
+
+    // Host path (chain walk over the dict frame, footer stepped over).
+    const w_host = try decoder.decompressFramed(tabled[0..n_dict], dst, &gpu_driver.g_default);
+    try testing.expectEqual(payload.len, w_host);
+    try testing.expectEqualSlices(u8, payload, dst[0..w_host]);
+
+    // D2D path: table-mode walk + dict-aware LZ kernels, byte-compared.
+    // Fresh device buffer - d_frame above was sized for the (smaller)
+    // pattern-payload frame.
+    var d_dict_frame: u64 = 0;
+    if (malloc_fn(&d_dict_frame, n_dict) != cuda.CUDA_SUCCESS) return error.SkipZigTest;
+    defer _ = free_fn(d_dict_frame);
+    if (h2d_fn(d_dict_frame, @ptrCast(tabled.ptr), n_dict) != cuda.CUDA_SUCCESS) return error.CopyFailed;
+    const w_d2d = try decoder.decompressFramedFromDevice(null, d_dict_frame, @intCast(n_dict), d_out, &gpu_driver.g_default, @intCast(payload.len));
+    try testing.expectEqual(@as(u32, @intCast(payload.len)), w_d2d);
+    @memset(dst, 0x77);
+    if (d2h_fn(@ptrCast(dst.ptr), d_out, payload.len) != cuda.CUDA_SUCCESS) return error.CopyFailed;
+    try testing.expectEqualSlices(u8, payload, dst[0..payload.len]);
 }
 
 test "v4 #16: dictionary frames roundtrip, compress better, enforce the registry" {
