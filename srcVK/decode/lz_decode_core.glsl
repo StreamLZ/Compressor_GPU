@@ -58,6 +58,57 @@ void warpScanU32(uint v, int lane, out uint exclusive, out uint total) {
         }                                                                       \
     } while (false)
 
+// CUDA reference: src/decode/lz_decode_core.cuh:68-77 (readBackRefByte,
+// v4 #16). Read one match-source byte that may lie BELOW the sub-chunk's
+// output window: with a preset dictionary, the negative space immediately
+// before `window_base` maps onto the dictionary's tail (dict byte
+// `dict_len - k` sits k bytes below the window). The u32 wrap arithmetic
+// makes the below-window test correct even when the arithmetic source
+// address wrapped negative (chunk 0 windows). Reads reaching below the
+// dictionary itself (hostile frames) clamp to 0x00.
+//
+// VK adaptation: out-param statement macro (CUDA returns the byte; GLSL
+// macros cannot return, and the two-SSBO read rules out a function) —
+// the same shape as _SLZ_OFF16_READ_FALSE/_TRUE in lz_decode_raw.glsl.
+#define _SLZ_READ_BACKREF(out_b, dst_ssbo, addr, window_base, dict_ssbo, dict_len) \
+    do {                                                                           \
+        uint _rb_below = uint(window_base) - uint(addr);                           \
+        if (_rb_below != 0u && _rb_below < 0x80000000u) {                          \
+            (out_b) = (_rb_below <= uint(dict_len))                                \
+                ? (dict_ssbo)[uint(dict_len) - _rb_below] : uint8_t(0u);           \
+        } else {                                                                   \
+            (out_b) = (dst_ssbo)[uint(addr)];                                      \
+        }                                                                          \
+    } while (false)
+
+// CUDA reference: src/decode/lz_decode_core.cuh:86-103 (warpMatchCopyD,
+// v4 #16). Match copy with dictionary reach — the HAS_DICT=true template
+// instantiation. The HAS_DICT=false instantiation IS warpMatchCopy above
+// (CUDA compiles it to exactly that), so dictionary-less call sites keep
+// using warpMatchCopy and pay nothing. A match whose source STRADDLES the
+// window base is handled per byte; self-overlap semantics are unchanged
+// because the dist/len relation is independent of where the source bytes
+// live.
+#define warpMatchCopyD(dst_ssbo, dst_pos, match_src, match_len, match_dist, lane, \
+                       window_base, dict_ssbo, dict_len)                          \
+    do {                                                                          \
+        if (int(match_dist) >= int(match_len) && uint(match_len) >= MIN_PARALLEL_MATCH_LEN) { \
+            for (uint _wmd_i = uint(lane); _wmd_i < uint(match_len); _wmd_i += WARP_SIZE) { \
+                uint8_t _wmd_b;                                                   \
+                _SLZ_READ_BACKREF(_wmd_b, dst_ssbo, uint(match_src) + _wmd_i,     \
+                                  window_base, dict_ssbo, dict_len);              \
+                (dst_ssbo)[uint(dst_pos) + _wmd_i] = _wmd_b;                      \
+            }                                                                     \
+        } else if (uint(lane) == 0u) {                                           \
+            for (uint _wmd_j = 0u; _wmd_j < uint(match_len); _wmd_j += 1u) {      \
+                uint8_t _wmd_b2;                                                  \
+                _SLZ_READ_BACKREF(_wmd_b2, dst_ssbo, uint(match_src) + _wmd_j,    \
+                                  window_base, dict_ssbo, dict_len);              \
+                (dst_ssbo)[uint(dst_pos) + _wmd_j] = _wmd_b2;                     \
+            }                                                                     \
+        }                                                                         \
+    } while (false)
+
 // CUDA reference: src/decode/lz_decode_core.cuh:65-73. Bounded literal
 // copy used by the general decoder. VK adaptation mirrors warpLiteralCopy
 // — macro form with SSBO + base offsets in scope.
@@ -81,6 +132,34 @@ void warpScanU32(uint v, int lane, out uint exclusive, out uint total) {
                 if (uint(dst_pos) + _wmcb_j < uint(dst_end_abs))                                    \
                     (dst_ssbo)[uint(dst_pos) + _wmcb_j] = (dst_ssbo)[uint(match_src) + _wmcb_j];    \
         }                                                                                           \
+    } while (false)
+
+// CUDA reference: src/decode/lz_decode_core.cuh:141-161 (warpMatchCopyBoundedD,
+// v4 #16). Bounded match copy with dictionary reach — the general decoder's
+// counterpart of warpMatchCopyD; the HAS_DICT=false instantiation IS
+// warpMatchCopyBounded above, so dictionary-less call sites keep using it.
+#define warpMatchCopyBoundedD(dst_ssbo, dst_pos, match_src, match_len, match_dist, \
+                              dst_end_abs, lane, window_base, dict_ssbo, dict_len) \
+    do {                                                                           \
+        if (int(match_dist) >= int(match_len) && uint(match_len) >= MIN_PARALLEL_MATCH_LEN) { \
+            for (uint _wmbd_i = uint(lane); _wmbd_i < uint(match_len); _wmbd_i += WARP_SIZE) { \
+                if (uint(dst_pos) + _wmbd_i < uint(dst_end_abs)) {                 \
+                    uint8_t _wmbd_b;                                               \
+                    _SLZ_READ_BACKREF(_wmbd_b, dst_ssbo, uint(match_src) + _wmbd_i, \
+                                      window_base, dict_ssbo, dict_len);           \
+                    (dst_ssbo)[uint(dst_pos) + _wmbd_i] = _wmbd_b;                 \
+                }                                                                  \
+            }                                                                      \
+        } else if (uint(lane) == 0u) {                                            \
+            for (uint _wmbd_j = 0u; _wmbd_j < uint(match_len); _wmbd_j += 1u) {    \
+                if (uint(dst_pos) + _wmbd_j < uint(dst_end_abs)) {                 \
+                    uint8_t _wmbd_b2;                                              \
+                    _SLZ_READ_BACKREF(_wmbd_b2, dst_ssbo, uint(match_src) + _wmbd_j, \
+                                      window_base, dict_ssbo, dict_len);           \
+                    (dst_ssbo)[uint(dst_pos) + _wmbd_j] = _wmbd_b2;                \
+                }                                                                  \
+            }                                                                      \
+        }                                                                          \
     } while (false)
 
 #endif

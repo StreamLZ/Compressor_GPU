@@ -21,6 +21,16 @@ shared uint s_lz_dst_adj[WARPS_PER_BLOCK][WARP_SIZE];
 shared uint s_lz_im_prefix[WARPS_PER_BLOCK][WARP_SIZE];
 shared uint s_lz_im_dst_adj[WARPS_PER_BLOCK][WARP_SIZE];
 shared uint s_lz_im_src_adj[WARPS_PER_BLOCK][WARP_SIZE];
+// v4 #16 fu7: staging for the flat ENTIRELY-DICT match copy (CUDA
+// reference: s_dm_prefix / s_dm_dst_adj / s_dm_src_adj). +768 B.
+// VK adaptation: CUDA declares these inside the `if constexpr
+// (HAS_DICT)` block so the dict-less instantiation allocates nothing;
+// GLSL shared variables must live at file scope, so both including
+// kernels carry them unconditionally (no occupancy effect at this
+// size - see PortAdaptations).
+shared uint s_lz_dm_prefix[WARPS_PER_BLOCK][WARP_SIZE];
+shared uint s_lz_dm_dst_adj[WARPS_PER_BLOCK][WARP_SIZE];
+shared uint s_lz_dm_src_adj[WARPS_PER_BLOCK][WARP_SIZE];
 
 // CUDA reference: src/decode/lz_decode_raw.cuh:24-211.
 // Templated `decodeSubChunkRawMode<OFF16_SPLIT>` in CUDA. Both
@@ -59,6 +69,85 @@ shared uint s_lz_im_src_adj[WARPS_PER_BLOCK][WARP_SIZE];
         (out_v) = _o16_lo | (_o16_hi << 8);                                                           \
     } while (false)
 
+// ── v4 #16: dictionary dimension of the body macro ─────────────────
+// CUDA templates the body on HAS_DICT alongside OFF16_SPLIT; the VK
+// mirror parameterizes the SAME body on three pluggable macros (the
+// off16_read_macro pattern), and the _dict instantiations below select
+// the ON/DICT set. The OFF/PLAIN set expands to exactly the pre-dict
+// code, mirroring nvcc's dead-code elimination of the false branch.
+//
+// Classification (CUDA reference: src/decode/lz_decode_raw.cuh:207-217):
+// matches whose source lies ENTIRELY in the dictionary get their own
+// flat pass; straddlers and hostile below-dict reaches fall into the
+// dependent loop, whose per-byte dict-aware read handles (and clamps)
+// them.
+#define _SLZ_DICT_CLASSIFY_OFF(out_reaches, out_entirely, my_match_len, my_src, window_base, dict_len) \
+    do {                                                                                              \
+        (out_reaches) = false;                                                                        \
+        (out_entirely) = false;                                                                       \
+    } while (false)
+
+#define _SLZ_DICT_CLASSIFY_ON(out_reaches, out_entirely, my_match_len, my_src, window_base, dict_len) \
+    do {                                                                                              \
+        (out_reaches) = ((my_match_len) > 0u) && ((my_src) < int(window_base));                       \
+        (out_entirely) = (out_reaches) &&                                                             \
+            ((my_src) + int(my_match_len) <= int(window_base)) &&                                     \
+            ((my_src) + int(dict_len) >= int(window_base));                                           \
+    } while (false)
+
+// Flat ENTIRELY-DICT match copy (CUDA reference:
+// src/decode/lz_decode_raw.cuh:248-279). Same ownership-search shape as
+// the im pass, source read from the dictionary. Shares the phase with
+// the lit/im passes hazard-free (dict bytes are never written; dst
+// ranges are disjoint by token ownership). dm_src_adj is staged in
+// DICT coordinates: dict byte k below the window is dict[dict_len - k];
+// u32 wrap arithmetic lands exactly.
+#define _SLZ_DICT_FLAT_DM_OFF(dst_ssbo, dict_ssbo, dict_len, window_base, my_entirely_dict, \
+                              my_match_len, my_copy_dst, my_src, batch_size, lane)          \
+    do {                                                                                    \
+    } while (false)
+
+#define _SLZ_DICT_FLAT_DM_ON(dst_ssbo, dict_ssbo, dict_len, window_base, my_entirely_dict, \
+                             my_match_len, my_copy_dst, my_src, batch_size, lane)          \
+    do {                                                                                   \
+        uint _fdm_my_len = (my_entirely_dict) ? uint(my_match_len) : 0u;                   \
+        uint _fdm_local;                                                                   \
+        uint _fdm_total;                                                                   \
+        warpScanU32(_fdm_my_len, int(lane), _fdm_local, _fdm_total);                       \
+        if (_fdm_total > 0u) {                                                             \
+            uint _fdm_dict_src = uint(int(dict_len) + (my_src) - int(window_base));        \
+            s_lz_dm_prefix[gl_LocalInvocationID.y][uint(lane)]  = _fdm_local;              \
+            s_lz_dm_dst_adj[gl_LocalInvocationID.y][uint(lane)] = uint(my_copy_dst) - _fdm_local; \
+            s_lz_dm_src_adj[gl_LocalInvocationID.y][uint(lane)] = _fdm_dict_src - _fdm_local; \
+            subgroupBarrier();                                                             \
+            for (uint _fdm_i = uint(lane); _fdm_i < _fdm_total; _fdm_i += WARP_SIZE) {     \
+                uint _fdm_k = 0u;                                                          \
+                for (uint _fdm_s = 16u; _fdm_s >= 1u; _fdm_s >>= 1) {                      \
+                    uint _fdm_c = _fdm_k + _fdm_s;                                         \
+                    if (_fdm_c < uint(batch_size) &&                                       \
+                        s_lz_dm_prefix[gl_LocalInvocationID.y][_fdm_c] <= _fdm_i)          \
+                        _fdm_k = _fdm_c;                                                   \
+                }                                                                          \
+                (dst_ssbo)[s_lz_dm_dst_adj[gl_LocalInvocationID.y][_fdm_k] + _fdm_i] =     \
+                    (dict_ssbo)[s_lz_dm_src_adj[gl_LocalInvocationID.y][_fdm_k] + _fdm_i]; \
+            }                                                                              \
+            subgroupBarrier();                                                             \
+            subgroupMemoryBarrierBuffer();                                                 \
+        }                                                                                  \
+    } while (false)
+
+// Dependent-loop / slow-path match copy selector. PLAIN ignores the
+// dict args and expands to the pre-dict warpMatchCopy; DICT routes
+// every byte through the dict-aware read (CUDA: warpMatchCopyD).
+#define _SLZ_DEP_COPY_PLAIN(dst_ssbo, copy_dst, match_src, match_len, match_dist, lane, \
+                            window_base, dict_ssbo, dict_len)                           \
+    warpMatchCopy(dst_ssbo, copy_dst, match_src, match_len, match_dist, lane)
+
+#define _SLZ_DEP_COPY_DICT(dst_ssbo, copy_dst, match_src, match_len, match_dist, lane, \
+                           window_base, dict_ssbo, dict_len)                           \
+    warpMatchCopyD(dst_ssbo, copy_dst, match_src, match_len, match_dist, lane,         \
+                   window_base, dict_ssbo, dict_len)
+
 // Core macro body — parameterized on the off16 read shape via
 // `off16_read_macro`. Both decodeSubChunkRawMode_false and
 // decodeSubChunkRawMode_true delegate here.
@@ -80,6 +169,11 @@ shared uint s_lz_im_src_adj[WARPS_PER_BLOCK][WARP_SIZE];
 //   dst_offset            - absolute dst position where this sub-chunk starts
 //   lane                  - this invocation's lane id (gl_SubgroupInvocationID & 31)
 //   off16_read_macro      - _SLZ_OFF16_READ_FALSE or _SLZ_OFF16_READ_TRUE
+//   dict_ssbo, dict_len   - v4 #16 preset dictionary bytes + length (placeholders
+//                           + 0 on dict-less instantiations)
+//   dict_classify_macro   - _SLZ_DICT_CLASSIFY_OFF or _ON
+//   dict_flat_dm_macro    - _SLZ_DICT_FLAT_DM_OFF or _ON
+//   dep_copy_macro        - _SLZ_DEP_COPY_PLAIN or _DICT
 #define _SLZ_DECODE_RAW_BODY(cmd_ssbo, cmd_base, cmd_size, lit_ssbo, lit_base, lit_size, \
                               off16_ssbo, off16_base,                                    \
                               off16_hi_ssbo, off16_hi_base,                              \
@@ -87,7 +181,9 @@ shared uint s_lz_im_src_adj[WARPS_PER_BLOCK][WARP_SIZE];
                               off16_count,                                               \
                               length_ssbo, length_base, length_remaining,                \
                               dst_ssbo, dst_size, initial_copy, dst_offset, lane,        \
-                              off16_read_macro)                                          \
+                              off16_read_macro,                                          \
+                              dict_ssbo, dict_len, dict_classify_macro,                  \
+                              dict_flat_dm_macro, dep_copy_macro)                        \
     do {                                                                                  \
         uint _ds_cmd_pos = 0u, _ds_lit_pos = 0u, _ds_off16_pos = 0u;                      \
         uint _ds_dst_pos = uint(dst_offset) + uint(initial_copy);                         \
@@ -205,7 +301,18 @@ shared uint s_lz_im_src_adj[WARPS_PER_BLOCK][WARP_SIZE];
                     uint _ds_my_copy_dst = _ds_dst_pos + _ds_my_dst_local                 \
                                            + _ds_my_lit_len;                              \
                     int  _ds_my_src = int(_ds_my_copy_dst) + _ds_my_match_offset;         \
+                    /* v4 #16 fu7 (CUDA ref: lz_decode_raw.cuh:207-219):                  \
+                       ENTIRELY-dict matches get their own flat pass;                     \
+                       straddlers/hostile reaches ride the dependent                      \
+                       loop's dict-aware per-byte read. OFF classify                      \
+                       pins both flags false = the pre-dict code. */                      \
+                    bool _ds_my_reaches_dict;                                             \
+                    bool _ds_my_entirely_dict;                                            \
+                    dict_classify_macro(_ds_my_reaches_dict, _ds_my_entirely_dict,        \
+                                        _ds_my_match_len, _ds_my_src,                     \
+                                        dst_offset, dict_len);                            \
                     bool _ds_my_is_indep = (_ds_my_match_len > 0u) &&                     \
+                        !_ds_my_reaches_dict &&                                           \
                         (_ds_my_src + int(_ds_my_match_len) <= int(_ds_dst_pos));         \
                     uint _ds_my_im_len = _ds_my_is_indep ? _ds_my_match_len : 0u;         \
                     uint _ds_my_im_local, _ds_total_im;                                   \
@@ -238,10 +345,20 @@ shared uint s_lz_im_src_adj[WARPS_PER_BLOCK][WARP_SIZE];
                         subgroupMemoryBarrierBuffer();                                    \
                     }                                                                     \
                                                                                           \
+                    /* v4 #16 fu7: flat ENTIRELY-DICT match copy (CUDA                    \
+                       ref: lz_decode_raw.cuh:248-279). Expands to                        \
+                       nothing on dict-less instantiations. */                            \
+                    dict_flat_dm_macro(dst_ssbo, dict_ssbo, dict_len, dst_offset,         \
+                                       _ds_my_entirely_dict, _ds_my_match_len,            \
+                                       _ds_my_copy_dst, _ds_my_src,                       \
+                                       _ds_batch_size, lane);                             \
+                                                                                          \
                     /* Dependent matches, token order; ballot skips                       \
-                       lit-only tokens AND flat-copied independents. */                   \
+                       lit-only tokens, flat-copied independents AND                      \
+                       flat-copied entirely-dict matches. */                              \
                     uvec4 _ds_mm_ballot = subgroupBallot(_ds_my_match_len > 0u            \
-                                                         && !_ds_my_is_indep);            \
+                                                         && !_ds_my_is_indep              \
+                                                         && !_ds_my_entirely_dict);       \
                     uint _ds_match_mask = _ds_mm_ballot.x;                                \
                     while (_ds_match_mask != 0u) {                                        \
                         uint _ds_k = uint(findLSB(_ds_match_mask));                       \
@@ -253,9 +370,10 @@ shared uint s_lz_im_src_adj[WARPS_PER_BLOCK][WARP_SIZE];
                                                                                           \
                         uint _ds_copy_dst = _ds_dst_pos + _ds_k_dst_local + _ds_k_lit_len; \
                         uint _ds_match_src = uint(int(_ds_copy_dst) + _ds_k_match_off);   \
-                        warpMatchCopy(dst_ssbo, _ds_copy_dst,                             \
-                                      _ds_match_src, _ds_k_match_len,                     \
-                                      -_ds_k_match_off, lane);                            \
+                        dep_copy_macro(dst_ssbo, _ds_copy_dst,                            \
+                                       _ds_match_src, _ds_k_match_len,                    \
+                                       -_ds_k_match_off, lane,                            \
+                                       dst_offset, dict_ssbo, dict_len);                  \
                         subgroupBarrier();                                                \
                         subgroupMemoryBarrierBuffer();                                    \
                     }                                                                     \
@@ -336,9 +454,13 @@ shared uint s_lz_im_src_adj[WARPS_PER_BLOCK][WARP_SIZE];
                                                                                           \
             if (_ds_match_len > 0u) {                                                     \
                 uint _ds_match_src = uint(int(_ds_dst_pos) + _ds_match_offset);           \
-                warpMatchCopy(dst_ssbo, _ds_dst_pos,                                      \
-                              _ds_match_src, _ds_match_len,                               \
-                              -_ds_match_offset, lane);                                   \
+                /* CUDA ref: lz_decode_raw.cuh:382 - the slow path is                     \
+                   dict-aware too (long-near matches can reach the                        \
+                   dictionary). */                                                        \
+                dep_copy_macro(dst_ssbo, _ds_dst_pos,                                     \
+                               _ds_match_src, _ds_match_len,                              \
+                               -_ds_match_offset, lane,                                   \
+                               dst_offset, dict_ssbo, dict_len);                          \
                 subgroupBarrier();                                                        \
                 subgroupMemoryBarrierBuffer();                                            \
             }                                                                             \
@@ -359,10 +481,12 @@ shared uint s_lz_im_src_adj[WARPS_PER_BLOCK][WARP_SIZE];
         }                                                                                 \
     } while (false)
 
-// CUDA reference: src/decode/lz_decode_raw.cuh:24 (OFF16_SPLIT=false
-// instantiation). Off16 is interleaved u16 in `off16_raw`. The
-// off16_hi/off16_lo SSBO/base args are unused by this macro — pass the
-// raw SSBO + 0 as placeholders.
+// CUDA reference: src/decode/lz_decode_raw.cuh:24 (OFF16_SPLIT=false,
+// HAS_DICT=false instantiation). Off16 is interleaved u16 in
+// `off16_raw`. The off16_hi/off16_lo SSBO/base args are unused by this
+// macro — pass the raw SSBO + 0 as placeholders. The dict slots take
+// dst_ssbo + 0 placeholders; the OFF/PLAIN macro set never touches them
+// (the pre-dict expansion exactly).
 #define decodeSubChunkRawMode_false(cmd_ssbo, cmd_base, cmd_size, lit_ssbo, lit_base, lit_size, \
                                     off16_ssbo, off16_base, off16_count,                       \
                                     length_ssbo, length_base, length_remaining,                \
@@ -373,12 +497,14 @@ shared uint s_lz_im_src_adj[WARPS_PER_BLOCK][WARP_SIZE];
                           off16_count,                                                         \
                           length_ssbo, length_base, length_remaining,                          \
                           dst_ssbo, dst_size, initial_copy, dst_offset, lane,                  \
-                          _SLZ_OFF16_READ_FALSE)
+                          _SLZ_OFF16_READ_FALSE,                                               \
+                          dst_ssbo, 0u, _SLZ_DICT_CLASSIFY_OFF,                                \
+                          _SLZ_DICT_FLAT_DM_OFF, _SLZ_DEP_COPY_PLAIN)
 
-// CUDA reference: src/decode/lz_decode_raw.cuh:24 (OFF16_SPLIT=true
-// instantiation). Off16 is split into separate hi/lo byte streams. The
-// off16_raw SSBO/base args are unused — pass the hi SSBO + 0 as
-// placeholders.
+// CUDA reference: src/decode/lz_decode_raw.cuh:24 (OFF16_SPLIT=true,
+// HAS_DICT=false instantiation). Off16 is split into separate hi/lo
+// byte streams. The off16_raw SSBO/base args are unused — pass the hi
+// SSBO + 0 as placeholders.
 #define decodeSubChunkRawMode_true(cmd_ssbo, cmd_base, cmd_size, lit_ssbo, lit_base, lit_size, \
                                    off16_hi_ssbo, off16_hi_base,                              \
                                    off16_lo_ssbo, off16_lo_base, off16_count,                 \
@@ -391,6 +517,46 @@ shared uint s_lz_im_src_adj[WARPS_PER_BLOCK][WARP_SIZE];
                           off16_count,                                                        \
                           length_ssbo, length_base, length_remaining,                         \
                           dst_ssbo, dst_size, initial_copy, dst_offset, lane,                 \
-                          _SLZ_OFF16_READ_TRUE)
+                          _SLZ_OFF16_READ_TRUE,                                               \
+                          dst_ssbo, 0u, _SLZ_DICT_CLASSIFY_OFF,                               \
+                          _SLZ_DICT_FLAT_DM_OFF, _SLZ_DEP_COPY_PLAIN)
+
+// CUDA reference: src/decode/lz_decode_raw.cuh:40 (OFF16_SPLIT=false,
+// HAS_DICT=true instantiation, v4 #16). Same body with the dictionary
+// macro set live: ENTIRELY-dict matches go to the flat dm pass,
+// straddlers/hostile reaches ride the dict-aware dependent loop.
+#define decodeSubChunkRawMode_false_dict(cmd_ssbo, cmd_base, cmd_size, lit_ssbo, lit_base, lit_size, \
+                                         off16_ssbo, off16_base, off16_count,                       \
+                                         length_ssbo, length_base, length_remaining,                \
+                                         dst_ssbo, dst_size, initial_copy, dst_offset, lane,        \
+                                         dict_ssbo, dict_len)                                       \
+    _SLZ_DECODE_RAW_BODY(cmd_ssbo, cmd_base, cmd_size, lit_ssbo, lit_base, lit_size,                \
+                          off16_ssbo, off16_base,                                                   \
+                          off16_ssbo, 0u, off16_ssbo, 0u,                                           \
+                          off16_count,                                                              \
+                          length_ssbo, length_base, length_remaining,                               \
+                          dst_ssbo, dst_size, initial_copy, dst_offset, lane,                       \
+                          _SLZ_OFF16_READ_FALSE,                                                    \
+                          dict_ssbo, dict_len, _SLZ_DICT_CLASSIFY_ON,                               \
+                          _SLZ_DICT_FLAT_DM_ON, _SLZ_DEP_COPY_DICT)
+
+// CUDA reference: src/decode/lz_decode_raw.cuh:40 (OFF16_SPLIT=true,
+// HAS_DICT=true instantiation, v4 #16).
+#define decodeSubChunkRawMode_true_dict(cmd_ssbo, cmd_base, cmd_size, lit_ssbo, lit_base, lit_size, \
+                                        off16_hi_ssbo, off16_hi_base,                              \
+                                        off16_lo_ssbo, off16_lo_base, off16_count,                 \
+                                        length_ssbo, length_base, length_remaining,                \
+                                        dst_ssbo, dst_size, initial_copy, dst_offset, lane,        \
+                                        dict_ssbo, dict_len)                                       \
+    _SLZ_DECODE_RAW_BODY(cmd_ssbo, cmd_base, cmd_size, lit_ssbo, lit_base, lit_size,               \
+                          off16_hi_ssbo, 0u,                                                       \
+                          off16_hi_ssbo, off16_hi_base,                                            \
+                          off16_lo_ssbo, off16_lo_base,                                            \
+                          off16_count,                                                             \
+                          length_ssbo, length_base, length_remaining,                              \
+                          dst_ssbo, dst_size, initial_copy, dst_offset, lane,                      \
+                          _SLZ_OFF16_READ_TRUE,                                                    \
+                          dict_ssbo, dict_len, _SLZ_DICT_CLASSIFY_ON,                              \
+                          _SLZ_DICT_FLAT_DM_ON, _SLZ_DEP_COPY_DICT)
 
 #endif

@@ -37,6 +37,41 @@ pub fn ensureDeviceOutput(self: *DecodeContext, size: usize) descriptors.GpuErro
     return ensureDeviceBuf(&self.d_output, &self.d_output_size, size);
 }
 
+/// CUDA reference: src/decode/decode_context.zig:61-71 (v4 #16).
+/// Register a custom dictionary on this context. The bytes are copied
+/// (context-owned; freed by deinit via the captured allocator). Returns
+/// the content-derived ID - the value frames carry. Registering the
+/// same content again is a no-op returning the same ID.
+pub fn registerDict(self: *DecodeContext, allocator: std.mem.Allocator, data: []const u8) !u32 {
+    const dictionary = @import("../dict/dictionary.zig");
+    const id = dictionary.customId(data);
+    for (self.registered_dicts.items) |r| {
+        if (r.id == id) return id;
+    }
+    const copy = try allocator.dupe(u8, data);
+    errdefer allocator.free(copy);
+    try self.registered_dicts.append(allocator, .{ .id = id, .data = copy });
+    self.dict_store_alloc = allocator;
+    return id;
+}
+
+/// CUDA reference: src/decode/decode_context.zig:73-83 (v4 #16). Make
+/// the preset dictionary `data` (identified by `id`) resident in the
+/// context's `d_dict` buffer. The upload runs only when the cached ID
+/// changes - the batch use case decodes thousands of frames against one
+/// dictionary with a single upload.
+pub fn ensureDictOnDevice(self: *DecodeContext, id: u32, data: []const u8) descriptors.GpuError!void {
+    if (self.dict_cached_id == id and self.dict_cached_len == data.len) return;
+    // Callers may reach this before any dispatch initialized the
+    // driver (the upload is lazy - see decompressFrameInner).
+    if (!@import("module_loader.zig").init()) return error.BackendNotAvailable;
+    self.dict_cached_id = 0;
+    try ensureDeviceBuf(&self.d_dict, &self.d_dict_size, data.len);
+    if (!copyHostToDevice(self.d_dict, data)) return error.CopyFailed;
+    self.dict_cached_id = id;
+    self.dict_cached_len = @intCast(data.len);
+}
+
 /// CUDA reference: src/decode/decode_context.zig:56-63. Page-locked
 /// (host-visible / host-coherent) host allocation through
 /// `procs.malloc_host`. Returns null when the backend is unavailable so
@@ -273,6 +308,19 @@ pub const DecodeContext = struct {
     // wrapper leaves it at 0 (default stream).
     work_stream: usize = 0,
 
+    // ── v4 #16: preset dictionary (CUDA reference:
+    // src/decode/decode_context.zig:299-311) ────────────────────
+    // Device-resident copy of the frame's dictionary, cached by ID and
+    // reused across calls. `dict_cached_id` keys the cache (0 = empty).
+    d_dict: VkDeviceBuffer = 0,
+    d_dict_size: usize = 0,
+    dict_cached_id: u32 = 0,
+    dict_cached_len: u32 = 0,
+    // Caller-registered custom dictionaries (slzSetDictionary / CLI -D
+    // <file>). Context-owned copies; freed in deinit.
+    dict_store_alloc: ?std.mem.Allocator = null,
+    registered_dicts: std.ArrayList(@import("../dict/dictionary.zig").RegisteredDict) = .empty,
+
     /// CUDA reference: src/decode/decode_context.zig:320-374. Free every
     /// owned device + host buffer and reset every field to its default.
     pub fn deinit(self: *DecodeContext) void {
@@ -310,6 +358,16 @@ pub const DecodeContext = struct {
         free_dev(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size);
         free_dev(&self.d_huff_descs, &self.d_huff_descs_size);
         free_dev(&self.d_huff_lut, &self.d_huff_lut_size);
+        // v4 #16: dictionary cache + registered custom dictionaries.
+        free_dev(&self.d_dict, &self.d_dict_size);
+        self.dict_cached_id = 0;
+        self.dict_cached_len = 0;
+        if (self.dict_store_alloc) |alloc| {
+            for (self.registered_dicts.items) |r| alloc.free(r.data);
+            self.registered_dicts.deinit(alloc);
+            self.registered_dicts = .empty;
+            self.dict_store_alloc = null;
+        }
 
         // Pinned host output (procs.malloc_host / procs.free_host).
         if (self.h_pinned_output) |p| {

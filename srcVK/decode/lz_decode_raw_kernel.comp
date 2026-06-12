@@ -9,6 +9,11 @@
 #extension GL_KHR_shader_subgroup_ballot : require
 #extension GL_KHR_shader_subgroup_vote : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+// v4 #16: the preset dictionary arrives as a buffer device address in
+// the push constants (the VK mirror of CUDA's `const uint8_t* dict`
+// launch param - same pattern as the v4 #5 entropy-scratch regions).
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
 
 #include "slz_wire_format.glsl"
 #include "lz_decode_core.glsl"
@@ -42,13 +47,28 @@ layout(std430, binding = 3) readonly buffer TotalChunksBuf {
     uint d_total_chunks;
 };
 
-// Scalar args 3, 5: chunks_per_group, sub_chunk_cap.
+// v4 #16: dictionary bytes, BDA-addressed (CUDA: `const uint8_t* dict`
+// launch param; nullptr on dictionary-less frames -> address 0 + len 0
+// here, never dereferenced because every dict read is gated on the
+// dict_len != 0 branch below).
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer DictRef {
+    uint8_t b[];
+};
+DictRef g_dict;
+
+// Scalar args 3, 5: chunks_per_group, sub_chunk_cap; v4 #16 appends the
+// dictionary address (lo/hi u32 pair) + length.
 layout(push_constant) uniform Push {
     uint chunks_per_group;
     uint sub_chunk_cap;
+    uint dict_addr_lo;
+    uint dict_addr_hi;
+    uint dict_len;
+    uint _dict_pad;
 } pc;
 
 void main() {
+    g_dict = DictRef(uvec2(pc.dict_addr_lo, pc.dict_addr_hi));
     // CUDA reference: src/decode/lz_decode_kernels.cuh:168-173.
     uint total_chunks = d_total_chunks;
     uint warp_id = gl_LocalInvocationID.y;
@@ -116,9 +136,20 @@ void main() {
                 // CUDA reference: src/decode/lz_decode_kernels.cuh:216-219.
                 // L1 raw fast path: parseAndDecodeSubChunkRaw inline parse
                 // + decodeSubChunkRawMode<false>.
-                parseAndDecodeSubChunkRaw(
-                    compressed, sc_payload, sc_comp_size, sc_size,
-                    dst, sc_dst_off, sc_dst_off, lane);
+                // v4 #16 (CUDA ref: lz_decode_kernels.cuh:127-136): dict
+                // presence is frame-uniform - one predictable branch per
+                // sub-chunk selects the dict-aware instantiation; the
+                // false path is the pre-dict code exactly.
+                if (pc.dict_len != 0u) {
+                    parseAndDecodeSubChunkRaw_dict(
+                        compressed, sc_payload, sc_comp_size, sc_size,
+                        dst, sc_dst_off, sc_dst_off, lane,
+                        g_dict.b, pc.dict_len);
+                } else {
+                    parseAndDecodeSubChunkRaw(
+                        compressed, sc_payload, sc_comp_size, sc_size,
+                        dst, sc_dst_off, sc_dst_off, lane);
+                }
             } else {
                 // Uncompressed sub-chunk: copy. CUDA reference:
                 // src/decode/lz_decode_kernels.cuh:220-223.

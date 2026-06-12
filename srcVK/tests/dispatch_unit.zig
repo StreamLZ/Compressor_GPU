@@ -171,28 +171,34 @@ test "buildChunkDescriptors via decoder facade: respects dst_start_off prefix" {
     try testing.expectEqual(@as(u32, dst_start_off), descs[0].dst_offset);
 }
 
-test "kernel_raw_fn ABI: KERNEL_DECLS n_bindings=4 + push=8 matches runLzPipeline raw_params[] layout" {
+test "kernel_raw_fn ABI: KERNEL_DECLS n_bindings=4 + push=24 matches runLzPipeline raw_params[] layout" {
     // Pin the kernel_raw_fn entry in module_loader.KERNEL_DECLS against the
     // raw_params[] array built in decode_dispatch.runLzPipeline (use_raw_kernel
     // branch). The 4 SSBO bindings are CompressedBuf, ChunksBuf, DstBuf,
-    // TotalChunksBuf; the 2× u32 push constants are chunks_per_group +
-    // sub_chunk_cap. If either side drifts, this test fires.
+    // TotalChunksBuf; the 6× u32 push constants are chunks_per_group +
+    // sub_chunk_cap + (v4 #16) dict_addr_lo/hi + dict_len + pad. If either
+    // side drifts, this test fires.
     const info = module_loader.kernelLayoutByName("kernel_raw_fn") orelse {
         try testing.expect(false); // kernel_raw_fn missing from KERNEL_DECLS
         return;
     };
     try testing.expectEqual(@as(u32, 4), info.n_bindings);
-    try testing.expectEqual(@as(u32, 8), info.push_constant_size);
+    try testing.expectEqual(@as(u32, 24), info.push_constant_size);
 
-    // Mirror the raw_params[] construction from runLzPipeline (decode_dispatch.zig:411)
-    // to assert the array has 6 slots: 4 device-buffer-pointer slots
-    // followed by 2 u32-value-pointer slots.
+    // Mirror the raw_params[] construction from runLzPipeline
+    // (decode_dispatch.zig, use_raw_kernel branch) to assert the array
+    // has 10 slots: 4 device-buffer-pointer slots followed by 6
+    // u32-value-pointer slots.
     var comp: u64 = 0xAAAA_0000_0000_0001;
     var descs: u64 = 0xAAAA_0000_0000_0002;
     var dst: u64 = 0xAAAA_0000_0000_0003;
     var total: u64 = 0xAAAA_0000_0000_0004;
     var chunks_per_group: u32 = 7;
     var sub_chunk_cap: u32 = 13;
+    var dict_lo: u32 = 0;
+    var dict_hi: u32 = 0;
+    var dict_len: u32 = 0;
+    var dict_pad: u32 = 0;
 
     const raw_params = [_]?*anyopaque{
         @ptrCast(&comp),
@@ -201,27 +207,36 @@ test "kernel_raw_fn ABI: KERNEL_DECLS n_bindings=4 + push=8 matches runLzPipelin
         @ptrCast(&total),
         @ptrCast(&chunks_per_group),
         @ptrCast(&sub_chunk_cap),
+        @ptrCast(&dict_lo),
+        @ptrCast(&dict_hi),
+        @ptrCast(&dict_len),
+        @ptrCast(&dict_pad),
     };
 
-    // Total slot count = n_bindings (4 buffer ptrs) + push payload as 2× u32.
-    try testing.expectEqual(@as(usize, 6), raw_params.len);
+    // Total slot count = n_bindings (4 buffer ptrs) + push payload as 6× u32.
+    try testing.expectEqual(@as(usize, 10), raw_params.len);
     try testing.expectEqual(info.n_bindings + (info.push_constant_size / @sizeOf(u32)), @as(u32, @intCast(raw_params.len)));
 
     // Slots 0..3 must point at the four VkDeviceBuffer-sized handles
-    // (u64); slots 4..5 must point at the two u32 push constants.
+    // (u64); slots 4..9 must point at the six u32 push constants.
     try testing.expectEqual(@as(usize, @intFromPtr(&comp)), @intFromPtr(raw_params[0].?));
     try testing.expectEqual(@as(usize, @intFromPtr(&descs)), @intFromPtr(raw_params[1].?));
     try testing.expectEqual(@as(usize, @intFromPtr(&dst)), @intFromPtr(raw_params[2].?));
     try testing.expectEqual(@as(usize, @intFromPtr(&total)), @intFromPtr(raw_params[3].?));
     try testing.expectEqual(@as(usize, @intFromPtr(&chunks_per_group)), @intFromPtr(raw_params[4].?));
     try testing.expectEqual(@as(usize, @intFromPtr(&sub_chunk_cap)), @intFromPtr(raw_params[5].?));
+    try testing.expectEqual(@as(usize, @intFromPtr(&dict_lo)), @intFromPtr(raw_params[6].?));
+    try testing.expectEqual(@as(usize, @intFromPtr(&dict_hi)), @intFromPtr(raw_params[7].?));
+    try testing.expectEqual(@as(usize, @intFromPtr(&dict_len)), @intFromPtr(raw_params[8].?));
+    try testing.expectEqual(@as(usize, @intFromPtr(&dict_pad)), @intFromPtr(raw_params[9].?));
 
     // Confirm the underlying value sizes match the binding contract:
-    // 4 buffer slots are u64-wide, 2 push slots are u32-wide.
+    // 4 buffer slots are u64-wide, 6 push slots are u32-wide.
     try testing.expectEqual(@as(usize, 8), @sizeOf(@TypeOf(comp)));
     try testing.expectEqual(@as(usize, 8), @sizeOf(@TypeOf(descs)));
     try testing.expectEqual(@as(usize, 8), @sizeOf(@TypeOf(dst)));
     try testing.expectEqual(@as(usize, 8), @sizeOf(@TypeOf(total)));
     try testing.expectEqual(@as(usize, 4), @sizeOf(@TypeOf(chunks_per_group)));
     try testing.expectEqual(@as(usize, 4), @sizeOf(@TypeOf(sub_chunk_cap)));
+    try testing.expectEqual(@as(usize, 4), @sizeOf(@TypeOf(dict_len)));
 }

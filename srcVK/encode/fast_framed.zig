@@ -219,7 +219,7 @@ pub fn compressFramedOne(
         .block_size = opts.block_size,
         .sc_group_size = sc_grp,
         .content_size = if (opts.include_content_size) @as(u64, @intCast(src.len)) else null,
-        .dictionary_id = null,
+        .dictionary_id = opts.dictionary_id,
         .content_checksum = false,
         .chunk_merkle = opts.chunk_checksum,
     }) catch return error.DestinationTooSmall;

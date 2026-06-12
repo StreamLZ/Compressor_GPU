@@ -211,7 +211,21 @@ pub fn decompressFrameInner(
 
     const hdr = frame.parseHeader(src) catch return error.BadFrame;
 
-    if (hdr.dictionary_id) |_| return error.UnknownDictionary;
+    // v4 #16 (CUDA-mirror): resolve the frame's dictionary in the
+    // registry (unknown ID rejects immediately - the wire contract).
+    // The device upload is LAZY: it happens at the first
+    // compressed-block dispatch, cached by ID on the context so a batch
+    // of frames sharing one dictionary uploads once. Uncompressed-body
+    // dict frames (tiny inputs) therefore decode without touching the
+    // GPU at all.
+    var dict_bytes: ?[]const u8 = null;
+    var dict_id: u32 = 0;
+    if (hdr.dictionary_id) |did| {
+        const dictionary = @import("../dict/dictionary.zig");
+        dict_bytes = dictionary.resolve(dec_ctx.registered_dicts.items, did) orelse
+            return error.UnknownDictionary;
+        dict_id = did;
+    }
 
     if (hdr.content_size) |cs| {
         if (cs > max_content_size) return error.ContentSizeTooLarge;
@@ -256,6 +270,16 @@ pub fn decompressFrameInner(
         }
 
         const block_src = src[pos .. pos + block_hdr.compressed_size];
+        // v4 #16 (CUDA-mirror): first compressed block - make the
+        // dictionary device-resident now (cached; see the resolution
+        // above).
+        var d_dict: u64 = 0;
+        var dict_len: u32 = 0;
+        if (dict_bytes) |data| {
+            gpu_driver.ensureDictOnDevice(dec_ctx, dict_id, data) catch return error.BadMode;
+            d_dict = dec_ctx.d_dict;
+            dict_len = dec_ctx.dict_cached_len;
+        }
         // VK adaptation: only thread level>=3 to trigger fullGpuLaunchImpl's
         // L2 gate (the Huffman pre-decode chain + general LZ kernel). L2
         // frames have no Huffman streams, and the upstream scan/compact/
@@ -275,6 +299,8 @@ pub fn decompressFrameInner(
             dec_ctx,
             d_output_target,
             io,
+            d_dict,
+            dict_len,
         );
         // Restore the 8-byte SC tail prefix bytes that the encoder
         // appended at the end of the block. The decoder kernel writes
@@ -353,6 +379,10 @@ pub fn dispatchCompressedBlock(
     dec_ctx: *gpu_driver.DecodeContext,
     d_output_target: ?u64,
     io: ?std.Io,
+    // v4 #16 (CUDA-mirror): preset dictionary, already device-resident
+    // on the context's d_dict cache. 0/0 on dictionary-less frames.
+    d_dict: u64,
+    dict_len: u32,
 ) DecompressError!void {
     const eff_chunk_size = @min(frame.scGroupSizeToBytes(sc_group_size), constants.chunk_size);
     const num_chunks = (decompressed_size + eff_chunk_size - 1) / eff_chunk_size;
@@ -403,6 +433,8 @@ pub fn dispatchCompressedBlock(
         // this the default level=1 keeps n_huff=0 and the dispatcher
         // routes to the L1 raw kernel — produces wrong output past byte 8.
         .level = level,
+        .d_dict = d_dict,
+        .dict_len = dict_len,
     });
 }
 

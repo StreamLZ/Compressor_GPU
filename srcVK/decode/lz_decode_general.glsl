@@ -167,6 +167,21 @@ struct DecodeOutput {
         (out_v) = _o16g_lo | (_o16g_hi << 8);                                          \
     } while (false)
 
+// ── v4 #16: dictionary dimension (CUDA templates the body on HAS_DICT
+// alongside OFF16_SPLIT; same pluggable-macro mirror as
+// lz_decode_raw.glsl). The general decoder's only dict site is the
+// bounded match copy (CUDA reference: lz_decode_general.cuh:244-246) —
+// sources below the sub-chunk's window base read the dictionary tail.
+#define _SLZ_GEN_COPY_PLAIN(dst_ssbo, dst_pos, match_src, match_len, match_dist,     \
+                            dst_end_abs, lane, window_base, dict_ssbo, dict_len)     \
+    warpMatchCopyBounded(dst_ssbo, dst_pos, match_src, match_len, match_dist,        \
+                         dst_end_abs, lane)
+
+#define _SLZ_GEN_COPY_DICT(dst_ssbo, dst_pos, match_src, match_len, match_dist,      \
+                           dst_end_abs, lane, window_base, dict_ssbo, dict_len)      \
+    warpMatchCopyBoundedD(dst_ssbo, dst_pos, match_src, match_len, match_dist,       \
+                          dst_end_abs, lane, window_base, dict_ssbo, dict_len)
+
 // CUDA reference: src/decode/lz_decode_general.cuh:77-309. Shared body
 // for the two OFF16_SPLIT specializations.
 #define _SLZ_DECODE_GENERAL_BODY(comp_ssbo, ps_lit_ptr, ps_lit_size,                 \
@@ -182,7 +197,8 @@ struct DecodeOutput {
                                   lit_scratch_ssbo, ps_lit_in_scratch,                \
                                   cmd_scratch_ssbo, ps_cmd_in_scratch,                \
                                   dst_ssbo, out_dst_size, out_dst_offset,            \
-                                  mode, lane, off16_read_macro)                       \
+                                  mode, lane, off16_read_macro,                       \
+                                  dict_ssbo, dict_len, gen_copy_macro)                \
     do {                                                                              \
         uint _dg_cmd_pos = 0u, _dg_lit_pos = 0u;                                      \
         uint _dg_off16_pos = 0u, _dg_off32_pos = 0u;                                  \
@@ -366,9 +382,10 @@ struct DecodeOutput {
                 if (_dg_match_len > 0u) {                                              \
                     uint _dg_match_src = uint(int(_dg_dst_pos) + _dg_match_offset);   \
                     int  _dg_match_dist = -_dg_match_offset;                          \
-                    warpMatchCopyBounded(dst_ssbo, _dg_dst_pos,                        \
-                                          _dg_match_src, _dg_match_len,                \
-                                          _dg_match_dist, _dg_dst_end_abs, lane);     \
+                    gen_copy_macro(dst_ssbo, _dg_dst_pos,                              \
+                                   _dg_match_src, _dg_match_len,                       \
+                                   _dg_match_dist, _dg_dst_end_abs, lane,              \
+                                   out_dst_offset, dict_ssbo, dict_len);               \
                     subgroupBarrier();                                                 \
                     subgroupMemoryBarrierBuffer();                                     \
                     _dg_dst_pos = _dg_dst_pos + _dg_match_len;                        \
@@ -501,7 +518,8 @@ struct DecodeOutput {
                               lit_scratch_ssbo, ps_lit_in_scratch,                    \
                               cmd_scratch_ssbo, ps_cmd_in_scratch,                    \
                               dst_ssbo, out_dst_size, out_dst_offset,                \
-                              mode, lane, _SLZ_OFF16_READ_GEN_FALSE)
+                              mode, lane, _SLZ_OFF16_READ_GEN_FALSE,                  \
+                              dst_ssbo, 0u, _SLZ_GEN_COPY_PLAIN)
 
 // CUDA reference: src/decode/lz_decode_general.cuh:77 (OFF16_SPLIT=true
 // instantiation). Reads off16 from split hi/lo byte streams in
@@ -533,6 +551,72 @@ struct DecodeOutput {
                               lit_scratch_ssbo, ps_lit_in_scratch,                    \
                               cmd_scratch_ssbo, ps_cmd_in_scratch,                    \
                               dst_ssbo, out_dst_size, out_dst_offset,                \
-                              mode, lane, _SLZ_OFF16_READ_GEN_TRUE)
+                              mode, lane, _SLZ_OFF16_READ_GEN_TRUE,                   \
+                              dst_ssbo, 0u, _SLZ_GEN_COPY_PLAIN)
+
+// CUDA reference: src/decode/lz_decode_general.cuh:76 (OFF16_SPLIT=false,
+// HAS_DICT=true instantiation, v4 #16). Match sources below the
+// sub-chunk's window base read the dictionary tail.
+#define decodeSubChunkGeneral_false_dict(comp_ssbo, ps_lit_ptr, ps_lit_size,          \
+                                         ps_cmd_ptr, ps_cmd_size,                     \
+                                         ps_off16_raw, ps_off16_count,                \
+                                         off16_hi_ssbo, ps_off16_hi,                  \
+                                         off16_lo_ssbo, ps_off16_lo,                  \
+                                         ps_off32_raw1, ps_off32_count1,              \
+                                         ps_off32_raw2, ps_off32_count2,              \
+                                         ps_len_stream, ps_len_avail,                 \
+                                         ps_off16_split,                              \
+                                         ps_cmd_stream2_offset, ps_initial_copy,      \
+                                         lit_scratch_ssbo, ps_lit_in_scratch,          \
+                                         cmd_scratch_ssbo, ps_cmd_in_scratch,          \
+                                         dst_ssbo, out_dst_size, out_dst_offset,      \
+                                         mode, lane, dict_ssbo, dict_len)             \
+    _SLZ_DECODE_GENERAL_BODY(comp_ssbo, ps_lit_ptr, ps_lit_size,                     \
+                              ps_cmd_ptr, ps_cmd_size,                               \
+                              ps_off16_raw, ps_off16_count,                          \
+                              off16_hi_ssbo, ps_off16_hi,                            \
+                              off16_lo_ssbo, ps_off16_lo,                            \
+                              ps_off32_raw1, ps_off32_count1,                        \
+                              ps_off32_raw2, ps_off32_count2,                        \
+                              ps_len_stream, ps_len_avail,                           \
+                              ps_off16_split,                                        \
+                              ps_cmd_stream2_offset, ps_initial_copy,                \
+                              lit_scratch_ssbo, ps_lit_in_scratch,                    \
+                              cmd_scratch_ssbo, ps_cmd_in_scratch,                    \
+                              dst_ssbo, out_dst_size, out_dst_offset,                \
+                              mode, lane, _SLZ_OFF16_READ_GEN_FALSE,                  \
+                              dict_ssbo, dict_len, _SLZ_GEN_COPY_DICT)
+
+// CUDA reference: src/decode/lz_decode_general.cuh:76 (OFF16_SPLIT=true,
+// HAS_DICT=true instantiation, v4 #16).
+#define decodeSubChunkGeneral_true_dict(comp_ssbo, ps_lit_ptr, ps_lit_size,           \
+                                        ps_cmd_ptr, ps_cmd_size,                      \
+                                        ps_off16_raw, ps_off16_count,                 \
+                                        off16_hi_ssbo, ps_off16_hi,                   \
+                                        off16_lo_ssbo, ps_off16_lo,                   \
+                                        ps_off32_raw1, ps_off32_count1,               \
+                                        ps_off32_raw2, ps_off32_count2,               \
+                                        ps_len_stream, ps_len_avail,                  \
+                                        ps_off16_split,                               \
+                                        ps_cmd_stream2_offset, ps_initial_copy,       \
+                                        lit_scratch_ssbo, ps_lit_in_scratch,           \
+                                        cmd_scratch_ssbo, ps_cmd_in_scratch,           \
+                                        dst_ssbo, out_dst_size, out_dst_offset,       \
+                                        mode, lane, dict_ssbo, dict_len)              \
+    _SLZ_DECODE_GENERAL_BODY(comp_ssbo, ps_lit_ptr, ps_lit_size,                     \
+                              ps_cmd_ptr, ps_cmd_size,                               \
+                              ps_off16_raw, ps_off16_count,                          \
+                              off16_hi_ssbo, ps_off16_hi,                            \
+                              off16_lo_ssbo, ps_off16_lo,                            \
+                              ps_off32_raw1, ps_off32_count1,                        \
+                              ps_off32_raw2, ps_off32_count2,                        \
+                              ps_len_stream, ps_len_avail,                           \
+                              ps_off16_split,                                        \
+                              ps_cmd_stream2_offset, ps_initial_copy,                \
+                              lit_scratch_ssbo, ps_lit_in_scratch,                    \
+                              cmd_scratch_ssbo, ps_cmd_in_scratch,                    \
+                              dst_ssbo, out_dst_size, out_dst_offset,                \
+                              mode, lane, _SLZ_OFF16_READ_GEN_TRUE,                   \
+                              dict_ssbo, dict_len, _SLZ_GEN_COPY_DICT)
 
 #endif

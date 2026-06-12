@@ -50,6 +50,34 @@ pub const id_github_users: u32 = 8;
 /// reserved for registry built-ins.
 pub const custom_id_base: u32 = 0x1000_0000;
 
+/// Compute a custom dictionary's ID from its content: XXH32 of the
+/// bytes, forced into the custom range. Content-derived IDs are
+/// deterministic across machines (and the CPU sibling), need no
+/// coordination, and let the decoder VERIFY a supplied dictionary
+/// against the frame's ID instead of trusting it blindly.
+pub fn customId(data: []const u8) u32 {
+    const xxh = @import("../format/xxhash32.zig");
+    return custom_id_base | xxh.xxhash32(data);
+}
+
+/// A caller-registered dictionary held on an encode/decode context.
+/// `data` is a context-owned copy (freed by the context's deinit).
+pub const RegisteredDict = struct {
+    id: u32,
+    data: []u8,
+};
+
+/// Resolve `id` against a context's registered dictionaries first,
+/// then the built-in table. The registered store wins on (impossible
+/// by construction) collisions so a caller can never be shadowed.
+pub fn resolve(registered: []const RegisteredDict, id: u32) ?[]const u8 {
+    for (registered) |*r| {
+        if (r.id == id) return r.data;
+    }
+    if (findById(id)) |d| return d.data;
+    return null;
+}
+
 /// Table of compiled-in dictionaries. Adding one is a new row plus a
 /// `builtin/<name>.dict` asset (mirrored into srcVK/dict/builtin/).
 pub const builtin_dicts: []const DictInfo = &.{

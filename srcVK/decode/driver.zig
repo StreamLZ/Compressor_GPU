@@ -41,6 +41,9 @@ pub const bindContextToCallingThread = decode_context.bindContextToCallingThread
 pub const beginKernelTiming = decode_context.beginKernelTiming;
 pub const endKernelTiming = decode_context.endKernelTiming;
 pub const finalizeProfiling = decode_context.finalizeProfiling;
+// v4 #16: preset-dictionary device cache + custom-dict registration.
+pub const ensureDictOnDevice = decode_context.ensureDictOnDevice;
+pub const registerDict = decode_context.registerDict;
 pub const ensurePipelineStream = module_loader.ensurePipelineStream;
 pub const lockDispatcherMutex = module_loader.lockDispatcherMutex;
 pub const unlockDispatcherMutex = module_loader.unlockDispatcherMutex;

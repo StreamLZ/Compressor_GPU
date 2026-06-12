@@ -76,6 +76,15 @@ ScratchRef g_scr_lit;
 ScratchRef g_scr_tok;
 ScratchRef g_scr_off16;
 
+// v4 #16: dictionary bytes, BDA-addressed (CUDA: `const uint8_t* dict`
+// launch param; nullptr on dictionary-less frames -> address 0 + len 0
+// here, never dereferenced because every dict read is gated on the
+// dict_len != 0 branch below).
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer DictRef {
+    uint8_t b[];
+};
+DictRef g_dict;
+
 // arg 8: const uint32_t* first_subchunk_idx (per-chunk global sub-chunk
 // base index, written by runHuffBuildAndDecode's prefix sum).
 layout(std430, binding = 4) readonly buffer FirstSubChunkIdxBuf {
@@ -96,6 +105,11 @@ layout(push_constant) uniform Push {
     uint tok_addr_hi;
     uint off16_addr_lo;
     uint off16_addr_hi;
+    // v4 #16: dictionary address + length (0/0 on dict-less frames).
+    uint dict_addr_lo;
+    uint dict_addr_hi;
+    uint dict_len;
+    uint _dict_pad;
 } pc;
 
 void main() {
@@ -103,6 +117,8 @@ void main() {
     g_scr_lit   = ScratchRef(uvec2(pc.lit_addr_lo, pc.lit_addr_hi));
     g_scr_tok   = ScratchRef(uvec2(pc.tok_addr_lo, pc.tok_addr_hi));
     g_scr_off16 = ScratchRef(uvec2(pc.off16_addr_lo, pc.off16_addr_hi));
+    // v4 #16: dictionary reference (never dereferenced at dict_len == 0).
+    g_dict = DictRef(uvec2(pc.dict_addr_lo, pc.dict_addr_hi));
     // CUDA reference: src/decode/lz_decode_kernels.cuh:43-50.
     uint total_chunks = d_total_chunks;
     uint warp_id = gl_LocalInvocationID.y;
@@ -206,13 +222,28 @@ void main() {
                 // in the frame) triggers the 8-byte initial copy. CUDA's
                 // host-side SC prefix table post-pass restores per-chunk
                 // init copies separately.
-                parseAndDecodeSubChunk(
-                    compressed, sc_payload, sc_comp_size, sc_size,
-                    dst, sc_dst_off, sc_dst_off, sc_mode,
-                    g_scr_lit.b, subchunk_scratch_base,
-                    g_scr_tok.b, subchunk_scratch_base,
-                    g_scr_off16.b, subchunk_scratch_base,
-                    /*has_entropy=*/1u, lane);
+                // v4 #16 (CUDA ref: lz_decode_kernels.cuh:460-482): dict
+                // presence is frame-uniform - one predictable branch per
+                // sub-chunk selects the dict-aware instantiation; the
+                // false path is the pre-dict code exactly.
+                if (pc.dict_len != 0u) {
+                    parseAndDecodeSubChunk_dict(
+                        compressed, sc_payload, sc_comp_size, sc_size,
+                        dst, sc_dst_off, sc_dst_off, sc_mode,
+                        g_scr_lit.b, subchunk_scratch_base,
+                        g_scr_tok.b, subchunk_scratch_base,
+                        g_scr_off16.b, subchunk_scratch_base,
+                        /*has_entropy=*/1u, lane,
+                        g_dict.b, pc.dict_len);
+                } else {
+                    parseAndDecodeSubChunk(
+                        compressed, sc_payload, sc_comp_size, sc_size,
+                        dst, sc_dst_off, sc_dst_off, sc_mode,
+                        g_scr_lit.b, subchunk_scratch_base,
+                        g_scr_tok.b, subchunk_scratch_base,
+                        g_scr_off16.b, subchunk_scratch_base,
+                        /*has_entropy=*/1u, lane);
+                }
             } else {
                 // CUDA reference: src/decode/lz_decode_kernels.cuh:130-133.
                 // Uncompressed sub-chunk: copy raw bytes.

@@ -1906,14 +1906,16 @@ const KERNEL_DECLS = [_]KernelDecl{
     // v4 #5 (2026-06-10): entropy scratch regions are BDA-addressed (3 u64
     // region addresses appended to the pc) - bindings drop to 5 (comp,
     // chunks, dst, total, first_subchunk_idx), no region-view binds.
-    .{ .kind = .kernel_fn, .n_bindings = 5, .push_constant_size = 32, .pin_subgroup_32 = true },
-    // srcVK/decode/lz_decode_raw_kernel.comp:25-50 declares 4 SSBO
-    // bindings (CompressedBuf, ChunksBuf, DstBuf, TotalChunksBuf) plus
-    // a 2× u32 push-constant block (chunks_per_group, sub_chunk_cap).
-    .{ .kind = .kernel_raw_fn, .n_bindings = 4, .push_constant_size = 8, .pin_subgroup_32 = true },
+    // v4 #16: +16 pc bytes (dict address lo/hi + dict_len + pad).
+    .{ .kind = .kernel_fn, .n_bindings = 5, .push_constant_size = 48, .pin_subgroup_32 = true },
+    // srcVK/decode/lz_decode_raw_kernel.comp declares 4 SSBO bindings
+    // (CompressedBuf, ChunksBuf, DstBuf, TotalChunksBuf) plus the
+    // push-constant block (chunks_per_group, sub_chunk_cap; v4 #16
+    // appends dict address lo/hi + dict_len + pad).
+    .{ .kind = .kernel_raw_fn, .n_bindings = 4, .push_constant_size = 24, .pin_subgroup_32 = true },
     // v4 #15: 2-warp pipelined raw kernel - same ABI as kernel_raw_fn,
     // grid doubled by the dispatch (both subgroups share one group).
-    .{ .kind = .kernel_raw_pipeline_fn, .n_bindings = 4, .push_constant_size = 8, .pin_subgroup_32 = true },
+    .{ .kind = .kernel_raw_pipeline_fn, .n_bindings = 4, .push_constant_size = 24, .pin_subgroup_32 = true },
     .{ .kind = .gather_off16_fn, .n_bindings = 4, .push_constant_size = 4, .pin_subgroup_32 = true },
     .{ .kind = .scan_parse_fn, .n_bindings = 10, .push_constant_size = 8, .pin_subgroup_32 = true },
     // walk_frame / prefix_sum_chunks / compact_huff / compact_raw /

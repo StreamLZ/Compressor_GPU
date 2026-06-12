@@ -571,6 +571,15 @@ pub const DecodeRequest = struct {
     /// loaded-module-set.
     level: u8 = 1,
 
+    /// v4 #16 (CUDA reference: src/decode/decode_dispatch.zig:338-342):
+    /// preset dictionary, already device-resident (uploaded by the
+    /// caller via the context's d_dict cache). 0/0 on dictionary-less
+    /// frames - the LZ kernels then take the pre-dict code path.
+    /// VK adaptation: a VkDeviceBuffer handle (resolved to a buffer
+    /// device address at launch), not a raw pointer.
+    d_dict: u64 = 0,
+    dict_len: u32 = 0,
+
     /// True when the LZ kernel can write decompressed bytes straight
     /// into the caller's device buffer (no `dst_start_off` prefix to
     /// splice in, and a `d_output_target` was supplied). On this path
@@ -748,6 +757,12 @@ pub fn runLzPipeline(
     /// the caller routes `req.d_output_target` here so the kernel
     /// skips the finalize D2D copy.
     lz_dst_base_dev: VkDeviceBuffer,
+    /// v4 #16: preset dictionary as a buffer device address (the VK
+    /// mirror of CUDA's `const uint8_t* dict` launch param; resolved by
+    /// the caller from the context's d_dict cache). 0/0 on
+    /// dictionary-less frames.
+    dict_addr: u64,
+    dict_len: u32,
 ) GpuError!i64 {
     _ = total_subchunks;
     const launch_fn = procs.launch;
@@ -803,6 +818,13 @@ pub fn runLzPipeline(
         const raw_grid_x: u32 = if (use_pipeline) lz_grid_x * 2 else lz_grid_x;
         const raw_block_y: u32 = if (use_pipeline) 4 else 2;
         const raw_label: [*:0]const u8 = if (use_pipeline) "slzLzDecodeRawPipelinedKernel" else "slzLzDecodeRawKernel";
+        // v4 #16: dictionary address + length appended to the push
+        // constants (lo/hi u32 pair, then len + pad - matches the
+        // Push block in lz_decode_raw_kernel.comp).
+        var p_dict_lo: u32 = @truncate(dict_addr);
+        var p_dict_hi: u32 = @truncate(dict_addr >> 32);
+        var p_dict_len: u32 = dict_len;
+        var p_dict_pad: u32 = 0;
         var raw_params = [_]?*anyopaque{
             @ptrCast(&common.comp),
             @ptrCast(&common.descs_dev),
@@ -810,6 +832,10 @@ pub fn runLzPipeline(
             @ptrCast(&common.total),
             @ptrCast(&common.chunks_per_group),
             @ptrCast(&common.sub_chunk_cap),
+            @ptrCast(&p_dict_lo),
+            @ptrCast(&p_dict_hi),
+            @ptrCast(&p_dict_len),
+            @ptrCast(&p_dict_pad),
         };
         var raw_extra = [_]?*anyopaque{null};
         const t_lzr = beginKernelTiming(self.enable_profiling, &self.pending_timings, raw_label, stream);
@@ -838,6 +864,12 @@ pub fn runLzPipeline(
         var p_tok_hi: u32 = @truncate(tok_addr2 >> 32);
         var p_off16_lo: u32 = @truncate(off16_addr2);
         var p_off16_hi: u32 = @truncate(off16_addr2 >> 32);
+        // v4 #16: dictionary address + length appended (matches the
+        // Push block in lz_decode_kernel.comp).
+        var p_dict_lo2: u32 = @truncate(dict_addr);
+        var p_dict_hi2: u32 = @truncate(dict_addr >> 32);
+        var p_dict_len2: u32 = dict_len;
+        var p_dict_pad2: u32 = 0;
         var lz_params = [_]?*anyopaque{
             @ptrCast(&common.comp),
             @ptrCast(&common.descs_dev),
@@ -849,6 +881,8 @@ pub fn runLzPipeline(
             @ptrCast(&p_lit_lo),   @ptrCast(&p_lit_hi),
             @ptrCast(&p_tok_lo),   @ptrCast(&p_tok_hi),
             @ptrCast(&p_off16_lo), @ptrCast(&p_off16_hi),
+            @ptrCast(&p_dict_lo2), @ptrCast(&p_dict_hi2),
+            @ptrCast(&p_dict_len2), @ptrCast(&p_dict_pad2),
         };
         var lz_extra = [_]?*anyopaque{null};
 
@@ -1206,6 +1240,15 @@ pub fn runBackHalf(
         });
     }
 
+    // v4 #16: resolve the dictionary buffer to a device address for the
+    // LZ kernel push constants (the VK mirror of CUDA passing the dict
+    // pointer as a launch param). 0/0 on dictionary-less frames.
+    var dict_addr: u64 = 0;
+    if (req.d_dict != 0 and req.dict_len != 0) {
+        dict_addr = module_loader.getBufferDeviceAddress(req.d_dict);
+        if (dict_addr == 0) return error.BackendNotAvailable;
+    }
+
     const _t_lz0 = if (g_phase_profile_enabled) vk.qpcNow() else 0;
     const split_lz_ns = try runLzPipeline(
         self, procs,
@@ -1213,6 +1256,7 @@ pub fn runBackHalf(
         total_chunks, layout.total_subchunks,
         heavy_stream, split_timer, io,
         lz_total_count_dev, lz_dst_base_dev,
+        dict_addr, if (dict_addr != 0) req.dict_len else 0,
     );
     if (g_phase_profile_enabled) g_phase_backhalf_lz_launch_ns += qpcDeltaNs(_t_lz0, vk.qpcNow());
 

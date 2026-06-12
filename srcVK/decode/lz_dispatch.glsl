@@ -196,6 +196,158 @@
         }                                                                              \
     } while (false)
 
+// CUDA reference: src/decode/lz_dispatch.cuh:23-165 with HAS_DICT=true
+// (v4 #16). Textual twin of parseAndDecodeSubChunkRaw whose decode arms
+// call the _dict body instantiations — the GLSL mirror of CUDA's second
+// template instantiation (kernels select between the two on the
+// frame-uniform `dict != nullptr` / `pc.dict_len != 0u` branch).
+#define parseAndDecodeSubChunkRaw_dict(comp_ssbo, sc_src_off, sc_comp_size, sc_decomp_size, \
+                                       dst_ssbo, dst_offset, base_offset, lane,             \
+                                       dict_ssbo, dict_len)                                 \
+    do {                                                                               \
+        uint _pd_src = uint(sc_src_off);                                               \
+        uint _pd_src_end = uint(sc_src_off) + uint(sc_comp_size);                      \
+                                                                                       \
+        uint _pd_initial_copy = 0u;                                                    \
+        if (uint(base_offset) == 0u) {                                                 \
+            if (uint(lane) < INITIAL_LITERAL_COPY_BYTES) {                             \
+                (dst_ssbo)[uint(dst_offset) + uint(lane)] =                            \
+                    (comp_ssbo)[_pd_src + uint(lane)];                                 \
+            }                                                                          \
+            subgroupBarrier();                                                         \
+            subgroupMemoryBarrierBuffer();                                             \
+            _pd_src += INITIAL_LITERAL_COPY_BYTES;                                     \
+            _pd_initial_copy = INITIAL_LITERAL_COPY_BYTES;                             \
+        }                                                                              \
+                                                                                       \
+        uint _pd_lit_ptr = _pd_src;                                                    \
+        uint _pd_lit_size = 0u;                                                        \
+        if (uint(lane) == 0u) {                                                        \
+            uint _pd_b0 = uint((comp_ssbo)[_pd_src + 0u]);                              \
+            uint _pd_b1 = uint((comp_ssbo)[_pd_src + 1u]);                              \
+            uint _pd_b2 = uint((comp_ssbo)[_pd_src + 2u]);                              \
+            Type0HdrFields _pd_h = parseType0HdrFields(_pd_b0, _pd_b1, _pd_b2);        \
+            _pd_lit_size = _pd_h.size;                                                 \
+            _pd_src += _pd_h.header_bytes;                                              \
+            _pd_lit_ptr = _pd_src;                                                     \
+            _pd_src += _pd_lit_size;                                                   \
+        }                                                                              \
+        _pd_lit_size = subgroupShuffle(_pd_lit_size, 0u);                              \
+        _pd_src = subgroupShuffle(_pd_src, 0u);                                        \
+        _pd_lit_ptr = _pd_src - _pd_lit_size;                                          \
+                                                                                       \
+        uint _pd_cmd_ptr;                                                              \
+        uint _pd_cmd_size = 0u;                                                        \
+        if (uint(lane) == 0u) {                                                        \
+            uint _pd_c0 = uint((comp_ssbo)[_pd_src + 0u]);                              \
+            uint _pd_c1 = uint((comp_ssbo)[_pd_src + 1u]);                              \
+            uint _pd_c2 = uint((comp_ssbo)[_pd_src + 2u]);                              \
+            Type0HdrFields _pd_hc = parseType0HdrFields(_pd_c0, _pd_c1, _pd_c2);       \
+            _pd_cmd_size = _pd_hc.size;                                                \
+            _pd_src += _pd_hc.header_bytes;                                             \
+            _pd_cmd_ptr = _pd_src;                                                     \
+            _pd_src += _pd_cmd_size;                                                   \
+        }                                                                              \
+        _pd_cmd_size = subgroupShuffle(_pd_cmd_size, 0u);                              \
+        _pd_src = subgroupShuffle(_pd_src, 0u);                                        \
+        _pd_cmd_ptr = _pd_src - _pd_cmd_size;                                          \
+                                                                                       \
+        uint _pd_block2_cmd_offset = _pd_cmd_size;                                     \
+        if (uint(lane) == 0u && uint(sc_decomp_size) > LZ_BLOCK_SIZE) {                \
+            uint _pd_b2_lo = uint((comp_ssbo)[_pd_src + 0u]);                           \
+            uint _pd_b2_hi = uint((comp_ssbo)[_pd_src + 1u]);                           \
+            _pd_block2_cmd_offset = readU16LE(_pd_b2_lo, _pd_b2_hi);                    \
+            _pd_src += 2u;                                                              \
+        }                                                                              \
+        _pd_block2_cmd_offset = subgroupShuffle(_pd_block2_cmd_offset, 0u);            \
+        _pd_src = subgroupShuffle(_pd_src, 0u);                                        \
+                                                                                       \
+        uint _pd_off16_raw;                                                            \
+        uint _pd_off16_count = 0u;                                                     \
+        if (uint(lane) == 0u) {                                                        \
+            uint _pd_o0 = uint((comp_ssbo)[_pd_src + 0u]);                              \
+            uint _pd_o1 = uint((comp_ssbo)[_pd_src + 1u]);                              \
+            _pd_off16_count = readU16LE(_pd_o0, _pd_o1);                                \
+            _pd_off16_raw = _pd_src + 2u;                                              \
+            _pd_src += 2u + _pd_off16_count * OFF16_ENTRY_BYTES;                       \
+        }                                                                              \
+        _pd_off16_count = subgroupShuffle(_pd_off16_count, 0u);                        \
+        _pd_src = subgroupShuffle(_pd_src, 0u);                                        \
+        _pd_off16_raw = _pd_src - _pd_off16_count * OFF16_ENTRY_BYTES;                 \
+                                                                                       \
+        uint _pd_off32_count1 = 0u, _pd_off32_count2 = 0u;                              \
+        uint _pd_off32_raw1 = _pd_src, _pd_off32_raw2 = _pd_src;                        \
+        uint _pd_len_stream;                                                            \
+        uint _pd_len_avail = 0u;                                                       \
+                                                                                       \
+        if (uint(lane) == 0u) {                                                        \
+            uint _pd_t0 = uint((comp_ssbo)[_pd_src + 0u]);                              \
+            uint _pd_t1 = uint((comp_ssbo)[_pd_src + 1u]);                              \
+            uint _pd_t2 = uint((comp_ssbo)[_pd_src + 2u]);                              \
+            uint _pd_tmp = readLE24(_pd_t0, _pd_t1, _pd_t2);                            \
+            _pd_src += 3u;                                                              \
+            if (_pd_tmp != 0u) {                                                       \
+                _pd_off32_count1 = _pd_tmp >> OFF32_COUNT1_SHIFT;                       \
+                _pd_off32_count2 = _pd_tmp & OFF32_COUNT2_MASK;                         \
+                if (_pd_off32_count1 == OFF32_COUNT_PACK_MAX) {                        \
+                    uint _pd_e0 = uint((comp_ssbo)[_pd_src + 0u]);                      \
+                    uint _pd_e1 = uint((comp_ssbo)[_pd_src + 1u]);                      \
+                    _pd_off32_count1 = readU16LE(_pd_e0, _pd_e1);                       \
+                    _pd_src += 2u;                                                      \
+                }                                                                       \
+                if (_pd_off32_count2 == OFF32_COUNT_PACK_MAX) {                        \
+                    uint _pd_f0 = uint((comp_ssbo)[_pd_src + 0u]);                      \
+                    uint _pd_f1 = uint((comp_ssbo)[_pd_src + 1u]);                      \
+                    _pd_off32_count2 = readU16LE(_pd_f0, _pd_f1);                       \
+                    _pd_src += 2u;                                                      \
+                }                                                                       \
+                _pd_off32_raw1 = _pd_src;                                               \
+                _pd_src += _pd_off32_count1 * OFF32_ENTRY_BYTES;                        \
+                _pd_off32_raw2 = _pd_src;                                               \
+                _pd_src += _pd_off32_count2 * OFF32_ENTRY_BYTES;                        \
+            } else {                                                                    \
+                _pd_off32_raw1 = _pd_src;                                               \
+                _pd_off32_raw2 = _pd_src;                                               \
+            }                                                                           \
+            _pd_len_stream = _pd_src;                                                  \
+            _pd_len_avail = _pd_src_end - _pd_src;                                     \
+        }                                                                              \
+        _pd_off32_count1 = subgroupShuffle(_pd_off32_count1, 0u);                      \
+        _pd_off32_count2 = subgroupShuffle(_pd_off32_count2, 0u);                      \
+        _pd_len_avail = subgroupShuffle(_pd_len_avail, 0u);                            \
+        _pd_src = subgroupShuffle(_pd_src, 0u);                                        \
+        _pd_len_stream = _pd_src;                                                      \
+        _pd_off32_raw2 = _pd_src - _pd_off32_count2 * OFF32_ENTRY_BYTES;                \
+        _pd_off32_raw1 = _pd_off32_raw2 - _pd_off32_count1 * OFF32_ENTRY_BYTES;         \
+                                                                                       \
+        if (_pd_off32_count1 == 0u && _pd_off32_count2 == 0u) {                        \
+            decodeSubChunkRawMode_false_dict(                                          \
+                comp_ssbo, _pd_cmd_ptr, _pd_cmd_size,                                  \
+                comp_ssbo, _pd_lit_ptr, _pd_lit_size,                                  \
+                comp_ssbo, _pd_off16_raw, _pd_off16_count,                             \
+                comp_ssbo, _pd_len_stream, _pd_len_avail,                              \
+                dst_ssbo, sc_decomp_size, _pd_initial_copy, dst_offset, lane,          \
+                dict_ssbo, dict_len);                                                  \
+        } else {                                                                       \
+            decodeSubChunkGeneral_false_dict(                                          \
+                comp_ssbo,                                                             \
+                _pd_lit_ptr, _pd_lit_size,                                             \
+                _pd_cmd_ptr, _pd_cmd_size,                                             \
+                _pd_off16_raw, _pd_off16_count,                                        \
+                comp_ssbo, 0u,                                                         \
+                comp_ssbo, 0u,                                                         \
+                _pd_off32_raw1, _pd_off32_count1,                                      \
+                _pd_off32_raw2, _pd_off32_count2,                                      \
+                _pd_len_stream, _pd_len_avail,                                         \
+                /*off16_split=*/0u,                                                    \
+                _pd_block2_cmd_offset, _pd_initial_copy,                               \
+                /*lit_scratch_ssbo=*/comp_ssbo, /*lit_in_scratch=*/0u,                  \
+                /*cmd_scratch_ssbo=*/comp_ssbo, /*cmd_in_scratch=*/0u,                  \
+                dst_ssbo, sc_decomp_size, dst_offset,                                  \
+                /*mode=*/1u, lane, dict_ssbo, dict_len);                               \
+        }                                                                              \
+    } while (false)
+
 // CUDA reference: src/decode/lz_dispatch.cuh:173-226.
 // General entropy-capable parseAndDecodeSubChunk: invokes
 // parseSubChunkHeaders to fill a ParsedStreams record, then dispatches
@@ -353,6 +505,140 @@
                     entropy_tok_ssbo, _pdg_ps.cmd_in_scratch,                           \
                     dst_ssbo, sc_decomp_size, dst_offset,                               \
                     mode, lane);                                                        \
+            }                                                                           \
+        }                                                                               \
+    } while (false)
+
+// CUDA reference: src/decode/lz_dispatch.cuh:173-226 with HAS_DICT=true
+// (v4 #16). Textual twin of parseAndDecodeSubChunk whose decode arms
+// call the _dict body instantiations — the GLSL mirror of CUDA's second
+// template instantiation. Same A-001 (lit_src, cmd_src) cross-product
+// enumeration; see the dict-less twin above for the arm rationale.
+#define parseAndDecodeSubChunk_dict(comp_ssbo, sc_src_off, sc_comp_size, sc_decomp_size, \
+                                    dst_ssbo, dst_offset, base_offset, mode,            \
+                                    entropy_lit_ssbo, entropy_lit_base,                 \
+                                    entropy_tok_ssbo, entropy_tok_base,                 \
+                                    entropy_off16_ssbo, entropy_off16_base,             \
+                                    has_entropy, lane, dict_ssbo, dict_len)             \
+    do {                                                                                \
+        ParsedStreams _pdg_ps;                                                          \
+        parseSubChunkHeaders(comp_ssbo, sc_src_off, sc_comp_size, sc_decomp_size,       \
+                              dst_ssbo, dst_offset, base_offset,                        \
+                              entropy_lit_ssbo, entropy_lit_base,                       \
+                              entropy_tok_ssbo, entropy_tok_base,                       \
+                              entropy_off16_ssbo, entropy_off16_base,                   \
+                              has_entropy,                                              \
+                              _pdg_ps, lane);                                           \
+                                                                                        \
+        if (uint(mode) == 1u && _pdg_ps.off32_count1 == 0u && _pdg_ps.off32_count2 == 0u) { \
+            if (_pdg_ps.off16_split != 0u) {                                            \
+                if (_pdg_ps.lit_in_scratch != 0u && _pdg_ps.cmd_in_scratch != 0u) {     \
+                    decodeSubChunkRawMode_true_dict(                                    \
+                        entropy_tok_ssbo, _pdg_ps.cmd_ptr, _pdg_ps.cmd_size,            \
+                        entropy_lit_ssbo, _pdg_ps.lit_ptr, _pdg_ps.lit_size,            \
+                        entropy_off16_ssbo, _pdg_ps.off16_hi,                           \
+                        entropy_off16_ssbo, _pdg_ps.off16_lo, _pdg_ps.off16_count,      \
+                        comp_ssbo, _pdg_ps.len_stream, _pdg_ps.len_avail,               \
+                        dst_ssbo, sc_decomp_size, _pdg_ps.initial_copy, dst_offset, lane, \
+                        dict_ssbo, dict_len);                                           \
+                } else if (_pdg_ps.lit_in_scratch != 0u) {                              \
+                    decodeSubChunkRawMode_true_dict(                                    \
+                        comp_ssbo, _pdg_ps.cmd_ptr, _pdg_ps.cmd_size,                   \
+                        entropy_lit_ssbo, _pdg_ps.lit_ptr, _pdg_ps.lit_size,            \
+                        entropy_off16_ssbo, _pdg_ps.off16_hi,                           \
+                        entropy_off16_ssbo, _pdg_ps.off16_lo, _pdg_ps.off16_count,      \
+                        comp_ssbo, _pdg_ps.len_stream, _pdg_ps.len_avail,               \
+                        dst_ssbo, sc_decomp_size, _pdg_ps.initial_copy, dst_offset, lane, \
+                        dict_ssbo, dict_len);                                           \
+                } else if (_pdg_ps.cmd_in_scratch != 0u) {                              \
+                    decodeSubChunkRawMode_true_dict(                                    \
+                        entropy_tok_ssbo, _pdg_ps.cmd_ptr, _pdg_ps.cmd_size,            \
+                        comp_ssbo, _pdg_ps.lit_ptr, _pdg_ps.lit_size,                   \
+                        entropy_off16_ssbo, _pdg_ps.off16_hi,                           \
+                        entropy_off16_ssbo, _pdg_ps.off16_lo, _pdg_ps.off16_count,      \
+                        comp_ssbo, _pdg_ps.len_stream, _pdg_ps.len_avail,               \
+                        dst_ssbo, sc_decomp_size, _pdg_ps.initial_copy, dst_offset, lane, \
+                        dict_ssbo, dict_len);                                           \
+                } else {                                                                \
+                    decodeSubChunkRawMode_true_dict(                                    \
+                        comp_ssbo, _pdg_ps.cmd_ptr, _pdg_ps.cmd_size,                   \
+                        comp_ssbo, _pdg_ps.lit_ptr, _pdg_ps.lit_size,                   \
+                        entropy_off16_ssbo, _pdg_ps.off16_hi,                           \
+                        entropy_off16_ssbo, _pdg_ps.off16_lo, _pdg_ps.off16_count,      \
+                        comp_ssbo, _pdg_ps.len_stream, _pdg_ps.len_avail,               \
+                        dst_ssbo, sc_decomp_size, _pdg_ps.initial_copy, dst_offset, lane, \
+                        dict_ssbo, dict_len);                                           \
+                }                                                                       \
+            } else {                                                                    \
+                if (_pdg_ps.lit_in_scratch != 0u && _pdg_ps.cmd_in_scratch != 0u) {     \
+                    decodeSubChunkRawMode_false_dict(                                   \
+                        entropy_tok_ssbo, _pdg_ps.cmd_ptr, _pdg_ps.cmd_size,            \
+                        entropy_lit_ssbo, _pdg_ps.lit_ptr, _pdg_ps.lit_size,            \
+                        comp_ssbo, _pdg_ps.off16_raw, _pdg_ps.off16_count,              \
+                        comp_ssbo, _pdg_ps.len_stream, _pdg_ps.len_avail,               \
+                        dst_ssbo, sc_decomp_size, _pdg_ps.initial_copy, dst_offset, lane, \
+                        dict_ssbo, dict_len);                                           \
+                } else if (_pdg_ps.lit_in_scratch != 0u) {                              \
+                    decodeSubChunkRawMode_false_dict(                                   \
+                        comp_ssbo, _pdg_ps.cmd_ptr, _pdg_ps.cmd_size,                   \
+                        entropy_lit_ssbo, _pdg_ps.lit_ptr, _pdg_ps.lit_size,            \
+                        comp_ssbo, _pdg_ps.off16_raw, _pdg_ps.off16_count,              \
+                        comp_ssbo, _pdg_ps.len_stream, _pdg_ps.len_avail,               \
+                        dst_ssbo, sc_decomp_size, _pdg_ps.initial_copy, dst_offset, lane, \
+                        dict_ssbo, dict_len);                                           \
+                } else if (_pdg_ps.cmd_in_scratch != 0u) {                              \
+                    decodeSubChunkRawMode_false_dict(                                   \
+                        entropy_tok_ssbo, _pdg_ps.cmd_ptr, _pdg_ps.cmd_size,            \
+                        comp_ssbo, _pdg_ps.lit_ptr, _pdg_ps.lit_size,                   \
+                        comp_ssbo, _pdg_ps.off16_raw, _pdg_ps.off16_count,              \
+                        comp_ssbo, _pdg_ps.len_stream, _pdg_ps.len_avail,               \
+                        dst_ssbo, sc_decomp_size, _pdg_ps.initial_copy, dst_offset, lane, \
+                        dict_ssbo, dict_len);                                           \
+                } else {                                                                \
+                    decodeSubChunkRawMode_false_dict(                                   \
+                        comp_ssbo, _pdg_ps.cmd_ptr, _pdg_ps.cmd_size,                   \
+                        comp_ssbo, _pdg_ps.lit_ptr, _pdg_ps.lit_size,                   \
+                        comp_ssbo, _pdg_ps.off16_raw, _pdg_ps.off16_count,              \
+                        comp_ssbo, _pdg_ps.len_stream, _pdg_ps.len_avail,               \
+                        dst_ssbo, sc_decomp_size, _pdg_ps.initial_copy, dst_offset, lane, \
+                        dict_ssbo, dict_len);                                           \
+                }                                                                       \
+            }                                                                           \
+        } else {                                                                        \
+            if (_pdg_ps.off16_split != 0u) {                                            \
+                decodeSubChunkGeneral_true_dict(                                        \
+                    comp_ssbo,                                                          \
+                    _pdg_ps.lit_ptr, _pdg_ps.lit_size,                                  \
+                    _pdg_ps.cmd_ptr, _pdg_ps.cmd_size,                                  \
+                    _pdg_ps.off16_raw, _pdg_ps.off16_count,                             \
+                    entropy_off16_ssbo, _pdg_ps.off16_hi,                               \
+                    entropy_off16_ssbo, _pdg_ps.off16_lo,                               \
+                    _pdg_ps.off32_raw1, _pdg_ps.off32_count1,                           \
+                    _pdg_ps.off32_raw2, _pdg_ps.off32_count2,                           \
+                    _pdg_ps.len_stream, _pdg_ps.len_avail,                              \
+                    _pdg_ps.off16_split,                                                \
+                    _pdg_ps.cmd_stream2_offset, _pdg_ps.initial_copy,                   \
+                    entropy_lit_ssbo, _pdg_ps.lit_in_scratch,                           \
+                    entropy_tok_ssbo, _pdg_ps.cmd_in_scratch,                           \
+                    dst_ssbo, sc_decomp_size, dst_offset,                               \
+                    mode, lane, dict_ssbo, dict_len);                                   \
+            } else {                                                                    \
+                decodeSubChunkGeneral_false_dict(                                       \
+                    comp_ssbo,                                                          \
+                    _pdg_ps.lit_ptr, _pdg_ps.lit_size,                                  \
+                    _pdg_ps.cmd_ptr, _pdg_ps.cmd_size,                                  \
+                    _pdg_ps.off16_raw, _pdg_ps.off16_count,                             \
+                    entropy_off16_ssbo, _pdg_ps.off16_hi,                               \
+                    entropy_off16_ssbo, _pdg_ps.off16_lo,                               \
+                    _pdg_ps.off32_raw1, _pdg_ps.off32_count1,                           \
+                    _pdg_ps.off32_raw2, _pdg_ps.off32_count2,                           \
+                    _pdg_ps.len_stream, _pdg_ps.len_avail,                              \
+                    _pdg_ps.off16_split,                                                \
+                    _pdg_ps.cmd_stream2_offset, _pdg_ps.initial_copy,                   \
+                    entropy_lit_ssbo, _pdg_ps.lit_in_scratch,                           \
+                    entropy_tok_ssbo, _pdg_ps.cmd_in_scratch,                           \
+                    dst_ssbo, sc_decomp_size, dst_offset,                               \
+                    mode, lane, dict_ssbo, dict_len);                                   \
             }                                                                           \
         }                                                                               \
     } while (false)

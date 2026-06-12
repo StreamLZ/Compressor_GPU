@@ -38,6 +38,11 @@
 #extension GL_KHR_shader_subgroup_ballot : require
 #extension GL_KHR_shader_subgroup_vote : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+// v4 #16: the preset dictionary arrives as a buffer device address in
+// the push constants (the VK mirror of CUDA's `const uint8_t* dict`
+// launch param - same pattern as the v4 #5 entropy-scratch regions).
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
 
 #include "slz_wire_format.glsl"
 #include "lz_decode_core.glsl"
@@ -66,13 +71,34 @@ layout(std430, binding = 3) readonly buffer TotalChunksBuf {
 layout(push_constant) uniform Push {
     uint chunks_per_group;
     uint sub_chunk_cap;
+    // v4 #16: dictionary address + length (0/0 on dict-less frames);
+    // same ABI as lz_decode_raw_kernel.comp.
+    uint dict_addr_lo;
+    uint dict_addr_hi;
+    uint dict_len;
+    uint _dict_pad;
 } pc;
+
+// v4 #16: dictionary bytes, BDA-addressed. Never dereferenced at
+// dict_len == 0 (every dict read below is gated on pc.dict_len).
+//
+// VK adaptation (PortAdaptations): CUDA specializes the whole pipeline
+// on a HAS_DICT template parameter selected once per sub-chunk; the
+// plain GLSL functions here gate each dict site on the frame-uniform
+// pc.dict_len instead (uniform branch, loop-invariant). The dict-less
+// instruction stream is NOT textually identical to pre-dict - verified
+// at-baseline by the dict-less bench gate instead.
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer DictRef {
+    uint8_t b[];
+};
+DictRef g_dict;
 
 // ── Shared pipeline state ────────────────────────────────────────
 struct PipeBatch {
     uint batch_size;
     uint total_lit;
     uint total_im;
+    uint total_dm;   // v4 #16 fu7: flat dict-match byte count (dict frames only)
     uint dst_pos;
     uint lit_pos;
     uint dep_mask;
@@ -81,6 +107,14 @@ struct PipeBatch {
     uint im_prefix[32];
     uint im_dst_adj[32];
     uint im_src_adj[32];
+    // v4 #16 fu7 (CUDA ref: lz_decode_raw_pipeline.cuh:95-103): flat
+    // ENTIRELY-DICT match pool - read-only dictionary sources, no write
+    // hazard against anything in the batch, so they run in phase 1 at
+    // full team width instead of the serial dependent loop. dm_src_adj
+    // is in DICT coordinates.
+    uint dm_prefix[32];
+    uint dm_dst_adj[32];
+    uint dm_src_adj[32];
     uint match_len[32];
     int  match_offset[32];
 };
@@ -100,7 +134,8 @@ bool fillBatch(
     uint off16_base, uint off16_count,
     inout uint cmd_pos, inout uint lit_pos, inout uint off16_pos,
     inout uint dst_pos, inout int recent_offset,
-    int lane, uint slot
+    int lane, uint slot,
+    uint window_base // v4 #16: sub-chunk output base (dict classification)
 ) {
     uint remaining = cmd_size - cmd_pos;
     uint batch_size = remaining < WARP_SIZE ? remaining : WARP_SIZE;
@@ -149,7 +184,17 @@ bool fillBatch(
 
     uint my_copy_dst = dst_pos + my_dst_local + my_lit_len;
     int  my_src      = int(my_copy_dst) + my_match_offset;
-    bool my_is_indep = (my_match_len > 0u) &&
+    // v4 #16 fu7 (CUDA ref: lz_decode_raw_pipeline.cuh:173-190):
+    // ENTIRELY-dict matches go to their own flat pool; straddlers and
+    // hostile below-dict reaches ride the dependent loop's dict-aware
+    // per-byte read. Frame-uniform pc.dict_len gate - both flags are
+    // false on dict-less frames.
+    bool my_reaches_dict = (pc.dict_len != 0u) && (my_match_len > 0u) &&
+                           (my_src < int(window_base));
+    bool my_entirely_dict = my_reaches_dict &&
+                            (my_src + int(my_match_len) <= int(window_base)) &&
+                            (my_src + int(pc.dict_len) >= int(window_base));
+    bool my_is_indep = (my_match_len > 0u) && !my_reaches_dict &&
                        (my_src + int(my_match_len) <= int(dst_pos));
     uint my_im_len = my_is_indep ? my_match_len : 0u;
     uint my_im_local, total_im;
@@ -162,7 +207,21 @@ bool fillBatch(
     s_pb[slot].im_src_adj[lane]   = uint(my_src) - my_im_local;
     s_pb[slot].match_len[lane]    = my_match_len;
     s_pb[slot].match_offset[lane] = my_match_offset;
-    uvec4 db = subgroupBallot(my_match_len > 0u && !my_is_indep);
+    // v4 #16 fu7 (CUDA ref: lz_decode_raw_pipeline.cuh:200-211): stage
+    // the flat dict-match pool. Dict-space source: dict byte k below
+    // the window is dict[dict_len - k]; u32 wrap arithmetic lands
+    // exactly.
+    if (pc.dict_len != 0u) {
+        uint my_dm_len = my_entirely_dict ? my_match_len : 0u;
+        uint my_dm_local, total_dm;
+        warpScanU32(my_dm_len, lane, my_dm_local, total_dm);
+        uint my_dict_src = uint(int(pc.dict_len) + my_src - int(window_base));
+        s_pb[slot].dm_prefix[lane]  = my_dm_local;
+        s_pb[slot].dm_dst_adj[lane] = my_copy_dst - my_dm_local;
+        s_pb[slot].dm_src_adj[lane] = my_dict_src - my_dm_local;
+        if (lane == 0) s_pb[slot].total_dm = total_dm;
+    }
+    uvec4 db = subgroupBallot(my_match_len > 0u && !my_is_indep && !my_entirely_dict);
     if (lane == 0) {
         s_pb[slot].batch_size = batch_size;
         s_pb[slot].total_lit  = total_lit;
@@ -208,12 +267,27 @@ void executeFlats(uint lit_base, uint team_lane, uint slot) {
         }
         dst[s_pb[slot].im_dst_adj[k] + i] = dst[s_pb[slot].im_src_adj[k] + i];
     }
+    // v4 #16 fu7 (CUDA ref: lz_decode_raw_pipeline.cuh:301-311): flat
+    // ENTIRELY-DICT match pass. Same shape as the im pass with the
+    // source read from the dictionary. Hazard-free against the lit and
+    // im passes (reads touch only dictionary bytes; writes are disjoint
+    // by token ownership), so it shares phase 1 with no extra barrier.
+    if (pc.dict_len != 0u) {
+        for (uint i = team_lane; i < s_pb[slot].total_dm; i += PIPE_TEAM_THREADS) {
+            uint k = 0u;
+            for (uint step = 16u; step >= 1u; step >>= 1) {
+                uint cand = k + step;
+                if (cand < bs && s_pb[slot].dm_prefix[cand] <= i) k = cand;
+            }
+            dst[s_pb[slot].dm_dst_adj[k] + i] = g_dict.b[s_pb[slot].dm_src_adj[k] + i];
+        }
+    }
 }
 
 // Dependent matches, token order, warp 1 only (they may read any
 // earlier byte including this batch's flat output, so the caller
 // fences before calling).
-void executeDeps(int lane, uint slot) {
+void executeDeps(int lane, uint slot, uint window_base) {
     uint dep_mask = s_pb[slot].dep_mask;
     while (dep_mask != 0u) {
         uint k = uint(findLSB(dep_mask));
@@ -222,7 +296,15 @@ void executeDeps(int lane, uint slot) {
         int  k_match_off = s_pb[slot].match_offset[k];
         uint copy_dst = s_pb[slot].im_dst_adj[k] + s_pb[slot].im_prefix[k];
         uint match_src = uint(int(copy_dst) + k_match_off);
-        warpMatchCopy(dst, copy_dst, match_src, k_match_len, -k_match_off, lane);
+        // v4 #16 (CUDA ref: lz_decode_raw_pipeline.cuh:327-328): the
+        // dependent loop is dict-aware - straddling and hostile reaches
+        // route through the per-byte clamped read.
+        if (pc.dict_len != 0u) {
+            warpMatchCopyD(dst, copy_dst, match_src, k_match_len, -k_match_off, lane,
+                           window_base, g_dict.b, pc.dict_len);
+        } else {
+            warpMatchCopy(dst, copy_dst, match_src, k_match_len, -k_match_off, lane);
+        }
         subgroupBarrier();
         subgroupMemoryBarrierBuffer();
     }
@@ -257,6 +339,18 @@ void executeFlatsSolo(uint lit_base, int lane, uint slot) {
         }
         dst[s_pb[slot].im_dst_adj[k] + i] = dst[s_pb[slot].im_src_adj[k] + i];
     }
+    // v4 #16 fu7: flat dict pool, single-warp variant (experiment path
+    // keeps the same phase-1 work set as the team variant).
+    if (pc.dict_len != 0u) {
+        for (uint i = uint(lane); i < s_pb[slot].total_dm; i += WARP_SIZE) {
+            uint k = 0u;
+            for (uint step = 16u; step >= 1u; step >>= 1) {
+                uint cand = k + step;
+                if (cand < bs && s_pb[slot].dm_prefix[cand] <= i) k = cand;
+            }
+            dst[s_pb[slot].dm_dst_adj[k] + i] = g_dict.b[s_pb[slot].dm_src_adj[k] + i];
+        }
+    }
     subgroupBarrier();
     subgroupMemoryBarrierBuffer();
 }
@@ -283,7 +377,7 @@ void decodeSubChunkPipelined(
             bool got = (cmd_pos < cmd_size) && fillBatch(
                 cmd_base, cmd_size, off16_base, off16_count,
                 cmd_pos, lit_pos, off16_pos, dst_pos, recent_offset,
-                lane, 0u);
+                lane, 0u, dst_offset);
             if (lane == 0) s_have[0] = got ? 1u : 0u;
         }
         barrier();
@@ -311,13 +405,13 @@ void decodeSubChunkPipelined(
             if (dm != 0u) {
                 groupMemoryBarrier();
                 barrier();
-                if (is_parser) executeDeps(lane, cur);
+                if (is_parser) executeDeps(lane, cur, dst_offset);
             }
             if (is_parser) {
                 bool got = (cmd_pos < cmd_size) && fillBatch(
                     cmd_base, cmd_size, off16_base, off16_count,
                     cmd_pos, lit_pos, off16_pos, dst_pos, recent_offset,
-                    lane, 1u - cur);
+                    lane, 1u - cur, dst_offset);
                 if (lane == 0) s_have[1u - cur] = got ? 1u : 0u;
             }
 #else
@@ -325,7 +419,7 @@ void decodeSubChunkPipelined(
                 bool got = (cmd_pos < cmd_size) && fillBatch(
                     cmd_base, cmd_size, off16_base, off16_count,
                     cmd_pos, lit_pos, off16_pos, dst_pos, recent_offset,
-                    lane, 1u - cur);
+                    lane, 1u - cur, dst_offset);
                 if (lane == 0) s_have[1u - cur] = got ? 1u : 0u;
             } else {
                 executeFlats(lit_base, team_lane, cur);
@@ -334,7 +428,7 @@ void decodeSubChunkPipelined(
                 groupMemoryBarrier();
                 barrier();
                 if (gl_LocalInvocationID.y == 1u)
-                    executeDeps(lane, cur);
+                    executeDeps(lane, cur, dst_offset);
             }
 #endif
             groupMemoryBarrier();
@@ -408,9 +502,16 @@ void decodeSubChunkPipelined(
         if (smatch > 0u) {
             // One warp performs the match (warpMatchCopy is
             // warp-granular; running it on both would double-write).
+            // v4 #16 (CUDA ref: lz_decode_raw_pipeline.cuh:472-473):
+            // long-near matches can reach the dictionary too.
             if (is_parser) {
                 uint msrc = uint(int(dst_pos) + soff);
-                warpMatchCopy(dst, dst_pos, msrc, smatch, -soff, lane);
+                if (pc.dict_len != 0u) {
+                    warpMatchCopyD(dst, dst_pos, msrc, smatch, -soff, lane,
+                                   dst_offset, g_dict.b, pc.dict_len);
+                } else {
+                    warpMatchCopy(dst, dst_pos, msrc, smatch, -soff, lane);
+                }
             }
             groupMemoryBarrier();
             barrier();
@@ -527,9 +628,16 @@ void parsePipelined(
         // no barrier is crossed divergently. (VK adaptation: guard
         // the CUDA bridge lacks.)
         if (is_parser) {
-            parseAndDecodeSubChunkRaw(
-                compressed, sc_src_off, sc_comp_size, sc_decomp_size,
-                dst, dst_offset, base_offset, lane);
+            if (pc.dict_len != 0u) {
+                parseAndDecodeSubChunkRaw_dict(
+                    compressed, sc_src_off, sc_comp_size, sc_decomp_size,
+                    dst, dst_offset, base_offset, lane,
+                    g_dict.b, pc.dict_len);
+            } else {
+                parseAndDecodeSubChunkRaw(
+                    compressed, sc_src_off, sc_comp_size, sc_decomp_size,
+                    dst, dst_offset, base_offset, lane);
+            }
         }
         return;
     }
@@ -544,6 +652,8 @@ void parsePipelined(
 }
 
 void main() {
+    // v4 #16: dictionary reference (never dereferenced at dict_len == 0).
+    g_dict = DictRef(uvec2(pc.dict_addr_lo, pc.dict_addr_hi));
     uint total_chunks = d_total_chunks;
     // Both subgroups share ONE group id (grid doubled by the host).
     uint group_id = gl_WorkGroupID.x;
