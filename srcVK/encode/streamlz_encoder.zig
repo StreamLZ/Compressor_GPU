@@ -39,10 +39,12 @@ pub const Options = struct {
     /// bit 6) - 3 bytes per chunk after the end mark, before the
     /// trailers. Lets the device-resident decode path locate every
     /// chunk with one parallel read instead of the serial chunk-chain
-    /// walk. Decoders that predate the bit ignore the footer. Not
-    /// emitted on uncompressed-body frames or when the effective chunk
-    /// size is under 64 KB.
-    chunk_size_table: bool = false,
+    /// walk. Decoders that predate the bit ignore the footer.
+    /// DEFAULT ON since 2026-06-12 (both backends emit byte-identical
+    /// footers). Not emitted on uncompressed-body frames, when the
+    /// effective chunk size is under 64 KB, or on the device-resident-
+    /// output encode path (A-031).
+    chunk_size_table: bool = true,
 };
 
 /// CUDA reference: src/encode/streamlz_encoder.zig:70-84. Upper bound on

@@ -34,8 +34,9 @@ pub const Args = struct {
     /// dictionary against the frame header's ID.
     dictionary: ?[]const u8 = null,
     /// v4 #20 (CUDA-mirror): emit the chunk-size table footer (speeds
-    /// up the device-resident decode path's frame walk).
-    chunk_table: bool = false,
+    /// up the device-resident decode path's frame walk). Default ON
+    /// since 2026-06-12; --no-chunk-table opts out.
+    chunk_table: bool = true,
     /// VK adaptation: raw `--device <arg>` payload. Pure-digit strings
     /// are interpreted as `by_index`; otherwise as `by_name` (case-
     /// insensitive substring of vkPhysicalDeviceProperties.deviceName).
@@ -68,6 +69,7 @@ pub fn parseArgs(raw: []const []const u8, w: *std.Io.Writer) Args {
         if (eql(arg, "-r")) { i += 1; result.runs = parseInt(u32, expect(raw, i, "-r", w), w, "-r"); continue; }
         if (eql(arg, "-D")) { i += 1; result.dictionary = expect(raw, i, "-D", w); continue; }
         if (eql(arg, "--chunk-table")) { result.chunk_table = true; continue; }
+        if (eql(arg, "--no-chunk-table")) { result.chunk_table = false; continue; }
         if (eql(arg, "-o")) { i += 1; result.output = expect(raw, i, "-o", w); continue; }
         if (eql(arg, "--sc")) {
             i += 1;
@@ -267,7 +269,8 @@ pub fn printUsage(w: *std.Io.Writer) !void {
         \\                  css, js, general), numeric ID, or "auto" (by
         \\                  input extension). Decode reads the frame header.
         \\  --chunk-table   Emit the chunk-size table footer (faster
-        \\                  device-resident decode; +3 B per 64 KB chunk)
+        \\                  device-resident decode; +3 B per 64 KB
+        \\                  chunk). DEFAULT ON; --no-chunk-table opts out.
         \\  --sc <float>    sc_group_size override (0.25 = 64 KB sub-chunks)
         \\  --device <N|name>  Select Vulkan physical device by zero-based index
         \\                  or case-insensitive substring of deviceName.

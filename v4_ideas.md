@@ -1290,8 +1290,23 @@ table-walk decode + hostile corrupted-entry reject (ptest 64/0/0).
 VK MIRROR SHIPPED same day (cc40284, see the #16 VK PORT WAVE
 block): walk_frame_table_kernel.comp + emission + geometry +
 status readback; table frames byte-identical cross-backend; VK
-table walk drops the D2D kernel 2.844 -> 2.291 ms. The default-on
-flip is now unblocked on both backends.
+table walk drops the D2D kernel 2.844 -> 2.291 ms.
+**DEFAULT-ON FLIPPED same day (both backends, CLI + Options/API).**
+--no-chunk-table opts out (reproduces the old baseline bytes -
+verified, d94701d8 again). One identity decision: the footer is a
+HOST-OUTPUT-PATH feature on BOTH backends - CUDA could append it on
+the D2D-output (async ABI) encode path but VK cannot (A-031), and
+cross-backend frame identity outranks the footer there, so the
+CUDA emit gate also requires d_output_override == 0. NEW SHA-GATE
+BASELINE HASHES (enwik8, defaults):
+  L1 d2d3fb6c00d8e4152180113e9e11e273c5164874d3b0ffee3704b9439c751afd
+  L3 762916e29c0ebe864dacd20ae5703934b27f1d725b3633614291c3321686d0b4
+  L5 55aaaa805296bb72ea21c12a96b90b93ca1de9ff40e58c3e329e9776fc8db0c7
+Gates: ptest 64/0/0 (the #20 test's plain reference encode now
+passes chunk_size_table=false explicitly), ptest_vk 155/9/0,
+cross-backend SHA 3/3 at the new hashes, bench_all 10/10 SHA OK
+with the default-frame D2D column improving 0.6-1.7 ms per cell
+(silesia gains most - more chunks, longer serial walk avoided).
 
 **Tier-3 design SETTLED with the user 2026-06-12:**
 - SIZES, not offsets: the descriptors need both, and each form

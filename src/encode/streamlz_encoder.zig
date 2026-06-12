@@ -92,11 +92,13 @@ pub const Options = struct {
     /// one parallel read instead of the serial chunk-chain walk
     /// (~0.7 ms -> tens of us on a 100 MB frame). Decoders that
     /// predate the bit ignore the footer and decode normally.
-    /// Opt-in (default off) until the VK encoder mirrors it - the
-    /// cross-backend SHA gate requires both backends' default frames
-    /// to stay byte-identical. Not emitted on uncompressed-body
-    /// frames or when the effective chunk size is under 64 KB.
-    chunk_size_table: bool = false,
+    /// DEFAULT ON since the VK encoder mirrored it (2026-06-12, both
+    /// backends emit byte-identical footers). Not emitted on
+    /// uncompressed-body frames, when the effective chunk size is
+    /// under 64 KB, or on the device-resident-output encode path
+    /// (cross-backend frame identity: VK cannot append to a device
+    /// frame - PortAdaptations A-031 - so neither backend does).
+    chunk_size_table: bool = true,
 };
 
 /// Upper bound on the compressed-output size for an input of `src_len`

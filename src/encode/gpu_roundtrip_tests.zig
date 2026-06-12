@@ -267,7 +267,10 @@ test "v4 #20: chunk-size table frames - footer correctness, roundtrips, D2D walk
     defer allocator.free(dst);
 
     for ([_]u8{ 1, 3, 5 }) |level| {
-        const n_plain = try encoder.compressFramed(allocator, payload, plain, .{ .level = level }, &gpu_encoder.g_default);
+        // Explicit false: the footer is DEFAULT ON since 2026-06-12,
+        // and this test's splice assertions need a genuinely plain
+        // reference frame.
+        const n_plain = try encoder.compressFramed(allocator, payload, plain, .{ .level = level, .chunk_size_table = false }, &gpu_encoder.g_default);
         const n_tab = try encoder.compressFramed(
             allocator,
             payload,

@@ -151,9 +151,16 @@ pub fn compressFramedOne(
     // 3-byte entry width both assume it). Decided up front because the
     // flag lives in the header; the rare assembly-cap fallback below
     // clears the bit again when it downgrades to an uncompressed body.
+    // Default-on flip (2026-06-12): additionally gated to the
+    // host-output path - VK cannot append the footer to a caller's
+    // device frame (VkDeviceBuffer handles take no +offset H2D;
+    // PortAdaptations A-031), and cross-backend frame identity is a
+    // hard invariant, so NEITHER backend emits it on the
+    // device-resident-output (async ABI) encode path.
     const emit_chunk_table = opts.chunk_size_table and
         src.len > min_source_length and
-        effChunkFor(src.len, opts.sc_group_size_override) >= 65536;
+        effChunkFor(src.len, opts.sc_group_size_override) >= 65536 and
+        enc_ctx.d_output_override == 0;
 
     const hdr_len = frame.writeHeader(dst, .{
         .codec = .fast,
