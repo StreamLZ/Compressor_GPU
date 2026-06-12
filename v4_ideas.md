@@ -580,13 +580,18 @@ in-tree tooling (dump env var -> tans_gate2 replay).
   cannot share a pass. Total cost is ~15 SASS instructions once per
   huff block: unmeasurable, and an encoder touch would cost a full
   cross-backend SHA gate. Closed without change.
-- **BUG: L3+ true-D2D decode fails** (found 2026-06-10 by
+- ~~**BUG: L3+ true-D2D decode fails**~~ ✅ CLOSED-STALE 2026-06-12:
+  this was the missing level readback in decompressFramedFromDevice,
+  fixed 2026-06-10 (the <=64-byte header D2H threading hdr.level into
+  the dispatch) - the basket line was never ticked. Verified today:
+  enwik8 L3 true-D2D verify-OK, 3.84 ms, full Huffman chain in the
+  per-kernel breakdown. Original entry: (found 2026-06-10 by
   toolsench_d2d.bat during the README perf refresh): slzDecompressAsync
   verify-FAILs on enwik8 L3 with zero kernel time (instant return);
   L1/L2 D2D pass. Suspect the 2026-06-09 A-024 region-offset rework -
   the D2D path had no L3+ coverage (c_abi_tests D2D case runs at L1).
-  FIX FIRST, then extend c_abi_tests.zig's D2D roundtrip to L5, then
-  re-measure the README L5 async-wall cell (marked with * there).
+  The follow-ups happened with the fix: c_abi_tests roundtrips D2D
+  at L1 AND L5 since 2026-06-10.
 
 ## 13. Fuzzing the decoder (and differential CUDA-vs-VK fuzz) — ✅ SHIPPED 2026-06-10 (fuzz_frames.zig differential harness + XXH32 content checksum, 4b0dfbf); ongoing-use tool
 
