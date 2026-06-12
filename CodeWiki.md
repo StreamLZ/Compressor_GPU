@@ -105,15 +105,15 @@ Repository root:
 
 How a dictionary flows through the codec: the encoder resolves the
 ID, builds a position hash table on the host (`encode_lz.zig
-ensureDictOnDevice`, cached per context), and the greedy parser
-probes it as its lowest-priority match source - a dictionary match
-is an ordinary off16 token whose distance reaches below the
-sub-chunk window. The decoder resolves the same ID from the frame
-header, uploads the bytes once (`decode_context.zig
-ensureDictOnDevice`), and the LZ kernels' dict-templated copy paths
-(`readBackRefByte` in `lz_decode_core.cuh`) map below-window reads
-onto the dictionary tail. The L5 chain parser does not search the
-dictionary yet (accepts dict frames; no ratio benefit).
+ensureDictOnDevice`, cached per context), and both parsers probe it
+as their lowest-priority match source - a dictionary match is an
+ordinary off16 token whose distance reaches below the sub-chunk
+window. The decoder resolves the same ID from the frame header,
+uploads the bytes once (`decode_context.zig ensureDictOnDevice`),
+and the LZ kernels' dict-templated copy paths (`readBackRefByte` in
+`lz_decode_core.cuh`, plus a flat entirely-dict pass beside the
+independent-match pool) map below-window reads onto the dictionary
+tail.
 
 ### `src/common/` - headers shared by encode and decode kernels
 

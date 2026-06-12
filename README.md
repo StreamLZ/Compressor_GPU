@@ -192,13 +192,14 @@ half, RTX 4060 Ti, encode+decode byte-verified):
 |-------|------:|-----------------------:|------------:|
 | L1 | 57.5% | **28.5%** | 2.02x |
 | L3 | 57.5% | **28.5%** | 2.02x |
-| L5 | 52.4% | 52.9% (no dict search yet) | - |
+| L5 | 52.4% | **28.1%** | 1.86x |
 
 Dictionary quality is per-corpus: the same records with the generic
 json dictionary stay at ~57% - train on a sample of YOUR records.
-The L5 chain parser does not search dictionaries yet (frames stay
-valid; no ratio benefit). Dictionary-less frames are byte-identical
-to before the feature existed.
+Dictionaries also help large corpora as shared cross-window context:
+enwik8 with the generic text dictionary improves 58.6% -> 53.6% at
+L1 and 39.6% -> 38.3% at L5. Dictionary-less frames are
+byte-identical to before the feature existed.
 
 ### vs nvCOMP (enwik8 100 MB, RTX 4060 Ti)
 

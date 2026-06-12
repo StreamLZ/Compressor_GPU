@@ -287,30 +287,20 @@ test "v4 #16: dictionary frames roundtrip, compress better, enforce the registry
         try testing.expectEqual(@as(?u32, dictionary.id_json), hdr.dictionary_id);
         const id_pos = hdr.header_size - 4;
 
-        if (level == 5) {
-            // The L5 chain parser does not search the dictionary yet
-            // (v4 #16 follow-up): a dict frame must equal the plain
-            // frame plus EXACTLY the spliced header field. This pins
-            // the phase-1 invariant where it still holds - and breaks
-            // loudly when chain-parser dict search lands, as a
-            // reminder to extend the ratio assertions to L5.
-            try testing.expectEqual(n_plain + 4, n_dict);
-            try testing.expectEqualSlices(u8, plain[0..5], with_dict[0..5]);
-            try testing.expectEqual(plain[5] | @as(u8, 0x08), with_dict[5]);
-            try testing.expectEqualSlices(u8, plain[6..id_pos], with_dict[6..id_pos]);
-            try testing.expectEqualSlices(u8, plain[id_pos..n_plain], with_dict[hdr.header_size..n_dict]);
-        } else {
-            // Greedy levels (1-4) search the dictionary: on this
-            // dict-derived payload the dict frame must be MEANINGFULLY
-            // smaller (the cold-start content is dict-matchable by
-            // construction; require at least 20% off).
-            if (n_dict >= n_plain - n_plain / 5) {
-                std.debug.print(
-                    "dict ratio L{d}: plain {d} B, dict {d} B - expected >= 20% reduction\n",
-                    .{ level, n_plain, n_dict },
-                );
-                return error.TestUnexpectedResult;
-            }
+        // Every level searches the dictionary (greedy at L1-4, the
+        // chain parser at L5): on this dict-derived payload the dict
+        // frame must be MEANINGFULLY smaller (the cold-start content
+        // is dict-matchable by construction). The bar is 20% for the
+        // greedy levels and 10% for L5 - the lazy parser already
+        // captures most inter-record redundancy on its own, so the
+        // dictionary's marginal lift is structurally smaller there.
+        const min_cut: usize = if (level == 5) n_plain / 10 else n_plain / 5;
+        if (n_dict >= n_plain - min_cut) {
+            std.debug.print(
+                "dict ratio L{d}: plain {d} B, dict {d} B - reduction below the bar\n",
+                .{ level, n_plain, n_dict },
+            );
+            return error.TestUnexpectedResult;
         }
 
         // Dict frames roundtrip byte-exact through the dict-aware

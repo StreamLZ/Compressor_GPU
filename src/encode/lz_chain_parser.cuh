@@ -99,6 +99,17 @@ __device__ bool isBetterThanRecentMatch(int32_t recent_match_length, int32_t mat
 //
 // Returns ChainMatch: {length, offset}
 //   offset=0 means recent-offset reuse; offset>0 is explicit distance
+// v4 #16 (HAS_DICT): the preset dictionary is probed as the STRICTLY
+// lowest-priority source - only when the window yields nothing usable
+// (no chain/long-hash/offset-8 match and no recent reuse), so
+// dictionary-less parses are byte-identical by construction. The
+// probe reuses the greedy parser's dict table (hashKey6 buckets) and
+// gates distances to off16 (<= NEAR_OFFSET_MAX), exactly like the
+// greedy integration. The lazy-1/lazy-2 evaluation upstream treats a
+// dict match as an ordinary candidate; backward extension never
+// applies to dict matches (the `pos > actual_offset` guard is always
+// false for them - dict distances exceed the position by design).
+template <bool HAS_DICT = false>
 __device__ ChainMatch findMatchChain(
     const uint8_t* src, uint32_t src_size,
     uint32_t pos,
@@ -106,7 +117,9 @@ __device__ ChainMatch findMatchChain(
     uint32_t* first_hash, uint32_t* long_hash, uint16_t* next_hash,
     uint32_t hash_bits, uint32_t hash_mask,
     uint32_t end_pos,
-    uint32_t lit_run_length
+    uint32_t lit_run_length,
+    const uint8_t* dict = nullptr, uint32_t dict_len = 0,
+    const uint32_t* dict_ht = nullptr
 ) {
     SLZ_CHAIN_COUNT(g_slz_chain_calls, 1);
     // Read 4 bytes at current position
@@ -283,6 +296,27 @@ __device__ ChainMatch findMatchChain(
 
     // (f) Return best match vs recent match (prefer recent if close)
     if (best_offset == 0 || !isBetterThanRecentMatch(recent_match_length, best_match_length, best_offset)) {
+        // v4 #16: dictionary probe - only when the window would yield
+        // no usable match at all (a recent reuse of length >= 2 is a
+        // match the caller takes; dict never competes with it).
+        if constexpr (HAS_DICT) {
+            if (recent_match_length < 2) {
+                uint32_t h6 = hashKey6(at_src, hash_bits, hash_mask);
+                uint32_t dv = dict_ht[h6];
+                if (dv != HASH_EMPTY) {
+                    uint32_t dist = pos + (dict_len - dv);
+                    if (dist <= NEAR_OFFSET_MAX && readU32LE(dict + dv) == bytes_at_pos) {
+                        uint32_t ml = 4;
+                        uint32_t max_ext = end_pos - pos;
+                        uint32_t dict_avail = dict_len - dv;
+                        if (dict_avail < max_ext) max_ext = dict_avail;
+                        while (ml < max_ext && src[pos + ml] == dict[dv + ml]) ml++;
+                        if ((int32_t)ml >= minimum_match_length)
+                            return {(int32_t)ml, (int32_t)dist};
+                    }
+                }
+            }
+        }
         return {recent_match_length, 0};
     }
     return {best_match_length, best_offset};
@@ -331,13 +365,16 @@ __device__ void insertChainRange(
 // Scans positions [start_pos .. end_pos), using the chain hasher to
 // find matches with lazy-1 and lazy-2 evaluation, backward extension,
 // and emitting tokens via emitCmd.
+template <bool HAS_DICT = false>
 __device__ void scanBlockChain(
     const uint8_t* src, uint32_t src_size,
     uint32_t* first_hash, uint32_t* long_hash, uint16_t* next_hash,
     uint32_t hash_bits, uint32_t hash_mask,
     OutputStreams &s,
     uint32_t &anchor, int32_t &recent_offset,
-    uint32_t start_pos, uint32_t end_pos, uint32_t block2_start
+    uint32_t start_pos, uint32_t end_pos, uint32_t block2_start,
+    const uint8_t* dict = nullptr, uint32_t dict_len = 0,
+    const uint32_t* dict_ht = nullptr
 ) {
     const uint32_t lane = threadIdx.x & LANE_MASK;
 
@@ -363,9 +400,10 @@ __device__ void scanBlockChain(
     while (pos + CHAIN_MIN_LOOKAHEAD < end_pos) {
         // Find a match at current position
         uint32_t cur_lit_run = pos - anchor;
-        ChainMatch match = findMatchChain(src, src_size, pos, recent_offset,
+        ChainMatch match = findMatchChain<HAS_DICT>(src, src_size, pos, recent_offset,
                                           first_hash, long_hash, next_hash,
-                                          hash_bits, hash_mask, end_pos, cur_lit_run);
+                                          hash_bits, hash_mask, end_pos, cur_lit_run,
+                                          dict, dict_len, dict_ht);
         if (match.length < 2) {
             pos++;
             continue;
@@ -373,18 +411,20 @@ __device__ void scanBlockChain(
 
         // Lazy-1: check pos+1 for a better match
         while (pos + CHAIN_MIN_LOOKAHEAD + 1 < end_pos) {
-            ChainMatch lazy1 = findMatchChain(src, src_size, pos + 1, recent_offset,
+            ChainMatch lazy1 = findMatchChain<HAS_DICT>(src, src_size, pos + 1, recent_offset,
                                               first_hash, long_hash, next_hash,
-                                              hash_bits, hash_mask, end_pos, cur_lit_run + 1);
+                                              hash_bits, hash_mask, end_pos, cur_lit_run + 1,
+                                              dict, dict_len, dict_ht);
             if (lazy1.length >= 2 && isLazyMatchBetter(lazy1, match, 0)) {
                 pos++;
                 match = lazy1;
             } else {
                 // Lazy-2: check pos+2 (only if current match length > 2)
                 if (pos + CHAIN_MIN_LOOKAHEAD + 2 >= end_pos || match.length == 2) break;
-                ChainMatch lazy2 = findMatchChain(src, src_size, pos + 2, recent_offset,
+                ChainMatch lazy2 = findMatchChain<HAS_DICT>(src, src_size, pos + 2, recent_offset,
                                                   first_hash, long_hash, next_hash,
-                                                  hash_bits, hash_mask, end_pos, cur_lit_run + 2);
+                                                  hash_bits, hash_mask, end_pos, cur_lit_run + 2,
+                                                  dict, dict_len, dict_ht);
                 if (lazy2.length >= 2 && isLazyMatchBetter(lazy2, match, 1)) {
                     pos += 2;
                     match = lazy2;

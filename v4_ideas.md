@@ -1070,8 +1070,24 @@ FOLLOW-UPS (in priority order): (1) VK port wave - the whole feature
 mirrors (registry done; encoder one-liner + decoder lookup + GLSL
 readBackRefByte in 3 shader bodies + the host table is
 backend-agnostic; cross-backend SHA gate then covers dict frames).
-(2) L5 chain-parser dict probe (the L5 row above; the splice-identity
-assertion in the ratio test breaks loudly when it lands). (3) D2D
+(2) ~~L5 chain-parser dict probe~~ ✅ DONE 2026-06-12 (same day):
+findMatchChain<HAS_DICT> probes the SAME greedy dict table (one
+hashKey6 at the probe site - the at_src word is already in hand) as
+the strictly lowest-priority source: only when the window yields no
+chain/long-hash/offset-8 match AND no recent reuse (length < 2).
+Same off16 gate; the lazy-1/lazy-2 evaluation treats dict candidates
+as ordinary matches; backward extension self-excludes (dict
+distances always exceed pos, the existing `pos > actual_offset`
+guard is never true for them). MEASURED: held-out github_users L5
+52.4% -> **28.1%** (1.86x, the best ratio of any level) with encode
+12% FASTER (4535 -> 3984 ms - the parser stops striding through
+unmatched literals); enwik8 + text dict L5 39.58% -> **38.33%**.
+The ratio test now asserts a reduction bar at ALL five levels (20%
+greedy / 10% L5 - the lazy parser already captures inter-record
+redundancy, so the dict's marginal lift is structurally smaller).
+Gates: ptest 61/0/0, ptest_vk 155/9/0, cross-backend SHA 3/3 MATCH
+(hashes again identical to pre-dict baselines), bench_all all-OK at
+baseline times. (3) D2D
 dict decode via registered-dict validation + the #19 verdict surface.
 (4) compute-sanitizer pass over the dict paths (tools/sanitize.bat) at
 the next milestone. (5) #13 fuzz tier for dict frames (mutate IDs +
