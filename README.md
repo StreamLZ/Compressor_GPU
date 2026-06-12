@@ -123,8 +123,9 @@ device-resident path.
 Best-of-8+ decode on an RTX 4060 Ti (sm_89), `streamlz -db`,
 re-measured 2026-06-11 with the pipelined decode kernels at every
 level. Frames carry the default-on checksum, so the e2e column
-INCLUDES integrity verification. Re-run by
-`tools\bench_all.bat`.
+INCLUDES integrity verification. Test corpora: enwik8 (a 100 MB
+Wikipedia text dump) and silesia (a 213 MB mixed-content archive),
+both in `assets/`. Re-run by `tools\bench_all.bat`.
 
 ### Decode (ms): D2D wall-clock and end-to-end
 
@@ -184,8 +185,9 @@ enables the LZ4-style whole-file XXH32 (flag bit 1). See FORMAT.md.
 | Async call wall     | **4.49 ms** | 6.25 ms | 1.39× |
 | End-to-end host wall | **15.45 ms** | 18.16 ms | 1.18× |
 
-StreamLZ columns re-measured 2026-06-11; nvCOMP columns are the
-2026-05-27 `nvcomp_bench3` runs (our changes don't affect them).
+StreamLZ columns re-measured 2026-06-11; nvCOMP columns were
+measured 2026-05-27 with the harness in `tools/` (StreamLZ changes
+do not move them).
 
 See [docs/cudaOptimize.md](docs/cudaOptimize.md) "vs nvCOMP -
 measurement methodology" for what each window measures - the
@@ -210,35 +212,22 @@ StreamLZ, best-of-20 for nvCOMP; e2e = host wall incl. PCIe both ways):
 | Decode kernel | **26.3 ms** (38.0 GB/s) | 50.8 ms (19.7 GB/s) | 1.93× |
 | Decode e2e | **148.9 ms** (incl. verification) | 164.4 ms | 1.10× |
 
-These numbers use the 2026-06-09 defaults: `sc_group_size = 0.25` at
-every input size (64 KB sub-chunks - more decode warps, shorter
-per-warp serial chains) and `hash_bits = 17` at every level. Pass
-`--sc 0.5` for ~2 pp better ratio at ~1.8× slower 1 GB-scale decode.
+These numbers use the current defaults: 64 KB sub-chunks (more
+decode warps, shorter per-warp serial work) and a 17-bit match hash
+at every level. Pass `--sc 0.5` for ~2 percentage points better
+ratio at ~1.8× slower 1 GB-scale decode.
 
 ---
 
 ## Project layout
 
-```
-build.zig              Zig 0.16 build script (always builds GPU)
-include/streamlz_gpu.h C ABI public header
-src/                   CUDA backend. See CodeWiki.md for the full
-                       per-file map.
-  common/              CUDA headers #include'd by every kernel
-  format/              Host-side wire-format parsers/writers
-  encode/              GPU encode driver + kernels
-  decode/              GPU decode driver + kernels
-srcVK/                 Vulkan backend (full 1:1 port). See
-                       srcVK/README.md + srcVK/Handbook.md.
-docs/                  GPU_ARCHITECTURE.md, cudaOptimize.md, how_to_debug_cuda.md
-tools/                 Build scripts + bench harnesses
-CodeWiki.md            Source tree map + invariants
-v4_ideas.md            Forward-looking work list
-FORMAT.md              SLZ1 wire format specification
-CHANGELOG.md           Release history
-FAILED_EXPERIMENTS.md  Rejected experiments + war stories
-SECURITY.md            Security policy + threat model
-```
+- `src/` - the CUDA backend (per-file map in [CodeWiki.md](CodeWiki.md))
+- `srcVK/` - the Vulkan backend, a full 1:1 port
+- `include/streamlz_gpu.h` - the C ABI header both backends implement
+- `tools/` - build scripts + bench/sanitize/fuzz harnesses
+- `docs/` - design and tooling notes
+- `assets/` - test corpora
+- `build.zig` - builds everything
 
 ## Documentation
 
