@@ -1212,6 +1212,32 @@ tiers:
    without the token-level upheaval.
 **Recommendation**: tier 1 anytime; tier 3 in the VK-era format
 window; skip tier 2.
+**Tier-3 design SETTLED with the user 2026-06-12:**
+- SIZES, not offsets: the descriptors need both, and each form
+  derives the other with one parallel op (prefix-scan vs adjacent
+  difference) - but sizes are self-validating (sum + headers must
+  equal the block's compressed size, a free integrity equation; each
+  entry also cross-checks against its chunk header) and match the
+  format's existing 3-byte-LE idiom (off32 entries, readLE24).
+- FIXED 3-BYTE entries (user decision): 24 bits covers even the
+  uncompressed-chunk form at the format's 256 KB chunk ceiling, so
+  no sentinel, no eff_chunk-dependent width, uniform entries - and
+  headroom if chunks ever grow. (2-byte entries DO work at the 64 KB
+  default - compressed chunks are strictly < 64 KB by the encoder's
+  beat-raw rule, raw chunks have derivable size - but cost a sentinel
+  + width switching; rejected for simplicity + flexibility.)
+- FOOTER placement: sizes exist only after compression (header
+  placement = reserve + backpatch), and footers are self-locating in
+  this format (chunk count derives from content_size / eff_chunk, so
+  the table position is computable from the header alone).
+- Flag-gated on a reserved header bit (6 or 7). New decoder + old
+  frame = chain walk as today. Old decoder + new frame = loud
+  reserved-bit reject.
+- SEQUENCING: lands in the VK-era window - the cross-backend SHA
+  gate forces both encoders to emit it in the same step (CUDA-only
+  emission would diverge every gated frame by construction).
+- Emission is near-free: the device assemble kernel already holds
+  every chunk's size/offset when it splices the frame.
 **NCU CONFIRMED 2026-06-12** (admin run of
 tools/ncu_profile_d2d_dict.bat, slz_d2d_dict_walk.ncu-rep): 707 us
 duration at 0.07% SM throughput, 2.07% occupancy (one warp on one
