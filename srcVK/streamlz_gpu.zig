@@ -55,12 +55,16 @@ comptime {
 pub const pseudo_kernel_compressed_size: [*:0]const u8 = "__compressed_size__";
 pub const pseudo_kernel_decompressed_size: [*:0]const u8 = "__decompressed_size__";
 
-/// CUDA reference: src/streamlz_gpu.zig:105-110. Mirror of slzCompressOpts_t.
+/// CUDA reference: src/streamlz_gpu.zig:105-114. Mirror of slzCompressOpts_t.
 const CompressOpts = extern struct {
     level: c_int = 5,
     enable_profiling: c_int = 0,
     effective_level_out: c_int = 0,
-    reserved: [5]c_int = @splat(0),
+    /// v4 #16: preset dictionary ID (0 = none). Reuses the next
+    /// `reserved` slot, so pre-dict callers (who must zero reserved)
+    /// are automatically dictionary-less; struct size unchanged.
+    dictionary_id: c_int = 0,
+    reserved: [4]c_int = @splat(0),
 };
 
 /// CUDA reference: src/streamlz_gpu.zig:113-116. Mirror of slzDecompressOpts_t.
@@ -81,7 +85,8 @@ comptime {
     std.debug.assert(@offsetOf(CompressOpts, "level") == 0);
     std.debug.assert(@offsetOf(CompressOpts, "enable_profiling") == @sizeOf(c_int));
     std.debug.assert(@offsetOf(CompressOpts, "effective_level_out") == 2 * @sizeOf(c_int));
-    std.debug.assert(@offsetOf(CompressOpts, "reserved") == 3 * @sizeOf(c_int));
+    std.debug.assert(@offsetOf(CompressOpts, "dictionary_id") == 3 * @sizeOf(c_int));
+    std.debug.assert(@offsetOf(CompressOpts, "reserved") == 4 * @sizeOf(c_int));
     std.debug.assert(@offsetOf(DecompressOpts, "enable_profiling") == 0);
     std.debug.assert(@offsetOf(DecompressOpts, "reserved") == @sizeOf(c_int));
     std.debug.assert(@offsetOf(KernelTimingC, "name") == 0);
@@ -171,15 +176,26 @@ fn isGpuFallbackError(err: anyerror) bool {
 }
 
 // ── Codec cores — run on the worker thread ────────────────────────────
-/// CUDA reference: src/streamlz_gpu.zig:258-269.
+// CUDA reference: src/streamlz_gpu.zig:263-280. Each returns the byte
+// count (>= 0) or a NEGATED SLZ_ERROR_* code - the public constants
+// are positive, so a positive error would be misread as a tiny
+// successful output (the exact latent bug the CUDA v4 #16 dict test
+// exposed and fixed; mirrored here). Entry points negate back before
+// returning a status to the C caller.
 fn compressCore(h: *Context, input: []const u8, output: []u8, opts: CompressOpts) c_int {
+    // Level range is validated by `encoder.compressFramed` (returns
+    // `error.BadLevel` -> SLZ_ERROR_UNSUPPORTED via mapCompressError);
+    // an unresolvable dictionary_id likewise (error.UnknownDictionary).
     const n = encoder.compressFramed(
         allocator,
         input,
         output,
-        .{ .level = @intCast(opts.level) },
+        .{
+            .level = @intCast(opts.level),
+            .dictionary_id = if (opts.dictionary_id != 0) @intCast(opts.dictionary_id) else null,
+        },
         &h.enc,
-    ) catch |err| return mapCompressError(err);
+    ) catch |err| return -mapCompressError(err);
     return @intCast(n);
 }
 
@@ -228,12 +244,14 @@ fn decompressCore(h: *Context, frame_bytes: []const u8, output: []u8, opts: Deco
         frame_bytes,
         output,
         &h.dec,
-    ) catch |err| return mapDecompressError(err);
+    ) catch |err| return -mapDecompressError(err);
     return @intCast(r.written);
 }
 
 // ── Worker jobs ───────────────────────────────────────────────────────
-/// CUDA reference: src/streamlz_gpu.zig:288-345.
+// CUDA reference: src/streamlz_gpu.zig:288-345. Job-result protocol:
+// `result` >= 0 is a byte count; errors are NEGATED SLZ_ERROR_* codes
+// (see the codec-core comment above).
 const CompressJob = struct {
     h: *Context,
     src: []const u8,
@@ -242,11 +260,11 @@ const CompressJob = struct {
     d_src: u64 = 0,
     d_dst: u64 = 0,
     work_stream: usize = 0,
-    result: c_int = SLZ_ERROR_CUDA,
+    result: c_int = -SLZ_ERROR_CUDA,
 
     fn run(j: *CompressJob) void {
         if (!gpu_driver.bindContextToCallingThread()) {
-            j.result = SLZ_ERROR_CUDA;
+            j.result = -SLZ_ERROR_CUDA;
             return;
         }
         if (j.d_src != 0) {
@@ -274,7 +292,7 @@ const CompressJob = struct {
         }
         if (j.d_dst != 0 and !j.h.enc.output_written_to_device) {
             if (!gpu_driver.copyHostToDevice(j.d_dst, j.dst[0..@intCast(rc)])) {
-                j.result = SLZ_ERROR_CUDA;
+                j.result = -SLZ_ERROR_CUDA;
                 return;
             }
         }
@@ -288,11 +306,11 @@ const DecompressJob = struct {
     src: []const u8,
     dst: []u8,
     opts: DecompressOpts = .{},
-    result: c_int = SLZ_ERROR_CUDA,
+    result: c_int = -SLZ_ERROR_CUDA,
 
     fn run(j: *DecompressJob) void {
         if (!gpu_driver.bindContextToCallingThread()) {
-            j.result = SLZ_ERROR_CUDA;
+            j.result = -SLZ_ERROR_CUDA;
             return;
         }
         j.result = decompressCore(j.h, j.src, j.dst, j.opts);
@@ -309,12 +327,12 @@ const DecompressJobTrueD2D = struct {
     opts: DecompressOpts = .{},
     work_stream: usize = 0,
     decomp_size: u32 = 0,
-    result: c_int = SLZ_ERROR_CUDA,
+    result: c_int = -SLZ_ERROR_CUDA,
     fall_back: bool = false,
 
     fn run(j: *DecompressJobTrueD2D) void {
         if (!gpu_driver.bindContextToCallingThread()) {
-            j.result = SLZ_ERROR_CUDA;
+            j.result = -SLZ_ERROR_CUDA;
             return;
         }
         j.h.dec.enable_profiling = j.opts.enable_profiling != 0;
@@ -333,9 +351,9 @@ const DecompressJobTrueD2D = struct {
         ) catch |err| {
             if (isGpuFallbackError(err)) {
                 j.fall_back = true;
-                j.result = SLZ_ERROR_CUDA;
+                j.result = -SLZ_ERROR_CUDA;
             } else {
-                j.result = mapDecompressError(err);
+                j.result = -mapDecompressError(err);
             }
             return;
         };
@@ -343,11 +361,13 @@ const DecompressJobTrueD2D = struct {
     }
 };
 
-/// CUDA reference: src/streamlz_gpu.zig:418-423. Run `job` on a fresh
+/// CUDA reference: src/streamlz_gpu.zig:434-441. Run `job` on a fresh
 /// worker thread with a large stack, blocking until it finishes.
+/// Returns the job's `result` (byte count >= 0, or negative
+/// SLZ_ERROR_*); -SLZ_ERROR_OUT_OF_MEMORY if the thread cannot spawn.
 fn runOnWorker(comptime Job: type, job: *Job) c_int {
     const t = std.Thread.spawn(.{ .stack_size = worker_stack_size }, Job.run, .{job}) catch
-        return SLZ_ERROR_OUT_OF_MEMORY;
+        return -SLZ_ERROR_OUT_OF_MEMORY;
     t.join();
     return job.result;
 }
@@ -393,6 +413,31 @@ export fn slzDestroy(handle: ?*Context) c_int {
         h.dec.deinit();
         allocator.destroy(h);
     }
+    return SLZ_SUCCESS;
+}
+
+/// CUDA reference: src/streamlz_gpu.zig:490-513 (v4 #16). Register a
+/// custom dictionary on this handle for both directions. The bytes are
+/// copied (freed at slzDestroy). The returned ID is content-derived
+/// (XXH32 of the bytes, forced into the custom range >= 0x10000000):
+/// pass it as `slzCompressOpts_t.dictionary_id`; decompression
+/// resolves it automatically from the frame header. Built-in IDs
+/// (1..8) need no registration. Registering identical content twice is
+/// a no-op returning the same ID.
+export fn slzSetDictionary(
+    handle: ?*Context,
+    dict: ?[*]const u8,
+    dict_size: usize,
+    id_out: ?*u32,
+) c_int {
+    const h = handle orelse return SLZ_ERROR_INVALID_HANDLE;
+    const ptr = dict orelse return SLZ_ERROR_INVALID_ARG;
+    if (dict_size == 0) return SLZ_ERROR_INVALID_ARG;
+    const bytes = ptr[0..dict_size];
+    const enc_id = h.enc.registerDict(allocator, bytes) catch return SLZ_ERROR_OUT_OF_MEMORY;
+    const dec_id = gpu_driver.registerDict(&h.dec, allocator, bytes) catch return SLZ_ERROR_OUT_OF_MEMORY;
+    std.debug.assert(enc_id == dec_id);
+    if (id_out) |out| out.* = enc_id;
     return SLZ_SUCCESS;
 }
 
@@ -464,7 +509,7 @@ export fn slzCompressHost(
         .opts = opts,
     };
     const rc = runOnWorker(CompressJob, &job);
-    if (rc < 0) return rc;
+    if (rc < 0) return -rc;
     out_size.* = @intCast(rc);
     return SLZ_SUCCESS;
 }
@@ -493,7 +538,7 @@ export fn slzDecompressHost(
         .opts = opts,
     };
     const rc = runOnWorker(DecompressJob, &job);
-    if (rc < 0) return rc;
+    if (rc < 0) return -rc;
     out_size.* = @intCast(rc);
     return SLZ_SUCCESS;
 }
@@ -534,7 +579,7 @@ export fn slzCompressAsync(
     };
     CompressJob.run(&job);
     const rc = job.result;
-    if (rc < 0) return rc;
+    if (rc < 0) return -rc;
     out_size.* = @intCast(rc);
     return SLZ_SUCCESS;
 }
@@ -566,7 +611,7 @@ export fn slzDecompressAsync(
     const rc = true_job.result;
     if (rc >= 0) return SLZ_SUCCESS;
     if (true_job.fall_back) return SLZ_ERROR_UNSUPPORTED;
-    return rc;
+    return -rc;
 }
 
 // ── Profiling ─────────────────────────────────────────────────────────
