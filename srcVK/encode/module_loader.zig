@@ -199,12 +199,15 @@ const ENCODE_KERNELS = struct {
     // lz_encode (A-008 BDA): SSBO[0]=input, [1]=output, [2]=descs,
     //   [3]=comp_sizes (was [4] before A-008 BDA dropped GlobalHashBuf
     //   from binding 3); push={total_chunks, hash_bits, use_chain,
-    //   l4_features, hash_addr (u64 = 2× u32 slots)} = 24 B. The hash
+    //   l4_features, hash_addr (u64 = 2× u32 slots), v4 #16 dict_addr
+    //   (u64), dict_ht_addr (u64), dict_len, pad} = 48 B. The hash
     //   table is no longer bound as an SSBO; the kernel reads its raw
     //   `uint64_t` device address from the push constant and dereferences
     //   it through a buffer_reference, bypassing the
-    //   `maxStorageBufferRange = 4 GiB - 1` per-binding cap.
-    pub const lz: EncodeKernelDecl = .{ .name = "lz_encode", .n_bindings = 4, .push_constant_size = 24 };
+    //   `maxStorageBufferRange = 4 GiB - 1` per-binding cap. The
+    //   dictionary + its position table ride the same BDA pattern
+    //   (0/0/0 on dictionary-less calls).
+    pub const lz: EncodeKernelDecl = .{ .name = "lz_encode", .n_bindings = 4, .push_constant_size = 48 };
     // huff_build_tables: SSBO[0]=input, [1]=descs, [2]=code_lengths_out,
     //   [3]=codes_out; push={tables_stride, n_blocks} = 8 B.
     pub const huff_tables: EncodeKernelDecl = .{ .name = "huff_build_tables", .n_bindings = 4, .push_constant_size = 8 };

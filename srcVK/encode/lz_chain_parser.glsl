@@ -118,6 +118,60 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
         (out_word8) = uvec2(_slr_lo, _slr_hi);                                                      \
     } while (false)
 
+// ── v4 #16: dictionary probe macros (chain parser) ──────────────────
+// CUDA templates findMatchChain on HAS_DICT; same pluggable-macro
+// mirror as the greedy parser. The probe (CUDA reference:
+// src/encode/lz_chain_parser.cuh:299-319) fires only when the window
+// would yield no usable match at all (a recent reuse of length >= 2 is
+// a match the caller takes; dict never competes with it), reuses the
+// greedy parser's dict table (hashKey6 buckets) and keeps the off16
+// gate. The lazy-1/lazy-2 evaluation treats dict candidates as
+// ordinary matches; backward extension self-excludes (dict distances
+// always exceed pos, the existing `pos > actual_offset` guard is never
+// true for them).
+#define _SLZ_CHAIN_DICT_PROBE_OFF(out_hit, out_len, out_off, recent_len_v, at_src_v,                \
+                                  hb_in, hm_in, pos_v, end_pos_v, bytes_at_pos_v, min_len_v,        \
+                                  src_buf, src_base, dict_buf, dict_ht_buf, dict_len)               \
+    do {                                                                                            \
+        (out_hit) = false;                                                                          \
+    } while (false)
+
+#define _SLZ_CHAIN_DICT_PROBE_ON(out_hit, out_len, out_off, recent_len_v, at_src_v,                 \
+                                 hb_in, hm_in, pos_v, end_pos_v, bytes_at_pos_v, min_len_v,         \
+                                 src_buf, src_base, dict_buf, dict_ht_buf, dict_len)                \
+    do {                                                                                            \
+        (out_hit) = false;                                                                          \
+        if ((recent_len_v) < 2) {                                                                   \
+            uint _cdp_h6 = hashKey6(at_src_v, hb_in, hm_in);                                        \
+            uint _cdp_dv = (dict_ht_buf).e[_cdp_h6];                                                \
+            if (_cdp_dv != HASH_EMPTY) {                                                            \
+                uint _cdp_dist = (pos_v) + (uint(dict_len) - _cdp_dv);                              \
+                if (_cdp_dist <= NEAR_OFFSET_MAX) {                                                 \
+                    uint _cdp_p0 = uint((dict_buf)[_cdp_dv + 0u]);                                  \
+                    uint _cdp_p1 = uint((dict_buf)[_cdp_dv + 1u]);                                  \
+                    uint _cdp_p2 = uint((dict_buf)[_cdp_dv + 2u]);                                  \
+                    uint _cdp_p3 = uint((dict_buf)[_cdp_dv + 3u]);                                  \
+                    if (readU32LE(_cdp_p0, _cdp_p1, _cdp_p2, _cdp_p3) == (bytes_at_pos_v)) {        \
+                        uint _cdp_ml = 4u;                                                          \
+                        uint _cdp_max = (end_pos_v) - (pos_v);                                      \
+                        uint _cdp_avail = uint(dict_len) - _cdp_dv;                                 \
+                        if (_cdp_avail < _cdp_max) _cdp_max = _cdp_avail;                           \
+                        while (_cdp_ml < _cdp_max &&                                                \
+                               (src_buf)[uint(src_base) + (pos_v) + _cdp_ml] ==                     \
+                               (dict_buf)[_cdp_dv + _cdp_ml]) {                                     \
+                            _cdp_ml += 1u;                                                          \
+                        }                                                                           \
+                        if (int(_cdp_ml) >= (min_len_v)) {                                          \
+                            (out_hit) = true;                                                       \
+                            (out_len) = int(_cdp_ml);                                               \
+                            (out_off) = int(_cdp_dist);                                             \
+                        }                                                                           \
+                    }                                                                               \
+                }                                                                                   \
+            }                                                                                       \
+        }                                                                                           \
+    } while (false)
+
 // CUDA reference: src/encode/lz_chain_parser.cuh:83-267. findMatchChain:
 // chain-hash match finder for the lazy parser. Port of CPU
 // findMatchWithChainHasher. Called by lane 0 only.
@@ -138,7 +192,8 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
                        ht_buf, first_hash_base, long_hash_base, next_hash_base,                     \
                        hash_bits_in, hash_mask_in,                                                  \
                        end_pos_in, lit_run_length_in,                                               \
-                       out_match_length, out_match_offset)                                          \
+                       out_match_length, out_match_offset,                                          \
+                       dict_buf, dict_ht_buf, dict_len, chain_dict_probe_macro)                     \
     do {                                                                                            \
         uint _fmc_pos = uint(pos_in);                                                               \
         uint _fmc_src_size = uint(src_size_in);                                                     \
@@ -349,8 +404,21 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
             if (_fmc_best_offset == 0 ||                                                            \
                 !isBetterThanRecentMatch(_fmc_recent_match_length,                                  \
                                           _fmc_best_match_length, _fmc_best_offset)) {              \
-                (out_match_length) = _fmc_recent_match_length;                                      \
-                (out_match_offset) = 0;                                                             \
+                /* v4 #16 (CUDA ref: lz_chain_parser.cuh:299-319):                                  \
+                   dictionary probe - only when the window would yield                              \
+                   no usable match at all. Expands to a no-op on                                    \
+                   dict-less instantiations. */                                                     \
+                bool _fmc_dict_hit;                                                                 \
+                chain_dict_probe_macro(_fmc_dict_hit, out_match_length, out_match_offset,           \
+                                       _fmc_recent_match_length, _fmc_at_src,                       \
+                                       _fmc_hash_bits, _fmc_hash_mask,                              \
+                                       _fmc_pos, _fmc_end_pos, _fmc_bytes_at_pos,                   \
+                                       _fmc_minimum_match_length,                                   \
+                                       src_buf, src_base, dict_buf, dict_ht_buf, dict_len);         \
+                if (!_fmc_dict_hit) {                                                               \
+                    (out_match_length) = _fmc_recent_match_length;                                  \
+                    (out_match_offset) = 0;                                                         \
+                }                                                                                   \
             } else {                                                                                \
                 (out_match_length) = _fmc_best_match_length;                                        \
                 (out_match_offset) = _fmc_best_offset;                                              \
@@ -409,7 +477,9 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
 // VK adaptation: macro form so the SSBO buffers (input + 3 hash tables +
 // output substreams) remain visible at the call site; GLSL cannot pass
 // SSBOs as function arguments.
-#define scanBlockChain(src_buf, src_base, src_size_in,                                              \
+// v4 #16: the trailing dict params select the dictionary dimension;
+// use the scanBlockChain / scanBlockChain_dict wrappers below.
+#define _SLZ_SCAN_BLOCK_CHAIN_BODY(src_buf, src_base, src_size_in,                                  \
                        ht_buf, first_hash_base, long_hash_base, next_hash_base,                     \
                        hash_bits_in, hash_mask_in,                                                  \
                        lit_buf, lit_base, lit_count,                                                \
@@ -419,7 +489,8 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
                        len_buf, len_base, len_count,                                                \
                        anchor_inout, recent_offset_inout,                                           \
                        start_pos_in, end_pos_in, block2_start_in,                                   \
-                       lane_in)                                                                     \
+                       lane_in,                                                                     \
+                       dict_buf, dict_ht_buf, dict_len, chain_dict_probe_macro)                     \
     do {                                                                                            \
         if (uint(lane_in) == 0u) {                                                                  \
             uint _sbc_src_size = uint(src_size_in);                                                 \
@@ -455,7 +526,8 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
                                    ht_buf, first_hash_base, long_hash_base, next_hash_base,         \
                                    hash_bits_in, hash_mask_in,                                      \
                                    _sbc_end_pos, _sbc_cur_lit_run,                                  \
-                                   _sbc_match_len, _sbc_match_off);                                 \
+                                   _sbc_match_len, _sbc_match_off,                                  \
+                                   dict_buf, dict_ht_buf, dict_len, chain_dict_probe_macro);        \
                     if (_sbc_match_len < 2) {                                                       \
                         _sbc_pos += 1u;                                                             \
                         continue;                                                                   \
@@ -470,7 +542,8 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
                                        ht_buf, first_hash_base, long_hash_base, next_hash_base,     \
                                        hash_bits_in, hash_mask_in,                                  \
                                        _sbc_end_pos, _sbc_cur_lit_run + 1u,                         \
-                                       _sbc_lazy1_len, _sbc_lazy1_off);                             \
+                                       _sbc_lazy1_len, _sbc_lazy1_off,                              \
+                                       dict_buf, dict_ht_buf, dict_len, chain_dict_probe_macro);    \
                         if (_sbc_lazy1_len >= 2 &&                                                  \
                             isLazyMatchBetter(_sbc_lazy1_len, _sbc_lazy1_off,                       \
                                               _sbc_match_len, _sbc_match_off, 0)) {                 \
@@ -488,7 +561,9 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
                                            ht_buf, first_hash_base, long_hash_base, next_hash_base, \
                                            hash_bits_in, hash_mask_in,                              \
                                            _sbc_end_pos, _sbc_cur_lit_run + 2u,                     \
-                                           _sbc_lazy2_len, _sbc_lazy2_off);                         \
+                                           _sbc_lazy2_len, _sbc_lazy2_off,                          \
+                                           dict_buf, dict_ht_buf, dict_len,                         \
+                                           chain_dict_probe_macro);                                 \
                             if (_sbc_lazy2_len >= 2 &&                                              \
                                 isLazyMatchBetter(_sbc_lazy2_len, _sbc_lazy2_off,                   \
                                                   _sbc_match_len, _sbc_match_off, 1)) {             \
@@ -582,5 +657,62 @@ bool isBetterThanRecentMatch(int recent_match_length, int match_length, int matc
             }                                                                                       \
         }                                                                                           \
     } while (false)
+
+// CUDA reference: src/encode/lz_chain_parser.cuh:368 (HAS_DICT=false
+// instantiation). The dict slots take placeholders the OFF probe never
+// touches - the pre-dict expansion exactly.
+#define scanBlockChain(src_buf, src_base, src_size_in,                                              \
+                       ht_buf, first_hash_base, long_hash_base, next_hash_base,                     \
+                       hash_bits_in, hash_mask_in,                                                  \
+                       lit_buf, lit_base, lit_count,                                                \
+                       token_buf, token_base, token_count,                                          \
+                       off16_buf, off16_base, off16_count,                                          \
+                       off32_buf, off32_base, off32_pos, off32_count,                               \
+                       len_buf, len_base, len_count,                                                \
+                       anchor_inout, recent_offset_inout,                                           \
+                       start_pos_in, end_pos_in, block2_start_in,                                   \
+                       lane_in)                                                                     \
+    _SLZ_SCAN_BLOCK_CHAIN_BODY(src_buf, src_base, src_size_in,                                      \
+                       ht_buf, first_hash_base, long_hash_base, next_hash_base,                     \
+                       hash_bits_in, hash_mask_in,                                                  \
+                       lit_buf, lit_base, lit_count,                                                \
+                       token_buf, token_base, token_count,                                          \
+                       off16_buf, off16_base, off16_count,                                          \
+                       off32_buf, off32_base, off32_pos, off32_count,                               \
+                       len_buf, len_base, len_count,                                                \
+                       anchor_inout, recent_offset_inout,                                           \
+                       start_pos_in, end_pos_in, block2_start_in,                                   \
+                       lane_in,                                                                     \
+                       src_buf, ht_buf, 0u, _SLZ_CHAIN_DICT_PROBE_OFF)
+
+// CUDA reference: src/encode/lz_chain_parser.cuh:368 (HAS_DICT=true
+// instantiation, v4 #16). Probes the SAME greedy dict table (hashKey6
+// buckets) as the strictly lowest-priority source. Only block 1 ever
+// takes this instantiation - block-2 dict distances always exceed
+// NEAR_OFFSET_MAX.
+#define scanBlockChain_dict(src_buf, src_base, src_size_in,                                         \
+                       ht_buf, first_hash_base, long_hash_base, next_hash_base,                     \
+                       hash_bits_in, hash_mask_in,                                                  \
+                       lit_buf, lit_base, lit_count,                                                \
+                       token_buf, token_base, token_count,                                          \
+                       off16_buf, off16_base, off16_count,                                          \
+                       off32_buf, off32_base, off32_pos, off32_count,                               \
+                       len_buf, len_base, len_count,                                                \
+                       anchor_inout, recent_offset_inout,                                           \
+                       start_pos_in, end_pos_in, block2_start_in,                                   \
+                       lane_in,                                                                     \
+                       dict_buf, dict_ht_buf, dict_len)                                             \
+    _SLZ_SCAN_BLOCK_CHAIN_BODY(src_buf, src_base, src_size_in,                                      \
+                       ht_buf, first_hash_base, long_hash_base, next_hash_base,                     \
+                       hash_bits_in, hash_mask_in,                                                  \
+                       lit_buf, lit_base, lit_count,                                                \
+                       token_buf, token_base, token_count,                                          \
+                       off16_buf, off16_base, off16_count,                                          \
+                       off32_buf, off32_base, off32_pos, off32_count,                               \
+                       len_buf, len_base, len_count,                                                \
+                       anchor_inout, recent_offset_inout,                                           \
+                       start_pos_in, end_pos_in, block2_start_in,                                   \
+                       lane_in,                                                                     \
+                       dict_buf, dict_ht_buf, dict_len, _SLZ_CHAIN_DICT_PROBE_ON)
 
 #endif

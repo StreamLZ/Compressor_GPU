@@ -42,6 +42,8 @@ pub var last_kernel_ns: i64 = 0;
 
 // ── Encode kernel entry points ─────────────────────────────────────────
 pub const gpuCompressImpl = encode_lz.gpuCompressImpl;
+// v4 #16: preset-dictionary staging (bytes + hashKey6 position table).
+pub const ensureDictOnDevice = encode_lz.ensureDictOnDevice;
 pub const gpuEncodeLiteralsHuffImpl = encode_huff.gpuEncodeLiteralsHuffImpl;
 pub const gpuEncodeTokensHuffImpl = encode_huff.gpuEncodeTokensHuffImpl;
 pub const gpuEncodeOff16HuffImpl = encode_huff.gpuEncodeOff16HuffImpl;

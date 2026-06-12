@@ -213,6 +213,21 @@ pub fn compressFramedOne(
     var pos: usize = 0;
     const sc_grp = resolveScGroupSize(src.len, opts.sc_group_size_override);
 
+    // v4 #16 (CUDA reference: src/encode/fast_framed.zig:134-147):
+    // stage the preset dictionary (bytes + hashKey6 position table,
+    // cached on the context by id) and arm it for this call's LZ
+    // launches. The ID was validated by compressFramedWithIo;
+    // resolution here cannot fail.
+    enc_ctx.dict_armed = false;
+    if (opts.dictionary_id) |did| {
+        const dict_registry = @import("../dict/dictionary.zig");
+        const levels = @import("levels.zig");
+        const data = dict_registry.resolve(enc_ctx.registered_dicts.items, did) orelse unreachable;
+        if (!gpu_enc.ensureDictOnDevice(enc_ctx, allocator, did, data, levels.hashBitsForLevel(opts.level)))
+            return error.DestinationTooSmall;
+        enc_ctx.dict_armed = true;
+    }
+
     const hdr_len = frame.writeHeader(dst, .{
         .codec = .fast,
         .level = codecLevelFor(opts.level),

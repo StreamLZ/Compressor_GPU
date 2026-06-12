@@ -98,9 +98,29 @@ layout(push_constant) uniform Push {
     uint use_chain;
     uint l4_features;
     uvec2 hash_addr;
+    // v4 #16: preset dictionary bytes + host-built hashKey6 position
+    // table, both BDA-addressed (CUDA: `const uint8_t* dict` +
+    // `const uint32_t* dict_ht` launch params). 0/0/0 on
+    // dictionary-less calls - the kernel then takes the pre-dict
+    // scanBlock/scanBlockChain instantiations exactly.
+    uvec2 dict_addr;
+    uvec2 dict_ht_addr;
+    uint dict_len;
+    uint _dict_pad;
 } pc;
 
+// v4 #16: dictionary byte array (read-only; never dereferenced at
+// dict_len == 0).
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer DictBytesRef {
+    uint8_t b[];
+};
+DictBytesRef g_dict;
+HashU32Ref g_dict_ht;
+
 void main() {
+    // v4 #16: materialise the dictionary references (see pc comment).
+    g_dict = DictBytesRef(pc.dict_addr);
+    g_dict_ht = HashU32Ref(pc.dict_ht_addr);
     const uint chunk_id = gl_WorkGroupID.x;
     const uint lane = gl_LocalInvocationID.x & LANE_MASK;
     if (chunk_id >= pc.total_chunks) return;
@@ -167,18 +187,38 @@ void main() {
         subgroupMemoryBarrierBuffer();
 
         // Block 1 pass: [anchor, min(src_size, LZ_BLOCK_SIZE))
+        // v4 #16 (CUDA ref: lz_kernel.cu:195-202): dict presence is
+        // frame-uniform - one branch selects the dict-aware
+        // instantiation; the false path is the pre-dict code exactly.
+        // Block 2 keeps the plain instantiation on BOTH arms: any dict
+        // distance from a block-2 position exceeds NEAR_OFFSET_MAX, so
+        // the probe would self-gate (CUDA ref: lz_kernel.cu:212-218).
         {
             uint block1_end = (src_size < LZ_BLOCK_SIZE) ? src_size : LZ_BLOCK_SIZE;
-            scanBlock(input_buf, src_base, src_size,
-                      global_hash, ht_base, pc.hash_bits, hash_mask,
-                      output_buf, lit_base, lit_count,
-                      output_buf, token_base, token_count,
-                      output_buf, off16_base, off16_count,
-                      output_buf, off32_base, off32_pos, off32_count,
-                      output_buf, len_base, length_count,
-                      anchor, recent_offset,
-                      anchor, block1_end, 0u,
-                      pc.l4_features, lane);
+            if (pc.dict_len != 0u) {
+                scanBlock_dict(input_buf, src_base, src_size,
+                          global_hash, ht_base, pc.hash_bits, hash_mask,
+                          output_buf, lit_base, lit_count,
+                          output_buf, token_base, token_count,
+                          output_buf, off16_base, off16_count,
+                          output_buf, off32_base, off32_pos, off32_count,
+                          output_buf, len_base, length_count,
+                          anchor, recent_offset,
+                          anchor, block1_end, 0u,
+                          pc.l4_features, lane,
+                          g_dict.b, g_dict_ht, pc.dict_len);
+            } else {
+                scanBlock(input_buf, src_base, src_size,
+                          global_hash, ht_base, pc.hash_bits, hash_mask,
+                          output_buf, lit_base, lit_count,
+                          output_buf, token_base, token_count,
+                          output_buf, off16_base, off16_count,
+                          output_buf, off32_base, off32_pos, off32_count,
+                          output_buf, len_base, length_count,
+                          anchor, recent_offset,
+                          anchor, block1_end, 0u,
+                          pc.l4_features, lane);
+            }
             off32_count_block1 = off32_count;
             off32_count = 0u;
         }
@@ -220,20 +260,38 @@ void main() {
         subgroupMemoryBarrierBuffer();
 
         // Block 1 pass: [anchor, min(src_size, LZ_BLOCK_SIZE))
+        // v4 #16 (CUDA ref: lz_kernel.cu:146-158): same frame-uniform
+        // dict selection as the greedy branch; block 2 self-gates.
         {
             uint block1_end = (src_size < LZ_BLOCK_SIZE) ? src_size : LZ_BLOCK_SIZE;
-            scanBlockChain(input_buf, src_base, src_size,
-                           global_hash,
-                           chain_first_hash_base, chain_long_hash_base, chain_next_hash_base,
-                           pc.hash_bits, hash_mask,
-                           output_buf, lit_base, lit_count,
-                           output_buf, token_base, token_count,
-                           output_buf, off16_base, off16_count,
-                           output_buf, off32_base, off32_pos, off32_count,
-                           output_buf, len_base, length_count,
-                           anchor, recent_offset,
-                           anchor, block1_end, 0u,
-                           lane);
+            if (pc.dict_len != 0u) {
+                scanBlockChain_dict(input_buf, src_base, src_size,
+                               global_hash,
+                               chain_first_hash_base, chain_long_hash_base, chain_next_hash_base,
+                               pc.hash_bits, hash_mask,
+                               output_buf, lit_base, lit_count,
+                               output_buf, token_base, token_count,
+                               output_buf, off16_base, off16_count,
+                               output_buf, off32_base, off32_pos, off32_count,
+                               output_buf, len_base, length_count,
+                               anchor, recent_offset,
+                               anchor, block1_end, 0u,
+                               lane,
+                               g_dict.b, g_dict_ht, pc.dict_len);
+            } else {
+                scanBlockChain(input_buf, src_base, src_size,
+                               global_hash,
+                               chain_first_hash_base, chain_long_hash_base, chain_next_hash_base,
+                               pc.hash_bits, hash_mask,
+                               output_buf, lit_base, lit_count,
+                               output_buf, token_base, token_count,
+                               output_buf, off16_base, off16_count,
+                               output_buf, off32_base, off32_pos, off32_count,
+                               output_buf, len_base, length_count,
+                               anchor, recent_offset,
+                               anchor, block1_end, 0u,
+                               lane);
+            }
             off32_count_block1 = off32_count;
             off32_count = 0u;
         }

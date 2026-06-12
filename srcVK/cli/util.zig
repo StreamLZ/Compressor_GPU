@@ -27,6 +27,12 @@ pub const Args = struct {
     output: ?[]const u8 = null,
     report_mem: bool = false,
     sc_group: ?f32 = null,
+    /// v4 #16 (CUDA-mirror): preset dictionary for compression - a
+    /// registry name ("json", "html", ...), a numeric ID, "auto"
+    /// (select by the input file's extension), or a path to a custom
+    /// dictionary file. Decompression verifies a supplied custom
+    /// dictionary against the frame header's ID.
+    dictionary: ?[]const u8 = null,
     /// VK adaptation: raw `--device <arg>` payload. Pure-digit strings
     /// are interpreted as `by_index`; otherwise as `by_name` (case-
     /// insensitive substring of vkPhysicalDeviceProperties.deviceName).
@@ -57,6 +63,7 @@ pub fn parseArgs(raw: []const []const u8, w: *std.Io.Writer) Args {
         if (eql(arg, "-gpu")) continue;
         if (eql(arg, "-l")) { i += 1; result.level = parseInt(u8, expect(raw, i, "-l", w), w, "-l"); continue; }
         if (eql(arg, "-r")) { i += 1; result.runs = parseInt(u32, expect(raw, i, "-r", w), w, "-r"); continue; }
+        if (eql(arg, "-D")) { i += 1; result.dictionary = expect(raw, i, "-D", w); continue; }
         if (eql(arg, "-o")) { i += 1; result.output = expect(raw, i, "-o", w); continue; }
         if (eql(arg, "--sc")) {
             i += 1;
@@ -114,6 +121,118 @@ pub fn die(w: *std.Io.Writer, msg: []const u8) noreturn {
     std.process.exit(2);
 }
 
+/// CUDA reference: src/cli/util.zig:105-141 (v4 #16). Resolve the `-D`
+/// value to a dictionary ID for COMPRESSION. Accepts, in order: a
+/// registry name, a numeric builtin ID, "auto" (select by the input
+/// path's extension), or a path to a custom dictionary file - the
+/// file's bytes are registered on `enc_ctx` and the content-derived ID
+/// is returned. Exits with a message naming the available dictionaries
+/// on failure.
+pub fn resolveDictionary(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    spec: ?[]const u8,
+    input_path: []const u8,
+    w: *std.Io.Writer,
+    enc_ctx: *@import("../encode/driver.zig").EncodeContext,
+) ?u32 {
+    const dictionary = @import("../dict/dictionary.zig");
+    const s = spec orelse return null;
+    if (eql(s, "auto")) {
+        if (dictionary.findByExtension(input_path)) |d| return d.id;
+        return null;
+    }
+    if (dictionary.findByName(s)) |d| return d.id;
+    if (std.fmt.parseInt(u32, s, 10) catch null) |id| {
+        if (dictionary.findById(id)) |d| return d.id;
+    }
+    if (loadDictFile(allocator, io, s)) |bytes| {
+        defer allocator.free(bytes);
+        const id = enc_ctx.registerDict(allocator, bytes) catch
+            die(w, "error: out of memory registering dictionary\n");
+        w.print("dictionary: {s} ({d} bytes, id 0x{x:0>8})\n", .{ s, bytes.len, id }) catch {};
+        return id;
+    }
+    w.print("error: unknown dictionary '{s}'; available:", .{s}) catch {};
+    for (dictionary.builtin_dicts) |*d| w.print(" {s}", .{d.name}) catch {};
+    w.writeAll(" auto, or a path to a dictionary file\n") catch {};
+    w.flush() catch {};
+    std.process.exit(2);
+}
+
+/// CUDA reference: src/cli/util.zig:150-202 (v4 #16). Decode-side `-D` -
+/// supply a dictionary for the frame about to be decoded and VERIFY it
+/// against the frame's dictionary ID (mismatch exits naming both IDs).
+/// Builtins resolve automatically from the frame header with no flag;
+/// without -D, a frame needing a custom dictionary gets a message
+/// naming the ID to go find.
+pub fn supplyDecodeDictionary(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    spec: ?[]const u8,
+    frame_dict_id: ?u32,
+    w: *std.Io.Writer,
+    dec_ctx: *@import("../decode/driver.zig").DecodeContext,
+) void {
+    const dictionary = @import("../dict/dictionary.zig");
+    const gpu_dec = @import("../decode/driver.zig");
+    const s = spec orelse {
+        if (frame_dict_id) |fid| {
+            if (dictionary.findById(fid) == null) {
+                w.print(
+                    "error: frame requires dictionary 0x{x:0>8} (not a built-in); supply it with -D <file>\n",
+                    .{fid},
+                ) catch {};
+                w.flush() catch {};
+                std.process.exit(1);
+            }
+        }
+        return;
+    };
+    const fid = frame_dict_id orelse {
+        w.print("note: -D ignored - the frame carries no dictionary\n", .{}) catch {};
+        return;
+    };
+    var supplied_id: ?u32 = null;
+    if (dictionary.findByName(s)) |d| {
+        supplied_id = d.id;
+    } else if (std.fmt.parseInt(u32, s, 10) catch null) |nid| {
+        if (dictionary.findById(nid)) |d| supplied_id = d.id;
+    }
+    if (supplied_id == null) {
+        if (loadDictFile(allocator, io, s)) |bytes| {
+            defer allocator.free(bytes);
+            supplied_id = gpu_dec.registerDict(dec_ctx, allocator, bytes) catch
+                die(w, "error: out of memory registering dictionary\n");
+        } else {
+            w.print("error: unknown dictionary '{s}' (not a built-in name/ID or readable file)\n", .{s}) catch {};
+            w.flush() catch {};
+            std.process.exit(2);
+        }
+    }
+    if (supplied_id.? != fid) {
+        w.print(
+            "error: frame requires dictionary 0x{x:0>8}, supplied dictionary is 0x{x:0>8}\n",
+            .{ fid, supplied_id.? },
+        ) catch {};
+        w.flush() catch {};
+        std.process.exit(1);
+    }
+}
+
+/// CUDA reference: src/cli/util.zig:208-216 (v4 #16). Load a custom
+/// dictionary file (raw bytes, as `dict_gate0` trains them). Returns
+/// null when the path does not name a readable file.
+pub fn loadDictFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
+    const max_dict_file: usize = 16 * 1024 * 1024;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, @enumFromInt(max_dict_file)) catch return null;
+    if (bytes.len == 0) {
+        allocator.free(bytes);
+        return null;
+    }
+    return bytes;
+}
+
 /// CUDA reference: src/cli/util.zig:93-98. Print version line.
 pub fn printVersion(w: *std.Io.Writer) !void {
     try w.print("streamlz_vk {s} (Vulkan, Zig {f}, {s}-{s})\n", .{
@@ -140,6 +259,9 @@ pub fn printUsage(w: *std.Io.Writer) !void {
         \\  -l <1..5>       Compression level (default: 1)
         \\  -r <runs>       Benchmark runs (default: 3 for -b, 10 for -db)
         \\  -o <file>       Output path
+        \\  -D <dict>       Preset dictionary: name (json, html, text, xml,
+        \\                  css, js, general), numeric ID, or "auto" (by
+        \\                  input extension). Decode reads the frame header.
         \\  --sc <float>    sc_group_size override (0.25 = 64 KB sub-chunks)
         \\  --device <N|name>  Select Vulkan physical device by zero-based index
         \\                  or case-insensitive substring of deviceName.

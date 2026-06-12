@@ -56,6 +56,49 @@ uint slzClz(uint x) {
     return (x == 0u) ? 32u : (31u - uint(findMSB(x)));
 }
 
+// ── v4 #16: dictionary probe macros ─────────────────────────────────
+// CUDA templates scanBlock on HAS_DICT; the VK mirror parameterizes the
+// SAME body on a probe macro + a literal `dict_on` flag (the same
+// pluggable-macro pattern as the decode-side bodies). The OFF set
+// expands to exactly the pre-dict code - dictionary-less parses are
+// byte-identical by construction.
+//
+// Probe (CUDA reference: src/encode/lz_greedy_parser.cuh:192-210):
+// strictly lowest priority - fires only where hash/xor/eight all
+// missed, so it can only ADD matches where the window finds none.
+// Same bucket `h`, separate read-only table; the off16 gate
+// (dist <= NEAR_OFFSET_MAX) keeps every dict distance encodable with
+// the existing token forms.
+#define _SLZ_DICT_PROBE_OFF(out_dm, out_dref, is_active_v, hash_m, xor_m, eight_m,                  \
+                            my_pos_v, key4_v, h_v, dict_buf, dict_ht_buf, dict_len)                 \
+    do {                                                                                            \
+        (out_dm) = false;                                                                           \
+        (out_dref) = 0u;                                                                            \
+    } while (false)
+
+#define _SLZ_DICT_PROBE_ON(out_dm, out_dref, is_active_v, hash_m, xor_m, eight_m,                   \
+                           my_pos_v, key4_v, h_v, dict_buf, dict_ht_buf, dict_len)                  \
+    do {                                                                                            \
+        (out_dm) = false;                                                                           \
+        (out_dref) = 0u;                                                                            \
+        if ((is_active_v) && !(hash_m) && !(xor_m) && !(eight_m)) {                                 \
+            uint _dp_dv = (dict_ht_buf).e[(h_v)];                                                   \
+            if (_dp_dv != HASH_EMPTY) {                                                             \
+                uint _dp_dist = (my_pos_v) + (uint(dict_len) - _dp_dv);                             \
+                if (_dp_dist <= NEAR_OFFSET_MAX) {                                                  \
+                    uint _dp_p0 = uint((dict_buf)[_dp_dv + 0u]);                                    \
+                    uint _dp_p1 = uint((dict_buf)[_dp_dv + 1u]);                                    \
+                    uint _dp_p2 = uint((dict_buf)[_dp_dv + 2u]);                                    \
+                    uint _dp_p3 = uint((dict_buf)[_dp_dv + 3u]);                                    \
+                    if (readU32LE(_dp_p0, _dp_p1, _dp_p2, _dp_p3) == (key4_v)) {                    \
+                        (out_dm) = true;                                                            \
+                        (out_dref) = _dp_dv;                                                        \
+                    }                                                                               \
+                }                                                                                   \
+            }                                                                                       \
+        }                                                                                           \
+    } while (false)
+
 // CUDA reference: src/encode/lz_greedy_parser.cuh:26-393. scanBlock:
 // warp-parallel greedy scan of positions [start_pos .. end_pos). All
 // stream cursors live in the in-scope identifiers (no OutputStreams
@@ -71,7 +114,12 @@ uint slzClz(uint x) {
 // word offset within that region; the macro dereferences via
 // `(ht_buf).e[ht_base + h]` — bypassing the per-SSBO-binding 4 GiB cap
 // that would otherwise force `hash_bits=18` on inputs >= 128 MiB at L3.
-#define scanBlock(src_buf, src_base, src_size_in,                                                   \
+//
+// v4 #16: the trailing dict params select the dictionary dimension -
+// `dict_on` is a LITERAL 0u/1u (ref-side ternaries fold away at 0u),
+// `dict_probe_macro` is _SLZ_DICT_PROBE_OFF or _ON. Use the
+// scanBlock / scanBlock_dict wrappers below, not this body directly.
+#define _SLZ_SCAN_BLOCK_BODY(src_buf, src_base, src_size_in,                                        \
                   ht_buf, ht_base, hash_bits_in, hash_mask_in,                                      \
                   lit_buf, lit_base, lit_count,                                                     \
                   token_buf, token_base, token_count,                                               \
@@ -80,7 +128,8 @@ uint slzClz(uint x) {
                   len_buf, len_base, len_count,                                                     \
                   anchor_inout, recent_offset_inout,                                                \
                   start_pos_in, end_pos_in, block2_start_in,                                        \
-                  enable_match_rehash_in, lane_in)                                                  \
+                  enable_match_rehash_in, lane_in,                                                  \
+                  dict_on, dict_buf, dict_ht_buf, dict_len, dict_probe_macro)                       \
     do {                                                                                            \
         uint _sb_pos = uint(start_pos_in);                                                          \
         uint _sb_end_pos = uint(end_pos_in);                                                        \
@@ -199,11 +248,23 @@ uint slzClz(uint x) {
                 if (_sb_eight_word == _sb_key4) _sb_eight_match = true;                             \
             }                                                                                       \
                                                                                                     \
-            bool _sb_has_match = _sb_hash_match || _sb_xor_match || _sb_eight_match;                \
+            /* v4 #16 (CUDA ref: lz_greedy_parser.cuh:192-210):                                    \
+               dictionary probe - strictly lowest priority. Expands to                              \
+               false/0 on dict-less instantiations. */                                              \
+            bool _sb_dict_match;                                                                    \
+            uint _sb_dict_ref;                                                                      \
+            dict_probe_macro(_sb_dict_match, _sb_dict_ref, _sb_is_active,                           \
+                             _sb_hash_match, _sb_xor_match, _sb_eight_match,                        \
+                             _sb_my_pos, _sb_key4, _sb_h,                                           \
+                             dict_buf, dict_ht_buf, dict_len);                                      \
+                                                                                                    \
+            bool _sb_has_match = _sb_hash_match || _sb_xor_match || _sb_eight_match                 \
+                               || _sb_dict_match;                                                   \
             uint _sb_my_match_type = _sb_hash_match ? 0u                                            \
                                    : (_sb_xor_match ? 1u                                            \
-                                   : (_sb_eight_match ? 2u : 0u));                                  \
-            uint _sb_my_ref = _sb_hash_ref;                                                         \
+                                   : (_sb_eight_match ? 2u                                          \
+                                   : (_sb_dict_match ? 3u : 0u)));                                  \
+            uint _sb_my_ref = _sb_hash_match ? _sb_hash_ref : _sb_dict_ref;                         \
             uint _sb_match_ballot = subgroupBallot(_sb_has_match).x;                                \
                                                                                                     \
             /* CUDA reference: src/encode/lz_greedy_parser.cuh:196-203.                            \
@@ -247,8 +308,14 @@ uint slzClz(uint x) {
             uint _sb_match_pos;                                                                     \
             uint _sb_match_ref;                                                                     \
             uint _sb_min_match_len;                                                                 \
+            /* v4 #16 (CUDA ref: lz_greedy_parser.cuh:279-282): a type-3                            \
+               win carries a DICT-space ref; extension, backward walk                               \
+               and the offset computation all read the dictionary. The                              \
+               literal dict_on folds this (and every ternary below) away                            \
+               on dict-less instantiations. */                                                      \
+            bool _sb_ref_in_dict = (uint(dict_on) != 0u) && (_sb_winning_type == 3u);               \
                                                                                                     \
-            if (_sb_winning_type == 0u) {                                                           \
+            if (_sb_winning_type == 0u || _sb_winning_type == 3u) {                                 \
                 _sb_match_pos = _sb_pos + _sb_first_lane;                                           \
                 _sb_match_ref = subgroupShuffle(_sb_my_ref, _sb_first_lane);                        \
                 _sb_min_match_len = MIN_MATCH;                                                      \
@@ -262,10 +329,16 @@ uint slzClz(uint x) {
                 _sb_min_match_len = MIN_MATCH;                                                      \
             }                                                                                       \
                                                                                                     \
-            /* CUDA reference: src/encode/lz_greedy_parser.cuh:261-278.                            \
-               Match extension from min_match_len, capped at end_pos. */                            \
+            /* CUDA reference: src/encode/lz_greedy_parser.cuh:303-328.                            \
+               Match extension from min_match_len, capped at end_pos                                \
+               (and at the dictionary end for dict refs - the encoder                               \
+               never emits a straddling source). */                                                 \
             uint _sb_match_len = _sb_min_match_len;                                                 \
             uint _sb_max_match = _sb_end_pos - _sb_match_pos;                                       \
+            if (_sb_ref_in_dict) {                                                                  \
+                uint _sb_dict_avail = uint(dict_len) - _sb_match_ref;                               \
+                if (_sb_dict_avail < _sb_max_match) _sb_max_match = _sb_dict_avail;                 \
+            }                                                                                       \
             bool _sb_ext_found = false;                                                             \
             for (uint _sb_ext = _sb_min_match_len; _sb_ext < _sb_max_match;                         \
                  _sb_ext += WARP_SIZE) {                                                            \
@@ -274,8 +347,11 @@ uint slzClz(uint x) {
                 if (_sb_check >= _sb_max_match) {                                                   \
                     _sb_mm = true;                                                                  \
                 } else {                                                                            \
-                    _sb_mm = ((src_buf)[uint(src_base) + _sb_match_pos + _sb_check]                 \
-                            != (src_buf)[uint(src_base) + _sb_match_ref + _sb_check]);              \
+                    uint _sb_refb = _sb_ref_in_dict                                                 \
+                        ? uint((dict_buf)[_sb_match_ref + _sb_check])                               \
+                        : uint((src_buf)[uint(src_base) + _sb_match_ref + _sb_check]);              \
+                    _sb_mm = (uint((src_buf)[uint(src_base) + _sb_match_pos + _sb_check])           \
+                            != _sb_refb);                                                           \
                 }                                                                                   \
                 uint _sb_mm_mask = subgroupBallot(_sb_mm).x;                                        \
                 if (_sb_mm_mask != 0u) {                                                            \
@@ -287,7 +363,13 @@ uint slzClz(uint x) {
             if (!_sb_ext_found) _sb_match_len = _sb_max_match;                                      \
                                                                                                     \
             {                                                                                       \
-                int _sb_neg_off = -int(_sb_match_pos - _sb_match_ref);                              \
+                /* v4 #16 (CUDA ref: lz_greedy_parser.cuh:330-337): for                             \
+                   dict refs the distance reaches below the window. The                             \
+                   backward walk below keeps it invariant (both cursors                             \
+                   step together). */                                                               \
+                int _sb_neg_off = _sb_ref_in_dict                                                   \
+                    ? -int(_sb_match_pos + (uint(dict_len) - _sb_match_ref))                        \
+                    : -int(_sb_match_pos - _sb_match_ref);                                          \
                 uint _sb_off_param = (_sb_neg_off == int(recent_offset_inout))                      \
                     ? 0u : uint(-_sb_neg_off);                                                      \
                 uint _sb_resolved_off = _sb_off_param;                                              \
@@ -308,8 +390,10 @@ uint slzClz(uint x) {
                     uint _sb_mp = _sb_match_pos;                                                    \
                     uint _sb_mr = _sb_match_ref;                                                    \
                     while (_sb_mp > uint(anchor_inout) && _sb_mr > 0u &&                            \
-                           (src_buf)[uint(src_base) + _sb_mp - 1u] ==                               \
-                           (src_buf)[uint(src_base) + _sb_mr - 1u]) {                               \
+                           uint((src_buf)[uint(src_base) + _sb_mp - 1u]) ==                         \
+                           (_sb_ref_in_dict                                                         \
+                                ? uint((dict_buf)[_sb_mr - 1u])                                     \
+                                : uint((src_buf)[uint(src_base) + _sb_mr - 1u]))) {                 \
                         _sb_mp -= 1u;                                                               \
                         _sb_mr -= 1u;                                                               \
                         _sb_bw_steps += 1u;                                                         \
@@ -415,5 +499,60 @@ uint slzClz(uint x) {
             }                                                                                       \
         }                                                                                           \
     } while (false)
+
+// CUDA reference: src/encode/lz_greedy_parser.cuh:39 (HAS_DICT=false
+// instantiation). The dict slots take placeholders the OFF macro set
+// never touches - the pre-dict expansion exactly. `src_buf` stands in
+// for dict_buf and `ht_buf` for dict_ht_buf (both unreferenced).
+#define scanBlock(src_buf, src_base, src_size_in,                                                   \
+                  ht_buf, ht_base, hash_bits_in, hash_mask_in,                                      \
+                  lit_buf, lit_base, lit_count,                                                     \
+                  token_buf, token_base, token_count,                                               \
+                  off16_buf, off16_base, off16_count,                                               \
+                  off32_buf, off32_base, off32_pos, off32_count,                                    \
+                  len_buf, len_base, len_count,                                                     \
+                  anchor_inout, recent_offset_inout,                                                \
+                  start_pos_in, end_pos_in, block2_start_in,                                        \
+                  enable_match_rehash_in, lane_in)                                                  \
+    _SLZ_SCAN_BLOCK_BODY(src_buf, src_base, src_size_in,                                            \
+                  ht_buf, ht_base, hash_bits_in, hash_mask_in,                                      \
+                  lit_buf, lit_base, lit_count,                                                     \
+                  token_buf, token_base, token_count,                                               \
+                  off16_buf, off16_base, off16_count,                                               \
+                  off32_buf, off32_base, off32_pos, off32_count,                                    \
+                  len_buf, len_base, len_count,                                                     \
+                  anchor_inout, recent_offset_inout,                                                \
+                  start_pos_in, end_pos_in, block2_start_in,                                        \
+                  enable_match_rehash_in, lane_in,                                                  \
+                  0u, src_buf, ht_buf, 0u, _SLZ_DICT_PROBE_OFF)
+
+// CUDA reference: src/encode/lz_greedy_parser.cuh:39 (HAS_DICT=true
+// instantiation, v4 #16). `dict_buf` is the dictionary byte array
+// (BDA-backed), `dict_ht_buf` the host-built hashKey6 position table
+// (HashU32Ref). Only block 1 ever takes this instantiation - block-2
+// dict distances always exceed NEAR_OFFSET_MAX (the probe would
+// self-gate), so the kernel keeps the plain scanBlock there.
+#define scanBlock_dict(src_buf, src_base, src_size_in,                                              \
+                  ht_buf, ht_base, hash_bits_in, hash_mask_in,                                      \
+                  lit_buf, lit_base, lit_count,                                                     \
+                  token_buf, token_base, token_count,                                               \
+                  off16_buf, off16_base, off16_count,                                               \
+                  off32_buf, off32_base, off32_pos, off32_count,                                    \
+                  len_buf, len_base, len_count,                                                     \
+                  anchor_inout, recent_offset_inout,                                                \
+                  start_pos_in, end_pos_in, block2_start_in,                                        \
+                  enable_match_rehash_in, lane_in,                                                  \
+                  dict_buf, dict_ht_buf, dict_len)                                                  \
+    _SLZ_SCAN_BLOCK_BODY(src_buf, src_base, src_size_in,                                            \
+                  ht_buf, ht_base, hash_bits_in, hash_mask_in,                                      \
+                  lit_buf, lit_base, lit_count,                                                     \
+                  token_buf, token_base, token_count,                                               \
+                  off16_buf, off16_base, off16_count,                                               \
+                  off32_buf, off32_base, off32_pos, off32_count,                                    \
+                  len_buf, len_base, len_count,                                                     \
+                  anchor_inout, recent_offset_inout,                                                \
+                  start_pos_in, end_pos_in, block2_start_in,                                        \
+                  enable_match_rehash_in, lane_in,                                                  \
+                  1u, dict_buf, dict_ht_buf, dict_len, _SLZ_DICT_PROBE_ON)
 
 #endif

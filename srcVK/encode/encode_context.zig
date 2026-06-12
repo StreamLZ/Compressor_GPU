@@ -131,6 +131,28 @@ pub const EncodeContext = struct {
     assembled_offsets: ?[]u32 = null,
     assembled_sizes: ?[]u32 = null,
 
+    // ── v4 #16: preset dictionary, device-resident + cached (CUDA
+    // reference: src/encode/encode_context.zig:163-182) ──────────
+    // `d_dict` holds the dictionary bytes; `d_dict_table` the
+    // host-built position hash table (hashKey6, one u32 per bucket,
+    // 0xFFFFFFFF = empty, mirroring the kernel's HASH_EMPTY). Cached
+    // by (id, hash_bits) so a batch of dict frames uploads once.
+    // `dict_armed` is per-CALL state set by fast_framed: the cache
+    // persists across calls but only armed calls pass the dictionary
+    // to the LZ kernel.
+    d_dict: VkDeviceBuffer = 0,
+    d_dict_size: usize = 0,
+    d_dict_table: VkDeviceBuffer = 0,
+    d_dict_table_size: usize = 0,
+    dict_cached_id: u32 = 0,
+    dict_cached_len: u32 = 0,
+    dict_cached_hash_bits: u32 = 0,
+    dict_armed: bool = false,
+    /// v4 #16 custom dictionaries: caller-registered dictionaries
+    /// (context-owned copies, freed in deinit). Resolution order:
+    /// this store first, then the builtin registry.
+    registered_dicts: std.ArrayList(@import("../dict/dictionary.zig").RegisteredDict) = .empty,
+
     huff_off16hi_sizes: ?[]u32 = null,
     huff_off16hi_offsets: ?[]u32 = null,
     huff_off16lo_sizes: ?[]u32 = null,
@@ -227,6 +249,30 @@ pub const EncodeContext = struct {
         free_dev(&self.d_asm_descs, &self.d_asm_descs_size);
         free_dev(&self.d_asm_out, &self.d_asm_out_size);
         free_dev(&self.d_asm_sizes, &self.d_asm_sizes_size);
+        // v4 #16: dictionary bytes + position table.
+        free_dev(&self.d_dict, &self.d_dict_size);
+        free_dev(&self.d_dict_table, &self.d_dict_table_size);
+        self.dict_cached_id = 0;
+        self.dict_cached_len = 0;
+        self.dict_cached_hash_bits = 0;
+    }
+
+    /// CUDA reference: src/encode/encode_context.zig:362-376 (v4 #16).
+    /// Register a custom dictionary on this context. The bytes are
+    /// copied (context-owned, freed by deinit); the returned ID is
+    /// content-derived (`dictionary.customId`) and is what
+    /// `Options.dictionary_id` and the frame header carry. Registering
+    /// the same content again is a no-op returning the same ID.
+    pub fn registerDict(self: *EncodeContext, allocator: std.mem.Allocator, data: []const u8) !u32 {
+        const dictionary = @import("../dict/dictionary.zig");
+        const id = dictionary.customId(data);
+        for (self.registered_dicts.items) |r| {
+            if (r.id == id) return id;
+        }
+        const copy = try allocator.dupe(u8, data);
+        errdefer allocator.free(copy);
+        try self.registered_dicts.append(allocator, .{ .id = id, .data = copy });
+        return id;
     }
 
     /// CUDA reference: src/encode/encode_context.zig:223-276. Free every
@@ -278,6 +324,11 @@ pub const EncodeContext = struct {
             self.regions_scratch = null;
             self.regions_scratch_cap = 0;
         }
+
+        // v4 #16: registered custom dictionaries (context-owned copies).
+        for (self.registered_dicts.items) |r| allocator.free(r.data);
+        self.registered_dicts.deinit(allocator);
+        self.registered_dicts = .empty;
 
         self.pending_timings.deinit(std.heap.page_allocator);
         self.last_timings.deinit(std.heap.page_allocator);

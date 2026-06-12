@@ -36,6 +36,63 @@ const VK_SUCCESS_RC = vk.VK_SUCCESS_RC;
 const EncodeContext = encode_context.EncodeContext;
 const CompressChunkDesc = encode_context.CompressChunkDesc;
 
+// ── v4 #16: preset-dictionary staging (CUDA reference:
+// src/encode/encode_lz.zig:28-81) ─────────────────────────────────
+
+/// Host twin of the kernel's hashKey6 (lz_format.glsl): Fibonacci
+/// multiplier shifted for the k=6 key, take the top hash_bits.
+/// Must stay bit-identical - the host builds the dictionary table the
+/// kernel probes, and the table must be byte-identical to the CUDA
+/// backend's (cross-backend frame identity for dict frames).
+fn hashKey6(word8: u64, hash_bits: u5) u32 {
+    const product = word8 *% 0x79B97F4A7C150000;
+    return @intCast(product >> @intCast(@as(u7, 64) - hash_bits));
+}
+
+const dict_table_empty: u32 = 0xFFFF_FFFF; // kernel HASH_EMPTY
+
+/// Make the dictionary bytes + the hashKey6 position table resident
+/// on the device, cached by (id, hash_bits). The table maps each
+/// bucket to the HIGHEST dict position hashing there (ascending
+/// insertion, last writer wins - the same order a serial pass over
+/// the dictionary would leave behind, and the CPU sibling's
+/// preloadDictionary semantics). Returns false on VK failure.
+pub fn ensureDictOnDevice(
+    self: *EncodeContext,
+    allocator: std.mem.Allocator,
+    id: u32,
+    data: []const u8,
+    hash_bits: u32,
+) bool {
+    if (self.dict_cached_id == id and
+        self.dict_cached_len == data.len and
+        self.dict_cached_hash_bits == hash_bits) return true;
+    self.dict_cached_id = 0;
+    if (!module_loader.init()) return false;
+    const h2d_fn = vk.procs.h2d orelse return false;
+
+    const table_len = @as(usize, 1) << @intCast(hash_bits);
+    const table = allocator.alloc(u32, table_len) catch return false;
+    defer allocator.free(table);
+    @memset(table, dict_table_empty);
+    if (data.len >= 8) {
+        var p: usize = 0;
+        while (p + 8 <= data.len) : (p += 1) {
+            const word = std.mem.readInt(u64, data[p..][0..8], .little);
+            table[hashKey6(word, @intCast(hash_bits))] = @intCast(p);
+        }
+    }
+
+    if (!encode_context.ensureBuf(&self.d_dict, &self.d_dict_size, data.len)) return false;
+    if (!encode_context.ensureBuf(&self.d_dict_table, &self.d_dict_table_size, table_len * 4)) return false;
+    if (h2d_fn(self.d_dict, @ptrCast(data.ptr), data.len) != VK_SUCCESS_RC) return false;
+    if (h2d_fn(self.d_dict_table, @ptrCast(table.ptr), table_len * 4) != VK_SUCCESS_RC) return false;
+    self.dict_cached_id = id;
+    self.dict_cached_len = @intCast(data.len);
+    self.dict_cached_hash_bits = hash_bits;
+    return true;
+}
+
 /// CUDA reference: src/encode/encode_lz.zig:21-153. L1 hot LZ encode
 /// launcher. Returns true on success, false on FFI / GPU failure.
 pub fn gpuCompressImpl(
@@ -202,6 +259,26 @@ pub fn gpuCompressImpl(
     var p_hash_addr_lo: u32 = @truncate(hash_addr);
     var p_hash_addr_hi: u32 = @truncate(hash_addr >> 32);
 
+    // v4 #16 (CUDA reference: src/encode/encode_lz.zig:214-219): pass
+    // the staged dictionary only when fast_framed armed it for THIS
+    // call - the cache may hold a dictionary while a dictionary-less
+    // frame must encode exactly as before. VK adaptation: BDA
+    // addresses in the push constants instead of pointer params.
+    var dict_addr: u64 = 0;
+    var dict_ht_addr: u64 = 0;
+    var p_dict_len: u32 = 0;
+    if (self.dict_armed) {
+        dict_addr = decode_module_loader.getBufferDeviceAddress(self.d_dict);
+        dict_ht_addr = decode_module_loader.getBufferDeviceAddress(self.d_dict_table);
+        if (dict_addr == 0 or dict_ht_addr == 0) return false;
+        p_dict_len = self.dict_cached_len;
+    }
+    var p_dict_addr_lo: u32 = @truncate(dict_addr);
+    var p_dict_addr_hi: u32 = @truncate(dict_addr >> 32);
+    var p_dict_ht_lo: u32 = @truncate(dict_ht_addr);
+    var p_dict_ht_hi: u32 = @truncate(dict_ht_addr >> 32);
+    var p_dict_pad: u32 = 0;
+
     // params layout per procs.launch_kernel contract: the first
     // n_bindings entries are pointers to VkDeviceBuffer handles
     // (the shader's std430 buffer bindings 0..n_bindings-1), the
@@ -225,6 +302,12 @@ pub fn gpuCompressImpl(
         @ptrCast(&p_l4),
         @ptrCast(&p_hash_addr_lo),
         @ptrCast(&p_hash_addr_hi),
+        @ptrCast(&p_dict_addr_lo),
+        @ptrCast(&p_dict_addr_hi),
+        @ptrCast(&p_dict_ht_lo),
+        @ptrCast(&p_dict_ht_hi),
+        @ptrCast(&p_dict_len),
+        @ptrCast(&p_dict_pad),
     };
     var extra = [_]?*anyopaque{null};
 
