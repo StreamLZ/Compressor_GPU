@@ -65,6 +65,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
         .sc_group_size_override = args.sc_group,
         .content_checksum = args.checksum,
         .dictionary_id = util.resolveDictionary(allocator, io, args.dictionary, in_path, w, &gpu_enc_driver.g_default),
+        .chunk_size_table = args.chunk_table,
     }, &gpu_enc_driver.g_default) catch |err| {
         out_map.unmap();
         try w.print("error: compression failed: {s}\n", .{@errorName(err)});

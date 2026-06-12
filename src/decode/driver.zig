@@ -71,6 +71,8 @@ pub const finalizeProfiling = decode_context.finalizeProfiling;
 
 // ── Decode pipeline entry points ──────────────────────────────
 pub const gpuWalkFrameImpl = scan_gpu.gpuWalkFrameImpl;
+pub const gpuWalkFrame = scan_gpu.gpuWalkFrame;
+pub const ChunkTableInfo = scan_gpu.ChunkTableInfo;
 pub const fullGpuLaunchImpl = decode_dispatch.fullGpuLaunchImpl;
 
 // ── Singletons ────────────────────────────────────────────────

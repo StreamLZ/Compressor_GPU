@@ -192,7 +192,28 @@ pub fn decompressFramedFromDevice(
         dict_len = dec_ctx.dict_cached_len;
     }
 
-    const dev = try gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size);
+    // v4 #20: when the frame carries the chunk-size table footer, the
+    // walk runs as a parallel table-mode kernel instead of the serial
+    // chunk chain. The table position is computable from the header:
+    // frame_end - trailers - 3 * n_chunks (n_chunks from content_size
+    // and eff_chunk; trailer sizes announced by flag bits).
+    var table_info: ?gpu_driver.ChunkTableInfo = null;
+    if (parsed_hdr.chunk_size_table) {
+        const eff: u32 = @intCast(@min(frame.scGroupSizeToBytes(parsed_hdr.sc_group_size), constants.chunk_size));
+        if (eff == 0) return error.BadMode;
+        const n_tab: u32 = (decomp_size + eff - 1) / eff;
+        var trailer_bytes: u32 = 0;
+        if (parsed_hdr.chunk_merkle) trailer_bytes += 4;
+        if (parsed_hdr.content_checksum) trailer_bytes += 4;
+        const table_bytes: u32 = n_tab * 3;
+        if (frame_size < trailer_bytes + table_bytes) return error.BadMode;
+        table_info = .{
+            .table_off = frame_size - trailer_bytes - table_bytes,
+            .n_chunks = n_tab,
+        };
+    }
+
+    const dev = try gpu_driver.gpuWalkFrame(dec_ctx, d_frame, frame_size, table_info);
 
     // Stub slices: the kernel reads from `d_chunk_descs_override` and
     // `d_compressed_src`; the host slices are length-only.
@@ -219,6 +240,20 @@ pub fn decompressFramedFromDevice(
         .d_dict = d_dict,
         .dict_len = dict_len,
     });
+
+    // v4 #20: surface walk-kernel rejections. The downstream kernels
+    // self-gate on the walk's n_chunks, so a non-zero status (hostile
+    // frame, inconsistent chunk table, truncation) would otherwise
+    // return SUCCESS with undecoded output. Read after the dispatch's
+    // own sync - zero extra synchronization in sync mode. Async-stream
+    // callers sync on their own stream; carrying the status to them
+    // belongs to the #19 verdict surface.
+    if (dec_ctx.work_stream == 0) {
+        var wstatus: u32 = 0;
+        if (!gpu_driver.copyDeviceToHost(std.mem.asBytes(&wstatus), dev.d_meta + gpu_driver.walk_meta_offsets.status))
+            return error.CopyFailed;
+        if (wstatus != 0) return error.BadMode;
+    }
     return decomp_size;
 }
 
@@ -414,6 +449,15 @@ fn decompressFrameInner(
 
     if (hdr.content_size) |cs| {
         if (dst_off != cs) return error.SizeMismatch;
+    }
+
+    // v4 #20: the chunk-size table footer sits between the end mark
+    // and the trailers - step the forward cursor over it so the
+    // trailer reads below land on the right bytes. (The host decode
+    // path itself never reads the table; it walks the chunk chain.)
+    if (hdr.chunk_size_table) {
+        const eff_t = @min(frame.scGroupSizeToBytes(hdr.sc_group_size), constants.chunk_size);
+        if (eff_t > 0) pos += ((dst_off + eff_t - 1) / eff_t) * 3;
     }
 
     // v4 #13 (2026-06-10): XXH32 content checksum verification. The 4-byte

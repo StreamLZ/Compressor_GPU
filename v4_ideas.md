@@ -1212,6 +1212,39 @@ tiers:
    without the token-level upheaval.
 **Recommendation**: tier 1 anytime; tier 3 in the VK-era format
 window; skip tier 2.
+**Tier 3 SHIPPED 2026-06-12 (same day): walk 0.678 -> 0.0154 ms
+(44x); D2D kernel-active 2.71 -> 1.96 ms (-28%).** Implementation:
+flag bit 6 + footer of 3-byte LE per-chunk TOTAL wire sizes (internal
+hdr + chunk hdr + payload), emitted in assembleFrame from the
+per-chunk totals the host already holds (~4.6 KB per 100 MB); opt-in
+via Options.chunk_size_table / CLI --chunk-table (defaults unchanged
+- SHA gate hashes reproduced again). Decode: slzWalkFrameTableKernel
+- one 1024-thread block does a coalesced table read, Hillis-Steele
+scan, then ONE THREAD PER CHUNK parses its headers independently and
+writes its descriptor; validates the integrity equation (entries +
+SC tail == block compressed size, status 14) plus per-chunk
+entry-vs-header cross-checks. Host-bounce path ignores the footer
+(chain walk as before) - one fix needed: the trailer reads walk
+forward from the end mark and had to step over the footer.
+Old decoders decode table frames correctly (reserved bits are not
+validated; the footer sits outside the block walk).
+TWO SIDE-FINDS, one fixed: (a) FIXED - the D2D path never read the
+walk's status word (kernels self-gate on n_chunks), so ANY walk
+rejection - hostile frames included - returned SUCCESS with
+undecoded output; now surfaced as BadMode after the dispatch sync
+(async-stream callers still need the #19 verdict surface). (b) OPEN
+- the SERIAL walk kernel does not handle the per-chunk uncompressed
+form ([2B internal, bit7][payload], no 4-byte chunk header): it
+unconditionally parses a chunk header after the internal header, so
+D2D frames containing an incompressible chunk would misparse on the
+serial path (compressible corpora never hit it; the TABLE walk
+handles the form correctly). Fix the serial walk when next touched.
+REMAINING from this entry: tier 1 (fuse the 0.108 ms prefix-sum
+kernel - the table walk already computes everything it needs);
+optional host-path table use (~10-150 us -> ~2 us, <=1% of e2e).
+Tests: footer splice + sum equation + roundtrips L1/L3/L5 + D2D
+table-walk decode + hostile corrupted-entry reject (ptest 64/0/0).
+
 **Tier-3 design SETTLED with the user 2026-06-12:**
 - SIZES, not offsets: the descriptors need both, and each form
   derives the other with one parallel op (prefix-scan vs adjacent

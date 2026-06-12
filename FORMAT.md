@@ -68,7 +68,8 @@ Offset  Size  Field
 | 3   | DictionaryIdPresent | 4-byte dictionary ID follows the optional content size. The ID is opaque: it names a preset dictionary BOTH sides must already have (the wire never carries dictionary bytes). The decoder resolves the ID in its registry (`src/dict/dictionary.zig`) and rejects unknown IDs with `error.UnknownDictionary`. See "Preset dictionaries" below for how dictionary bytes extend the match window. |
 | 4   | ParallelDecodeMeta  | Legacy CPU-codec sidecar; the GPU decoder skips it, the GPU encoder never sets it. |
 | 5   | ChunkMerkleChecksum | 4-byte trailer after the end mark (after the bit-1 trailer when both are set): XXH32 over the concatenated per-chunk hashes (LE, chunk-index order) of the decompressed content, where each per-chunk hash is itself XXH32 over the concatenated XXH32s (LE) of the chunk's 1024-byte segments (last segment partial; chunk grid = the frame's effective chunk size). The two-level shape exists so GPUs can hash one thread per segment. A self-verification root, NOT a plain content hash - do not compare external XXH32(file) against it. The GPU encoder sets this by default since 2026-06-11; whether a given frame carries it is always announced by this flag bit, never assumed. |
-| 6-7 | Reserved            | Must be 0. |
+| 6   | ChunkSizeTable      | A chunk-size table footer follows the end mark, BEFORE the bit-1/bit-5 trailers. See "Chunk-size table footer" below. Opt-in; lets a decoder locate every chunk in parallel instead of walking the chunk chain. Decoders that do not know this bit decode the frame correctly by ignoring the footer. |
+| 7   | Reserved            | Must be 0. |
 
 ### Codec ID at offset 6
 
@@ -150,7 +151,32 @@ The block list ends with 4 zero bytes:
 00 00 00 00
 ```
 
-Trailers follow the end mark in flag-bit order:
+If `ChunkSizeTable` (bit 6) is set, the chunk-size table footer
+follows the end mark first, then the trailers below.
+
+### Chunk-size table footer (flag bit 6)
+
+`num_chunks` 3-byte little-endian entries, one per chunk in frame
+order. Each entry is the chunk's TOTAL wire size: its 2-byte internal
+header, plus its 4-byte chunk header when present (compressed and
+memset chunks have one; uncompressed chunks do not), plus its
+payload. The exclusive prefix sum of the entries gives every chunk's
+byte offset within the block payload, so a decoder can locate all
+chunks with one contiguous read instead of walking the chunk chain.
+
+The footer is self-locating: `num_chunks` derives from
+`content_size` and the effective chunk size (both in the frame
+header), and the trailer sizes are announced by flag bits, so its
+position is `frame_end - trailers - 3 * num_chunks`. Two integrity
+properties hold by construction and decoders should verify them: the
+entries sum to the block's compressed size, and each entry agrees
+with the size field in the chunk header it points to. The encoder
+emits the footer only on compressed-body frames (never on
+uncompressed-body fallbacks) and only when the effective chunk size
+is at least 64 KB.
+
+Trailers follow (after the table footer when present) in flag-bit
+order:
 
 1. If `ContentChecksum` (bit 1) is set, a 4-byte XXH32 of the whole
    uncompressed content. Opt-in via the encoder's `content_checksum`

@@ -25,6 +25,9 @@ pub const Args = struct {
     /// input file's extension). Decompression needs no flag: the
     /// frame header names its dictionary.
     dictionary: ?[]const u8 = null,
+    /// v4 #20: emit the chunk-size table footer (speeds up the
+    /// device-resident decode path's frame walk).
+    chunk_table: bool = false,
 };
 
 pub fn parseArgs(raw: []const []const u8, w: *std.Io.Writer) Args {
@@ -49,6 +52,7 @@ pub fn parseArgs(raw: []const []const u8, w: *std.Io.Writer) Args {
         if (eql(arg, "-o")) { i += 1; result.output = expect(raw, i, "-o", w); continue; }
         if (eql(arg, "--checksum")) { result.checksum = true; continue; }
         if (eql(arg, "-D")) { i += 1; result.dictionary = expect(raw, i, "-D", w); continue; }
+        if (eql(arg, "--chunk-table")) { result.chunk_table = true; continue; }
         if (eql(arg, "--sc")) {
             i += 1;
             const v = expect(raw, i, "--sc", w);
@@ -237,6 +241,8 @@ pub fn printUsage(w: *std.Io.Writer) !void {
         \\  -D <dict>       Preset dictionary: name (json, html, text, xml,
         \\                  css, js, general), numeric ID, or "auto" (by
         \\                  input extension). Decode reads the frame header.
+        \\  --chunk-table   Emit the chunk-size table footer (faster
+        \\                  device-resident decode; +3 B per 64 KB chunk)
         \\  --sc <float>    sc_group_size override (0.25 = 64 KB sub-chunks)
         \\  -gpu            Accepted, no-op (GPU is the only backend)
         \\  -mem            Print peak process memory at exit

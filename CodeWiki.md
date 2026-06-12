@@ -156,7 +156,7 @@ tail.
 - `driver.zig`, `cuda_api.zig`, `module_loader.zig` - facade, driver function table, PTX loading (also owns the single CUDA context)
 - `lz_kernel.cu` - the LZ decode kernel module; the pipelined hot path is `lz_decode_raw_pipeline.cuh`, the single-warp originals are `lz_decode_raw.cuh` and friends, header parsing in `lz_header_parse.cuh`, format constants in `slz_wire_format.cuh`
 - `huffman_kernel.cu` - decode-side LUT build and the 32-stream Huffman decode
-- bookkeeping kernels, one file each: `walk_frame_kernel.cuh` (parse the frame on device), `prefix_sum_chunks_kernel.cuh`, `scan_parse_kernel.cuh`, `compact_descs_kernels.cuh`, `merge_huff_descs_kernel.cuh`, `gather_raw_off16_kernel.cuh`
+- bookkeeping kernels, one file each: `walk_frame_kernel.cuh` (parse the frame on device: the serial chunk-chain walk, plus the parallel table-mode walk used when the frame carries the v4 #20 chunk-size table footer - 44x faster), `prefix_sum_chunks_kernel.cuh`, `scan_parse_kernel.cuh`, `compact_descs_kernels.cuh`, `merge_huff_descs_kernel.cuh`, `gather_raw_off16_kernel.cuh`
 
 Compiled `.ptx` files are committed next to their `.cu` sources.
 

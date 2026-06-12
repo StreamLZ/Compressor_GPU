@@ -44,6 +44,7 @@ pub var merkle_verdict_fn: usize = 0;
 pub var gather_off16_fn: usize = 0;
 pub var scan_parse_fn: usize = 0;
 pub var walk_frame_fn: usize = 0;
+pub var walk_frame_table_fn: usize = 0;
 pub var prefix_sum_chunks_fn: usize = 0;
 pub var compact_huff_descs_fn: usize = 0;
 pub var compact_all_descs_fn: usize = 0;
@@ -206,6 +207,7 @@ pub fn init() bool {
     // Optional GPU frame-walk kernel. Absent → the D2D decompress path
     // falls back to host bounce.
     _ = get_fn(&walk_frame_fn, module, "slzWalkFrameKernel");
+    _ = get_fn(&walk_frame_table_fn, module, "slzWalkFrameTableKernel");
     // Optional GPU prefix-sum-chunks kernel. Absent → pure-D2D pipeline
     // disabled, host computes `first_sub_idx`.
     _ = get_fn(&prefix_sum_chunks_fn, module, "slzPrefixSumChunksKernel");

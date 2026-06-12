@@ -102,6 +102,11 @@ static constexpr uint8_t  SLZ_INT_BLOCK_MAGIC       = 0x05;
 static constexpr uint8_t  SLZ_BLOCK_HDR_MAGIC_MASK   = 0x0F; // low nibble of internal-header byte 0
 static constexpr uint8_t  SLZ_BLOCK_HDR_DECODER_MASK = 0x7F; // low 7 bits of internal-header byte 1
 static constexpr uint8_t  SLZ_BLOCK_HDR_CHECKSUM_FLAG = 0x80; // top bit of internal-header byte 1
+// Internal-header byte 0 high bits (above the magic nibble):
+static constexpr uint8_t  SLZ_BLOCK_HDR_SC_FLAG       = 0x10; // self-contained chunks (SC tail present)
+static constexpr uint8_t  SLZ_INT_BLOCK_UNCOMP_FLAG   = 0x80; // per-chunk uncompressed form: no 4-byte chunk hdr
+// v4 #20 frame-header flag bit 6: chunk-size table footer present.
+static constexpr uint8_t  SLZ_FRAME_FLAG_CHUNK_TABLE  = 0x40;
 static constexpr uint8_t  SLZ_DECODER_FAST          = 1;
 static constexpr uint8_t  SLZ_DECODER_TURBO         = 2;
 

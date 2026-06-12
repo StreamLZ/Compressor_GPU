@@ -85,6 +85,18 @@ pub const Options = struct {
     /// on the wire; the match finder does not search the dictionary
     /// yet, so there is no ratio benefit until the kernel phases land.
     dictionary_id: ?u32 = null,
+
+    /// v4 #20: emit the chunk-size table footer (flag bit 6) -
+    /// 3 bytes per chunk after the end mark, before the trailers.
+    /// Lets the device-resident decode path locate every chunk with
+    /// one parallel read instead of the serial chunk-chain walk
+    /// (~0.7 ms -> tens of us on a 100 MB frame). Decoders that
+    /// predate the bit ignore the footer and decode normally.
+    /// Opt-in (default off) until the VK encoder mirrors it - the
+    /// cross-backend SHA gate requires both backends' default frames
+    /// to stay byte-identical. Not emitted on uncompressed-body
+    /// frames or when the effective chunk size is under 64 KB.
+    chunk_size_table: bool = false,
 };
 
 /// Upper bound on the compressed-output size for an input of `src_len`
@@ -99,12 +111,17 @@ pub fn compressBound(src_len: usize) usize {
     // off32 / length headers that follow.
     const per_sub_chunk_overhead: usize = 3 + 8 + 3 + 256;
     const sc_prefix_upper_bound: usize = chunk_count * 8;
+    // v4 #20 chunk-size table: 3 B per effective chunk. The table is
+    // only emitted for eff_chunk >= 64 KB, so ceil(len/64K) bounds the
+    // entry count at every legal sc setting.
+    const chunk_table_upper_bound: usize = (src_len / 65536 + 2) * 3;
     return frame.max_header_size + 4 + 4 // (+4: v4 #19 merkle trailer)
         + chunk_count * (8 + 2 + 4)
         + sub_chunks * per_sub_chunk_overhead
         + src_len
         + 64
         + sc_prefix_upper_bound
+        + chunk_table_upper_bound
         + 4; // XXH32 content checksum trailer
 }
 

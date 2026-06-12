@@ -146,6 +146,15 @@ pub fn compressFramedOne(
         enc_ctx.dict_armed = true;
     }
 
+    // v4 #20: the chunk-size table is only meaningful for compressed
+    // bodies with >= 64 KB effective chunks (the bound math and the
+    // 3-byte entry width both assume it). Decided up front because the
+    // flag lives in the header; the rare assembly-cap fallback below
+    // clears the bit again when it downgrades to an uncompressed body.
+    const emit_chunk_table = opts.chunk_size_table and
+        src.len > min_source_length and
+        effChunkFor(src.len, opts.sc_group_size_override) >= 65536;
+
     const hdr_len = frame.writeHeader(dst, .{
         .codec = .fast,
         .level = codecLevelFor(opts.level),
@@ -155,6 +164,7 @@ pub fn compressFramedOne(
         .dictionary_id = opts.dictionary_id,
         .content_checksum = opts.content_checksum,
         .chunk_merkle = opts.chunk_checksum,
+        .chunk_size_table = emit_chunk_table,
     }) catch return error.DestinationTooSmall;
     pos += hdr_len;
 
@@ -181,6 +191,7 @@ pub fn compressFramedOne(
         enc_ctx,
         sc_grp,
         frame_block_hdr_pos,
+        emit_chunk_table,
     );
 }
 
@@ -215,6 +226,7 @@ fn gpuEncodeAndAssemble(
     enc_ctx: *gpu_enc.EncodeContext,
     sc_grp: f32,
     frame_block_hdr_pos: usize,
+    emit_chunk_table: bool,
 ) CompressError!usize {
     const eff_chunk = @min(frame.scGroupSizeToBytes(sc_grp), lz_constants.chunk_size);
     const sub_chunk_cap: usize = lz_constants.sub_chunk_size;
@@ -231,6 +243,14 @@ fn gpuEncodeAndAssemble(
         // frame uncompressed body. Rare: at sc=0.25 the threshold is
         // 1 GB; users encoding more than that should use multi-frame
         // batching at a higher level.
+        // v4 #20: the header already promised a chunk-size table; an
+        // uncompressed body has no table, so clear the bit (the header
+        // sits in the host dst buffer; flags byte is offset 5).
+        if (emit_chunk_table) dst[5] = @bitCast(blk: {
+            var f: frame.FrameFlags = @bitCast(dst[5]);
+            f.chunk_size_table = false;
+            break :blk f;
+        });
         return writeUncompressedFrame(dst, frame_block_hdr_pos, frame_block_hdr_pos + 8, src);
     }
 
@@ -324,6 +344,7 @@ fn gpuEncodeAndAssemble(
         n_chunks,
         comp_sizes,
         frame_block_hdr_pos,
+        emit_chunk_table,
     );
     enc_phase.add(.asm_host, t_ph);
 
@@ -370,6 +391,7 @@ fn assembleFrame(
     n_chunks: usize,
     comp_sizes: []const u32,
     frame_block_hdr_pos: usize,
+    emit_chunk_table: bool,
 ) CompressError!usize {
     const sizes = enc_ctx.assembled_sizes orelse return error.DestinationTooSmall;
     const offsets = enc_ctx.assembled_offsets orelse return error.DestinationTooSmall;
@@ -455,6 +477,31 @@ fn assembleFrame(
         enc_ctx.d_output_override,
     ) orelse return error.DestinationTooSmall;
     enc_ctx.output_written_to_device = true;
+
+    // v4 #20: append the chunk-size table footer to the device frame,
+    // right after the end mark and before any trailer the caller adds
+    // (the Merkle root-write that follows uses the bumped frame size,
+    // keeping the wire order [end][table][trailers]). Each entry is
+    // the chunk's TOTAL wire size - the same per-chunk totals the walk
+    // would otherwise re-derive serially: 2-byte internal header plus
+    // either 4-byte chunk header + payload (compressed) or the raw
+    // payload (uncompressed marker form).
+    if (emit_chunk_table) {
+        const table = try allocator.alloc(u8, n_chunks * 3);
+        defer allocator.free(table);
+        for (0..n_chunks) |ci| {
+            const wire: u32 = if (per_chunk_asm_off_buf[ci] == gpu_enc.UNCOMPRESSED_CHUNK_MARKER)
+                gpu_enc.UNCOMPRESSED_CHUNK_HDR_BYTES + per_chunk_asm_size_buf[ci]
+            else
+                gpu_enc.CHUNK_INTERNAL_HDR_BYTES + per_chunk_asm_size_buf[ci];
+            table[ci * 3] = @intCast(wire & 0xFF);
+            table[ci * 3 + 1] = @intCast((wire >> 8) & 0xFF);
+            table[ci * 3 + 2] = @intCast(wire >> 16);
+        }
+        if (!gpu_enc.copyHostToDevice(enc_ctx.d_output_override + frame_size, table))
+            return error.DestinationTooSmall;
+        return @as(usize, @intCast(frame_size)) + table.len;
+    }
     return @intCast(frame_size);
 }
 

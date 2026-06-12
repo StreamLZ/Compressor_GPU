@@ -91,9 +91,18 @@ pub const FrameFlags = packed struct(u8) {
     /// XXH32 tools must not compare against it. Default-ON since
     /// 2026-06-11.
     chunk_merkle: bool = false,
-    /// Bits 6-7: reserved. Must be zero on write; non-zero values
+    /// Bit 6 (v4 #20): a chunk-size table footer follows the end-mark
+    /// (BEFORE the bit-1/bit-5 trailers): `num_chunks` 3-byte LE
+    /// entries, each the chunk's TOTAL wire size (its internal +
+    /// chunk headers + payload). Lets a decoder locate every chunk
+    /// without walking the chunk chain - the table position is
+    /// computable from the header alone (chunk count derives from
+    /// content_size / eff_chunk). Opt-in; emitted only by the GPU
+    /// compress path (never on uncompressed-body frames).
+    chunk_size_table: bool = false,
+    /// Bit 7: reserved. Must be zero on write; non-zero values
     /// reject with `error.BadFrame`.
-    _reserved: u2 = 0,
+    _reserved: u1 = 0,
 };
 
 pub const Codec = enum(u8) {
@@ -124,6 +133,7 @@ pub const FrameHeader = struct {
     dictionary_id: ?u32,
     content_checksum: bool,
     chunk_merkle: bool,
+    chunk_size_table: bool,
     header_size: usize,
 };
 
@@ -209,6 +219,7 @@ pub fn parseHeader(src: []const u8) ParseError!FrameHeader {
         .dictionary_id = dict_id,
         .content_checksum = raw_flags.content_checksum,
         .chunk_merkle = raw_flags.chunk_merkle,
+        .chunk_size_table = raw_flags.chunk_size_table,
         .header_size = pos,
     };
 }
@@ -241,6 +252,7 @@ pub const WriteHeaderOptions = struct {
     content_size: ?u64 = null,
     content_checksum: bool = false,
     chunk_merkle: bool = false,
+    chunk_size_table: bool = false,
     block_checksums: bool = false,
     dictionary_id: ?u32 = null,
 };
@@ -268,6 +280,7 @@ pub fn writeHeader(dst: []u8, opts: WriteHeaderOptions) WriteError!usize {
         .content_size_present = opts.content_size != null,
         .content_checksum = opts.content_checksum,
         .chunk_merkle = opts.chunk_merkle,
+        .chunk_size_table = opts.chunk_size_table,
         .block_checksums = opts.block_checksums,
         .dictionary_id_present = opts.dictionary_id != null,
         .parallel_decode_metadata_present = opts.parallel_decode_metadata_present,

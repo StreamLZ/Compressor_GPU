@@ -241,6 +241,118 @@ test "compressFramed rejects undersized destination" {
     );
 }
 
+test "v4 #20: chunk-size table frames - footer correctness, roundtrips, D2D walk, hostile reject" {
+    lockGpuTests();
+    defer unlockGpuTests();
+    if (!gpu_encoder.isAvailable()) return error.SkipZigTest;
+    if (!gpu_driver.isAvailable()) return error.SkipZigTest;
+    if (!gpu_driver.bindContextToCallingThread()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const frame_format = @import("../format/frame_format.zig");
+    const constants = @import("../format/streamlz_constants.zig");
+    const cuda = @import("../decode/cuda_api.zig");
+
+    // Multi-chunk payload (~200 KB = 4 chunks at the default sc).
+    const payload = try allocator.alloc(u8, 200 * 1024);
+    defer allocator.free(payload);
+    const pattern = "chunk size table footer test payload with enough redundancy to compress well ";
+    for (payload, 0..) |*b, i| b.* = pattern[i % pattern.len];
+
+    const bound = encoder.compressBound(payload.len);
+    const plain = try allocator.alloc(u8, bound);
+    defer allocator.free(plain);
+    const tabled = try allocator.alloc(u8, bound);
+    defer allocator.free(tabled);
+    const dst = try allocator.alloc(u8, payload.len + decoder.safe_space);
+    defer allocator.free(dst);
+
+    for ([_]u8{ 1, 3, 5 }) |level| {
+        const n_plain = try encoder.compressFramed(allocator, payload, plain, .{ .level = level }, &gpu_encoder.g_default);
+        const n_tab = try encoder.compressFramed(
+            allocator,
+            payload,
+            tabled,
+            .{ .level = level, .chunk_size_table = true },
+            &gpu_encoder.g_default,
+        );
+
+        // Footer correctness: the table frame is the plain frame with
+        // flag bit 6 set and exactly n_chunks 3-byte entries spliced in
+        // between the end mark and the Merkle trailer. The entries must
+        // sum (with the SC tail) to the block's compressed size, and the
+        // payload bytes around the footer must match the plain frame.
+        const hdr = frame_format.parseHeader(tabled[0..n_tab]) catch unreachable;
+        try testing.expect(hdr.chunk_size_table);
+        const eff = @min(frame_format.scGroupSizeToBytes(hdr.sc_group_size), constants.chunk_size);
+        const n_chunks = (payload.len + eff - 1) / eff;
+        try testing.expectEqual(n_plain + n_chunks * 3, n_tab);
+        // [0..5] equal, flag byte differs by bit 6 only, rest of the
+        // pre-table bytes identical (trailer = last 4 in both).
+        try testing.expectEqualSlices(u8, plain[0..5], tabled[0..5]);
+        try testing.expectEqual(plain[5] | @as(u8, 0x40), tabled[5]);
+        const pre_table = n_plain - 4; // everything up to the Merkle trailer
+        try testing.expectEqualSlices(u8, plain[6..pre_table], tabled[6..pre_table]);
+        try testing.expectEqualSlices(u8, plain[pre_table..n_plain], tabled[n_tab - 4 .. n_tab]);
+        // Entries + SC tail == block compressed size (read from the
+        // 8-byte block header after the frame header).
+        var sum: usize = 0;
+        for (0..n_chunks) |i| {
+            const e = tabled[pre_table + i * 3 ..][0..3];
+            sum += @as(usize, e[0]) | (@as(usize, e[1]) << 8) | (@as(usize, e[2]) << 16);
+        }
+        const block_w0 = std.mem.readInt(u32, tabled[hdr.header_size..][0..4], .little);
+        const block_comp: usize = block_w0 & 0x3FFF_FFFF;
+        const sc_tail: usize = if (n_chunks > 1) (n_chunks - 1) * 8 else 0;
+        try testing.expectEqual(block_comp, sum + sc_tail);
+
+        // Host-path roundtrip (walks the chain, ignores the footer).
+        const written = try decoder.decompressFramed(tabled[0..n_tab], dst, &gpu_driver.g_default);
+        try testing.expectEqual(payload.len, written);
+        try testing.expectEqualSlices(u8, payload, dst[0..written]);
+    }
+
+    // D2D path: the table-mode walk kernel drives the decode.
+    const malloc_fn = cuda.cuMemAlloc_fn orelse return error.SkipZigTest;
+    const free_fn = cuda.cuMemFree_fn orelse return error.SkipZigTest;
+    const h2d_fn = cuda.cuMemcpyHtoD_fn orelse return error.SkipZigTest;
+    const d2h_fn = cuda.cuMemcpyDtoH_fn orelse return error.SkipZigTest;
+
+    const n_tab = try encoder.compressFramed(
+        allocator,
+        payload,
+        tabled,
+        .{ .level = 1, .chunk_size_table = true },
+        &gpu_encoder.g_default,
+    );
+    var d_frame: u64 = 0;
+    if (malloc_fn(&d_frame, n_tab) != cuda.CUDA_SUCCESS) return error.SkipZigTest;
+    defer _ = free_fn(d_frame);
+    var d_out: u64 = 0;
+    if (malloc_fn(&d_out, payload.len + decoder.safe_space) != cuda.CUDA_SUCCESS) return error.SkipZigTest;
+    defer _ = free_fn(d_out);
+    if (h2d_fn(d_frame, @ptrCast(tabled.ptr), n_tab) != cuda.CUDA_SUCCESS) return error.CopyFailed;
+
+    const n_dec = try decoder.decompressFramedFromDevice(null, d_frame, @intCast(n_tab), d_out, &gpu_driver.g_default, @intCast(payload.len));
+    try testing.expectEqual(@as(u32, @intCast(payload.len)), n_dec);
+    @memset(dst, 0x77);
+    if (d2h_fn(@ptrCast(dst.ptr), d_out, payload.len) != cuda.CUDA_SUCCESS) return error.CopyFailed;
+    try testing.expectEqualSlices(u8, payload, dst[0..payload.len]);
+
+    // Hostile: corrupt one table entry - the walk's integrity equation
+    // (entries + SC tail == block size) must reject the frame before
+    // any chunk decodes.
+    const hdr2 = frame_format.parseHeader(tabled[0..n_tab]) catch unreachable;
+    const eff2 = @min(frame_format.scGroupSizeToBytes(hdr2.sc_group_size), constants.chunk_size);
+    const n_chunks2 = (payload.len + eff2 - 1) / eff2;
+    const table_pos = n_tab - 4 - n_chunks2 * 3;
+    tabled[table_pos] +%= 1;
+    if (h2d_fn(d_frame, @ptrCast(tabled.ptr), n_tab) != cuda.CUDA_SUCCESS) return error.CopyFailed;
+    try testing.expectError(
+        error.BadMode,
+        decoder.decompressFramedFromDevice(null, d_frame, @intCast(n_tab), d_out, &gpu_driver.g_default, @intCast(payload.len)),
+    );
+}
+
 test "v4 #16: dictionary frames roundtrip, compress better, enforce the registry" {
     lockGpuTests();
     defer unlockGpuTests();
