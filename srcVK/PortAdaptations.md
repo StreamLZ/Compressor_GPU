@@ -1258,3 +1258,112 @@ healthy driver. A-028 stands. Operational lesson recorded: repeated
 VK TDRs degrade the NVIDIA VK driver until reboot
 (Win+Ctrl+Shift+B insufficient) - re-baseline any VK perf numbers
 taken after a TDR debugging session.
+
+### A-029: v4 #16 dict transport - BDA push constants instead of pointer launch params
+- **File:line**: `srcVK/decode/lz_decode_raw_kernel.comp` /
+  `lz_decode_kernel.comp` / `lz_decode_raw_pipelined_kernel.comp`
+  (Push blocks + DictRef), `srcVK/encode/lz_encode_kernel.comp`
+  (dict_addr + dict_ht_addr), `srcVK/decode/decode_dispatch.zig`
+  runLzPipeline, `srcVK/encode/encode_lz.zig` gpuCompressImpl
+- **CUDA reference**: kernels take `const uint8_t* dict, uint32_t
+  dict_len[, const uint32_t* dict_ht]` launch params (nullptr/0 on
+  dict-less frames)
+- **Class**: language-forced (no pointer kernel params in Vulkan)
+- **Why**: the dictionary (and the encoder's position table) ride as
+  buffer device addresses + length in the push constants - the same
+  v4 #5 / A-008 BDA pattern already proven for the entropy-scratch
+  regions and the encode hash table. Address 0 + len 0 mirrors
+  CUDA's nullptr; every dict dereference is gated on dict_len != 0
+  so the null reference is never followed.
+- **Risk if wrong**: dangling/wrong BDA reads (garbage matches or
+  device fault) on dict frames; accidental dereference at len 0.
+- **Static verification**: per-line diff of all probe/copy/classify
+  sites against the CUDA bodies (this wave).
+- **Runtime verification**: enwik8 `-D text` frames byte-identical
+  CUDA vs VK at L1/L3/L5 (cmp); VK decodes CUDA dict frames
+  byte-exact at L1/L3/L5; true-D2D dict decode verify-OK; dict-less
+  baseline SHA256 hashes reproduced on both backends.
+- **Discovered**: v4 #16 VK port wave (2026-06-12)
+- **Status**: ACTIVE
+
+### A-030: HAS_DICT specialization - macro instantiation sets (+ one runtime-gated kernel)
+- **File:line**: `srcVK/decode/lz_decode_raw.glsl` (_SLZ_DICT_* macro
+  sets + decodeSubChunkRawMode_{false,true}_dict),
+  `lz_decode_general.glsl` (_SLZ_GEN_COPY_*), `lz_dispatch.glsl`
+  (parseAndDecodeSubChunk[Raw]_dict textual twins),
+  `srcVK/encode/lz_greedy_parser.glsl` (scanBlock[_dict] over
+  _SLZ_SCAN_BLOCK_BODY with a LITERAL dict_on flag),
+  `lz_chain_parser.glsl` (probe-macro param)
+- **CUDA reference**: `template <bool HAS_DICT>` bodies; kernels
+  select instantiations on the frame-uniform `dict != nullptr`
+- **Class**: language-forced (no templates in GLSL), same pattern as
+  the A-001 / OFF16_SPLIT macro-textual specialization
+- **Why**: the OFF set of pluggable macros expands to the pre-dict
+  text exactly (the nvcc dead-code-elimination guarantee, reproduced
+  textually); kernels branch frame-uniformly on pc.dict_len between
+  the instantiation sets, exactly where CUDA branches on the
+  pointer. EXCEPTION: lz_decode_raw_pipelined_kernel.comp (opt-in,
+  TDR-gated, not production) uses runtime pc.dict_len gates inside
+  its plain GLSL functions instead of textual twins - duplicating
+  ~500 lines of hand-maintained functions was judged a worse risk
+  than a loop-invariant uniform branch. Its dict-less instruction
+  stream is NOT textually identical to pre-dict.
+- **Risk if wrong**: dict-less frames change bytes (encoder) or
+  output (decoder); perf cost on dict-less paths.
+- **Static verification**: OFF-set expansion compared against the
+  pre-wave macro text (this wave).
+- **Runtime verification**: dict-less cross-backend SHA gate
+  reproduced the UNCHANGED baseline hashes (d94701d8/ca8fb216/
+  547f9629) after the parser + decoder changes; dict-less decode
+  kernels bench at-or-faster than the PerfSweep baselines (L1 2.32
+  vs 3.04, L3 4.02 vs 5.15, L5 3.94 vs 5.19 ms). Pipelined kernel:
+  ptest_vk only (not production).
+- **Discovered**: v4 #16 VK port wave (2026-06-12)
+- **Status**: ACTIVE
+
+### A-031: v4 #20 chunk-table emission - host dst write instead of device append
+- **File:line**: `srcVK/encode/fast_framed.zig` (emit gate +
+  assembleFrame table write)
+- **CUDA reference**: `src/encode/fast_framed.zig:489-504` - CUDA
+  appends the footer to the DEVICE frame at
+  `d_output_override + frame_size` via cuMemcpyHtoD
+- **Class**: structural-limit (VkDeviceBuffer is a registry index;
+  handle + byte-offset arithmetic does not exist, and no
+  offset-capable H2D proc is exposed)
+- **Why**: the table bytes are written into the host `dst` at
+  [frame_size..] BEFORE the frame D2H (which covers only frame_size
+  bytes, so they survive it). Additional emit gate:
+  `d_output_override == 0` (host-output path only). The D2D-output
+  ABI carries no chunk-table option, so nothing reachable loses the
+  footer; if the option ever reaches the D2D path, the gate keeps
+  the header honest (flag never set when the table cannot be
+  emitted).
+- **Risk if wrong**: footer missing/garbled on some path while the
+  header flag promises it -> decoder status 14 on every D2D decode.
+- **Static verification**: wire computation (UNCOMPRESSED_CHUNK_
+  MARKER / internal-hdr forms) diffed against CUDA line-by-line.
+- **Runtime verification**: --chunk-table frames byte-identical CUDA
+  vs VK (cmp, enwik8 L1, incl. dict+table); VK host + D2D decode
+  verify-OK; corrupted-entry frame rejected (BadMode) via the walk
+  status readback.
+- **Discovered**: v4 #20 VK port wave (2026-06-12)
+- **Status**: ACTIVE
+
+### A-032: walk-status readback reads the whole meta block
+- **File:line**: `srcVK/decode/streamlz_decoder.zig`
+  decompressFramedFromDevice tail
+- **CUDA reference**: `src/decode/streamlz_decoder.zig:251-256` -
+  CUDA D2Hs 4 bytes from `d_meta + status_offset`
+- **Class**: structural-limit (same handle-arithmetic limit as A-025;
+  procs.d2h reads from offset 0 of a handle)
+- **Why**: D2H the whole 1536-byte A-025-strided meta block and index
+  the status slot (byte 1280) on the host. ~1.5 KB vs 4 B is noise
+  next to the per-submit floor the call already pays.
+- **Risk if wrong**: status misread -> hostile frames return success
+  (the exact silent-success hole this readback closes).
+- **Static verification**: offset cross-checked against
+  descriptors.walk_meta_offsets.
+- **Runtime verification**: corrupted table entry -> BadMode through
+  this readback (2026-06-12).
+- **Discovered**: v4 #20 VK port wave (2026-06-12)
+- **Status**: ACTIVE

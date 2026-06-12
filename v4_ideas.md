@@ -1066,10 +1066,9 @@ ratio gain). Decode cost of the serial-dependent-path routing showed
 up at this fire rate: LZ kernel 1.74 -> 2.53 ms (e2e 15.5 -> 15.9,
 PCIe-dominated). See follow-up (7).
 
-FOLLOW-UPS (in priority order): (1) VK port wave - the whole feature
-mirrors (registry done; encoder one-liner + decoder lookup + GLSL
-readBackRefByte in 3 shader bodies + the host table is
-backend-agnostic; cross-backend SHA gate then covers dict frames).
+FOLLOW-UPS (in priority order): (1) ~~VK port wave~~ ✅ DONE
+2026-06-12 (commits cc10bda + c4196f3 + 4629df8 + cc40284 - see the
+"VK PORT WAVE SHIPPED" block at the end of this entry).
 (2) ~~L5 chain-parser dict probe~~ ✅ DONE 2026-06-12 (same day):
 findMatchChain<HAS_DICT> probes the SAME greedy dict table (one
 hashKey6 at the probe site - the at_src word is already in hand) as
@@ -1190,6 +1189,50 @@ verification blocked (ERR_NVGPUCTRPERM, needs admin shell);
 counters + wall-clock are conclusive. ptest 61/0/0, ptest_vk
 155/9/0.
 
+**VK PORT WAVE SHIPPED 2026-06-12 (commits cc10bda, c4196f3,
+4629df8, cc40284 - the whole #16 feature + the #20 chunk table now
+mirror on Vulkan).** Sequence and proofs:
+- A1+A2 decode reach (cc10bda): readBackRefByte + warpMatchCopy[
+  Bounded]D in GLSL core; raw + general bodies grew a dict dimension
+  via pluggable macro parameters (the off16_read_macro pattern; OFF
+  set = pre-dict text exactly); _dict instantiations of both bodies
+  + textual _dict twins of both dispatchers; flat ENTIRELY-DICT pass
+  in the raw body; kernels select frame-uniformly on pc.dict_len.
+  Dict transport = BDA address + length in push constants (the v4 #5
+  pattern; PortAdaptations A-029/A-030). Host: d_dict cache,
+  registerDict, lazy upload, resolution replacing the reject. PROOF:
+  VK decodes CUDA-encoded dict frames byte-exact at L1/L3/L5.
+- A3+A4 encoder + surfaces (c4196f3, 4629df8): greedy + chain dict
+  probes (block 1 only - block-2 distances self-gate, CUDA-mirror),
+  bit-exact hashKey6 host twin + table builder, per-call arming, CLI
+  -D both directions, ABI dictionary_id + slzSetDictionary. FOUND +
+  FIXED the same latent ABI error-protocol bug CUDA's wave exposed
+  (positive codes read as byte counts; cores now negate). CUDA-side
+  residual: runOnWorker's spawn-failure still returns POSITIVE
+  OOM - one-liner follow-up. PROOF: dict frames byte-identical
+  CUDA vs VK at L1/L3/L5 (cmp); dict-less baseline SHA hashes
+  reproduced unchanged on both backends.
+- Wave B chunk table + D2D dict (cc40284): --chunk-table emission
+  (host-dst write, A-031), walk_frame_table_kernel.comp (1:1 port,
+  same status vocabulary incl. 14), table geometry + dispatcher in
+  decompressFramedFromDevice, host trailer-cursor fix, walk-status
+  readback (A-032 - closes the same silent-success hole), AND two
+  latent VK bugs found by the mirror: GLSL DICT_ID flag was 0x02
+  (the same wrong bit CUDA fixed; now 0x08) and the serial walk
+  still REJECTED dict frames (now skips the ID; true-D2D dict decode
+  works on VK). PROOF: table/dict/dict+table frames all verify-OK
+  through VK true-D2D (table walk drops kernel 2.844 -> 2.291 ms;
+  dict+table 2.063 ms); corrupted table entry -> BadMode;
+  dict+table frames byte-identical cross-backend.
+- Gates at the end: ptest 64/0/0, ptest_vk 155/9/0, vk_abi 1/1 +
+  async 5/5, dict-less VK decode kernels at-or-faster than the
+  PerfSweep baselines (L1 2.32/3.04, L3 4.02/5.15, L5 3.94/5.19 ms).
+- NOW UNBLOCKED: the #13 dict fuzz tier (differential CUDA-vs-VK
+  oracle) and the chunk-table default-on flip (both encoders emit
+  identical footers; flip is one Options default + SHA-gate
+  re-baseline). Remaining VK gap (documented, unreachable): the
+  D2D-OUTPUT encode path cannot append the footer (A-031).
+
 ## 20. D2D front-half: parallelize the frame walk (walk+prefix = 29% of D2D kernel time)
 
 **What**: `slzWalkFrameKernel` is a SINGLE GPU thread chasing the
@@ -1244,6 +1287,11 @@ kernel - the table walk already computes everything it needs);
 optional host-path table use (~10-150 us -> ~2 us, <=1% of e2e).
 Tests: footer splice + sum equation + roundtrips L1/L3/L5 + D2D
 table-walk decode + hostile corrupted-entry reject (ptest 64/0/0).
+VK MIRROR SHIPPED same day (cc40284, see the #16 VK PORT WAVE
+block): walk_frame_table_kernel.comp + emission + geometry +
+status readback; table frames byte-identical cross-backend; VK
+table walk drops the D2D kernel 2.844 -> 2.291 ms. The default-on
+flip is now unblocked on both backends.
 
 **Tier-3 design SETTLED with the user 2026-06-12:**
 - SIZES, not offsets: the descriptors need both, and each form
