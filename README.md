@@ -176,13 +176,20 @@ enables the LZ4-style whole-file XXH32 (flag bit 1). See FORMAT.md.
 
 Small records barely compress cold - every frame starts with no
 history. A preset dictionary gives the match finder shared context
-both sides already know: `streamlz -D <name>` on encode, automatic
-on decode (the frame header names its dictionary; the wire never
-carries dictionary bytes). Built-ins: json, html, text, xml, css,
-js, general (shared with the CPU sibling project), and
-github-users (trained on the bundled corpus). Train your own with
-`zig build dict_gate0`; C callers set `dictionary_id` in
-`slzCompressOpts_t`.
+both sides already know: `streamlz -D <name|file>` on encode,
+automatic on decode for built-ins (the frame header names its
+dictionary; the wire never carries dictionary bytes). Built-ins:
+json, html, text, xml, css, js, general (shared with the CPU
+sibling project), and github-users (trained on the bundled corpus).
+
+Custom dictionaries: train with `zig build dict_gate0`, then
+`-D path/to/your.dict` on both sides - the dictionary ID is derived
+from the content (XXH32), so decode verifies the supplied file
+against the frame and names the expected ID on mismatch. C callers
+register via `slzSetDictionary(ctx, bytes, len, &id)` and pass the
+ID in `slzCompressOpts_t.dictionary_id`; decompression (including
+the device-resident `slzDecompressAsync` path) resolves it
+automatically.
 
 Per-record benchmark (`zig build dict_bench`, 4,557 GitHub-API JSON
 records averaging 825 B, held-out from the dictionary's training

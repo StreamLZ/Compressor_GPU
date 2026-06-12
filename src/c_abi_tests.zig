@@ -361,6 +361,100 @@ test "C ABI: slzCompressAsync + slzDecompressAsync D2D roundtrip (NULL stream)" 
     }
 }
 
+test "C ABI: D2D dictionary frames - async encode, true-D2D decode, rejection (v4 #16)" {
+    gpu_roundtrip_tests.lockGpuTests();
+    defer gpu_roundtrip_tests.unlockGpuTests();
+    const allocator = testing.allocator;
+    const h = try createOrSkip();
+    defer _ = slzDestroy(h);
+
+    const malloc_fn = cuda.cuMemAlloc_fn orelse return error.SkipZigTest;
+    const free_fn = cuda.cuMemFree_fn orelse return error.SkipZigTest;
+    const h2d_fn = cuda.cuMemcpyHtoD_fn orelse return error.SkipZigTest;
+    const d2h_fn = cuda.cuMemcpyDtoH_fn orelse return error.SkipZigTest;
+    const sync_fn = cuda.cuCtxSynchronize_fn orelse return error.SkipZigTest;
+
+    // Random custom dictionary + a payload of near-disjoint dictionary
+    // slices: the frames produced here carry dict-reaching tokens, so
+    // the decode below exercises the dictionary path through the
+    // device-side frame walk and the dict-aware LZ kernels.
+    var prng = std.Random.DefaultPrng.init(0xd2d_d1c7);
+    const dict = try allocator.alloc(u8, 2048);
+    defer allocator.free(dict);
+    prng.random().bytes(dict);
+    var id: u32 = 0;
+    try testing.expectEqual(SLZ_SUCCESS, slzSetDictionary(h, dict.ptr, dict.len, &id));
+
+    var payload: [2080]u8 = undefined;
+    for (0..10) |r| {
+        const base = r * 208;
+        var dec_buf: [16]u8 = undefined;
+        const dec = std.fmt.bufPrint(&dec_buf, "==record {d:0>4}==", .{r * 37}) catch unreachable;
+        @memcpy(payload[base..][0..16], dec);
+        @memcpy(payload[base + 16 ..][0..192], dict[r * 180 ..][0..192]);
+    }
+
+    var bound: usize = 0;
+    try testing.expectEqual(SLZ_SUCCESS, slzCompressBound(h, payload.len, .{}, &bound));
+    var d_in: u64 = 0;
+    if (malloc_fn(&d_in, payload.len) != cuda.CUDA_SUCCESS) return error.SkipZigTest;
+    defer _ = free_fn(d_in);
+    var d_comp: u64 = 0;
+    if (malloc_fn(&d_comp, bound) != cuda.CUDA_SUCCESS) return error.SkipZigTest;
+    defer _ = free_fn(d_comp);
+    var d_out: u64 = 0;
+    if (malloc_fn(&d_out, payload.len + decoder.safe_space) != cuda.CUDA_SUCCESS) return error.SkipZigTest;
+    defer _ = free_fn(d_out);
+    if (h2d_fn(d_in, @ptrCast(&payload), payload.len) != cuda.CUDA_SUCCESS) return error.CopyFailed;
+
+    var comp_size: usize = 0;
+    for ([_]c_int{ 1, 5 }) |lvl| {
+        try testing.expectEqual(SLZ_SUCCESS, slzCompressAsync(
+            h,
+            @ptrFromInt(d_in),
+            payload.len,
+            @ptrFromInt(d_comp),
+            bound,
+            &comp_size,
+            .{ .level = lvl, .dictionary_id = @bitCast(id) },
+            null,
+        ));
+        if (sync_fn() != cuda.CUDA_SUCCESS) return error.SyncFailed;
+
+        try testing.expectEqual(SLZ_SUCCESS, slzDecompressAsync(
+            h,
+            @ptrFromInt(d_comp),
+            comp_size,
+            @ptrFromInt(d_out),
+            payload.len,
+            .{},
+            null,
+        ));
+        if (sync_fn() != cuda.CUDA_SUCCESS) return error.SyncFailed;
+
+        var dst: [payload.len]u8 = undefined;
+        @memset(&dst, 0x55);
+        if (d2h_fn(@ptrCast(&dst), d_out, payload.len) != cuda.CUDA_SUCCESS) return error.CopyFailed;
+        try testing.expectEqualSlices(u8, &payload, &dst);
+    }
+
+    // A handle that never registered the dictionary rejects the D2D
+    // frame with CORRUPT_FRAME (UnknownDictionary), not the silent
+    // fallback UNSUPPORTED.
+    var h2: Handle = null;
+    try testing.expectEqual(SLZ_SUCCESS, slzCreate(&h2));
+    defer _ = slzDestroy(h2);
+    try testing.expectEqual(SLZ_ERROR_CORRUPT_FRAME, slzDecompressAsync(
+        h2,
+        @ptrFromInt(d_comp),
+        comp_size,
+        @ptrFromInt(d_out),
+        payload.len,
+        .{},
+        null,
+    ));
+}
+
 // ── Timings drain ──────────────────────────────────────────────────
 
 test "C ABI: slzGetLastTimings and slzWaitAndGetLastTimings drain contract" {

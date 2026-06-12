@@ -1123,6 +1123,49 @@ dict-reaching offsets). (6) Custom-dictionary registration API
   CAN read the dict ID there - the actual blockers are the hardcoded
   `block_start = 14+8+8` (off by 4 on dict frames) and the walk
   kernel's device-side header parse skipping the ID field.
+
+**Custom-dictionary wave SHIPPED 2026-06-12 (CUDA finalization).**
+- Registration core: `dictionary.customId` (0x10000000 | XXH32),
+  `RegisteredDict` stores on BOTH contexts (context-owned copies,
+  freed in deinit), `resolve()` = registered-first-then-builtins at
+  all three resolution points (encoder validation, encoder arming,
+  decoder lookup).
+- CLI: `-D <path>` on compress (loads + registers + prints the ID)
+  and on decompress/-db (registers + VERIFIES against the frame ID;
+  mismatch names both IDs; a custom-dict frame without -D names the
+  needed ID). Builtins unchanged: name/id/auto on encode, automatic
+  on decode.
+- C ABI: `slzSetDictionary(ctx, bytes, len, &id)` registers both
+  directions of a handle. Found + fixed a LATENT ERROR-PROTOCOL BUG:
+  the codec cores returned positive SLZ_ERROR_* codes where the
+  worker-job protocol required negatives, so EVERY codec error
+  through slzCompressHost/slzDecompressHost reported success with
+  output_size = the error code (no prior test drove a codec error
+  through the worker path).
+- True-D2D dict decode SHIPPED: block offsets derived from the
+  parsed header (was hardcoded 14+8+8, off by 4 on dict frames),
+  walk kernel skips the 4-byte ID field, host resolves the ID from
+  its existing 64-byte header readback and passes the dict as launch
+  params. Found + fixed a SECOND latent bug: the device-side
+  SLZ_FRAME_FLAG_DICT_ID_PRESENT was 0x02 (the content-CHECKSUM bit)
+  instead of 0x08 - harmless while the walk rejected all flagged
+  frames, garbage block parses once the skip depended on it (caught
+  by the D2D dict roundtrip test as wrong-from-byte-0 output).
+- Device-resident dictionary SET: DROPPED (recorded decision). Its
+  driving use case (on-device ID resolution for D2D) dissolved when
+  the header-readback path proved sufficient; the residual benefit
+  is ~10 us per dict SWITCH in mixed-dict batches - not worth the
+  blob/index machinery. Revisit only if mixed-dict batch thrash
+  measures as real.
+- Dict FUZZ tier: deferred to the VK wave on purpose - the
+  differential CUDA-vs-VK oracle is the whole point of #13 tier 3,
+  and VK cannot decode dict frames until the port lands.
+- Sanitizer: memcheck CLEAN on dict roundtrips (web.txt L1+L5);
+  racecheck shows 2 pre-existing hazards in the no-dict pipelined
+  kernel - identical with/without dict, recorded as NEW EVIDENCE
+  under #18 (likely its first direct signature).
+- Gates: ptest 63/0/0 (slzSetDictionary contract test + D2D dict
+  roundtrip test added); CLI smoke all three decode UX paths.
 (7) ~~Flat dict-match decode pass~~ ✅ DONE 2026-06-12 (same day).
 Attribution first via new gated counters in fillBatch
 (g_slz_match_total/g_slz_match_dep, SLZ_COUNT_PP pattern, readback
@@ -1244,6 +1287,19 @@ from the failure moment incl. VK-CUDA driver interleaving): 99
 cycles, 0 failures. ~280 suite executions today, 1 hit total. Suspect
 ranking unchanged (K=4 pipeline serial/prime boundary), mitigation
 SLZ_NO_PIPELINE=1.
+**NEW EVIDENCE 2026-06-12 (from the v4 #16 sanitizer pass):**
+compute-sanitizer RACECHECK reports a read/write SHARED-MEMORY race
+inside `decodeSubChunkRawModePipelined<false,false>` - the plain
+no-dict instantiation - at SASS +0x59e0 (read) vs +0x5a00 (write),
+~1200 hazard instances per web.txt L1 roundtrip, reproducible every
+run. Pre-existing (identical with and without a dictionary; first
+racecheck since the K=4 pipeline shipped 2026-06-11). This is the
+first DIRECT evidence consistent with the #18 suspect ranking: a
+genuine race in the pipelined kernel's shared state. NEXT: rebuild
+PTX with -lineinfo and re-run racecheck to map the offsets to source
+(candidates: the s_have double-buffer flags, the PipeBatch slot
+handoff, or s_state/s_long broadcast), then audit the barrier that
+should separate them. Until fixed, #18's mitigation stands.
 
 **Detection sub-item (2026-06-11, from "does the software KNOW it
 fails?"):** today, NO by default -- silent wrong bytes; only test

@@ -728,9 +728,11 @@ export fn slzDecompressAsync(
     const rc = true_job.result;
     if (rc >= 0) return SLZ_SUCCESS;
     // The async path can't bounce through the host on the caller's
-    // behalf. If the TrueD2D shape isn't satisfied (dict frame / PDM /
-    // multi-block / size out of bounds), return SLZ_ERROR_UNSUPPORTED
-    // so the caller can retry via slzDecompressHost.
+    // behalf. If the TrueD2D shape isn't satisfied (PDM / multi-block /
+    // size out of bounds - dictionary frames ARE supported since
+    // v4 #16, given the dictionary is built-in or was registered via
+    // slzSetDictionary), return SLZ_ERROR_UNSUPPORTED so the caller
+    // can retry via slzDecompressHost.
     if (true_job.fall_back) return SLZ_ERROR_UNSUPPORTED;
     return -rc;
 }

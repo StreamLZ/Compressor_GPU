@@ -81,9 +81,16 @@ static constexpr uint8_t  SLZ_CODEC_FAST_LZ         = 1; // Codec.fast_lz
 static constexpr uint32_t SLZ_FRAME_MIN_HDR_SIZE    = 14;
 static constexpr uint32_t SLZ_FRAME_END_MARK        = 0;
 
-// Frame-header flag bits (byte 5 of the frame header).
+// Frame-header flag bits (byte 5 of the frame header). Host twin:
+// format/frame_format.zig FrameFlags (bit 0 = content size, bit 1 =
+// content checksum, bit 2 = block checksums, bit 3 = dictionary ID).
+// DICT_ID was wrongly 0x02 (the content-checksum bit) until v4 #16
+// made the walk kernel actually parse dictionary frames - harmless
+// while every flagged frame was rejected, catastrophic once the
+// 4-byte skip depended on it (found by the D2D dict roundtrip test:
+// the block parse landed 4 bytes early and produced garbage descs).
 static constexpr uint8_t  SLZ_FRAME_FLAG_CONTENT_SIZE_PRESENT = 0x01;
-static constexpr uint8_t  SLZ_FRAME_FLAG_DICT_ID_PRESENT      = 0x02;
+static constexpr uint8_t  SLZ_FRAME_FLAG_DICT_ID_PRESENT      = 0x08;
 
 // Block-header bits (4-byte LE word at block start).
 static constexpr uint32_t SLZ_BLOCK_UNCOMP_FLAG     = 0x80000000u;

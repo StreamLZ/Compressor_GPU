@@ -133,9 +133,11 @@ pub fn decompressFramedThreaded(
 /// metadata) — the v3 contract requires it.
 ///
 /// Accepts only the slzCompress-shape frame: Fast codec, single block,
-/// content_size present, sc_group ≤ 1.0, no dictionary. Anything else
-/// returns `error.BadMode` and the C ABI falls back to the host-bounce
-/// entry points.
+/// content_size present, sc_group ≤ 1.0. Dictionary frames are
+/// supported (v4 #16): the ID is read from the ≤64-byte header D2H and
+/// resolved against the context's registered dictionaries + builtins.
+/// Other shapes return `error.BadMode` and the C ABI falls back to the
+/// host-bounce entry points.
 pub fn decompressFramedFromDevice(
     io: ?std.Io,
     d_frame: u64,
@@ -144,11 +146,12 @@ pub fn decompressFramedFromDevice(
     dec_ctx: *gpu_driver.DecodeContext,
     decomp_size: u32,
 ) DecompressError!u32 {
-    // Frame layout: [hdr 14][content_size 8][block_hdr 8][block][end 4]
-    const fixed_overhead: u32 = 14 + 8 + 8 + 4;
-    if (frame_size < fixed_overhead + 1) return error.BadMode;
-    const block_start: u32 = 14 + 8 + 8;
-    const block_size: u32 = frame_size - fixed_overhead;
+    // Frame layout: [hdr 14][content_size 8][dict_id 4?][block_hdr 8]
+    // [block][end 4]. The header is variable (dict frames carry 4 more
+    // bytes), so the block offsets are derived from the parsed header
+    // below - the ≤64-byte D2H already happens for the codec level.
+    const min_overhead: u32 = 14 + 8 + 8 + 4;
+    if (frame_size < min_overhead + 1) return error.BadMode;
 
     // sc_group=0.25 → effective chunk size of 64 KB, the smallest the
     // GPU encoder produces. The walk kernel writes the real chunk count
@@ -169,12 +172,25 @@ pub fn decompressFramedFromDevice(
     if (!gpu_driver.copyDeviceToHost(hdr_buf[0..hdr_n], d_frame)) return error.BadMode;
     const parsed_hdr = frame.parseHeader(hdr_buf[0..]) catch return error.BadMode;
 
-    // v4 #16: dictionary frames carry 4 extra header bytes, which
-    // breaks this function's fixed `block_start` layout above (and the
-    // device walk does not know the dictionary either). Reject with
-    // BadMode so the C ABI falls back to the host-bounce path, where
-    // the registry resolution applies.
-    if (parsed_hdr.dictionary_id != null) return error.BadMode;
+    // Block offsets follow the variable-length header (dict frames
+    // carry 4 extra ID bytes; header_size accounts for it).
+    const block_start: u32 = @intCast(parsed_hdr.header_size + 8);
+    if (frame_size < block_start + 4 + 1) return error.BadMode;
+    const block_size: u32 = frame_size - block_start - 4;
+
+    // v4 #16: resolve the frame's dictionary (registered store first,
+    // then builtins) and make it device-resident. An unresolvable ID
+    // is a real error, not a fall-back shape - the host-bounce path
+    // could not resolve it either.
+    var d_dict: u64 = 0;
+    var dict_len: u32 = 0;
+    if (parsed_hdr.dictionary_id) |did| {
+        const data = dictionary.resolve(dec_ctx.registered_dicts.items, did) orelse
+            return error.UnknownDictionary;
+        try gpu_driver.ensureDictOnDevice(dec_ctx, did, data);
+        d_dict = dec_ctx.d_dict;
+        dict_len = dec_ctx.dict_cached_len;
+    }
 
     const dev = try gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size);
 
@@ -200,6 +216,8 @@ pub fn decompressFramedFromDevice(
         .d_compressed_src = d_frame + block_start,
         .d_chunk_descs_override = dev.d_chunk_descs,
         .d_n_chunks_dev = dev.d_meta + gpu_driver.walk_meta_offsets.n_chunks,
+        .d_dict = d_dict,
+        .dict_len = dict_len,
     });
     return decomp_size;
 }

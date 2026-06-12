@@ -16,15 +16,18 @@
 // entry; legacy host-bounce paths keep their CPU walk.
 //
 // Scope: handles the slzCompress output shape - Fast codec, no
-// dictionary, no parallel-decode-metadata, no checksums. Sets d_status
-// non-zero on any unsupported feature so the wrapper can fall back.
+// parallel-decode-metadata, no checksums. Dictionary frames walk
+// normally (v4 #16) - the host resolves the dictionary ID. Sets
+// d_status non-zero on any unsupported feature so the wrapper can
+// fall back.
 //
 // Status codes (must match decode/driver.zig FrameWalkStatus):
 //   0 = success
 //   1 = bad magic                  6 = block header truncated
 //   2 = unsupported version        7 = bad internal block magic
 //   3 = unsupported codec          8 = bad decoder type
-//   4 = dictionary present         9 = chunk header truncated
+//   4 = retired (was: dictionary   9 = chunk header truncated
+//       present - pre-v4 #16)
 //   5 = pdm flag / checksums set  10 = bad chunk type
 //  11 = chunk_descs buffer overflow
 //  12 = frame truncated mid-block
@@ -82,8 +85,12 @@ extern "C" __global__ void slzWalkFrameKernel(
     uint32_t pos = SLZ_FRAME_MIN_HDR_SIZE;
     const bool content_size_present = (flags & SLZ_FRAME_FLAG_CONTENT_SIZE_PRESENT) != 0;
     const bool dict_id_present      = (flags & SLZ_FRAME_FLAG_DICT_ID_PRESENT) != 0;
-    if (dict_id_present) { *d_status = 4; return; }
     if (content_size_present) pos += 8;
+    // v4 #16: dictionary frames walk normally - the 4-byte ID follows
+    // the optional content size; the HOST resolves it (it already
+    // reads the header back for the codec level) and supplies the
+    // dictionary to the LZ kernels as launch params.
+    if (dict_id_present) pos += 4;
     // No PDM / checksums on the slzCompress path; the loop below
     // rejects them if encountered (status 5).
 
