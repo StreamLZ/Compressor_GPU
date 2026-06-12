@@ -21,6 +21,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
         try w.flush();
         std.process.exit(1);
     };
+
+    // v4 #16: supply/verify a custom dictionary before benching.
+    util.supplyDecodeDictionary(allocator, io, args.dictionary, hdr.dictionary_id, w, &gpu_dec_driver.g_default);
+
     const content_size: usize = if (hdr.content_size) |cs| @intCast(cs) else {
         try w.writeAll("error: frame has no content size; bench needs a sized frame\n");
         try w.flush();

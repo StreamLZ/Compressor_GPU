@@ -11,6 +11,7 @@ const std = @import("std");
 const cuda_ffi = @import("cuda_ffi.zig");
 const module_loader = @import("module_loader.zig");
 const gpu_decode = @import("../decode/driver.zig");
+const dictionary = @import("../dict/dictionary.zig");
 
 const CUdeviceptr = cuda_ffi.CUdeviceptr;
 
@@ -175,6 +176,10 @@ pub const EncodeContext = struct {
     dict_cached_len: u32 = 0,
     dict_cached_hash_bits: u32 = 0,
     dict_armed: bool = false,
+    /// v4 #16 custom dictionaries: caller-registered dictionaries
+    /// (context-owned copies, freed in deinit). Resolution order:
+    /// this store first, then the builtin registry.
+    registered_dicts: std.ArrayList(dictionary.RegisteredDict) = .empty,
 
     // ── v4 #17: pinned host staging for the LZ compressed-chunk
     // gather (reverse-port of VK's ensureD2hFinalBuf shape). Grow-only,
@@ -333,6 +338,10 @@ pub const EncodeContext = struct {
     pub fn deinit(self: *EncodeContext, allocator: std.mem.Allocator) void {
         self.releaseDeviceBuffers();
 
+        for (self.registered_dicts.items) |r| allocator.free(r.data);
+        self.registered_dicts.deinit(allocator);
+        self.registered_dicts = .empty;
+
         if (self.assembled_offsets) |s| { allocator.free(s); self.assembled_offsets = null; }
         if (self.assembled_sizes) |s| { allocator.free(s); self.assembled_sizes = null; }
 
@@ -348,6 +357,22 @@ pub const EncodeContext = struct {
 
         self.pending_timings.deinit(std.heap.page_allocator);
         self.last_timings.deinit(std.heap.page_allocator);
+    }
+
+    /// v4 #16: register a custom dictionary on this context. The bytes
+    /// are copied (context-owned, freed by deinit); the returned ID is
+    /// content-derived (`dictionary.customId`) and is what
+    /// `Options.dictionary_id` and the frame header carry. Registering
+    /// the same content again is a no-op returning the same ID.
+    pub fn registerDict(self: *EncodeContext, allocator: std.mem.Allocator, data: []const u8) !u32 {
+        const id = dictionary.customId(data);
+        for (self.registered_dicts.items) |r| {
+            if (r.id == id) return id;
+        }
+        const copy = try allocator.dupe(u8, data);
+        errdefer allocator.free(copy);
+        try self.registered_dicts.append(allocator, .{ .id = id, .data = copy });
+        return id;
     }
 };
 

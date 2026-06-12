@@ -138,8 +138,10 @@ pub fn compressFramedOne(
     enc_ctx.dict_armed = false;
     if (opts.dictionary_id) |did| {
         const dict_registry = @import("../dict/dictionary.zig");
-        const info = dict_registry.findById(did) orelse unreachable;
-        if (!gpu_enc.ensureDictOnDevice(enc_ctx, allocator, did, info.data, levels.hashBitsForLevel(opts.level)))
+        // Registered store first, then builtins; compressFramedWithIo
+        // already validated resolvability.
+        const data = dict_registry.resolve(enc_ctx.registered_dicts.items, did) orelse unreachable;
+        if (!gpu_enc.ensureDictOnDevice(enc_ctx, allocator, did, data, levels.hashBitsForLevel(opts.level)))
             return error.DestinationTooSmall;
         enc_ctx.dict_armed = true;
     }

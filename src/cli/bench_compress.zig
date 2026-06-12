@@ -33,7 +33,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer, args: ut
     const comp_opts: encoder.Options = .{
         .level = args.level,
         .sc_group_size_override = args.sc_group,
-        .dictionary_id = util.resolveDictionary(args.dictionary, in_path, w),
+        .dictionary_id = util.resolveDictionary(allocator, io, args.dictionary, in_path, w, &gpu_enc_driver.g_default),
     };
 
     var comp_size: usize = try encoder.compressFramedWithIo(allocator, io, src, compressed, comp_opts, &gpu_enc_driver.g_default);

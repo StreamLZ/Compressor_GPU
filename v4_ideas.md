@@ -1081,7 +1081,10 @@ distances always exceed pos, the existing `pos > actual_offset`
 guard is never true for them). MEASURED: held-out github_users L5
 52.4% -> **28.1%** (1.86x, the best ratio of any level) with encode
 12% FASTER (4535 -> 3984 ms - the parser stops striding through
-unmatched literals); enwik8 + text dict L5 39.58% -> **38.33%**.
+unmatched literals); enwik8 + text dict L5 39.58% -> **38.33%**
+(encode kernel +2.5%, decode kernel 2.96 -> 3.15 ms / e2e +1.4% -
+the same more-matches residual as L1, served by the flat dict pass
+through the general pipelined kernel's shared body).
 The ratio test now asserts a reduction bar at ALL five levels (20%
 greedy / 10% L5 - the lazy parser already captures inter-record
 redundancy, so the dict's marginal lift is structurally smaller).
@@ -1093,6 +1096,33 @@ dict decode via registered-dict validation + the #19 verdict surface.
 the next milestone. (5) #13 fuzz tier for dict frames (mutate IDs +
 dict-reaching offsets). (6) Custom-dictionary registration API
 (slzSetDictionary) when an external caller needs non-builtin dicts.
+
+**Custom-dictionary design settled 2026-06-12 (discussion):**
+- Explicit-supply model on BOTH sides (the zstd shape): the caller
+  names the dictionary at the call site - CLI `-D <builtin-name |
+  path>`, C ABI `slzSetDictionary(ctx, bytes, len)`. No folder
+  scanning, no discovery problem: the host was handed the bytes.
+- Custom IDs are CONTENT-DERIVED: `0x10000000 | XXH32(dict bytes)`
+  (the OR keeps them in the reserved custom range, clear of builtin
+  IDs 1-8). Deterministic across machines and the CPU sibling; the
+  trainer's raw output format stays unchanged.
+- Decode VERIFIES the supplied dictionary against the frame's ID and
+  fails naming the expected ID on mismatch - never trusts blindly
+  (wrong bytes would otherwise surface as ChecksumMismatch after a
+  full decode instead of a clear header-time error). Builtins keep
+  resolving automatically from the frame ID with no flag.
+- Device-resident dictionary SET on the DecodeContext (one blob +
+  {id, offset, len} index, populated from registry + registrations):
+  kills the one-slot cache thrash on mixed-dict batches and lets the
+  D2D walk kernel resolve IDs on-device (unknown -> walk status
+  word). DECODE ONLY - encode keeps the lazy per-dict table cache
+  (the host always knows its ID; the 512 KB hashKey6 tables are the
+  expensive artifact, never eager-build them for a whole folder).
+- True-D2D dict decode is mechanical, not architectural: the path
+  already D2Hs 64 header bytes (for the codec level), so the host
+  CAN read the dict ID there - the actual blockers are the hardcoded
+  `block_start = 14+8+8` (off by 4 on dict frames) and the walk
+  kernel's device-side header parse skipping the ID field.
 (7) ~~Flat dict-match decode pass~~ ✅ DONE 2026-06-12 (same day).
 Attribution first via new gated counters in fillBatch
 (g_slz_match_total/g_slz_match_dep, SLZ_COUNT_PP pattern, readback

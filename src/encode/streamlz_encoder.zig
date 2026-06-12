@@ -146,7 +146,7 @@ pub fn compressFramedWithIo(
     if (dst.len < compressBound(src.len)) return error.DestinationTooSmall;
     if (opts.dictionary_id) |did| {
         const dict = @import("../dict/dictionary.zig");
-        if (dict.findById(did) == null) return error.UnknownDictionary;
+        if (dict.resolve(enc_ctx.registered_dicts.items, did) == null) return error.UnknownDictionary;
     }
     var frame_len = try fast_framed.compressFramedOne(allocator, io, src, dst, opts, enc_ctx);
     if (opts.content_checksum) {

@@ -46,7 +46,8 @@ const CompressOpts = extern struct {
     level: c_int = 5,
     enable_profiling: c_int = 0,
     effective_level_out: c_int = 0,
-    reserved: [5]c_int = @splat(0),
+    dictionary_id: c_int = 0,
+    reserved: [4]c_int = @splat(0),
 };
 const DecompressOpts = extern struct {
     enable_profiling: c_int = 0,
@@ -72,6 +73,7 @@ extern fn slzCompressHost(handle: Handle, input: ?*const anyopaque, input_size: 
 extern fn slzDecompressHost(handle: Handle, frame_in: ?*const anyopaque, frame_size: usize, output: ?*anyopaque, output_capacity: usize, output_size: ?*usize, opts: DecompressOpts) c_int;
 extern fn slzCompressAsync(handle: Handle, d_input: ?*const anyopaque, input_size: usize, d_output: ?*anyopaque, max_compressed_size: usize, compressed_size: ?*usize, opts: CompressOpts, stream: ?*anyopaque) c_int;
 extern fn slzDecompressAsync(handle: Handle, d_frame: ?*const anyopaque, frame_size: usize, d_output: ?*anyopaque, output_size: usize, opts: DecompressOpts, stream: ?*anyopaque) c_int;
+extern fn slzSetDictionary(handle: Handle, dict: ?*const anyopaque, dict_size: usize, id_out: ?*u32) c_int;
 extern fn slzGetLastTimings(handle: Handle, timings: ?[*]KernelTimingC, capacity: usize, count_out: ?*usize) c_int;
 extern fn slzWaitAndGetLastTimings(handle: Handle, stream: ?*anyopaque, timings: ?[*]KernelTimingC, capacity: usize, count_out: ?*usize) c_int;
 
@@ -409,4 +411,79 @@ test "C ABI: slzGetLastTimings and slzWaitAndGetLastTimings drain contract" {
     // The wait-variant with a NULL stream behaves like the plain call.
     var count3: usize = 0;
     try testing.expectEqual(SLZ_SUCCESS, slzWaitAndGetLastTimings(h, null, null, 0, &count3));
+}
+
+test "C ABI: slzSetDictionary registration, ratio benefit, roundtrip, rejection" {
+    gpu_roundtrip_tests.lockGpuTests();
+    defer gpu_roundtrip_tests.unlockGpuTests();
+    const allocator = testing.allocator;
+    const h = try createOrSkip();
+    defer _ = slzDestroy(h);
+
+    // Arg validation.
+    var id: u32 = 0;
+    try testing.expectEqual(SLZ_ERROR_INVALID_HANDLE, slzSetDictionary(null, "x", 1, &id));
+    try testing.expectEqual(SLZ_ERROR_INVALID_ARG, slzSetDictionary(h, null, 1, &id));
+    try testing.expectEqual(SLZ_ERROR_INVALID_ARG, slzSetDictionary(h, "x", 0, &id));
+
+    // Register a 2 KB custom dictionary of RANDOM bytes; ID is
+    // content-derived and in the custom range. Re-registering returns
+    // the same ID. (Random content matters: the payload below is
+    // explainable ONLY via the dictionary, so the ratio assertion
+    // cleanly separates dict matching from self-similarity.)
+    var prng = std.Random.DefaultPrng.init(0x517_d1c7);
+    const dict = try allocator.alloc(u8, 2048);
+    defer allocator.free(dict);
+    prng.random().bytes(dict);
+    try testing.expectEqual(SLZ_SUCCESS, slzSetDictionary(h, dict.ptr, dict.len, &id));
+    try testing.expect(id >= 0x1000_0000);
+    var id2: u32 = 0;
+    try testing.expectEqual(SLZ_SUCCESS, slzSetDictionary(h, dict.ptr, dict.len, &id2));
+    try testing.expectEqual(id, id2);
+
+    // Payload = near-disjoint 192-byte dictionary slices with unique
+    // decorations: nothing for intra-window matching, everything for
+    // the dictionary.
+    var payload: [2080]u8 = undefined;
+    for (0..10) |r| {
+        const base = r * 208;
+        var dec_buf: [16]u8 = undefined;
+        const dec = std.fmt.bufPrint(&dec_buf, "==record {d:0>4}==", .{r * 37}) catch unreachable;
+        @memcpy(payload[base..][0..16], dec);
+        @memcpy(payload[base + 16 ..][0..192], dict[r * 180 ..][0..192]);
+    }
+    var bound: usize = 0;
+    try testing.expectEqual(SLZ_SUCCESS, slzCompressBound(h, payload.len, .{}, &bound));
+    const comp = try allocator.alloc(u8, bound);
+    defer allocator.free(comp);
+
+    var n_plain: usize = 0;
+    try testing.expectEqual(SLZ_SUCCESS, slzCompressHost(h, &payload, payload.len, comp.ptr, bound, &n_plain, .{ .level = 1 }));
+    var n_dict: usize = 0;
+    try testing.expectEqual(SLZ_SUCCESS, slzCompressHost(h, &payload, payload.len, comp.ptr, bound, &n_dict, .{
+        .level = 1,
+        .dictionary_id = @bitCast(id),
+    }));
+    try testing.expect(n_dict < n_plain);
+
+    const out = try allocator.alloc(u8, payload.len + 64);
+    defer allocator.free(out);
+    var written: usize = 0;
+    try testing.expectEqual(SLZ_SUCCESS, slzDecompressHost(h, comp.ptr, n_dict, out.ptr, out.len, &written, .{}));
+    try testing.expectEqual(payload.len, written);
+    try testing.expectEqualSlices(u8, &payload, out[0..payload.len]);
+
+    // Unregistered IDs are rejected at compress time (UNSUPPORTED); a
+    // FRESH handle that never registered the dictionary rejects the
+    // frame at decompress time (UnknownDictionary maps to
+    // CORRUPT_FRAME on the decode surface).
+    var n3: usize = 0;
+    try testing.expectEqual(SLZ_ERROR_UNSUPPORTED, slzCompressHost(h, &payload, payload.len, comp.ptr, bound, &n3, .{
+        .level = 1,
+        .dictionary_id = @bitCast(@as(u32, 0x1234_5678)),
+    }));
+    var h2: Handle = null;
+    try testing.expectEqual(SLZ_SUCCESS, slzCreate(&h2));
+    defer _ = slzDestroy(h2);
+    try testing.expectEqual(SLZ_ERROR_CORRUPT_FRAME, slzDecompressHost(h2, comp.ptr, n_dict, out.ptr, out.len, &written, .{}));
 }

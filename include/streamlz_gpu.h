@@ -154,6 +154,20 @@ typedef struct slzDecompressOpts_t {
 /* Default options (profiling off). */
 slzDecompressOpts_t slzDecompressDefaultOpts(void);
 
+/* ---- Custom dictionaries --------------------------------------------- */
+/* Register a custom dictionary on this handle for both directions.
+ * The bytes are copied (released at slzDestroy). The dictionary ID is
+ * content-derived (XXH32 of the bytes, forced into the custom range
+ * >= 0x10000000) and written to *id_out: pass it as
+ * slzCompressOpts_t.dictionary_id when compressing; decompression
+ * resolves it automatically from the frame header. Built-in IDs
+ * (1..8) need no registration. Both encoder and decoder must register
+ * the same bytes - the ID being content-derived makes agreement
+ * verifiable. Registering identical content twice is a no-op that
+ * returns the same ID. */
+slzStatus_t slzSetDictionary(slzContext_t ctx, const void* dict,
+                             size_t dict_size, uint32_t* id_out);
+
 /* ---- Per-kernel profiling ------------------------------------------- */
 /* Returned by slzGetLastTimings when enable_profiling was set on the
  * most recent compress/decompress call. `name` is a static null-terminated

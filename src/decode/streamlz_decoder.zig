@@ -254,10 +254,11 @@ fn decompressFrameInner(
     // inputs) therefore decode without touching the GPU at all - the
     // eager-upload variant failed them with BackendNotAvailable
     // before any dispatch had initialized the driver.
-    var dict_info: ?*const dictionary.DictInfo = null;
+    var dict_bytes: ?[]const u8 = null;
     var dict_id: u32 = 0;
     if (hdr.dictionary_id) |did| {
-        dict_info = dictionary.findById(did) orelse return error.UnknownDictionary;
+        dict_bytes = dictionary.resolve(dec_ctx.registered_dicts.items, did) orelse
+            return error.UnknownDictionary;
         dict_id = did;
     }
 
@@ -331,8 +332,8 @@ fn decompressFrameInner(
         // device-resident now (cached; see the resolution above).
         var d_dict: u64 = 0;
         var dict_len: u32 = 0;
-        if (dict_info) |info| {
-            try gpu_driver.ensureDictOnDevice(dec_ctx, dict_id, info.data);
+        if (dict_bytes) |data| {
+            try gpu_driver.ensureDictOnDevice(dec_ctx, dict_id, data);
             d_dict = dec_ctx.d_dict;
             dict_len = dec_ctx.dict_cached_len;
         }

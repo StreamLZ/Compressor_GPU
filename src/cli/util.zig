@@ -98,11 +98,20 @@ pub fn die(w: *std.Io.Writer, msg: []const u8) noreturn {
     std.process.exit(2);
 }
 
-/// v4 #16: resolve the `-D` value to a dictionary ID. Accepts a
-/// registry name, a numeric ID, or "auto" (select by the input path's
-/// extension, falling back to the "general" dictionary). Exits with a
-/// message naming the available dictionaries on failure.
-pub fn resolveDictionary(spec: ?[]const u8, input_path: []const u8, w: *std.Io.Writer) ?u32 {
+/// v4 #16: resolve the `-D` value to a dictionary ID for COMPRESSION.
+/// Accepts, in order: a registry name, a numeric builtin ID, "auto"
+/// (select by the input path's extension), or a path to a custom
+/// dictionary file - the file's bytes are registered on `enc_ctx`
+/// and the content-derived ID is returned. Exits with a message
+/// naming the available dictionaries on failure.
+pub fn resolveDictionary(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    spec: ?[]const u8,
+    input_path: []const u8,
+    w: *std.Io.Writer,
+    enc_ctx: *@import("../encode/driver.zig").EncodeContext,
+) ?u32 {
     const dictionary = @import("../dict/dictionary.zig");
     const s = spec orelse return null;
     if (eql(s, "auto")) {
@@ -113,11 +122,93 @@ pub fn resolveDictionary(spec: ?[]const u8, input_path: []const u8, w: *std.Io.W
     if (std.fmt.parseInt(u32, s, 10) catch null) |id| {
         if (dictionary.findById(id)) |d| return d.id;
     }
+    if (loadDictFile(allocator, io, s)) |bytes| {
+        defer allocator.free(bytes);
+        const id = enc_ctx.registerDict(allocator, bytes) catch
+            die(w, "error: out of memory registering dictionary\n");
+        w.print("dictionary: {s} ({d} bytes, id 0x{x:0>8})\n", .{ s, bytes.len, id }) catch {};
+        return id;
+    }
     w.print("error: unknown dictionary '{s}'; available:", .{s}) catch {};
     for (dictionary.builtin_dicts) |*d| w.print(" {s}", .{d.name}) catch {};
-    w.writeAll(" auto\n") catch {};
+    w.writeAll(" auto, or a path to a dictionary file\n") catch {};
     w.flush() catch {};
     std.process.exit(2);
+}
+
+/// v4 #16: decode-side `-D` - supply a dictionary for the frame about
+/// to be decoded and VERIFY it against the frame's dictionary ID
+/// (mismatch exits naming both IDs, far clearer than the wrong-bytes
+/// ChecksumMismatch a blind decode would produce). Builtins resolve
+/// automatically from the frame header with no flag; without -D, a
+/// frame needing a custom dictionary gets a message naming the ID to
+/// go find.
+pub fn supplyDecodeDictionary(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    spec: ?[]const u8,
+    frame_dict_id: ?u32,
+    w: *std.Io.Writer,
+    dec_ctx: *@import("../decode/driver.zig").DecodeContext,
+) void {
+    const dictionary = @import("../dict/dictionary.zig");
+    const gpu_dec = @import("../decode/driver.zig");
+    const s = spec orelse {
+        if (frame_dict_id) |fid| {
+            if (dictionary.findById(fid) == null) {
+                w.print(
+                    "error: frame requires dictionary 0x{x:0>8} (not a built-in); supply it with -D <file>\n",
+                    .{fid},
+                ) catch {};
+                w.flush() catch {};
+                std.process.exit(1);
+            }
+        }
+        return;
+    };
+    const fid = frame_dict_id orelse {
+        w.print("note: -D ignored - the frame carries no dictionary\n", .{}) catch {};
+        return;
+    };
+    var supplied_id: ?u32 = null;
+    if (dictionary.findByName(s)) |d| {
+        supplied_id = d.id;
+    } else if (std.fmt.parseInt(u32, s, 10) catch null) |nid| {
+        if (dictionary.findById(nid)) |d| supplied_id = d.id;
+    }
+    if (supplied_id == null) {
+        if (loadDictFile(allocator, io, s)) |bytes| {
+            defer allocator.free(bytes);
+            supplied_id = gpu_dec.registerDict(dec_ctx, allocator, bytes) catch
+                die(w, "error: out of memory registering dictionary\n");
+        } else {
+            w.print("error: unknown dictionary '{s}' (not a built-in name/ID or readable file)\n", .{s}) catch {};
+            w.flush() catch {};
+            std.process.exit(2);
+        }
+    }
+    if (supplied_id.? != fid) {
+        w.print(
+            "error: frame requires dictionary 0x{x:0>8}, supplied dictionary is 0x{x:0>8}\n",
+            .{ fid, supplied_id.? },
+        ) catch {};
+        w.flush() catch {};
+        std.process.exit(1);
+    }
+}
+
+/// Load a custom dictionary file (raw bytes, as `dict_gate0` trains
+/// them). Returns null when the path does not name a readable file.
+/// Size cap: dictionaries beyond off16 reach are useless to the
+/// match finder, so reject absurd files early.
+pub fn loadDictFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
+    const max_dict_file: usize = 16 * 1024 * 1024;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, @enumFromInt(max_dict_file)) catch return null;
+    if (bytes.len == 0) {
+        allocator.free(bytes);
+        return null;
+    }
+    return bytes;
 }
 
 pub fn printVersion(w: *std.Io.Writer) !void {

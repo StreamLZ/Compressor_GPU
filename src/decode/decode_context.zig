@@ -7,6 +7,7 @@
 //! multi-stream API does not have to thread mutable globals.
 
 const std = @import("std");
+const dictionary = @import("../dict/dictionary.zig");
 
 const cuda = @import("cuda_api.zig");
 const descriptors = @import("descriptors.zig");
@@ -52,6 +53,23 @@ pub fn ensureDeviceOutput(self: *DecodeContext, size: usize) descriptors.GpuErro
 /// resident in the context's `d_dict` buffer. The upload runs only
 /// when the cached ID changes — the batch use case decodes thousands
 /// of frames against one dictionary with a single upload.
+/// v4 #16: register a custom dictionary on this context. The bytes
+/// are copied (context-owned; freed by deinit via the captured
+/// allocator). Returns the content-derived ID - the value frames
+/// carry. Registering the same content again is a no-op returning
+/// the same ID.
+pub fn registerDict(self: *DecodeContext, allocator: std.mem.Allocator, data: []const u8) !u32 {
+    const id = dictionary.customId(data);
+    for (self.registered_dicts.items) |r| {
+        if (r.id == id) return id;
+    }
+    const copy = try allocator.dupe(u8, data);
+    errdefer allocator.free(copy);
+    try self.registered_dicts.append(allocator, .{ .id = id, .data = copy });
+    self.dict_store_alloc = allocator;
+    return id;
+}
+
 pub fn ensureDictOnDevice(self: *DecodeContext, id: u32, data: []const u8) descriptors.GpuError!void {
     if (self.dict_cached_id == id and self.dict_cached_len == data.len) return;
     // Callers may reach this before any dispatch initialized the
@@ -286,6 +304,12 @@ pub const DecodeContext = struct {
     d_dict_size: usize = 0,
     dict_cached_id: u32 = 0,
     dict_cached_len: u32 = 0,
+    /// v4 #16 custom dictionaries: caller-registered dictionaries
+    /// (context-owned copies). The allocator is captured at first
+    /// registration because this context's deinit takes none.
+    /// Resolution order: this store first, then the builtin registry.
+    registered_dicts: std.ArrayList(dictionary.RegisteredDict) = .empty,
+    dict_store_alloc: ?std.mem.Allocator = null,
 
     // Pure-D2D prefix-sum scratch: d_first_sub_idx holds the per-chunk
     // first-sub-chunk index; d_total_subchunks_buf is a single u32 with
@@ -407,6 +431,12 @@ pub const DecodeContext = struct {
         free_dev(&self.d_dict, &self.d_dict_size);
         self.dict_cached_id = 0;
         self.dict_cached_len = 0;
+        if (self.dict_store_alloc) |alloc| {
+            for (self.registered_dicts.items) |r| alloc.free(r.data);
+            self.registered_dicts.deinit(alloc);
+            self.registered_dicts = .empty;
+            self.dict_store_alloc = null;
+        }
 
         // Pinned host output (cuMemAllocHost / cuMemFreeHost).
         if (self.h_pinned_output) |p| {
