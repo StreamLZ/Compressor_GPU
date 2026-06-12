@@ -38,6 +38,11 @@ pub const CompressError = error{
     /// remediation (grow the output buffer) helps the first case and
     /// is a no-op against the second.
     DestinationTooSmall,
+    /// `opts.dictionary_id` does not resolve in the dictionary
+    /// registry (`src/dict/dictionary.zig`). Only registry built-ins
+    /// are accepted today; custom-dictionary registration lands with
+    /// the C ABI surface.
+    UnknownDictionary,
 } || std.mem.Allocator.Error;
 
 pub const Options = struct {
@@ -72,6 +77,14 @@ pub const Options = struct {
     /// decoder KNOW when output is corrupt instead of returning wrong
     /// bytes silently. Pass false to strip it.
     chunk_checksum: bool = true,
+
+    /// v4 #16: preset-dictionary ID (a `src/dict/dictionary.zig`
+    /// built-in; flag bit 3 + 4 ID bytes in the frame header). The
+    /// decoder must resolve the same ID or it rejects the frame with
+    /// `error.UnknownDictionary`. Phase 1 records and enforces the ID
+    /// on the wire; the match finder does not search the dictionary
+    /// yet, so there is no ratio benefit until the kernel phases land.
+    dictionary_id: ?u32 = null,
 };
 
 /// Upper bound on the compressed-output size for an input of `src_len`
@@ -131,6 +144,10 @@ pub fn compressFramedWithIo(
 ) CompressError!usize {
     if (opts.level < 1 or opts.level > 5) return error.BadLevel;
     if (dst.len < compressBound(src.len)) return error.DestinationTooSmall;
+    if (opts.dictionary_id) |did| {
+        const dict = @import("../dict/dictionary.zig");
+        if (dict.findById(did) == null) return error.UnknownDictionary;
+    }
     var frame_len = try fast_framed.compressFramedOne(allocator, io, src, dst, opts, enc_ctx);
     if (opts.content_checksum) {
         if (frame_len + 4 > dst.len) return error.DestinationTooSmall;

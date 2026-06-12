@@ -65,7 +65,7 @@ Offset  Size  Field
 | 0   | ContentSizePresent  | 8-byte content size follows the fixed header. The GPU encoder always sets this bit. |
 | 1   | ContentChecksum     | 4-byte XXH32 of the whole uncompressed content follows the end mark. Opt-in: the GPU encoder sets it when `content_checksum` is requested (CLI `--checksum`). |
 | 2   | BlockChecksums      | Per-block XXH32 checksum follows each block payload. The GPU encoder does not set this bit. |
-| 3   | DictionaryIdPresent | 4-byte dictionary ID follows the optional content size. The GPU encoder does not set this bit; decoders reject frames with this bit set (`error.UnknownDictionary`). |
+| 3   | DictionaryIdPresent | 4-byte dictionary ID follows the optional content size. The ID is opaque: it names a preset dictionary BOTH sides must already have (the wire never carries dictionary bytes). The decoder resolves the ID in its registry (`src/dict/dictionary.zig`) and rejects unknown IDs with `error.UnknownDictionary`. See "Preset dictionaries" below for how dictionary bytes extend the match window. |
 | 4   | ParallelDecodeMeta  | Legacy CPU-codec sidecar; the GPU decoder skips it, the GPU encoder never sets it. |
 | 5   | ChunkMerkleChecksum | 4-byte trailer after the end mark (after the bit-1 trailer when both are set): XXH32 over the concatenated per-chunk hashes (LE, chunk-index order) of the decompressed content, where each per-chunk hash is itself XXH32 over the concatenated XXH32s (LE) of the chunk's 1024-byte segments (last segment partial; chunk grid = the frame's effective chunk size). The two-level shape exists so GPUs can hash one thread per segment. A self-verification root, NOT a plain content hash - do not compare external XXH32(file) against it. The GPU encoder sets this by default since 2026-06-11; whether a given frame carries it is always announced by this flag bit, never assumed. |
 | 6-7 | Reserved            | Must be 0. |
@@ -372,6 +372,34 @@ length" name a number of bytes to consume from this stream. The
 extended-length marker threshold is 251: token-stream bytes with raw
 value > 251 (i.e., 252-255) indicate the length spills into the
 length stream.
+
+---
+
+## Preset dictionaries
+
+When the frame header carries a dictionary ID (flag bit 3), the named
+dictionary's bytes are logically prepended BELOW every sub-chunk's
+output window: a match whose source address falls k bytes below the
+sub-chunk's first output byte reads dictionary byte `dict_len - k`.
+No token form changes - a dictionary reference is an ordinary match
+whose distance exceeds the current position within the sub-chunk.
+Rules:
+
+- A match source may straddle the boundary (start in the dictionary,
+  run into the sub-chunk's own output); per-byte sequential semantics
+  apply unchanged. The GPU encoder never emits straddling sources,
+  but decoders must accept them.
+- Reaches below the dictionary itself (hostile frames) decode as
+  0x00 bytes; they are not an error.
+- The GPU encoder emits dictionary references only at off16-encodable
+  distances (<= 65535), so positions in a second 64 KB LZ block never
+  reference the dictionary. The off32 form's block-relative encoding
+  also reaches dictionary space (`v` larger than the block's start
+  offset) and decoders support it.
+- The dictionary applies per sub-chunk: every sub-chunk's window
+  starts with the full dictionary reachable, independent of its
+  neighbors. The chunk-Merkle and content checksums are computed over
+  the decompressed content only and are dictionary-independent.
 
 ---
 

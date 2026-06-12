@@ -17,6 +17,9 @@ pub const CompressError = error{
     BadBlockSize,
     BadScGroupSize,
     DestinationTooSmall,
+    /// v4 #16 (CUDA-mirror): `opts.dictionary_id` does not resolve in
+    /// the dictionary registry (`srcVK/dict/dictionary.zig`).
+    UnknownDictionary,
 } || std.mem.Allocator.Error;
 
 /// CUDA reference: src/encode/streamlz_encoder.zig:43-64. Encoder
@@ -28,6 +31,10 @@ pub const Options = struct {
     sc_group_size_override: ?f32 = null,
     /// v4 #19 (CUDA-mirror): chunk-Merkle checksum, default ON.
     chunk_checksum: bool = true,
+    /// v4 #16 (CUDA-mirror): preset-dictionary ID, flag bit 3 + 4 ID
+    /// bytes in the frame header. Phase 1: wire surface only - the
+    /// match finder does not search the dictionary yet.
+    dictionary_id: ?u32 = null,
 };
 
 /// CUDA reference: src/encode/streamlz_encoder.zig:70-84. Upper bound on
@@ -69,6 +76,10 @@ pub fn compressFramedWithIo(
 ) CompressError!usize {
     if (opts.level < 1 or opts.level > 5) return error.BadLevel;
     if (dst.len < compressBound(src.len)) return error.DestinationTooSmall;
+    if (opts.dictionary_id) |did| {
+        const dict = @import("../dict/dictionary.zig");
+        if (dict.findById(did) == null) return error.UnknownDictionary;
+    }
     var frame_len = try fast_framed.compressFramedOne(allocator, io, src, dst, opts, enc_ctx);
     // v4 #19 (CUDA-mirror): chunk-Merkle trailer after the end mark.
     // d_input_override != 0 means the caller's data is DEVICE-resident

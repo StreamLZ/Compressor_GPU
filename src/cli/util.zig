@@ -20,6 +20,11 @@ pub const Args = struct {
     report_mem: bool = false,
     sc_group: ?f32 = null,
     checksum: bool = false,
+    /// v4 #16: preset dictionary for compression - a registry name
+    /// ("json", "html", ...), a numeric ID, or "auto" (select by the
+    /// input file's extension). Decompression needs no flag: the
+    /// frame header names its dictionary.
+    dictionary: ?[]const u8 = null,
 };
 
 pub fn parseArgs(raw: []const []const u8, w: *std.Io.Writer) Args {
@@ -43,6 +48,7 @@ pub fn parseArgs(raw: []const []const u8, w: *std.Io.Writer) Args {
         if (eql(arg, "-r")) { i += 1; result.runs = parseInt(u32, expect(raw, i, "-r", w), w, "-r"); continue; }
         if (eql(arg, "-o")) { i += 1; result.output = expect(raw, i, "-o", w); continue; }
         if (eql(arg, "--checksum")) { result.checksum = true; continue; }
+        if (eql(arg, "-D")) { i += 1; result.dictionary = expect(raw, i, "-D", w); continue; }
         if (eql(arg, "--sc")) {
             i += 1;
             const v = expect(raw, i, "--sc", w);
@@ -92,6 +98,28 @@ pub fn die(w: *std.Io.Writer, msg: []const u8) noreturn {
     std.process.exit(2);
 }
 
+/// v4 #16: resolve the `-D` value to a dictionary ID. Accepts a
+/// registry name, a numeric ID, or "auto" (select by the input path's
+/// extension, falling back to the "general" dictionary). Exits with a
+/// message naming the available dictionaries on failure.
+pub fn resolveDictionary(spec: ?[]const u8, input_path: []const u8, w: *std.Io.Writer) ?u32 {
+    const dictionary = @import("../dict/dictionary.zig");
+    const s = spec orelse return null;
+    if (eql(s, "auto")) {
+        if (dictionary.findByExtension(input_path)) |d| return d.id;
+        return null;
+    }
+    if (dictionary.findByName(s)) |d| return d.id;
+    if (std.fmt.parseInt(u32, s, 10) catch null) |id| {
+        if (dictionary.findById(id)) |d| return d.id;
+    }
+    w.print("error: unknown dictionary '{s}'; available:", .{s}) catch {};
+    for (dictionary.builtin_dicts) |*d| w.print(" {s}", .{d.name}) catch {};
+    w.writeAll(" auto\n") catch {};
+    w.flush() catch {};
+    std.process.exit(2);
+}
+
 pub fn printVersion(w: *std.Io.Writer) !void {
     try w.print("streamlz {s} (GPU-only, Zig {f}, {s}-{s})\n", .{
         version_string, builtin.zig_version,
@@ -115,6 +143,9 @@ pub fn printUsage(w: *std.Io.Writer) !void {
         \\  -l <1..5>       Compression level (default: 1)
         \\  -r <runs>       Benchmark runs (default: 3 for -b, 10 for -db)
         \\  -o <file>       Output path
+        \\  -D <dict>       Preset dictionary: name (json, html, text, xml,
+        \\                  css, js, general), numeric ID, or "auto" (by
+        \\                  input extension). Decode reads the frame header.
         \\  --sc <float>    sc_group_size override (0.25 = 64 KB sub-chunks)
         \\  -gpu            Accepted, no-op (GPU is the only backend)
         \\  -mem            Print peak process memory at exit

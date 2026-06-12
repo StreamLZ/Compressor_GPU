@@ -159,6 +159,23 @@ pub const EncodeContext = struct {
     d_sizes_persist: CUdeviceptr = 0,
     d_sizes_size: usize = 0,
 
+    // ── v4 #16: preset dictionary, device-resident + cached ──────
+    // `d_dict` holds the dictionary bytes; `d_dict_table` the
+    // host-built position hash table (hashKey6, one u32 per bucket,
+    // 0xFFFFFFFF = empty, mirroring the kernel's HASH_EMPTY). Cached
+    // by (id, hash_bits) so a batch of dict frames uploads once.
+    // `dict_armed` is per-CALL state set by fast_framed: the cache
+    // persists across calls but only armed calls pass the dictionary
+    // to the LZ kernel.
+    d_dict: CUdeviceptr = 0,
+    d_dict_size: usize = 0,
+    d_dict_table: CUdeviceptr = 0,
+    d_dict_table_size: usize = 0,
+    dict_cached_id: u32 = 0,
+    dict_cached_len: u32 = 0,
+    dict_cached_hash_bits: u32 = 0,
+    dict_armed: bool = false,
+
     // ── v4 #17: pinned host staging for the LZ compressed-chunk
     // gather (reverse-port of VK's ensureD2hFinalBuf shape). Grow-only,
     // freed in deinit via cuMemFreeHost. The gather queues one
@@ -289,6 +306,12 @@ pub const EncodeContext = struct {
         free_dev(&self.d_descs_persist, &self.d_descs_size);
         free_dev(&self.d_hash_persist, &self.d_hash_size);
         free_dev(&self.d_sizes_persist, &self.d_sizes_size);
+        free_dev(&self.d_dict, &self.d_dict_size);
+        free_dev(&self.d_dict_table, &self.d_dict_table_size);
+        self.dict_cached_id = 0;
+        self.dict_cached_len = 0;
+        self.dict_cached_hash_bits = 0;
+        self.dict_armed = false;
         free_dev(&self.d_huff_descs_persist, &self.d_huff_descs_size);
         free_dev(&self.d_huff_cl_persist, &self.d_huff_cl_size);
         free_dev(&self.d_huff_codes_persist, &self.d_huff_codes_size);

@@ -25,6 +25,61 @@ const CompressChunkDesc = encode_context.CompressChunkDesc;
 /// The SLZ_FORCE_BATCH env var mirrors this for command-line runs.
 pub var g_force_batch_count_for_test: u32 = 0;
 
+// ── v4 #16: preset-dictionary staging ────────────────────────────
+
+/// Host twin of the kernel's hashKey6 (lz_format.cuh): Fibonacci
+/// multiplier shifted for the k=6 key, take the top hash_bits.
+/// Must stay bit-identical - the host builds the dictionary table the
+/// kernel probes.
+fn hashKey6(word8: u64, hash_bits: u5) u32 {
+    const product = word8 *% 0x79B97F4A7C150000;
+    return @intCast(product >> @intCast(@as(u7, 64) - hash_bits));
+}
+
+const dict_table_empty: u32 = 0xFFFF_FFFF; // kernel HASH_EMPTY
+
+/// Make the dictionary bytes + the hashKey6 position table resident
+/// on the device, cached by (id, hash_bits). The table maps each
+/// bucket to the HIGHEST dict position hashing there (ascending
+/// insertion, last writer wins - the same order a serial pass over
+/// the dictionary would leave behind, and the CPU sibling's
+/// preloadDictionary semantics). Returns false on CUDA failure.
+pub fn ensureDictOnDevice(
+    self: *EncodeContext,
+    allocator: std.mem.Allocator,
+    id: u32,
+    data: []const u8,
+    hash_bits: u32,
+) bool {
+    if (self.dict_cached_id == id and
+        self.dict_cached_len == data.len and
+        self.dict_cached_hash_bits == hash_bits) return true;
+    self.dict_cached_id = 0;
+    if (!module_loader.init()) return false;
+    const h2d_fn = cuda_ffi.cuMemcpyHtoD_fn orelse return false;
+
+    const table_len = @as(usize, 1) << @intCast(hash_bits);
+    const table = allocator.alloc(u32, table_len) catch return false;
+    defer allocator.free(table);
+    @memset(table, dict_table_empty);
+    if (data.len >= 8) {
+        var p: usize = 0;
+        while (p + 8 <= data.len) : (p += 1) {
+            const word = std.mem.readInt(u64, data[p..][0..8], .little);
+            table[hashKey6(word, @intCast(hash_bits))] = @intCast(p);
+        }
+    }
+
+    if (!encode_context.ensureBuf(&self.d_dict, &self.d_dict_size, data.len)) return false;
+    if (!encode_context.ensureBuf(&self.d_dict_table, &self.d_dict_table_size, table_len * 4)) return false;
+    if (h2d_fn(self.d_dict, @ptrCast(data.ptr), data.len) != cuda_ffi.CUDA_SUCCESS) return false;
+    if (h2d_fn(self.d_dict_table, @ptrCast(table.ptr), table_len * 4) != cuda_ffi.CUDA_SUCCESS) return false;
+    self.dict_cached_id = id;
+    self.dict_cached_len = @intCast(data.len);
+    self.dict_cached_hash_bits = hash_bits;
+    return true;
+}
+
 pub fn gpuCompressImpl(
     self: *EncodeContext,
     input: []const u8,
@@ -156,6 +211,12 @@ pub fn gpuCompressImpl(
     // v4 #6 experiment (2026-06-10): L2 = greedy+rehash WITHOUT entropy -
     // re-differentiates L2 from L1 (hb=17-everywhere had collapsed them).
     var p_l4: u32 = if (level >= 4 or level == 2) 1 else 0;
+    // v4 #16: pass the staged dictionary only when fast_framed armed it
+    // for THIS call - the device cache outlives the call, but a
+    // dictionary-less frame must encode exactly as before.
+    var p_dict: CUdeviceptr = if (self.dict_armed) self.d_dict else 0;
+    var p_dict_len: u32 = if (self.dict_armed) self.dict_cached_len else 0;
+    var p_dict_table: CUdeviceptr = if (self.dict_armed) self.d_dict_table else 0;
 
     var params = [_]?*anyopaque{
         @ptrCast(&p_input),
@@ -167,6 +228,9 @@ pub fn gpuCompressImpl(
         @ptrCast(&p_hash_bits),
         @ptrCast(&p_use_chain),
         @ptrCast(&p_l4),
+        @ptrCast(&p_dict),
+        @ptrCast(&p_dict_len),
+        @ptrCast(&p_dict_table),
     };
     var extra = [_]?*anyopaque{null};
 

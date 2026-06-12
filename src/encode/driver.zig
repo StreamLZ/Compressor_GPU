@@ -63,6 +63,7 @@ pub var last_kernel_ns: i64 = 0;
 // Every caller threads its own `*EncodeContext`; the `g_default` singleton
 // above remains the conventional handle used by the CLI / C ABI today.
 pub const gpuCompressImpl = encode_lz.gpuCompressImpl;
+pub const ensureDictOnDevice = encode_lz.ensureDictOnDevice;
 pub const enc_module_loader = module_loader;
 
 /// v4 #19 device-only: launch slzMerkleRootWriteKernel - rolls the

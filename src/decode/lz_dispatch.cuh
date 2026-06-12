@@ -20,13 +20,17 @@
 //
 // Lane contract: warp-cooperative; each header is parsed on lane 0 and
 // `src` is rebuilt on every lane via broadcastSrc.
+template <bool HAS_DICT = false>
 __device__ void parseAndDecodeSubChunkRaw(
     const uint8_t* __restrict__ sc_src,
     uint32_t sc_comp_size,
     uint32_t sc_decomp_size,
     uint8_t* __restrict__ dst,
     uint32_t dst_offset,
-    uint32_t base_offset
+    uint32_t base_offset,
+    // v4 #16 (HAS_DICT only): preset dictionary for below-window match
+    // sources; threaded into both decode bodies.
+    const uint8_t* __restrict__ dict = nullptr, uint32_t dict_len = 0
 ) {
     const int lane = threadIdx.x & LANE_MASK;
     const uint8_t* src = sc_src;
@@ -132,14 +136,14 @@ __device__ void parseAndDecodeSubChunkRaw(
 
     if (off32_count1 == 0 && off32_count2 == 0) {
         // OFF16_SPLIT=false: raw-off16 path is the only one in raw L1/L2.
-        decodeSubChunkRawMode<false>(
+        decodeSubChunkRawMode<false, HAS_DICT>(
             cmd_ptr, cmd_size,
             lit_ptr, lit_size,
             off16_raw, off16_count,
             nullptr, nullptr,  // off16_hi/lo unused at OFF16_SPLIT=false
             len_stream, len_avail,
             dst, sc_decomp_size, initial_copy,
-            dst_offset
+            dst_offset, dict, dict_len
         );
     } else {
         // Positional brace-init matches ParsedStreams field order in
@@ -160,7 +164,7 @@ __device__ void parseAndDecodeSubChunkRaw(
         // ps_raw.off16_split is always 0 on this path (raw L1/L2 has no
         // entropy-coded off16), so the false specialization is the only
         // one ever reached.
-        decodeSubChunkGeneral<false>(ps_raw, out_raw, /*mode=*/1);
+        decodeSubChunkGeneral<false, HAS_DICT>(ps_raw, out_raw, /*mode=*/1, dict, dict_len);
     }
 }
 
@@ -170,6 +174,7 @@ __device__ void parseAndDecodeSubChunkRaw(
 // Calls parseSubChunkHeaders (__noinline__) then dispatches to
 // decodeSubChunkRawMode or decodeSubChunkGeneral. The header parser's
 // registers are freed before the decode hot loop runs.
+template <bool HAS_DICT = false>
 __device__ void parseAndDecodeSubChunk(
     const uint8_t* __restrict__ sc_src,
     uint32_t sc_comp_size,
@@ -180,7 +185,10 @@ __device__ void parseAndDecodeSubChunk(
     uint32_t mode,
     uint8_t* __restrict__ entropy_lit_scratch,
     uint8_t* __restrict__ entropy_tok_scratch,
-    uint8_t* __restrict__ entropy_off16_scratch
+    uint8_t* __restrict__ entropy_off16_scratch,
+    // v4 #16 (HAS_DICT only): preset dictionary for below-window match
+    // sources; threaded into both decode bodies.
+    const uint8_t* __restrict__ dict = nullptr, uint32_t dict_len = 0
 ) {
     ParsedStreams ps;
     parseSubChunkHeaders(sc_src, sc_comp_size, sc_decomp_size, dst,
@@ -192,24 +200,24 @@ __device__ void parseAndDecodeSubChunk(
         // eliminate the unused branch + the unused pointer params for
         // the raw-off16 case (the common L1 path).
         if (ps.off16_split) {
-            decodeSubChunkRawMode<true>(
+            decodeSubChunkRawMode<true, HAS_DICT>(
                 ps.cmd_ptr, ps.cmd_size,
                 ps.lit_ptr, ps.lit_size,
                 ps.off16_raw, ps.off16_count,
                 ps.off16_hi, ps.off16_lo,
                 ps.len_stream, ps.len_avail,
                 dst, sc_decomp_size, ps.initial_copy,
-                dst_offset
+                dst_offset, dict, dict_len
             );
         } else {
-            decodeSubChunkRawMode<false>(
+            decodeSubChunkRawMode<false, HAS_DICT>(
                 ps.cmd_ptr, ps.cmd_size,
                 ps.lit_ptr, ps.lit_size,
                 ps.off16_raw, ps.off16_count,
                 ps.off16_hi, ps.off16_lo,
                 ps.len_stream, ps.len_avail,
                 dst, sc_decomp_size, ps.initial_copy,
-                dst_offset
+                dst_offset, dict, dict_len
             );
         }
     } else {
@@ -218,9 +226,9 @@ __device__ void parseAndDecodeSubChunk(
         // above: nvcc dead-code-eliminates the unused off16 branch + drops
         // the unused pointer params in each specialization.
         if (ps.off16_split) {
-            decodeSubChunkGeneral<true>(ps, out_general, mode);
+            decodeSubChunkGeneral<true, HAS_DICT>(ps, out_general, mode, dict, dict_len);
         } else {
-            decodeSubChunkGeneral<false>(ps, out_general, mode);
+            decodeSubChunkGeneral<false, HAS_DICT>(ps, out_general, mode, dict, dict_len);
         }
     }
 }

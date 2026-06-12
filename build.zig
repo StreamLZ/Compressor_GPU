@@ -107,6 +107,28 @@ pub fn build(b: *std.Build) void {
     const chaincount_exe = b.addExecutable(.{ .name = "chaincount", .root_module = chaincount_module });
     b.step("chaincount", "Build the v4 #14 chain-parser instrumentation readback").dependOn(&b.addInstallArtifact(chaincount_exe, .{}).step);
 
+    // v4 #16 gate-0: dictionary ratio measurement (FASTCOVER train +
+    // marginal-size measurement through the production encoder).
+    const dict_gate0_module = b.createModule(.{
+        .root_source_file = b.path("src/dict_gate0_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const dict_gate0_exe = b.addExecutable(.{ .name = "dict_gate0", .root_module = dict_gate0_module });
+    b.step("dict_gate0", "Build the v4 #16 gate-0 dictionary ratio measurement tool").dependOn(&b.addInstallArtifact(dict_gate0_exe, .{}).step);
+
+    // v4 #16: per-record dictionary benchmark (real dict frames, both
+    // directions, byte-verified).
+    const dict_bench_module = b.createModule(.{
+        .root_source_file = b.path("src/dict_bench_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const dict_bench_exe = b.addExecutable(.{ .name = "dict_bench", .root_module = dict_bench_module });
+    b.step("dict_bench", "Build the v4 #16 per-record dictionary benchmark").dependOn(&b.addInstallArtifact(dict_bench_exe, .{}).step);
+
     // ── Unit tests ───────────────────────────────────────────────────────
     const test_runner = b.addTest(.{
         .root_module = cli_module,

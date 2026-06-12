@@ -73,11 +73,14 @@ __device__ __forceinline__ void deltaLiteralCopyBounded(
 // L3 enwik8 kernel time regressed ~130 µs (+2%) measurably. The PTX
 // REG count stays at 40 either way, so the cost is scheduling /
 // memory-ordering, not register pressure. Keep the shfls.
-template <bool OFF16_SPLIT>
+template <bool OFF16_SPLIT, bool HAS_DICT = false>
 __device__ void decodeSubChunkGeneral(
     const ParsedStreams& ps,
     const DecodeOutput& out,
-    uint32_t mode
+    uint32_t mode,
+    // v4 #16 (HAS_DICT only): preset dictionary; match sources below
+    // `out.dst_offset` (the sub-chunk's window base) read the dict tail.
+    const uint8_t* __restrict__ dict = nullptr, uint32_t dict_len = 0
 ) {
     // Hoist field reads into locals so the hot loop addresses registers
     // rather than restating `ps.x` everywhere. nvcc would do this anyway
@@ -238,8 +241,9 @@ __device__ void decodeSubChunkGeneral(
             if (match_len > 0) {
                 uint32_t match_src = (uint32_t)((int32_t)dst_pos + match_offset);
                 int32_t match_dist = -match_offset;
-                warpMatchCopyBounded(dst, dst_pos, match_src, match_len,
-                                     match_dist, dst_end_abs, lane);
+                warpMatchCopyBoundedD<HAS_DICT>(dst, dst_pos, match_src, match_len,
+                                                match_dist, dst_end_abs, lane,
+                                                dst_offset, dict, dict_len);
                 __syncwarp();
                 dst_pos += match_len;
             }

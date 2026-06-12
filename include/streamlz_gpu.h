@@ -131,7 +131,15 @@ typedef struct slzCompressOpts_t {
                                * Callers MUST read this back after the
                                * call and compare goldens against the
                                * clamped level, not the requested level. */
-    int reserved[5];          /* must be zero — reserved for future options */
+    int dictionary_id;        /* Preset dictionary ID (0 = none). Built-in
+                               * IDs: 1=json 2=html 3=text 4=xml 5=css 6=js
+                               * 7=general. The decoder resolves the same ID
+                               * from the frame header — both sides must
+                               * know the dictionary. Unknown IDs fail with
+                               * SLZ_ERROR_UNSUPPORTED. Occupies a formerly
+                               * reserved (must-be-zero) slot, so pre-dict
+                               * callers are automatically dictionary-less. */
+    int reserved[4];          /* must be zero — reserved for future options */
 } slzCompressOpts_t;
 
 /* Default options (level 5, profiling off). */

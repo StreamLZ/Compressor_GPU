@@ -33,6 +33,7 @@ const CompressError = encoder.CompressError;
 const gpu_enc = @import("driver.zig");
 const cuda_api = @import("../decode/cuda_api.zig");
 const enc_phase = @import("enc_phase.zig");
+const levels = @import("levels.zig");
 
 /// Number of decoder warps each SM can host simultaneously on sm_8x /
 /// sm_9x. Used to size the saturation threshold below which sc_group=0.25
@@ -130,13 +131,26 @@ pub fn compressFramedOne(
         enc_ctx.merkle_device_done = false;
     }
 
+    // v4 #16: stage the preset dictionary (bytes + hashKey6 position
+    // table, cached on the context by id) and arm it for this call's
+    // LZ launches. The ID was validated by compressFramedWithIo;
+    // resolution here cannot fail.
+    enc_ctx.dict_armed = false;
+    if (opts.dictionary_id) |did| {
+        const dict_registry = @import("../dict/dictionary.zig");
+        const info = dict_registry.findById(did) orelse unreachable;
+        if (!gpu_enc.ensureDictOnDevice(enc_ctx, allocator, did, info.data, levels.hashBitsForLevel(opts.level)))
+            return error.DestinationTooSmall;
+        enc_ctx.dict_armed = true;
+    }
+
     const hdr_len = frame.writeHeader(dst, .{
         .codec = .fast,
         .level = codecLevelFor(opts.level),
         .block_size = opts.block_size,
         .sc_group_size = sc_grp,
         .content_size = if (opts.include_content_size) @as(u64, @intCast(src.len)) else null,
-        .dictionary_id = null,
+        .dictionary_id = opts.dictionary_id,
         .content_checksum = opts.content_checksum,
         .chunk_merkle = opts.chunk_checksum,
     }) catch return error.DestinationTooSmall;

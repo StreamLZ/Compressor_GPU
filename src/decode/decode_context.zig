@@ -48,6 +48,22 @@ pub fn ensureDeviceOutput(self: *DecodeContext, size: usize) descriptors.GpuErro
     return ensureDeviceBuf(&self.d_output, &self.d_output_size, size);
 }
 
+/// v4 #16: make the preset dictionary `data` (identified by `id`)
+/// resident in the context's `d_dict` buffer. The upload runs only
+/// when the cached ID changes — the batch use case decodes thousands
+/// of frames against one dictionary with a single upload.
+pub fn ensureDictOnDevice(self: *DecodeContext, id: u32, data: []const u8) descriptors.GpuError!void {
+    if (self.dict_cached_id == id and self.dict_cached_len == data.len) return;
+    // Callers may reach this before any dispatch initialized the
+    // driver (the upload is lazy - see decompressFrameInner).
+    if (!@import("module_loader.zig").init()) return error.BackendNotAvailable;
+    self.dict_cached_id = 0;
+    try ensureDeviceBuf(&self.d_dict, &self.d_dict_size, data.len);
+    if (!copyHostToDevice(self.d_dict, data)) return error.CopyFailed;
+    self.dict_cached_id = id;
+    self.dict_cached_len = @intCast(data.len);
+}
+
 /// Page-locked (pinned) host allocation. D2H/H2D against pinned memory runs
 /// at full PCIe bandwidth (~2x pageable, which the driver stages chunk-wise
 /// through an internal pinned buffer) and is genuinely async-capable.
@@ -261,6 +277,16 @@ pub const DecodeContext = struct {
     d_merkle_seghashes: u64 = 0,
     d_merkle_seghashes_size: usize = 0,
 
+    // v4 #16: persistent preset-dictionary buffer, uploaded once per
+    // dictionary and reused across calls. `dict_cached_id` keys the
+    // cache (0 = nothing cached); a frame naming a different ID
+    // re-uploads. One dictionary at a time matches the batch use case
+    // (thousands of frames sharing one dict).
+    d_dict: CUdeviceptr = 0,
+    d_dict_size: usize = 0,
+    dict_cached_id: u32 = 0,
+    dict_cached_len: u32 = 0,
+
     // Pure-D2D prefix-sum scratch: d_first_sub_idx holds the per-chunk
     // first-sub-chunk index; d_total_subchunks_buf is a single u32 with
     // the running total (device-resident, never D2H'd on the pure path).
@@ -378,6 +404,9 @@ pub const DecodeContext = struct {
         free_dev(&self.d_n_groups_scratch, &self.d_n_groups_scratch_size);
         free_dev(&self.d_huff_descs, &self.d_huff_descs_size);
         free_dev(&self.d_huff_lut, &self.d_huff_lut_size);
+        free_dev(&self.d_dict, &self.d_dict_size);
+        self.dict_cached_id = 0;
+        self.dict_cached_len = 0;
 
         // Pinned host output (cuMemAllocHost / cuMemFreeHost).
         if (self.h_pinned_output) |p| {

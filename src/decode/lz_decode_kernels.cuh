@@ -39,7 +39,10 @@ slzLzDecodeKernel(
     uint32_t sub_chunk_cap,
     uint8_t* __restrict__ entropy_scratch,
     uint64_t entropy_slot_stride,
-    const uint32_t* __restrict__ first_subchunk_idx
+    const uint32_t* __restrict__ first_subchunk_idx,
+    // v4 #16: preset dictionary (nullptr/0 on dictionary-less frames).
+    const uint8_t* __restrict__ dict,
+    uint32_t dict_len
 ) {
     // WARPS_PER_BLOCK warps per block: warp 0 = threadIdx.y==0, etc.
     const uint32_t total_chunks = *d_total_chunks;
@@ -121,11 +124,24 @@ slzLzDecodeKernel(
                 // the frame) triggers the 8-byte initial copy. Per-chunk
                 // init copies are restored by the host-side SC prefix table
                 // post-pass instead.
-                parseAndDecodeSubChunk(
-                    sc_payload, sc_comp_size, sc_size,
-                    dst, sc_dst_off, sc_dst_off, sc_mode,
-                    subchunk_scratch_base, tok_slot, off16_slot
-                );
+                // v4 #16: dict presence is frame-uniform - one
+                // predictable branch per sub-chunk selects the
+                // dict-aware instantiation; the false path is the
+                // pre-dict code exactly.
+                if (dict != nullptr) {
+                    parseAndDecodeSubChunk<true>(
+                        sc_payload, sc_comp_size, sc_size,
+                        dst, sc_dst_off, sc_dst_off, sc_mode,
+                        subchunk_scratch_base, tok_slot, off16_slot,
+                        dict, dict_len
+                    );
+                } else {
+                    parseAndDecodeSubChunk<false>(
+                        sc_payload, sc_comp_size, sc_size,
+                        dst, sc_dst_off, sc_dst_off, sc_mode,
+                        subchunk_scratch_base, tok_slot, off16_slot
+                    );
+                }
             } else {
                 // Uncompressed sub-chunk: copy
                 for (uint32_t i = lane; i < sc_size; i += WARP_SIZE)
@@ -163,7 +179,10 @@ slzLzDecodeRawKernel(
     uint8_t* __restrict__ dst,
     uint32_t chunks_per_group,
     const uint32_t* __restrict__ d_total_chunks,
-    uint32_t sub_chunk_cap
+    uint32_t sub_chunk_cap,
+    // v4 #16: preset dictionary (nullptr/0 on dictionary-less frames).
+    const uint8_t* __restrict__ dict,
+    uint32_t dict_len
 ) {
     const uint32_t total_chunks = *d_total_chunks;
     const uint32_t warp_id = threadIdx.y;
@@ -213,10 +232,17 @@ slzLzDecodeRawKernel(
             const uint8_t* sc_payload = chunk_src + 3;
 
             if (sc_comp_size < sc_size) {
-                parseAndDecodeSubChunkRaw(
-                    sc_payload, sc_comp_size, sc_size,
-                    dst, sc_dst_off, sc_dst_off
-                );
+                if (dict != nullptr) {
+                    parseAndDecodeSubChunkRaw<true>(
+                        sc_payload, sc_comp_size, sc_size,
+                        dst, sc_dst_off, sc_dst_off, dict, dict_len
+                    );
+                } else {
+                    parseAndDecodeSubChunkRaw<false>(
+                        sc_payload, sc_comp_size, sc_size,
+                        dst, sc_dst_off, sc_dst_off
+                    );
+                }
             } else {
                 for (uint32_t i = lane; i < sc_size; i += WARP_SIZE)
                     dst[sc_dst_off + i] = sc_payload[i];
@@ -244,7 +270,10 @@ slzLzDecodeRawPipelinedKernel(
     uint8_t* __restrict__ dst,
     uint32_t chunks_per_group,
     const uint32_t* __restrict__ d_total_chunks,
-    uint32_t sub_chunk_cap
+    uint32_t sub_chunk_cap,
+    // v4 #16: preset dictionary (nullptr/0 on dictionary-less frames).
+    const uint8_t* __restrict__ dict,
+    uint32_t dict_len
 ) {
     const uint32_t total_chunks = *d_total_chunks;
     const uint32_t group_id = blockIdx.x;
@@ -296,11 +325,19 @@ slzLzDecodeRawPipelinedKernel(
             const uint8_t* sc_payload = chunk_src + 3;
 
             if (sc_comp_size < sc_size) {
-                parseAndDecodeSubChunkRawPipelined(
-                    sc_payload, sc_comp_size, sc_size,
-                    dst, sc_dst_off, sc_dst_off,
-                    s_pipe_batch
-                );
+                if (dict != nullptr) {
+                    parseAndDecodeSubChunkRawPipelined<true>(
+                        sc_payload, sc_comp_size, sc_size,
+                        dst, sc_dst_off, sc_dst_off,
+                        s_pipe_batch, dict, dict_len
+                    );
+                } else {
+                    parseAndDecodeSubChunkRawPipelined<false>(
+                        sc_payload, sc_comp_size, sc_size,
+                        dst, sc_dst_off, sc_dst_off,
+                        s_pipe_batch
+                    );
+                }
             } else {
                 uint32_t gl = threadIdx.y * WARP_SIZE + lane;
                 for (uint32_t i = gl; i < sc_size; i += SLZ_PIPE_BLOCK_THREADS)
@@ -339,7 +376,10 @@ slzLzDecodeGeneralPipelinedKernel(
     uint32_t sub_chunk_cap,
     uint8_t* __restrict__ entropy_scratch,
     uint64_t entropy_slot_stride,
-    const uint32_t* __restrict__ first_subchunk_idx
+    const uint32_t* __restrict__ first_subchunk_idx,
+    // v4 #16: preset dictionary (nullptr/0 on dictionary-less frames).
+    const uint8_t* __restrict__ dict,
+    uint32_t dict_len
 ) {
     const uint32_t total_chunks = *d_total_chunks;
     const uint32_t group_id = blockIdx.x;
@@ -417,7 +457,31 @@ slzLzDecodeGeneralPipelinedKernel(
                 __syncthreads();
 
                 if (sc_mode == 1 && s_ps.off32_count1 == 0 && s_ps.off32_count2 == 0) {
-                    if (s_ps.off16_split) {
+                    // v4 #16: the dict branch is frame-uniform; each arm
+                    // repeats the off16_split dispatch so every reached
+                    // combination is its own dead-code-eliminated
+                    // instantiation.
+                    if (dict != nullptr) {
+                        if (s_ps.off16_split) {
+                            decodeSubChunkRawModePipelined<true, true>(
+                                s_ps.cmd_ptr, s_ps.cmd_size,
+                                s_ps.lit_ptr, s_ps.lit_size,
+                                s_ps.off16_raw, s_ps.off16_count,
+                                s_ps.off16_hi, s_ps.off16_lo,
+                                s_ps.len_stream, s_ps.len_avail,
+                                dst, sc_size, s_ps.initial_copy, sc_dst_off,
+                                s_pipe_batch, dict, dict_len);
+                        } else {
+                            decodeSubChunkRawModePipelined<false, true>(
+                                s_ps.cmd_ptr, s_ps.cmd_size,
+                                s_ps.lit_ptr, s_ps.lit_size,
+                                s_ps.off16_raw, s_ps.off16_count,
+                                s_ps.off16_hi, s_ps.off16_lo,
+                                s_ps.len_stream, s_ps.len_avail,
+                                dst, sc_size, s_ps.initial_copy, sc_dst_off,
+                                s_pipe_batch, dict, dict_len);
+                        }
+                    } else if (s_ps.off16_split) {
                         decodeSubChunkRawModePipelined<true>(
                             s_ps.cmd_ptr, s_ps.cmd_size,
                             s_ps.lit_ptr, s_ps.lit_size,
@@ -442,7 +506,13 @@ slzLzDecodeGeneralPipelinedKernel(
                     // parsed - no re-parse).
                     if (threadIdx.y == 0) {
                         const DecodeOutput out_general = { dst, sc_size, sc_dst_off };
-                        if (s_ps.off16_split) {
+                        if (dict != nullptr) {
+                            if (s_ps.off16_split) {
+                                decodeSubChunkGeneral<true, true>(s_ps, out_general, sc_mode, dict, dict_len);
+                            } else {
+                                decodeSubChunkGeneral<false, true>(s_ps, out_general, sc_mode, dict, dict_len);
+                            }
+                        } else if (s_ps.off16_split) {
                             decodeSubChunkGeneral<true>(s_ps, out_general, sc_mode);
                         } else {
                             decodeSubChunkGeneral<false>(s_ps, out_general, sc_mode);

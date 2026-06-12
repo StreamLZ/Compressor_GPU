@@ -334,6 +334,13 @@ pub const DecodeRequest = struct {
     merkle_expected_root: u32 = 0,
     merkle_verdict_out: ?*u32 = null,
 
+    /// v4 #16: preset dictionary, already device-resident (uploaded by
+    /// the caller via the context's d_dict cache). 0/0 on
+    /// dictionary-less frames - the LZ kernels then take the pre-dict
+    /// code path exactly.
+    d_dict: u64 = 0,
+    dict_len: u32 = 0,
+
     /// True when the LZ kernel can write decompressed bytes straight
     /// into the caller's device buffer (no `dst_start_off` prefix to
     /// splice in, and a `d_output_target` was supplied). On this path
@@ -451,6 +458,9 @@ fn runLzPipeline(
     /// the caller routes `req.d_output_target` here so the kernel
     /// skips the finalize D2D copy.
     lz_dst_base_dev: CUdeviceptr,
+    /// v4 #16: device-resident preset dictionary (0/0 = none).
+    d_dict: CUdeviceptr,
+    dict_len: u32,
 ) GpuError!i64 {
     const launch_fn = procs.launch;
     const stream_sync_fn = procs.stream_sync;
@@ -509,6 +519,8 @@ fn runLzPipeline(
         const raw_kernel = if (use_pipeline) module_loader.kernel_raw_pipeline_fn else module_loader.kernel_raw_fn;
         const raw_grid_x: u32 = if (use_pipeline) lz_grid_x * 2 else lz_grid_x;
         const raw_block_y: u32 = if (use_pipeline) 4 else 2;
+        var p_dict: u64 = d_dict;
+        var p_dict_len: u32 = dict_len;
         var raw_params = [_]?*anyopaque{
             @ptrCast(&common.comp),
             @ptrCast(&common.descs_dev),
@@ -516,6 +528,8 @@ fn runLzPipeline(
             @ptrCast(&common.chunks_per_group),
             @ptrCast(&common.total),
             @ptrCast(&common.sub_chunk_cap),
+            @ptrCast(&p_dict),
+            @ptrCast(&p_dict_len),
         };
         var raw_extra = [_]?*anyopaque{null};
         const label: [*:0]const u8 = if (use_pipeline) "slzLzDecodeRawPipelinedKernel" else "slzLzDecodeRawKernel";
@@ -526,6 +540,8 @@ fn runLzPipeline(
         var p_entropy_scratch: u64 = self.d_entropy_scratch;
         var p_entropy_slot_stride: u64 = @as(u64, total_subchunks) * descriptors.ENTROPY_SCRATCH_SLOT_BYTES;
         var p_first_sub_idx: CUdeviceptr = self.d_first_subchunk_idx;
+        var p_dict: u64 = d_dict;
+        var p_dict_len: u32 = dict_len;
 
         var lz_params = [_]?*anyopaque{
             @ptrCast(&common.comp),
@@ -537,6 +553,8 @@ fn runLzPipeline(
             @ptrCast(&p_entropy_scratch),
             @ptrCast(&p_entropy_slot_stride),
             @ptrCast(&p_first_sub_idx),
+            @ptrCast(&p_dict),
+            @ptrCast(&p_dict_len),
         };
         var lz_extra = [_]?*anyopaque{null};
 
@@ -796,6 +814,7 @@ fn runBackHalf(
         total_chunks, layout.total_subchunks,
         heavy_stream, split_timer, io,
         lz_total_count_dev, lz_dst_base_dev,
+        req.d_dict, req.dict_len,
     );
 
     // Back-half stream sync: skip in async mode (caller's stream

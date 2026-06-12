@@ -106,7 +106,11 @@ const CompressOpts = extern struct {
     level: c_int = 5,
     enable_profiling: c_int = 0,
     effective_level_out: c_int = 0,
-    reserved: [5]c_int = @splat(0),
+    /// v4 #16: preset dictionary ID (0 = none). Reuses the next
+    /// `reserved` slot, so pre-dict callers (who must zero reserved)
+    /// are automatically dictionary-less; struct size unchanged.
+    dictionary_id: c_int = 0,
+    reserved: [4]c_int = @splat(0),
 };
 
 /// Mirror of `slzDecompressOpts_t`.
@@ -131,7 +135,8 @@ comptime {
     std.debug.assert(@offsetOf(CompressOpts, "level") == 0);
     std.debug.assert(@offsetOf(CompressOpts, "enable_profiling") == @sizeOf(c_int));
     std.debug.assert(@offsetOf(CompressOpts, "effective_level_out") == 2 * @sizeOf(c_int));
-    std.debug.assert(@offsetOf(CompressOpts, "reserved") == 3 * @sizeOf(c_int));
+    std.debug.assert(@offsetOf(CompressOpts, "dictionary_id") == 3 * @sizeOf(c_int));
+    std.debug.assert(@offsetOf(CompressOpts, "reserved") == 4 * @sizeOf(c_int));
     std.debug.assert(@offsetOf(DecompressOpts, "enable_profiling") == 0);
     std.debug.assert(@offsetOf(DecompressOpts, "reserved") == @sizeOf(c_int));
     // `slzKernelTiming_t` is `const char* + float` with trailing pad to
@@ -169,7 +174,9 @@ const Context = struct {
 /// variant is added.
 fn mapCompressError(err: anyerror) c_int {
     return switch (err) {
-        error.BadLevel, error.BadScGroupSize, error.BadBlockSize => SLZ_ERROR_UNSUPPORTED,
+        // UnknownDictionary: the caller named a dictionary_id the
+        // registry cannot resolve (v4 #16).
+        error.BadLevel, error.BadScGroupSize, error.BadBlockSize, error.UnknownDictionary => SLZ_ERROR_UNSUPPORTED,
         error.DestinationTooSmall => SLZ_ERROR_BUFFER_TOO_SMALL,
         error.OutOfMemory, error.OutOfDeviceMemory => SLZ_ERROR_OUT_OF_MEMORY,
         error.BackendNotAvailable,
@@ -257,12 +264,16 @@ fn isGpuFallbackError(err: anyerror) bool {
 // Each returns the byte count (>= 0) or a negative SLZ_ERROR_* code.
 fn compressCore(h: *Context, input: []const u8, output: []u8, opts: CompressOpts) c_int {
     // Level range is validated by `encoder.compressFramed` (returns
-    // `error.BadLevel` → SLZ_ERROR_UNSUPPORTED via mapCompressError).
+    // `error.BadLevel` → SLZ_ERROR_UNSUPPORTED via mapCompressError);
+    // an unresolvable dictionary_id likewise (error.UnknownDictionary).
     const n = encoder.compressFramed(
         allocator,
         input,
         output,
-        .{ .level = @intCast(opts.level) },
+        .{
+            .level = @intCast(opts.level),
+            .dictionary_id = if (opts.dictionary_id != 0) @intCast(opts.dictionary_id) else null,
+        },
         &h.enc,
     ) catch |err| return mapCompressError(err);
     return @intCast(n);

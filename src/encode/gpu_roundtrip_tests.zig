@@ -240,3 +240,101 @@ test "compressFramed rejects undersized destination" {
         encoder.compressFramed(allocator, src, &dst, .{ .level = 1 }, &gpu_encoder.g_default),
     );
 }
+
+test "v4 #16: dictionary frames roundtrip, compress better, enforce the registry" {
+    lockGpuTests();
+    defer unlockGpuTests();
+    if (!gpu_encoder.isAvailable()) return error.SkipZigTest;
+    if (!gpu_driver.isAvailable()) return error.SkipZigTest;
+    if (!gpu_driver.bindContextToCallingThread()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const dictionary = @import("../dict/dictionary.zig");
+    const frame_format = @import("../format/frame_format.zig");
+
+    // Small-records payload built FROM dictionary bytes: 120 records,
+    // each a slice of the json dictionary's tail plus a unique
+    // decoration. Dictionary matches are guaranteed by construction,
+    // so the ratio assertions below are deterministic.
+    const dict_data = dictionary.findById(dictionary.id_json).?.data;
+    var payload_list: std.ArrayList(u8) = .empty;
+    defer payload_list.deinit(allocator);
+    for (0..120) |i| {
+        var dec_buf: [32]u8 = undefined;
+        const dec = std.fmt.bufPrint(&dec_buf, "#rec{d}:{d};", .{ i, i * 31 }) catch unreachable;
+        try payload_list.appendSlice(allocator, dec);
+        const start = dict_data.len - 2048 + (i * 13) % 1600;
+        try payload_list.appendSlice(allocator, dict_data[start .. start + 192]);
+    }
+    const payload = payload_list.items;
+
+    const bound = encoder.compressBound(payload.len);
+    const plain = try allocator.alloc(u8, bound);
+    defer allocator.free(plain);
+    const with_dict = try allocator.alloc(u8, bound);
+    defer allocator.free(with_dict);
+
+    for ([_]u8{ 1, 2, 3, 4, 5 }) |level| {
+        const n_plain = try encoder.compressFramed(allocator, payload, plain, .{ .level = level }, &gpu_encoder.g_default);
+        const n_dict = try encoder.compressFramed(
+            allocator,
+            payload,
+            with_dict,
+            .{ .level = level, .dictionary_id = dictionary.id_json },
+            &gpu_encoder.g_default,
+        );
+
+        const hdr = frame_format.parseHeader(with_dict[0..n_dict]) catch unreachable;
+        try testing.expectEqual(@as(?u32, dictionary.id_json), hdr.dictionary_id);
+        const id_pos = hdr.header_size - 4;
+
+        if (level == 5) {
+            // The L5 chain parser does not search the dictionary yet
+            // (v4 #16 follow-up): a dict frame must equal the plain
+            // frame plus EXACTLY the spliced header field. This pins
+            // the phase-1 invariant where it still holds - and breaks
+            // loudly when chain-parser dict search lands, as a
+            // reminder to extend the ratio assertions to L5.
+            try testing.expectEqual(n_plain + 4, n_dict);
+            try testing.expectEqualSlices(u8, plain[0..5], with_dict[0..5]);
+            try testing.expectEqual(plain[5] | @as(u8, 0x08), with_dict[5]);
+            try testing.expectEqualSlices(u8, plain[6..id_pos], with_dict[6..id_pos]);
+            try testing.expectEqualSlices(u8, plain[id_pos..n_plain], with_dict[hdr.header_size..n_dict]);
+        } else {
+            // Greedy levels (1-4) search the dictionary: on this
+            // dict-derived payload the dict frame must be MEANINGFULLY
+            // smaller (the cold-start content is dict-matchable by
+            // construction; require at least 20% off).
+            if (n_dict >= n_plain - n_plain / 5) {
+                std.debug.print(
+                    "dict ratio L{d}: plain {d} B, dict {d} B - expected >= 20% reduction\n",
+                    .{ level, n_plain, n_dict },
+                );
+                return error.TestUnexpectedResult;
+            }
+        }
+
+        // Dict frames roundtrip byte-exact through the dict-aware
+        // decode kernels at every level.
+        const dst = try allocator.alloc(u8, payload.len + decoder.safe_space);
+        defer allocator.free(dst);
+        const written = try decoder.decompressFramed(with_dict[0..n_dict], dst, &gpu_driver.g_default);
+        try testing.expectEqual(payload.len, written);
+        try testing.expectEqualSlices(u8, payload, dst[0..written]);
+
+        // Unknown IDs are rejected on both sides. The decoder check
+        // patches the ID field in place - no checksum covers header
+        // bytes, so the frame stays otherwise valid.
+        try testing.expectError(error.UnknownDictionary, encoder.compressFramed(
+            allocator,
+            payload,
+            plain,
+            .{ .level = level, .dictionary_id = 999 },
+            &gpu_encoder.g_default,
+        ));
+        std.mem.writeInt(u32, with_dict[id_pos..][0..4], 0xDEAD_BEEF, .little);
+        try testing.expectError(
+            error.UnknownDictionary,
+            decoder.decompressFramed(with_dict[0..n_dict], dst, &gpu_driver.g_default),
+        );
+    }
+}

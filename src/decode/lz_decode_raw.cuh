@@ -37,7 +37,7 @@ __device__ unsigned long long g_slz_pp_tokens = 0;    // tokens consumed by PP b
 __device__ unsigned long long g_slz_serial_iters = 0; // serial-path iterations (1 token each)
 #endif
 
-template <bool OFF16_SPLIT>
+template <bool OFF16_SPLIT, bool HAS_DICT = false>
 __device__ __noinline__ void decodeSubChunkRawMode(
     const uint8_t* __restrict__ cmd, uint32_t cmd_size,
     const uint8_t* __restrict__ lit, uint32_t lit_size,
@@ -46,7 +46,10 @@ __device__ __noinline__ void decodeSubChunkRawMode(
     const uint8_t* __restrict__ length_stream, uint32_t length_remaining,
     uint8_t* __restrict__ dst, uint32_t dst_size,
     uint32_t initial_copy,
-    uint32_t dst_offset
+    uint32_t dst_offset,
+    // v4 #16 (HAS_DICT only): preset dictionary; match sources below
+    // `dst_offset` (the sub-chunk's window base) read the dict tail.
+    const uint8_t* __restrict__ dict = nullptr, uint32_t dict_len = 0
 ) {
     const int lane = threadIdx.x & LANE_MASK;
     uint32_t cmd_pos = 0, lit_pos = 0, off16_pos = 0;
@@ -201,7 +204,14 @@ __device__ __noinline__ void decodeSubChunkRawMode(
                 // granularity — src-entirely-pre-batch suffices.)
                 uint32_t my_copy_dst = dst_pos + my_dst_local + my_lit_len;
                 int32_t  my_src      = (int32_t)my_copy_dst + my_match_offset;
-                bool my_is_indep = (my_match_len > 0) &&
+                // v4 #16: a match whose source reaches below the window
+                // base needs the dict-aware per-byte read - exclude it
+                // from the flat pass (it falls into the dependent loop,
+                // which is order-safe for it: its source is dictionary
+                // bytes plus pre-batch output only).
+                bool my_reaches_dict = HAS_DICT && (my_match_len > 0) &&
+                                       (my_src < (int32_t)dst_offset);
+                bool my_is_indep = (my_match_len > 0) && !my_reaches_dict &&
                                    (my_src + (int32_t)my_match_len <= (int32_t)dst_pos);
                 uint32_t my_im_len = my_is_indep ? my_match_len : 0u;
                 uint32_t my_im_local, total_im;
@@ -245,7 +255,8 @@ __device__ __noinline__ void decodeSubChunkRawMode(
 
                     uint32_t copy_dst = dst_pos + k_dst_local + k_lit_len;
                     uint32_t match_src = (uint32_t)((int32_t)copy_dst + k_match_off);
-                    warpMatchCopy(dst, copy_dst, match_src, k_match_len, -k_match_off, lane);
+                    warpMatchCopyD<HAS_DICT>(dst, copy_dst, match_src, k_match_len, -k_match_off, lane,
+                                             dst_offset, dict, dict_len);
                     __syncwarp();
                 }
 
@@ -330,7 +341,8 @@ __device__ __noinline__ void decodeSubChunkRawMode(
         // ── Warp-cooperative match copy ──
         if (match_len > 0) {
             uint32_t match_src = (uint32_t)((int32_t)dst_pos + match_offset);
-            warpMatchCopy(dst, dst_pos, match_src, match_len, -match_offset, lane);
+            warpMatchCopyD<HAS_DICT>(dst, dst_pos, match_src, match_len, -match_offset, lane,
+                                     dst_offset, dict, dict_len);
             __syncwarp();
         }
         dst_pos += match_len;

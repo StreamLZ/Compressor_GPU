@@ -30,6 +30,7 @@ ML pipelines link against).
 streamlz file.txt                # compress (default L1)
 streamlz -l 3 file.txt           # compress at level 3
 streamlz -d file.slz             # decompress
+streamlz -D json records.json    # compress with a preset dictionary
 streamlz -b -l 5 file.txt        # compress + decompress + verify
 streamlz -ba file.txt            # sweep L1-L5, ratio + throughput
 streamlz -db file.slz            # decompress-only benchmark
@@ -170,6 +171,34 @@ data returns `error.ChecksumMismatch` instead of wrong bytes. Cost
 is ~1 ms per 100 MB on encode and ~zero on decode. Pass
 `chunk_checksum = false` to strip it; `--checksum` additionally
 enables the LZ4-style whole-file XXH32 (flag bit 1). See FORMAT.md.
+
+### Preset dictionaries
+
+Small records barely compress cold - every frame starts with no
+history. A preset dictionary gives the match finder shared context
+both sides already know: `streamlz -D <name>` on encode, automatic
+on decode (the frame header names its dictionary; the wire never
+carries dictionary bytes). Built-ins: json, html, text, xml, css,
+js, general (shared with the CPU sibling project), and
+github-users (trained on the bundled corpus). Train your own with
+`zig build dict_gate0`; C callers set `dictionary_id` in
+`slzCompressOpts_t`.
+
+Per-record benchmark (`zig build dict_bench`, 4,557 GitHub-API JSON
+records averaging 825 B, held-out from the dictionary's training
+half, RTX 4060 Ti, encode+decode byte-verified):
+
+| Level | Plain | With 2 KB trained dict | Improvement |
+|-------|------:|-----------------------:|------------:|
+| L1 | 57.5% | **28.5%** | 2.02x |
+| L3 | 57.5% | **28.5%** | 2.02x |
+| L5 | 52.4% | 52.9% (no dict search yet) | - |
+
+Dictionary quality is per-corpus: the same records with the generic
+json dictionary stay at ~57% - train on a sample of YOUR records.
+The L5 chain parser does not search dictionaries yet (frames stay
+valid; no ratio benefit). Dictionary-less frames are byte-identical
+to before the feature existed.
 
 ### vs nvCOMP (enwik8 100 MB, RTX 4060 Ti)
 

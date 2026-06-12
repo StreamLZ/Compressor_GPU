@@ -70,7 +70,14 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
     uint32_t total_chunks,
     uint32_t hash_bits,
     uint32_t use_chain,
-    uint32_t l4_features
+    uint32_t l4_features,
+    // v4 #16: preset dictionary + its host-built position hash table
+    // (hashKey6 over the same hash_bits). nullptr/0 = no dictionary.
+    // Searched by the greedy parser only; the L5 chain parser accepts
+    // dict frames but does not search the dictionary yet.
+    const uint8_t* __restrict__ dict,
+    uint32_t dict_len,
+    const uint32_t* __restrict__ dict_ht
 ) {
     const uint32_t chunk_id = blockIdx.x;
     const uint32_t lane = threadIdx.x & LANE_MASK;
@@ -172,22 +179,33 @@ extern "C" __global__ void __launch_bounds__(32, 1) slzLzEncodeKernel(
         // ── Block 1 pass ────
         {
             uint32_t block1_end = (src_size < LZ_BLOCK_SIZE) ? src_size : LZ_BLOCK_SIZE;
-            scanBlock(src, src_size, ht, hash_bits, hash_mask,
-                      streams,
-                      anchor, recent_offset,
-                      anchor, block1_end, /*block2_start=*/0, l4_features);
+            if (dict != nullptr) {
+                scanBlock<true>(src, src_size, ht, hash_bits, hash_mask,
+                                streams,
+                                anchor, recent_offset,
+                                anchor, block1_end, /*block2_start=*/0, l4_features,
+                                dict, dict_len, dict_ht);
+            } else {
+                scanBlock<false>(src, src_size, ht, hash_bits, hash_mask,
+                                 streams,
+                                 anchor, recent_offset,
+                                 anchor, block1_end, /*block2_start=*/0, l4_features);
+            }
             off32_count_block1 = streams.off32_count;
             streams.off32_count = 0;
         }
 
         // ── Block 2 pass ────
+        // Dict probes in block 2 self-gate (any dict distance from a
+        // position >= 64 KB exceeds the off16 cap), so the plain
+        // instantiation is correct and cheaper.
         if (src_size > LZ_BLOCK_SIZE) {
             cmd_stream2_offset = streams.token_count;
             uint32_t block2_start_pos = (anchor > LZ_BLOCK_SIZE) ? anchor : LZ_BLOCK_SIZE;
-            scanBlock(src, src_size, ht, hash_bits, hash_mask,
-                      streams,
-                      anchor, recent_offset,
-                      block2_start_pos, src_size, /*block2_start=*/LZ_BLOCK_SIZE, l4_features);
+            scanBlock<false>(src, src_size, ht, hash_bits, hash_mask,
+                             streams,
+                             anchor, recent_offset,
+                             block2_start_pos, src_size, /*block2_start=*/LZ_BLOCK_SIZE, l4_features);
             off32_count_block2 = streams.off32_count;
         }
     }

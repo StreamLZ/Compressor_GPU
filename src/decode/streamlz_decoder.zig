@@ -20,6 +20,7 @@ const std = @import("std");
 const frame = @import("../format/frame_format.zig");
 const block_header = @import("../format/block_header.zig");
 const constants = @import("../format/streamlz_constants.zig");
+const dictionary = @import("../dict/dictionary.zig");
 const gpu_driver = @import("driver.zig");
 
 /// Bytes the decoder is allowed to overshoot past the requested output
@@ -65,8 +66,10 @@ pub const DecompressError = error{
     ChecksumMismatch,
     /// A chunk's `decompressed_size` disagrees with its dst-stride.
     ChunkSizeMismatch,
-    /// The frame carries a `dictionary_id`; the GPU decoder has no
-    /// dictionary store. Always rejected.
+    /// The frame carries a `dictionary_id` that does not resolve in
+    /// the dictionary registry (`src/dict/dictionary.zig`). Only
+    /// registry built-ins resolve today; custom-dictionary
+    /// registration lands with the C ABI surface.
     UnknownDictionary,
     /// `content_size` exceeds `max_content_size` (4 GiB). Either the
     /// frame is hostile or it was produced by an encoder that exceeds
@@ -166,6 +169,13 @@ pub fn decompressFramedFromDevice(
     if (!gpu_driver.copyDeviceToHost(hdr_buf[0..hdr_n], d_frame)) return error.BadMode;
     const parsed_hdr = frame.parseHeader(hdr_buf[0..]) catch return error.BadMode;
 
+    // v4 #16: dictionary frames carry 4 extra header bytes, which
+    // breaks this function's fixed `block_start` layout above (and the
+    // device walk does not know the dictionary either). Reject with
+    // BadMode so the C ABI falls back to the host-bounce path, where
+    // the registry resolution applies.
+    if (parsed_hdr.dictionary_id != null) return error.BadMode;
+
     const dev = try gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size);
 
     // Stub slices: the kernel reads from `d_chunk_descs_override` and
@@ -236,10 +246,20 @@ fn decompressFrameInner(
 
     const hdr = frame.parseHeader(src) catch return error.BadFrame;
 
-    // GPU codec never produces dictionary frames. The dictionary subsystem
-    // was removed during the GPU-only strip; any frame carrying a
-    // dictionary_id originated from the legacy CPU encoder.
-    if (hdr.dictionary_id) |_| return error.UnknownDictionary;
+    // v4 #16: resolve the frame's dictionary in the registry (unknown
+    // ID rejects immediately - the wire contract). The device upload
+    // is LAZY: it happens at the first compressed-block dispatch,
+    // cached by ID on the context so a batch of frames sharing one
+    // dictionary uploads once. Uncompressed-body dict frames (tiny
+    // inputs) therefore decode without touching the GPU at all - the
+    // eager-upload variant failed them with BackendNotAvailable
+    // before any dispatch had initialized the driver.
+    var dict_info: ?*const dictionary.DictInfo = null;
+    var dict_id: u32 = 0;
+    if (hdr.dictionary_id) |did| {
+        dict_info = dictionary.findById(did) orelse return error.UnknownDictionary;
+        dict_id = did;
+    }
 
     if (hdr.content_size) |cs| {
         if (cs > max_content_size) return error.ContentSizeTooLarge;
@@ -307,6 +327,15 @@ fn decompressFrameInner(
         }
 
         const block_src = src[pos .. pos + block_hdr.compressed_size];
+        // v4 #16: first compressed block - make the dictionary
+        // device-resident now (cached; see the resolution above).
+        var d_dict: u64 = 0;
+        var dict_len: u32 = 0;
+        if (dict_info) |info| {
+            try gpu_driver.ensureDictOnDevice(dec_ctx, dict_id, info.data);
+            d_dict = dec_ctx.d_dict;
+            dict_len = dec_ctx.dict_cached_len;
+        }
         // v4 #19: per-block device-hash geometry.
         var blk_merkle_n: u32 = 0;
         var blk_merkle_base: u32 = 0;
@@ -335,6 +364,8 @@ fn decompressFrameInner(
             blk_run_verdict,
             merkle_expected,
             &merkle_verdict,
+            d_dict,
+            dict_len,
         );
         // Restore the 8-byte SC tail prefix bytes that the encoder
         // appended at the end of the block. The decoder kernel writes
@@ -428,6 +459,9 @@ fn dispatchCompressedBlock(
     merkle_run_verdict: bool,
     merkle_expected: u32,
     merkle_verdict_out: *u32,
+    // v4 #16: device-resident preset dictionary (0/0 = none).
+    d_dict: u64,
+    dict_len: u32,
 ) DecompressError!void {
     const eff_chunk_size = @min(frame.scGroupSizeToBytes(sc_group_size), constants.chunk_size);
     const num_chunks = (decompressed_size + eff_chunk_size - 1) / eff_chunk_size;
@@ -487,6 +521,8 @@ fn dispatchCompressedBlock(
         .merkle_run_verdict = merkle_run_verdict,
         .merkle_expected_root = merkle_expected,
         .merkle_verdict_out = if (merkle_run_verdict) merkle_verdict_out else null,
+        .d_dict = d_dict,
+        .dict_len = dict_len,
     });
 }
 

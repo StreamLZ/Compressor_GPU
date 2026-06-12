@@ -91,14 +91,15 @@ struct PipeBatch {
 // window starts with a long token (caller drains + runs the serial
 // handler) or cmd is exhausted (caller checks cmd_pos).
 // Runs on the parser warp only.
-template <bool OFF16_SPLIT>
+template <bool OFF16_SPLIT, bool HAS_DICT = false>
 __device__ bool fillBatch(
     const uint8_t* __restrict__ cmd, uint32_t cmd_size,
     const uint8_t* __restrict__ off16_raw, uint32_t off16_count,
     const uint8_t* __restrict__ off16_hi, const uint8_t* __restrict__ off16_lo,
     uint32_t& cmd_pos, uint32_t& lit_pos, uint32_t& off16_pos,
     uint32_t& dst_pos, int32_t& recent_offset,
-    int lane, PipeBatch* s
+    int lane, PipeBatch* s,
+    uint32_t window_base = 0 // v4 #16: sub-chunk output base (HAS_DICT only)
 ) {
     uint32_t remaining = cmd_size - cmd_pos;
     uint32_t batch_size = remaining < WARP_SIZE ? remaining : WARP_SIZE;
@@ -149,10 +150,15 @@ __device__ bool fillBatch(
     uint32_t my_lit_local, total_lit;
     warpScanU32(my_lit_len, my_lit_local, total_lit);
 
-    // Independent-match classification (v4 #2).
+    // Independent-match classification (v4 #2). v4 #16: dict-reaching
+    // matches are excluded from the flat pass - they fall into the
+    // dependent loop, whose per-byte dict-aware read handles them
+    // (order-safe: their sources are dict bytes + pre-batch output).
     uint32_t my_copy_dst = dst_pos + my_dst_local + my_lit_len;
     int32_t  my_src      = (int32_t)my_copy_dst + my_match_offset;
-    bool my_is_indep = (my_match_len > 0) &&
+    bool my_reaches_dict = HAS_DICT && (my_match_len > 0) &&
+                           (my_src < (int32_t)window_base);
+    bool my_is_indep = (my_match_len > 0) && !my_reaches_dict &&
                        (my_src + (int32_t)my_match_len <= (int32_t)dst_pos);
     uint32_t my_im_len = my_is_indep ? my_match_len : 0u;
     uint32_t my_im_local, total_im;
@@ -202,13 +208,17 @@ __device__ bool fillBatch(
 // it; warps 2-3 park at the closing team barrier meanwhile. The
 // parser is NOT a participant in either team barrier and keeps
 // parsing batch N+1 throughout.
+template <bool HAS_DICT = false>
 __device__ void executeBatchTeam(
     uint8_t* __restrict__ dst,
     const uint8_t* __restrict__ lit,
     int lane,           // lane within own warp
     uint32_t team_lane, // 0..95 across the 3 copier warps
     uint32_t warp_y,    // threadIdx.y (1..3)
-    const PipeBatch* s
+    const PipeBatch* s,
+    // v4 #16 (HAS_DICT only): dict reach for the dependent loop.
+    uint32_t window_base = 0,
+    const uint8_t* __restrict__ dict = nullptr, uint32_t dict_len = 0
 ) {
     uint32_t bs = s->batch_size;
     uint32_t batch_dst = s->dst_pos;
@@ -253,7 +263,8 @@ __device__ void executeBatchTeam(
             int32_t  k_match_off = s->match_offset[k];
             uint32_t copy_dst = s->im_dst_adj[k] + s->im_prefix[k];
             uint32_t match_src = (uint32_t)((int32_t)copy_dst + k_match_off);
-            warpMatchCopy(dst, copy_dst, match_src, k_match_len, -k_match_off, lane);
+            warpMatchCopyD<HAS_DICT>(dst, copy_dst, match_src, k_match_len, -k_match_off, lane,
+                                     window_base, dict, dict_len);
             __syncwarp();
         }
     }
@@ -270,7 +281,7 @@ __device__ void executeBatchTeam(
 //            in the same iteration, both fall through
 //   serial:  if cmd remains (long token), all warps execute it
 //            cooperatively, then re-prime
-template <bool OFF16_SPLIT>
+template <bool OFF16_SPLIT, bool HAS_DICT = false>
 __device__ __noinline__ void decodeSubChunkRawModePipelined(
     const uint8_t* __restrict__ cmd, uint32_t cmd_size,
     const uint8_t* __restrict__ lit, uint32_t lit_size,
@@ -280,7 +291,10 @@ __device__ __noinline__ void decodeSubChunkRawModePipelined(
     uint8_t* __restrict__ dst, uint32_t dst_size,
     uint32_t initial_copy,
     uint32_t dst_offset,
-    PipeBatch* s_batch // [SLZ_PIPE_STAGES], caller-allocated shared
+    PipeBatch* s_batch, // [SLZ_PIPE_STAGES], caller-allocated shared
+    // v4 #16 (HAS_DICT only): preset dictionary; match sources below
+    // `dst_offset` (the sub-chunk's window base) read the dict tail.
+    const uint8_t* __restrict__ dict = nullptr, uint32_t dict_len = 0
 ) {
     const int lane = threadIdx.x & LANE_MASK;
     const uint32_t warp_y = threadIdx.y;
@@ -300,10 +314,10 @@ __device__ __noinline__ void decodeSubChunkRawModePipelined(
     while (true) {
         // ── Prime: parser stages the first batch of this run ─────
         if (is_parser) {
-            bool got = (cmd_pos < cmd_size) && fillBatch<OFF16_SPLIT>(
+            bool got = (cmd_pos < cmd_size) && fillBatch<OFF16_SPLIT, HAS_DICT>(
                 cmd, cmd_size, off16_raw, off16_count, off16_hi, off16_lo,
                 cmd_pos, lit_pos, off16_pos, dst_pos, recent_offset,
-                lane, &s_batch[0]);
+                lane, &s_batch[0], dst_offset);
             if (lane == 0) s_have[0] = got ? 1 : 0;
         }
         __syncthreads();
@@ -312,13 +326,14 @@ __device__ __noinline__ void decodeSubChunkRawModePipelined(
         uint32_t cur = 0;
         while (s_have[cur]) {
             if (is_parser) {
-                bool got = (cmd_pos < cmd_size) && fillBatch<OFF16_SPLIT>(
+                bool got = (cmd_pos < cmd_size) && fillBatch<OFF16_SPLIT, HAS_DICT>(
                     cmd, cmd_size, off16_raw, off16_count, off16_hi, off16_lo,
                     cmd_pos, lit_pos, off16_pos, dst_pos, recent_offset,
-                    lane, &s_batch[1 - cur]);
+                    lane, &s_batch[1 - cur], dst_offset);
                 if (lane == 0) s_have[1 - cur] = got ? 1 : 0;
             } else {
-                executeBatchTeam(dst, lit, lane, team_lane, warp_y, &s_batch[cur]);
+                executeBatchTeam<HAS_DICT>(dst, lit, lane, team_lane, warp_y, &s_batch[cur],
+                                           dst_offset, dict, dict_len);
             }
             __syncthreads(); // slot 1-cur staged; slot cur executed
             cur = 1 - cur;
@@ -393,7 +408,8 @@ __device__ __noinline__ void decodeSubChunkRawModePipelined(
             // — one warp avoids double-writing).
             if (is_parser) {
                 uint32_t msrc = (uint32_t)((int32_t)dst_pos + soff);
-                warpMatchCopy(dst, dst_pos, msrc, smatch, -soff, lane);
+                warpMatchCopyD<HAS_DICT>(dst, dst_pos, msrc, smatch, -soff, lane,
+                                         dst_offset, dict, dict_len);
             }
             __syncthreads();
         }
@@ -413,6 +429,7 @@ __device__ __noinline__ void decodeSubChunkRawModePipelined(
 // Stream headers are parsed on the parser warp (same serial walk as
 // parseAndDecodeSubChunkRaw in lz_dispatch.cuh) and broadcast to the
 // copier warp through shared memory.
+template <bool HAS_DICT = false>
 __device__ void parseAndDecodeSubChunkRawPipelined(
     const uint8_t* __restrict__ sc_src,
     uint32_t sc_comp_size,
@@ -420,7 +437,8 @@ __device__ void parseAndDecodeSubChunkRawPipelined(
     uint8_t* __restrict__ dst,
     uint32_t dst_offset,
     uint32_t base_offset,
-    PipeBatch* s_batch
+    PipeBatch* s_batch,
+    const uint8_t* __restrict__ dict = nullptr, uint32_t dict_len = 0
 ) {
     const int lane = threadIdx.x & LANE_MASK;
     const uint32_t warp_id = threadIdx.y;
@@ -481,13 +499,13 @@ __device__ void parseAndDecodeSubChunkRawPipelined(
     }
     __syncthreads();
 
-    decodeSubChunkRawModePipelined<false>(
+    decodeSubChunkRawModePipelined<false, HAS_DICT>(
         (const uint8_t*)(uintptr_t)s_parse[1], (uint32_t)s_parse[5],
         (const uint8_t*)(uintptr_t)s_parse[0], (uint32_t)s_parse[4],
         (const uint8_t*)(uintptr_t)s_parse[2], (uint32_t)s_parse[6],
         nullptr, nullptr,
         (const uint8_t*)(uintptr_t)s_parse[3], (uint32_t)s_parse[7],
         dst, sc_decomp_size, initial_copy, dst_offset,
-        s_batch
+        s_batch, dict, dict_len
     );
 }

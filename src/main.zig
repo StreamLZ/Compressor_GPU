@@ -19,6 +19,9 @@ test {
     _ = @import("encode/huff_conformance_tests.zig");
     _ = @import("cli_smoke_tests.zig");
     _ = @import("encode/l5_hardening_tests.zig");
+    _ = @import("dict/trainer.zig");
+    _ = @import("dict/dictionary.zig");
+    _ = @import("decode/dict_vector_tests.zig");
     // Pull the C ABI implementation into the test build so its export
     // symbols exist for c_abi_tests.zig's extern declarations. The
     // production exe is unaffected (test blocks are test-build only).

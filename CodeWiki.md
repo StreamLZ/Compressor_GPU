@@ -93,7 +93,27 @@ Repository root:
 - `test_runner_parallel.zig` - the custom test runner behind `zig build ptest`; runs tests in parallel and names every skipped one
 - `stress18_main.zig` - standalone encode/decode loop built to chase an intermittent roundtrip mismatch (`zig build stress18`)
 - `chain_count_main.zig` - runs one level-5 encode and prints how much work the match-finder did (`zig build chaincount`)
+- `dict_gate0_main.zig` - trains preset dictionaries at several sizes and measures their compression-ratio lift on a small-records corpus through the production encoder (`zig build dict_gate0`)
+- `dict_bench_main.zig` - per-record dictionary benchmark: encodes every record of a corpus plain and with a dictionary, decodes and byte-verifies, reports ratio + throughput (`zig build dict_bench`)
 - `version.zig`, `mmap.zig` - version string; memory-mapped file IO
+
+### `src/dict/` - preset dictionaries
+
+- `dictionary.zig` - the dictionary registry: built-in dictionaries compiled in via `@embedFile`, identified by the well-known IDs carried in the frame header (flag bit 3). Both encoder and decoder resolve IDs through it; an ID permanently names exact bytes (retraining means a new ID). Mirrored at `srcVK/dict/`.
+- `builtin/*.dict` - the built-in dictionary assets. IDs 1-7 are shared byte-for-byte with the CPU sibling project so frames are dictionary-compatible across the two; ID 8 (github-users) is StreamLZ-trained at the measured 2 KB ratio knee.
+- `trainer.zig` - FASTCOVER dictionary trainer (the zstd algorithm, ported from the CPU sibling project); selects the most frequently-matched segments from sample records and packs them into a raw dictionary, best content at the tail. Host-only, no GPU interaction.
+
+How a dictionary flows through the codec: the encoder resolves the
+ID, builds a position hash table on the host (`encode_lz.zig
+ensureDictOnDevice`, cached per context), and the greedy parser
+probes it as its lowest-priority match source - a dictionary match
+is an ordinary off16 token whose distance reaches below the
+sub-chunk window. The decoder resolves the same ID from the frame
+header, uploads the bytes once (`decode_context.zig
+ensureDictOnDevice`), and the LZ kernels' dict-templated copy paths
+(`readBackRefByte` in `lz_decode_core.cuh`) map below-window reads
+onto the dictionary tail. The L5 chain parser does not search the
+dictionary yet (accepts dict frames; no ratio benefit).
 
 ### `src/common/` - headers shared by encode and decode kernels
 
@@ -128,6 +148,7 @@ Repository root:
 ### `src/decode/`
 
 - `streamlz_decoder.zig` - the public API: `decompressFramed`, frame walking, trailer verification, error surface
+- `dict_vector_tests.zig` - hand-crafted dictionary-frame decode vectors generated from the FORMAT spec alongside a sequential reference model; proves the kernels' dictionary reach (straddle, recent-offset, off32, hostile clamp) independent of the encoder
 - `decode_dispatch.zig` - the heart of decode: one function that launches the whole kernel sequence for a block, including the integrity-check kernels
 - `decode_context.zig` - persistent device buffers, stream/event handles, per-kernel timing capture
 - `descriptors.zig` - the chunk descriptor structs shared with the kernels, and the error set
@@ -176,7 +197,9 @@ These checks decide whether a change lands.
 
 (The test corpora live in `assets/`: `enwik8.txt` is a 100 MB
 Wikipedia text dump, `silesia_all.tar` is the 213 MB Silesia
-mixed-content corpus.)
+mixed-content corpus, and `github_users.jsonl` is a 9k-record
+small-JSON corpus - one ~820-byte record per line - for the
+dictionary work.)
 
 1. **Cross-backend identity.** After any encoder change, encode
    enwik8 at levels 1, 3, and 5 on both backends and compare the

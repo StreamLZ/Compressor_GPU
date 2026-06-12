@@ -853,6 +853,238 @@ frames. Gate on a measured win: build the host-side prototype first
 and measure ratio lift on a real small-records corpus (e.g. 10k JSON
 docs) before touching kernels.
 
+**Design settled 2026-06-11** (discussion + review of the CPU
+sibling's `src/dict`, Compressor_Native checkout at `c:\tmp`):
+- The CPU version uses the prefix-window shape on BOTH sides
+  (encode: `effective_src = dict ++ src`; decode: dst =
+  `[dict | output | safe_space]`, zero copy-loop changes) - and its
+  OWN device-resident path REJECTS dictionary frames
+  (`error.BadMode`): the prefix shape does not survive a contiguous
+  multi-chunk device output. That settles the GPU shape: **one
+  read-only dict buffer + a source select in the copy loop** (match
+  source before chunk start resolves to `dict_base`, not
+  `out_base`), NOT per-chunk prefix staging.
+- **ONE copy in global memory**, uploaded at dict-load, persistent
+  in the context. No shared-memory staging: L1 and shared are the
+  same SRAM on Ada, a hot <= 32 KB dict is L1-resident per SM, the
+  copy loop already reads every match source from global
+  (`d_output`), and shared staging would cost blocks/SM at K=4
+  (~8 KB/block budget). Per FAILED_EXPERIMENTS, latency attacks do
+  not move these kernels; occupancy does.
+- **Encoder seeding**: one shared read-only dict hash table built on
+  device at dict-load; the match finder probes it as a SECOND probe
+  on chunk-table miss. Zero per-chunk init (vs ~2.6 ms/frame D2D to
+  seed 1500 per-chunk tables).
+- **Steal from Compressor_Native**: the FASTCOVER trainer
+  (`src/dict/trainer.zig`, ~160 lines, dependency-free Zig), the
+  registry + ID scheme (IDs 1-7 builtin
+  json/html/text/xml/css/js/general, >= 0x1000_0000 custom,
+  extension auto-select), the seven 32 KB `.dict` assets, and the
+  header surface (flag bit + opaque u32 dict ID +
+  `UnknownDictionary`). Keeping IDs/bytes identical makes
+  dictionaries interchangeable across the two products.
+- **Offset economics bound dict size**: a dict match at chunk
+  position p to dict depth q encodes as offset ~ p + (D - q), so
+  deep-chunk dict refs can exceed off16 (off32 forms exist).
+  FASTCOVER fills the dict BACKWARD (best segments at the tail =
+  cheapest offsets), so growing D adds segments that are both rarer
+  and dearer - returns decay on both axes. Useful D is bounded by
+  the per-chunk cold zone, not corpus richness; expected knee
+  8-16 KB for small records (zstd ships ~110 KB for heterogeneous
+  sets - corpus-dependent, measure).
+- **Size is a training parameter**, not a format or architecture
+  constant (the wire carries only the ID). Bench plan: ratio axis
+  FIRST via the host prototype (train 4/8/16/32/64 KB variants,
+  sweep the small-records corpus); placement A/B (global vs <= 4 KB
+  shared staging) only if NCU shows dict reads missing L1/L2 -
+  prediction: they will not for <= 32 KB.
+- **v1 scope cuts**: keep the 8-byte verbatim chunk prefix (the CPU
+  version drops it under dict; touching the SC-prefix machinery for
+  0.012% is not worth the #19 entanglement). Cross-backend SHA gate
+  extends to dict frames; dict-ID resolution must be identical on
+  both backends from day one.
+
+**Gate 0 - MEASURED 2026-06-11, PASSED decisively (phase 0 complete).**
+Tooling landed (no codec changes): `src/dict/trainer.zig` (FASTCOVER
+port from the CPU sibling, 4 unit tests, suite 55/0/0),
+`src/dict_gate0_main.zig` + `zig build dict_gate0` (train + measure
+driver), `assets/github_users.jsonl` (9114 real GitHub-API JSON
+records, ~825 B avg - the canonical zstd dictionary corpus).
+Method: marginal-size proxy through the production encoder -
+`|encode(dict ++ record)| - |encode(dict)|` at sc=1.0 (one parse
+window) + measured per-frame overhead, alternating train/eval split
+(dict never scored on its training records). RTX 4060 Ti, CUDA
+backend. Results (eval half = 4557 records, 3.76 MB raw):
+
+| Level | cold | 2 KB dict | best dict | lift at best |
+|-------|-----:|----------:|----------:|-------------:|
+| L1 | 57.5% | 24.9% | 24.9% (2 KB) | 2.31x |
+| L3 | 57.5% | 24.9% | 18.3% (16 KB) | 3.14x |
+| L5 | 52.4% | 21.4% | 15.0% (16 KB) | 3.50x |
+
+Findings:
+- **The lift is 2.3-3.5x ratio** on the target workload - orders of
+  magnitude past any plausible build bar (compare the 0.02 pp that
+  parked #11). The small-input story goes from "barely compresses"
+  (57.5%) to better-than-enwik8-L5 (15-25%).
+- **The knee is at 2 KB on the L1 (clean LZ-only) signal** - flat
+  2.2-2.3x across 2-64 KB, with 2 KB actually BEST (24.9% vs 25.4%
+  at 64 KB): the offset-economics prediction confirmed (bigger dicts
+  = dearer offsets, no additional matches that matter on
+  uniform-structure records). The 8-16 KB prediction was
+  conservative; single-record-type corpora saturate even earlier.
+- **L3/L5 per-size numbers carry proxy noise** (the 16 KB spike):
+  the combined encode shares Huffman tables between dict and record,
+  which production dict frames would not. Direction and magnitude
+  are trustworthy; per-size ranking at L3+ is not. Re-rank during
+  phase 2/3 with real dict frames before choosing built-in sizes.
+- Trained dicts staged at `c:/tmp/slz_dicts/github_users_{2..64}k.dict`
+  (reproducible: `dict_gate0 assets/github_users.jsonl --out-dir <dir>`).
+VERDICT: build it. Phase 1 (registry + header plumbing) is next;
+kernel phases 2-3 follow per the settled design above.
+
+**Phase 1 - DONE on CUDA 2026-06-12 (registry + wire surface; inert
+until the kernel phases).** Landed:
+- `src/dict/dictionary.zig`: the registry - 7 built-ins via
+  @embedFile (`src/dict/builtin/*.dict`, byte-identical to the CPU
+  sibling's so frames are dictionary-compatible across products),
+  IDs 1-7, custom range >= 0x1000_0000 reserved, findBy
+  Name/Id/Extension, 4 unit tests. An ID permanently names exact
+  bytes; retraining = new ID.
+- Encoder: `Options.dictionary_id` (validated against the registry,
+  `error.UnknownDictionary`), flows into the already-existing
+  `WriteHeaderOptions.dictionary_id` (flag bit 3 + 4 ID bytes). The
+  device assemble takes the header as variable-length prefix_bytes -
+  no kernel changes needed.
+- Decoder: the unconditional dict-frame reject became a registry
+  resolution (unknown ID still rejects); the true-D2D path
+  (`decompressFramedFromDevice`) explicitly rejects dict frames with
+  BadMode - its fixed block_start layout and the device walk don't
+  know the 4 extra header bytes yet (host-bounce fallback covers).
+- Test (gpu_roundtrip_tests): dict frames at L1/L3/L5 must equal the
+  plain frame PLUS EXACTLY the spliced header field (flag bit + 4 ID
+  bytes, all other bytes identical) - this invariant also carries
+  cross-backend identity for dict frames while the SHA gate covers
+  plain frames; it intentionally BREAKS at phase 3 when the match
+  finder starts using the dictionary. Plus roundtrip, and
+  unknown-ID rejection on both sides (decoder via in-place ID patch).
+- Gates: ptest 60/0/0, ptest_vk 155/9/0, cross-backend SHA enwik8
+  L1/L3/L5 3/3 MATCH.
+- VK state (user-directed CUDA-first sequencing): registry + assets
+  mirrored to `srcVK/dict/`, Options/validation mirrored into the VK
+  encoder (its 4 registry tests run in ptest_vk) - but VK's
+  fast_framed still writes `.dictionary_id = null`, so a VK caller
+  passing a dict ID validates-then-silently-drops it. UNREACHABLE
+  today (no VK surface passes one). The VK port wave = that one
+  line + the decoder lookup + the splice test mirror.
+
+**Phases 2-4 - DONE on CUDA 2026-06-12 (decode reach + encoder
+search + CLI/C ABI; feature complete at L1-L4).** One overnight wave.
+
+Phase 2, decode (all four LZ kernels): bodies templated on HAS_DICT
+mirroring the OFF16_SPLIT pattern - the false instantiation is the
+pre-dict code exactly (zero cost, proven: bench_all decode times
+match the README table, and the cross-backend SHA gate reproduced
+byte-identical hashes to the pre-change run). `readBackRefByte`
+(lz_decode_core.cuh) maps below-window reads onto the dict tail with
+u32-wrap-safe compares (chunk-0 windows wrap negative); reaches
+below the dict clamp to 0x00. Dict-reaching matches are excluded
+from the flat independent pass and ride the dependent loop
+(order-safe: their sources are dict bytes + pre-batch output).
+Kernel signatures gained (dict, dict_len); the true-D2D path keeps
+its phase-1 BadMode reject. Host: d_dict cache by ID on
+DecodeContext, upload LAZY at the first compressed-block dispatch
+(eager upload broke uncompressed-body dict frames on machines where
+no dispatch had initialized CUDA - found by CLI smoke).
+VERIFICATION: spec-derived hand-crafted frame vectors
+(src/decode/dict_vector_tests.zig) - wire bytes AND expected output
+generated from a declarative op list through a sequential reference
+model, no code shared with the decoder. Covers pure dict match,
+straddle + self-overlap, recent-offset reach in one PP batch,
+long-near (serial drain), off32 short-far (general body), hostile
+clamp; every vector on BOTH kernel paths (pipelined +
+SLZ_NO_PIPELINE=1, env-flipped in-process via _putenv with a
+visibility probe). Found during construction: a sub-chunk whose
+payload >= decomp size routes to the uncompressed-memcpy branch -
+vectors must stay genuinely compressed.
+
+Phase 3, encode (greedy parser = L1-L4): dict probe as a FOURTH
+match type with strictly lowest priority (fires only where
+hash/xor/eight all missed) - dictionary-less parses are
+byte-identical by construction, and dict matches only ever replace
+literal runs. One hash (hashKey6), two probes: a host-built dict
+position table (ensureDictOnDevice in encode_lz.zig, bit-exact Zig
+twin of hashKey6, ascending insertion last-writer-wins, cached by
+(id, hash_bits)) sits beside the per-chunk table. Extension and
+backward walk read dict bytes via ref_base; distances stay invariant
+under the backward walk. SCOPE CUT that simplified everything: dict
+matches are gated to off16-encodable distances (<= 65535) at the
+probe - no off32 emission, no token-form changes, block-2 positions
+self-reject, and the raw decode fast path stays raw (the pipelined
+raw bridge assumes off32-free sub-chunks - an off32 dict path would
+have forced the general kernel onto every dict frame). The off16
+gate costs nothing real: 2 KB dicts (the knee) stay off16 to
+position ~63 KB, and deep positions prefer intra-window matches
+anyway. L5 chain parser: accepts dict frames, does NOT search
+(follow-up below). Per-call arming flag on EncodeContext (the
+device cache persists across calls; unarmed calls pass null).
+
+Phase 4, surfaces: CLI `-D <name|id|auto>` (compress + bench paths;
+decompress reads the header; `-i` already printed the ID), C ABI
+`dictionary_id` takes a formerly-reserved must-be-zero slot in
+slzCompressOpts_t (size/ABI unchanged, old callers automatically
+dict-less; unknown IDs -> SLZ_ERROR_UNSUPPORTED). Registry gained
+ID 8 "github-users": the gate-0-trained 2 KB knee dict - the first
+StreamLZ-trained builtin and the worked example of per-corpus
+training (additive; IDs 1-7 untouched per the immutability rule).
+
+MEASURED (dict_bench, 4557 held-out github_users records, avg 825 B,
+RTX 4060 Ti, real frames, decode byte-verified):
+| L1 | plain 57.5% -> dict 28.5% | 2.02x | encode FASTER (1170->1016 ms) |
+| L3 | same as L1 (entropy never engages on 825 B streams) | 2.02x |
+| L5 | 52.4% -> 52.9% = exactly +4 B/frame (no search; header cost) |
+vs gate-0's 24.9% marginal-proxy projection: the 3.5 pp gap is real
+per-frame overhead (~22-26 B of header/trailer per 825 B record) +
+the no-straddle/lowest-priority conservatisms. The generic json
+builtin on the same records: ~0 lift (schema mismatch) - dictionary
+quality is per-corpus, exactly as the tuning discussion predicted.
+
+GATES: ptest 61/0/0 (4 registry + trainer tests, 1 spec-vector test,
+the ratio/roundtrip/reject test at all 5 levels), ptest_vk 155/9/0,
+cross-backend SHA enwik8 L1/L3/L5 3/3 MATCH with hashes IDENTICAL to
+pre-change (no-dict frames provably untouched), bench_all all-SHA-OK
+with decode times at the README table (no perf regression), CLI
+smoke incl. tiny uncompressed-body dict frames.
+
+SURPRISE MEASUREMENT (2026-06-12, user-prompted): the generic `text`
+builtin on enwik8 at DEFAULT settings: L1 58.6% -> 53.6% (-5.0 pp,
+-8.6% bytes), L3 43.7% -> 42.0%, roundtrips verified. The dict is
+not a window-start-only lever - it acts as a persistent
+common-phrases table for ALL 1526 windows, firing wherever 64 KB of
+local history misses (lowest priority = replaces literals only, pure
+ratio gain). Decode cost of the serial-dependent-path routing showed
+up at this fire rate: LZ kernel 1.74 -> 2.53 ms (e2e 15.5 -> 15.9,
+PCIe-dominated). See follow-up (7).
+
+FOLLOW-UPS (in priority order): (1) VK port wave - the whole feature
+mirrors (registry done; encoder one-liner + decoder lookup + GLSL
+readBackRefByte in 3 shader bodies + the host table is
+backend-agnostic; cross-backend SHA gate then covers dict frames).
+(2) L5 chain-parser dict probe (the L5 row above; the splice-identity
+assertion in the ratio test breaks loudly when it lands). (3) D2D
+dict decode via registered-dict validation + the #19 verdict surface.
+(4) compute-sanitizer pass over the dict paths (tools/sanitize.bat) at
+the next milestone. (5) #13 fuzz tier for dict frames (mutate IDs +
+dict-reaching offsets). (6) Custom-dictionary registration API
+(slzSetDictionary) when an external caller needs non-builtin dicts.
+(7) Flat dict-match decode pass: dict sources are read-only (no
+write hazard by definition), so dict matches are trivially
+flat-pass-eligible - they ride the serial dependent loop today for
+implementation simplicity only. Worth ~0.8 ms on enwik8-L1-with-dict
+(1.74 -> 2.53 ms measured); build when dict-on-large-corpora becomes
+a real workload, alongside an enwik-class trained dict (the 5 pp
+above is from an UNTUNED generic dict).
+
 ## 17. Reverse-port VK persistent encode regions to CUDA — ✅ DONE 2026-06-11 (both backends; CUDA L1 encode 123→87 ms)
 
 **What**: The 2026-06-11 60-cell sweep found VK encode FASTER than

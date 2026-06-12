@@ -62,6 +62,7 @@ pub const allocHost = decode_context.allocHost;
 pub const freeHost = decode_context.freeHost;
 pub const copyDeviceToHost = decode_context.copyDeviceToHost;
 pub const copyHostToDevice = decode_context.copyHostToDevice;
+pub const ensureDictOnDevice = decode_context.ensureDictOnDevice;
 pub const bindContextToCallingThread = decode_context.bindContextToCallingThread;
 pub const beginKernelTiming = decode_context.beginKernelTiming;
 pub const endKernelTiming = decode_context.endKernelTiming;

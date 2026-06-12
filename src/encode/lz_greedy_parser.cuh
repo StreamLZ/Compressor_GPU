@@ -23,13 +23,29 @@ static constexpr uint32_t NO_MATCH_STEP_MAX = 16;         // cap on the adaptive
 // All stream cursors live in OutputStreams and accumulate across calls.
 // enable_match_rehash inserts hash entries inside the just-emitted
 // match (the driver's L4-and-up behavior).
+//
+// v4 #16 (HAS_DICT): a read-only preset dictionary extends the match
+// space BELOW position 0 - dict byte `dict_len - k` sits k bytes below
+// the window, so a dict match at position p to dict position dv emits
+// the ordinary off16 distance `p + (dict_len - dv)`. The dict probe is
+// the LOWEST-priority match source (fires only where hash/xor/eight
+// all missed), so dictionary-less content parses byte-identically.
+// `dict_ht` is a host-built table of dict positions hashed with the
+// same hashKey6/hash_bits as `ht` (one hash, two probes). Matches are
+// gated to off16-encodable distances (<= NEAR_OFFSET_MAX): block-2
+// positions auto-reject, so the off32 path is never involved, and
+// extension is capped at the dict end (the encoder never emits
+// straddling sources; the decoder supports them regardless).
+template <bool HAS_DICT = false>
 __device__ void scanBlock(
     const uint8_t* src, uint32_t src_size,
     uint32_t* ht, uint32_t hash_bits, uint32_t hash_mask,
     OutputStreams &s,
     uint32_t &anchor, int32_t &recent_offset,
     uint32_t start_pos, uint32_t end_pos, uint32_t block2_start,
-    uint32_t enable_match_rehash
+    uint32_t enable_match_rehash,
+    const uint8_t* dict = nullptr, uint32_t dict_len = 0,
+    const uint32_t* dict_ht = nullptr
 ) {
     const uint32_t lane = threadIdx.x & LANE_MASK;
     uint32_t pos = start_pos;
@@ -173,18 +189,40 @@ __device__ void scanBlock(
             if (eight_word == key4) eight_match = true;
         }
 
-        bool has_match = hash_match || xor_match || eight_match;
+        // v4 #16: dictionary probe - strictly lowest priority, so it can
+        // only ADD matches where the window finds none (dictionary-less
+        // parses are untouched). Same bucket `h`, separate read-only
+        // table; the off16 gate keeps every dict distance encodable
+        // with the existing token forms.
+        bool dict_match = false;
+        uint32_t dict_ref = 0;
+        if constexpr (HAS_DICT) {
+            if (is_active && !hash_match && !xor_match && !eight_match) {
+                uint32_t dv = dict_ht[h];
+                if (dv != HASH_EMPTY) {
+                    uint32_t dist = my_pos + (dict_len - dv);
+                    if (dist <= NEAR_OFFSET_MAX && readU32LE(dict + dv) == key4) {
+                        dict_match = true;
+                        dict_ref = dv;
+                    }
+                }
+            }
+        }
+
+        bool has_match = hash_match || xor_match || eight_match || dict_match;
         // Match type for dispatch:
         //   0 = hash    (hash_ref)
         //   1 = xor     (cursor+1, offset=recent)
         //   2 = eight   (offset=8)
+        //   3 = dict    (dict_ref, dict-space - v4 #16)
         // (Intra-warp same-key cases are folded into hash_match by the
         // unified serial-order simulation above.)
         uint32_t my_match_type = hash_match  ? 0u
                                : xor_match   ? 1u
                                : eight_match ? 2u
+                               : dict_match  ? 3u
                                : 0u;
-        uint32_t my_ref = hash_ref;
+        uint32_t my_ref = hash_match ? hash_ref : dict_ref;
         uint32_t match_ballot = __ballot_sync(FULL_WARP_MASK, has_match);
 
         // CPU runGreedyParser advances by an adaptive step on no match:
@@ -238,9 +276,14 @@ __device__ void scanBlock(
         uint32_t match_pos;
         uint32_t match_ref;
         uint32_t min_match_len;
+        // v4 #16: when the winning match is type 3, match_ref is a
+        // DICT-space position; extension, backward walk, and the
+        // offset computation all read the dictionary instead of src.
+        bool ref_in_dict = HAS_DICT && (winning_type == 3);
 
-        if (winning_type == 0) {
-            // Hash match (includes intra-warp same-key - unified above).
+        if (winning_type == 0 || winning_type == 3) {
+            // Hash match (includes intra-warp same-key - unified above)
+            // or dict match: both carry their ref in my_ref.
             match_pos = pos + first_lane;
             match_ref = __shfl_sync(FULL_WARP_MASK, my_ref, first_lane);
             min_match_len = MIN_MATCH;
@@ -257,9 +300,16 @@ __device__ void scanBlock(
             min_match_len = MIN_MATCH;
         }
 
-        // Match extension from min_match_len, capped at end_pos.
+        // Match extension from min_match_len, capped at end_pos (and at
+        // the dictionary end for dict refs - the encoder never emits a
+        // straddling source).
+        const uint8_t* ref_base = ref_in_dict ? dict : src;
         uint32_t match_len = min_match_len;
         uint32_t max_match = end_pos - match_pos;
+        if (ref_in_dict) {
+            uint32_t dict_avail = dict_len - match_ref;
+            if (dict_avail < max_match) max_match = dict_avail;
+        }
         bool ext_found = false;
         for (uint32_t ext = min_match_len; ext < max_match; ext += WARP_SIZE) {
             uint32_t check = ext + lane;
@@ -267,7 +317,7 @@ __device__ void scanBlock(
             if (check >= max_match)
                 mm = true;
             else
-                mm = (src[match_pos + check] != src[match_ref + check]);
+                mm = (src[match_pos + check] != ref_base[match_ref + check]);
             uint32_t mm_mask = __ballot_sync(FULL_WARP_MASK, mm);
             if (mm_mask != 0) {
                 match_len = ext + __ffs(mm_mask) - 1;
@@ -278,7 +328,12 @@ __device__ void scanBlock(
         if (!ext_found) match_len = max_match;
 
         {
-            int32_t neg_off = -(int32_t)(match_pos - match_ref);
+            // For dict refs the distance reaches below the window:
+            // dist = match_pos + (dict_len - match_ref). The backward
+            // walk below keeps it invariant (both cursors step together).
+            int32_t neg_off = ref_in_dict
+                ? -(int32_t)(match_pos + (dict_len - match_ref))
+                : -(int32_t)(match_pos - match_ref);
             uint32_t off_param = (neg_off == recent_offset) ? 0 : (uint32_t)(-neg_off);
 
             // Resolve actual offset for fast-path decision
@@ -301,7 +356,7 @@ __device__ void scanBlock(
             if (lane == 0) {
                 uint32_t mp = match_pos;
                 uint32_t mr = match_ref;
-                while (mp > anchor && mr > 0 && src[mp - 1] == src[mr - 1]) {
+                while (mp > anchor && mr > 0 && src[mp - 1] == ref_base[mr - 1]) {
                     mp--;
                     mr--;
                     bw_steps++;
