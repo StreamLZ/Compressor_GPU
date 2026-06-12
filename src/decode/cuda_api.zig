@@ -65,6 +65,10 @@ pub const FnDeviceGetAttribute = *const fn (*c_int, c_int, CUdevice) callconv(.c
 pub const FnDeviceGetName = *const fn ([*]u8, c_int, CUdevice) callconv(.c) CUresult;
 pub const FnCtxCreate = *const fn (*usize, c_uint, CUdevice) callconv(.c) CUresult;
 pub const FnModuleLoadData = *const fn (*usize, [*]const u8) callconv(.c) CUresult;
+/// cuModuleLoadDataEx: LoadData plus JIT options. Used only by the
+/// SLZ_JIT_LINEINFO debug hook (CU_JIT_GENERATE_LINE_INFO) so
+/// compute-sanitizer maps SASS offsets to source lines.
+pub const FnModuleLoadDataEx = *const fn (*usize, [*]const u8, c_uint, [*]c_uint, [*]?*anyopaque) callconv(.c) CUresult;
 pub const FnModuleGetFunction = *const fn (*usize, usize, [*:0]const u8) callconv(.c) CUresult;
 pub const FnModuleGetGlobal = *const fn (*usize, *usize, usize, [*:0]const u8) callconv(.c) CUresult;
 pub const FnMemAlloc = *const fn (*CUdeviceptr, usize) callconv(.c) CUresult;
@@ -115,6 +119,7 @@ pub var device_name_len: usize = 0;
 /// CUDA driver API constant: CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT.
 pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
 pub var cuModuleLoadData_fn: ?FnModuleLoadData = null;
+pub var cuModuleLoadDataEx_fn: ?FnModuleLoadDataEx = null;
 pub var cuModuleGetFunction_fn: ?FnModuleGetFunction = null;
 pub var cuModuleGetGlobal_fn: ?FnModuleGetGlobal = null;
 pub var cuMemAlloc_fn: ?FnMemAlloc = null;

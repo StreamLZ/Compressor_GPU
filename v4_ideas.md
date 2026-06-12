@@ -1190,6 +1190,45 @@ verification blocked (ERR_NVGPUCTRPERM, needs admin shell);
 counters + wall-clock are conclusive. ptest 61/0/0, ptest_vk
 155/9/0.
 
+## 20. D2D front-half: parallelize the frame walk (walk+prefix = 29% of D2D kernel time)
+
+**What**: `slzWalkFrameKernel` is a SINGLE GPU thread chasing the
+chunk chain (chunk N+1's offset = chunk N's offset + comp_size):
+~1526 dependent global loads x ~430 ns = 0.66 ms on enwik8, plus
+0.11 ms of `slzPrefixSumChunksKernel` - together 0.77 of the 2.68 ms
+D2D kernel-active total (measured 2026-06-12 on the dict bench; the
+host-bounce path is unaffected, its walk runs on the CPU). Three
+tiers:
+1. **Fuse the prefix-sum into the walk** (~free, -0.11 ms): the
+   serial walk already carries the running totals; emit
+   first_subchunk_idx inline and drop the second kernel.
+2. **Latency-shave the chain** (-0.1-0.2 ms, meh): __ldg + wider
+   per-step reads; the dependency chain remains.
+3. **Embedded chunk-size table** (the real fix, format addition): a
+   3 B/chunk size table (~4.5 KB per 100 MB = 0.005% ratio) makes
+   the walk a parallel prefix-scan - 0.66 ms collapses to ~tens of
+   us. Flag-gated on a reserved header bit; old frames keep the
+   serial walk; both backends in one step. A small clean slice of #8
+   without the token-level upheaval.
+**Recommendation**: tier 1 anytime; tier 3 in the VK-era format
+window; skip tier 2.
+**NCU CONFIRMED 2026-06-12** (admin run of
+tools/ncu_profile_d2d_dict.bat, slz_d2d_dict_walk.ncu-rep): 707 us
+duration at 0.07% SM throughput, 2.07% occupancy (one warp on one
+SM), IPC 0.06, ~70% of stall cycles long-scoreboard, memory at
+6.1 GB/s on a 288 GB/s part - the textbook serial-dependency-chain
+signature, exactly as predicted. The data fully backs tier 3.
+BONUS finding: slzPrefixSumChunksKernel is ALSO grid=1/block=1
+single-thread (0.09% SM) - the D2D front-half is two serial chains
+back to back, strengthening tier 1 (the prefix re-reads through
+memory what the walk just held in registers).
+SIDE RESULT, fu7 NCU verification (slz_d2d_dict_lz.ncu-rep): the
+DICT-frame LZ kernel profiles at SM 73.8% / occupancy 92% / top
+stall barrier 8.2 cycles - byte-for-byte the #15 K=4 design floor
+measured on PLAIN frames. The flat dict pass restored dict frames
+to the pipeline's designed efficiency; no residual serialization
+signature.
+
 ## 17. Reverse-port VK persistent encode regions to CUDA — ✅ DONE 2026-06-11 (both backends; CUDA L1 encode 123→87 ms)
 
 **What**: The 2026-06-11 60-cell sweep found VK encode FASTER than

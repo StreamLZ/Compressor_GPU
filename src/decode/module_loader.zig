@@ -101,6 +101,7 @@ pub fn init() bool {
     cuda.cuDeviceGetName_fn = cuda.getProc(cuda.FnDeviceGetName, "cuDeviceGetName");
     cuda.cuCtxCreate_fn = cuda.getProc(cuda.FnCtxCreate, "cuCtxCreate_v2") orelse cuda.getProc(cuda.FnCtxCreate, "cuCtxCreate");
     cuda.cuModuleLoadData_fn = cuda.getProc(cuda.FnModuleLoadData, "cuModuleLoadData");
+    cuda.cuModuleLoadDataEx_fn = cuda.getProc(cuda.FnModuleLoadDataEx, "cuModuleLoadDataEx");
     cuda.cuModuleGetFunction_fn = cuda.getProc(cuda.FnModuleGetFunction, "cuModuleGetFunction");
     cuda.cuModuleGetGlobal_fn = cuda.getProc(cuda.FnModuleGetGlobal, "cuModuleGetGlobal_v2");
     cuda.cuMemAlloc_fn = cuda.getProc(cuda.FnMemAlloc, "cuMemAlloc_v2");
@@ -174,7 +175,17 @@ pub fn init() bool {
 
     // Load LZ decode kernel (Pass 2)
     const ptx = nullTerminatedPtx(LZ_PTX_NAME);
-    if (load_fn(&module, ptx.ptr) != CUDA_SUCCESS) return false;
+    // SLZ_JIT_LINEINFO=1 debug hook: ask the JIT to keep line info so
+    // compute-sanitizer maps SASS offsets to source lines (the PTX
+    // must also be built with -lineinfo; see CLAUDE.md for the manual
+    // nvcc/vcvarsall recipe). CU_JIT_GENERATE_LINE_INFO = 13.
+    if (std.c.getenv("SLZ_JIT_LINEINFO") != null) {
+        if (cuda.cuModuleLoadDataEx_fn) |load_ex| {
+            var jit_opts = [_]c_uint{13};
+            var jit_vals = [_]?*anyopaque{@ptrFromInt(1)};
+            if (load_ex(&module, ptx.ptr, 1, &jit_opts, &jit_vals) != CUDA_SUCCESS) return false;
+        } else if (load_fn(&module, ptx.ptr) != CUDA_SUCCESS) return false;
+    } else if (load_fn(&module, ptx.ptr) != CUDA_SUCCESS) return false;
     if (get_fn(&kernel_fn, module, "slzLzDecodeKernel") != CUDA_SUCCESS) return false;
     // Optional raw-off16 gather kernel - driver falls back to D2D copies
     // if absent.
