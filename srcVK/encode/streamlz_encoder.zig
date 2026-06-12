@@ -35,6 +35,14 @@ pub const Options = struct {
     /// bytes in the frame header. Phase 1: wire surface only - the
     /// match finder does not search the dictionary yet.
     dictionary_id: ?u32 = null,
+    /// v4 #20 (CUDA-mirror): emit the chunk-size table footer (flag
+    /// bit 6) - 3 bytes per chunk after the end mark, before the
+    /// trailers. Lets the device-resident decode path locate every
+    /// chunk with one parallel read instead of the serial chunk-chain
+    /// walk. Decoders that predate the bit ignore the footer. Not
+    /// emitted on uncompressed-body frames or when the effective chunk
+    /// size is under 64 KB.
+    chunk_size_table: bool = false,
 };
 
 /// CUDA reference: src/encode/streamlz_encoder.zig:70-84. Upper bound on
@@ -44,12 +52,17 @@ pub fn compressBound(src_len: usize) usize {
     const sub_chunks: usize = (src_len + lz_constants.sub_chunk_size - 1) / lz_constants.sub_chunk_size;
     const per_sub_chunk_overhead: usize = 3 + 8 + 3 + 256;
     const sc_prefix_upper_bound: usize = chunk_count * 8;
+    // v4 #20 chunk-size table: 3 B per effective chunk. The table is
+    // only emitted for eff_chunk >= 64 KB, so ceil(len/64K) bounds the
+    // entry count at every legal sc setting.
+    const chunk_table_upper_bound: usize = (src_len / 65536 + 2) * 3;
     return frame.max_header_size + 4 + 4 // (+4: v4 #19 merkle trailer)
         + chunk_count * (8 + 2 + 4)
         + sub_chunks * per_sub_chunk_overhead
         + src_len
         + 64
-        + sc_prefix_upper_bound;
+        + sc_prefix_upper_bound
+        + chunk_table_upper_bound;
 }
 
 /// CUDA reference: src/encode/streamlz_encoder.zig:97-105. Host->host

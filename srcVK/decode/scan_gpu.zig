@@ -28,6 +28,29 @@ pub fn gpuWalkFrameImpl(
     d_frame: u64,
     frame_size: u32,
 ) GpuError!descriptors.WalkFrameResultDev {
+    return gpuWalkFrame(self, d_frame, frame_size, null);
+}
+
+/// CUDA reference: src/decode/scan_gpu.zig:45-51 (v4 #20). Geometry of
+/// the chunk-size table footer, derived by the host from its header
+/// readback (the table position is computable from header fields alone
+/// - see FORMAT.md).
+pub const ChunkTableInfo = struct {
+    table_off: u32,
+    n_chunks: u32,
+};
+
+/// CUDA reference: src/decode/scan_gpu.zig:53-123 (v4 #20). Walk
+/// dispatcher: the table-mode kernel (parallel, one invocation per
+/// chunk after a workgroup-wide scan of the size table) when the frame
+/// carries the footer, the serial chain-walk kernel otherwise. Falls
+/// back to the serial kernel when the table kernel is missing.
+pub fn gpuWalkFrame(
+    self: *DecodeContext,
+    d_frame: u64,
+    frame_size: u32,
+    table: ?ChunkTableInfo,
+) GpuError!descriptors.WalkFrameResultDev {
     if (!module_loader.init()) return error.BackendNotAvailable;
     if (module_loader.walk_frame_fn == 0) return error.KernelMissing;
     const launch = vk.procs.launch_kernel orelse return error.BackendNotAvailable;
@@ -69,13 +92,6 @@ pub fn gpuWalkFrameImpl(
     //
     // (The former iter-4c NOTE about this site is resolved by A-025
     // above: per-binding offsets + 256-byte meta stride.)
-    var params = [_]?*anyopaque{
-        @ptrCast(&k_frame),       @ptrCast(&k_chunks),
-        @ptrCast(&k_meta_n),      @ptrCast(&k_meta_decomp),
-        @ptrCast(&k_meta_sccap),  @ptrCast(&k_meta_bstart),
-        @ptrCast(&k_meta_bsize),  @ptrCast(&k_meta_status),
-        @ptrCast(&k_size),        @ptrCast(&k_max),
-    };
     var extra = [_]?*anyopaque{null};
     var walk_offs = [_]u64{
         0, // FrameBuf
@@ -87,10 +103,39 @@ pub fn gpuWalkFrameImpl(
         descriptors.walk_meta_offsets.block_size,
         descriptors.walk_meta_offsets.status,
     };
-    const t_walk = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzWalkFrameKernel", stream);
-    try vkCall(launch(module_loader.walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, stream, &params, &extra, &walk_offs), .launch);
-    if (vk.procs.compute_to_compute_barrier) |bf| try vkCall(bf(stream), .sync);
-    decode_context.endKernelTiming(t_walk, stream);
+
+    const use_table = table != null and module_loader.walk_frame_table_fn != 0;
+    if (use_table) {
+        // v4 #20: table-mode walk - same 8 bindings (+ per-binding meta
+        // offsets), pc adds table_off + n_chunks. ONE 1024-invocation
+        // workgroup (the scan is workgroup-local).
+        var k_table_off: u32 = table.?.table_off;
+        var k_n_chunks: u32 = table.?.n_chunks;
+        var params = [_]?*anyopaque{
+            @ptrCast(&k_frame),       @ptrCast(&k_chunks),
+            @ptrCast(&k_meta_n),      @ptrCast(&k_meta_decomp),
+            @ptrCast(&k_meta_sccap),  @ptrCast(&k_meta_bstart),
+            @ptrCast(&k_meta_bsize),  @ptrCast(&k_meta_status),
+            @ptrCast(&k_size),        @ptrCast(&k_max),
+            @ptrCast(&k_table_off),   @ptrCast(&k_n_chunks),
+        };
+        const t_walk = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzWalkFrameTableKernel", stream);
+        try vkCall(launch(module_loader.walk_frame_table_fn, 1, 1, 1, 1024, 1, 1, 0, stream, &params, &extra, &walk_offs), .launch);
+        if (vk.procs.compute_to_compute_barrier) |bf| try vkCall(bf(stream), .sync);
+        decode_context.endKernelTiming(t_walk, stream);
+    } else {
+        var params = [_]?*anyopaque{
+            @ptrCast(&k_frame),       @ptrCast(&k_chunks),
+            @ptrCast(&k_meta_n),      @ptrCast(&k_meta_decomp),
+            @ptrCast(&k_meta_sccap),  @ptrCast(&k_meta_bstart),
+            @ptrCast(&k_meta_bsize),  @ptrCast(&k_meta_status),
+            @ptrCast(&k_size),        @ptrCast(&k_max),
+        };
+        const t_walk = decode_context.beginKernelTiming(self.enable_profiling, &self.pending_timings, "slzWalkFrameKernel", stream);
+        try vkCall(launch(module_loader.walk_frame_fn, 1, 1, 1, 1, 1, 1, 0, stream, &params, &extra, &walk_offs), .launch);
+        if (vk.procs.compute_to_compute_barrier) |bf| try vkCall(bf(stream), .sync);
+        decode_context.endKernelTiming(t_walk, stream);
+    }
 
     return .{
         .d_chunk_descs = self.d_walk_chunks,

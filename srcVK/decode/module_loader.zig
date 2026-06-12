@@ -328,6 +328,9 @@ pub var kernel_raw_pipeline_fn: usize = 0;
 pub var gather_off16_fn: usize = 0;
 pub var scan_parse_fn: usize = 0;
 pub var walk_frame_fn: usize = 0;
+// v4 #20: parallel table-mode walk (0 = unavailable; call sites fall
+// back to the serial walk).
+pub var walk_frame_table_fn: usize = 0;
 pub var prefix_sum_chunks_fn: usize = 0;
 pub var compact_huff_descs_fn: usize = 0;
 pub var compact_raw_descs_fn: usize = 0;
@@ -1868,6 +1871,7 @@ const KernelKind = enum(usize) {
     gather_off16_fn,
     scan_parse_fn,
     walk_frame_fn,
+    walk_frame_table_fn,
     prefix_sum_chunks_fn,
     compact_huff_descs_fn,
     compact_raw_descs_fn,
@@ -1923,6 +1927,10 @@ const KERNEL_DECLS = [_]KernelDecl{
     // call any subgroup cooperative op. Do NOT pin — pipeline creation
     // would fail on workgroup-X-not-multiple-of-subgroupSize.
     .{ .kind = .walk_frame_fn, .n_bindings = 8, .push_constant_size = 8 },
+    // v4 #20: parallel table-mode walk. Same 8 bindings as the serial
+    // walk; pc adds table_off + n_chunks (16 B). 1024-thread workgroup
+    // but NO subgroup ops (shared-memory scan only) - no pin needed.
+    .{ .kind = .walk_frame_table_fn, .n_bindings = 8, .push_constant_size = 16 },
     // srcVK/decode/prefix_sum_chunks_kernel.comp:16-34 declares 3 SSBO
     // bindings (ChunksBuf, FirstSubIdxBuf, TotalSubchunksBuf) plus a
     // 2× u32 push-constant block (n_chunks, sub_chunk_cap).
@@ -2693,6 +2701,12 @@ pub fn init() bool {
 
     if (!buildKernel(.walk_frame_fn, spv_blobs.walk_frame)) return false;
     walk_frame_fn = @intCast(metaFor(.walk_frame_fn).pipeline);
+
+    // v4 #20: table-mode walk. Optional (call site gates on the slot and
+    // falls back to the serial walk) - mirrors CUDA's optional symbol load.
+    if (buildKernel(.walk_frame_table_fn, spv_blobs.walk_frame_table)) {
+        walk_frame_table_fn = @intCast(metaFor(.walk_frame_table_fn).pipeline);
+    }
 
     if (!buildKernel(.prefix_sum_chunks_fn, spv_blobs.prefix_sum_chunks)) return false;
     prefix_sum_chunks_fn = @intCast(metaFor(.prefix_sum_chunks_fn).pipeline);

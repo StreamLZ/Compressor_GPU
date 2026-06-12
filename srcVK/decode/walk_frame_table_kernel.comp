@@ -1,0 +1,275 @@
+// 1:1 port of src/decode/walk_frame_kernel.cuh, entry point
+// slzWalkFrameTableKernel (v4 #20).
+// CUDA reference: src/decode/walk_frame_kernel.cuh:209-401.
+//
+// Parallel replacement for the serial walk when the frame carries the
+// chunk-size table footer (flag bit 6): one coalesced read of the
+// table, a workgroup-wide prefix scan of the 3-byte entries, then one
+// invocation per chunk parses its chunk's headers independently and
+// writes its descriptor. Replaces ~n_chunks serialized DRAM
+// round-trips with a few microseconds.
+//
+// Launch shape: ONE workgroup of SLZ_TWALK_THREADS invocations (the
+// scan is workgroup-local; n_chunks up to WALK_MAX_CHUNKS is handled
+// by giving each invocation a contiguous segment of ceil(n / threads)
+// entries).
+//
+// Validation (same status vocabulary as the serial walk, plus):
+//   14 = table inconsistent (entry vs parsed chunk header, or the
+//        entries + SC tail do not sum to the block's compressed size)
+// A hostile table cannot redirect reads outside the frame: every
+// per-chunk position is bounds-checked against the block range before
+// its headers are read.
+
+#version 460 core
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "slz_wire_format.glsl"
+
+#define SLZ_TWALK_THREADS 1024u
+
+layout(local_size_x = 1024) in;
+
+// Bindings mirror walk_frame_kernel.comp (the host launches both
+// through the same descriptor plumbing).
+layout(std430, binding = 0) readonly buffer FrameBuf {
+    uint8_t d_frame[];
+};
+layout(std430, binding = 1) buffer ChunksBuf {
+    SlzChunkDesc d_chunks[];
+};
+layout(std430, binding = 2) buffer NChunksBuf {
+    uint d_n_chunks;
+};
+layout(std430, binding = 3) buffer DecompressedSizeBuf {
+    uint d_decompressed_size;
+};
+layout(std430, binding = 4) buffer SubChunkCapBuf {
+    uint d_sub_chunk_cap;
+};
+layout(std430, binding = 5) buffer BlockStartBuf {
+    uint d_block_start;
+};
+layout(std430, binding = 6) buffer BlockSizeBuf {
+    uint d_block_size;
+};
+layout(std430, binding = 7) buffer StatusBuf {
+    uint d_status;
+};
+
+// Scalar args: frame_size, max_chunks (serial-walk pair), then the
+// v4 #20 host-supplied table geometry (both derivable from the
+// <= 64-byte header readback the D2D path already performs).
+layout(push_constant) uniform Push {
+    uint frame_size;
+    uint max_chunks;
+    uint table_off;
+    uint n_chunks;
+} pc;
+
+shared uint s_partial[SLZ_TWALK_THREADS];
+shared uint s_meta[6]; // block_start, block_size, decomp, eff_chunk, sc_tail, status
+
+uint frameReadU32LE(uint pos) {
+    uint p0 = uint(d_frame[pos + 0u]);
+    uint p1 = uint(d_frame[pos + 1u]);
+    uint p2 = uint(d_frame[pos + 2u]);
+    uint p3 = uint(d_frame[pos + 3u]);
+    return readU32LE(p0, p1, p2, p3);
+}
+
+uint frameReadLE24(uint pos) {
+    uint p0 = uint(d_frame[pos + 0u]);
+    uint p1 = uint(d_frame[pos + 1u]);
+    uint p2 = uint(d_frame[pos + 2u]);
+    return readLE24(p0, p1, p2);
+}
+
+float walkReadF32LE(uint pos) {
+    return uintBitsToFloat(frameReadU32LE(pos));
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint n_chunks = pc.n_chunks;
+    const uint table_off = pc.table_off;
+
+    // ── Invocation 0: header + block-header parse (mirrors the serial
+    // walk). CUDA reference: walk_frame_kernel.cuh:252-307.
+    if (tid == 0u) {
+        d_n_chunks = 0u;
+        d_decompressed_size = 0u;
+        d_sub_chunk_cap = ENTROPY_SCRATCH_SLOT_BYTES;
+        d_block_start = 0u;
+        d_block_size = 0u;
+        d_status = 0u;
+        s_meta[5] = 0u;
+
+        // GLSL has no `do { } while (false)` early-exit idiom across
+        // statements at this nesting; a single-iteration loop carries
+        // the CUDA shape (every `break` = CUDA's `break`).
+        for (uint once = 0u; once < 1u; once += 1u) {
+            if (pc.frame_size < SLZ_FRAME_MIN_HDR_SIZE) { s_meta[5] = 12u; break; }
+            if (frameReadU32LE(0u) != SLZ_FRAME_MAGIC) { s_meta[5] = 1u; break; }
+            if (uint(d_frame[4u]) != SLZ_FRAME_VERSION) { s_meta[5] = 2u; break; }
+            uint flags = uint(d_frame[5u]);
+            if (uint(d_frame[6u]) != SLZ_CODEC_FAST_LZ) { s_meta[5] = 3u; break; }
+            float sc_group_size = walkReadF32LE(9u);
+
+            uint pos = SLZ_FRAME_MIN_HDR_SIZE;
+            if ((flags & SLZ_FRAME_FLAG_CONTENT_SIZE_PRESENT) != 0u) pos += 8u;
+            if ((flags & SLZ_FRAME_FLAG_DICT_ID_PRESENT) != 0u) pos += 4u;
+
+            uint eff_chunk = uint(sc_group_size * float(SLZ_CHUNK_SIZE_BYTES));
+            if (eff_chunk > SLZ_CHUNK_SIZE_BYTES) eff_chunk = SLZ_CHUNK_SIZE_BYTES;
+            if (eff_chunk == 0u) eff_chunk = DEFAULT_SUB_CHUNK_CAP;
+
+            if (pos + 8u > pc.frame_size) { s_meta[5] = 6u; break; }
+            uint w0 = frameReadU32LE(pos);
+            uint decomp_size = frameReadU32LE(pos + 4u);
+            if ((w0 & SLZ_BLOCK_PDM_FLAG) != 0u) { s_meta[5] = 5u; break; }
+            if ((w0 & SLZ_BLOCK_UNCOMP_FLAG) != 0u) { s_meta[5] = 13u; break; } // table never on uncomp bodies
+            uint comp_size = w0 & ~(SLZ_BLOCK_UNCOMP_FLAG | SLZ_BLOCK_PDM_FLAG);
+            pos += 8u;
+
+            if (n_chunks == 0u || n_chunks > pc.max_chunks) { s_meta[5] = 11u; break; }
+            if (table_off + 3u * n_chunks > pc.frame_size) { s_meta[5] = 12u; break; }
+
+            // First internal header: magic / decoder / checksum gates,
+            // plus the self-contained bit that announces the SC tail.
+            if (pos + 2u > pc.frame_size) { s_meta[5] = 12u; break; }
+            uint bh0 = uint(d_frame[pos]);
+            uint bh1 = uint(d_frame[pos + 1u]);
+            if ((bh0 & SLZ_BLOCK_HDR_MAGIC_MASK) != SLZ_INT_BLOCK_MAGIC) { s_meta[5] = 7u; break; }
+            uint decoder = bh1 & SLZ_BLOCK_HDR_DECODER_MASK;
+            if (decoder != SLZ_DECODER_FAST && decoder != SLZ_DECODER_TURBO) { s_meta[5] = 8u; break; }
+            if ((bh1 & SLZ_BLOCK_HDR_CHECKSUM_FLAG) != 0u) { s_meta[5] = 5u; break; }
+            bool self_contained = (bh0 & SLZ_BLOCK_HDR_SC_FLAG) != 0u;
+            uint sc_tail = (self_contained && n_chunks > 1u) ? (n_chunks - 1u) * 8u : 0u;
+
+            s_meta[0] = pos;        // block payload start (at the internal hdr)
+            s_meta[1] = comp_size;
+            s_meta[2] = decomp_size;
+            s_meta[3] = eff_chunk;
+            s_meta[4] = sc_tail;
+        }
+    }
+    // CUDA __syncthreads(); GLSL compute barrier() implies
+    // memoryBarrierShared() per GLSL 4.60 section 8.17.
+    barrier();
+    if (s_meta[5] != 0u) {
+        if (tid == 0u) d_status = s_meta[5];
+        return;
+    }
+    const uint block_start = s_meta[0];
+    const uint block_size  = s_meta[1];
+    const uint decomp_size = s_meta[2];
+    const uint eff_chunk   = s_meta[3];
+    const uint sc_tail     = s_meta[4];
+
+    // ── Pass 1: segment sums of the 3-byte entries ──────────────────
+    // CUDA reference: walk_frame_kernel.cuh:320-336.
+    const uint seg = (n_chunks + SLZ_TWALK_THREADS - 1u) / SLZ_TWALK_THREADS;
+    const uint seg_begin = tid * seg;
+    const uint seg_end = (seg_begin + seg < n_chunks) ? seg_begin + seg : n_chunks;
+    uint sum = 0u;
+    for (uint i = seg_begin; i < seg_end; i += 1u)
+        sum += frameReadLE24(table_off + 3u * i);
+    s_partial[tid] = sum;
+    barrier();
+
+    // Hillis-Steele inclusive scan over the per-invocation partials.
+    for (uint d = 1u; d < SLZ_TWALK_THREADS; d <<= 1) {
+        uint v = (tid >= d) ? s_partial[tid - d] : 0u;
+        barrier();
+        s_partial[tid] += v;
+        barrier();
+    }
+    const uint total_wire = s_partial[SLZ_TWALK_THREADS - 1u];
+    const uint seg_base = (tid > 0u) ? s_partial[tid - 1u] : 0u; // exclusive
+
+    // The free integrity equation: chunk wire bytes + SC tail must be
+    // exactly the block's compressed size.
+    if (tid == 0u && total_wire + sc_tail != block_size) {
+        d_status = 14u;
+        s_meta[5] = 14u;
+    }
+    barrier();
+    if (s_meta[5] != 0u) return;
+
+    // ── Pass 2: per-chunk header parse + descriptor write ──────────
+    // CUDA reference: walk_frame_kernel.cuh:349-393.
+    uint rel = seg_base;
+    for (uint i = seg_begin; i < seg_end; i += 1u) {
+        const uint entry = frameReadLE24(table_off + 3u * i);
+        const uint dst_off = i * eff_chunk;
+        const uint dst_this = (decomp_size - dst_off < eff_chunk)
+            ? decomp_size - dst_off : eff_chunk;
+        const uint p = block_start + rel;
+
+        // Bounds: the chunk's whole wire range must sit inside the block.
+        if (rel + entry > block_size - sc_tail || entry < 2u) {
+            atomicExchange(d_status, 14u);
+            return;
+        }
+
+        const uint b0 = uint(d_frame[p]);
+        const uint b1 = uint(d_frame[p + 1u]);
+        if ((b0 & SLZ_BLOCK_HDR_MAGIC_MASK) != SLZ_INT_BLOCK_MAGIC) { atomicExchange(d_status, 7u); return; }
+        const uint dec2 = b1 & SLZ_BLOCK_HDR_DECODER_MASK;
+        if (dec2 != SLZ_DECODER_FAST && dec2 != SLZ_DECODER_TURBO) { atomicExchange(d_status, 8u); return; }
+
+        // src_offset is BLOCK-PAYLOAD-RELATIVE (matches the serial walk).
+        if ((b0 & SLZ_INT_BLOCK_UNCOMP_FLAG) != 0u) {
+            // Uncompressed chunk: [2B internal][raw payload], no chunk hdr.
+            if (entry != 2u + dst_this) { atomicExchange(d_status, 14u); return; }
+            SlzChunkDesc ch;
+            ch.src_offset = rel + 2u;
+            ch.comp_size = dst_this;
+            ch.decomp_size = dst_this;
+            ch.dst_offset = dst_off;
+            ch.flags = CHUNK_FLAG_UNCOMPRESSED;
+            ch.memset_and_reserved = 0u;
+            d_chunks[i] = ch;
+        } else {
+            if (entry < 6u) { atomicExchange(d_status, 14u); return; }
+            const uint v = frameReadU32LE(p + 2u);
+            const uint size_field = v & SLZ_CHUNK_SIZE_MASK;
+            const uint chunk_type = (v >> SLZ_CHUNK_TYPE_SHIFT) & 3u;
+            if (chunk_type == 0u) {
+                const uint comp = size_field + 1u;
+                if (entry != 6u + comp) { atomicExchange(d_status, 14u); return; }
+                const uint flg = (comp == dst_this) ? CHUNK_FLAG_UNCOMPRESSED : 0u;
+                SlzChunkDesc ch;
+                ch.src_offset = rel + 6u;
+                ch.comp_size = comp;
+                ch.decomp_size = dst_this;
+                ch.dst_offset = dst_off;
+                ch.flags = flg;
+                ch.memset_and_reserved = 0u;
+                d_chunks[i] = ch;
+            } else if (chunk_type == 1u) {
+                if (entry != 7u) { atomicExchange(d_status, 14u); return; }
+                SlzChunkDesc ch;
+                ch.src_offset = 0u;
+                ch.comp_size = 0u;
+                ch.decomp_size = dst_this;
+                ch.dst_offset = dst_off;
+                ch.flags = CHUNK_FLAG_MEMSET;
+                ch.memset_and_reserved = uint(d_frame[p + 6u]) & 0xFFu;
+                d_chunks[i] = ch;
+            } else {
+                atomicExchange(d_status, 10u);
+                return;
+            }
+        }
+        rel += entry;
+    }
+
+    if (tid == 0u) {
+        d_n_chunks = n_chunks;
+        d_decompressed_size = decomp_size;
+        d_block_start = block_start;
+        d_block_size = block_size;
+    }
+}

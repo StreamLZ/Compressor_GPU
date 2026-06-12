@@ -20,6 +20,8 @@ pub const lz_decode: []const u8 = @embedFile("lz_decode_kernel.spv");
 pub const prefix_sum_chunks: []const u8 = @embedFile("prefix_sum_chunks_kernel.spv");
 pub const gather_raw_off16: []const u8 = @embedFile("gather_raw_off16_kernel.spv");
 pub const walk_frame: []const u8 = @embedFile("walk_frame_kernel.spv");
+// v4 #20: parallel table-mode walk (chunk-size table footer frames).
+pub const walk_frame_table: []const u8 = @embedFile("walk_frame_table_kernel.spv");
 pub const compact_huff_descs: []const u8 = @embedFile("compact_huff_descs_kernel.spv");
 pub const compact_raw_descs: []const u8 = @embedFile("compact_raw_descs_kernel.spv");
 pub const compact_all_descs: []const u8 = @embedFile("compact_all_descs_kernel.spv");

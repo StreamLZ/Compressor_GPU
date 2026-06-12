@@ -53,12 +53,18 @@ const uint SLZ_CODEC_FAST_LZ          = 1u; // Codec.fast_lz
 const uint SLZ_FRAME_MIN_HDR_SIZE     = 14u;
 const uint SLZ_FRAME_END_MARK         = 0u;
 
-// CUDA reference: src/common/gpu_wire_format.cuh:85-86. Frame-header
-// flag bits (byte 5 of the frame header).
+// CUDA reference: src/common/gpu_wire_format.cuh:92-93. Frame-header
+// flag bits (byte 5 of the frame header). DICT_ID was wrongly 0x02
+// (the content-checksum bit) until the v4 #16 VK port wave - the same
+// latent bug CUDA fixed when its walk kernel started parsing
+// dictionary frames. Harmless while nothing tested the bit against a
+// dict frame; catastrophic once the 4-byte skip depends on it.
 const uint SLZ_FRAME_FLAG_CONTENT_SIZE_PRESENT = 0x01u;
-const uint SLZ_FRAME_FLAG_DICT_ID_PRESENT      = 0x02u;
+const uint SLZ_FRAME_FLAG_DICT_ID_PRESENT      = 0x08u;
+// v4 #20 frame-header flag bit 6: chunk-size table footer present.
+const uint SLZ_FRAME_FLAG_CHUNK_TABLE          = 0x40u;
 
-// CUDA reference: src/common/gpu_wire_format.cuh:89-99. Block-header
+// CUDA reference: src/common/gpu_wire_format.cuh:96-111. Block-header
 // bits (4-byte LE word at block start) + internal-block-header masks.
 const uint SLZ_BLOCK_UNCOMP_FLAG      = 0x80000000u;
 const uint SLZ_BLOCK_PDM_FLAG         = 0x40000000u;
@@ -69,6 +75,9 @@ const uint SLZ_INT_BLOCK_MAGIC        = 0x05u;
 const uint SLZ_BLOCK_HDR_MAGIC_MASK    = 0x0Fu;
 const uint SLZ_BLOCK_HDR_DECODER_MASK  = 0x7Fu;
 const uint SLZ_BLOCK_HDR_CHECKSUM_FLAG = 0x80u;
+// Internal-header byte 0 high bits (above the magic nibble):
+const uint SLZ_BLOCK_HDR_SC_FLAG       = 0x10u; // self-contained chunks (SC tail present)
+const uint SLZ_INT_BLOCK_UNCOMP_FLAG   = 0x80u; // per-chunk uncompressed form: no 4-byte chunk hdr
 const uint SLZ_DECODER_FAST           = 1u;
 const uint SLZ_DECODER_TURBO          = 2u;
 

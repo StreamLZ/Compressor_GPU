@@ -495,6 +495,7 @@ const srcvk_kernels = [_][]const u8{
     "decode/prefix_sum_chunks_kernel",
     "decode/gather_raw_off16_kernel",
     "decode/walk_frame_kernel",
+    "decode/walk_frame_table_kernel",
     "decode/compact_huff_descs_kernel",
     "decode/compact_raw_descs_kernel",
     "decode/compact_all_descs_kernel",

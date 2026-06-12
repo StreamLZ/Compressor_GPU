@@ -228,6 +228,24 @@ pub fn compressFramedOne(
         enc_ctx.dict_armed = true;
     }
 
+    // v4 #20 (CUDA reference: src/encode/fast_framed.zig:149-156): the
+    // chunk-size table is only meaningful for compressed bodies with
+    // >= 64 KB effective chunks (the bound math and the 3-byte entry
+    // width both assume it). Decided up front because the flag lives in
+    // the header; the rare assembly-cap fallback clears the bit again
+    // when it downgrades to an uncompressed body.
+    // VK adaptation: additionally gated to the host-output path
+    // (d_output_override == 0). CUDA appends the table to the device
+    // frame at `d_output_override + frame_size`; VkDeviceBuffer is a
+    // registry index, so handle+offset H2D arithmetic does not exist -
+    // the table is written into the host `dst` after the frame D2H
+    // instead. The D2D-output path (async ABI) has no chunk-table
+    // option, so nothing reachable loses the footer.
+    const emit_chunk_table = opts.chunk_size_table and
+        src.len > min_source_length and
+        effChunkFor(src.len, opts.sc_group_size_override) >= 65536 and
+        enc_ctx.d_output_override == 0;
+
     const hdr_len = frame.writeHeader(dst, .{
         .codec = .fast,
         .level = codecLevelFor(opts.level),
@@ -237,6 +255,7 @@ pub fn compressFramedOne(
         .dictionary_id = opts.dictionary_id,
         .content_checksum = false,
         .chunk_merkle = opts.chunk_checksum,
+        .chunk_size_table = emit_chunk_table,
     }) catch return error.DestinationTooSmall;
     pos += hdr_len;
 
@@ -263,6 +282,7 @@ pub fn compressFramedOne(
         enc_ctx,
         sc_grp,
         frame_block_hdr_pos,
+        emit_chunk_table,
     );
 }
 
@@ -297,6 +317,7 @@ fn gpuEncodeAndAssemble(
     enc_ctx: *gpu_enc.EncodeContext,
     sc_grp: f32,
     frame_block_hdr_pos: usize,
+    emit_chunk_table: bool,
 ) CompressError!usize {
     // VK adaptation: per-phase profile checkpoint (cpu_descs_build /
     // wrap_input_h2d / ensure_gpu_out_buf). Pure measurement — does not
@@ -338,6 +359,15 @@ fn gpuEncodeAndAssemble(
         n_gpu_blocks += (chunk_size + gpu_block - 1) / gpu_block;
     }
     if (n_chunks > assembly_chunk_cap) {
+        // v4 #20 (CUDA-mirror): the header already promised a
+        // chunk-size table; an uncompressed body has no table, so
+        // clear the bit (the header sits in the host dst buffer;
+        // flags byte is offset 5).
+        if (emit_chunk_table) dst[5] = @bitCast(blk: {
+            var f: frame.FrameFlags = @bitCast(dst[5]);
+            f.chunk_size_table = false;
+            break :blk f;
+        });
         return writeUncompressedFrame(dst, frame_block_hdr_pos, frame_block_hdr_pos + 8, src);
     }
 
@@ -467,7 +497,13 @@ fn gpuEncodeAndAssemble(
         n_chunks,
         comp_sizes,
         frame_block_hdr_pos,
+        emit_chunk_table,
     );
+    // v4 #20: the table bytes already sit in dst[frame_size..] (host
+    // write in assembleFrame); the D2H below covers only frame_size
+    // bytes so they survive. The bumped return places the caller's
+    // Merkle trailer after the table.
+    const chunk_table_bytes: usize = if (emit_chunk_table) n_chunks * 3 else 0;
 
     // VK adaptation: d2h_final = the ~50 MB compressed-frame D2H readback.
     // host_finalize = any post-D2H bookkeeping that runs before the
@@ -545,7 +581,7 @@ fn gpuEncodeAndAssemble(
         g_enc_phase_host_finalize_ns += wall - attributed;
     }
     if (_prof) g_enc_phase_count += 1;
-    return frame_size;
+    return frame_size + chunk_table_bytes;
 }
 
 /// CUDA reference: src/encode/fast_framed.zig:282-378. Launch
@@ -561,6 +597,7 @@ fn assembleFrame(
     n_chunks: usize,
     comp_sizes: []const u32,
     frame_block_hdr_pos: usize,
+    emit_chunk_table: bool,
 ) CompressError!usize {
     const sizes = enc_ctx.assembled_sizes orelse return error.DestinationTooSmall;
     const offsets = enc_ctx.assembled_offsets orelse return error.DestinationTooSmall;
@@ -636,6 +673,34 @@ fn assembleFrame(
         enc_ctx.d_output_override,
     ) orelse return error.DestinationTooSmall;
     enc_ctx.output_written_to_device = true;
+
+    // v4 #20 (CUDA reference: src/encode/fast_framed.zig:481-504):
+    // append the chunk-size table footer right after the end mark and
+    // before any trailer the caller adds (the host Merkle append in
+    // compressFramedWithIo uses the bumped frame size, keeping the
+    // wire order [end][table][trailers]). Each entry is the chunk's
+    // TOTAL wire size - 2-byte internal header plus either 4-byte
+    // chunk header + payload (compressed) or the raw payload
+    // (uncompressed marker form).
+    // VK adaptation: the table is written into the HOST `dst` at
+    // [frame_size..] - the caller's D2H covers only frame_size bytes,
+    // so these bytes survive it (CUDA appends to the device frame
+    // instead; VkDeviceBuffer handles take no +offset arithmetic).
+    // The emit gate guarantees the host-output path.
+    if (emit_chunk_table) {
+        if (dst.len < @as(usize, @intCast(frame_size)) + n_chunks * 3)
+            return error.DestinationTooSmall;
+        const table = dst[@intCast(frame_size)..][0 .. n_chunks * 3];
+        for (0..n_chunks) |ci| {
+            const wire: u32 = if (per_chunk_asm_off_buf[ci] == gpu_enc.UNCOMPRESSED_CHUNK_MARKER)
+                gpu_enc.UNCOMPRESSED_CHUNK_HDR_BYTES + per_chunk_asm_size_buf[ci]
+            else
+                gpu_enc.CHUNK_INTERNAL_HDR_BYTES + per_chunk_asm_size_buf[ci];
+            table[ci * 3] = @intCast(wire & 0xFF);
+            table[ci * 3 + 1] = @intCast((wire >> 8) & 0xFF);
+            table[ci * 3 + 2] = @intCast(wire >> 16);
+        }
+    }
     return @intCast(frame_size);
 }
 

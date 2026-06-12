@@ -80,14 +80,16 @@ pub fn decompressFramedFromDevice(
     dec_ctx: *gpu_driver.DecodeContext,
     decomp_size: u32,
 ) DecompressError!u32 {
-    // CUDA reference: src/decode/streamlz_decoder.zig:144-148. Frame
-    // layout: [hdr 14][content_size 8][block_hdr 8][block][end 4].
-    const fixed_overhead: u32 = 14 + 8 + 8 + 4;
-    if (frame_size < fixed_overhead + 1) return error.BadMode;
-    const block_start: u32 = 14 + 8 + 8;
-    const block_size: u32 = frame_size - fixed_overhead;
+    // CUDA reference: src/decode/streamlz_decoder.zig:149-154 (v4 #16
+    // revision). Frame layout: [hdr 14][content_size 8][dict_id 4?]
+    // [block_hdr 8][block][end 4]. The header is variable (dict frames
+    // carry 4 more bytes), so the block offsets are derived from the
+    // parsed header below - the <=64-byte D2H already happens for the
+    // codec level.
+    const min_overhead: u32 = 14 + 8 + 8 + 4;
+    if (frame_size < min_overhead + 1) return error.BadMode;
 
-    // CUDA reference: src/decode/streamlz_decoder.zig:150-155.
+    // CUDA reference: src/decode/streamlz_decoder.zig:156-161.
     // sc_group=0.25 → effective chunk size of 64 KB, the smallest the
     // GPU encoder produces. The walk kernel writes the real chunk count
     // to d_meta+0; this bound only sizes descriptor + grid space.
@@ -105,6 +107,48 @@ pub fn decompressFramedFromDevice(
     const hdr_n: u32 = @min(frame_size, 64);
     if (!gpu_driver.copyDeviceToHost(hdr_buf[0..hdr_n], d_frame)) return error.BadMode;
     const parsed_hdr = frame.parseHeader(hdr_buf[0..]) catch return error.BadMode;
+
+    // Block offsets follow the variable-length header (dict frames
+    // carry 4 extra ID bytes; header_size accounts for it).
+    const block_start: u32 = @intCast(parsed_hdr.header_size + 8);
+    if (frame_size < block_start + 4 + 1) return error.BadMode;
+    const block_size: u32 = frame_size - block_start - 4;
+
+    // v4 #16 (CUDA-mirror): resolve the frame's dictionary (registered
+    // store first, then builtins) and make it device-resident. An
+    // unresolvable ID is a real error, not a fall-back shape - the
+    // host-bounce path could not resolve it either.
+    var d_dict: u64 = 0;
+    var dict_len: u32 = 0;
+    if (parsed_hdr.dictionary_id) |did| {
+        const dictionary = @import("../dict/dictionary.zig");
+        const data = dictionary.resolve(dec_ctx.registered_dicts.items, did) orelse
+            return error.UnknownDictionary;
+        gpu_driver.ensureDictOnDevice(dec_ctx, did, data) catch return error.BadMode;
+        d_dict = dec_ctx.d_dict;
+        dict_len = dec_ctx.dict_cached_len;
+    }
+
+    // v4 #20 (CUDA-mirror): when the frame carries the chunk-size table
+    // footer, the walk runs as a parallel table-mode kernel instead of
+    // the serial chunk chain. The table position is computable from the
+    // header: frame_end - trailers - 3 * n_chunks (n_chunks from
+    // content_size and eff_chunk; trailer sizes announced by flag bits).
+    var table_info: ?gpu_driver.ChunkTableInfo = null;
+    if (parsed_hdr.chunk_size_table) {
+        const eff: u32 = @intCast(@min(frame.scGroupSizeToBytes(parsed_hdr.sc_group_size), constants.chunk_size));
+        if (eff == 0) return error.BadMode;
+        const n_tab: u32 = (decomp_size + eff - 1) / eff;
+        var trailer_bytes: u32 = 0;
+        if (parsed_hdr.chunk_merkle) trailer_bytes += 4;
+        if (parsed_hdr.content_checksum) trailer_bytes += 4;
+        const table_bytes: u32 = n_tab * 3;
+        if (frame_size < trailer_bytes + table_bytes) return error.BadMode;
+        table_info = .{
+            .table_off = frame_size - trailer_bytes - table_bytes,
+            .n_chunks = n_tab,
+        };
+    }
 
     // A-026 (2026-06-10): batch the WHOLE D2D call onto pipeline_stream.
     // Without this, the walk launch and the compressed-block D2D copy
@@ -127,7 +171,7 @@ pub fn decompressFramedFromDevice(
         gpu_driver.unlockDispatcherMutex();
     };
 
-    const dev = try gpu_driver.gpuWalkFrameImpl(dec_ctx, d_frame, frame_size);
+    const dev = try gpu_driver.gpuWalkFrame(dec_ctx, d_frame, frame_size, table_info);
     // v4 #12 RESOLVED (2026-06-10): the walk now batches into the same
     // cmdbuf as the rest of the pipeline - the former "early submit"
     // workaround is gone. The mystery was never the walk: the chunk-desc
@@ -163,6 +207,8 @@ pub fn decompressFramedFromDevice(
         .d_chunk_descs_override = dev.d_chunk_descs,
         .d_n_chunks_dev = dev.d_meta + gpu_driver.walk_meta_offsets.n_chunks,
         .level = parsed_hdr.level,
+        .d_dict = d_dict,
+        .dict_len = dict_len,
     });
 
     // A-026: drain the batch - ONE submit+wait for walk + copy + prefix
@@ -173,6 +219,23 @@ pub fn decompressFramedFromDevice(
         const sync_fn = vk.procs.stream_sync orelse return error.BackendNotAvailable;
         if (sync_fn(dec_ctx.work_stream) != vk.VK_SUCCESS_RC) return error.SyncFailed;
         gpu_driver.finalizeProfiling(&dec_ctx.pending_timings, &dec_ctx.last_timings);
+
+        // v4 #20 (CUDA-mirror): surface walk-kernel rejections. The
+        // downstream kernels self-gate on the walk's n_chunks, so a
+        // non-zero status (hostile frame, inconsistent chunk table,
+        // truncation) would otherwise return SUCCESS with undecoded
+        // output. Read after the batch drain - zero extra
+        // synchronization. Async-stream callers sync on their own
+        // stream; carrying the status to them belongs to the #19
+        // verdict surface.
+        // VK adaptation: VkDeviceBuffer handles take no +offset
+        // arithmetic, so D2H the whole 1536-byte meta block and index
+        // the status slot on the host.
+        var meta_buf: [gpu_driver.walk_meta_offsets.bytes]u8 = undefined;
+        if (!gpu_driver.copyDeviceToHost(meta_buf[0..], dev.d_meta))
+            return error.CopyFailed;
+        const wstatus = std.mem.readInt(u32, meta_buf[gpu_driver.walk_meta_offsets.status..][0..4], .little);
+        if (wstatus != 0) return error.BadMode;
     }
     return decomp_size;
 }
@@ -329,6 +392,15 @@ pub fn decompressFrameInner(
 
     if (hdr.content_size) |cs| {
         if (dst_off != cs) return error.SizeMismatch;
+    }
+
+    // v4 #20 (CUDA-mirror): the chunk-size table footer sits between
+    // the end mark and the trailers - step the forward cursor over it
+    // so the trailer reads below land on the right bytes. (The host
+    // decode path itself never reads the table; it walks the chain.)
+    if (hdr.chunk_size_table) {
+        const eff_t = @min(frame.scGroupSizeToBytes(hdr.sc_group_size), constants.chunk_size);
+        if (eff_t > 0) pos += ((dst_off + eff_t - 1) / eff_t) * 3;
     }
 
     // v4 #13 (2026-06-10, CUDA-mirror): XXH32 content checksum

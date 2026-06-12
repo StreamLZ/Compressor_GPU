@@ -37,7 +37,13 @@ pub const FrameFlags = packed struct(u8) {
     /// Bit 5 (v4 #19): chunk-Merkle checksum trailer follows the
     /// end-mark. See the CUDA reference for full semantics.
     chunk_merkle: bool = false,
-    _reserved: u2 = 0,
+    /// Bit 6 (v4 #20): a chunk-size table footer sits between the end
+    /// mark and any trailers - `num_chunks` 3-byte LE entries, each a
+    /// chunk's TOTAL wire size. Lets the device frame walk read chunk
+    /// boundaries in one coalesced pass instead of chasing the chunk
+    /// chain serially. See FORMAT.md "Chunk-size table footer".
+    chunk_size_table: bool = false,
+    _reserved: u1 = 0,
 };
 
 /// CUDA reference: src/format/frame_format.zig:91-103. Codec enum.
@@ -70,6 +76,7 @@ pub const FrameHeader = struct {
     dictionary_id: ?u32,
     content_checksum: bool,
     chunk_merkle: bool,
+    chunk_size_table: bool,
     header_size: usize,
 };
 
@@ -144,6 +151,7 @@ pub fn parseHeader(src: []const u8) ParseError!FrameHeader {
         .dictionary_id = dict_id,
         .content_checksum = raw_flags.content_checksum,
         .chunk_merkle = raw_flags.chunk_merkle,
+        .chunk_size_table = raw_flags.chunk_size_table,
         .header_size = pos,
     };
 }
@@ -177,6 +185,9 @@ pub const WriteHeaderOptions = struct {
     content_size: ?u64 = null,
     content_checksum: bool = false,
     chunk_merkle: bool = false,
+    /// v4 #20: emit the chunk-size table footer flag (the table bytes
+    /// themselves are appended by the encoder after the end mark).
+    chunk_size_table: bool = false,
     block_checksums: bool = false,
     dictionary_id: ?u32 = null,
 };
@@ -201,6 +212,7 @@ pub fn writeHeader(dst: []u8, opts: WriteHeaderOptions) WriteError!usize {
         .content_size_present = opts.content_size != null,
         .content_checksum = opts.content_checksum,
         .chunk_merkle = opts.chunk_merkle,
+        .chunk_size_table = opts.chunk_size_table,
         .block_checksums = opts.block_checksums,
         .dictionary_id_present = opts.dictionary_id != null,
         .parallel_decode_metadata_present = opts.parallel_decode_metadata_present,

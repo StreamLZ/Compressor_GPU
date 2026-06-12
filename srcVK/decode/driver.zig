@@ -50,6 +50,9 @@ pub const unlockDispatcherMutex = module_loader.unlockDispatcherMutex;
 
 // ── Decode pipeline entry points ───────────────────────────────────────
 pub const gpuWalkFrameImpl = scan_gpu.gpuWalkFrameImpl;
+// v4 #20: table-mode walk dispatcher + the host-derived table geometry.
+pub const gpuWalkFrame = scan_gpu.gpuWalkFrame;
+pub const ChunkTableInfo = scan_gpu.ChunkTableInfo;
 pub const fullGpuLaunchImpl = decode_dispatch.fullGpuLaunchImpl;
 
 // ── Per-phase host-overhead profiling (SLZ_VK_PROFILE_PHASES=1) ───────

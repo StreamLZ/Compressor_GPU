@@ -115,8 +115,12 @@ void main() {
     uint pos = SLZ_FRAME_MIN_HDR_SIZE;
     bool content_size_present = (flags & SLZ_FRAME_FLAG_CONTENT_SIZE_PRESENT) != 0u;
     bool dict_id_present      = (flags & SLZ_FRAME_FLAG_DICT_ID_PRESENT) != 0u;
-    if (dict_id_present) { d_status = 4u; return; }
     if (content_size_present) pos = pos + 8u;
+    // v4 #16 (CUDA ref: walk_frame_kernel.cuh:89-93): dictionary frames
+    // walk normally - the 4-byte ID follows the optional content size;
+    // the host resolves the dictionary from its header readback and
+    // passes it to the LZ kernels. (Status 4 = retired dict reject.)
+    if (dict_id_present) pos = pos + 4u;
 
     // CUDA reference: src/decode/walk_frame_kernel.cuh:92-97. eff_chunk_size
     // mirrors decompressOneFrame's logic: clamp to SLZ_CHUNK_SIZE_BYTES,
