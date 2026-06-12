@@ -1077,13 +1077,29 @@ dict decode via registered-dict validation + the #19 verdict surface.
 the next milestone. (5) #13 fuzz tier for dict frames (mutate IDs +
 dict-reaching offsets). (6) Custom-dictionary registration API
 (slzSetDictionary) when an external caller needs non-builtin dicts.
-(7) Flat dict-match decode pass: dict sources are read-only (no
-write hazard by definition), so dict matches are trivially
-flat-pass-eligible - they ride the serial dependent loop today for
-implementation simplicity only. Worth ~0.8 ms on enwik8-L1-with-dict
-(1.74 -> 2.53 ms measured); build when dict-on-large-corpora becomes
-a real workload, alongside an enwik-class trained dict (the 5 pp
-above is from an UNTUNED generic dict).
+(7) ~~Flat dict-match decode pass~~ ✅ DONE 2026-06-12 (same day).
+Attribution first via new gated counters in fillBatch
+(g_slz_match_total/g_slz_match_dep, SLZ_COUNT_PP pattern, readback
+in `-db`; left in-tree at zero cost): plain enwik8 L1 routes 11.6%
+of matches to the serial dependent loop, the text-dict frame routed
+**37.9%** (13.6M vs 3.7M serialized) - the whole regression.
+Fix: an ENTIRELY-DICT flat pool beside the v4 #2 independent pool in
+BOTH raw bodies (PipeBatch dm_prefix/dm_dst_adj/dm_src_adj in dict
+coordinates + a third phase-1 team loop reading dict[]; same
+ownership-search shape). Hazard argument: dict bytes are never
+written, dst ranges are disjoint by token ownership - shares phase 1
+barrier-free. Straddlers and hostile below-dict reaches stay in the
+dependent loop where readBackRefByte clamps them (the encoder never
+emits either; the spec vectors cover both). Classification guards
+dict_src >= 0 so hostile reaches never index the flat pool.
+MEASURED: dict enwik8 L1 kernel 2.527 -> **1.917 ms** (-24%); the
+0.19 ms residual vs plain (1.728, unchanged - zero-cost guarantee
+intact, bench_all all-SHA-OK at baseline times) is the dict frame's
+~4M additional matches doing real copy work. Dict e2e 15.36 ms now
+BEATS plain (15.48) - the smaller payload uploads faster. NCU
+verification blocked (ERR_NVGPUCTRPERM, needs admin shell);
+counters + wall-clock are conclusive. ptest 61/0/0, ptest_vk
+155/9/0.
 
 ## 17. Reverse-port VK persistent encode regions to CUDA — ✅ DONE 2026-06-11 (both backends; CUDA L1 encode 123→87 ms)
 

@@ -186,10 +186,29 @@ fn countPpReport(w: *std.Io.Writer) !void {
     const pp_tokens = vals[1];
     const serial = vals[2];
     const total_tokens = pp_tokens + serial;
-    if (total_tokens == 0) return;
-    const tok_frac = @as(f64, @floatFromInt(serial)) / @as(f64, @floatFromInt(total_tokens));
-    const iter_frac = @as(f64, @floatFromInt(serial)) / @as(f64, @floatFromInt(serial + pp_batches));
-    const avg_batch = if (pp_batches > 0) @as(f64, @floatFromInt(pp_tokens)) / @as(f64, @floatFromInt(pp_batches)) else 0;
-    try w.print("  pp-count: tokens {d} (pp {d} + serial {d})  serial-token-frac {d:.2}%\n", .{ total_tokens, pp_tokens, serial, tok_frac * 100.0 });
-    try w.print("  pp-count: iters  {d} (pp {d} + serial {d})  serial-iter-frac  {d:.2}%  avg-batch {d:.1}\n", .{ serial + pp_batches, pp_batches, serial, iter_frac * 100.0, avg_batch });
+    // These three counters live in the single-warp body, so they stay
+    // zero on the default pipelined path (SLZ_NO_PIPELINE=1 populates
+    // them) - fall through to the pipelined match counters either way.
+    if (total_tokens != 0) {
+        const tok_frac = @as(f64, @floatFromInt(serial)) / @as(f64, @floatFromInt(total_tokens));
+        const iter_frac = @as(f64, @floatFromInt(serial)) / @as(f64, @floatFromInt(serial + pp_batches));
+        const avg_batch = if (pp_batches > 0) @as(f64, @floatFromInt(pp_tokens)) / @as(f64, @floatFromInt(pp_batches)) else 0;
+        try w.print("  pp-count: tokens {d} (pp {d} + serial {d})  serial-token-frac {d:.2}%\n", .{ total_tokens, pp_tokens, serial, tok_frac * 100.0 });
+        try w.print("  pp-count: iters  {d} (pp {d} + serial {d})  serial-iter-frac  {d:.2}%  avg-batch {d:.1}\n", .{ serial + pp_batches, pp_batches, serial, iter_frac * 100.0, avg_batch });
+    }
+
+    // v4 #16 follow-up (7): match-routing split in the pipelined parser
+    // (flat passes vs the serial dependent loop). Queried separately so
+    // PTX builds without these globals still print the report above.
+    var mvals: [2]u64 = .{ 0, 0 };
+    const mnames = [_][*:0]const u8{ "g_slz_match_total", "g_slz_match_dep" };
+    for (mnames, 0..) |nm, i| {
+        var dptr: usize = 0;
+        var sz: usize = 0;
+        if (gg(&dptr, &sz, module_loader.module, nm) != cuda.CUDA_SUCCESS) return;
+        if (d2h(@ptrCast(&mvals[i]), dptr, 8) != cuda.CUDA_SUCCESS) return;
+    }
+    if (mvals[0] == 0) return;
+    const dep_frac = @as(f64, @floatFromInt(mvals[1])) / @as(f64, @floatFromInt(mvals[0]));
+    try w.print("  pp-count: matches {d}, dep-routed {d} ({d:.2}%)\n", .{ mvals[0], mvals[1], dep_frac * 100.0 });
 }

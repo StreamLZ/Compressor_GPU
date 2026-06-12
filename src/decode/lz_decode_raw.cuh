@@ -204,13 +204,17 @@ __device__ __noinline__ void decodeSubChunkRawMode(
                 // granularity — src-entirely-pre-batch suffices.)
                 uint32_t my_copy_dst = dst_pos + my_dst_local + my_lit_len;
                 int32_t  my_src      = (int32_t)my_copy_dst + my_match_offset;
-                // v4 #16: a match whose source reaches below the window
-                // base needs the dict-aware per-byte read - exclude it
-                // from the flat pass (it falls into the dependent loop,
-                // which is order-safe for it: its source is dictionary
-                // bytes plus pre-batch output only).
+                // v4 #16 fu7: matches whose source lies ENTIRELY in the
+                // dictionary get their own flat pass below (read-only
+                // sources, zero hazards). Straddlers and hostile
+                // below-dict reaches fall into the dependent loop,
+                // whose per-byte dict-aware read handles (and clamps)
+                // them.
                 bool my_reaches_dict = HAS_DICT && (my_match_len > 0) &&
                                        (my_src < (int32_t)dst_offset);
+                bool my_entirely_dict = my_reaches_dict &&
+                                        (my_src + (int32_t)my_match_len <= (int32_t)dst_offset) &&
+                                        (my_src + (int32_t)dict_len >= (int32_t)dst_offset);
                 bool my_is_indep = (my_match_len > 0) && !my_reaches_dict &&
                                    (my_src + (int32_t)my_match_len <= (int32_t)dst_pos);
                 uint32_t my_im_len = my_is_indep ? my_match_len : 0u;
@@ -241,10 +245,44 @@ __device__ __noinline__ void decodeSubChunkRawMode(
                     __syncwarp();
                 }
 
+                // ── Flat entirely-dict match copy (v4 #16 fu7) ──
+                // Same ownership-search shape as the im pass, source
+                // read from the dictionary. Shares the phase with the
+                // lit/im passes hazard-free (dict bytes are never
+                // written; dst ranges are disjoint by token ownership).
+                if constexpr (HAS_DICT) {
+                    uint32_t my_dm_len = my_entirely_dict ? my_match_len : 0u;
+                    uint32_t my_dm_local, total_dm;
+                    warpScanU32(my_dm_len, my_dm_local, total_dm);
+                    if (total_dm > 0) {
+                        __shared__ uint32_t s_dm_prefix[WARPS_PER_BLOCK][WARP_SIZE];
+                        __shared__ uint32_t s_dm_dst_adj[WARPS_PER_BLOCK][WARP_SIZE];
+                        __shared__ uint32_t s_dm_src_adj[WARPS_PER_BLOCK][WARP_SIZE];
+                        uint32_t my_dict_src = (uint32_t)((int32_t)dict_len + my_src - (int32_t)dst_offset);
+                        s_dm_prefix[threadIdx.y][lane]  = my_dm_local;
+                        s_dm_dst_adj[threadIdx.y][lane] = my_copy_dst - my_dm_local;
+                        s_dm_src_adj[threadIdx.y][lane] = my_dict_src - my_dm_local;
+                        __syncwarp();
+                        for (uint32_t i = lane; i < total_dm; i += WARP_SIZE) {
+                            uint32_t k = 0;
+                            #pragma unroll
+                            for (uint32_t step = 16; step >= 1; step >>= 1) {
+                                uint32_t cand = k + step;
+                                if (cand < batch_size && s_dm_prefix[threadIdx.y][cand] <= i)
+                                    k = cand;
+                            }
+                            dst[s_dm_dst_adj[threadIdx.y][k] + i] =
+                                dict[s_dm_src_adj[threadIdx.y][k] + i];
+                        }
+                        __syncwarp();
+                    }
+                }
+
                 // ── Dependent matches, token order ──
-                // Ballot only the matches the flat pass could NOT take
-                // (batch-local or self-overlapping source ranges).
-                uint32_t match_mask = __ballot_sync(FULL_WARP_MASK, my_match_len > 0 && !my_is_indep);
+                // Ballot only the matches the flat passes could NOT take
+                // (batch-local, straddling, or hostile source ranges).
+                uint32_t match_mask = __ballot_sync(FULL_WARP_MASK,
+                    my_match_len > 0 && !my_is_indep && !my_entirely_dict);
                 while (match_mask != 0) {
                     uint32_t k = (uint32_t)(__ffs(match_mask) - 1);
                     match_mask &= match_mask - 1;

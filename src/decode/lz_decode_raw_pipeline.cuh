@@ -43,6 +43,15 @@
 
 #include "lz_decode_core.cuh"
 
+// v4 #16 follow-up (7) attribution: per-batch match-routing counters,
+// compile-time gated by the same SLZ_COUNT_PP flag as the single-warp
+// body's counters (lz_decode_raw.cuh defines it earlier in the TU;
+// default 0 = zero cost). Read back by `-db` under env SLZ_COUNT_PP=1.
+#if SLZ_COUNT_PP
+__device__ unsigned long long g_slz_match_total = 0; // matches staged by fillBatch
+__device__ unsigned long long g_slz_match_dep = 0;   // routed to the serial dependent loop
+#endif
+
 // Double buffer: the parser runs at most one batch ahead.
 // (A cuda::pipeline mbarrier ring was measured 2026-06-11 and LOST:
 // S=2 2.18 ms / S=4 2.64 ms vs 1.90 ms for __syncthreads pacing on
@@ -74,6 +83,7 @@ struct PipeBatch {
     uint32_t batch_size; // tokens staged (>= 1)
     uint32_t total_lit;
     uint32_t total_im;
+    uint32_t total_dm;   // v4 #16 fu7: flat dict-match byte count (HAS_DICT only)
     uint32_t dst_pos;    // batch's absolute dst base
     uint32_t lit_pos;    // batch's absolute lit base
     uint32_t dep_mask;   // ballot of dependent-match lanes
@@ -82,6 +92,15 @@ struct PipeBatch {
     uint32_t im_prefix[WARP_SIZE];   // exclusive indep-match-byte prefix
     uint32_t im_dst_adj[WARP_SIZE];  // copy_dst - im_local
     uint32_t im_src_adj[WARP_SIZE];  // match_src - im_local
+    // v4 #16 fu7: flat ENTIRELY-DICT match pool (sources are read-only
+    // dictionary bytes - no write hazard against anything in the batch,
+    // so they run in phase 1 at full team width instead of the serial
+    // dependent loop; the dict-heavy routing measured 37.9% of matches
+    // dep-routed vs 11.6% plain, costing 1.74 -> 2.53 ms on enwik8-L1
+    // -with-dict). dm_src_adj is in DICT coordinates.
+    uint32_t dm_prefix[WARP_SIZE];
+    uint32_t dm_dst_adj[WARP_SIZE];
+    uint32_t dm_src_adj[WARP_SIZE];
     uint32_t match_len[WARP_SIZE];
     int32_t  match_offset[WARP_SIZE];
 };
@@ -99,7 +118,8 @@ __device__ bool fillBatch(
     uint32_t& cmd_pos, uint32_t& lit_pos, uint32_t& off16_pos,
     uint32_t& dst_pos, int32_t& recent_offset,
     int lane, PipeBatch* s,
-    uint32_t window_base = 0 // v4 #16: sub-chunk output base (HAS_DICT only)
+    uint32_t window_base = 0, // v4 #16: sub-chunk output base (HAS_DICT only)
+    uint32_t dict_len = 0
 ) {
     uint32_t remaining = cmd_size - cmd_pos;
     uint32_t batch_size = remaining < WARP_SIZE ? remaining : WARP_SIZE;
@@ -150,14 +170,19 @@ __device__ bool fillBatch(
     uint32_t my_lit_local, total_lit;
     warpScanU32(my_lit_len, my_lit_local, total_lit);
 
-    // Independent-match classification (v4 #2). v4 #16: dict-reaching
-    // matches are excluded from the flat pass - they fall into the
-    // dependent loop, whose per-byte dict-aware read handles them
-    // (order-safe: their sources are dict bytes + pre-batch output).
+    // Independent-match classification (v4 #2). v4 #16 fu7: matches
+    // whose source lies ENTIRELY inside the dictionary go to their own
+    // flat pool (read-only sources - zero write hazards; the encoder
+    // emits only this kind). Straddlers and hostile below-dict reaches
+    // fall into the dependent loop, whose per-byte dict-aware read
+    // handles (and clamps) them.
     uint32_t my_copy_dst = dst_pos + my_dst_local + my_lit_len;
     int32_t  my_src      = (int32_t)my_copy_dst + my_match_offset;
     bool my_reaches_dict = HAS_DICT && (my_match_len > 0) &&
                            (my_src < (int32_t)window_base);
+    bool my_entirely_dict = my_reaches_dict &&
+                            (my_src + (int32_t)my_match_len <= (int32_t)window_base) &&
+                            (my_src + (int32_t)dict_len >= (int32_t)window_base);
     bool my_is_indep = (my_match_len > 0) && !my_reaches_dict &&
                        (my_src + (int32_t)my_match_len <= (int32_t)dst_pos);
     uint32_t my_im_len = my_is_indep ? my_match_len : 0u;
@@ -172,7 +197,27 @@ __device__ bool fillBatch(
     s->im_src_adj[lane]   = (uint32_t)my_src - my_im_local;
     s->match_len[lane]    = my_match_len;
     s->match_offset[lane] = my_match_offset;
-    uint32_t dep_ballot = __ballot_sync(FULL_WARP_MASK, my_match_len > 0 && !my_is_indep);
+    if constexpr (HAS_DICT) {
+        uint32_t my_dm_len = my_entirely_dict ? my_match_len : 0u;
+        uint32_t my_dm_local, total_dm;
+        warpScanU32(my_dm_len, my_dm_local, total_dm);
+        // Dict-space source: dict byte k below the window is
+        // dict[dict_len - k]; u32 wrap arithmetic lands exactly.
+        uint32_t my_dict_src = (uint32_t)((int32_t)dict_len + my_src - (int32_t)window_base);
+        s->dm_prefix[lane]  = my_dm_local;
+        s->dm_dst_adj[lane] = my_copy_dst - my_dm_local;
+        s->dm_src_adj[lane] = my_dict_src - my_dm_local;
+        if (lane == 0) s->total_dm = total_dm;
+    }
+    uint32_t dep_ballot = __ballot_sync(FULL_WARP_MASK,
+        my_match_len > 0 && !my_is_indep && !my_entirely_dict);
+#if SLZ_COUNT_PP
+    uint32_t match_ballot_count = __ballot_sync(FULL_WARP_MASK, my_match_len > 0);
+    if (lane == 0) {
+        atomicAdd(&g_slz_match_total, (unsigned long long)__popc(match_ballot_count));
+        atomicAdd(&g_slz_match_dep, (unsigned long long)__popc(dep_ballot));
+    }
+#endif
     if (lane == 0) {
         s->batch_size = batch_size;
         s->total_lit  = total_lit;
@@ -248,6 +293,22 @@ __device__ void executeBatchTeam(
         }
         dst[s->im_dst_adj[k] + i] = dst[s->im_src_adj[k] + i];
     }
+    // v4 #16 fu7: flat ENTIRELY-DICT match pass. Same shape as the im
+    // pass with the source read from the dictionary. Hazard-free
+    // against the lit and im passes (reads touch only dictionary
+    // bytes; writes are disjoint by token ownership), so it shares
+    // phase 1 with no extra barrier.
+    if constexpr (HAS_DICT) {
+        for (uint32_t i = team_lane; i < s->total_dm; i += SLZ_PIPE_TEAM_THREADS) {
+            uint32_t k = 0;
+            #pragma unroll
+            for (uint32_t step = 16; step >= 1; step >>= 1) {
+                uint32_t cand = k + step;
+                if (cand < bs && s->dm_prefix[cand] <= i) k = cand;
+            }
+            dst[s->dm_dst_adj[k] + i] = dict[s->dm_src_adj[k] + i];
+        }
+    }
     pipeTeamBar(); // phase-1 writes visible to the dep warp
 
     // Phase 2: dependent matches in token order, warp 1 only.
@@ -317,7 +378,7 @@ __device__ __noinline__ void decodeSubChunkRawModePipelined(
             bool got = (cmd_pos < cmd_size) && fillBatch<OFF16_SPLIT, HAS_DICT>(
                 cmd, cmd_size, off16_raw, off16_count, off16_hi, off16_lo,
                 cmd_pos, lit_pos, off16_pos, dst_pos, recent_offset,
-                lane, &s_batch[0], dst_offset);
+                lane, &s_batch[0], dst_offset, dict_len);
             if (lane == 0) s_have[0] = got ? 1 : 0;
         }
         __syncthreads();
@@ -329,7 +390,7 @@ __device__ __noinline__ void decodeSubChunkRawModePipelined(
                 bool got = (cmd_pos < cmd_size) && fillBatch<OFF16_SPLIT, HAS_DICT>(
                     cmd, cmd_size, off16_raw, off16_count, off16_hi, off16_lo,
                     cmd_pos, lit_pos, off16_pos, dst_pos, recent_offset,
-                    lane, &s_batch[1 - cur], dst_offset);
+                    lane, &s_batch[1 - cur], dst_offset, dict_len);
                 if (lane == 0) s_have[1 - cur] = got ? 1 : 0;
             } else {
                 executeBatchTeam<HAS_DICT>(dst, lit, lane, team_lane, warp_y, &s_batch[cur],
