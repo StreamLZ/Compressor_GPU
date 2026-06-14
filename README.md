@@ -147,19 +147,17 @@ with the output download; see Integrity below).
 
 ### Compression ratio
 
-| Level | enwik8 | silesia |
-|-------|-------:|--------:|
-| L1 | 58.6% | 47.8% |
-| L2 | 57.3% | 47.2% |
-| L3 | 43.7% | 38.1% |
-| L4 | 42.7% | 37.5% |
-| L5 | 39.6% | 33.9% |
+| Level | Parser | Entropy | enwik8 | silesia |
+|-------|--------|---------|-------:|--------:|
+| L1 | Greedy | LZ only | 58.6% | 47.8% |
+| L2 | Greedy + rehash | LZ only | 57.3% | 47.2% |
+| L3 | Greedy | + Huffman | 43.7% | 38.1% |
+| L4 | Greedy + rehash | + Huffman | 42.7% | 37.5% |
+| L5 | Chain (lazy) | + Huffman | 39.6% | 33.9% |
 
-L1-L2 are LZ-only (no entropy stage); L2 adds the greedy parser's
-match-range rehash (~1 pp better ratio, +29% encode cost, decodes
-slightly FASTER than L1 - fewer tokens). L3-L5 add 32-stream GPU
-Huffman; L4 adds the rehash on top of L3; L5 swaps in the chain
-parser.
+L1 is the fastest encoder; L2 adds match-range rehash for ~1 pp
+better ratio at +29% encode cost (decodes slightly faster - fewer
+tokens). L3+ add 32-stream GPU Huffman on top of LZ.
 
 ### Integrity
 
