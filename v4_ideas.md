@@ -516,6 +516,17 @@ in-tree tooling (dump env var -> tans_gate2 replay).
 
 ## 12. Small-items basket (carried from the retired todo.md deferrals)
 
+- **VK g_import_cache lacks a dedicated lock** (found 2026-06-13 by
+  external review): the 16-slot LRU import cache in
+  `srcVK/decode/module_loader.zig` (`lookupImportedBuffer` /
+  `insertImportedBuffer`) is accessed without a fine-grained mutex.
+  No in-tree caller triggers a race today: the sync path holds the
+  dispatcher mutex, and the async path rejects concurrent submits on
+  the same handle (`isBusy()`). But two threads sharing `g_default`
+  in sync mode would race on the cache. Fix: add a lightweight lock
+  around lookup+insert, or document that `g_default` is
+  single-thread-only. Low priority (no caller triggers it), medium
+  severity if it ever fires (double-free or stale mapping).
 - **`slzCompressAsync` input-size gap**: inputs outside [128 B, ~1 GiB]
   return SLZ_ERROR_UNSUPPORTED on the async path; the >1 GiB side is
   the caller-relevant one (TODO2's deferral-defender). Close by D2H-ing
