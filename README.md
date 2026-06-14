@@ -203,9 +203,21 @@ half, RTX 4060 Ti, encode+decode byte-verified):
 
 Dictionary quality is per-corpus: the same records with the generic
 json dictionary stay at ~57% - train on a sample of YOUR records.
-Dictionaries also help large corpora as shared cross-window context:
-enwik8 with the generic text dictionary improves 58.6% -> 53.6% at
-L1 and 39.6% -> 38.3% at L5. Dictionary-less frames are
+
+Dictionaries also help large corpora as shared cross-window context
+(enwik8 100 MB with the built-in `text` dictionary, RTX 4060 Ti):
+
+| Level | Plain | With text dict | Reduction |
+|-------|------:|---------------:|----------:|
+| L1 | 58.6% | **53.6%** | -8.5% bytes |
+| L3 | 43.7% | **42.0%** | -3.9% bytes |
+| L5 | 39.6% | **38.3%** | -3.3% bytes |
+
+The L1 lift is the largest because the greedy parser has no
+cross-window history at all - the dictionary acts as a persistent
+common-phrases table across all 1,526 chunk windows. At L5 the chain
+parser already captures most redundancy on its own, so the
+dictionary's marginal lift is smaller. Dictionary-less frames are
 byte-identical to before the feature existed.
 
 ### vs nvCOMP (enwik8 100 MB, RTX 4060 Ti)
